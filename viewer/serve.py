@@ -13,100 +13,17 @@ import functools
 import http.server
 import os
 import sys
-import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-_WINDOWS_RESERVED_DEVICES = frozenset({
-    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
-    # Windows also treats superscript 1/2/3 as device numbers. Keep this fallback
-    # complete for Python 3.12, which has no os.path.isreserved.
-    *(f"COM{i}" for i in "123456789\u00b9\u00b2\u00b3"),
-    *(f"LPT{i}" for i in "123456789\u00b9\u00b2\u00b3"),
-})
-
-
-def _is_reserved_segment(seg: str) -> bool:
-    # Spaces before an extension do not make a device into a normal filename:
-    # Windows treats e.g. "NUL .glb" as NUL (as does ntpath.isreserved in Python 3.13+).
-    stem = seg.split(".", 1)[0].rstrip(" ").upper()
-    if stem in _WINDOWS_RESERVED_DEVICES:
-        return True
-    isreserved = getattr(os.path, "isreserved", None)
-    if callable(isreserved) and isreserved(seg):
-        return True
-    return False
-
-
-# Binding to 127.0.0.1 keeps other machines out, but not other web pages: a page on any site can point its own
-# domain at 127.0.0.1 (DNS rebinding) and read /world/ through this server as same-origin. Its requests still carry
-# that domain in the Host header, so only requests that name this machine are answered.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
-
-
-def host_allowed(host: str | None) -> bool:
-    """True when a request's Host header names the loopback address. Browsers always send Host; a request without
-    one comes from a local tool, not a web page, and is allowed.
-
-    The value must be `name` or `name:port` (RFC 7230 section 5.4): text after an IPv6 literal's `]` other than
-    `:port`, a second colon, or a port that is not 1-5 ASCII digits up to 65535 is malformed and refused."""
-    if host is None:
-        return True
-    host = host.strip().lower()
-    if host.startswith("["):                        # [::1] or [::1]:8765
-        end = host.find("]")
-        if end < 0:
-            return False
-        name, rest = host[:end + 1], host[end + 1:]
-        if rest and not rest.startswith(":"):
-            return False                            # [::1]junk, [::1].
-        port = rest[1:] if rest else None
-    else:
-        name, colon, port = host.partition(":")
-        if not colon:
-            port = None
-        elif ":" in port:
-            return False                            # a bare IPv6 address, or name:port:more
-        if name.endswith("."):                      # one trailing dot: the fully qualified form
-            name = name[:-1]
-    # The length cap comes before int(): a port of thousands of digits would hit Python's int conversion limit.
-    if port is not None and not (0 < len(port) <= 5 and port.isascii() and port.isdigit() and int(port) <= 65535):
-        return False
-    return name in _LOOPBACK_HOSTS
+TOOLS_DIR = os.path.join(os.path.dirname(HERE), "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+from local_http_guard import host_allowed, safe_prefix_path
 
 
 def safe_world_path(world_dir: str, req_path: str) -> str | None:
     """Resolve a /world/... request path safely inside world_dir, or return None."""
-    if not world_dir or not isinstance(req_path, str):
-        return None
-    clean = req_path.split("#", 1)[0].split("?", 1)[0]
-    if not clean.startswith("/world/"):
-        return None
-    rel = urllib.parse.unquote(clean[len("/world/"):])
-    if not rel or "\x00" in rel:
-        return None
-    if rel.startswith(("/", "\\")) or rel.endswith(("/", "\\")):
-        return None
-    norm = rel.replace("\\", "/")
-    parts = norm.split("/")
-    for seg in parts:
-        if not seg or seg in (".", "..") or ":" in seg or _is_reserved_segment(seg):
-            return None
-    if os.path.isabs(rel) or os.path.isabs(norm):
-        return None
-    real_world = os.path.realpath(world_dir)
-    real_target = os.path.realpath(os.path.join(real_world, *parts))
-    try:
-        common = os.path.commonpath([real_world, real_target])
-    except ValueError:
-        return None
-    if os.path.normcase(common) != os.path.normcase(real_world):
-        return None
-    if os.path.normcase(real_target) == os.path.normcase(real_world):
-        return None
-    if os.path.isdir(real_target):
-        return None
-    return real_target
+    return safe_prefix_path(world_dir, req_path, "/world/")
 
 
 # Outside /world/ the viewer is one page. Serving only these two request paths, matched before any decoding,
