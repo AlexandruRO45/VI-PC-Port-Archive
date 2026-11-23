@@ -356,5 +356,44 @@ class TestSNotB64IEEE754(unittest.TestCase):
         self.assertEqual(hw_res, ref_not_b64(inf64))
 
 
+class TestSNotB64NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for s_not_b64."""
+
+    def test_rejection_of_invalid_syntax(self):
+        lines_missing = [
+            "s_mov_b32 s0, 1",
+            "s_not_b64 s[0:1]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_not64_err", lines_missing)
+
+    def test_rejection_of_out_of_bounds_register(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 105, size=2)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, -1, size=2)
+
+    def test_mutation_detection_incomplete_inversion(self):
+        # Mutated oracle inverting only lower 32 bits
+        def bad_oracle_lo_only(val):
+            return ((val >> 32) << 32) | ((~val) & MASK32)
+
+        val = 0x123456789ABCDEF0
+        self.assertNotEqual(ref_not_b64(val), bad_oracle_lo_only(val))
+
+    def test_mutation_detection_scc_logic(self):
+        # Mutated oracle where SCC is 1 when result is zero
+        def bad_oracle_scc(val):
+            res = ref_not_b64(val)
+            scc = 1 if res == 0 else 0
+            return res, scc
+
+        _, bad_scc = bad_oracle_scc(MASK64)
+        _, good_scc = ref_not_b64_scc(MASK64)
+        self.assertNotEqual(good_scc, bad_scc)
+
+
 if __name__ == "__main__":
     unittest.main()
