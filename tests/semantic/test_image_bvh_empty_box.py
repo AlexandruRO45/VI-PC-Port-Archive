@@ -19,6 +19,7 @@ CHILD = (0x11, 0x12, 0x13, 0x14)
 HIT = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
 EMPTY = ((1.0, 1.0, 1.0), (0.0, 0.0, 0.0))         # min > max on every axis
 EMPTY_X = ((1.0, 0.0, 0.0), (0.0, 1.0, 1.0))       # min > max on x only
+EMPTY_Z = ((0.0, 0.0, 1.0), (1.0, 1.0, 0.0))       # min > max on z only, the ray's axis
 OFF = ((5.0, 5.0, 5.0), (6.0, 6.0, 6.0))           # a real box the ray misses
 
 
@@ -59,7 +60,7 @@ class EmptyBox(unittest.TestCase):
         with self.subTest(b16=b16):
             self.assertEqual(run([HIT, OFF, OFF, OFF], b16), [CHILD[0], MISS, MISS, MISS])   # control
             self.assertEqual(run([HIT, EMPTY, OFF, OFF], b16), [CHILD[0], MISS, MISS, MISS])
-            self.assertEqual(run([EMPTY, HIT, EMPTY_X, OFF], b16), [MISS, CHILD[1], MISS, MISS])
+            self.assertEqual(run([EMPTY, HIT, EMPTY_X, EMPTY_Z], b16), [MISS, CHILD[1], MISS, MISS])
 
     def test_box32(self):
         self.check(False)
