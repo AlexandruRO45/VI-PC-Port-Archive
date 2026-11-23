@@ -27,6 +27,7 @@ if _TOOLS_DIR not in sys.path:
 
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -222,7 +223,7 @@ def _scan_rpf_offsets(path: str, jobs: int = 1) -> tuple[list[int], int, int]:
             complete_0x7a += c7a
             incomplete_0x7a += i7a
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=process_workers(workers)) as ex:
             for part_offs, c7a, i7a in ex.map(_scan_rpf_chunk, ranges):
                 offs.extend(part_offs)
                 complete_0x7a += c7a
