@@ -324,5 +324,29 @@ class SMaxI32TranslatorTests(unittest.TestCase):
         self.assertEqual(words[0], 50)
         self.assertEqual(words[1], 1)
 
+# -----------------------------------------------------------------------------
+# Opcode 4: s_max_u32
+# -----------------------------------------------------------------------------
+def oracle_max_u32(s0: int, s1: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_max_u32: returns (result_u32, scc)."""
+    xu = s0 & MASK32
+    yu = s1 & MASK32
+    val = xu if xu > yu else yu
+    scc = 1 if xu > yu else 0
+    return val, scc
+
+
+class SMaxU32OracleTests(unittest.TestCase):
+    def test_max_u32_basic(self):
+        # max(0xFFFFFFFF, 10) = 0xFFFFFFFF, SCC = 1 (0xFFFFFFFF > 10 unsigned)
+        res, scc = oracle_max_u32(0xFFFFFFFF, 10)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(scc, 1)
+
+    def test_max_u32_zero(self):
+        res, scc = oracle_max_u32(0, 100)
+        self.assertEqual(res, 100)
+        self.assertEqual(scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
