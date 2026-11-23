@@ -177,5 +177,27 @@ class VAddCoU32TranslatorIntegrationTests(unittest.TestCase):
         sub_res, _ = ref_sub_co_u32(a, b)
         self.assertNotEqual(add_res, sub_res)
 
+class VSubCoU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_sub_co_u32."""
+
+    def test_basic_subtraction_no_borrow(self):
+        d, b = ref_sub_co_u32(50, 20)
+        self.assertEqual(d, 30)
+        self.assertEqual(b, 0)
+
+    def test_subtraction_with_borrow(self):
+        d, b = ref_sub_co_u32(5, 8)
+        self.assertEqual(d, 0xFFFFFFFD)
+        self.assertEqual(b, 1)
+
+    def test_identity_zero(self):
+        d, b = ref_sub_co_u32(42, 0)
+        self.assertEqual(d, 42)
+        self.assertEqual(b, 0)
+
+        d2, b2 = ref_sub_co_u32(42, 42)
+        self.assertEqual(d2, 0)
+        self.assertEqual(b2, 0)
+
 if __name__ == "__main__":
     unittest.main()
