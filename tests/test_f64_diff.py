@@ -274,11 +274,16 @@ class F64DiffTests(unittest.TestCase):
     # ---- --oracle hw: routed through tools/hw_oracle, compared with the reference (a fake stands in for the GPU) ----
 
     class FakeHW:
-        """Answers each raw kernel with the reference's own result, as a hardware stand-in; flip corrupts v_trunc_f64."""
-        device = "fake gfx1036"
+        """Answers each raw kernel with the reference's own result, as a hardware stand-in; flip corrupts v_trunc_f64.
 
-        def __init__(self, flip=False, reason=None):
-            self.flip, self.reason, self.calls, self.closed = flip, reason, [], False
+        With stale, an output register the kernel never writes reads a leftover word instead of zero, as an allocated
+        but unset VGPR does on gfx1036 (#6784)."""
+        device = "fake gfx1036"
+        STALE = (0x5A5A0008, 0x5A5A0009, 0x5A5A000A, 0x5A5A000B)
+
+        def __init__(self, flip=False, reason=None, stale=False):
+            self.flip, self.reason, self.stale = flip, reason, stale
+            self.calls, self.closed = [], False
 
         def run(self, kernels):
             self.calls.append(list(kernels))
@@ -287,11 +292,25 @@ class F64DiffTests(unittest.TestCase):
                 if self.reason:
                     out.append(self.reason)
                     continue
+                program = kernel.lines[:-3]                            # drop the address move, store and s_endpgm
                 try:
-                    words = fd.ref_program(kernel.lines[:-3], True)   # drop the store epilogue
+                    words = fd.ref_program(program, True)
                 except (fd.SkipCase, ArithmeticError, IndexError, KeyError, ValueError):
                     out.append("assembler rejected: fake")
                     continue
+                if self.stale:
+                    written = set()
+                    for line in program:
+                        operands = line.split()
+                        if len(operands) < 2 or not operands[0].startswith("v_"):
+                            continue
+                        dest = operands[1].rstrip(",")
+                        if dest.startswith("v[") and ":" in dest:
+                            lo, hi = dest[2:-1].split(":")
+                            written.update(range(int(lo), int(hi) + 1))
+                        elif dest.startswith("v") and dest[1:].isdigit():
+                            written.add(int(dest[1:]))
+                    words = [word if 8 + i in written else self.STALE[i] for i, word in enumerate(words)]
                 broken = self.flip and any(line.startswith("v_trunc_f64 ") for line in kernel.lines)   # a planted hardware bug
                 out.append([words[0] ^ 1] + list(words[1:]) if broken else list(words))
             return out
@@ -344,6 +363,13 @@ class F64DiffTests(unittest.TestCase):
         self.assertGreater(len(fake.calls), 1)               # the shrinker re-ran trial programs
         self.assertTrue(all(len(batch) == 1 for batch in fake.calls[1:]))
         self.assertTrue(fake.closed)
+
+    def test_hw_oracle_shrinks_a_mismatch_to_code_that_writes_the_output(self):
+        fake = self.FakeHW(flip=True, stale=True)
+        code, out, _, _ = self.run_main(fake, "--ops", "v_trunc_f64", "--programs", "0")
+        self.assertEqual(code, 1, out)
+        minimal = out.split("minimal program:", 1)[1].split("expected:", 1)[0]
+        self.assertIn("v_trunc_f64", minimal)
 
     def test_hw_oracle_skip_reason_from_runner_is_counted(self):
         fake = self.FakeHW(reason="MODE dx10_clamp, ieee cannot be set on gfx1170")
