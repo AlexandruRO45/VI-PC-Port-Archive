@@ -1,7 +1,7 @@
 // Clears compared with native Windows D3D12/WARP across the format classes (D3D-45): ClearRenderTargetView on
 // UNORM, SNORM, SRGB, FLOAT, UINT and SINT formats and ClearDepthStencilView on every depth format, each with and
 // without rectangles. Every case clears, copies the result into a readback buffer through D3D12 and compares the
-// bytes with what WARP wrote. Extends d3d12_uint_clear_test.cpp (UINT only).
+// bytes with what WARP wrote. Extends d3d12_clear_test.cpp.
 // No game data or shaders. Run explicitly (needs Vulkan hardware and WARP); LEONIDA_VK_VALIDATION=1 checks Vulkan
 // usage. A format the layer cannot create yet is listed as "not exposed" and does not fail the test; any other
 // difference does.
