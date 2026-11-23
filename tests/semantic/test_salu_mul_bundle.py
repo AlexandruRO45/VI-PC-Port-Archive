@@ -84,6 +84,33 @@ class ASTInstruction:
 
         return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}"
 
+class ScalarMachineState:
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.scc: int = 0
+
+    def read_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        return op.value & MASK32
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+
+GLOBAL_ORACLE_MAP: dict[Opcode, Callable[[int, int], int]] = {}
+
+
+class ScalarInterpreter:
+    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> int:
+        s0 = state.read_operand(instr.src0)
+        s1 = state.read_operand(instr.src1)
+        res = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1)
+        if instr.dst.kind == OperandKind.SGPR:
+            state.write_sgpr(instr.dst.index, res)
+        # Note: s_mul_i32, s_mul_hi_i32, s_mul_hi_u32 do NOT modify SCC in RDNA2 ISA
+        return res
+
 def ref_s_mul_i32(s0: int, s1: int) -> int:
     """Low 32 bits of 32x32 integer multiply (identical for signed/unsigned)."""
     return (s0 * s1) & MASK32
@@ -129,6 +156,37 @@ class TestSMulI32ASTAndSignExtensions(unittest.TestCase):
         val_neg = u32(-50)
         self.assertEqual(i32(val_neg), -50)
         self.assertEqual(u32(i32(val_neg)), val_neg)
+
+GLOBAL_ORACLE_MAP[Opcode.S_MUL_I32] = ref_s_mul_i32
+
+
+class TestSMulI32ScalarInterpreter(unittest.TestCase):
+    def test_step_sgpr_sources(self) -> None:
+        state = ScalarMachineState()
+        state.write_sgpr(0, 25)
+        state.write_sgpr(1, 4)
+        inst = ASTInstruction(
+            Opcode.S_MUL_I32,
+            ASTOperand.sgpr(2),
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(1),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 100)
+        self.assertEqual(state.sgprs[2], 100)
+
+    def test_step_imm_source(self) -> None:
+        state = ScalarMachineState()
+        state.write_sgpr(5, 12)
+        inst = ASTInstruction(
+            Opcode.S_MUL_I32,
+            ASTOperand.sgpr(6),
+            ASTOperand.sgpr(5),
+            ASTOperand.imm(12),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 144)
+        self.assertEqual(state.sgprs[6], 144)
 
 if __name__ == "__main__":
     unittest.main()
