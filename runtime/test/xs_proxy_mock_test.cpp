@@ -1528,6 +1528,97 @@ int check_slot70_typed_buffer() {
     return 0;
 }
 
+// ---- 8d. Device slot 70: a buffer view of bytes in the title's own memory ----
+//
+// On the retail boot the two typed R16_UINT views name bytes no placed buffer holds. Slot 70 asks slot 133's
+// handler for a buffer on the title's pages over that range, once per range, and holds it until the device dies.
+
+struct TitlePageCall {
+    unsigned calls;
+    std::uint64_t va;
+    D3D12_RESOURCE_DESC desc;
+    std::uint32_t layout;
+    bool refuse;
+    Mock* made;
+};
+TitlePageCall g_title_page{};
+
+int check_slot70_title_pages() {
+    constexpr std::uint64_t kVa = 0x7f2000000000ull;
+    const std::uint64_t destination = 0x7000;
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    unsigned views = mock->calls[18];
+
+    // No handler (a PC device behind the proxy): the null view.
+    xs::set_placed_at_va_handler(nullptr);
+    RawShape shape = buffer_view_shape(kVa, 768, DXGI_FORMAT_R16_UINT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == ++views && is_null_view(mock));
+
+    g_title_page = {};
+    xs::set_placed_at_va_handler([](ID3D12Device*, void* va, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
+                                    REFIID, void** out) -> HRESULT {
+        ++g_title_page.calls;
+        g_title_page.va = reinterpret_cast<std::uint64_t>(va);
+        g_title_page.desc = desc;
+        g_title_page.layout = layout;
+        if (g_title_page.refuse) return E_INVALIDARG;
+        g_title_page.made = new_mock(Kind::resource);
+        g_title_page.made->refs = 1;
+        *out = g_title_page.made;
+        return S_OK;
+    });
+    // The measured shape: the handler makes a 768-byte buffer at the address, with the layout slot 133 gives a buffer.
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    Mock* const first = g_title_page.made;
+    EXPECT(g_title_page.calls == 1 && g_title_page.va == kVa && first);
+    EXPECT(g_title_page.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && g_title_page.desc.Width == 768 &&
+           g_title_page.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && g_title_page.desc.Flags == 0 &&
+           g_title_page.layout == 0xFFFFFFFFu);
+    EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(first) && mock->srv.Format == DXGI_FORMAT_R16_UINT &&
+           mock->srv.Buffer.FirstElement == 0 && mock->srv.Buffer.NumElements == 384);
+    EXPECT(first->refs == 1);  // the proxy's
+    // The same range again, and a range inside it: the same buffer, no new call.
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(g_title_page.calls == 1 && mock->calls[18] == ++views && mock->args[18][0] == word(first));
+    shape = buffer_view_shape(kVa + 0x100, 0x200, DXGI_FORMAT_R16_UINT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(g_title_page.calls == 1 && mock->calls[18] == ++views && mock->args[18][0] == word(first) &&
+           mock->srv.Buffer.FirstElement == 0x80 && mock->srv.Buffer.NumElements == 0x100 && first->refs == 1);
+    // A range past it (the measured 6144 bytes elsewhere): a second buffer.
+    shape = buffer_view_shape(kVa + 0x10000, 6144, DXGI_FORMAT_R16_UINT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    Mock* const second = g_title_page.made;
+    EXPECT(g_title_page.calls == 2 && second != first && g_title_page.va == kVa + 0x10000 &&
+           mock->calls[18] == ++views && mock->args[18][0] == word(second) && mock->srv.Buffer.NumElements == 3072);
+    // A buffer slot 133 placed over an address wins over the title's pages.
+    const D3D12_RESOURCE_DESC placed_desc = placed_buffer_desc(0x1000);
+    void* placed = nullptr;
+    g_title_page.refuse = true;  // slot 133 falls back to a committed buffer, which it remembers
+    EXPECT(hr_of(raw6(device, 133, kVa + 0x20000, word(&placed_desc), 0xFFFFFFFFu, 0, word(&kResourceIid),
+                      word(&placed))) == S_OK && placed);
+    const unsigned asked = g_title_page.calls;
+    shape = buffer_view_shape(kVa + 0x20000, 0x100, DXGI_FORMAT_R16_UINT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(g_title_page.calls == asked && mock->calls[18] == ++views && mock->args[18][0] == word(placed));
+    // The handler refusing a range: the null view, nothing held.
+    shape = buffer_view_shape(kVa + 0x30000, 768, DXGI_FORMAT_R16_UINT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(g_title_page.calls == asked + 1 && mock->calls[18] == ++views && is_null_view(mock));
+    xs::set_placed_at_va_handler(nullptr);
+
+    // The buffers go with the device.
+    EXPECT(release(placed) == 0);
+    EXPECT(mock->calls[70] == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0 && first->refs == 0 && second->refs == 0);
+    std::printf("%s: device slot 70 views bytes in the title's memory through a buffer slot 133's handler makes on "
+                "its pages, once per range, held until the device dies\n",
+                g_label);
+    return 0;
+}
+
 // ---- 9. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -1972,8 +2063,8 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_slot70() || check_slot70_raw_buffer() ||
-        check_slot70_placed_buffer() || check_slot70_typed_buffer() || check_descriptor_heap_hooks() ||
-        check_committed_resource3_x() ||
+        check_slot70_placed_buffer() || check_slot70_typed_buffer() || check_slot70_title_pages() ||
+        check_descriptor_heap_hooks() || check_committed_resource3_x() ||
         check_committed_resource3_xmem_hook())
         return 1;
     if (check_placed_resource_x()) return 1;
