@@ -165,7 +165,23 @@ int main() {
         return 1;
     }
     PhysicalGpu gpu_half(d.device, d.device_proc, pool, store, mem_props);
+    EXPECT(gpu_half.ok());
     Gpu gpu(d, context, queue);
+
+    // Pages the store does not have are refused, and the GPU half allocates nothing for them.
+    {
+        EXPECT(store.data(1024) == nullptr && !store.allocated(1024) && !store.allocated(1000));
+        store.mark_dirty(1024);
+        const auto in_use = pool.pages_in_use();
+        const PhysicalPage absent[]{1000, 5000};
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) {
+            EXPECT(!gpu_half.record_upload(cb, absent));
+            EXPECT(!gpu_half.record_readback(cb, absent));
+        }));
+        EXPECT(gpu_half.gpu_page(1000) == kNoPage);
+        EXPECT(pool.pages_in_use() == in_use && gpu_half.pages_uploaded() == 0);
+        EXPECT(!gpu_half.finish_readback(absent));
+    }
 
     // --- Double mapping: one physical page at two VAs ----------------------------------------------------------
     std::vector<PhysicalPage> phys;
@@ -234,7 +250,10 @@ int main() {
         d.fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, region.buffer(), kVa + 2 * kPageSize, kPageSize, 0x5A5A5A5Au);
         EXPECT(gpu_half.record_readback(cb, p2));
     }));
-    gpu_half.finish_readback(p2);
+    const PhysicalPage p3[1]{phys[3]};
+    EXPECT(!gpu_half.finish_readback(p3));  // not the pages that were read back
+    EXPECT(gpu_half.finish_readback(p2));
+    EXPECT(!gpu_half.finish_readback(p2));  // finished once
     EXPECT(all_bytes(r1 + 2 * kPageSize, 0x5A, kPageSize));
     EXPECT(store.take_dirty().empty());  // a readback updates the CPU half without making it dirty
     std::printf("INFO GPU fill of arena page -> readback -> CPU view of P%u reads 0x%02x\n", phys[2],

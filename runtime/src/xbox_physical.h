@@ -61,7 +61,8 @@ public:
         if (ok()) unregister_store(this);
         for (auto& [base, region] : regions_) {
             for (std::uint32_t i = 0; i < region.pages.size(); ++i)
-                if (region.pages[i] != kUnmapped) unmap_view2_(GetCurrentProcess(), region.at(i), MEM_PRESERVE_PLACEHOLDER);
+                if (region.pages[i] != kUnmapped)
+                    unmap_view2_(GetCurrentProcess(), region.at(i), MEM_PRESERVE_PLACEHOLDER);
             // Split slots are placeholders of their own: merge them back into one, then release it.
             if (!region.split.empty())
                 VirtualFree(reinterpret_cast<void*>(base), region.pages.size() * kPageSize,
@@ -76,6 +77,7 @@ public:
 
     // Commits `count` physical pages, zeroed. All or nothing.
     bool allocate(std::uint32_t count, std::vector<PhysicalPage>& out) {
+        if (!ok()) return false;
         std::unique_lock lock(mutex_);
         const std::size_t base = out.size();
         for (std::uint32_t p = 0; p < capacity_ && out.size() - base < count; ++p) {
@@ -92,8 +94,9 @@ public:
 
     // Placeholder reservation for `pages` 64 KiB pages; the title's mappings go here. Returns the base, or nullptr.
     void* reserve(std::uint32_t pages, void* at = nullptr) {
-        void* base = virtual_alloc2_(nullptr, at, std::uint64_t(pages) * kPageSize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                     PAGE_NOACCESS, nullptr, 0);
+        if (!ok() || !pages) return nullptr;
+        void* base = virtual_alloc2_(nullptr, at, std::uint64_t(pages) * kPageSize,
+                                     MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
         if (!base) return nullptr;
         std::unique_lock lock(mutex_);
         Region region;
@@ -157,10 +160,18 @@ public:
     }
 
     // Marks pages dirty without a write (a GPU-to-CPU readback, or a test).
-    void mark_dirty(PhysicalPage p) { dirty_[p].store(1, std::memory_order_release); }
+    void mark_dirty(PhysicalPage p) {
+        if (p < capacity_) dirty_[p].store(1, std::memory_order_release);
+    }
+
+    // Whether `p` was allocated (its CPU half is committed).
+    bool allocated(PhysicalPage p) const {
+        std::shared_lock lock(mutex_);
+        return p < capacity_ && used_[p];
+    }
 
     // The CPU half through the store's own view (always writable; never tracked).
-    std::uint8_t* data(PhysicalPage p) const { return store_ + std::uint64_t(p) * kPageSize; }
+    std::uint8_t* data(PhysicalPage p) const { return p < capacity_ ? store_ + std::uint64_t(p) * kPageSize : nullptr; }
 
     std::uint64_t write_faults() const { return faults_.load(std::memory_order_relaxed); }
 
@@ -263,7 +274,7 @@ private:
     VirtualAlloc2Fn virtual_alloc2_ = nullptr;
     MapViewOfFile3Fn map_view3_ = nullptr;
     UnmapViewOfFile2Fn unmap_view2_ = nullptr;
-    std::shared_mutex mutex_;
+    mutable std::shared_mutex mutex_;
     std::vector<std::atomic<std::uint8_t>> dirty_;
     std::vector<bool> used_;
     std::map<std::uintptr_t, Region> regions_;
@@ -273,7 +284,7 @@ private:
 
 // The GPU half of physical pages: a PagePool page per physical page, created on first use, plus the copies that keep
 // the two halves coherent. Copies address a page through a plain buffer bound to its chunk's memory (memory may be
-// bound to a sparse arena page and to a plain buffer at once).
+// bound to a sparse arena page and to a plain buffer at once). One thread records with it.
 class PhysicalGpu {
 public:
     PhysicalGpu(VkDevice device, PFN_vkGetDeviceProcAddr get, PagePool& pool, PhysicalPageStore& store,
@@ -282,7 +293,8 @@ public:
         create_buffer_ = reinterpret_cast<PFN_vkCreateBuffer>(get(device, "vkCreateBuffer"));
         destroy_buffer_ = reinterpret_cast<PFN_vkDestroyBuffer>(get(device, "vkDestroyBuffer"));
         bind_ = reinterpret_cast<PFN_vkBindBufferMemory>(get(device, "vkBindBufferMemory"));
-        requirements_ = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(get(device, "vkGetBufferMemoryRequirements"));
+        requirements_ =
+            reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(get(device, "vkGetBufferMemoryRequirements"));
         allocate_ = reinterpret_cast<PFN_vkAllocateMemory>(get(device, "vkAllocateMemory"));
         free_ = reinterpret_cast<PFN_vkFreeMemory>(get(device, "vkFreeMemory"));
         map_ = reinterpret_cast<PFN_vkMapMemory>(get(device, "vkMapMemory"));
@@ -291,6 +303,11 @@ public:
     }
     PhysicalGpu(const PhysicalGpu&) = delete;
     PhysicalGpu& operator=(const PhysicalGpu&) = delete;
+
+    bool ok() const {
+        return create_buffer_ && destroy_buffer_ && bind_ && requirements_ && allocate_ && free_ && map_ && copy_ &&
+               barrier_;
+    }
     ~PhysicalGpu() {
         for (auto& [memory, buffer] : access_) destroy_buffer_(device_, buffer, nullptr);
         std::vector<PageId> pages;
@@ -302,6 +319,7 @@ public:
 
     // The GPU half of `p`, allocated on first use (kNoPage if the pool is out of memory).
     PageId gpu_page(PhysicalPage p) {
+        if (!store_.allocated(p)) return kNoPage;
         auto it = gpu_.find(p);
         if (it != gpu_.end()) return it->second;
         std::vector<PageId> one;
@@ -316,6 +334,7 @@ public:
         if (pages.empty()) return true;
         std::vector<Target> targets;
         if (!resolve(pages, targets) || !ensure_staging(pages.size() * kPageSize)) return false;
+        readback_.clear();  // the staging data it was waiting for is overwritten
         for (std::size_t i = 0; i < pages.size(); ++i) {
             std::memcpy(staging_map_ + i * kPageSize, store_.data(pages[i]), kPageSize);
             const VkBufferCopy region{i * kPageSize, targets[i].offset, kPageSize};
@@ -348,13 +367,19 @@ public:
         after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         barrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        readback_.assign(pages.begin(), pages.end());
         return true;
     }
 
-    // GPU -> CPU, step 2, once that work is complete: the CPU halves take the GPU data.
-    void finish_readback(std::span<const PhysicalPage> pages) {
+    // GPU -> CPU, step 2, once that work is complete: the CPU halves take the GPU data. `pages` must be the last
+    // record_readback's, with no upload recorded since; each readback is finished once.
+    bool finish_readback(std::span<const PhysicalPage> pages) {
+        if (readback_.empty() || !std::equal(pages.begin(), pages.end(), readback_.begin(), readback_.end()))
+            return false;
         for (std::size_t i = 0; i < pages.size(); ++i)
             std::memcpy(store_.data(pages[i]), staging_map_ + i * kPageSize, kPageSize);
+        readback_.clear();
+        return true;
     }
 
     std::uint64_t pages_uploaded() const { return uploaded_; }
@@ -368,6 +393,9 @@ private:
     // Each page's GPU half as a buffer and offset, so a failure records nothing.
     bool resolve(std::span<const PhysicalPage> pages, std::vector<Target>& out) {
         out.clear();
+        if (!ok()) return false;
+        for (PhysicalPage p : pages)
+            if (!store_.allocated(p)) return false;
         out.reserve(pages.size());
         for (PhysicalPage p : pages) {
             const PageId gpu = gpu_page(p);
@@ -450,6 +478,7 @@ private:
     std::uint8_t* staging_map_ = nullptr;
     VkDeviceSize staging_size_ = 0;
     std::uint64_t uploaded_ = 0;
+    std::vector<PhysicalPage> readback_;  // staged by the last record_readback, not finished yet
 };
 
 }  // namespace leonida::xbox
