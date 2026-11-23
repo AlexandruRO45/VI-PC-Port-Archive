@@ -154,6 +154,9 @@ instruction family per file; the list below describes some of them, not every fi
   (MoltenVK) would inline it into a short-circuiting `&&`/`||` or a ternary's arm, for 11 DPP16/DPP8 forms with
   and without a lane off in EXEC, using a model of SPIRV-Cross's single-use forwarding (its own tests cover the
   model). It also runs the same programs in `spirv_wave_interp.py` against a plain-Python DPP reference.
+- `test_mbcnt_eager_subgroup.py` (#6214) checks the same SPIRV-Cross forwarding rule and per-lane values for
+  `v_mbcnt_lo_u32_b32` / `v_mbcnt_hi_u32_b32` reading SGPR and VCC masks under narrowed EXEC (`cs_w32_mbcnt_exec`
+  and `fixtures/mbcnt_exec_wave64.asm`).
 
 Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
 `OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), control flow followed one branch at a time (the fragment-exit discard test, the compute

@@ -7417,6 +7417,9 @@ class Gen:
                 half = self.mask_half(a[1]) if self.wave64 else None
                 idx = (1 if half == "hi" else 0) if half is not None else (0 if op.endswith("lo_u32_b32") else 1)
                 mask = self.wave_mask(a[1])[idx]
+                if not self.emulate:
+                    # Every lane runs the mask reduction, also lanes off in EXEC whose bit an active lane counts (SHADER-529).
+                    mask = self.eager("%uint", mask)
                 acc = self.src_u(a[2])
             else:
                 mask, acc = self.src_u(a[1]), self.src_u(a[2])
