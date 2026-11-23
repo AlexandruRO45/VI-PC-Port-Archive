@@ -327,6 +327,20 @@ class TestSAddcU32ChainingAndPropagation(unittest.TestCase):
         self.assertEqual((r_lo, r_hi), (0, 4))
         self.assertEqual(cout2, 0)
 
+class TestSAddcU32Translator(unittest.TestCase):
+    def test_translator_s_addc_u32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0xffffffff",
+            "s_add_u32 s5, s4, 1",        # produces carry = 1 in SCC
+            "s_mov_b32 s6, 100",
+            "s_addc_u32 s7, s6, 200",     # 100 + 200 + 1 = 301
+            "v_mov_b32_e32 v1, s7",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_addc_u32")
+        for l in range(32):
+            self.assertEqual(results[l], 301)
+
 
 if __name__ == "__main__":
     unittest.main()
