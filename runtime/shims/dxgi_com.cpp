@@ -1342,6 +1342,10 @@ public:
           queue_(queue), queue_family_(queue_family) {
         if (owner_) owner_->AddRef();
     }
+    // The owner's release stays the last statement here, and in the body rather than in a member: it can be the
+    // device's last reference, so the device and its Vulkan handles may be gone once it returns, and nothing after
+    // it may use them. private_data_ is destroyed after it, which is safe because a D3D12 object kept there holds
+    // its own device reference (Child::device_).
     ~Factory() {
         if (owner_) owner_->Release();
     }
