@@ -434,6 +434,17 @@ class TestCli(unittest.TestCase):
                     self.assertEqual(rc, 2)
                     self.assertIn("cannot read input", err.getvalue())
 
+    def test_labels_json_saved_with_a_utf8_bom(self):
+        label = "ZZ_LINE_A_1"
+        body = ('{"%08x": "%s"}' % (T.joaat(label), label)).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("labels.json", "labels.txt"):
+                with self.subTest(name):
+                    path = os.path.join(tmp, name)
+                    with open(path, "wb") as fh:
+                        fh.write(b"\xef\xbb\xbf" + body)
+                    self.assertEqual(T.read_labels(path), {T.joaat(label): label})
+
     def test_carve_folder_with_wrong_shape_index_is_clean_error(self):
         for name, text in (("list", "[]"), ("nofiles", "{}"), ("badrow", '{"files": [1]}')):
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
