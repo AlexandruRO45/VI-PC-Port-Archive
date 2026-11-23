@@ -2042,8 +2042,18 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         # same decoder record as the model and texture exports above.
         record = os.path.join(pool_dir, DECODER_RECORD)
         if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
+            # A pool folder that is a link may point at another drive: it is not followed to remove what it points
+            # at (shutil.rmtree refuses a link anyway, with a traceback), so the stage stops with one error line.
+            if _linked(pool_dir):
+                fail(f"assets: texture pool folder {pool_dir} is a symlink or a junction, and its export came from "
+                     "another decoder: the assets stage removes this folder to export the pool again and does not "
+                     "follow a link to do it; remove the link and run again")
             log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
-            shutil.rmtree(pool_dir)
+            try:
+                shutil.rmtree(pool_dir)
+            except OSError as e:
+                fail(f"assets: cannot remove {e.filename or pool_dir} from another decoder's texture pool export "
+                     f"({e.strerror or e}); close what holds it or delete {pool_dir}, then run again")
         pool_jobs.append((p, name, root, pool_dir, record))
 
     pool_todo = [(p, name, root, pool_dir, record) for p, name, root, pool_dir, record in pool_jobs

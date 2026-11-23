@@ -156,6 +156,47 @@ class AssetsPoolsTest(unittest.TestCase):
         self.assertIn("bcpack-calibration.json", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_a_linked_pool_folder_from_another_decoder_stops_with_one_error_line(self):
+        # A pool folder kept on another drive through a symlink is not followed: what it points at stays, and the
+        # stage stops with one ERROR line instead of shutil.rmtree's OSError traceback (BUILD-2834).
+        self.pool("data/ttdb/pool.ttpf")
+        target = os.path.join(self.tmp.name, "elsewhere", "pool")
+        self.stub(os.path.join(target, "000000_old.dds"))
+        with open(os.path.join(target, make_game.DECODER_RECORD), "w", encoding="utf-8", newline="\n") as f:
+            f.write("d1\n")
+        pool_dir = os.path.join(self.out, "ttpf", "pool")
+        os.makedirs(os.path.dirname(pool_dir), exist_ok=True)
+        try:
+            os.symlink(target, pool_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as e:  # Windows without the symlink privilege
+            self.skipTest(f"cannot create a symlink here: {e}")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            self.run_assets("d2")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("ERROR:", stderr.getvalue())
+        self.assertIn(pool_dir, stderr.getvalue())
+        self.assertIn("symlink", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertTrue(os.path.islink(pool_dir))
+        self.assertTrue(os.path.isfile(os.path.join(target, "000000_old.dds")))
+        with open(os.path.join(target, make_game.DECODER_RECORD), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "d1\n")
+
+    def test_a_pool_folder_that_cannot_be_removed_stops_with_one_error_line(self):
+        self.pool("data/ttdb/pool.ttpf")
+        pool_dir = os.path.join(self.out, "ttpf", "pool")
+        self.run_assets("d1")
+        denied = PermissionError(13, "Permission denied", os.path.join(pool_dir, "000000_old.dds"))
+        stderr = io.StringIO()
+        with mock.patch.object(make_game.shutil, "rmtree", side_effect=denied), \
+             contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            self.run_assets("d2")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("000000_old.dds", stderr.getvalue())
+        self.assertIn("Permission denied", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
