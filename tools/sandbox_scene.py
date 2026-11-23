@@ -169,8 +169,9 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     try:
         stats = build(ap.parse_args(argv))
-    except OSError as e:
-        # An unreadable --entities/--models or an unwritable --out used to end in a traceback.
+    except (OSError, ValueError) as e:
+        # An unreadable --entities/--models, an --entities file that is not UTF-8 text or an unwritable --out
+        # used to end in a traceback.
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     print(" ".join(f"{k}={v}" for k, v in stats.items()))

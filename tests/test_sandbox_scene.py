@@ -141,6 +141,18 @@ class TestCliErrors(unittest.TestCase):
         self.assertEqual(len(err.strip().splitlines()), 1)
         self.assertTrue(err.startswith("ERROR:"))
 
+    def test_non_utf8_entities_is_one_error_line(self):
+        """An --entities file re-saved as UTF-16 (PowerShell's Out-File default) used to end in a traceback."""
+        utf16 = os.path.join(self.tmp.name, "utf16.jsonl")
+        with open(utf16, "wb") as f:
+            f.write(('{"archetype": 123, "position": [0, 0, 0], "rotation": [0, 0, 0, 1], '
+                     '"lod_level": 0}\r\n').encode("utf-16"))
+        rc, err = self._run(utf16, os.path.join(self.tmp.name, "o.bin"))
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+        self.assertTrue(err.startswith("ERROR:"), err)
+        self.assertIn(utf16, err)
+
     def test_writable_out_still_builds(self):
         out = os.path.join(self.tmp.name, "o.bin")
         err = io.StringIO()
