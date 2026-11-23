@@ -213,6 +213,7 @@ CPU_EXPLICIT = {
     "i9-14900k": 200, "i5-11400": 92, "i5-11600k": 100, "i7-11700": 103,
     "i7-10700": 98, "i5-10400": 82, "i5-10600k": 92, "i9-10900k": 108,
     "i7-9700k": 93, "i9-9900k": 105, "i5-9400": 75, "i7-8700k": 90, "i5-8400": 78,
+    "cc150": 90,
     "r5-5600": 100, "r5-5600x": 104, "r7-3700x": 100, "r5-3600": 90,
     "r5-5500": 90, "r7-5700x": 115, "r7-5800x": 120, "r7-5800x3d": 140,
     "r9-5900x": 135, "r5-7600": 130, "r7-7800x3d": 175, "r7-9800x3d": 190,
@@ -256,6 +257,9 @@ def cpu_lookup(name: str):
         return None, False
     s = re.sub(r"\((?:r|tm)\)|[®™]", "", name.lower())
 
+    if re.search(r"\bcc[- ]?150\b", s):
+        return CPU_EXPLICIT["cc150"], True
+
     m = re.search(r"core\s*ultra\s*([3579])\s*(\d{3})([a-z]*)", s)
     if m:
         base = ULTRA_BASE[int(m[1])]
@@ -294,6 +298,7 @@ def cpu_score(name: str):
 
 
 CPU_CHOICES = [
+    "Intel CC150",
     "Intel Core i3-10100F", "Intel Core i5-10400F", "Intel Core i7-10700K",
     "Intel Core i5-11400F", "Intel Core i7-11700K", "Intel Core i3-12100F",
     "Intel Core i5-12400F", "Intel Core i5-12600K", "Intel Core i7-12700K",

@@ -53,6 +53,8 @@ class CpuScore(unittest.TestCase):
         self.assertEqual(pc.cpu_score("AMD Ryzen 5 5600"), 100)
         self.assertEqual(pc.cpu_score("Intel(R) Core(TM) i5-12400F"), 102)
         self.assertEqual(pc.cpu_score("AMD Ryzen 7 5800X3D 8-Core"), 140)
+        self.assertEqual(pc.cpu_score("Intel CC150"), 90)
+        self.assertEqual(pc.cpu_score("Intel(R) CC150 CPU @ 3.50GHz"), 90)
 
     def test_estimated(self):
         self.assertAlmostEqual(pc.cpu_score("Intel Core i7-11700K"), 103 * 1.06)
