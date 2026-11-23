@@ -174,5 +174,40 @@ class SummaryTests(unittest.TestCase):
             sys.stderr = stderr
 
 
+class LimitTests(unittest.TestCase):
+    """`--limit` names how many listings to scan: a value the run cannot honour is a usage error, not a
+    silently shorter (or reassigned) census."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.disasm = os.path.join(self.tmp, "disasm")
+        os.mkdir(self.disasm)
+        write_listing(self.tmp, "ps_table32", LISTINGS["ps_table32"])
+        write_listing(self.tmp, "ps_ptr64", LISTINGS["ps_ptr64"])
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_main(self, argv):
+        stderr, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                stdout, sys.stdout = sys.stdout, io.StringIO()
+                try:
+                    return P.main(argv)
+                finally:
+                    sys.stdout = stdout
+        finally:
+            sys.stderr = stderr
+
+    def test_zero_and_negative_limits_are_refused(self):
+        for bad in ("0", "-1", "-2"):
+            with self.assertRaises(SystemExit, msg=bad) as raised:
+                self.run_main([self.disasm, "--jobs", "1", "--limit", bad])
+            self.assertEqual(raised.exception.code, 2, bad)
+
+
 if __name__ == "__main__":
     unittest.main()
