@@ -3919,6 +3919,15 @@ private:
         if (graphics_.depth_bias_dynamic && !graphics_.depth_bias24_dynamic)
             dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
         if (!r.bindings.empty()) dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+        // A mesh pipeline takes neither the topology nor the strides as dynamic state
+        // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066), so it has its own list, filled in the
+        // mesh branch below; depth bias joins both lists alike. Both arrays are alive at the vkCreateGraphicsPipelines
+        // call at the end of build(), which reads them there.
+        static constexpr VkDynamicState mesh_fixed_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        VkDynamicState mesh_states[std::size(mesh_fixed_states) + 1] = {};  // + depth bias
+        std::uint32_t mesh_count = 0;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
             if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
@@ -3960,17 +3969,8 @@ private:
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
-        // A mesh pipeline takes neither the topology nor the strides as dynamic state
-        // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066). Depth bias joins its list as it
-        // does a vertex pipeline's.
-        static constexpr VkDynamicState mesh_fixed_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
-                                                                 VK_DYNAMIC_STATE_SCISSOR,
-                                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         if (r.mesh) {
-            VkDynamicState mesh_states[std::size(mesh_fixed_states) + 1] = {};  // + depth bias
-            std::uint32_t mesh_count = 0;
             for (const VkDynamicState state : mesh_fixed_states) mesh_states[mesh_count++] = state;
             if (graphics_.depth_bias_dynamic && !graphics_.depth_bias24_dynamic)
                 mesh_states[mesh_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
