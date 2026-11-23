@@ -1268,6 +1268,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         off21 = w1 & 0x1FFFFF
         soff = (w1 >> 25) & 0x7F
         entry = T.SMEM.get(opc)
+        if entry is None and mcpu.startswith("gfx101"):
+            entry = T.SMEM_GFX101.get(opc)
         if entry is None:
             return None, 4
         name, spec = entry
@@ -1278,6 +1280,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             w = _width(nr, wave32)
             if fn == "SDATA":
                 args.append(_sreg(sdata, w))
+            elif fn == "PROBE":  # s_atc_probe*: the SDATA field is a 7-bit immediate (the probe mode)
+                args.append({"k": "imm", "v": sdata})
             elif fn == "SBASE":
                 args.append(_sreg(sbase, w))
             elif fn in ("OFFSET", "SOFFSET"):
