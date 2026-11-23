@@ -93,6 +93,10 @@ struct Mock {
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
+    std::uint64_t fence_value = kCompletedValue;  // fence: GetCompletedValue (slot 8), moved by Signal (10)
+    HANDLE armed_event = nullptr;                 // fence: the event SetEventOnCompletion (9) registered
+    std::uint64_t armed_value = 0;                // fence: its threshold
+    SRWLOCK lock = SRWLOCK_INIT;                  // fence: orders the value and the armed event
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -113,6 +117,7 @@ Mock* new_mock(Kind kind) {
     std::memset(m, 0, sizeof(*m));
     m->vtable = mock_vtable();
     m->kind = kind;
+    m->fence_value = kCompletedValue;
     return m;
 }
 
@@ -253,7 +258,32 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         }
         return S_OK;
     }
-    if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::fence && slot >= 8 && slot <= 10) {
+        if (slot == 8) {  // GetCompletedValue
+            AcquireSRWLockExclusive(&m->lock);
+            const std::uint64_t value = m->fence_value;
+            ReleaseSRWLockExclusive(&m->lock);
+            return value;
+        }
+        if (slot == 9) {  // SetEventOnCompletion(value, event)
+            AcquireSRWLockExclusive(&m->lock);
+            m->armed_value = a1;
+            m->armed_event = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(a2));
+            const bool reached = m->armed_event && m->fence_value >= a1;
+            HANDLE event = m->armed_event;
+            ReleaseSRWLockExclusive(&m->lock);
+            if (reached) SetEvent(event);
+            return S_OK;
+        }
+        // Slot 10: Signal(value), from the CPU. A threshold at or below it is released.
+        AcquireSRWLockExclusive(&m->lock);
+        m->fence_value = a1;
+        const bool reached = m->armed_event && m->fence_value >= m->armed_value;
+        HANDLE event = m->armed_event;
+        ReleaseSRWLockExclusive(&m->lock);
+        if (reached) SetEvent(event);
+        return S_OK;
+    }
     if (m->kind == Kind::heap && slot == 9) {
         if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
         return kMockHeapCpuStart;
@@ -415,6 +445,20 @@ void* make_fence(void* device, const IID& iid = kFenceIid) {
     void* fence = nullptr;
     return SUCCEEDED(hr_of(raw(device, 36, 0, 0, word(&iid), word(&fence)))) ? fence : nullptr;
 }
+
+// Moves a mock fence's completed value the way a producer outside the proxy does: its own slot 10.
+void fence_signal(Mock* fence, std::uint64_t value) { raw(fence, 10, value); }
+
+std::uint64_t fence_completed(Mock* fence) { return raw(fence, 8); }
+
+bool fence_armed_for(Mock* fence, std::uint64_t value) {
+    AcquireSRWLockExclusive(&fence->lock);
+    const bool armed = fence->armed_event && fence->armed_value == value;
+    ReleaseSRWLockExclusive(&fence->lock);
+    return armed;
+}
+
+bool reads_within(const volatile std::uint64_t* completed, std::uint64_t value) { return *completed == value; }
 
 unsigned long release(void* object) {
     return static_cast<unsigned long>(raw(object, 2));
@@ -592,6 +636,62 @@ int check_fence1() {
     }
     std::printf("%s: fences without and with ID3D12Fence1: 11/12 slots, QueryInterface, slot 11 and creation as "
                 "Fence1 refused or forwarded to match\n", g_label);
+    return 0;
+}
+
+// ---- 2b. Fence slot 12: the address of a live completed value ----
+
+int check_fence_completed_value() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const unsigned long device_refs = xs::device_proxy_ref_count(device);
+    void* fence = make_fence(device);
+    Mock* const fence_mock = mock->last_child;
+    EXPECT(fence && fence_mock);
+
+    volatile std::uint64_t* completed = reinterpret_cast<volatile std::uint64_t*>(
+        raw(fence, 12, 4, 0x1234, 0x5678));
+    EXPECT(completed && reads_within(completed, kCompletedValue));
+    EXPECT(raw(fence, 12, 0, 0, 0) == reinterpret_cast<std::uint64_t>(completed));  // one mirror per fence
+    EXPECT(fence_mock->calls[12] == 0);  // the real fence's own slot 12 is never asked (it has none)
+
+    // A CPU Signal through the proxy refreshes the mirror before the title can read it.
+    EXPECT(hr_of(raw(fence, 10, 40)) == S_OK && reads_within(completed, 40));
+    // Wait for the wait thread to arm its next threshold before rewinding.
+    const ULONGLONG until = GetTickCount64() + 1000;
+    while (!fence_armed_for(fence_mock, 41) && GetTickCount64() < until) Sleep(1);
+    EXPECT(fence_armed_for(fence_mock, 41));
+    EXPECT(hr_of(raw(fence, 10, 3)) == S_OK && reads_within(completed, 3));
+    fence_signal(fence_mock, 15);
+    EXPECT(fence_completed(fence_mock) == 15);
+    EXPECT(raw(fence, 12) == reinterpret_cast<std::uint64_t>(completed));
+    if (!reads_within(completed, 15)) {
+        std::fprintf(stderr, "rewind: underlying fence %llu, slot 12 mirror %llu\n",
+                     static_cast<unsigned long long>(fence_completed(fence_mock)),
+                     static_cast<unsigned long long>(*completed));
+        return 1;
+    }
+    // A rewind by a producer outside the proxy can go straight below its outstanding event.
+    fence_signal(fence_mock, 2);
+    EXPECT(raw(fence, 12) == reinterpret_cast<std::uint64_t>(completed) && reads_within(completed, 2));
+    fence_signal(fence_mock, 7);
+    EXPECT(raw(fence, 12) == reinterpret_cast<std::uint64_t>(completed) && reads_within(completed, 7));
+    // The timeout refresh leaves the pending completion event alone.
+    EXPECT(fence_armed_for(fence_mock, 41));
+    fence_signal(fence_mock, 45);
+    const ULONGLONG until45 = GetTickCount64() + 1000;
+    while (!reads_within(completed, 45) && GetTickCount64() < until45) Sleep(1);
+    EXPECT(reads_within(completed, 45));
+    // Device removal: the real fence reports ~0, which the title tests for, and nothing is armed after it.
+    fence_signal(fence_mock, ~std::uint64_t{0});
+    EXPECT(raw(fence, 12) == reinterpret_cast<std::uint64_t>(completed) &&
+           reads_within(completed, ~std::uint64_t{0}));
+    EXPECT(release(fence) == 0 && fence_mock->refs == 0);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: fence slot 12 returns one live completed-value address per fence: CPU Signal, an outside "
+                "rewind below the armed event, and device removal all show without another registration\n", g_label);
     return 0;
 }
 
@@ -1215,7 +1315,11 @@ int check_tail(bool want_guarded) {
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
-    for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    // Fence slot 12 is the served exception (the live completed value); 13 and past it are refused.
+    const std::uint64_t completed = raw(fence, 12);
+    EXPECT(completed && *reinterpret_cast<volatile const std::uint64_t*>(completed) == kCompletedValue);
+    for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot)
+        EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
@@ -1475,9 +1579,9 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() ||
-        check_open_shared() || check_alloc_failures() || check_allocators() || check_xbox_slots() ||
-        check_custom_heap_properties() || check_placed_resource_x() || check_view_heap_cap() ||
+    if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_fence_completed_value() ||
+        check_create_failures() || check_open_shared() || check_alloc_failures() || check_allocators() ||
+        check_xbox_slots() || check_custom_heap_properties() || check_placed_resource_x() || check_view_heap_cap() ||
         check_descriptor_heap_hooks())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

@@ -71,7 +71,10 @@
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
 // in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
-// first four argument words and refused with E_NOTIMPL. Queue slot 32 is PresentX in the retail executable: it goes
+// first four argument words and refused with E_NOTIMPL. Fence slot 12 is the served exception: the retail executable
+// calls it as (value, descriptor, flags) and reads the return as a pointer to the fence's completed value, so the
+// proxy returns a live per-fence mirror (see the section in d3d12_xs_device.cpp). Queue slot 32 is PresentX in the
+// retail executable: it goes
 // to the real presenter when one is registered, else to the opt-in capture when LEONIDA_PRESENTX_SLOT/_CAPTURE names
 // it, else it is refused like any other tail slot (slot 30 can be named as the alternate). A slot past the table
 // faults on the vtable read inside a reserved, never-committed region, and the
