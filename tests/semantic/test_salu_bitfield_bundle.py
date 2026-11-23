@@ -163,5 +163,20 @@ class TestSBfeU32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 1)
 
 
+class TestSBfeU32Bounds(unittest.TestCase):
+    """Bitfield boundary and status flag handling for s_bfe_u32."""
+
+    def test_width_clamping_to_word_edge(self):
+        # offset 28, width 10 -> clamped to 4 bits
+        val, scc = ref_bfe_u32(0xF0000000, 28 | (10 << 16))
+        self.assertEqual(val, 0xF)
+        self.assertEqual(scc, 1)
+
+    def test_offset_at_edge(self):
+        val, scc = ref_bfe_u32(0x80000000, 31 | (1 << 16))
+        self.assertEqual(val, 1)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
