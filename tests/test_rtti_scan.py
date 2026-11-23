@@ -683,6 +683,24 @@ class RttiScanCoreTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("ERROR:", p.stderr)
 
+    def test_main_uses_same_report_path_for_folding_alias(self):
+        import contextlib
+        import io
+        from unittest import mock
+        img_path = os.path.join(self.tmp.name, "sample.exe")
+        with open(img_path, "wb") as f:
+            f.write(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))
+        alias = os.path.join(self.tmp.name, "alias.json")
+        err = io.StringIO()
+        with mock.patch.object(rtti_scan, "same_report_path", return_value=True) as mocked, \
+                mock.patch.object(sys, "argv", ["rtti_scan.py", img_path, "--out", alias]), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                rtti_scan.main()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("output must not overwrite the source image", err.getvalue())
+        mocked.assert_called_once_with(img_path, alias)
+
 
 if __name__ == "__main__":
     unittest.main()
