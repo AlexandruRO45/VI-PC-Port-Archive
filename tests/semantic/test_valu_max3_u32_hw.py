@@ -111,5 +111,78 @@ class TestValuMax3U32ReferenceOracle(unittest.TestCase):
         self.assertEqual(oracle_max3_u32(c, a, b), m)
         self.assertEqual(oracle_max3_u32(c, b, a), m)
 
+# ---------------------------------------------------------------------------
+# Stage 2: Symbolic AST definitions and typed expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    VGPR = enum.auto()
+    SGPR = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR and not (0 <= self.index < 256):
+            raise ValueError(f"VGPR index out of range: {self.index}")
+        if self.kind == RegKind.SGPR and not (0 <= self.index < 106):
+            raise ValueError(f"SGPR index out of range: {self.index}")
+
+    def __str__(self) -> str:
+        if self.name:
+            return self.name
+        if self.kind == RegKind.VGPR:
+            return f"v{self.index}"
+        return f"s{self.index}"
+
+
+class Opcode(enum.Enum):
+    V_MAX3_U32 = "v_max3_u32"
+
+
+@dataclasses.dataclass(frozen=True)
+class VOP3Instruction:
+    opcode: Opcode
+    vdst: Register
+    src0: Register | int
+    src1: Register | int
+    src2: Register | int
+
+    def __post_init__(self) -> None:
+        if self.vdst.kind != RegKind.VGPR:
+            raise ValueError(f"Destination vdst must be VGPR, got {self.vdst.kind}")
+
+
+class TestValuMax3U32ASTDefinitions(unittest.TestCase):
+    """Stage 2: Symbolic AST definitions and typed expressions for v_max3_u32."""
+
+    def test_ast_construction_and_formatting(self) -> None:
+        vdst = Register(RegKind.VGPR, 0)
+        src0 = Register(RegKind.VGPR, 1)
+        src1 = Register(RegKind.VGPR, 2)
+        src2 = Register(RegKind.VGPR, 3)
+        inst = VOP3Instruction(Opcode.V_MAX3_U32, vdst, src0, src1, src2)
+
+        self.assertEqual(inst.opcode, Opcode.V_MAX3_U32)
+        self.assertEqual(str(inst.vdst), "v0")
+        self.assertEqual(str(inst.src0), "v1")
+        self.assertEqual(str(inst.src1), "v2")
+        self.assertEqual(str(inst.src2), "v3")
+
+    def test_ast_with_literal_and_sgpr(self) -> None:
+        vdst = Register(RegKind.VGPR, 4)
+        src0 = Register(RegKind.SGPR, 2)
+        src1 = Register(RegKind.VGPR, 5)
+        inst = VOP3Instruction(Opcode.V_MAX3_U32, vdst, src0, src1, 42)
+
+        self.assertEqual(str(inst.vdst), "v4")
+        self.assertEqual(str(inst.src0), "s2")
+        self.assertEqual(str(inst.src1), "v5")
+        self.assertEqual(inst.src2, 42)
+
 if __name__ == "__main__":
     unittest.main()
