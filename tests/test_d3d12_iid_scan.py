@@ -181,17 +181,17 @@ class IidScan(unittest.TestCase):
     def test_truncated_file_rva_past_eof_keeps_prior_imports(self):
         # Two d3d12_xs.dll descriptors in one section whose header declares SizeOfRawData = VirtualSize = 0x400,
         # but the file is truncated at sect_raw + 0x100. Descriptor 1's thunks live before EOF; descriptor 2's
-        # lookup RVA maps inside the section header bounds but past len(data), so offset() must return None
-        # rather than letting struct.unpack_from raise and discard descriptor 1's imports.
+        # lookup RVA maps to sect_raw + 0x100 (exactly len(data), inside the declared section bounds), so offset()
+        # must return None rather than letting struct.unpack_from raise and discard descriptor 1's imports.
         sect_rva, sect_raw, declared_size = 0x1000, 0x200, 0x400
         body = bytearray(0x100)
         # Descriptor table at +0x00 (2 descriptors + null terminator = 60 bytes):
         #   name "d3d12_xs.dll\0" at +0x40, descriptor 1 thunks at +0x60 (ordinal #80 + 0),
-        #   descriptor 2 lookup RVA at sect_rva + 0x300 (inside declared_size, past len(body)).
+        #   descriptor 2 lookup RVA at sect_rva + 0x100 (exact EOF boundary, inside declared_size).
         body[0x40:0x40 + 13] = b"d3d12_xs.dll\0"
         struct.pack_into("<QQ", body, 0x60, (1 << 63) | 80, 0)
         struct.pack_into("<IIIII", body, 0, sect_rva + 0x60, 0, 0, sect_rva + 0x40, sect_rva + 0x60)
-        struct.pack_into("<IIIII", body, 20, sect_rva + 0x300, 0, 0, sect_rva + 0x40, sect_rva + 0x300)
+        struct.pack_into("<IIIII", body, 20, sect_rva + 0x100, 0, 0, sect_rva + 0x40, sect_rva + 0x100)
 
         pe, opt_size = 0x80, 240
         hdr = bytearray(sect_raw)
