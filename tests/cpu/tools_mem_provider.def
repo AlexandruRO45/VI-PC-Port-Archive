@@ -1,0 +1,4 @@
+LIBRARY xmem
+EXPORTS
+    XMemIsToolsMemAvailable
+    tools_mem_calls

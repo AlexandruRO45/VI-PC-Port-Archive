@@ -1,0 +1,4 @@
+; Negative control: the same provider without the XMemIsToolsMemAvailable export.
+LIBRARY xmem
+EXPORTS
+    tools_mem_calls

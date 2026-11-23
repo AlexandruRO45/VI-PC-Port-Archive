@@ -1486,6 +1486,29 @@ cmake --build --preset dev --target pe_map cpu_exe_start_original cpu_exe_start_
 ctest --preset dev --no-tests=error -R '^cpu_native_exe_start$' -V
 ```
 
+### XMemIsToolsMemAvailable answers and the caller's branch
+
+`cpu_tools_mem_caller` is a source-built EXE without a C runtime ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)). It imports `xmem.dll!XMemIsToolsMemAvailable` by name and starts through `native_startup`, like `cpu_exe_start_original`. Here `xmem.dll` is a test-only recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)), not the desktop shim. It returns the BOOL chosen by `TOOLS_MEM_RESULT` and appends one `query <n> <result>` line per call to the file named by `TOOLS_MEM_RECORD`. The caller calls three times and requires the same answer each time (0 or 1). It then records its branch as the exit code: `0x7100` for FALSE (continue without tools memory) and `0x7101` for TRUE. A failed step gives `0xF00` plus the step number. The signature `BOOL XMemIsToolsMemAvailable(void)` is an assumption, and the caller passes no arguments.
+
+`cpu_native_xmem_tools_mem_caller` checks the import table with `pefile` and then runs each case under the Windows loader and under `pe_map_image` and `pe_map_run` in a child process. Both loaders must give the same exit code and the same record, and the mapped resolver must request exactly `xmem.dll!XMemIsToolsMemAvailable` and `cpu_exe_io.dll!finish_exe`:
+
+| Provider answer | Exit, Windows and `pe_map` | Record |
+| --- | --- | --- |
+| FALSE: desktop without a tools partition (proposed desktop policy) | `0x7100` | three calls, each 0 |
+| TRUE | `0x7101` | three calls, each 1 |
+| Control: answer alternates FALSE, TRUE | `0xf02` | calls 1 and 2 |
+| Control: `TOOLS_MEM_RESULT` unset, provider returns 2 | `0xf01` | call 1 |
+| Control: provider without the export | `0xc0000139` / `unresolved import xmem.dll!XMemIsToolsMemAvailable` | none, entry not reached |
+
+Swapping the answer changes the recorded branch under both loaders. As a one-off manual check (not in CI), removing the caller's comparison after the second call made the test fail with the alternating provider: both loaders exited `0x7100` instead of `0xf02`.
+
+FALSE for a desktop without a tools partition is proposed desktop policy. It follows the public reimplementation cited on [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870), which checks a console mode before its tools-partition lookup. This fixture does not settle the console ordering, does not change the desktop `xmem.dll`, and does not show that any real startup caller continues on FALSE. Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`.
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_tools_mem_caller cpu_tools_mem_provider cpu_tools_mem_provider_missing cpu_exe_io
+ctest --preset dev --no-tests=error -R '^cpu_native_xmem_tools_mem_caller$' -V
+```
+
 ### Starting an EXE with two DLLs
 
 `cpu_startup_exe` and two DLLs, all built without a C runtime, import each other in a known order. `cpu_startup_a` has no fixture DLL dependencies and keeps an event log and a value set by its initializer (`7`). `cpu_startup_b` imports `cpu_startup_a`, and its initializer publishes `a_value() * 2`, so it reads zero if it runs first. The EXE imports both. These initializers are the DLLs' `DLL_PROCESS_ATTACH` entry points, called by the loader, not C++ static constructors. The EXE's TLS callback logs `t` and its entry point logs `e`. The entry point then runs two worker threads one after the other and joins each with a 10 s limit. A's TLS callback allocates an explicit kernel32 `TlsAlloc` slot and sets `1` on the main thread. The workers set `2` and `3` in their respective copies of the slot. Both images use empty static TLS data templates. The entry point writes the event log and the callback trace to standard output and returns `b_value() | first worker << 8 | second worker << 16 | main << 24` as its exit code.

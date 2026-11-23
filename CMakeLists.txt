@@ -2869,6 +2869,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_exe_worker_alive_original>"
         "$<TARGET_FILE:cpu_exe_worker_alive_returning>"
         "$<TARGET_FILE:cpu_exe_worker_alive_no_worker>")
+    # XMemIsToolsMemAvailable caller and recording provider (#870). The provider is a test-only xmem.dll in
+    # its own folder, not the desktop shim; the _missing variant lacks the export (negative control).
+    foreach(provider IN ITEMS provider provider_missing)
+        add_library(cpu_tools_mem_${provider} SHARED tests/cpu/tools_mem_provider.cpp
+            tests/cpu/tools_mem_${provider}.def)
+        set_target_properties(cpu_tools_mem_${provider} PROPERTIES OUTPUT_NAME xmem
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools_mem_${provider}"
+            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools_mem_${provider}"
+            PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools_mem_${provider}")
+    endforeach()
+    add_executable(cpu_tools_mem_caller tests/cpu/tools_mem_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_tools_mem_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_tools_mem_caller PRIVATE /ENTRY:native_startup
+        /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_libraries(cpu_tools_mem_caller PRIVATE cpu_tools_mem_provider cpu_exe_io)
+    add_test(NAME cpu_native_xmem_tools_mem_caller COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/tools_mem_caller_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_tools_mem_caller>" "$<TARGET_FILE:cpu_tools_mem_provider>"
+        "$<TARGET_FILE:cpu_tools_mem_provider_missing>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xmem_tools_mem_caller PROPERTIES TIMEOUT 120)
     # Two CRT-free DLLs and an EXE: A has no imports, B imports A, the EXE imports both.
     foreach(dll IN ITEMS a a_alt b b_noinit)
         string(REGEX REPLACE "_(noinit|alt)$" "" source "${dll}")
