@@ -1,4 +1,4 @@
-"""No two neighbouring prose lines in the Markdown docs start the same way.
+"""No two neighbouring prose lines, and no neighbouring block of lines, repeat in the Markdown docs.
 
     python -I tests/test_docs_repeated_lines.py
 
@@ -8,7 +8,9 @@ had "the one left needs `buffer_store_short`" twice, docs/animation.md gave both
 export, docs/models.md said its test file runs 10 and 15 tests). A reader cannot tell which line is current.
 `tests/test_docs_list_items.py` does this for list items and `tests/test_docs_table_rows.py` for table rows; this
 flags two prose lines (neither a list item, table row, heading or code) within WINDOW lines of each other whose first
-OPENING characters are equal. Reads tracked Markdown only; no game files.
+OPENING characters are equal. The same merge habit also pastes a whole section twice, heading, table and code
+included, which the line check cannot see; `repeated_blocks` catches that one: a block of BLOCK lines or more that is
+immediately followed by a copy of itself. Reads tracked Markdown only; no game files.
 """
 import os
 import re
@@ -18,6 +20,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WINDOW = 3     # lines between the two (1 = neighbours)
 OPENING = 40   # characters, after the indentation, that must match
+BLOCK = 6      # lines, for a block pasted twice in a row
 LIST_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])\s")
 
 
@@ -35,6 +38,32 @@ def repeated_lines(text):
         if key in seen and n - seen[key] <= WINDOW:
             found.append((seen[key], n))
         seen[key] = n
+    return found
+
+
+def repeated_blocks(text, min_lines=BLOCK):
+    """[(first line, second line, length)] for a block of lines immediately followed by a copy of itself."""
+    lines = text.split("\n")
+    where = {}
+    for index, line in enumerate(lines):
+        where.setdefault(line, []).append(index)
+    found = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        for j in where[line]:
+            if j - i < min_lines:
+                continue
+            length = 0
+            while j + length < len(lines) and lines[i + length] == lines[j + length]:
+                length += 1
+            if length < j - i:      # the block is not followed by a full copy of itself
+                continue
+            length = j - i
+            while length and not lines[i + length - 1].strip():   # a copied section ends with its blank line
+                length -= 1
+            found.append((i + 1, j + 1, length))
+            break
     return found
 
 
@@ -68,6 +97,21 @@ class RepeatedLines(unittest.TestCase):
             with open(os.path.join(ROOT, path), encoding="utf-8") as f:
                 found += [f"{path}:{a} and :{b}" for a, b in repeated_lines(f.read())]
         self.assertEqual(found, [], "a line repeated just below itself (keep the current one): " + "; ".join(found))
+
+    def test_block_checker_flags_a_repeated_block_only(self):
+        block = ["First line of the block.", "", "Third line.", "Fourth line.", "Fifth line.", "Sixth line."]
+        self.assertEqual(repeated_blocks("\n".join(["intro", ""] + block + block + ["", "outro"])), [(3, 9, 6)])
+        short = ["one.", "two.", "three.", "four.", "five."]
+        self.assertEqual(repeated_blocks("\n".join(short + short)), [], "under BLOCK lines")
+        self.assertEqual(repeated_blocks("\n".join(block + ["between"] + block)), [], "not pasted next to itself")
+
+    def test_docs_have_no_repeated_neighbouring_blocks(self):
+        found = []
+        for path in markdown_files():
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                found += [f"{path}:{a}-{a + n - 1} repeated at :{b}-{b + n - 1} ({n} lines)"
+                          for a, b, n in repeated_blocks(f.read())]
+        self.assertEqual(found, [], "a block pasted just below itself (keep the current one): " + "; ".join(found))
 
 
 if __name__ == "__main__":
