@@ -89,6 +89,23 @@ class ModuleTimeoutTest(unittest.TestCase):
         self.assertEqual(r.stdout.count("MODULE TIMEOUT"), 1, r.stdout)
         self.assertEqual(inflight.read_text(), HANGER + "\tpipeline\n")
 
+    def test_a_cache_save_that_never_finishes_does_not_stop_the_exit(self):
+        # A driver can hold the cache's lock for the whole of a hung compile (MoltenVK does), so the checkpoint before
+        # the exit may never return; the exit must not wait for it, and the old cache file must stay as it was.
+        cache = self.path("held.cache")
+        cache.write_bytes(b"previous checkpoint")
+        inflight = self.path("held_inflight.txt")
+        env_args = ["--module-timeout", "2", "--inflight-file", str(inflight)]
+        env = dict(os.environ, VK_PIPELINE_CHECK_SIMULATE_CRASH=HANGER + ":HANG",
+                   VK_PIPELINE_CHECK_SIMULATE_SAVE_HANG="1")
+        r = subprocess.run([str(self.exe), str(self.dir), str(cache), "--jobs", "2"] + env_args, env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("MODULE TIMEOUT %s" % HANGER, r.stdout)
+        self.assertIn("the last saved checkpoint is kept", r.stderr)
+        self.assertEqual(cache.read_bytes(), b"previous checkpoint")
+        self.assertEqual(inflight.read_text(), HANGER + "\tpipeline\n")
+
     def test_without_a_timeout_nothing_changes(self):
         r = self.run_tool(["--module-timeout", "60"])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

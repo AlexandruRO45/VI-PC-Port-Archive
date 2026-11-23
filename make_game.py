@@ -1815,10 +1815,12 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
-    if checker_supports(exe, "--module-timeout"):
-        # A compile the driver never finishes (Apple's Metal compiler on some compute modules) would otherwise stop
-        # the stage for good: the checker gives up on it and exits PIPELINE_TIMEOUT_EXIT, and it is skipped below.
-        base += ["--module-timeout", str(PIPELINE_MODULE_TIMEOUT)]
+    # A compile the driver never finishes (Apple's Metal compiler on some compute modules) would otherwise stop the
+    # stage for good: the checker gives up on it and exits PIPELINE_TIMEOUT_EXIT, and it is skipped below. The
+    # single-module probes after a crash get the same limit.
+    timeout = PIPELINE_MODULE_TIMEOUT if checker_supports(exe, "--module-timeout") else None
+    if timeout:
+        base += ["--module-timeout", str(timeout)]
     # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
@@ -1835,10 +1837,18 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         with open(skip, "w", encoding="utf-8", newline="\n") as f:
             f.write("".join(n + (f"\t{why_skipped[n]}" if n in why_skipped else "") + "\n" for n in crashed))
 
+    def skip_timed_out(found: "list[str]") -> None:
+        for n in found:
+            log(f"pipelines: {n} was still compiling after {timeout} s (the driver hangs on it); checking the rest "
+                "without it")
+        if found:
+            skip_modules(found, f"did not finish within {timeout} s in an earlier run")
+
     def check_range(start: int = 0, count: "int | None" = None) -> int:
         selection = ["--start", str(start), "--count", str(count)] if count is not None else []
         allowed = set(names[start:start + count]) if count is not None else None
-        for _ in range(PIPELINE_CRASH_RETRIES + 1):
+        crash_runs = 0   # a timeout names new modules every time, so only crashes count against the retries
+        while crash_runs <= PIPELINE_CRASH_RETRIES:
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
             code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
             # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
@@ -1848,22 +1858,22 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                      "and report-file access in the output above")
             if code in (0, 1, 2) or interrupted(code):
                 return code
-            if code == PIPELINE_TIMEOUT_EXIT:
+            if timeout and code == PIPELINE_TIMEOUT_EXIT:
                 # The checker names only the modules it gave up on; compiling one alone again would hang again.
                 timed_out = list(dict.fromkeys(n for n in read_names(inflight)
                                                if n not in crashed and (allowed is None or n in allowed)))
                 if not timed_out:
                     fail("vk_pipeline_check gave up on a compile but named no module; report it")
-                for n in timed_out:
-                    log(f"pipelines: {n} was still compiling after {PIPELINE_MODULE_TIMEOUT} s (the driver hangs on "
-                        "it); checking the rest without it")
-                skip_modules(timed_out, f"did not finish within {PIPELINE_MODULE_TIMEOUT} s in an earlier run")
+                skip_timed_out(timed_out)
                 continue
+            crash_runs += 1
             suspects = list(dict.fromkeys(n for n in read_names(inflight)
                                           if n not in crashed and (allowed is None or n in allowed)))
             # Even the last in-flight module can be innocent after other heavy compiles in the batch.
             if count is not None or len(suspects) > 1:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
+                probed = {n: alone(exe, spirv, cache, n, inflight, timeout) for n in suspects}
+                skip_timed_out([n for n, what in probed.items() if what == "timeout"])
+                suspects = [n for n, what in probed.items() if what == "crash"]
             if not suspects:
                 if count is not None and count > 1:
                     # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
@@ -1962,22 +1972,29 @@ def pipeline_names(spirv: str) -> "list[str]":
     return sorted(index, key=lambda n: n.encode("utf-8"))
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
-    """Whether one module takes vk_pipeline_check down on its own, using its global index position."""
+def alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None,
+          timeout: int | None = None) -> str:
+    """What one module does to vk_pipeline_check on its own, using its global index position: "crash" when it takes
+    the checker down, "timeout" when --module-timeout gave up on it (a hang), "" otherwise."""
     names = pipeline_names(spirv)
     if name not in names:
-        return False
+        return ""
     args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
     if inflight:
         drop(inflight)
         args += ["--inflight-file", inflight]
+    if timeout:
+        args += ["--module-timeout", str(timeout)]   # a probe of a module that hangs must not wait forever either
     code = run(args, check=False)
     if code == 1 and inflight and not os.path.isfile(inflight):
         fail(f"pipelines: checking {name} alone exited with 1 before writing its work report; "
              "check Vulkan initialization and report-file access in the output above")
     if interrupted(code) or code == 2:
         fail(f"pipelines: checking {name} alone stopped with {exit_label(code)}")
-    return code not in (0, 1, 2) and not interrupted(code)
+    if timeout and code == PIPELINE_TIMEOUT_EXIT:
+        return "timeout"
+    return "crash" if code not in (0, 1, 2) and not interrupted(code) else ""
+
 
 
 def path_is_within(path: str, directory: str) -> bool:

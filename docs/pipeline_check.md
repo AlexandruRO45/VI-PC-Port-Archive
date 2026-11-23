@@ -37,7 +37,7 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
 | `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
 | `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. A line may add a TAB and the reason to print (default: "killed the driver in an earlier run"). |
-| `--module-timeout SEC` | Give up on a module that has been in the driver (shader module or pipeline creation) for more than SEC seconds; default 0, wait forever. A hung compile can't be cancelled, so the watchdog saves the cache, leaves only the timed-out modules in `--inflight-file`, prints `MODULE TIMEOUT` and exits with status 3. Not with `--isolate`. |
+| `--module-timeout SEC` | Give up on a module that has been in the driver (shader module or pipeline creation) for more than SEC seconds; default 0, wait forever. A hung compile can't be cancelled, so a thread that never enters the driver leaves only the timed-out modules in `--inflight-file`, prints `MODULE TIMEOUT`, saves the cache if the driver lets go of it within min(SEC, 60) s (otherwise the last checkpoint stays) and exits with status 3. Not with `--isolate`. |
 
 `--isolate-child` is internal to the parent/child protocol and is not meant to be passed directly. A module with a missing partner stub is skipped; without `--isolate`, a driver crash ends the run.
 
@@ -252,7 +252,13 @@ A compile that never returns (Apple's Metal compiler on some compute modules, BU
 batch forever. `make_game.py` passes `--module-timeout 1800` to a checker that has it; exit 3 names the modules it
 gave up on, and those go straight into the skip file with the reason "did not finish within 1800 s in an earlier run"
 and count as failed. They are not compiled alone again first, as a crash's suspects are, because a hang would just
-repeat. The slowest compiles that do finish are minutes (457 s for a `--f64-soft` compute shader on an Apple M2 Max).
+repeat. The single-module probes after a crash get the same limit, and a probe that times out marks its module as
+timed out, not as a crasher. Timeouts don't count against the crash retries: each one names a module not yet
+skipped. The slowest compiles that do finish are minutes (457 s for a `--f64-soft` compute shader on an Apple M2 Max).
+
+The deadline runs on its own thread, which never calls into the driver: MoltenVK holds the pipeline cache's lock
+while it compiles, so the watchdog's 10-minute checkpoint (`vkGetPipelineCacheData`) can wait for as long as a hung
+compile does.
 `tests/test_vk_pipeline_check_timeout.py` checks the checker side with the `HANG` test hook.
 
 `tests/test_make_game_pipeline_batches.py` runs the real build-stage orchestration against scripted child processes:

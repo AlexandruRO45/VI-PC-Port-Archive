@@ -45,12 +45,15 @@
 //                 may add a TAB and the reason to print (default: "killed the driver in an earlier run").
 //   --module-timeout SEC  give up on a module that has been in the driver (shader module or pipeline creation) for
 //                 more than SEC seconds (default 0: wait forever). A compile that never returns can't be cancelled, so
-//                 the watchdog saves the cache, leaves only the timed-out modules in --inflight-file, prints MODULE
-//                 TIMEOUT and ends the process with exit status 3; make_game.py then skips them like a crash. Not
-//                 with --isolate.
+//                 a thread that never enters the driver leaves only the timed-out modules in --inflight-file, prints
+//                 MODULE TIMEOUT, saves the cache if the driver lets go of it within min(SEC, 60) s (else the last
+//                 checkpoint stays) and ends the process with exit status 3; make_game.py then skips them. Not with
+//                 --isolate.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] raises SIGNAL (default SIGFPE)
 //                 just before the pipeline of a matching module is created; SIGNAL HANG sleeps there instead, as a
 //                 compiler that never returns. For testing --isolate, --module-timeout and the pipelines stage's retry.
+//                 VK_PIPELINE_CHECK_SIMULATE_SAVE_HANG=1 makes every cache checkpoint (not the final save) wait
+//                 forever, as a driver that holds the cache during a hung compile does.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
@@ -77,6 +80,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <shared_mutex>
@@ -1227,8 +1231,16 @@ int main(int argc, char** argv) {
         }
     }
     std::vector<char>().swap(seed);  // the driver has copied the seed; it can be several GiB
+    // Test hook (see the header): VK_PIPELINE_CHECK_SIMULATE_SAVE_HANG=1 makes a checkpoint (not the final save) wait
+    // forever, as vkGetPipelineCacheData does while a driver holds the cache for a compile that never returns.
+    const bool simulate_save_hang = [] {
+        const char* v = std::getenv("VK_PIPELINE_CHECK_SIMULATE_SAVE_HANG");
+        return v && *v && std::string(v) != "0";
+    }();
     auto save_cache = [&](bool final_save) {
         if (cache_path.empty()) return true;
+        if (simulate_save_hang && !final_save)
+            for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
         try {
             const auto data = pipeline_cache_snapshot([&](size_t* size, void* dest) {
                 return vkGetPipelineCacheData(dev, cache, size, dest);
@@ -1720,27 +1732,6 @@ int main(int argc, char** argv) {
             if (watch_cv.wait_for(g, std::chrono::seconds(5), [&] { return all_done; })) break;
             const auto now = std::chrono::steady_clock::now();
             write_inflight();   // --inflight-file: the modules compiling right now
-            if (module_timeout > 0) {   // --module-timeout: a compile that never returns ends the process
-                std::string timed_out;
-                for (const auto& [tid, job] : inflight) {
-                    const double s = std::chrono::duration<double>(now - job.since).count();
-                    if (s <= module_timeout) continue;
-                    std::printf("MODULE TIMEOUT %s (%s still in the driver after %.0fs)\n", job.name.c_str(),
-                                job.phase, s);
-                    timed_out += job.name + '\t' + job.phase + '\n';
-                }
-                if (!timed_out.empty()) {
-                    // Only the timed-out modules: the others were still making progress.
-                    if (!inflight_path.empty())
-                        if (const auto error = write_pipeline_cache_file(inflight_path, timed_out.data(), timed_out.size()))
-                            std::fprintf(stderr, "in-flight snapshot save to %s failed: %s\n", inflight_path.c_str(),
-                                         error.message().c_str());
-                    g.unlock();
-                    save_cache(false);   // keep what finished; the hung compile can't be cancelled
-                    std::fflush(nullptr);
-                    std::_Exit(3);
-                }
-            }
             for (auto& [tid, job] : inflight) {
                 const double s = std::chrono::duration<double>(now - job.since).count();
                 if (s > 60 && int(s) % 60 < 5)
@@ -1756,6 +1747,45 @@ int main(int argc, char** argv) {
             }
         }
     });
+    // --module-timeout: its own thread, which never enters the driver. The watchdog's checkpoint calls
+    // vkGetPipelineCacheData, and a driver can hold the cache's lock for the whole of a compile that never returns
+    // (MoltenVK does), so a deadline kept there could itself wait forever.
+    std::condition_variable deadline_cv;
+    std::thread deadline;
+    if (module_timeout > 0) deadline = std::thread([&] {
+        std::unique_lock<std::mutex> g(mu);
+        while (!all_done) {
+            if (deadline_cv.wait_for(g, std::chrono::seconds(1), [&] { return all_done; })) break;
+            const auto now = std::chrono::steady_clock::now();
+            std::string timed_out;
+            for (const auto& [tid, job] : inflight) {
+                const double s = std::chrono::duration<double>(now - job.since).count();
+                if (s <= module_timeout) continue;
+                std::printf("MODULE TIMEOUT %s (%s still in the driver after %.0fs)\n", job.name.c_str(), job.phase, s);
+                timed_out += job.name + '\t' + job.phase + '\n';
+            }
+            if (timed_out.empty()) continue;
+            // Only the timed-out modules: the others were still making progress.
+            if (!inflight_path.empty())
+                if (const auto error = write_pipeline_cache_file(inflight_path, timed_out.data(), timed_out.size()))
+                    std::fprintf(stderr, "in-flight snapshot save to %s failed: %s\n", inflight_path.c_str(),
+                                 error.message().c_str());
+            g.unlock();
+            // Keep what finished if the driver lets go of the cache; it may not while the hung compile holds it, and
+            // the compile can't be cancelled. Cache files are replaced whole, so the last checkpoint stays if not.
+            auto saved = std::make_shared<std::atomic<bool>>(false);
+            std::thread([saved, &save_cache] { save_cache(false); *saved = true; }).detach();
+            const auto wait = std::chrono::duration<double>(std::min(60.0, module_timeout));
+            const auto until = std::chrono::steady_clock::now() + wait;
+            while (!*saved && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!*saved)
+                std::fprintf(stderr, "the pipeline cache checkpoint did not finish within %.0fs (the driver still "
+                                     "holds the cache); the last saved checkpoint is kept\n", wait.count());
+            std::fflush(nullptr);
+            std::_Exit(3);
+        }
+    });
     for (auto& t : pool) t.join();
     {
         std::lock_guard<std::mutex> g(mu);
@@ -1764,7 +1794,9 @@ int main(int argc, char** argv) {
         write_inflight();   // the pass finished: nothing was compiling when the process ended
     }
     watch_cv.notify_one();
+    deadline_cv.notify_one();
     watch.join();
+    if (deadline.joinable()) deadline.join();
 
     for (auto& [_, mod] : stub_cache) if (mod) vkDestroyShaderModule(dev, mod, nullptr);
 
