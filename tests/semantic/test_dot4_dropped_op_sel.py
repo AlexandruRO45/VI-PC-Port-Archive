@@ -77,6 +77,13 @@ class Dot4DroppedOpSelTest(unittest.TestCase):
         # op_sel:[0,1,0] op_sel_hi:[1,0,1]: pairs 0..1 of S1 from its high half (-2, -3), pairs 2..3 from the low one.
         self.assertEqual(result(self.translate("00 50 16 cc 01 05 0e 0c")), 1 * -2 + 2 * -3 + 3 * 2 + 4 * 3 + 100)
 
+    def test_op_sel_bit_order(self):
+        # op_sel:[1,0,0] (word 0 bit 11): an asymmetric select, so a reversed bit order reads it as op_sel:[0,0,1].
+        # S0's pairs 0..1 come from its high half (3, 4), and op_sel_hi[0] keeps pairs 2..3 there too.
+        stored, printed = bytes.fromhex("00 48 16 cc 01 05 0e 1c"), bytes.fromhex("00 40 16 cc 01 05 0e 1c")
+        self.assertEqual(rdna2spirv.dropped_op_sel(stored, printed, "v_dot4_i32_i8"), ([1, 0, 0], [1, 1, 1]))
+        self.assertEqual(result(self.translate("00 48 16 cc 01 05 0e 1c")), 3 * 2 + 4 * 3 + 3 * -2 + 4 * -3 + 100)
+
     def test_constant_s1_broadcast(self):
         # The form the FSPX programs store: S1 an inline constant with op_sel_hi[1] = 0, so both byte pairs come from
         # its low half. -6 reads as its 32-bit value 0xfffffffa (measured on gfx1036 for v_dot4_i32_i8, #3372): low half
@@ -143,6 +150,10 @@ class Dot4DroppedOpSelTest(unittest.TestCase):
         self.assertIsNone(rdna2spirv.dropped_op_sel(stored, printed, "v_dot2_i32_i16"))
         # A printed instruction that already carries non-default selects is LLVM's own reading: nothing to restore.
         self.assertIsNone(rdna2spirv.dropped_op_sel(printed, stored, "v_dot4_i32_i8"))
+        # The same with a stored word that isn't the default either (printed op_sel_hi:[1,0,1], stored [0,1,1]), so
+        # the "stored is the default" check can't answer for it.
+        self.assertIsNone(rdna2spirv.dropped_op_sel(bytes.fromhex("00 40 16 cc 01 05 0e 14"),
+                                                    bytes.fromhex("00 40 16 cc 01 05 0e 0c"), "v_dot4_i32_i8"))
 
 
 if __name__ == "__main__":
