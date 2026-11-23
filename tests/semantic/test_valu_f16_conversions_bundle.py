@@ -128,6 +128,29 @@ class TestVCvtF16F32SIMD(unittest.TestCase):
         # Smallest positive subnormal is 2^-24 ~ 5.96e-8 (0x0001)
         self.assertEqual(ref_v_cvt_f16_f32(2.0 ** -24), 0x0001)
 
+class TestVCvtF16F32Translator(unittest.TestCase):
+    def test_translator_cvt_f16_f32_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0x3f800000",  # 1.0f
+            "v_cvt_f16_f32_e32 v2, v1",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_cvt_f16_f32")
+        for l in range(32):
+            self.assertEqual(results[l] & 0xFFFF, 0x3C00)
+
+    def test_translator_preserves_high_half(self) -> None:
+        # GFX10 partial write: high 16 bits of destination are kept
+        body = [
+            "v_mov_b32_e32 v2, 0xdead0000",
+            "v_mov_b32_e32 v1, 0x40000000",  # 2.0f
+            "v_cvt_f16_f32_e32 v2, v1",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_cvt_f16_f32_keep_hi")
+        for l in range(32):
+            self.assertEqual(results[l], 0xDEAD4000)
+
 
 if __name__ == "__main__":
     unittest.main()
