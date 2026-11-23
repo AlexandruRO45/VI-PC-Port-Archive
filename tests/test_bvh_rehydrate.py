@@ -253,7 +253,9 @@ class TestErrorsAndCli(unittest.TestCase):
                 with self.subTest(compare=what), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     self.assertEqual(R.main([paths["in.bin"], "--geom", paths["vb.bin"] + "," + paths["ib.bin"],
                                              "--out", paths["out.bin"], "--compare", compare]), 2)
-                self.assertIn(compare, err.getvalue())
+                # OSError formats its filename with %r, so this is the quoted form on every platform
+                # (Windows doubles the backslashes, POSIX leaves them).
+                self.assertIn(repr(compare), err.getvalue())
                 self.assertNotIn("rehydrated", out.getvalue())
                 with open(paths["out.bin"], "rb") as f:
                     self.assertEqual(f.read(), b"previous output", what)
