@@ -363,6 +363,14 @@ class TestVAddNcI16Interpreter(unittest.TestCase):
         self.assertEqual(res, 0x8000)
         self.assertEqual(state.vgpr[1], 0x8000)
 
+class TestVAddNcI16EdgeCases(unittest.TestCase):
+    def test_identity_and_inverses(self):
+        self.assertEqual(ref_v_add_nc_i16(0x1234, 0), 0x1234)
+        self.assertEqual(ref_v_add_nc_i16(0x1234, (-0x1234) & MASK16), 0)
+
+    def test_wrap_boundary(self):
+        self.assertEqual(ref_v_add_nc_i16(0x7FFF, 1), 0x8000)
+
 
 if __name__ == "__main__":
     unittest.main()
