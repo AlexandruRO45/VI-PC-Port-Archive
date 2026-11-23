@@ -29,6 +29,13 @@ inline unsigned& validation_error_count() {
     return count;
 }
 
+// Set while Device::validation_probe() makes its deliberate invalid call: that error is counted but not printed, so a
+// test whose output must not contain "Validation Error" or "VUID-" does not fail on it.
+inline bool& validation_probe_running() {
+    static bool running = false;
+    return running;
+}
+
 inline unsigned& known_validation_error_count() {
     static unsigned count = 0;
     return count;
@@ -56,6 +63,7 @@ inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityF
         ++validation_error_count();
         if (known) ++known_validation_error_count();
     }
+    if (validation_probe_running()) return VK_FALSE;
     std::fprintf(stderr, "%s%s: %s\n", validation ? "validation" : "vulkan (not counted)",
                  known ? " (known sRGB swapchain check)" : "",
                  data && data->pMessage ? data->pMessage : "(no message)");
@@ -635,14 +643,16 @@ public:
     // probe's own error is taken back off the count.
     bool validation_probe() {
         const unsigned errors = validation_error_count();
-        std::fprintf(stderr, "validation probe: one deliberate error follows (a buffer with usage 0)\n");
+        std::fprintf(stderr, "validation probe: one deliberate invalid call (a buffer with usage 0), not printed\n");
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = 256;
         info.usage = 0;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VkBuffer probe = VK_NULL_HANDLE;
+        validation_probe_running() = true;
         if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &info, nullptr, &probe) == VK_SUCCESS && probe)
             fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device, probe, nullptr);
+        validation_probe_running() = false;
         const bool reported = validation_error_count() > errors;
         validation_error_count() = errors;
         std::fprintf(stderr, "validation probe: %s\n", reported ? "reported, validation is active" : "not reported");

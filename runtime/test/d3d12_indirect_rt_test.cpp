@@ -30,12 +30,18 @@ unsigned& validation_errors() {
     return count;
 }
 
+bool& validation_probe_running() {  // the probe's deliberate error is counted but not printed
+    static bool running = false;
+    return running;
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                              VkDebugUtilsMessageTypeFlagsEXT types,
                                              const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
     if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
         (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
         ++validation_errors();
+    if (validation_probe_running()) return VK_FALSE;
     std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
@@ -99,17 +105,19 @@ int main() {
     const bool want_val = env_val && std::strcmp(env_val, "0") != 0;
     const char* val_layer = "VK_LAYER_KHRONOS_validation";
     const char* dbg_ext = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    bool val_active = false;
+    bool val_active = false, val_listed = false;
     if (want_val && enum_layers) {
         std::uint32_t cnt = 0;
         enum_layers(&cnt, nullptr);
         std::vector<VkLayerProperties> layers(cnt);
         enum_layers(&cnt, layers.data());
         for (const auto& l : layers) {
-            if (!std::strcmp(l.layerName, val_layer)) val_active = true;
+            if (!std::strcmp(l.layerName, val_layer)) val_listed = true;
         }
-        if (!val_active) return fail("LEONIDA_VK_VALIDATION is set but VK_LAYER_KHRONOS_validation is not installed");
     }
+    // A loader that lists no such layer (Wine's) cannot enable it; one enabled from outside (VK_INSTANCE_LAYERS
+    // before wine loads the host's) still validates, which the probe after the messenger is created must show.
+    val_active = want_val;
 
     VkDebugUtilsMessengerCreateInfoEXT dbg{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
     dbg.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
@@ -127,8 +135,8 @@ int main() {
     ici.pApplicationInfo = &app;
     if (val_active) {
         ici.pNext = &val_feats;
-        ici.enabledLayerCount = 1;
-        ici.ppEnabledLayerNames = &val_layer;
+        ici.enabledLayerCount = val_listed ? 1 : 0;
+        ici.ppEnabledLayerNames = val_listed ? &val_layer : nullptr;
         ici.enabledExtensionCount = 1;
         ici.ppEnabledExtensionNames = &dbg_ext;
     }
@@ -151,6 +159,30 @@ int main() {
         destroy_dbg =
             reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(gipa(instance, "vkDestroyDebugUtilsMessengerEXT"));
         if (create_dbg) create_dbg(instance, &dbg, nullptr, &messenger);
+        // A second messenger with no severity bits breaks
+        // VUID-VkDebugUtilsMessengerCreateInfoEXT-messageSeverity-requiredbitmask: a validation layer reports it.
+        bool reported = false;
+        if (create_dbg && destroy_dbg && messenger) {
+            VkDebugUtilsMessengerCreateInfoEXT invalid = dbg;
+            invalid.messageSeverity = 0;
+            VkDebugUtilsMessengerEXT probe = VK_NULL_HANDLE;
+            const unsigned before = validation_errors();
+            validation_probe_running() = true;
+            if (create_dbg(instance, &invalid, nullptr, &probe) == VK_SUCCESS && probe)
+                destroy_dbg(instance, probe, nullptr);
+            validation_probe_running() = false;
+            reported = validation_errors() > before;
+            validation_errors() = before;
+        }
+        if (!reported) {
+            if (messenger) destroy_dbg(instance, messenger, nullptr);
+            reinterpret_cast<PFN_vkDestroyInstance>(gipa(instance, "vkDestroyInstance"))(instance, nullptr);
+            return fail(val_listed ? "LEONIDA_VK_VALIDATION is set but validation is not active"
+                                   : "LEONIDA_VK_VALIDATION is set but validation is not active: the loader does not "
+                                     "list VK_LAYER_KHRONOS_validation and no layer reported a deliberate invalid call "
+                                     "(under Wine, set VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation before wine)");
+        }
+        std::printf("validation probe: reported, validation is active\n");
     }
 
     const auto enum_devs = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(instance, "vkEnumeratePhysicalDevices"));
