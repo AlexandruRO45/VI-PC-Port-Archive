@@ -580,6 +580,24 @@ class Gen:
         return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
 
     @staticmethod
+    def check_plain_int_valu(raw_op, op, a, mods, *, nargs, dst_n=1, src_indices=None):
+        """Validate an integer/bitwise VALU op that takes no DPP/SDWA encoding, no VOP3 modifiers, and no operand modifiers."""
+        if raw_op.endswith(("_dpp", "_sdwa")):
+            raise Unsupported(raw_op)
+        if mods:
+            raise Unsupported(f"{op} modifiers: {' '.join(mods)}")
+        if len(a) != nargs:
+            raise Unsupported(op + " operands")
+        if a[0].get("k") != "vgpr" or a[0].get("n", 1) != dst_n:
+            raise Unsupported(op + " destination")
+        if src_indices is None:
+            src_indices = range(1, nargs)
+        if any(a[i].get("n", 1) != 1 for i in src_indices):
+            raise Unsupported(op + " operands")
+        if any(t.get("neg") or t.get("abs") or t.get("sext") for t in a):
+            raise Unsupported(op + " operand modifiers")
+
+    @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
         A select bit of 1 reads the high half of that source; the last bit sends the result to the high half.
@@ -8115,6 +8133,7 @@ class Gen:
             self.emit(f"{r} = OpIAdd %uint {average} {rounding}")
             self.dst(a[0], r)
         elif op == "v_xnor_b32":
+            self.check_plain_int_valu(ins["op"], op, a, mods, nargs=3)
             x, y = self.src_u(a[1]), self.src_u(a[2])
             t, r = self.tmp(), self.tmp()
             self.emit(f"{t} = OpBitwiseXor %uint {x} {y}")
@@ -8873,6 +8892,7 @@ class Gen:
             for k in range(4):               # every source is read before the first write
                 self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, outs[k])
         elif op == "v_xad_u32":
+            self.check_plain_int_valu(ins["op"], op, a, mods, nargs=4)
             x, y, z = (self.src_u(t) for t in a[1:4])
             t, r = self.tmp(), self.tmp()
             self.emit(f"{t} = OpBitwiseXor %uint {x} {y}")
@@ -10393,6 +10413,7 @@ class Gen:
             # {src0, src1}, RDNA2 ISA reference, V_PERM_B32); 12 -> 0x00, >=13 -> 0xFF.
             # Both candidate shifts are (k & 3) * 8, so every shift stays below 32 (SPIR-V leaves larger ones
             # undefined, even on the side of the OpSelect that is discarded).
+            self.check_plain_int_valu(ins["op"], op, a, mods, nargs=4)
             s0, s1 = self.src_u(a[1]), self.src_u(a[2])
             selector = self.imm_val(a[3])
             if selector is not None:
@@ -11389,6 +11410,7 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("v_bfe_u32", "v_bfe_i32"):
             # offset and width are taken mod 32 (a width of 0 gives 0)
+            self.check_plain_int_valu(ins["op"], op, a, mods, nargs=4)
             o_val, w_val = self.imm_val(a[2]), self.imm_val(a[3])
             if o_val is not None and w_val is not None:
                 off = o_val & 31
@@ -11430,8 +11452,7 @@ class Gen:
             # {sdst, v[d:d+1]} = S0 * S1 + S2 as a 65-bit result (RDNA ISA pseudocode): 32 x 32 -> 64-bit product,
             # unsigned or signed, plus the 64-bit S2. sdst (a lane mask) gets bit 64: the carry out for u64; for i64
             # the sign of the exact sum, which a 65-bit two's-complement value always holds.
-            if a[0].get("n") != 2 or "clamp" in mods:
-                raise Unsupported(op + " operands")
+            self.check_plain_int_valu(ins["op"], op, a, mods, nargs=5, dst_n=2, src_indices=(2, 3))
             vd, sd, s0, s1, s2 = a[0], a[1], a[2], a[3], a[4]
             signed = op == "v_mad_i64_i32"
             if s2["k"] in ("vgpr", "sgpr") and s2.get("n") == 2:
