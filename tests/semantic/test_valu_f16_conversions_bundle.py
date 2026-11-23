@@ -365,6 +365,32 @@ class TestVCvtU16F16Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l] & 0xFFFF, 42)
 
+def ref_v_cvt_i16_f16(f16_bits: int) -> int:
+    """Reference mathematical oracle for v_cvt_i16_f16 with truncation and signed saturation."""
+    val = f16_bits_to_float(f16_bits & MASK16)
+    if math.isnan(val):
+        return 0
+    if math.isinf(val):
+        return 0x7FFF if val > 0 else 0x8000
+    tr = math.trunc(val)
+    if tr < -32768:
+        return 0x8000
+    if tr > 32767:
+        return 0x7FFF
+    return tr & MASK16
+
+
+class TestVCvtI16F16Oracle(unittest.TestCase):
+    def test_basic_values(self) -> None:
+        self.assertEqual(ref_v_cvt_i16_f16(0xD140), 0xFFD6)  # -42.0h -> -42 (0xFFD6)
+        self.assertEqual(ref_v_cvt_i16_f16(0x5140), 42)      # 42.0h -> 42
+        self.assertEqual(ref_v_cvt_i16_f16(0xBE00), 0xFFFF)  # -1.5h -> -1
+
+    def test_saturation_and_nan(self) -> None:
+        self.assertEqual(ref_v_cvt_i16_f16(0x7C00), 0x7FFF)  # +inf -> 32767
+        self.assertEqual(ref_v_cvt_i16_f16(0xFC00), 0x8000)  # -inf -> -32768
+        self.assertEqual(ref_v_cvt_i16_f16(0x7E00), 0x0000)  # NaN -> 0
+
 
 if __name__ == "__main__":
     unittest.main()
