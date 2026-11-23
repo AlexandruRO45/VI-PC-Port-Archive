@@ -92,6 +92,8 @@ EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
 # ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
 EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
+# ps_sdwa_class_f16, measured on gfx1036 (the .asm header): the class mask of v_cmp_class_f16 is an f16 constant
+EXPECTED_SDWA_CLASS_F16 = [0x600D600D, 0x600D600D, 0xBADBADBA, 0x600D600D]
 EXPECTED_VCMP_F32_NAN = [0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7]   # derivation in ps_vcmp_f32_nan.asm
 EXPECTED_VCMP_64 = [0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93]        # derivation in ps_vcmp_64.asm
 EXPECTED_ANDN2_EXEC = [1, 8, 16, 2064, 2068, 3, 20, 1544]                   # derivation in cs_w32_andn2_exec.asm
@@ -534,6 +536,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
         # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
         self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
+
+    def test_sdwa_src_sel_narrows_the_f16_class_mask_constant(self):
+        # -2.0 as the mask of v_cmp_class_f16_sdwa is 0x0000c000, so src1_sel:BYTE_1 reads 0xc0 (+0 and +denormal)
+        # and 1.0 under WORD_1 reads no class; the f32 bits of the constant would give the opposite answers.
+        self.check("ps_sdwa_class_f16", EXPECTED_SDWA_CLASS_F16)
 
     def test_f16_denormal_operand_does_not_rely_on_unpack_half(self):
         # On NVIDIA (RTX 5060 Ti, 610.88) UnpackHalf2x16 gives 0 for the denormal 0x0040 that word y's BYTE_1

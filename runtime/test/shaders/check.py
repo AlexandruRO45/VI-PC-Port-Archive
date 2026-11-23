@@ -361,6 +361,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_f16_pack_mods": (0x4400b400, 0xc4003400, 0x4400c200, 0xb400b400),
               # SDWA src_sel on a float inline constant in an f16 op (measured on gfx1036)
               "ps_sdwa_f16_const": (0xaaaa3800, 0xaaaa1c00, 0xaaaa3e00, 0xaaaa73f0),
+              # SDWA src1_sel on the float inline constant that is the class mask of v_cmp_class_f16 (gfx1036)
+              "ps_sdwa_class_f16": (0x600d600d, 0x600d600d, 0xbadbadba, 0x600d600d),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
