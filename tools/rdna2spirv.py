@@ -6149,6 +6149,51 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    def _validate_f64_valu(self, ins, op, mods, *, arity, dst_width, int_srcs=(),
+                           allow_clamp=True, allow_omod=True, strict_omod=True, vop3_only=False):
+        """Validate encoding, arity, destination/source widths and modifiers for binary64 VALU ops."""
+        raw_op = ins["op"]
+        raw_args = self.cur_ins["args"]
+        if raw_op.endswith(("_sdwa", "_dpp")) or (vop3_only and raw_op.endswith("_e32")):
+            raise Unsupported(op + " encoding")
+        if len(raw_args) != arity:
+            raise Unsupported(op + " operands")
+        dst = raw_args[0]
+        if dst.get("k") != "vgpr" or dst.get("n", 1) != dst_width:
+            raise Unsupported(op + " destination")
+        if dst.get("neg") or dst.get("abs") or dst.get("sext"):
+            raise Unsupported(op + " destination modifier")
+        is_e32 = raw_op.endswith("_e32")
+        for idx, src in enumerate(raw_args[1:], start=1):
+            if src.get("sext"):
+                raise Unsupported(op + " operand modifier")
+            if is_e32 and (src.get("neg") or src.get("abs")):
+                raise Unsupported(op + " operand modifier")
+            if idx in int_srcs:
+                if src.get("n", 1) != 1:
+                    raise Unsupported(op + " operand width")
+                if src.get("neg") or src.get("abs"):
+                    raise Unsupported(op + " operand modifier")
+        if is_e32 and mods:
+            raise Unsupported(op + " modifier")
+        seen_clamp = False
+        seen_omod = False
+        for m in mods:
+            if m == "clamp":
+                if not allow_clamp:
+                    raise Unsupported(op + " output modifier")
+                if seen_clamp:
+                    raise Unsupported(op + " modifier")
+                seen_clamp = True
+            elif m in ("mul:2", "mul:4", "div:2"):
+                if not allow_omod:
+                    raise Unsupported(op + " output modifier")
+                if strict_omod and seen_omod:
+                    raise Unsupported(op + " modifier")
+                seen_omod = True
+            else:
+                raise Unsupported(op + " modifier")
+
     def dst_f64(self, d, value, mods, op):
         if d["k"] != "vgpr" or d.get("n") != 2:
             raise Unsupported(op + " destination")
@@ -7667,6 +7712,7 @@ class Gen:
         elif op == "ds_swizzle_b32":
             self.swizzle(a, mods, ins)
         elif op in ("v_cvt_f64_i32", "v_cvt_f64_u32"):
+            self._validate_f64_valu(ins, op, mods, arity=2, dst_width=2, int_srcs=(1,))
             self.uses_f64 = True
             src = self.src_u(a[1])
             result = self.tmp()
@@ -7680,12 +7726,8 @@ class Gen:
             # denormals flushed. clamp applies in every MODE, so only it is passed on.
             self.dst_f64(a[0], result, [m for m in mods if m == "clamp"], op)
         elif op in ("v_trunc_f64", "v_ceil_f64", "v_rndne_f64", "v_floor_f64"):
-            if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n") != 2:
-                raise Unsupported(op + " operands")
+            self._validate_f64_valu(ins, op, mods, arity=2, dst_width=2)
             dst, src = a
-            if (ins["op"].endswith(("_dpp", "_sdwa"))
-                    or any(mod not in ("mul:2", "mul:4", "div:2", "clamp") for mod in mods)):
-                raise Unsupported(op + " modifier")
             self.uses_f64 = True
             if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
                 low = self.load_reg(src["k"], src["r"])
@@ -7723,6 +7765,12 @@ class Gen:
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
+            self._validate_f64_valu(
+                ins, op, mods,
+                arity=3 if op == "v_add_f64" else 2,
+                dst_width=1 if op == "v_cvt_f32_f64" else 2,
+                vop3_only=op == "v_add_f64",
+            )
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
                 lo, hi = self.f64_source_words(sv, op)
@@ -10836,6 +10884,14 @@ class Gen:
                 self.emit(f"{r} = OpSelect %uint {isnorm} {scaled} {other}")
                 self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
         elif op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64"):
+            self._validate_f64_valu(
+                ins, op, mods,
+                arity=2,
+                dst_width=1 if op == "v_frexp_exp_i32_f64" else 2,
+                allow_clamp=op == "v_frexp_mant_f64",
+                allow_omod=op == "v_frexp_mant_f64",
+                strict_omod=False,
+            )
             # Binary64 frexp, bit-exact on the (lo, hi) dword pair without requiring Float64/Int64 unless VOP3 output
             # modifiers are present. Measured natively on gfx1036 (wave32 & wave64, default denorm16_64=3, IEEE=0):
             # - Normal inputs (biased exponent 1..2046): mant in [0.5, 1) with sign, exp = e - 1022.
@@ -11041,11 +11097,10 @@ class Gen:
             # - VOP3 clamp applies in both denorm16_64=3 and 0 (dx10_clamp=1: NaN/-0/<0 -> +0.0, >1.0 -> 1.0).
             # - VOP3 omod (mul:2/mul:4/div:2) is ignored by hardware when denorm16_64=3 and active when 0, so it is
             #   rejected as MODE-dependent rather than guessed.
-            if any(m.startswith(("mul:", "div:")) for m in mods):
-                raise Unsupported(op + " output modifier")
+            self._validate_f64_valu(
+                ins, op, mods, arity=3, dst_width=2, int_srcs=(2,), allow_omod=False, vop3_only=True,
+            )
             d = a[0]
-            if d["k"] != "vgpr" or d.get("n") != 2:
-                raise Unsupported(op + " destination")
             sv = a[1]
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
