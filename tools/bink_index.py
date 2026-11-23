@@ -174,6 +174,10 @@ def scan_file(path, source):
     return rows, stats
 
 
+def _scan_failed(error):
+    raise error
+
+
 def scan_target(target, skip_report=None):
     """Index a single container or every file below a directory.
 
@@ -186,7 +190,7 @@ def scan_target(target, skip_report=None):
     if os.path.isdir(target):
         base = target
         paths = []
-        for root, _dirs, files in os.walk(target):
+        for root, _dirs, files in os.walk(target, onerror=_scan_failed):
             for name in files:
                 path = os.path.join(root, name)
                 if skip_report is not None and same_output_path(path, skip_report):
@@ -316,12 +320,17 @@ def main(argv=None):
         if os.path.isfile(manifest) and same_output_path(a.out, manifest):
             ap.error(f"--out would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
-            for root, _dirs, names in os.walk(a.target):
-                for name in names:
-                    if name.lower().endswith((".json", ".csv")):
-                        continue
-                    if same_output_path(os.path.join(root, name), a.out):
-                        ap.error(f"--out would overwrite an input file: {a.out}")
+            try:
+                for root, _dirs, names in os.walk(a.target, onerror=_scan_failed):
+                    for name in names:
+                        if name.lower().endswith((".json", ".csv")):
+                            continue
+                        if same_output_path(os.path.join(root, name), a.out):
+                            ap.error(f"--out would overwrite an input file: {a.out}")
+            except OSError as error:
+                path = error.filename or a.target
+                print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+                return 2
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2

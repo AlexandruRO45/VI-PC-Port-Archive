@@ -121,6 +121,20 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(rows[0]["frames"], 7)
         self.assertEqual(summary["streams"], 1)
 
+    def test_an_unreadable_subdirectory_raises(self):
+        bad = os.path.join(self.dir, "locked")
+        os.mkdir(bad)
+        real = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == bad:
+                raise PermissionError(13, "Permission denied", bad)
+            return real(path)
+
+        with mock.patch("os.scandir", side_effect=scandir):
+            with self.assertRaises(PermissionError):
+                bink.scan_target(self.dir)
+
     def test_short_file_bytes_are_accounted_for(self):
         path = os.path.join(self.dir, "tiny.bk2")
         with open(path, "wb") as fh:
@@ -298,6 +312,41 @@ class TestCommandLine(unittest.TestCase):
         self.assertEqual(summaries[0], summaries[1])
         self.assertEqual(summaries[0]["files_scanned"], 1)
         self.assertEqual(summaries[0]["streams"], 1)
+
+    def _locked(self, parent):
+        bad = os.path.join(parent, "locked")
+        os.mkdir(bad)
+        real = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == bad:
+                raise PermissionError(13, "Permission denied", bad)
+            return real(path)
+
+        return bad, mock.patch("os.scandir", side_effect=scandir)
+
+    def test_an_unreadable_target_directory_is_an_error(self):
+        bad, patch = self._locked(self.tmp.name)
+        err = io.StringIO()
+        with patch, contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([bad]), 2)
+        self.assertIn("cannot read", err.getvalue())
+        self.assertIn(bad, err.getvalue())
+
+    def test_the_out_check_fails_closed_on_an_unreadable_subtree(self):
+        target = os.path.join(self.tmp.name, "inputs")
+        os.mkdir(target)
+        bad, patch = self._locked(target)
+        out = os.path.join(self.tmp.name, "report.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        err = io.StringIO()
+        with patch, contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([target, "--out", out]), 2)
+        self.assertIn("cannot read", err.getvalue())
+        self.assertIn(bad, err.getvalue())
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "{}")
 
 
 if __name__ == "__main__":
