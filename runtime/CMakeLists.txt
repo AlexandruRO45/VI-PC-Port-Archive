@@ -2967,6 +2967,11 @@ if(TARGET Vulkan::Headers)
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
+    # CPU cost of the GFX10 format-table lookups an SRV makes, indexed against the scans they replaced; ctest runs
+    # its self-test (both agree on every format and code), run it without arguments for the numbers.
+    add_executable(gfx10_format_bench test/gfx10_format_bench.cpp)
+    target_link_libraries(gfx10_format_bench PRIVATE Vulkan::Headers)
+    add_test(NAME gfx10_format_bench_selftest COMMAND gfx10_format_bench --self-test)
     # CPU cost of the D3D12 -> Vulkan replay per command (record, prepare, emit) with no-op Vulkan entry points:
     # no GPU or driver. ctest runs its quick self-test; run it without arguments for the numbers.
     add_executable(replay_cpu_bench test/replay_cpu_bench.cpp)
