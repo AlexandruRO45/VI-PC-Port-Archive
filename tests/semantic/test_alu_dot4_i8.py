@@ -22,7 +22,7 @@ neg_lo and neg_hi. llvm-mc accepts them on v_dot4_i32_i8 for gfx1036 (not on v_d
 not ignore them: on the same GPU, 5 operand sets with 8 forms each gave the words of `ref_neg`, 9 of which are in
 MEASURED_NEG. For S0 and S1, neg_lo flips bit 15 and neg_hi flips bit 31 of the dword; for the addend, neg_hi clears
 bit 31 and neg_lo then flips it. That is what the fields do to float operands, applied to integer ones. The
-translator refuses a set bit and takes an all-zero field as the plain instruction.
+translator lowers them to match the measured hardware rule on v_dot4_i32_i8 and refuses them on v_dot4c_i32_i8.
 
     python -m unittest discover -s tests/semantic -p test_alu_dot4_i8.py
 """
@@ -172,14 +172,20 @@ class Dot4I8(unittest.TestCase):
         plain = MEASURED_NEG[0][5]
         self.assertEqual(sum(m != plain for *_, m in MEASURED_NEG[1:]), 7)
 
-    def test_a_set_neg_bit_is_refused(self):
-        for field in ("neg_lo:[1,0,0]", "neg_hi:[0,1,0]", "neg_lo:[0,0,1] neg_hi:[0,0,1]"):
-            with self.subTest(field=field):
-                lines = ["v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 0",
-                         f"v_dot4_i32_i8 v8, v1, v2, v3 {field}", "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
-                with self.assertRaises(rdna2spirv.Unsupported) as refused:
-                    support.translate_lines("ps_dot4_neg", lines)
-                self.assertEqual(str(refused.exception), "v_dot4_i32_i8 neg")
+    def test_neg_matches_hardware_words(self):
+        for neg_lo, neg_hi, a, b, addend, measured in MEASURED_NEG:
+            mod = f"neg_lo:[{','.join(map(str, neg_lo))}] neg_hi:[{','.join(map(str, neg_hi))}]"
+            with self.subTest(neg_lo=neg_lo, neg_hi=neg_hi):
+                lines = [
+                    f"v_mov_b32_e32 v1, 0x{a:08x}",
+                    f"v_mov_b32_e32 v2, 0x{b:08x}",
+                    f"v_mov_b32_e32 v3, 0x{addend:08x}",
+                    f"v_dot4_i32_i8 v8, v1, v2, v3 {mod}",
+                    "exp mrt0 v8, v8, v8, v8 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines("ps_dot4_neg", lines)
+                self.assertEqual(support.mrt0_words(spv), [measured] * 4)
 
     def test_an_all_zero_neg_field_is_the_plain_instruction(self):
         lines = ["v_mov_b32_e32 v1, 0x04030201", "v_mov_b32_e32 v2, 0x08070605", "v_mov_b32_e32 v3, 0x64",
@@ -231,6 +237,7 @@ class Dot4I8(unittest.TestCase):
         for name, inst, err in (
             ("ps_dot4_s2_opsel", "v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[0,0,1]", "v_dot4_i32_i8 op_sel"),
             ("ps_dot4c_clamp", "v_dot4c_i32_i8 v8, v1, v2 clamp", "v_dot4c_i32_i8 clamp"),
+            ("ps_dot4c_neg", "v_dot4c_i32_i8 v8, v1, v2 neg_lo:[1,0,0]", "v_dot4c_i32_i8 neg"),
         ):
             lines = ["v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 0",
                      inst, "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
