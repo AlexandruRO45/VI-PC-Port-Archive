@@ -340,6 +340,16 @@ class HeaderTests(unittest.TestCase):
             dds.parse_dds_header(b"NOPE" + b"\x00" * 124)
         self.assertIn("magic", str(ctx.exception))
 
+    def test_rejects_invalid_structure_sizes(self):
+        valid = dds_buffer(4, 4, bytes(8), flags=DDPF_FOURCC, fourcc=b"DXT1")
+        for field, offset, wrong_size in (("DDS_HEADER", 4, 123), ("DDS_PIXELFORMAT", 76, 31)):
+            for size in (0, wrong_size):
+                with self.subTest(field=field, size=size):
+                    data = bytearray(valid)
+                    struct.pack_into("<I", data, offset, size)
+                    with self.assertRaisesRegex(dds.DdsError, f"{field} size"):
+                        dds.parse_dds_header(data)
+
     def test_rejects_zero_dimensions(self):
         with self.assertRaises(dds.DdsError):
             dds.parse_dds_header(dds_buffer(0, 4, flags=DDPF_FOURCC, fourcc=b"DXT1"))

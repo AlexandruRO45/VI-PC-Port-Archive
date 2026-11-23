@@ -243,15 +243,19 @@ def _parse_header_internal(
     if bytes(data[:4]) != DDS_MAGIC:
         raise DdsError(f"Invalid DDS magic: {bytes(data[:4])!r}")
 
-    flags, height, width, pitch, raw_depth, raw_mips = struct.unpack_from("<6I", data, 8)
+    header_size, flags, height, width, pitch, raw_depth, raw_mips = struct.unpack_from("<7I", data, 4)
+    if header_size != DDS_HEADER_SIZE - len(DDS_MAGIC):
+        raise DdsError(f"Invalid DDS_HEADER size: {header_size} bytes (expected 124)")
     if width <= 0 or height <= 0:
         raise DdsError(f"Invalid DDS dimensions: {width}x{height}")
 
     mip_count = raw_mips if raw_mips > 0 else 1
 
-    pf_flags, fourcc, rgb_bit_count, r_mask, g_mask, b_mask, a_mask = struct.unpack_from(
-        "<I4sIIIII", data, 80
+    pf_size, pf_flags, fourcc, rgb_bit_count, r_mask, g_mask, b_mask, a_mask = struct.unpack_from(
+        "<II4sIIIII", data, 76
     )
+    if pf_size != 32:
+        raise DdsError(f"Invalid DDS_PIXELFORMAT size: {pf_size} bytes (expected 32)")
 
     dxgi_format: int | None = None
     alpha_mode = 0
