@@ -8,8 +8,11 @@
 // What is known and what is ours. From the public GDKX samples (section 4.5): the call order, the argument counts, that
 // the interval call takes an allowed frame latency (buffer count - 1 in one sample, 1 in another), that the origin
 // event is scheduled once and waited on every frame, that the wait yields a token that PresentX carries, and that
-// frame events must be registered again after ResumeX. Everything below the call shapes is our own model, chosen to
-// be deterministic and to behave like the samples expect; none of it is measured on the console:
+// frame events must be registered again after ResumeX. The FramePacing sample (MIT, Xbox-GDK-Samples
+// Samples/Graphics/FramePacing) names that third argument `periodInIntervals` and computes a frame's deadline as its
+// origin + LengthInMicroseconds * PeriodInIntervals - IntervalOffsetInMicroseconds: the vblank `period` intervals after
+// the one the origin follows. Everything below the call shapes is our own model, chosen to be deterministic and to
+// behave like the samples expect; none of it is measured on the console:
 //   * An interval is a period in microseconds (the real enum values are unmeasured).
 //   * Vblanks happen at epoch + n * period (n = 1, 2, ...), the epoch being the time of SetFrameIntervalX. The
 //     first origin after ScheduleFrameEventX is the next vblank. The origin event of vblank n is signalled
@@ -20,9 +23,11 @@
 //   * A wait that comes late (after the next origin already passed) returns at once with the newest passed origin;
 //     the missed origins are skipped, not queued.
 //   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful wait, never reused, across suspend/resume.
-//   * A frame is due at the vblank after the origin that handed out its token; a PresentX after that vblank is late by
-//     the time since it (present_timing), and ImmediateThresholdPercent decides whether that lateness is shown at once
-//     (decide_present_sync).
+//   * A frame is due `latency` (the period in intervals) vblanks after the vblank its origin follows: the vblank after
+//     the origin for a period of 1, a later one for a longer period, as in the FramePacing sample's deadline. A
+//     PresentX after that vblank is late by the time since it (present_timing), and ImmediateThresholdPercent decides
+//     whether that lateness is shown at once (decide_present_sync). A frame presented before it is shown at the next
+//     vblank.
 
 #include <algorithm>
 #include <atomic>
@@ -159,9 +164,10 @@ public:
     FramePacer(const FramePacer&) = delete;
     FramePacer& operator=(const FramePacer&) = delete;
 
-    // SetFrameIntervalX(output, interval, latency, flags). `period_us` is the interval as a period; `latency` is
-    // the number of frames allowed in flight (0 counts as 1). The vblank grid is re-based: its epoch is now. A
-    // scheduled origin event stays armed (with its offset, kept below the new period) and its next origin is one
+    // SetFrameIntervalX(output, interval, latency, flags). `period_us` is the interval as a period; `latency` is the
+    // period in intervals (the FramePacing sample's name): the number of frames allowed in flight, and how many
+    // intervals after its origin's vblank a frame is due (0 counts as 1). The vblank grid is re-based: its epoch is now.
+    // A scheduled origin event stays armed (with its offset, kept below the new period) and its next origin is one
     // new period from now; waiters blocked on the old grid pick the new one up.
     std::int32_t set_frame_interval(std::uint32_t period_us, std::uint32_t latency, std::uint32_t flags) {
         (void)flags;
@@ -371,7 +377,7 @@ private:
     };
     struct Record {
         std::uint64_t token = 0, origin_us = 0, present_us = 0, display_us = 0;
-        std::uint64_t due_us = 0;  // vblank after this token's origin, fixed when issued
+        std::uint64_t due_us = 0;  // `latency_` vblanks after this token's origin's, fixed when issued
         float percent_scanned = 0.0f;
         bool presented = false, displayed = false;
     };
@@ -410,7 +416,7 @@ private:
                     Record record;
                     record.token = *token;
                     record.origin_us = first + std::uint64_t(origin) * period_us_;
-                    record.due_us = record.origin_us - offset_us_ + period_us_;
+                    record.due_us = record.origin_us - offset_us_ + std::uint64_t(period_us_) * latency_;
                     records_.push_back(record);
                     if (records_.size() > 64) records_.pop_front();
                     return pacer_hr::ok;

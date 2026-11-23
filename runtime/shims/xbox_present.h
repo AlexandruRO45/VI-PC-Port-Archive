@@ -99,7 +99,8 @@ public:
 
     // Device side. `output` (an IDXGIOutput*, which the samples fetch from the device) is not used: there is one
     // window. `interval_period_us` is the period of a frame interval, e.g. xbox_frame_interval_60hz_us; `latency`
-    // is the frames allowed in flight (the samples pass the buffer count minus 1, or 1).
+    // is the period in intervals (the FramePacing sample's `periodInIntervals`; the samples pass the buffer count
+    // minus 1, or 1): the frames allowed in flight, and how many intervals after its origin's vblank a frame is due.
     HRESULT SetFrameIntervalX(IUnknown* output, UINT interval_period_us, UINT latency, UINT flags);
     // Only the origin event (xbox_frame_event_origin) exists. `offset_us` delays it inside the frame. The pointer
     // argument the samples pass as null is not modelled.

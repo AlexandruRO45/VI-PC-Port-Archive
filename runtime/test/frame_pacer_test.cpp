@@ -397,10 +397,11 @@ int main() {
     }
 
     // The same through the pacer: lateness against the vblank the token was due at, and what a tear does to the frame.
+    // A period of 1 interval: the frame is due at the vblank after its origin (longer periods: the case after this one).
     {
         ManualFrameClock clock;
         FramePacer pacer(clock);
-        EXPECT(setup(pacer, 2));
+        EXPECT(setup(pacer, 1));
         clock.advance_us(period);  // origin 1; its frame is due at vblank 2 (t = 2 * period)
         std::uint64_t token1 = 0, token2 = 0;
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token1) == pacer_hr::ok);
@@ -441,6 +442,52 @@ int main() {
         EXPECT(stats[0].time_us == 5 * period && stats[0].percent_scanned == 0.0f);
     }
 
+    // SetFrameIntervalX's third argument is the period in intervals: the public FramePacing sample (MIT,
+    // Xbox-GDK-Samples Samples/Graphics/FramePacing/FramePacing.cpp) passes `periodInIntervals` there and computes a
+    // frame's deadline as its origin + LengthInMicroseconds * PeriodInIntervals - IntervalOffsetInMicroseconds. So with
+    // a period of 3 the frame of an origin at vblank n + offset is due at vblank n + 3, and one presented before that is
+    // on time: no tear.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        constexpr std::uint32_t offset = period / 4;
+        EXPECT(setup(pacer, 3, offset));
+        clock.advance_us(period + offset);  // origin 1, at vblank 1 + offset: its deadline is vblank 4
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        clock.advance_us(period + period / 4);  // 2.5 periods: inside the budget of 3 * period - offset
+        EXPECT(pacer.present_timing(token).late_us == 0);
+        clock.advance_us(period);               // 3.5 periods
+        EXPECT(pacer.present_timing(token).late_us == 0);
+        clock.advance_us(period / 2);           // vblank 4: exactly at the deadline
+        EXPECT(pacer.present_timing(token).late_us == 0);
+        clock.advance_us(period / 4);           // a quarter of an interval past it: late
+        const FramePacer::PresentTiming timing = pacer.present_timing(token);
+        EXPECT(timing.late_us == period / 4);
+        const PresentSync sync = decide_present_sync(timing.late_us, timing.period_us, 30.0f);
+        EXPECT(sync == PresentSync::immediate);
+        pacer.commit_present_token(token, 1, sync);
+        FrameStatistic display{};
+        std::uint32_t count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &display) == pacer_hr::ok);
+        EXPECT(count == 1 && display.percent_scanned == 25.0f && display.time_us == 4 * period + period / 4);
+
+        // The next frame, presented 1.5 intervals after its origin with a threshold of 100: on time, so it waits for
+        // the vblank after the present instead of being flipped mid-scan.
+        clock.advance_us(period);  // 5.25 periods: origin 5 (at 5 * period + offset) has passed; due at vblank 8
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        clock.advance_us(period + period / 2);  // 6.75 periods
+        const FramePacer::PresentTiming on_time = pacer.present_timing(token);
+        EXPECT(on_time.late_us == 0);
+        EXPECT(decide_present_sync(on_time.late_us, on_time.period_us, 100.0f) == PresentSync::vblank);
+        pacer.commit_present_token(token, 1, PresentSync::vblank);
+        EXPECT(pacer.immediate_presents() == 1 && pacer.frames_in_flight() == 1);
+        clock.advance_us(period / 4);  // vblank 7
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &display) == pacer_hr::ok);
+        EXPECT(count == 1 && display.percent_scanned == 0.0f && display.time_us == 7 * period);
+    }
+
     // Rescheduling changes future origins but not the vblank an issued token was due at.
     {
         ManualFrameClock clock;
@@ -467,10 +514,11 @@ int main() {
     }
 
     // A frame behind one that still waits for its vblank cannot be shown at once (it would overtake it): not late.
+    // A period of 1 interval, so each frame is due at the vblank after its origin.
     {
         ManualFrameClock clock;
         FramePacer pacer(clock);
-        EXPECT(setup(pacer, 2));
+        EXPECT(setup(pacer, 1));
         std::uint64_t token1 = 0, token2 = 0;
         clock.advance_us(period);      // origin 1
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token1) == pacer_hr::ok);

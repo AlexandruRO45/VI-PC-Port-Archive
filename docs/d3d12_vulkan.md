@@ -2860,8 +2860,10 @@ SDL2 `src/render/direct3d12/SDL_render_d3d12_xbox.cpp` (zlib).
    game's own resources, not objects owned by a swapchain.
 3. DXGI is used only to find the output: QI the device for `IDXGIDevice1`, `GetAdapter`, `EnumOutputs(0)`.
 4. `device->SetFrameIntervalX(output, D3D12XBOX_FRAME_INTERVAL_60_HZ, n-1, D3D12XBOX_FRAME_INTERVAL_FLAG_NONE)`:
-   4 arguments; the third is the allowed frame latency (SimpleDeviceAndSwapChain passes buffer count minus 1,
-   SDL passes 1). Then `device->ScheduleFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 0, nullptr, ..._FLAG_NONE)`:
+   4 arguments; the third is the period in intervals (SimpleDeviceAndSwapChain passes buffer count minus 1,
+   SDL passes 1; the FramePacing sample names it `periodInIntervals`, defaults to 2 with 3 buffers, and computes a
+   frame's deadline as `origin + LengthInMicroseconds * PeriodInIntervals - IntervalOffsetInMicroseconds`, i.e. the
+   vblank that many intervals after the one its origin follows). Then `device->ScheduleFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 0, nullptr, ..._FLAG_NONE)`:
    4 arguments (event, a `UINT` passed as 0, a pointer passed as null, flags).
 5. Per frame: `device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, INFINITE, nullptr, ..._FLAG_NONE, &token)`:
    5 arguments, the last an out pointer to a `D3D12XBOX_FRAME_PIPELINE_TOKEN` (SDL stores it in a `UINT64`; the
@@ -3099,7 +3101,8 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   author's Radeon 880M and RTX 5070 Laptop (desktop without HDR enabled) list no ST.2084 surface, where the test logs
   that case as skipped and checks the 10-bit codes only where the surface has the format.
 - *`ImmediateThresholdPercent`* (hypothesis from the FramePacing text, item 7 above; not measured on the console):
-  a frame is due at the vblank after the origin that handed out its token. One that is presented later than that
+  a frame is due `PeriodInIntervals` vblanks after the vblank its origin follows (the FramePacing sample's deadline,
+  item 4 above; the vblank after the origin for a period of 1). One that is presented later than that
   is late, and when the scan would not be further down the screen than the threshold percentage (late time modulo the
   interval, as a fraction of the interval) it is flipped at once, mid-scan, instead of waiting a whole interval. 0,
   negative and NaN never tear; 100 or more tears wherever the scan is; a frame on time never does. The decision is
