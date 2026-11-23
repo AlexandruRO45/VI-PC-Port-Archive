@@ -187,6 +187,12 @@ class TestPackB32F16Translator(unittest.TestCase):
             res = run_ps_pack(s0, s1, name=f"ps_pack_mat_{s0}_{s1}")
             self.assertEqual(res, expected)
 
+class TestPermLane16Reference(unittest.TestCase):
+    def test_reference_identity(self):
+        spv = run_cs_permlane("v_permlane16_b32", 0x76543210, 0xFEDCBA98, name="cs_p16_ref")
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        self.assertIn("OpBitFieldUExtract", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
