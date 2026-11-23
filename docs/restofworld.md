@@ -458,6 +458,9 @@ children.
 exception, so a carve retains that page and can reproduce the archive join. Unrelated
 streams still need at least 64 inflated bytes. The folder join keeps its existing
 file-order framing policy; archive readers additionally require alignment and zero padding.
+The folder reader follows the carver's file types: `.bin` contains an inflated zlib
+payload and `.bk2` contains raw video. A `KB2` prefix inside a `.bin` remains resource
+data, while a raw `.bk2` interrupts the model's continuation run.
 
 | Pointed-to group start relative to the target stream (original survey) | Blocks |
 |---|---:|

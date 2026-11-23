@@ -1068,13 +1068,15 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
         off = int(match.group(1), 16) if match else len(streams)
         with open(full, "rb") as fh:
             head = fh.read(32)
-            if fsize % 65536 == 0 and head[:3] != b"KB2":
+            # The carver writes raw video as .bk2; a compressed .bin payload can also start with KB2.
+            is_bink = name.endswith(".bk2") and head[:3] == b"KB2"
+            if fsize % 65536 == 0 and not is_bink:
                 # Inspect the model header and map without copying a full page just for this metadata pass.
                 with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
                     system_pages.accept(data, adjacent=True, root_framed=True)
             else:
                 system_pages.reset()
-        if fsize >= 64 and head[:3] == b"KB2" and len(head) >= 0x1C:
+        if fsize >= 64 and is_bink and len(head) >= 0x1C:
             streams.append({
                 "stream_index": len(streams),
                 "offset": off,

@@ -27,6 +27,17 @@ def model_pages(final_size=48, middle_pages=0, first_size=65536):
     return [bytes(first), *([b"M" * 65536] * middle_pages), final, *graphics]
 
 
+def compressed_pages(pages):
+    """Keep every payload compressed, even when its bytes resemble a raw video."""
+    data = bytearray(fixture.pack_synthetic_rpf([])[0][:0x1010])
+    offsets = []
+    for page in pages:
+        data.extend(bytes(-len(data) % 16))
+        offsets.append(len(data))
+        data.extend(zlib.compress(page))
+    return bytes(data), offsets
+
+
 class ShortSystemPagesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -92,6 +103,61 @@ class ShortSystemPagesTest(unittest.TestCase):
         report = self.joined_cli(folder)
         self.assertEqual(report["summary"]["joined_resources"], 1)
         self.assertEqual(report["summary"]["zlib_streams"], 3)
+
+    def test_compressed_bink_prefix_stays_a_model_page(self):
+        for kind in ("ABC middle", "KB2 middle", "Bink header middle", "KB2 final 48", "KB2 final 64"):
+            with self.subTest(kind=kind):
+                final = kind.startswith("KB2 final")
+                pages = model_pages(final_size=64 if kind.endswith("64") else 48, middle_pages=0 if final else 1)
+                page = bytearray(pages[1])
+                if kind == "Bink header middle":
+                    video = fixture.make_bink2()
+                    page[:len(video)] = video
+                    struct.pack_into("<I", page, 4, len(page) - 8)
+                else:
+                    page[:3] = b"ABC" if kind == "ABC middle" else b"KB2"
+                pages[1] = bytes(page)
+                data, _ = compressed_pages(pages)
+                source, folder, index = self.carve(data)
+                self.assertEqual(index["summary"]["bink2_files"], 0)
+                self.assertEqual([row["size"] for row in index["files"]], list(map(len, pages)))
+                for row, expected in zip(index["files"], pages):
+                    self.assertEqual((folder / f"{row['off']:012x}.bin").read_bytes(), expected)
+                archive = self.joined_cli(source)
+                for report in (archive, self.joined_cli(folder)):
+                    self.assertEqual(report["summary"]["joined_resources"], 1)
+                    self.assertEqual(report["summary"]["zlib_streams"], len(pages))
+                    resource, = report["resources"]
+                    self.assertEqual([row["size"] for row in resource["system_streams"]],
+                                     list(map(len, pages[:-1])))
+                    self.assertEqual(resource["primary_triangles"], 3)
+                    self.assertEqual(resource["all_lod_triangles"], 4)
+
+    def test_raw_bink_files_still_interrupt_short_page_runs(self):
+        for video_size in (96, 65536):
+            with self.subTest(video_size=video_size):
+                pages = model_pages(middle_pages=1)
+                video = bytearray(fixture.make_bink2().ljust(video_size, b"\0"))
+                struct.pack_into("<I", video, 4, video_size - 8)
+                pages[1] = bytes(video)
+                # The fixture writes this middle page raw; the same bytes compressed above are a .bin.
+                data, recorded = fixture.pack_synthetic_rpf([pages])
+                source, folder, index = self.carve(data)
+                self.assertEqual(index["summary"]["bink2_files"], 1)
+                video_offset = recorded[0][0][1]
+                self.assertEqual((folder / f"{video_offset:012x}.bk2").read_bytes(), video)
+                self.assertEqual([row["size"] for row in index["files"]], [65536, video_size, 512])
+                # Also check the folder's own stop rule when a bare short file follows the raw video.
+                tail_offset = recorded[0][0][2]
+                (folder / f"{tail_offset:012x}.bin").write_bytes(pages[2])
+                for path in (source, folder):
+                    output = self.root / "interrupted.json"
+                    run = subprocess.run([sys.executable, "-I", str(ROOT / "tools/restofworld_model_join.py"),
+                                          str(path), str(output), "--quiet"], capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 1, run.stderr)
+                    summary = json.loads(output.read_text(encoding="utf-8"))["summary"]
+                    self.assertEqual(summary["joined_resources"], 0)
+                    self.assertEqual(summary["zlib_streams"], 2)
 
     def test_short_page_requires_valid_root_counts_and_full_nonfinal_pages(self):
         for kind in ("single page", "too many pages", "reserved map word", "short nonfinal", "empty final"):
