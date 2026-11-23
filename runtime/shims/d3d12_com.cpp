@@ -1453,7 +1453,7 @@ private:
                                                        leonida::d3d12_access::common, leonida::d3d12_access::common}));
             leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, leonida::IndexBufferView{},
                                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, viewport_, scissor_, blend_factor_,
-                               front_stencil_ref_, back_stencil_ref_, false, gs.draw_count, 1, 0, 0, 0,
+                               front_stencil_ref_, back_stencil_ref_, false, gs.draw_count, 1, 0, 0, 0, false,
                                gs.draw_tail, 5};
             check(list_.draw(std::move(draw)));
             return;
