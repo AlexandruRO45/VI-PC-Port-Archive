@@ -30,7 +30,15 @@
 
 namespace leonida {
 
+// The estimate is per platform: the same translated module costs far more through the vendor driver than through
+// RADV. Measured on Windows 10 / 32.0.16.1088 / RTX 2080 Ti with --wave64-emulate: 15.03 MiB of module peaked at
+// 24.6 GB (about 1670 bytes per byte) and crashed the driver, 23.97 MiB at 6.9 GB (about 290). 2048 keeps a margin
+// over the RADV measurement below and still lets the two calibrated ones run several at a time.
+#if defined(_WIN32)
+inline constexpr uint64_t kBytesPerSpirvByte = 2048;
+#else
 inline constexpr uint64_t kBytesPerSpirvByte = 512;
+#endif
 
 inline uint64_t large_module_estimate(uint64_t spirv_bytes) { return spirv_bytes * kBytesPerSpirvByte; }
 

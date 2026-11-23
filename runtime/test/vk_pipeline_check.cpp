@@ -1613,6 +1613,11 @@ int main(int argc, char** argv) {
             // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
             // module have been destroyed, including on failure. The watchdog and cache writer don't take this lock.
             const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
+            if (isolated && available_memory && leonida::large_module_estimate(file_size) > available_memory) {
+                std::printf("  %s needs about %.1f GB, %.1f GB free: it compiles alone and may not fit\n", name.c_str(),
+                            leonida::large_module_estimate(file_size) / 1e9, available_memory / 1e9);
+                std::fflush(stdout);   // a module that dies in the driver takes a buffered line with it
+            }
             std::unique_lock exclusive(compile_gate, std::defer_lock);
             std::shared_lock parallel(compile_gate, std::defer_lock);
             leonida::LargeModuleGate::Ticket large_ticket;   // left after the module and its pipeline are gone
