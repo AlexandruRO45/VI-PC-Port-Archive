@@ -70,6 +70,7 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            victory_profile::scope!("gpu", "host pipeline");
             let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             #[cfg(feature = "diagnostics")]

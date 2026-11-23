@@ -78,9 +78,16 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
+    let entry = shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry(*full.as_bytes());
+    if matches!(entry, std::collections::hash_map::Entry::Occupied(_)) {
+        victory_profile::cache!("shader", "containers", Hit);
+    } else {
+        victory_profile::cache!("shader", "containers", Miss);
+        victory_profile::resident!("shader", "containers", bytes.len());
+    }
+    entry
         .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
         .clone()
 }
@@ -111,6 +118,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                victory_profile::scope!("shader", "translate", self.container.len());
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
                 let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;

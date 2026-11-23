@@ -116,6 +116,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    // With `VICTORY_PROFILE`: the last frames, memory and caches as they
+    // were, before the run ends.
+    victory_profile::dump(&text);
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -127,13 +130,48 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            victory_profile::sampler(video_memory);
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
         }
     })
     .as_ref()
+}
+
+/// For `VICTORY_PROFILE`: the host textures' bytes (all, and those a list
+/// used), and the host adapter's memory in use and its budget, local
+/// (video memory) and non-local (shared system memory).
+fn video_memory(out: &mut Vec<(&'static str, u64)>) {
+    let Some(host) = host() else { return };
+    let (_, bytes, used, ..) = crate::resource::texture_counts();
+    out.push(("gpu.host_textures", bytes));
+    out.push(("gpu.host_textures_used", used));
+    // SAFETY: plain queries of the device's own adapter.
+    unsafe {
+        let luid = host.device.GetAdapterLuid();
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter3>(luid) else {
+            return;
+        };
+        use windows::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP_LOCAL as LOCAL;
+        use windows::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL as SHARED;
+        for (group, usage, budget) in [
+            (LOCAL, "vram.local", "vram.local_budget"),
+            (SHARED, "vram.shared", "vram.shared_budget"),
+        ] {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            if adapter.QueryVideoMemoryInfo(0, group, &mut info).is_ok() {
+                out.push((usage, info.CurrentUsage));
+                out.push((budget, info.Budget));
+            }
+        }
+    }
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -715,6 +753,7 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        victory_profile::submission(lists.len(), prepared - started, gpu);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -1822,6 +1861,7 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        victory_profile::count!("gpu", "upload buffer", size);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -1865,6 +1905,17 @@ impl Host {
             }
         }
     }
+}
+
+/// For `VICTORY_PROFILE`: draws and dispatches run on the host since the
+/// last presented frame.
+fn since_last_frame() -> (u64, u64) {
+    use std::sync::atomic::AtomicU64;
+    static LAST: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    let now = [crate::draw::drawn(), crate::draw::dispatched()];
+    let [draws, dispatches] =
+        [0, 1].map(|i| now[i].saturating_sub(LAST[i].swap(now[i], Ordering::Relaxed)));
+    (draws, dispatches)
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
@@ -2033,6 +2084,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        let presenting = std::time::Instant::now();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -2106,6 +2158,18 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if victory_profile::on() {
+                let (draws, dispatches) = since_last_frame();
+                victory_profile::frame(victory_profile::Frame {
+                    number: frame,
+                    width,
+                    height,
+                    format: desc.Format.0 as u32,
+                    draws,
+                    dispatches,
+                    present: presenting.elapsed(),
+                });
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
