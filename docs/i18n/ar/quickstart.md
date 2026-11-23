@@ -2,7 +2,7 @@
 
 # دليل البدء السريع لمشروع Leonida
 
-الوثائق الإنجليزية هي المرجع المعتمد. يستند هذا الدليل إلى المراجعة `ec8ec4c9` ويغطي خطوات البدء الأساسية.
+الوثائق الإنجليزية هي المرجع المعتمد. يستند هذا الدليل إلى المراجعة `3faac557` ويغطي خطوات البدء الأساسية.
 راجع [ملف README بالإنجليزية](../../../README.md#project-status) لمعرفة حالة المشروع الحالية، و[فهرس الوثائق](../../README.md) للمزيد من التفاصيل.
 
 ## ما هو Leonida؟
@@ -23,7 +23,14 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 - [حزمة Vulkan SDK](https://vulkan.lunarg.com/) لتوفير `spirv-as` و`spirv-val` و`vulkaninfo`.
 - [LLVM 21 أو أحدث](https://github.com/llvm/llvm-project/releases) مع دعم AMDGPU في `llvm-mc`.
   نسخة LLVM الرسمية لـWindows لا تتضمن هذا الدعم. من جذر المستودع، شغّل `scripts/build_llvm_mc.ps1` من PowerShell لبناء `llvm-mc.exe`.
-  يتطلب السكربت Git وأدوات C++ في Visual Studio ويضبط `LLVM_MC`. افتح نافذة PowerShell جديدة بعد انتهائه.
+  يتطلب السكربت Git وأدوات C++ في Visual Studio ويضبط `LLVM_MC`، ويستغرق نحو 20 إلى 40 دقيقة. افتح نافذة PowerShell جديدة بعد انتهائه.
+  هناك طريقة أسرع إن كنت تستخدم [conda](https://docs.conda.io/): ثبّت `llvm-tools` من conda-forge (نسخته لـWindows تتضمن دعم AMDGPU)،
+  ثم اضبط `LLVM_MC` على المسار الكامل لـ`llvm-mc.exe` الذي يثبّته. يعرض الأمر `where llvm-mc` هذا المسار بعد تفعيل البيئة.
+
+  ```powershell
+  conda install -c conda-forge llvm-tools
+  ```
+
   إذا ثبّتَّ `llvm-21` على Ubuntu داخل WSL، اضبط `LLVM_MC` في نافذة PowerShell التي ستشغّل منها البناء.
 
   ```powershell
@@ -32,6 +39,11 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 
 - Visual Studio 2022 مع حزمة **Desktop development with C++** وWindows SDK بالإصدار `10.0.26100` أو أحدث لبناء مكوّن التشغيل.
 - [ffmpeg](https://ffmpeg.org/download.html) ضمن `PATH`، وهو اختياري لفك ترميز XMA2 ومطلوب عند استخدام `--wav`.
+
+**مساحة القرص المحدودة:** رقم الـ350 غيغابايت يخص البناء الكامل. لتشغيل المنفذ فقط، تحتاج المراحل `--stages check,shaders,runtime`
+إلى نحو 30 غيغابايت. مرحلة `assets` (نحو 300 غيغابايت) مخصصة لأدوات الموارد فقط، ويضيف `--wav` أضعاف حجم ملفات Ogg Opus.
+يمكن وضع `--work` و`--out` على قرص آخر. يقرأ مكوّن التشغيل الحزمة من مكانها، لذلك إذا كانت الحزمة على قرص للقراءة فقط
+فاستخدم `gta6rt --overlay <مجلد قابل للكتابة>`. لاحظ أن `--overlay` خيار لـ`gta6rt` وليس لـ`make_game.py`.
 
 ## البناء على Windows
 
@@ -42,24 +54,26 @@ git clone --recursive https://github.com/ItsNotRexed/Leonida
 cd Leonida
 ```
 
-انقر نقرًا مزدوجًا على `Build.bat`. يبحث البرنامج عن نسختك على الجهاز. إذا وجد أكثر من نسخة فسيطلب منك الاختيار،
+انقر نقرًا مزدوجًا على `Build.bat`. يبحث البرنامج عن نسختك في Downloads وDesktop وDocuments (وفي المواقع التي يحفظها Windows فيها، مثل OneDrive)
+وGames ومجلد المستخدم وجذر كل قرص، حتى عمق مجلدين. إذا وجد أكثر من نسخة فسيطلب منك الاختيار،
 وإذا لم يجد أي نسخة فسيطلب مسار المجلد. يتحقق من الأدوات والمساحة المتاحة قبل بدء البناء. تُحفظ النتيجة افتراضيًا
 في `Documents\Leonida`، ويمكن استئناف البناء إذا توقف.
 
 ### البناء من PowerShell
 
-شغّل الأوامر من جذر المستودع. يعرض `--find` النسخ التي عُثر عليها محليًا، ويُستخدم `--check` لفحص الحزمة فقط.
+شغّل الأوامر من جذر المستودع. يعرض `--find` النسخ التي عُثر عليها محليًا، ويفتح `--pick` نافذة لاختيار مجلد اللعبة، ويُستخدم `--check` لفحص الحزمة فقط.
 يضيف `--full-check` مقارنة بصمة SHA-256 لكل ملف، وقد يستغرق ذلك وقتًا. في أمر البناء، استبدل المسارات بالمسارات على جهازك.
 
 ```powershell
 python -I make_game.py --find
+python -I make_game.py --pick
 python -I make_game.py --check
 python -I make_game.py --check --full-check
 python -I make_game.py --game "D:\path\to\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 ```
 
 ترتيب المراحل هو `check` ثم `shaders` ثم `assets` ثم `runtime` ثم `pipelines`.
-يمكن اختيار مراحل بعينها باستخدام `--stages shaders,assets`. عادةً ما تستغرق ترجمة برامج التظليل أطول وقت،
+يمكن اختيار مراحل بعينها باستخدام `--stages shaders,assets`، مثل `--stages check,shaders,runtime` عندما تكون المساحة محدودة. عادةً ما تستغرق ترجمة برامج التظليل أطول وقت،
 ويمكن ضبط عدد عملياتها باستخدام `--jobs`. اترك `--wave64-emulate` على القيمة الافتراضية `auto` ما لم تحتج إلى تجاوز اختيار الأداة.
 يضيف `--wav` نسخًا بصيغة PCM WAV من مسارات Ogg Opus ويزيد المساحة المطلوبة.
 
