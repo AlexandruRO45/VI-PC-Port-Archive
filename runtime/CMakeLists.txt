@@ -2000,9 +2000,9 @@ if(TARGET Vulkan::Headers)
         list(GET pair 1 output)
         add_custom_command(
           OUTPUT ${output}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
-                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
-          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.3 -o "${output}"
+                  "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}"
+          DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}"
           COMMENT "Compiling the first-frame dry-run shader ${source}"
           VERBATIM)
       endforeach()
