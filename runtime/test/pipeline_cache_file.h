@@ -10,9 +10,41 @@
 #include <system_error>
 
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#include <sys/stat.h>
 #include <thread>
 #include <windows.h>
 #endif
+
+namespace pipeline_cache_file_detail {
+
+inline std::FILE* create_exclusive(const std::filesystem::path& path) {
+#ifdef _WIN32
+    // Some static UCRT builds reject fopen's "x" mode; low-level creation preserves its no-overwrite contract.
+    int descriptor = -1;
+    const errno_t error = _wsopen_s(&descriptor, path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                                   _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    if (error) {
+        errno = error;
+        return nullptr;
+    }
+    std::FILE* file = _wfdopen(descriptor, L"wb");
+    if (!file) {
+        const int stream_error = errno ? errno : EIO;
+        _close(descriptor);
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        errno = stream_error;
+    }
+    return file;
+#else
+    return std::fopen(path.c_str(), "wbx");
+#endif
+}
+
+}  // namespace pipeline_cache_file_detail
 
 inline std::error_code write_pipeline_cache_file(const std::filesystem::path& destination,
                                                 const char* data, size_t size) {
@@ -23,11 +55,7 @@ inline std::error_code write_pipeline_cache_file(const std::filesystem::path& de
     for (int attempt = 0; attempt < 8; ++attempt) {
         staged = destination;
         staged += ".tmp." + std::to_string(stamp) + "." + std::to_string(attempt);
-#ifdef _WIN32
-        file = _wfopen(staged.c_str(), L"wbx");
-#else
-        file = std::fopen(staged.c_str(), "wbx");
-#endif
+        file = pipeline_cache_file_detail::create_exclusive(staged);
         if (file || errno != EEXIST) break;
     }
     if (!file) return {errno, std::generic_category()};

@@ -29,6 +29,29 @@ static std::string contents(const fs::path& path) {
     return {std::istreambuf_iterator<char>(file), {}};
 }
 
+static int test_exclusive_creation(const fs::path& dir) {
+    const auto staged = dir / fs::path(u8"staged_\u00e9_\u4e2d.bin");
+    const std::string bytes("exclusive\0data\r\n", 16);
+    std::FILE* file = pipeline_cache_file_detail::create_exclusive(staged);
+    CHECK(file != nullptr);
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size());
+    CHECK(std::fclose(file) == 0);
+    CHECK(contents(staged) == bytes);
+
+    errno = 0;
+    std::FILE* collision = pipeline_cache_file_detail::create_exclusive(staged);
+    const int collision_error = errno;
+    if (collision) std::fclose(collision);
+    CHECK(collision == nullptr && collision_error == EEXIST);
+    CHECK(contents(staged) == bytes);
+
+    const auto missing = dir / "missing" / "stage.bin";
+    CHECK(pipeline_cache_file_detail::create_exclusive(missing) == nullptr);
+    CHECK(!fs::exists(missing));
+    CHECK(fs::remove(staged));
+    return 0;
+}
+
 static int test_checkpoint(const fs::path& dir) {
     const auto cache = dir / "cache.bin";
     const auto partial = dir / "cache.bin.partial";
@@ -77,7 +100,8 @@ int main() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto dir = fs::temp_directory_path() / ("leonida_pipeline_cache_" + std::to_string(stamp));
     CHECK(fs::create_directory(dir));
-    const int result = test_checkpoint(dir);
+    const int creation_result = test_exclusive_creation(dir);
+    const int result = creation_result ? creation_result : test_checkpoint(dir);
     fs::remove_all(dir);
     return result;
 }
