@@ -366,10 +366,15 @@ int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* sta
 
 [[noreturn]] void finish_run(int code) {
     if (g_exit_tid) {
+        // The caller is parked on g_release_exit, so it is alive and its id still names it: when end_run could not
+        // duplicate its handle, open one by id before releasing it.
+        const HANDLE caller = g_exit_thread ? g_exit_thread : OpenThread(SYNCHRONIZE, FALSE, g_exit_tid);
         SetEvent(g_release_exit);
-        // Normally ExitProcess kills this host thread. If the caller died unexpectedly, retain the exit code.
-        if (g_exit_thread) WaitForSingleObject(g_exit_thread, INFINITE);
-        else for (;;) Sleep(INFINITE);  // handle duplication failed; retain the live caller's TLS, never race it
+        // Normally the caller's native ExitProcess kills this host thread before any DLL_PROCESS_DETACH runs, so this
+        // wait never bounds a detach (native ExitProcess does not either). If the caller died unexpectedly, retain
+        // the exit code.
+        if (caller) WaitForSingleObject(caller, INFINITE);
+        else for (;;) Sleep(INFINITE);  // no handle at all; retain the live caller's TLS, never race it
     }
     ExitProcess(static_cast<UINT>(code));
 }
