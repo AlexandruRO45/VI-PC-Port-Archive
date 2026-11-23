@@ -99,7 +99,7 @@ ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 76, 86, 101 and 108. Slot 10 is intentionally
+// 78/79/80 (the Xbox slots above, at their configured indices), 55, 62, 67, 76, 86, 101 and 108. Slot 10 is intentionally
 // false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which
 // the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
