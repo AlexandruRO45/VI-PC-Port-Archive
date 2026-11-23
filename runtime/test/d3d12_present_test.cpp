@@ -170,6 +170,8 @@ VkResult next_present = VK_SUCCESS;      // armed: the next present that succeed
 int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
 bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
 bool fail_surface_create = false;        // armed: the next vkCreateWin32SurfaceKHR fails (recreation after a loss)
+VkResult fail_next_caps = VK_SUCCESS;    // armed: the next vkGetPhysicalDeviceSurfaceCapabilitiesKHR fails
+VkResult fail_next_create_swapchain = VK_SUCCESS;  // armed: the next vkCreateSwapchainKHR fails
 unsigned surface_creations = 0;          // vkCreateWin32SurfaceKHR successes through the double
 bool observe_next_swapchain = false;
 bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
@@ -235,6 +237,11 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapcha
         observed_old_swapchain = info->oldSwapchain;
         observe_next_swapchain = false;
     }
+    if (fail_next_create_swapchain != VK_SUCCESS) {
+        const VkResult failure = fail_next_create_swapchain;
+        fail_next_create_swapchain = VK_SUCCESS;
+        return failure;
+    }
     const VkResult result = real_create_swapchain(device, info, allocator, out);
     if (result == VK_SUCCESS) last_created_swapchain = *out;
     return result;
@@ -242,6 +249,11 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapcha
 
 VKAPI_ATTR VkResult VKAPI_CALL get_surface_capabilities(VkPhysicalDevice physical, VkSurfaceKHR surface,
                                                         VkSurfaceCapabilitiesKHR* caps) {
+    if (fail_next_caps != VK_SUCCESS) {
+        const VkResult failure = fail_next_caps;
+        fail_next_caps = VK_SUCCESS;
+        return failure;
+    }
     const VkResult result = real_get_caps(physical, surface, caps);
     if (result == VK_SUCCESS && report_undefined_extent && caps) {
         caps->currentExtent.width = 0xFFFFFFFF;
@@ -548,6 +560,32 @@ int main() {
         driver::fail_surface_create = false;
         EXPECT(frame(0));                                              // surfaceable again: recover
         EXPECT(presenter->presented() == before + 1);
+
+        // Surface lost during swapchain recreation (recreate()): on a capability query after an out-of-date present
+        // and on vkCreateSwapchainKHR itself during a vsync switch. Both must retire the dead surface, keep
+        // rendering to nothing for that frame, and remake the surface on the next present.
+        EXPECT(frame(0, [] { driver::next_present = VK_ERROR_OUT_OF_DATE_KHR; }));
+        surfaces_before = driver::surface_creations;
+        before = presenter->presented();
+        EXPECT(frame(0, [] { driver::fail_next_caps = VK_ERROR_SURFACE_LOST_KHR; }));
+        EXPECT(presenter->presented() == before);
+        EXPECT(!presented_image_is_clear_colour());
+        EXPECT(driver::surface_creations == surfaces_before);
+        EXPECT(frame(0));
+        EXPECT(driver::surface_creations == surfaces_before + 1);
+        EXPECT(presenter->presented() == before + 1);
+        EXPECT(presented_image_is_clear_colour());
+
+        surfaces_before = driver::surface_creations;
+        before = presenter->presented();
+        EXPECT(frame(1, [] { driver::fail_next_create_swapchain = VK_ERROR_SURFACE_LOST_KHR; }));
+        EXPECT(presenter->presented() == before);
+        EXPECT(!presented_image_is_clear_colour());
+        EXPECT(driver::surface_creations == surfaces_before);
+        EXPECT(frame(0));
+        EXPECT(driver::surface_creations == surfaces_before + 1);
+        EXPECT(presenter->presented() == before + 1);
+        EXPECT(presented_image_is_clear_colour());
 
         std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
                     "released and retried, a failed blit submission recovered, undefined surface extent resolved "

@@ -445,7 +445,7 @@ private:
         if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_ || want_hdr != swapchain_hdr_req_) {
             // The swapchain's colour encoding is only recorded once the new swapchain exists, so a failed
             // recreate is tried again at the next present.
-            if (!recreate(vsync, srgb, want_hdr)) return VK_ERROR_OUT_OF_DATE_KHR;
+            if (!recreate(vsync, srgb, want_hdr)) return surface_lost_ ? VK_SUCCESS : VK_ERROR_OUT_OF_DATE_KHR;
         }
         if (!swapchain_) {  // minimised: try again next frame
             stale_ = true;
@@ -465,7 +465,7 @@ private:
         std::uint32_t image = 0;
         VkResult acquired = acquire(frame.acquired, &image);
         if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
-            if (!recreate(vsync, swapchain_srgb_, swapchain_hdr_req_)) return acquired;
+            if (!recreate(vsync, swapchain_srgb_, swapchain_hdr_req_)) return surface_lost_ ? VK_SUCCESS : acquired;
             if (!swapchain_) {  // minimised since the last present: skipped, as above
                 captured_ = false;
                 return VK_SUCCESS;
@@ -997,6 +997,11 @@ private:
         captured_ = false;
     }
 
+    bool check_surface_query(VkResult result) {
+        if (result == VK_ERROR_SURFACE_LOST_KHR) mark_surface_lost();
+        return result == VK_SUCCESS;
+    }
+
     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
     // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
     // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
@@ -1010,7 +1015,7 @@ private:
         stale_ = true;  // until this succeeds
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
-        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
+        if (!check_surface_query(vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps))) return false;
         VkExtent2D extent = caps.currentExtent;
         // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
         // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
@@ -1050,10 +1055,11 @@ private:
         if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
         std::uint32_t count = 0;
-        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
+        if (!check_surface_query(vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr)) || !count)
             return false;
         std::vector<VkSurfaceFormatKHR> formats(count);
-        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data()) != VK_SUCCESS || !count)
+        if (!check_surface_query(vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data())) ||
+            !count)
             return false;
         formats.resize(count);
         // An sRGB source wants an sRGB swapchain (the blit decodes and encodes, which cancel); any other source
@@ -1100,10 +1106,13 @@ private:
                     break;
                 }
         }
-        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
+        if (!check_surface_query(vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr)) ||
+            !count)
             return false;
         std::vector<VkPresentModeKHR> modes(count);
-        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data()) != VK_SUCCESS || !count)
+        if (!check_surface_query(
+                vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data())) ||
+            !count)
             return false;
         modes.resize(count);
         VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;  // always available
@@ -1152,7 +1161,7 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             release(old);  // retired by the creation attempt, whether or not it succeeded
         }
-        if (created != VK_SUCCESS) return false;
+        if (!check_surface_query(created)) return false;
 
         std::vector<VkImage> images;
         std::vector<VkSemaphore> ready;
