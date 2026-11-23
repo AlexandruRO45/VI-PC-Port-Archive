@@ -142,7 +142,7 @@ magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 1
 (driver 621.24, Vulkan 1.4.357): **12,804/16,384 (0.781)** covered. Without `LEONIDA_FIRST_LIGHT_DIR`,
 `python -I tests/test_first_light.py -v` runs **46 tests: 42 passed, 4 skipped** (the 3 package-gated
 `FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`, and `test_harness_rejects_wrapped_tsharp_va_overflow` needs a
-built `vk_harness`; the 4 `OracleTests` and the other 6 `TexturedOracleTests` run without a package). With
+built `vk_harness`; the 4 `OracleTests` and the other 11 `TexturedOracleTests` run without a package). With
 `LEONIDA_FIRST_LIGHT_DIR` set against a local package run (and `vk_harness` built) none of the 46 is skipped.
 
 ```sh
