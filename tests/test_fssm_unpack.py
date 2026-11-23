@@ -280,7 +280,7 @@ class TestXbchContainerCarvingAndUnpack(unittest.TestCase):
         bad_blob = b"XBCH" + bytes(8)
         dxil = make_xdat({0x0D: bad_blob})
         dxbc = make_dxbc([(b"DXIL", dxil)])
-        with self.assertRaises(struct.error):
+        with self.assertRaisesRegex(ValueError, "truncated XBCH header"):
             fssm_unpack.unpack(dxbc)
 
     def test_unpack_size_mismatch_raises_value_error(self):

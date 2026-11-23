@@ -48,6 +48,8 @@ MAX_FSSM_BYTES = 64 << 20
 def parts(d: bytes) -> dict:
     if len(d) < 32:
         raise ValueError("truncated DXBC header")
+    if d[:4] != b"DXBC":
+        raise ValueError(f"invalid DXBC magic {d[:4]!r}")
     count = struct.unpack_from("<I", d, 28)[0]
     table_end = 32 + 4 * count
     if table_end > len(d):
@@ -97,6 +99,8 @@ def _inflate_xbch(blob: bytes):
     """Decompress one XBCH entry payload to its FSSM blob, or None when it is not XBCH."""
     if not blob or blob[:4] != b"XBCH":
         return None
+    if len(blob) < 24:
+        raise ValueError("truncated XBCH header")
     stored = struct.unpack_from("<I", blob, 8)[0]
     unpacked = struct.unpack_from("<I", blob, 16)[0]
     if unpacked > MAX_FSSM_BYTES:
