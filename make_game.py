@@ -69,7 +69,7 @@ if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an old
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
-from mc_command import mc_command  # noqa: E402
+from mc_command import mc_command, split_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -271,11 +271,20 @@ def py(tool: str, *args) -> None:
 
 
 def tool_available(cmd: str) -> bool:
-    """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'."""
-    cmd = cmd.strip().strip('"')
+    """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'.
+
+    The command line goes through mc_command's split_command (the MSVC quoting rules), so a quoted executable
+    with spaces and arguments, `"C:\\Program Files\\...\\llvm-mc.exe" --flag`, is detected by its full path,
+    not by the `C:\\Program` a plain split() leaves as the head.
+    """
+    cmd = cmd.strip()
     if os.path.isfile(cmd):
         return True
-    head = cmd.split()[0].strip('"') if cmd.split() else ""
+    try:
+        parts = split_command(cmd)
+    except SystemExit:              # an invalid command line is not an available tool
+        return False
+    head = parts[0] if parts else ""
     return bool(head and (shutil.which(head) or os.path.isfile(head)))
 
 

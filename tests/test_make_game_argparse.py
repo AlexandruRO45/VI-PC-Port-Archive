@@ -652,6 +652,18 @@ class ToolAvailableTest(unittest.TestCase):
         self.assertTrue(make_game.tool_available(sys.executable))
         self.assertTrue(make_game.tool_available(f'"{sys.executable}"'))
 
+    def test_a_quoted_executable_with_spaces_and_arguments_is_true(self):
+        # a plain split() takes "C:\\Program" as the head and misses the executable after it
+        tmp = tempfile.mkdtemp(prefix="tool av ")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        exe = os.path.join(tmp, "demo tool.exe")
+        with open(exe, "w") as f:
+            f.write("x")
+        self.assertTrue(make_game.tool_available(f'"{exe}" --flag'))
+        self.assertTrue(make_game.tool_available(f'"{exe}"'))
+        with patch("shutil.which", return_value=None):
+            self.assertFalse(make_game.tool_available(os.path.join(tmp, "nope tool.exe") + " --flag"))
+
     def test_command_head_on_path_is_true(self):
         with patch("shutil.which", return_value="/bin/custom-tool"):
             self.assertTrue(make_game.tool_available("custom-tool -v"))
