@@ -158,6 +158,13 @@ class Api(unittest.TestCase):
         report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, rebar=False)
         self.assertIn("Resizable BAR is disabled", report.rebar_note)
         self.assertIn("Resizable BAR is disabled", report.as_text())
+        self.assertNotIn("not supported", report.rebar_note)
+
+    def test_rebar_advisory_pre_turing_tail(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce GTX 1070 (8 GB VRAM)", 32, rebar=False)
+        self.assertIn("Resizable BAR is disabled", report.rebar_note)
+        self.assertIn("(not supported on GTX 10-series / pre-Turing)", report.rebar_note)
 
     def test_no_rebar_advisory_when_enabled(self):
         c = pc.SpecChecker(XBOX)

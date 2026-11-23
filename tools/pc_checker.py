@@ -713,9 +713,10 @@ class SpecChecker:
         m = re.search(r"\((\d+)\s*GB\s*VRAM\)", gpu)
         vram_gb = int(m.group(1)) if m else None
         if vram_gb is not None and vram_gb <= 8 and rebar is False:
+            tail = " (not supported on GTX 10-series / pre-Turing)" if re.search(r"\bgtx\s*(10\d{2}|9\d{2}|[1-8]\d{2})\b", gpu, re.I) else ""
             rebar_note = (
-                "Tip: Resizable BAR is disabled (BAR1 <= 256 MiB). Enabling Resizable BAR / SAM in UEFI "
-                "prevents severe PCIe latency penalties (16x-269x) on bindless descriptor lookups and texture streaming."
+                f"Tip: Resizable BAR is disabled (BAR1 <= 256 MiB). Enabling Resizable BAR / SAM in UEFI "
+                f"prevents severe PCIe latency penalties (16x-269x) on bindless descriptor lookups and texture streaming.{tail}"
             )
         return Report(self.profile, headline, summary, [Check(*r) for r in rows], rebar_note=rebar_note)
 
