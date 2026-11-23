@@ -722,10 +722,14 @@ struct ShaderEntry {
 
 class ShaderLibrary {
 public:
-    // Reads <dir>/index.json, then <dir>/fspx/index.json when it is there (make_game.py translates the FidelityFX
-    // DLL's FSPX programs into that folder; their entries are named "fspx/<name>"). Entries with neither
-    // fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The fspx folder is optional: a
-    // missing or unreadable index there leaves the main one loaded.
+    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates outside the game's shader
+    // entries, each when it is there:
+    //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
+    //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
+    //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
+    //     like the FSPX ones (docs/shader_library.md).
+    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
+    // are optional: a missing or unreadable index there leaves the main one, and the other folders', loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -737,18 +741,23 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        try {
-            const auto ignore = [](const std::string&) { return false; };
-            if (std::ifstream(dir / "fspx/index.json", std::ios::binary)) load_index(dir / "fspx", "fspx/", ignore);
-        } catch (...) {
+        for (const char* folder : {"fspx", "library"}) {
+            try {
+                const auto ignore = [](const std::string&) { return false; };
+                const std::filesystem::path sub = dir / folder;
+                if (std::ifstream(sub / "index.json", std::ios::binary))
+                    load_index(sub, std::string(folder) + "/", ignore);
+            } catch (...) {
+            }
         }
         return true;
     }
 
     bool loaded() const { return !dir_.empty(); }
     std::size_t size() const { return count_; }
-    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
-    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
+    // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
+    // entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
@@ -915,7 +924,7 @@ private:
             e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
-            if (by_fspx && prefix == "fspx/") ++fspx_count_;
+            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
             ++count_;
         }
         return true;
