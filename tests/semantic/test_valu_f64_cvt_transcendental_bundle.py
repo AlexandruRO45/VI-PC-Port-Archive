@@ -459,6 +459,28 @@ class VRcpF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 0, res)
         self.assertEqual(wave.get_f64(0, 0), f64_to_u64(0.125))
 
+class VRcpF64SimdIeeeTests(unittest.TestCase):
+    def test_rcp_f64_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x00FF00FF
+        for i in range(32):
+            wave.set_f64(i, 0, 0x123456789ABCDEF0)
+            if (wave.exec_mask >> i) & 1:
+                denom = float(i + 1)
+                wave.set_f64(i, 0, oracle_rcp_f64(f64_to_u64(denom)))
+        for i in range(32):
+            if (0x00FF00FF >> i) & 1:
+                self.assertEqual(wave.get_f64(i, 0), f64_to_u64(1.0 / float(i + 1)))
+            else:
+                self.assertEqual(wave.get_f64(i, 0), 0x123456789ABCDEF0)
+
+    def test_rcp_f64_boundary_extremes(self):
+        # Very large float underflows to +0.0
+        self.assertEqual(oracle_rcp_f64(F64_MAX_NORMAL), f64_to_u64(1.0 / u64_to_f64(F64_MAX_NORMAL)))
+        # Very small normal inverts to large number
+        res = oracle_rcp_f64(F64_MIN_NORMAL)
+        self.assertTrue(u64_to_f64(res) > 1e300)
+
 
 if __name__ == "__main__":
     unittest.main()
