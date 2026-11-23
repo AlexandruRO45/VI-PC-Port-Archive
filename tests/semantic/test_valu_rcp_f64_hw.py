@@ -551,5 +551,55 @@ class TestValuRcpF64SIMD(unittest.TestCase):
             else:
                 self.assertEqual(state.get_vgpr64(lane, 0), 0)
 
+# ---------------------------------------------------------------------------
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestValuRcpF64Aliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_inplace_dst_equals_src(self) -> None:
+        """In-place reciprocal: v_rcp_f64 v[0:1], v[0:1]."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        # v[0:1] = 2.0
+        state.set_vgpr64(0, f64_to_u64(2.0))
+        inst = ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[0:1]")
+        res = interp.step(inst, state)
+
+        # v[0:1] becomes 0.5
+        self.assertEqual(res, f64_to_u64(0.5))
+        self.assertEqual(state.get_vgpr64(0), f64_to_u64(0.5))
+
+    def test_alias_partial_overlap_high_to_low(self) -> None:
+        """Partial overlap: vdst is v[0:1], vsrc is v[1:2]."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        # Setup v[1:2] with 2.0
+        val_2_0 = f64_to_u64(2.0)
+        state.set_vgpr64(1, val_2_0)
+
+        inst = ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[1:2]")
+        res = interp.step(inst, state)
+
+        # Latching source before writeback ensures correct result
+        self.assertEqual(res, f64_to_u64(0.5))
+        self.assertEqual(state.get_vgpr64(0), f64_to_u64(0.5))
+
+    def test_translator_aliased_inplace_translation(self) -> None:
+        """Verify support.translate_lines cleanly translates in-place v_rcp_f64 v[0:1], v[0:1]."""
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0x40000000",
+            "v_rcp_f64 v[0:1], v[0:1]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rcp_f64_alias", lines)
+        self.assertIn("OpCapability Float64", spv)
+        self.assertIn("OpFDiv %double", spv)
+
 if __name__ == "__main__":
     unittest.main()
