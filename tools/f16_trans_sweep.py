@@ -244,18 +244,23 @@ def mode_word(m):
             m.get("denorm16_64", 3) << 6 | m.get("dx10_clamp", 1) << 8 | m.get("ieee", 1) << 9)
 
 
+def words_of(res, n):
+    """True when one runner result is a list of exactly n int words (not a rejection string, None or other junk)."""
+    return isinstance(res, list) and len(res) == n and all(isinstance(w, int) for w in res)
+
+
 def check_modes(oracle, modes):
     from hw_oracle import asm
     body = ["s_getreg_b32 s4, hwreg(HW_REG_MODE, 0, 32)", "v_mov_b32 v1, s4", "v_mov_b32 v20, 0",
             f"{STORE32[asm.family(oracle.arch)]} v20, v1, s[2:3]", "s_endpgm"]
     kernels = [asm.Kernel(body, w, 1, 1, raw=True, mode=MODES[m]) for m in modes for w in (32, 64)]
     got = oracle.run(kernels, words=1)
-    if got is None or len(got) != len(kernels):
-        raise RuntimeError(f"MODE probe: the hardware runner returned {0 if got is None else len(got)} results "
-                           f"for {len(kernels)} kernels")
+    if not isinstance(got, list) or len(got) != len(kernels):
+        n = len(got) if isinstance(got, list) else type(got).__name__
+        raise RuntimeError(f"MODE probe: the hardware runner returned {n} results for {len(kernels)} kernels")
     for k, (m, w) in enumerate((m, w) for m in modes for w in (32, 64)):
         res = got[k]
-        if res is None or isinstance(res, str) or len(res) != 1 or res[0] & 0x3FF != mode_word(MODES[m]):
+        if not words_of(res, 1) or res[0] & 0x3FF != mode_word(MODES[m]):
             raise RuntimeError(f"MODE probe: {m} wave{w} reads back {res!r}, expected "
                                f"0x{mode_word(MODES[m]):x}; the kernel descriptor's float mode was not applied")
 
@@ -266,13 +271,21 @@ def sweep(oracle, op, mode, wave):
     kernels = [asm.Kernel(kernel_lines(op, j * PER_KERNEL, oracle.arch), wave, THREADS, PER_KERNEL // 2, raw=True,
                           mode=MODES[mode]) for j in range(65536 // PER_KERNEL)]
     got = oracle.run(kernels, words=PER_KERNEL // 2)
-    if got is None or len(got) != len(kernels):
-        raise RuntimeError(f"{op} {mode} wave{wave}: the hardware runner returned "
-                           f"{0 if got is None else len(got)} results for {len(kernels)} kernels")
+    if not isinstance(got, list) or len(got) != len(kernels):
+        n = len(got) if isinstance(got, list) else type(got).__name__
+        raise RuntimeError(f"{op} {mode} wave{wave}: the hardware runner returned {n} results "
+                           f"for {len(kernels)} kernels")
     out = []
     for j, words in enumerate(got):
-        if words is None or isinstance(words, str) or len(words) != PER_KERNEL // 2:
-            detail = "no result" if words is None else words if isinstance(words, str) else len(words)
+        if not words_of(words, PER_KERNEL // 2):
+            if isinstance(words, str):
+                detail = words
+            elif not isinstance(words, list):
+                detail = f"the hardware runner returned {words!r}"
+            elif len(words) != PER_KERNEL // 2:
+                detail = f"{len(words)} words"
+            else:
+                detail = f"word {next(w for w in words if not isinstance(w, int))!r} is not an int"
             raise RuntimeError(f"{op} {mode} wave{wave} kernel {j}: {detail}")
         for w in words:
             out += [w & 0xFFFF, w >> 16]

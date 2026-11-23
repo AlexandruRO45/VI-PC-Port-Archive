@@ -252,6 +252,12 @@ class Cli(unittest.TestCase):
             [None, [good_word]],
             [[], [good_word]],
             [[good_word, good_word], [good_word]],
+            5,
+            iter([[good_word], [good_word]]),
+            ([good_word], [good_word]),
+            [[None], [good_word]],
+            [[float(good_word)], [good_word]],
+            [[f"{good_word:x}"], [good_word]],
         ]
         for ret in bad_returns:
             with self.subTest(ret=ret), tempfile.TemporaryDirectory() as d:
@@ -277,6 +283,11 @@ class Cli(unittest.TestCase):
             ("extra_list", [list(good_kernel) for _ in range(n_kernels + 1)]),
             ("none_entry", [None] + [list(good_kernel) for _ in range(n_kernels - 1)]),
             ("short_words", [[0] * (words_per_kernel - 1)] + [list(good_kernel) for _ in range(n_kernels - 1)]),
+            ("int_list", 5),
+            ("generator", iter([list(good_kernel) for _ in range(n_kernels)])),
+            ("none_word", [[None] * words_per_kernel] + [list(good_kernel) for _ in range(n_kernels - 1)]),
+            ("float_words", [[0.0] * words_per_kernel] + [list(good_kernel) for _ in range(n_kernels - 1)]),
+            ("hex_words", [["0"] * words_per_kernel] + [list(good_kernel) for _ in range(n_kernels - 1)]),
         ]
         for label, ret in bad_returns:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
