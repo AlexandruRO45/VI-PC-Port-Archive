@@ -228,5 +228,43 @@ class TestMinF16SIMDAndIEEE(unittest.TestCase):
         self.assertEqual(ref_min_f16(NEG_INF16, f16_to_bits(-100.0)), NEG_INF16)
 
 
+# ------------------------------------------------------------------------------
+# v_min_f16 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import support
+import rdna2spirv
+
+
+class TestMinF16HardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 256)
+
+    def test_hardware_translator_execution(self):
+        cases = [
+            (f16_to_bits(1.0), f16_to_bits(2.0), f16_to_bits(1.0)),
+            (f16_to_bits(-3.0), f16_to_bits(1.0), f16_to_bits(-3.0)),
+            (POS_ZERO16, NEG_ZERO16, NEG_ZERO16),
+            (QNAN16, f16_to_bits(1.0), f16_to_bits(1.0)),
+            (POS_INF16, f16_to_bits(10.0), f16_to_bits(10.0)),
+        ]
+        for s0, s1, expected in cases:
+            prog = [
+                "v_mov_b32 v0, 0",
+                f"v_mov_b32 v1, {s0:#x}",
+                f"v_mov_b32 v2, {s1:#x}",
+                "v_min_f16 v0, v1, v2",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_min_f16_hw", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on min_f16({s0:#x}, {s1:#x})")
+
+
 if __name__ == '__main__':
     unittest.main()
