@@ -421,6 +421,12 @@ class CliTest(unittest.TestCase):
                 finally:
                     sys.stderr = saved
 
+    def test_deeply_nested_names_json_is_one_line(self):
+        bad = os.path.join(self.tmp.name, "deep.json")
+        with open(bad, "w", encoding="utf-8", newline="\n") as f:
+            f.write("[" * 50_000 + "]" * 50_000)
+        self.fails_with_one_line([self.names, "--names", bad])
+
 
 if __name__ == "__main__":
     unittest.main()

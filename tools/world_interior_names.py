@@ -229,7 +229,10 @@ def load_names(path):
 
     Raises ValueError (with OSError and json.JSONDecodeError, which is one) when the file is not such a table."""
     with open(path, encoding="utf-8") as f:
-        doc = json.load(f, object_pairs_hook=_pairs)
+        try:
+            doc = json.load(f, object_pairs_hook=_pairs)
+        except RecursionError as exc:
+            raise ValueError(f"JSON nesting too deep ({exc})") from None
     if not isinstance(doc, dict):
         raise ValueError(f"expected a JSON object, found {_json_type(doc)}")
     section = doc.get("InteriorNames", doc)
