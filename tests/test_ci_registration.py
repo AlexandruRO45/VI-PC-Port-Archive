@@ -120,11 +120,14 @@ def git_bash():
 def tracked_under_tests(root):
     try:
         result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
-        if result.returncode == 0:
+        # An empty listing is not trusted either. For a folder that only sits inside another repository (a .git in
+        # the home folder makes every temporary folder one) git answers 0 and lists nothing, and the scan then saw
+        # no test file at all.
+        if result.returncode == 0 and result.stdout:
             return [n for n in result.stdout.split("\0") if n]
     except OSError:
         pass
-    names = []                                     # no git: walk, as tests/test_docs_links.py does
+    names = []                                     # no git, or no listing: walk, as tests/test_docs_links.py does
     for base, dirs, files in os.walk(os.path.join(root, "tests")):
         dirs[:] = [d for d in dirs if d not in (".git", "third_party", "__pycache__")]
         for name in files:
@@ -338,8 +341,17 @@ class RepositoryRegistrationTest(unittest.TestCase):
     def test_the_scan_falls_back_when_git_is_missing(self):
         with mock.patch("subprocess.run", side_effect=FileNotFoundError("git")):
             files = tracked_under_tests(ROOT)
-            self.assertGreaterEqual(len(files), 300)
-            self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
+        self.assertGreaterEqual(len(files), 300)
+        self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
+
+    def test_the_scan_falls_back_when_git_lists_nothing(self):
+        # A folder that only sits inside another repository: git answers 0 and lists nothing, which must not read
+        # as a repository without test files. In a temporary folder it made the scan below raise KeyError.
+        done = subprocess.CompletedProcess(["git", "ls-files"], 0, stdout="")
+        with mock.patch("subprocess.run", return_value=done):
+            files = tracked_under_tests(ROOT)
+        self.assertGreaterEqual(len(files), 300)
+        self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
 
     def test_every_test_file_is_selected_by_a_job(self):
         unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]
