@@ -180,6 +180,24 @@ class TestSSubI32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x7FFFFFFF)
 
+def ref_s_add_u32(src0: int, src1: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_add_u32 -> (res, scc_carry)."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    total = s0 + s1
+    res = total & MASK32
+    carry = 1 if total >= 0x100000000 else 0
+    return res, carry
+
+
+class TestSAddU32Oracle(unittest.TestCase):
+    def test_basic_addition(self) -> None:
+        self.assertEqual(ref_s_add_u32(100, 200), (300, 0))
+
+    def test_carry_out(self) -> None:
+        self.assertEqual(ref_s_add_u32(0xFFFFFFFF, 1), (0, 1))
+        self.assertEqual(ref_s_add_u32(0xFFFFFFFF, 0xFFFFFFFF), (0xFFFFFFFE, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
