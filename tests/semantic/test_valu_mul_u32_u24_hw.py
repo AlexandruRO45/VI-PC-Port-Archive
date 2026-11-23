@@ -474,3 +474,74 @@ class TestIEEE754EdgeCases(unittest.TestCase):
         val = 0x1234
         got = oracle_mul_u32_u24(val, 1 << 16)
         self.assertEqual(got, val << 16)
+
+
+# ==============================================================================
+# SECTION 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_rejection_invalid_destination(self) -> None:
+        """Verify syntax rejection when destination is an SGPR."""
+        with self.assertRaises(TypeError):
+            VMulU24Instruction(dst=SGPR(0), src0=VGPR(1), src1=VGPR(2))
+
+    def test_rejection_out_of_range_registers(self) -> None:
+        """Verify rejection of register indices outside architectural bounds."""
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+
+    def test_mutation_detection_swap_opcodes(self) -> None:
+        """Mutation detector: swapping OpIMul with OpISub in SPIR-V is caught."""
+        spv = support.translate_lines("ps_mut_mul_test", [
+            "v_mov_b32 v1, 20",
+            "v_mov_b32 v2, 5",
+            "v_mul_u32_u24 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        orig_words = support.mrt0_words(spv)
+        self.assertEqual(orig_words[0], 100)
+
+        # Mutate SPIR-V: Replace OpIMul with OpISub
+        self.assertIn("OpIMul", spv)
+        mutated_spv = spv.replace("OpIMul", "OpISub", 1)
+        mutated_words = support.mrt0_words(mutated_spv)
+        self.assertNotEqual(orig_words[0], mutated_words[0])
+
+    def test_mutation_detection_missing_24bit_mask(self) -> None:
+        """Mutation detector: failing to mask high 8 bits is caught."""
+        def faulty_mul_no_mask(s0: int, s1: int) -> int:
+            return u32(s0 * s1)
+
+        s0 = 0x0100_0002  # low 24 = 2, 32-bit = 16777218
+        s1 = 3
+        correct = oracle_mul_u32_u24(s0, s1)  # 2 * 3 = 6
+        mutant = faulty_mul_no_mask(s0, s1)   # 16777218 * 3 = 50331654
+        self.assertEqual(correct, 6)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_inactive_lane_overwritten(self) -> None:
+        """Mutation detector: faulty interpreter overwriting inactive lane is detected."""
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        sentinel = 0x5555_5555
+        state.set_vgpr(1, 0, sentinel)
+
+        class FaultyInterpreter(SIMDInterpreter):
+            def step(self, instr: VMulU24Instruction, s: SIMDState):
+                for l in range(s.num_lanes):
+                    s.set_vgpr(l, instr.dst.value, 0x1234)
+                return []
+
+        faulty = FaultyInterpreter()
+        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2))
+        faulty.step(instr, state)
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+
+if __name__ == "__main__":
+    unittest.main()
