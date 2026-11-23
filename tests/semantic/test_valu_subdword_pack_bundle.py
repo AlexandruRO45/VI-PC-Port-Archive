@@ -290,6 +290,19 @@ class TestPermLaneX16Aliasing(unittest.TestCase):
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
         self.assertIn("OpBitwiseXor", spv)
 
+class TestPermLaneX16Selectors(unittest.TestCase):
+    def test_sgpr_sources(self):
+        code = [
+            "v_mov_b32_e32 v2, 600",
+            "s_mov_b32 s12, 0",
+            "s_mov_b32 s13, 0",
+            "v_permlanex16_b32 v4, v2, s12, s13",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_px16_sgprs", code, fssm=saveexec_run.fssm())
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+        self.assertIn("OpBitwiseXor", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
