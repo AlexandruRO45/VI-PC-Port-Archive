@@ -261,11 +261,21 @@ def ci_test_files():
     return found
 
 
+OUTPUT_TAIL = 1 << 16            # bytes of a test's output read back; the counters and the verdict are at its end
+
+
 def run_one_test(rel, timeout):
     t0 = time.monotonic()
     try:
-        r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, rel)], cwd=ROOT, capture_output=True, timeout=timeout)
-        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        # The output is spooled to a temporary file instead of a pipe: capture_output kept a whole chatty test's
+        # output in memory (16.8 MB for 8 MiB printed). Only the tail is needed — unittest prints "Ran N tests"
+        # and the OK/FAILED line last, and the failure detail is the scrubbed last line.
+        with tempfile.TemporaryFile() as sink:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, rel)], cwd=ROOT,
+                               stdout=sink, stderr=subprocess.STDOUT, timeout=timeout)
+            size = sink.seek(0, os.SEEK_END)
+            sink.seek(max(0, size - OUTPUT_TAIL))
+            out = sink.read().decode("utf-8", "replace")
         skipped = re.search(r"^OK \(skipped=(\d+)\)\r?$", out, re.M)
         res = "pass" if r.returncode == 0 else "fail"
         tail = "" if res == "pass" else scrub(out)
