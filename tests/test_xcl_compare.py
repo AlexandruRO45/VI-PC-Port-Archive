@@ -82,6 +82,59 @@ class Report(unittest.TestCase):
         self.assertEqual(r["differences"], 1)
 
 
+class ReportPath(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.xcl = self.root / "reference"
+        build = self.xcl / "target" / "release"
+        build.mkdir(parents=True)
+        self.runtime = self.root / "gta6rt.exe"
+        self.debugger = self.root / "cdb.exe"
+        self.work = self.root / "work"
+        self.binaries = [build / name for name in ("xcl.exe", "xcl_testtitle.exe", "testgame_mw.dll")]
+        self.binaries.extend((self.runtime, self.debugger))
+        for path in self.binaries:
+            path.write_bytes(b"synthetic input")
+
+    def reject(self, out):
+        args = argparse.Namespace(xcl=str(self.xcl), gta6rt=str(self.runtime), cdb=str(self.debugger),
+                                  work=str(self.work), out=str(out), timeout=1, skip=[], max_restarts=0)
+        with mock.patch.object(xc, "prepare_game", side_effect=AssertionError("started runtime setup")) as prepare:
+            with self.assertRaisesRegex(SystemExit, r"--out .*would overwrite"):
+                xc.run_all(args, Sink())
+        prepare.assert_not_called()
+
+    def test_report_cannot_replace_a_binary(self):
+        for path in self.binaries:
+            with self.subTest(path=path.name):
+                self.reject(path)
+                self.assertEqual(path.read_bytes(), b"synthetic input")
+                self.assertFalse(self.work.exists())
+
+    def test_report_cannot_replace_a_transcript(self):
+        for name in ("xcl_output.txt", "leonida_output.txt"):
+            with self.subTest(name=name):
+                self.reject(self.work / name)
+                self.assertFalse(self.work.exists())
+        self.work.mkdir(exist_ok=True)
+        transcript = self.work / "xcl_output.txt"
+        transcript.write_bytes(b"previous transcript")
+        self.reject(transcript)
+        self.assertEqual(transcript.read_bytes(), b"previous transcript")
+
+    def test_report_cannot_replace_a_hard_link_to_a_binary(self):
+        alias = self.root / "report.json"
+        try:
+            os.link(self.runtime, alias)
+        except OSError as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        self.reject(alias)
+        self.assertTrue(os.path.samefile(self.runtime, alias))
+        self.assertFalse(self.work.exists())
+
+
 class Transcript(unittest.TestCase):
     """run_title streams the title's output to the transcript file and keeps none of it on the Run."""
 

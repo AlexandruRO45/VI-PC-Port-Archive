@@ -38,6 +38,9 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tools"))
+from report_paths import same_report_path  # noqa: E402
+
 CDB_DEFAULT = Path(r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe")
 STATUS_ORDER = ("PASS", "FAIL", "SKIP", "HANG", "NOT RUN")
 
@@ -237,12 +240,19 @@ def run_all(args, events):
     if work.drive.upper() == "D:":
         # XCL maps the console drive D: to the game folder, so a real D:\ path is not reachable inside it.
         raise SystemExit("--work is on D:, which XCL maps to the game folder; use a folder on another drive")
-    work.mkdir(parents=True, exist_ok=True)
+    out = Path(args.out) if args.out else work / "report.json"
     cdb = Path(args.cdb) if args.cdb else (CDB_DEFAULT if CDB_DEFAULT.is_file() else None)
+    transcripts = {"xcl": work / "xcl_output.txt", "leonida": work / "leonida_output.txt"}
+    protected = [*bins, gta6rt, *transcripts.values()]
+    if cdb is not None:
+        protected.append(cdb)
+    for path in protected:
+        if same_report_path(out, path):
+            raise SystemExit(f"--out {out} would overwrite {path}")
 
+    work.mkdir(parents=True, exist_ok=True)
     xcl, leo = Run("XCL"), Run("Leonida")
     events.put(("runs", xcl, leo))
-    transcripts = {"xcl": work / "xcl_output.txt", "leonida": work / "leonida_output.txt"}
     for path in transcripts.values():
         open(path, "w", encoding="utf-8", newline="\n").close()
 
@@ -280,7 +290,6 @@ def run_all(args, events):
             leo.set(name)
     report = make_report(xcl, leo, known, gta6rt, xcl_dir)
     report["transcripts"] = {k: str(v) for k, v in transcripts.items()}
-    out = Path(args.out) if args.out else work / "report.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
