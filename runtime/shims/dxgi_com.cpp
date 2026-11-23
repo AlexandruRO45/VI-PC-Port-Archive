@@ -225,8 +225,10 @@ public:
         if (parent_) parent_->Release();
     }
 
-    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {
+    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
+              VkFormat vk_fmt) {
         hwnd_ = hwnd;
+        if (fullscreen_desc) fullscreen_desc_ = *fullscreen_desc;
         flags_ = desc.Flags;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
@@ -324,7 +326,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fs, IDXGIOutput** out) override {
-        if (fs) *fs = FALSE;
+        if (fs) *fs = !fullscreen_desc_.Windowed;
         if (out) *out = nullptr;
         return S_OK;
     }
@@ -465,8 +467,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
-        std::memset(desc, 0, sizeof(*desc));
-        desc->Windowed = TRUE;
+        *desc = fullscreen_desc_;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
@@ -616,6 +617,8 @@ private:
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_{{0, 0}, DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
+                                                    DXGI_MODE_SCALING_UNSPECIFIED, TRUE};
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
     HANDLE waitable_ = nullptr;
@@ -1444,11 +1447,11 @@ public:
     // IDXGIFactory2
     BOOL STDMETHODCALLTYPE IsWindowedStereoEnabled() override { return FALSE; }
     HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
-                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput* restrict_to_output,
+                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, IDXGIOutput* restrict_to_output,
                                                      IDXGISwapChain1** out) override {
         if (out) *out = nullptr;
         if (const HRESULT hr = check_hwnd_swap_chain(device, hwnd, desc, out); FAILED(hr)) return hr;
-        return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
+        return create_swap_chain(device, hwnd, desc, fullscreen_desc, restrict_to_output, out);
     }
 
     // What the host runtime's DXGI refuses for a D3D12 swap chain on a window (dxgi_swapchain_test compares these,
@@ -1488,7 +1491,8 @@ public:
     // The swap chain itself, for a window or (through its HWND) a CoreWindow. The CoreWindow path keeps only these
     // checks: the host's rules for it (ASPECT_RATIO_STRETCH, for one) can't be compared without a real CoreWindow.
     HRESULT create_swap_chain(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
-                              IDXGIOutput* restrict_to_output, IDXGISwapChain1** out) {
+                              const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, IDXGIOutput* restrict_to_output,
+                              IDXGISwapChain1** out) {
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
@@ -1498,7 +1502,7 @@ public:
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
         if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
-        if (!sc->init(hwnd, *desc, vk_fmt)) {
+        if (!sc->init(hwnd, *desc, fullscreen_desc, vk_fmt)) {
             sc->Release();
             return E_FAIL;
         }
@@ -1528,7 +1532,7 @@ public:
         const HRESULT hr = interop->get_WindowHandle(&hwnd);
         interop->Release();
         if (FAILED(hr) || !hwnd) return DXGI_ERROR_INVALID_CALL;
-        return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
+        return create_swap_chain(device, hwnd, desc, nullptr, restrict_to_output, out);
     }
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE, LUID*) override { return E_NOTIMPL; }
     // Microsoft documents S_OK with a cookie for UnregisterStereoStatus (E_NOTIMPL is only the answer of the

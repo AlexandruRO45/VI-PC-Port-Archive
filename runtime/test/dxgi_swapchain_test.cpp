@@ -505,6 +505,34 @@ int main() {
         return fail("queue/alloc/cl/fence");
     cl->Close();
 
+    // Run before the host comparison, which can stop early under Wine.
+    {
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        desc.Width = 128;
+        desc.Height = 128;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        for (const BOOL windowed : {FALSE, TRUE}) {
+            const DXGI_SWAP_CHAIN_FULLSCREEN_DESC requested{{60, 1}, DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE,
+                                                            DXGI_MODE_SCALING_CENTERED, windowed};
+            IDXGISwapChain1* chain = nullptr;
+            if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &desc, &requested, nullptr, &chain)) || !chain)
+                return fail("CreateSwapChainForHwnd fullscreen descriptor");
+            DXGI_SWAP_CHAIN_FULLSCREEN_DESC actual{};
+            BOOL fullscreen = FALSE;
+            const HRESULT desc_hr = chain->GetFullscreenDesc(&actual);
+            const HRESULT state_hr = chain->GetFullscreenState(&fullscreen, nullptr);
+            chain->Release();
+            if (FAILED(desc_hr) || FAILED(state_hr) || actual.RefreshRate.Numerator != 60 ||
+                actual.RefreshRate.Denominator != 1 || actual.ScanlineOrdering != requested.ScanlineOrdering ||
+                actual.Scaling != requested.Scaling || actual.Windowed != windowed || fullscreen != !windowed)
+                return fail("CreateSwapChainForHwnd did not retain fullscreen descriptor");
+        }
+    }
+
     // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.
     const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
     if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
