@@ -4,8 +4,8 @@
 Detects the hardware automatically (the lists in the window are only a fallback).
 Standard library only; tkinter is needed for the window (Linux: python3-tk).
 
-    python -I tools/pc_checker.py              # window
-    python -I tools/pc_checker.py --cli        # text only
+    python -I tools/pc_checker.py              # detect and print the result
+    python -I tools/pc_checker.py --gui        # window
     python -I tools/pc_checker.py --check      # verdict as exit code: 0 good, 1 weak, 2 unknown
     python -I tools/pc_checker.py --check --json --warn
 
@@ -540,7 +540,7 @@ def _total_ram_bytes():
             return st.ullTotalPhys
         if sys.platform == "darwin":
             return int(_run(["sysctl", "-n", "hw.memsize"]))
-        with open("/proc/meminfo", encoding="ascii") as f:
+        with open("/proc/meminfo") as f:
             return int(f.readline().split()[1]) * 1024
     except Exception:
         return None
@@ -947,9 +947,10 @@ def run_cli(args):
     print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram)))
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Compare this PC with the Leonida reference specs")
-    ap.add_argument("--cli", action="store_true", help="text mode, no window")
+    ap.add_argument("--gui", action="store_true", help="open the window instead of printing")
+    ap.add_argument("--cli", action="store_true", help=argparse.SUPPRESS)  # old name, now the default
     ap.add_argument("--profile", type=int, default=1,
                     help="1 = Xbox Series X, 2 = community 1080p Low estimate")
     ap.add_argument("--cpu", help="override the detected CPU")
@@ -960,17 +961,20 @@ def main():
     ap.add_argument("--json", action="store_true", help="with --check: print JSON")
     ap.add_argument("--warn", action="store_true",
                     help="with --check: show a popup when the PC is weak")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.check:
         sys.exit(run_check(args))
-    if args.cli or tk is None:
-        if tk is None and not args.cli:
-            print("tkinter isn't available; using text mode.\n")
-        run_cli(args)
-    else:
-        run_gui()
+    if args.gui and not args.cli:
+        if tk is not None:
+            run_gui()
+            return
+        print("tkinter isn't available; using text mode.\n")
+    run_cli(args)
 
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(errors="replace")
+    # Detected hardware names can hold characters a Windows console can't encode.
+    # pythonw has no stdout at all, so check before reconfiguring.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     main()

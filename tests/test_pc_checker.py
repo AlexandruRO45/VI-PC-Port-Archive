@@ -153,6 +153,46 @@ class Api(unittest.TestCase):
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
 
+class Entry(unittest.TestCase):
+    ARGS = ["--cpu", "Ryzen 5 5600", "--gpu", "RTX 3070", "--ram", "32"]
+
+    def setUp(self):
+        self._gui, self._tk = pc.run_gui, pc.tk
+        self.opened = []
+        pc.run_gui = lambda: self.opened.append(True)
+
+    def tearDown(self):
+        pc.run_gui, pc.tk = self._gui, self._tk
+
+    def run_main(self, *extra):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pc.main(self.ARGS + list(extra))
+        return out.getvalue()
+
+    def test_no_window_by_default(self):
+        pc.tk = object()
+        self.assertIn("Looks good", self.run_main())
+        self.assertEqual(self.opened, [])
+
+    def test_gui_flag_opens_window(self):
+        pc.tk = object()
+        self.run_main("--gui")
+        self.assertEqual(self.opened, [True])
+
+    def test_gui_flag_without_tkinter_falls_back_to_text(self):
+        pc.tk = None
+        out = self.run_main("--gui")
+        self.assertIn("tkinter isn't available", out)
+        self.assertIn("Looks good", out)
+        self.assertEqual(self.opened, [])
+
+    def test_old_cli_flag_still_accepted(self):
+        pc.tk = object()
+        self.assertIn("Looks good", self.run_main("--cli"))
+        self.assertEqual(self.opened, [])
 
 if __name__ == "__main__":
     unittest.main()
