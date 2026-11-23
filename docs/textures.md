@@ -823,6 +823,13 @@ hdr1, hdr2                         n = hdr1 + 256*hdr2 + 257   (h3 = 1)
   the payload; once `n` bytes are consumed, the decoder shifts in up to 8 virtual zero
   bytes until `state >= L`, continues decoding, and requires the fragment to land on the
   exact home state `state == L`. The next fragment starts from `state = 0`.
+  `third_party/bcpack-rs` has no virtual zero bytes, so `rans::decode_slice` refuses a stream whose omitted zero comes
+  before a symbol (`NoProgress`) that the strict model accepts; `python -I tools/bcpack_model_count.py --game-dir GAME --work WORK`
+  counts, over the chunks of a game copy, which decoder accepts what (counts only; ASSET-519).
+  On version 1.0.2.1 (57 pools, 108,605 BCPack chunks of 1,026,833): the Rust decoder fully accepts all 108,605 (none refused,
+  none short), so no chunk needs the Python-only model; on a 1-in-50 sample (2,173 chunks, 135,504 fragments) both models
+  accept every chunk with 0 symbol disagreements, the Python model shifts virtual zero bytes in 2,084 of them, and no fragment
+  has width 9.
 - `flush = 0`: once `n` bytes are consumed and `state < L`, the next fragment header is
   read and decoding continues with the carried-over state under the new `(w, q)` model.
 - After all lanes finish, any remaining bytes in the chunk must be zero.
