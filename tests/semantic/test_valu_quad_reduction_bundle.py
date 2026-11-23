@@ -566,3 +566,37 @@ class TestPermB32SIMDAndProperties(unittest.TestCase):
             "v_perm_b32 v0, v1, v2, 0x00010203",
         ])
         self.assertEqual(val_swap, 0xD4C3B2A1)
+
+
+# ------------------------------------------------------------------------------
+# v_perm_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestPermB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 256)
+
+    def test_boundary_extremes_hardware(self):
+        # All 0x0C (zero) and all 0x0D (0xFF)
+        val_zeroes, _ = run_shader_words("ps_perm_all_zero", [
+            "v_mov_b32 v1, 0xFFFFFFFF",
+            "v_mov_b32 v2, 0xFFFFFFFF",
+            "v_perm_b32 v0, v1, v2, 0x0C0C0C0C",
+        ])
+        val_ones, _ = run_shader_words("ps_perm_all_ones", [
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_perm_b32 v0, v1, v2, 0x0D0D0D0D",
+        ])
+        self.assertEqual(val_zeroes, 0)
+        self.assertEqual(val_ones, 0xFFFFFFFF)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        _, spv = run_shader_words("ps_perm_lowering", [
+            "v_mov_b32 v1, 0x11223344",
+            "v_mov_b32 v2, 0x55667788",
+            "v_mov_b32 v3, 0x03020100",
+            "v_perm_b32 v0, v1, v2, v3",
+        ])
+        self.assertIn("OpBitFieldUExtract", spv)
