@@ -8139,6 +8139,292 @@ int main() {
                     "refusals %s\n",
                     source, compared ? "matched the host's" : "checked on the layer alone");
     }
+
+    // A typed B8G8R8X8 texture with unordered access is created when its castable-format list names a format with a
+    // typed UAV, and refused without a list or with one naming only sRGB or B8G8R8X8 formats: WARP and AMD's D3D12
+    // driver answer so (RX 9060 XT, 26.11.2), committed and placed alike. Its UAV in a listed B8G8R8A8_UNORM clears as
+    // theirs does, byte for byte and the X byte included (the alpha lands there); both drivers give the same bytes.
+    // A UAV in B8G8R8X8, in a format the list doesn't name, or in the other channel order (R8G8B8A8, whose storage
+    // view the bindless set doesn't pick yet) gives no descriptor.
+    struct X8UavCase {
+        DXGI_FORMAT resource;
+        std::vector<DXGI_FORMAT> list;
+        HRESULT expected;
+    };
+    const std::vector<X8UavCase> x8_uav_cases = {
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {}, E_INVALIDARG},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_B8G8R8A8_UNORM}, S_OK},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}, E_INVALIDARG},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB}, E_INVALIDARG},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_R8G8B8A8_UNORM}, S_OK},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_R8G8B8A8_UINT}, S_OK},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_R32_UINT}, S_OK},
+        {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM}, S_OK},
+        {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, {}, E_INVALIDARG},
+        {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, {DXGI_FORMAT_B8G8R8A8_UNORM}, S_OK},
+    };
+    const auto x8_uav_desc = [](DXGI_FORMAT format) {
+        D3D12_RESOURCE_DESC1 texture{};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Width = texture.Height = 4;
+        texture.MipLevels = texture.DepthOrArraySize = 1;
+        texture.Format = format;
+        texture.SampleDesc.Count = 1;
+        texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        return texture;
+    };
+    // Each case's HRESULT, committed and then placed.
+    const auto x8_uav_creation = [&](ID3D12Device10* device10, std::vector<HRESULT>& out) -> bool {
+        D3D12_HEAP_DESC heap_desc{};
+        heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap_desc.SizeInBytes = 256 * 1024;
+        heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        Ref<ID3D12Heap> heap;
+        CAST_CHECK(SUCCEEDED(device10->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        out.clear();
+        for (const X8UavCase& c : x8_uav_cases) {
+            const D3D12_RESOURCE_DESC1 texture = x8_uav_desc(c.resource);
+            const UINT32 count = UINT32(c.list.size());
+            const DXGI_FORMAT* list = count ? c.list.data() : nullptr;
+            Ref<ID3D12Resource> committed, placed;
+            out.push_back(device10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                             D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, count, list,
+                                                             IID_PPV_ARGS(&committed.p)));
+            out.push_back(device10->CreatePlacedResource2(heap.p, 0, &texture, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
+                                                          count, list, IID_PPV_ARGS(&placed.p)));
+        }
+        return true;
+    };
+    // A B8G8R8X8_UNORM texture listing B8G8R8A8_UNORM, through a B8G8R8A8_UNORM UAV: texture 0 cleared with
+    // ClearUnorderedAccessViewFloat (0.2, 0.4, 0.6, 0.25); texture 1 with ClearUnorderedAccessViewUint (0x11, 0x22,
+    // 0x33, 0x44), then the float clear in the rectangle (1, 1)-(3, 3). Both read back at 0 and 1024, pitch 256.
+    const auto x8_uav_clears = [&](ID3D12Device10* device10, bool layer, std::uint8_t* out) -> bool {
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        const D3D12_RESOURCE_DESC1 texture = x8_uav_desc(DXGI_FORMAT_B8G8R8X8_UNORM);
+        const DXGI_FORMAT list[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
+        Ref<ID3D12Resource> targets[2];
+        for (auto& t : targets)
+            CAST_CHECK(SUCCEEDED(device10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                                    D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1,
+                                                                    list, IID_PPV_ARGS(&t.p))));
+        D3D12_DESCRIPTOR_HEAP_DESC gpu_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        D3D12_DESCRIPTOR_HEAP_DESC cpu_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
+        Ref<ID3D12DescriptorHeap> gpu_heap, cpu_heap;
+        CAST_CHECK(SUCCEEDED(device10->CreateDescriptorHeap(&gpu_desc, IID_PPV_ARGS(&gpu_heap.p))));
+        CAST_CHECK(SUCCEEDED(device10->CreateDescriptorHeap(&cpu_desc, IID_PPV_ARGS(&cpu_heap.p))));
+        const UINT stride = device10->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        for (UINT i = 0; i < 2; ++i) {
+            device10->CreateUnorderedAccessView(targets[i].p, nullptr, &uav,
+                                                {gpu_heap->GetCPUDescriptorHandleForHeapStart().ptr + i * stride});
+            device10->CreateUnorderedAccessView(targets[i].p, nullptr, &uav,
+                                                {cpu_heap->GetCPUDescriptorHandleForHeapStart().ptr + i * stride});
+        }
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12Fence> fence;
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list_;
+        CAST_CHECK(SUCCEEDED(device10->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        CAST_CHECK(SUCCEEDED(device10->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        CAST_CHECK(SUCCEEDED(device10->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&allocator.p))));
+        CAST_CHECK(SUCCEEDED(device10->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                         IID_PPV_ARGS(&list_.p))));
+        ID3D12DescriptorHeap* heaps[] = {gpu_heap.p};
+        list_->SetDescriptorHeaps(1, heaps);
+        for (auto& t : targets) {
+            const D3D12_RESOURCE_BARRIER barrier = transition(t.p, D3D12_RESOURCE_STATE_COMMON,
+                                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list_->ResourceBarrier(1, &barrier);
+        }
+        const FLOAT float_values[4] = {0.2f, 0.4f, 0.6f, 0.25f};
+        const UINT uint_values[4] = {0x11, 0x22, 0x33, 0x44};
+        const D3D12_RECT rect{1, 1, 3, 3};
+        const auto gpu = [&](UINT i) {
+            return D3D12_GPU_DESCRIPTOR_HANDLE{gpu_heap->GetGPUDescriptorHandleForHeapStart().ptr + i * stride};
+        };
+        const auto cpu = [&](UINT i) {
+            return D3D12_CPU_DESCRIPTOR_HANDLE{cpu_heap->GetCPUDescriptorHandleForHeapStart().ptr + i * stride};
+        };
+        list_->ClearUnorderedAccessViewFloat(gpu(0), cpu(0), targets[0].p, float_values, 0, nullptr);
+        list_->ClearUnorderedAccessViewUint(gpu(1), cpu(1), targets[1].p, uint_values, 0, nullptr);
+        D3D12_RESOURCE_BARRIER uav_barrier{D3D12_RESOURCE_BARRIER_TYPE_UAV};
+        uav_barrier.UAV.pResource = targets[1].p;
+        list_->ResourceBarrier(1, &uav_barrier);
+        list_->ClearUnorderedAccessViewFloat(gpu(1), cpu(1), targets[1].p, float_values, 1, &rect);
+        const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+        const D3D12_RESOURCE_DESC readback_desc = buffer_desc(2048);
+        Ref<ID3D12Resource> readback;
+        CAST_CHECK(SUCCEEDED(device10->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                               IID_PPV_ARGS(&readback.p))));
+        for (UINT i = 0; i < 2; ++i) {
+            const D3D12_RESOURCE_BARRIER barrier = transition(targets[i].p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                              D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list_->ResourceBarrier(1, &barrier);
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
+            placed.Offset = i * 1024;
+            placed.Footprint = {DXGI_FORMAT_B8G8R8X8_UNORM, 4, 4, 1, 256};
+            const D3D12_TEXTURE_COPY_LOCATION dst = footprint(readback.p, placed);
+            const D3D12_TEXTURE_COPY_LOCATION src = subresource(targets[i].p, 0);
+            list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        CAST_CHECK(SUCCEEDED(list_->Close()));
+        ID3D12CommandList* lists[] = {list_.p};
+        queue->ExecuteCommandLists(1, lists);
+        if (layer) CAST_CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        CAST_CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+        CAST_CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+        void* bytes = nullptr;
+        CAST_CHECK(SUCCEEDED(readback->Map(0, nullptr, &bytes)));
+        std::memcpy(out, bytes, 2048);
+        readback->Unmap(0, nullptr);
+        return true;
+    };
+    {
+        Ref<ID3D12Device> layer_device;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&layer_device.p))));
+        Ref<ID3D12Device10> layer10;
+        EXPECT(SUCCEEDED(layer_device.p->QueryInterface(IID_PPV_ARGS(&layer10.p))));
+        // The texture is a BGRA8 image: without storage on BGRA8 (not every GPU has it) the layer refuses it.
+        VkFormatProperties bgra8{};
+        d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+            d.physical, VK_FORMAT_B8G8R8A8_UNORM, &bgra8);
+        if (!(bgra8.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            std::printf("B8G8R8X8 with unordered access: this GPU has no BGRA8 storage images, skipped\n");
+        } else {
+            std::vector<HRESULT> ours_hr, host_hr;
+            EXPECT(x8_uav_creation(layer10.p, ours_hr));
+            unsigned x8_mismatches = 0;
+            for (size_t i = 0; i < ours_hr.size(); ++i) {
+                const X8UavCase& c = x8_uav_cases[i / 2];
+                if (SUCCEEDED(ours_hr[i]) != SUCCEEDED(c.expected)) {
+                    std::fprintf(stderr, "B8G8R8X8 UAV case %zu (%s): format %d, %zu listed: ours %08lx, want %08lx\n",
+                                 i / 2, i % 2 ? "placed" : "committed", int(c.resource), c.list.size(),
+                                 static_cast<unsigned long>(ours_hr[i]), static_cast<unsigned long>(c.expected));
+                    ++x8_mismatches;
+                }
+            }
+            EXPECT(x8_mismatches == 0);
+
+            // The views: a listed B8G8R8A8_UNORM or R32_UINT gives a descriptor; the texture's own format, B8G8R8X8,
+            // an unlisted format and (for now) R8G8B8A8 give none.
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                                 D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
+            Ref<ID3D12DescriptorHeap> uav_heap;
+            EXPECT(SUCCEEDED(layer10->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&uav_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE slot = uav_heap->GetCPUDescriptorHandleForHeapStart();
+            struct ViewCase {
+                std::vector<DXGI_FORMAT> list;
+                DXGI_FORMAT view;
+                bool written;
+            };
+            const ViewCase views[] = {
+                {{DXGI_FORMAT_B8G8R8A8_UNORM}, DXGI_FORMAT_B8G8R8A8_UNORM, true},
+                {{DXGI_FORMAT_R32_UINT}, DXGI_FORMAT_R32_UINT, true},
+                {{DXGI_FORMAT_B8G8R8A8_UNORM}, DXGI_FORMAT_UNKNOWN, false},
+                {{DXGI_FORMAT_B8G8R8A8_UNORM}, DXGI_FORMAT_B8G8R8X8_UNORM, false},
+                {{DXGI_FORMAT_B8G8R8A8_UNORM}, DXGI_FORMAT_R8G8B8A8_UNORM, false},
+                {{DXGI_FORMAT_R8G8B8A8_UNORM}, DXGI_FORMAT_R8G8B8A8_UNORM, false},
+            };
+            for (const ViewCase& v : views) {
+                const D3D12_RESOURCE_DESC1 texture = x8_uav_desc(DXGI_FORMAT_B8G8R8X8_UNORM);
+                Ref<ID3D12Resource> tex;
+                EXPECT(SUCCEEDED(layer10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                                   D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr,
+                                                                   UINT32(v.list.size()), v.list.data(),
+                                                                   IID_PPV_ARGS(&tex.p))));
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                uav.Format = v.view;
+                uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                std::memset(reinterpret_cast<void*>(slot.ptr), 0x55, 32);
+                layer10->CreateUnorderedAccessView(tex.p, nullptr, &uav, slot);
+                std::uint8_t first[32];
+                std::memcpy(first, reinterpret_cast<const void*>(slot.ptr), sizeof(first));
+                const bool written = std::any_of(std::begin(first), std::end(first), [](std::uint8_t b) { return b; });
+                if (written != v.written)
+                    std::fprintf(stderr, "B8G8R8X8 UAV in format %d (list %d): descriptor %s, want %s\n", int(v.view),
+                                 int(v.list[0]), written ? "written" : "empty", v.written ? "written" : "empty");
+                EXPECT(written == v.written);
+            }
+
+            // The clears' bytes: what WARP and AMD's D3D12 driver store, then WARP's own. ClearUnorderedAccessViewUint
+            // copies each value's low bits into its channel, as WARP and AMD's driver do; NVIDIA's D3D12 driver reads
+            // 00 there (RTX 4080, 617.42), so the bytes are compared with WARP's, not with the host adapter's.
+            std::array<std::uint8_t, 2048> ours{}, warp_bytes{};
+            EXPECT(x8_uav_clears(layer10.p, true, ours.data()));
+            unsigned differences = 0;
+            for (UINT row = 0; row < 4; ++row)
+                for (UINT x = 0; x < 4; ++x) {
+                    const bool inside = row >= 1 && row < 3 && x >= 1 && x < 3;
+                    const std::uint8_t cleared[4] = {153, 102, 51, 64}, uint_cleared[4] = {0x33, 0x22, 0x11, 0x44};
+                    for (UINT b = 0; b < 4; ++b) {
+                        const std::uint8_t want0 = cleared[b], want1 = inside ? cleared[b] : uint_cleared[b];
+                        const std::uint8_t got0 = ours[row * 256 + x * 4 + b], got1 = ours[1024 + row * 256 + x * 4 + b];
+                        if ((got0 != want0 || got1 != want1) && differences++ < 8)
+                            std::fprintf(stderr, "B8G8R8X8 UAV clear texel (%u, %u) byte %u: ours %02x/%02x, want "
+                                         "%02x/%02x\n", x, row, b, got0, got1, want0, want1);
+                    }
+                }
+            EXPECT(differences == 0);
+            const auto casts = [](ID3D12Device* device, Ref<ID3D12Device10>& out10) {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+                return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&out10.p))) &&
+                       SUCCEEDED(out10->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
+                                                            sizeof(options12))) &&
+                       options12.RelaxedFormatCastingSupported;
+            };
+            // The creation answers: the host runtime's on the layer's adapter, when it can cast.
+            Ref<ID3D12Device> host_device;
+            Ref<ID3D12Device10> host10;
+            const char* creation_source = "the measured answers (no host here can cast)";
+            if (create_host_device(host_device) && casts(host_device.p, host10)) {
+                EXPECT(x8_uav_creation(host10.p, host_hr));
+                for (size_t i = 0; i < ours_hr.size(); ++i)
+                    if (SUCCEEDED(ours_hr[i]) != SUCCEEDED(host_hr[i])) {
+                        std::fprintf(stderr, "B8G8R8X8 UAV case %zu (%s): ours %08lx, host %08lx\n", i / 2,
+                                     i % 2 ? "placed" : "committed", static_cast<unsigned long>(ours_hr[i]),
+                                     static_cast<unsigned long>(host_hr[i]));
+                        ++x8_mismatches;
+                    }
+                EXPECT(x8_mismatches == 0);
+                creation_source = "the host runtime's answers";
+            }
+            // The bytes: WARP's. LEONIDA_HOST_ADAPTER is saved and restored: it belongs to whoever runs the test.
+            char previous[128] = {};
+            const BOOL had = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", previous, sizeof(previous));
+            SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", "warp");
+            copycmp::Ptr<ID3D12Device> warp;
+            std::string warp_name;
+            Ref<ID3D12Device10> warp10;
+            const bool warp_casts = copycmp::try_create_host(warp, warp_name) && casts(warp.p, warp10);
+            SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", had && previous[0] ? previous : nullptr);
+            const char* clear_source = "the bytes WARP and AMD's D3D12 driver store (no WARP here)";
+            if (warp_casts) {
+                EXPECT(x8_uav_clears(warp10.p, false, warp_bytes.data()));
+                for (UINT row = 0; row < 4; ++row)
+                    for (UINT i = 0; i < 16; ++i)
+                        for (UINT base : {0u, 1024u}) {
+                            const UINT at = base + row * 256 + i;
+                            if (ours[at] != warp_bytes[at] && differences++ < 8)
+                                std::fprintf(stderr, "B8G8R8X8 UAV clear %u row %u byte %u: ours %02x, WARP %02x\n",
+                                             base / 1024, row, i, ours[at], warp_bytes[at]);
+                        }
+                EXPECT(differences == 0);
+                clear_source = "WARP's bytes";
+            }
+            std::printf("B8G8R8X8 with unordered access: %zu castable lists created or refused as %s, 6 UAV views "
+                        "given or refused, and B8G8R8A8 UAV clears matched %s\n", x8_uav_cases.size(), creation_source,
+                        clear_source);
+        }
+    }
 #undef CAST_CHECK
 
     if (d.validation_errors()) {

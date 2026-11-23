@@ -435,6 +435,15 @@ bool typed_without_uav(DXGI_FORMAT format) {
            format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM;
 }
 
+// The R8G8B8A8 formats: the other channel order from a B8G8R8X8 texture's BGRA8 image.
+bool rgba8_channel_order(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: return true;
+    default: return false;
+    }
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -500,13 +509,14 @@ UINT view_slices(const D3D12_RESOURCE_DESC& resource, UINT first_layer, UINT lay
 // attachment_usable: the GPU can render to `format`. A UAV texture then also gets COLOR_ATTACHMENT usage, because
 // ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
 // castable_list: the texture has a castable-format list, which may name a format a UAV view can use.
+// castable_uav: that list names a format with a typed UAV (DeviceState::lists_typed_uav_format).
 struct TextureCreateInfo {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     std::array<VkFormat, 2> view_formats{};
 
     TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable,
-                      bool castable_list = false) {
+                      bool castable_list = false, bool castable_uav = false) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -522,10 +532,15 @@ struct TextureCreateInfo {
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
-        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format) &&
+        // A B8G8R8X8 view is never a UAV, so the family needs no storage usage (not every GPU has it for BGRA8), unless
+        // a castable list names a format with a typed UAV: views in that format then store into the BGRA8 image.
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && (!alpha_unused(desc.Format) || castable_uav) &&
             (castable_list || !typed_without_uav(desc.Format))) {
             info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            // The BGRA8 image need not take storage writes itself (a B8G8R8X8_UNORM_SRGB texture's doesn't): the
+            // listed format's views do, which extended usage allows; bind_image keeps its other views to sampling.
+            if (alpha_unused(desc.Format))
+                info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
             if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         }
@@ -829,6 +844,23 @@ struct DeviceState {
         return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     }
 
+    // A format a typed UAV view of a texture can take, as CheckFeatureSupport reports TYPED_UNORDERED_ACCESS_VIEW: a
+    // typed colour format whose image can take storage writes. B8G8R8X8, sRGB and depth formats have none.
+    bool typed_uav_format(DXGI_FORMAT format) const {
+        if (alpha_unused(format) || typed_without_uav(format) || typed_depth(format)) return false;
+        const Format typed = vulkan_format(format, false);
+        return typed.format != VK_FORMAT_UNDEFINED && !typed.typeless && typed.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+               storage_usable(typed.format);
+    }
+
+    // Whether a castable-format list names such a format: WARP and AMD's D3D12 driver then create a typed B8G8R8X8
+    // texture that allows unordered access, and refuse one whose list names only sRGB or B8G8R8X8 formats.
+    bool lists_typed_uav_format(UINT32 count, const DXGI_FORMAT* formats) const {
+        for (UINT32 i = 0; formats && i < count; ++i)
+            if (typed_uav_format(formats[i])) return true;
+        return false;
+    }
+
     bool sampled_usable(VkFormat format) const {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
@@ -959,8 +991,9 @@ struct DeviceState {
         return VK_SAMPLE_COUNT_1_BIT;
     }
 
-    // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
-    Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
+    // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included. castable_uav: its
+    // castable-format list names a format with a typed UAV (lists_typed_uav_format).
+    Format texture_format(const D3D12_RESOURCE_DESC& desc, bool castable_uav = false) const {
         if (!xr_bias_compatible(desc)) return {};
         // The PC runtime has no volume texture in a depth format, whatever the flags, and no unordered access on the
         // depth-stencil ones (D3D-466).
@@ -994,9 +1027,10 @@ struct DeviceState {
             return {};
         }
         // The host runtime refuses typed B8G8R8X8 with unordered access (its typeless family is accepted): the
-        // BGRA8 image could take storage writes, but D3D12 has no typed UAV for these formats.
+        // BGRA8 image could take storage writes, but D3D12 has no typed UAV for these formats. A castable list that
+        // names a format with one (B8G8R8A8_UNORM, R8G8B8A8_UNORM, R32_UINT, ...) makes it valid, as on the host.
         if (alpha_unused(desc.Format) && desc.Format != DXGI_FORMAT_B8G8R8X8_TYPELESS &&
-            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !castable_uav) {
             log_once("B8G8R8X8 textures cannot allow unordered access; format", desc.Format);
             return {};
         }
@@ -1124,7 +1158,8 @@ struct DeviceState {
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                    bool allow_channel_cast = false, bool r9g9b9e5_as_r32_uint = false) {
+                    bool allow_channel_cast = false, bool r9g9b9e5_as_r32_uint = false,
+                    bool extended_usage = false) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
@@ -1177,7 +1212,9 @@ struct DeviceState {
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
         VkImageViewUsageCreateInfo sampled_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-        if (r9g9b9e5_as_r32_uint) {
+        // An image with extended usage has usages its own format lacks; a view in a format without storage keeps to
+        // sampling, which it is for.
+        if (r9g9b9e5_as_r32_uint || (extended_usage && !storage_usable(view_format))) {
             sampled_usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
             view_info.pNext = &sampled_usage;
         }
@@ -1771,6 +1808,8 @@ public:
     }
     bool has_castable_formats() const { return !castable_formats_.empty(); }
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
+    // The image has usages its own format lacks (a B8G8R8X8 texture's storage, for its listed UAV format).
+    bool extended_usage() const { return extended_usage_; }
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -2004,13 +2043,15 @@ public:
         return S_OK;
     }
 
-    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
+    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {},
+                           bool castable_uav = false) {
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format), !castable.empty());
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format), !castable.empty(),
+                                 castable_uav && !castable.empty());
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
@@ -2087,6 +2128,7 @@ public:
         binding.sampled_in_general = device_.bindless != nullptr;
         format_ = format.format;
         r9g9b9e5_as_r32_uint_ = format.r9g9b9e5_as_r32_uint;
+        extended_usage_ = (info.flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) && !format.r9g9b9e5_as_r32_uint;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         binding_ = binding;
@@ -2429,6 +2471,7 @@ private:
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     bool r9g9b9e5_as_r32_uint_ = false;
+    bool extended_usage_ = false;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -6422,9 +6465,16 @@ public:
                 return;
             }
         }
-        // B8G8R8X8 has no typed UAV, so no format of its family gives an unordered-access view.
-        if (alpha_unused(r->desc().Format) || alpha_unused(view.format)) {
-            log_once("unordered-access view of a B8G8R8X8 format; format", int(view.format));
+        // B8G8R8X8 has no typed UAV, so no format of its family gives an unordered-access view. A B8G8R8X8 texture
+        // whose castable list names a format with one takes a UAV in that format, as on the host. Only in formats
+        // whose storage view keeps the BGRA8 image's channel order, though: the set's storage view takes the image's
+        // order (bind_image), so an R8G8B8A8 view would store red and blue swapped. That stays refused for now.
+        const DXGI_FORMAT uav_format = view.format != DXGI_FORMAT_UNKNOWN ? view.format : r->desc().Format;
+        const bool listed_uav = alpha_unused(r->desc().Format) && r->lists_castable_format(uav_format) &&
+                                state_.typed_uav_format(uav_format) && !rgba8_channel_order(uav_format);
+        if (alpha_unused(uav_format) || (alpha_unused(r->desc().Format) && !listed_uav)) {
+            log_once("unordered-access view of a B8G8R8X8 texture in a format its castable list doesn't give it; format",
+                     int(uav_format));
             return;
         }
         // Nor do typed sRGB and depth formats (D3D-466): their images have no storage usage.
@@ -6866,7 +6916,8 @@ public:
             // quality is the description rules' above, as in CreateCommittedResource).
             D3D12_RESOURCE_DESC checked = *desc;
             checked.SampleDesc.Quality = 0;
-            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(checked);
+            const bool castable_uav = state_.lists_typed_uav_format(castable_count, castable);
+            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(checked, castable_uav);
             if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
                 heap_offset % alloc.Alignment) {
                 log_once("placed texture refused (size, alignment or room in the heap), dimension",
@@ -6876,8 +6927,8 @@ public:
             const UINT64 fit_bytes =
                 (tiled || msaa)
                     ? alloc.SizeInBytes
-                    : min_placed_texture_bytes(checked, state_.texture_format(checked), alloc.Alignment,
-                                               alloc.SizeInBytes);
+                    : min_placed_texture_bytes(checked, state_.texture_format(checked, castable_uav),
+                                               alloc.Alignment, alloc.SizeInBytes);
             if (fit_bytes > heap->bytes() || heap_offset > heap->bytes() - fit_bytes) {
                 log_once("placed texture refused (size, alignment or room in the heap), dimension",
                          int(desc->Dimension));
@@ -6904,13 +6955,14 @@ public:
             hr = resource->create_placed_buffer();
         } else {
             hr = S_OK;
-            const Format format = state_.texture_format(*desc);
+            const bool castable_uav = state_.lists_typed_uav_format(castable_count, castable);
+            const Format format = state_.texture_format(*desc, castable_uav);
             if (format.format == VK_FORMAT_UNDEFINED) {
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
-                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats, castable_uav);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
@@ -7776,7 +7828,8 @@ private:
     }
 
     // One resource's size and alignment, or kInvalidAllocation for a description D3D12 (or this device) rejects.
-    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc) const {
+    // castable_uav: a placed texture's castable list names a format with a typed UAV (create_placed).
+    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc, bool castable_uav = false) const {
         constexpr UINT64 align_4k = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT,
                          align_64k = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
                          align_msaa_64k = D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
@@ -7842,13 +7895,15 @@ private:
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
         }
 
-        const Format format = state_.texture_format(desc);
+        const Format format = state_.texture_format(desc, castable_uav);
         if (!format.format) {
             log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
+        // castable_uav only changes a B8G8R8X8 texture's usages here; the other castable rules stay as before.
+        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format), false,
+                                       castable_uav);
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
         if (tiled) {
             leonida::ResourceTiling tiling;
@@ -7937,7 +7992,7 @@ private:
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
-                                                  resource.r9g9b9e5_as_r32_uint());
+                                                  resource.r9g9b9e5_as_r32_uint(), resource.extended_usage());
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -7963,7 +8018,8 @@ private:
         // 1x texture while GetResourceAllocationInfo requires 0; the other texture checks stay shared with allocation.
         D3D12_RESOURCE_DESC checked = *desc;
         if (checked.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) checked.SampleDesc.Quality = 0;
-        if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && allocation(checked).SizeInBytes == UINT64_MAX) {
+        if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            allocation(checked, state_.lists_typed_uav_format(castable_count, castable)).SizeInBytes == UINT64_MAX) {
             log_once((std::string(method ? method : "CreateCommittedResource") +
                       " refused (texture size, mips, samples or alignment), dimension")
                          .c_str(),
@@ -8017,14 +8073,15 @@ private:
             hr = E_INVALIDARG;  // D3D12: nonzero power-of-two sample count up to 32; MSAA needs a single-mip 2D attachment
         } else {
             hr = S_OK;
-            const Format format = state_.texture_format(*desc);
+            const bool castable_uav = state_.lists_typed_uav_format(castable_count, castable);
+            const Format format = state_.texture_format(*desc, castable_uav);
             if (format.format == VK_FORMAT_UNDEFINED) {
                 log_once("texture format not supported yet:", desc->Format);
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
-                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats, castable_uav);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
