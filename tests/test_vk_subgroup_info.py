@@ -73,6 +73,8 @@ class FakeDevice:
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
+    driver_version: int = 0
+    pipeline_cache_uuid: bytes = bytes(16)
 
 
 class FakeVulkan:
@@ -186,6 +188,8 @@ class FakeVulkan:
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_TYPE).value = dev.device_type
         ctypes.c_uint32.from_address(base + vk_info.PROPS_VENDOR_ID).value = dev.vendor_id
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_ID).value = dev.device_id
+        ctypes.c_uint32.from_address(base + vk_info.PROPS_DRIVER_VERSION).value = dev.driver_version
+        ctypes.memmove(base + vk_info.PROPS_PIPELINE_CACHE_UUID, dev.pipeline_cache_uuid, 16)
         ctypes.c_uint32.from_address(base + vk_info.PROPS_MAX_PUSH_CONSTANTS_SIZE).value = dev.max_push_constants_size
         raw_name = dev.name.encode("utf-8") if isinstance(dev.name, str) else dev.name
         name_bytes = raw_name[:256].ljust(256, b"\x00")
@@ -802,9 +806,20 @@ class QueryTest(unittest.TestCase):
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
+                    "driver_version": 0,
+                    "pipeline_cache_uuid": "00" * 16,
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_driver_version_and_pipeline_cache_uuid(self):
+        """driverVersion (offset 4) and pipelineCacheUUID (offset 276, after deviceName[256]): what a VkPipelineCache
+        header is checked against, so make_game.py can tell a driver update from the cache it filled before."""
+        uuid = bytes.fromhex("9d207089f2b68ca5ea9f3748a65de4d2")
+        res, _vk = self._run_query(FakeDevice(name="N" * 255, driver_version=2605056000, pipeline_cache_uuid=uuid))
+        self.assertEqual((res["driver_version"], res["pipeline_cache_uuid"]), (2605056000, uuid.hex()))
+        self.assertEqual(res["device"], "N" * 255)   # the name ends before the UUID
+        self.assertEqual((vk_info.PROPS_DRIVER_VERSION, vk_info.PROPS_PIPELINE_CACHE_UUID), (4, 276))
 
     def test_max_push_constants_size(self):
         """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""

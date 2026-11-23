@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -95,7 +96,8 @@ class PipelineBatchesTest(unittest.TestCase):
         (self.spirv / "index.json").write_text(json.dumps({n: {} for n in reversed(names)}),
                                                 encoding="utf-8", newline="\n")
 
-    def invoke(self, control=None, range_support=True):
+    def invoke(self, control=None, range_support=True, gpu=None):
+        """gpu: what tools/vk_subgroup_info.py would answer; without it the GPU can't be told and nothing resumes."""
         (self.spirv / "control.json").write_text(json.dumps(control or {}), encoding="utf-8", newline="\n")
         def run(args, hint="", check=True, **kwargs):
             args = [str(a) for a in args]
@@ -109,7 +111,10 @@ class PipelineBatchesTest(unittest.TestCase):
             return range_support or "--start" not in options
         logs, err = [], io.StringIO()
         # create=True keeps the regression runnable on the old implementation, which lacks this constant.
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value="synthetic-checker"), \
+        # The resume key hashes the checker, so a run that can resume names a real file (the stand-in itself).
+        exe = str(self.child) if gpu is not None else "synthetic-checker"
+        with mock.patch.object(make_game, "pipeline_check_exe", return_value=exe), \
+                mock.patch.object(make_game, "runtime_gpu_info", return_value=dict(gpu or {})), \
                 mock.patch.object(make_game, "checker_supports", side_effect=supports), \
                 mock.patch.object(make_game, "PIPELINE_BATCH_SIZE", 3, create=True), \
                 mock.patch.object(make_game, "run", side_effect=run), \
@@ -229,6 +234,90 @@ class PipelineBatchesTest(unittest.TestCase):
         code, _, err = self.invoke()
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.commands), 1)
+
+
+GPU = {"device": "Synthetic GPU", "vendor_id": 0x10DE, "device_id": 0x2786, "driver_id": 4,
+       "driver_version": 2605056000, "pipeline_cache_uuid": "9d207089f2b68ca5ea9f3748a65de4d2"}
+
+
+class PipelineResumeTest(unittest.TestCase):
+    """A stopped build continues after the batches that passed (README: "A stopped build continues where it left
+    off"), and only while the shaders, the checker, the GPU driver and the cache they were checked into are the same."""
+
+    setUp = PipelineBatchesTest.setUp
+    write_index = PipelineBatchesTest.write_index
+    invoke = PipelineBatchesTest.invoke
+    calls = PipelineBatchesTest.calls
+
+    def checked(self):
+        """The index entries each completed checker process covered, in order; reset between runs."""
+        rows = [r["active"] for r in self.calls("completed")]
+        (self.spirv / "calls.jsonl").unlink(missing_ok=True)
+        return rows
+
+    def test_a_resumed_run_checks_only_the_batch_that_did_not_pass(self):
+        code, _, _ = self.invoke({"invalid": "m_04"}, gpu=GPU)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.checked(), [self.names[:3], self.names[3:6], self.names[6:]])
+        self.assertEqual(json.loads((self.out / "pipeline_progress.json").read_text(encoding="utf-8"))["done"], [0, 6])
+        code, logs, err = self.invoke(gpu=GPU)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.checked(), [self.names[3:6]])
+        self.assertTrue(any("2 of 3 batches passed in an earlier run" in line for line in logs), logs)
+
+    def test_a_finished_stage_checks_nothing_again(self):
+        self.assertEqual(self.invoke(gpu=GPU)[0], 0)
+        self.checked()
+        code, logs, err = self.invoke(gpu=GPU)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.checked(), [])
+        self.assertEqual(len(self.commands), 3)   # the first run's three batches; the second started no checker
+        self.assertIn("pipelines: done", logs)
+
+    def test_a_batch_with_a_module_that_took_the_checker_down_runs_again(self):
+        code, _, _ = self.invoke({"crasher": "m_01"}, gpu=GPU)
+        self.assertNotEqual(code, 0)
+        self.checked()
+        code, _, err = self.invoke(gpu=GPU)   # e.g. after a driver or translator fix
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.checked(), [self.names[:3]])
+
+    def test_new_shaders_another_driver_or_a_lost_cache_check_every_batch_again(self):
+        updated_driver = dict(GPU, driver_version=GPU["driver_version"] + 1, pipeline_cache_uuid="0" * 32)
+        for what in ("index", "driver", "cache"):
+            with self.subTest(what=what):
+                self.write_index(self.names)
+                (self.out / "pipeline_progress.json").unlink(missing_ok=True)
+                self.assertEqual(self.invoke(gpu=GPU)[0], 0)
+                self.checked()
+                if what == "index":
+                    self.write_index(self.names[:6] + ["m_99"])   # translated again: another index.json
+                elif what == "cache":
+                    (self.out / "pipeline_cache.bin").unlink()
+                code, _, err = self.invoke(gpu=updated_driver if what == "driver" else GPU)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(len(self.checked()), 3)
+
+    def test_without_a_gpu_identity_nothing_is_recorded_or_skipped(self):
+        self.assertEqual(self.invoke(gpu={})[0], 0)
+        self.assertFalse((self.out / "pipeline_progress.json").exists())
+        self.checked()
+        self.assertEqual(self.invoke(gpu={})[0], 0)
+        self.assertEqual(len(self.checked()), 3)
+
+    def test_a_cache_header_for_another_device_or_driver_is_not_trusted(self):
+        self.out.mkdir()
+        cache = self.out / "pipeline_cache.bin"
+        progress = self.out / "pipeline_progress.json"
+        key = {"index": "i", "checker": "c", "batch": 3, "gpu": ["Synthetic GPU", 0x10DE, 0x2786, 4, 1, "ab" * 16]}
+        make_game.save_pipeline_progress(str(progress), key, {0, 3})
+        header = lambda uuid: struct.pack("<IIII", 32, 1, 0x10DE, 0x2786) + bytes.fromhex(uuid)
+        cache.write_bytes(header("ab" * 16) + b"data")
+        self.assertEqual(make_game.load_pipeline_progress(str(progress), key, str(cache)), {0, 3})
+        cache.write_bytes(header("cd" * 16) + b"data")
+        self.assertEqual(make_game.load_pipeline_progress(str(progress), key, str(cache)), set())
+        self.assertEqual(make_game.load_pipeline_progress(str(progress), dict(key, index="other"), str(cache)), set())
+        self.assertEqual(make_game.load_pipeline_progress(str(progress), None, str(cache)), set())
 
 
 if __name__ == "__main__":

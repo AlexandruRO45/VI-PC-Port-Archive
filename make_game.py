@@ -2445,10 +2445,28 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     code = 0
     ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
               for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
+    # A stopped build continues after the batches that already passed: their pipelines are in the cache, and checking
+    # them again would cost a cache load and lookup per batch (about 20 s each on an RTX 4070). A batch is recorded
+    # only when it passed with no module taking the checker down, so failures still get a fresh run each time.
+    progress = os.path.join(out, PIPELINE_PROGRESS)
+    key = pipeline_progress_key(exe, spirv) if names else None
+    done = load_pipeline_progress(progress, key, cache)
+    if not done:
+        drop(progress)   # another index, checker or GPU, or nothing passed yet
+    passed_before = sum(1 for s, _ in ranges if s in done)
+    if passed_before:
+        log(f"pipelines: {passed_before} of {len(ranges)} batches passed in an earlier run against the same shaders, "
+            f"checker and GPU driver; continuing after them ({PIPELINE_PROGRESS})")
     for start, count in ranges:
+        if start in done:
+            continue
         if count is not None:
             log(f"pipelines: checking shaders {start + 1}-{start + count} of {len(names)} in a fresh process")
+        crashed_before = len(crashed)
         result = check_range(start, count)
+        if result == 0 and len(crashed) == crashed_before and key is not None:
+            done.add(start)
+            save_pipeline_progress(progress, key, done)
         if result:
             code = result   # a later successful batch must not erase an earlier validation failure
         if result == 2 or interrupted(result):
@@ -2467,6 +2485,56 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
 # 10 minutes since the last cache checkpoint, plus loading the cache). Looked up when pipelines() runs.
 PIPELINE_CRASH_RETRIES = 5
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
+PIPELINE_PROGRESS = "pipeline_progress.json"   # beside pipeline_cache.bin: the batches earlier runs passed
+
+
+def pipeline_progress_key(exe: str, spirv: str) -> "dict | None":
+    """What a finished batch was checked against: the translated index, this vk_pipeline_check, the batch size and the
+    GPU and driver the pipeline cache is for. None when the GPU's pipeline-cache UUID can't be told: then no batch is
+    skipped or recorded and the stage checks every batch, as before."""
+    try:
+        index, checker = file_sha256(os.path.join(spirv, "index.json")), file_sha256(exe)
+    except OSError:
+        return None
+    gpu = runtime_gpu_info()
+    uuid = gpu.get("pipeline_cache_uuid")
+    if not isinstance(uuid, str) or len(uuid) != 32:
+        return None
+    return {"index": index, "checker": checker, "batch": PIPELINE_BATCH_SIZE,
+            "gpu": [gpu.get("device"), gpu.get("vendor_id"), gpu.get("device_id"), gpu.get("driver_id"),
+                    gpu.get("driver_version"), uuid]}
+
+
+def load_pipeline_progress(path: str, key: "dict | None", cache: str) -> "set[int]":
+    """The starts of the batches an earlier run passed against the same key, while the cache they filled is still
+    there and still for this device and driver; empty otherwise."""
+    if key is None:
+        return set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        with open(cache, "rb") as f:
+            header = f.read(32)
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(doc, dict) or doc.get("key") != key or not isinstance(doc.get("done"), list):
+        return set()
+    # A VkPipelineCache header (VK_PIPELINE_CACHE_HEADER_VERSION_ONE): length 32, version 1, vendorID, deviceID and
+    # pipelineCacheUUID. A cache written for another device or driver does not hold the earlier batches' work.
+    if len(header) == 32 and struct.unpack_from("<II", header) == (32, 1):
+        vendor, device = struct.unpack_from("<II", header, 8)
+        if [vendor, device, header[16:].hex()] != [key["gpu"][1], key["gpu"][2], key["gpu"][5]]:
+            return set()
+    return {s for s in doc["done"] if type(s) is int and s >= 0}
+
+
+def save_pipeline_progress(path: str, key: dict, done: "set[int]") -> None:
+    """Record the passed batches; replaced whole, so a stop while writing leaves the previous record."""
+    pending = path + ".tmp"
+    with open(pending, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"key": key, "done": sorted(done)}, f)
+        f.write("\n")
+    os.replace(pending, path)
 
 
 def interrupted(code: int) -> bool:
