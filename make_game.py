@@ -1388,29 +1388,57 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 
 
 def verify_translation_completeness(dxbc: str, spirv: str) -> None:
-    """Every carved shader must be in the merged translation index before the stage may call itself done.
+    """Every shader the disassembly produced a listing for must be in the merged translation index.
 
     rdna2spirv.py drops a shader that is refused or whose module fails spirv-val (the module never reaches the
-    final path) and still exits 0, and nothing later in the build compares the counts: the merge already refuses
-    an empty index, and a translation that did not run fails the stage before this point, so those cases are left
-    to the paths that own them. What this adds is the silent one, a readable index naming fewer shaders than the
-    carve: a port assembled from it would lack the difference."""
+    final path) and still exits 0, and nothing later in the build compares the two sets, so a run can finish
+    "done" with an index that lost shaders — or holds names no listing backs (a stale index from another carve
+    hides a missing shader behind a matching count). The expected set is the disassembly's own listings, not the
+    carve: fssm_unpack.py deliberately tolerates carved containers that never yield a listing (parse failures,
+    "no XBCH"), and those must not block an otherwise healthy build. A missing index or listing folder is an
+    intermediate state the earlier steps own (rdna2spirv.py exits nonzero, the merge refuses an empty set, and
+    #3328 recovers a saved empty index); an empty index returns for the same reason."""
+    disasm = os.path.join(dxbc, "disasm")
     try:
-        with open(os.path.join(dxbc, "index.json"), encoding="utf-8") as f:
-            carved = json.load(f)
+        with os.scandir(disasm) as entries:
+            listings = {e.name[:-2] for e in entries if e.name.endswith(".s") and e.is_file()}
+    except OSError:
+        return
+    if not listings:
+        return
+    try:
         with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
             index = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return
-    if not isinstance(carved, list) or not isinstance(index, dict):
-        fail("shaders: the carve index is not a list or the translation index is not an object; "
-             "run the shaders stage again")
+    except OSError as e:
+        fail(f"shaders: cannot read the translation index ({e}); run the shaders stage again")
+    except ValueError as e:
+        fail(f"shaders: the translation index is not valid JSON ({e}); run the shaders stage again")
+    if not isinstance(index, dict):
+        fail("shaders: the translation index is not an object; run the shaders stage again")
     if not index:
         return   # an empty index is #3328's to refuse or translate again, not a partial one to compare
-    if len(index) != len(carved):
-        fail(f"shaders: the translation index holds {len(index)} of the {len(carved)} carved shaders "
-             f"({len(carved) - len(index)} were refused or failed spirv-val, listed in this stage's output): "
-             "a port built from it would lack them. Fix the translator for that class and translate again")
+    missing = sorted(listings - index.keys())
+    unexpected = sorted(index.keys() - listings)
+    if not missing and not unexpected:
+        return
+    parts = []
+    if missing:
+        parts.append(f"{len(missing)} listing(s) with no module in the index: {name_sample(missing)}")
+    if unexpected:
+        parts.append(f"{len(unexpected)} index entr{'y' if len(unexpected) == 1 else 'ies'} no listing backs: "
+                     f"{name_sample(unexpected)}")
+    fail("shaders: the translation index does not match the disassembly — " + "; ".join(parts) + ". The stage "
+         "output above and the shard logs name each spirv-val failure (today's class is the aa2988cc "
+         "typed-buffer regression, fixed by #3902/#4466): a port built from this index would lack the missing "
+         "shaders. Fix the translator for that class and translate again")
+
+
+def name_sample(names: list[str], limit: int = 8) -> str:
+    """A printable sample of a too-long name list: the first few, then an ellipsis with the total."""
+    return ", ".join(names[:limit]) + (f", … ({len(names)} total)" if len(names) > limit else "")
+
 
 # ---------------------------------------------------------------- assets
 DECODER_RECORD = "decoder.sha256"   # beside each model and texture manifest.json: the decoder_digest() that made it

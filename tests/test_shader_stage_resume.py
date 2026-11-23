@@ -93,6 +93,8 @@ class ShaderStageResumeTest(unittest.TestCase):
                 json.dump([{"file": "s0.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "s0"}], f)
+            elif p == os.path.join(self.spirv, "index.json"):
+                json.dump({"s0": {}}, f)
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 
@@ -109,7 +111,11 @@ class ShaderStageResumeTest(unittest.TestCase):
 
     def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
         self.ran.append("translate (emulated)" if emulate else "translate")
-        self.touch(spirv, "index.json")
+        # An index naming every listing present, as the real merge would publish it.
+        with os.scandir(disasm) as entries:
+            names = sorted(e.name[:-2] for e in entries if e.name.endswith(".s"))
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({name: {} for name in names}, f)
 
     def run_stage(self, emulate=None, jobs=2):
         self.ran = []
