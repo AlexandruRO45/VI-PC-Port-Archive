@@ -1047,11 +1047,11 @@ python -I tools/f32_fuzz.py --oracle hw --perturb mul_rtz --programs 500     # o
   the MODE probe then fails naming that reason instead of a whole chunk failing to assemble (FUZZ-43).
 - **GFX11 against GFX10, handled explicitly** (`tools/hw_oracle/asm.py`, checked by assembling every opcode for gfx1013,
   gfx1010, gfx1030, gfx1100, gfx1150 and gfx1200):
-  - *Skipped, never substituted:* `v_mad_f32`, `v_mac_f32`, `v_madak_f32` and `v_mad_legacy_f32` exist on GFX10.1 only
-    (gfx1010/1011/1013, the console's family); gfx1030 and every GFX11 part reject them. The fused replacements
-    (`v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fma_dx9_zero_f32`) round once, so they are different instructions. The
-    unfused mad semantics (and SHADER-118's flush) therefore stay unmeasured: no RDNA2 desktop part and no GFX11 part has
-    them. Also not generated: `v_madmk_f32` (GFX10.1 only, like the mad opcodes), `v_min_legacy_f32` (in no GFX10 or GFX11
+  - *Skipped, never substituted:* `v_mad_f32`, `v_mac_f32`, `v_madak_f32`, `v_madmk_f32` and `v_mad_legacy_f32` exist on
+    GFX10.1 only (gfx1010/1011/1013, the console's family); gfx1030, gfx1036 and every GFX11 part reject them. The fused
+    replacements (`v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32`, `v_fma_dx9_zero_f32`) round once, so they are
+    different instructions. The unfused mad semantics (and SHADER-118's flush) therefore stay unmeasured: no RDNA2 desktop
+    part and no GFX11 part has them. Also not generated: `v_min_legacy_f32` (in no GFX10 or GFX11
     part: llvm-mc rejects it for gfx1010, gfx1013, gfx1030 and gfx1150), `v_fma_legacy_f32`/`v_fmac_legacy_f32` (new in
     GFX10.3, not in gfx1013).
   - *Renamed, run:* `v_mul_legacy_f32` is `v_mul_dx9_zero_f32` in GFX11 (the DX9 rule `0 * x = 0`, inf and NaN included,

@@ -117,9 +117,12 @@ class HardwareOracle(unittest.TestCase):
 
     def test_removed_opcodes_are_skipped_not_substituted(self):
         from hw_oracle import asm
-        for op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_mad_legacy_f32"):
+        # v_madmk_f32 is the fifth: gfx1030 and gfx1036 (the RDNA2 desktop parts) reject it like the other four, so
+        # a run on them must skip it instead of failing as a harness problem (51 of 1,711 programs on gfx1036).
+        for op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_madmk_f32", "v_mad_legacy_f32"):
             self.assertIn(op, asm.valu_skip_reason(op, "gfx1150"))
             self.assertIn(op, asm.valu_skip_reason(op, "gfx1030"))
+            self.assertIn(op, asm.valu_skip_reason(op, "gfx1036"))
             self.assertIsNone(asm.valu_skip_reason(op, "gfx1013"))
         self.assertIsNone(asm.valu_skip_reason("v_mul_legacy_f32", "gfx1150"))
 

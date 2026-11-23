@@ -274,15 +274,16 @@ def module_text(programs, arch, prefix="k", wave=32):
 
 # ---- f32 vector ALU: what GFX11 does not have, or has under another name (tools/f32_fuzz.py --oracle hw) ----
 # Checked by assembling every f32_fuzz opcode with llvm-mc for gfx1013 (the console), gfx1010, gfx1030, gfx1100,
-# gfx1150 and gfx1200. The four mad opcodes exist on GFX10.1 only (gfx1010, gfx1011, gfx1013): gfx1030 (RDNA2
-# desktop) and every GFX11 part reject them. They are not "renamed": v_fma_f32, v_fmac_f32, v_fmaak_f32 and
-# v_fma_dx9_zero_f32 round once where the mad opcodes round the product first, so substituting one would compare a
-# different instruction.
+# gfx1150 and gfx1200. The five mad opcodes exist on GFX10.1 only (gfx1010, gfx1011, gfx1013): gfx1030 and gfx1036
+# (RDNA2 desktop) and every GFX11 part reject them. They are not "renamed": v_fma_f32, v_fmac_f32, v_fmaak_f32,
+# v_fmamk_f32 and v_fma_dx9_zero_f32 round once where the mad opcodes round the product first, so substituting one
+# would compare a different instruction.
 _MAD_GONE = "exists on GFX10.1 only (gfx1010/1011/1013), not on gfx1030 or GFX11; {} is fused, a different instruction"
 VALU_REMOVED = {
     "v_mad_f32": _MAD_GONE.format("v_fma_f32"),
     "v_mac_f32": _MAD_GONE.format("v_fmac_f32"),
     "v_madak_f32": _MAD_GONE.format("v_fmaak_f32"),
+    "v_madmk_f32": _MAD_GONE.format("v_fmamk_f32"),
     "v_mad_legacy_f32": _MAD_GONE.format("v_fma_dx9_zero_f32"),
 }
 # Same instruction, new mnemonic: the assembler takes the GFX10 spelling for GFX11 and encodes the GFX11 name.
