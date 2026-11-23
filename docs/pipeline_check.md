@@ -45,6 +45,23 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 
 `--isolate-child` is internal to the parent/child protocol and is not meant to be passed directly. A module with a missing partner stub is skipped; without `--isolate`, a driver crash ends the run.
 
+## Generate the partner stubs
+
+A graphics pipeline also needs a module for the other stage, so the checker names a partner stub from the entry's
+own locations (`stub_filename("vs", inputs)` for a pixel shader, for example) and looks for it in
+`<spirv dir>/stubs/`; a pipeline whose stub is not there is skipped with `missing stub <name>`. `tools/spirv_stubs.py`
+writes every stub the index needs, one per unique location set, with the standard library only:
+
+```powershell
+python -I tools/spirv_stubs.py <spirv dir>
+```
+
+It reads `index.json` (`stage`, then `inputs`, `outputs`, `params` for mesh or `gs_input_locations` and
+`gs_output_locations` for geometry), writes `vs_<locations>.spv` and `ps_<locations>.spv` (`vs_empty.spv` and
+`ps_empty.spv` for a stage with no varyings), and validates every location before writing a file, so a bad entry
+leaves the directory untouched. It prints `wrote N stubs to <spirv dir>/stubs`. Run it again after a re-translation:
+stubs from the old interface no longer match the new locations, and the pipelines that need new ones are skipped.
+
 ## Check user-defined interfaces between stages
 
 `tools/shader_link_check.py` compares the binary SPIR-V declarations of the shaders you plan to put in the
