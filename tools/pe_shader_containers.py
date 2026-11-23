@@ -189,24 +189,45 @@ def safe_stem(name: str | None, index: int) -> str:
     return stem or f"container_{index:02d}"
 
 
-def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
-    """Write each container as `<module>.dxbc`; return the translator's index entries."""
-    os.makedirs(directory, exist_ok=True)
-    index = []
+def plan_extract(records: list[dict], directory: str, taken: set | None = None) -> list[tuple]:
+    """[(record, name, file)] for extract(), with the collision suffixes it would use.
+
+    `taken` carries the names planned by earlier images of the same run, so no file is planned twice."""
+    taken = set() if taken is None else taken
+    plan = []
     for k, record in enumerate(records):
         stem = safe_stem(record["name"], k)
-        file = f"{stem}.dxbc"
-        target = os.path.join(directory, file)
-        n = k
+        attempt = 0
         while True:
+            file = f"{stem}.dxbc" if attempt == 0 else f"{stem}_{k + attempt - 1:02d}.dxbc"
+            target = os.path.join(directory, file)
+            key = os.path.normcase(os.path.abspath(target))
+            if key not in taken and not os.path.exists(target):
+                taken.add(key)
+                break
+            attempt += 1
+        plan.append((record, k, stem, file))
+    return plan
+
+
+def extract(data: bytes, records: list[dict], directory: str, plan=None) -> list[dict]:
+    """Write each container as `<module>.dxbc`; return the translator's index entries."""
+    os.makedirs(directory, exist_ok=True)
+    plan = plan_extract(records, directory) if plan is None else plan
+    index = []
+    for record, k, stem, file in plan:
+        attempt = 0
+        while True:
+            file = f"{stem}.dxbc" if attempt == 0 else f"{stem}_{k + attempt - 1:02d}.dxbc"
+            target = os.path.join(directory, file)
             try:
-                with open(target, "xb") as f:
+                with open(target, "xb") as f:   # exclusive: a file created after plan_extract must not be lost
                     f.write(data[record["offset"] : record["offset"] + record["size"]])
                 break
             except FileExistsError:
-                file = f"{stem}_{n:02d}.dxbc"
-                target = os.path.join(directory, file)
-                n += 1
+                attempt += 1
+                if attempt > 10_000:
+                    raise
         index.append({"name": stem, "file": file, "stage": "cs"})
     return index
 
@@ -244,6 +265,7 @@ def main(argv=None) -> int:
             ap.error(f"--json {a.json} would overwrite the extract index")
 
     all_records, status, index = [], 0, []
+    scans = []
     for image in a.images:
         try:
             with open(image, "rb") as f:
@@ -254,6 +276,7 @@ def main(argv=None) -> int:
             continue
         records, rejected = inspect(data, image)
         all_records.extend(records)
+        scans.append((image, data, records))
         print(
             f"{image}: {len(records)} container(s), {len(rejected)} rejected DXBC hit(s)"
         )
@@ -273,9 +296,26 @@ def main(argv=None) -> int:
                 print(
                     f"  {r['offset']:#x} {r['size']:>7} {flags:<3} {name:<28} {chunks}"
                 )
-        if a.extract:
+
+    plans = []
+    if a.extract:
+        taken = set()
+        for image, data, records in scans:
+            plans.append((data, records, plan_extract(records, a.extract, taken)))
+        outputs = [os.path.join(a.extract, "index.json")]
+        for _, _, plan in plans:
+            outputs.extend(os.path.join(a.extract, file) for _, _, _, file in plan)
+        for image, _, _ in scans:
+            for output in outputs:
+                if same_report_path(image, output):
+                    ap.error(f"--extract would overwrite the input {image} with {output}")
+        if a.json:
+            for output in outputs:
+                if same_report_path(a.json, output):
+                    ap.error(f"--json {a.json} would overwrite the extraction output {output}")
+        for data, records, plan in plans:
             try:
-                index.extend(extract(data, records, a.extract))
+                index.extend(extract(data, records, a.extract, plan))
             except OSError as e:
                 print(f"ERROR: cannot write {a.extract}: {e}", file=sys.stderr)
                 return 2

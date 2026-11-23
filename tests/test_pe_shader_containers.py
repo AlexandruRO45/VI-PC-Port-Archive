@@ -165,6 +165,21 @@ class ContainerTests(unittest.TestCase):
             with open(os.path.join(tmp, "RefitBVH4_00.dxbc"), "rb") as f:
                 self.assertEqual(f.read(), b"stale")
 
+    def test_extract_never_overwrites_a_file_created_after_planning(self):
+        data = container([(b"ILDN", ildn("RefitBVH4")), (b"DXIL", dxil_payload("RefitBVH4"))])
+        found, _ = psc.inspect(data, "fake.dll")
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = psc.plan_extract(found, tmp)
+            planned = plan[0][3]
+            with open(os.path.join(tmp, planned), "wb") as f:
+                f.write(b"racer")
+            index = psc.extract(data, found, tmp, plan)
+            self.assertNotEqual(index[0]["file"], planned)
+            with open(os.path.join(tmp, planned), "rb") as f:
+                self.assertEqual(f.read(), b"racer")
+            with open(os.path.join(tmp, index[0]["file"]), "rb") as f:
+                self.assertEqual(f.read(), data)
+
     def test_safe_stem(self):
         self.assertEqual(psc.safe_stem("a b/c", 1), "a_b_c")
         self.assertEqual(psc.safe_stem(None, 7), "container_07")
@@ -275,6 +290,33 @@ class ReportPathTests(unittest.TestCase):
         self.assertNotIn("Traceback", err)
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
+
+
+    def test_extract_must_not_overwrite_an_input_image(self):
+        extract = os.path.join(self.dir, "out")
+        os.makedirs(extract)
+        image = os.path.join(extract, "index.json")
+        with open(image, "wb") as f:
+            f.write(container([(b"SFI0", bytes(8))]))
+        with open(image, "rb") as f:
+            before = f.read()
+        code, _, err = self.run_main([image, "--extract", extract])
+        self.assertEqual(code, 2)
+        self.assertIn("--extract would overwrite the input", err)
+        with open(image, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_json_must_not_overwrite_a_planned_container(self):
+        image = os.path.join(self.dir, "named.dll")
+        with open(image, "wb") as f:
+            f.write(container([(b"ILDN", ildn("BitonicPreSort64CS")),
+                               (b"DXIL", dxil_payload("BitonicPreSort64CS"))]))
+        extract = os.path.join(self.dir, "out")
+        planned = os.path.join(extract, "BitonicPreSort64CS.dxbc")
+        code, _, err = self.run_main([image, "--extract", extract, "--json", planned])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the extraction output", err)
+        self.assertFalse(os.path.exists(planned))
 
 
 if __name__ == "__main__":
