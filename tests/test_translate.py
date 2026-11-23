@@ -10,7 +10,8 @@ import re
 import pytest
 
 import rdna2spirv
-from conftest import EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, make_dxbc, mesh_psv0_chunk, requires_tools, signature_chunk
+from conftest import (EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, cs_header_from_asm, make_dxbc,
+                      mesh_psv0_chunk, requires_tools, signature_chunk)
 
 pytestmark = requires_tools
 
@@ -55,7 +56,8 @@ def test_gpu_samples_translate_and_validate(path, make_shader):
     if name.startswith(("gs_", "ms_")) and stem not in SAMPLE_DXBC:
         pytest.skip(f"no synthetic DXBC (ISG1/OSG1 for gs, PSV0 for ms) defined for {stem} in conftest.SAMPLE_DXBC")
     with open(path, encoding="utf-8") as f:
-        shader = make_shader(f.read(), name, dxbc=SAMPLE_DXBC.get(stem, EMPTY_DXBC))
+        text = f.read()
+    shader = make_shader(text, name, dxbc=SAMPLE_DXBC.get(stem, EMPTY_DXBC), cs_header=cs_header_from_asm(text))
     shader.validate(shader.translate(), KNOWN_VAL_ISSUES.get(stem))
 
 
@@ -88,11 +90,51 @@ def test_compute_translates_and_validates(make_shader):
     shader.validate(shader.translate())
 
 
-def test_compute_thread_group_size_sgpr_is_rejected(make_shader):
-    """TG_SIZE_EN (RSRC2 bit 10) adds an SGPR the translator doesn't model."""
-    shader = make_shader("s_endpgm\n", name="cs_test", cs_header=(0x8088 | 1 << 10, (64, 1, 1)))
-    with pytest.raises(rdna2spirv.Unsupported):
-        shader.translate()
+_SIZE_WORD_OPS = {"OpIAdd": lambda a, b: a + b, "OpIMul": lambda a, b: a * b, "OpBitwiseOr": lambda a, b: a | b,
+                  "OpShiftLeftLogical": lambda a, b: a << b, "OpShiftRightLogical": lambda a, b: a >> b}
+
+
+def size_word(spvasm, local_id):
+    """(SGPR index, value) the entry block stores as the thread-group size word for one LocalInvocationId."""
+    vals = {m[1]: int(m[2]) for m in re.finditer(r"^\s*(%\w+) = OpConstant %uint (\d+)$", spvasm, re.M)}
+    sgpr = None
+    for m in re.finditer(r"^\s*(%sz\w+) = (Op\w+) %\w+ (.+)$", spvasm, re.M):
+        res, op, args = m[1], m[2], m[3].split()
+        if op == "OpCompositeExtract":
+            assert args[0] == "%lci", m[0]
+            vals[res] = local_id[int(args[1])]
+        elif op == "OpAccessChain":
+            assert args[0] == "%sgpr", m[0]
+            sgpr = vals[args[1]]
+        else:
+            vals[res] = _SIZE_WORD_OPS[op](vals[args[0]], vals[args[1]]) & 0xFFFFFFFF
+    stored = re.search(r"OpStore %szp (%\w+)", spvasm)
+    assert sgpr is not None and stored, "no thread-group size word stored"
+    return sgpr, vals[stored[1]]
+
+
+def test_compute_thread_group_size_sgpr(make_shader):
+    """TG_SIZE_EN (RSRC2 bit 10) appends one SGPR after the enabled workgroup ids.
+
+    Mesa radv_shader_args.c (workgroup_ids, then tg_size) and ac_nir_lower_intrinsics_to_args.c: [5:0] = waves in
+    the group, [24:20] = wave id on GFX10.3, [11:6] = the ordered id Mesa reads as the wave id on GFX6-10. The group
+    is 16x4x2 = 128 threads (thread i = x + 16y + 64z is in wave i / W): 4 waves of 32 or 2 waves of 64.
+    """
+    rsrc2 = 0x8088 | 1 << 10 | 1 << 8 | 2 << 11       # 4 user SGPRs, TGID_X/Y, TG_SIZE_EN, thread ids x/y/z
+    for asm, wave in (("s_endpgm\n", 32), ("s_mov_b64 exec, -1\ns_endpgm\n", 64)):
+        shader = make_shader(asm, name="cs_tgsize_ci", cs_header=(rsrc2, (16, 4, 2)))
+        spvasm = shader.translate()
+        shader.validate(spvasm)
+        assert "OpExecutionMode %main LocalSize 16 4 2" in spvasm
+        for idx in (4, 5):                            # workgroup ids stay at s[user..], no shift
+            assert re.search(rf"%wgp\d+ = OpAccessChain %_ptr_Function_uint %sgpr %c{idx}\n\s*"
+                             rf"OpStore %wgp\d+ %wg\d+\n", spvasm), f"workgroup id missing from s{idx}"
+        waves = 128 // wave
+        for z in range(2):
+            for y in range(4):
+                for x in range(16):
+                    w = (x + 16 * y + 64 * z) // wave
+                    assert size_word(spvasm, (x, y, z)) == (6, waves | w << 6 | w << 20), (wave, x, y, z)
 
 
 @pytest.mark.parametrize("group", [(0, 1, 1), (2048, 1, 1)], ids=["empty", "over-1024"])

@@ -110,6 +110,24 @@ KNOWN_VAL_ISSUES = {"ms_tri": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036"}
 DEFAULT_CS_HEADER = (0x8088, (64, 1, 1))
 
 
+def cs_header_from_asm(asm):
+    """Leading '; rsrc2:' / '; group:' comments override DEFAULT_CS_HEADER (same convention as build.py)."""
+    rsrc2, group = DEFAULT_CS_HEADER
+    for ln in asm.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith(";"):
+            break
+        m = re.match(r";\s*rsrc2:\s*(\S+)", s)
+        if m:
+            rsrc2 = int(m.group(1), 0)
+        m = re.match(r";\s*group:\s*(\d+)\s+(\d+)\s+(\d+)", s)
+        if m:
+            group = tuple(int(x) for x in m.groups())
+    return rsrc2, group
+
+
 class Shader:
     def __init__(self, workdir, name, asm, cs_header=DEFAULT_CS_HEADER, dxbc=EMPTY_DXBC):
         self.name = name

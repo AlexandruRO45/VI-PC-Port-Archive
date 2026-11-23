@@ -7,7 +7,8 @@ path, as for the shaders stage). Listings, synthetic FSSM headers and DXBC conta
 directory. After validation, the build writes <out>/spirv/<name>.spv and the translator metadata.
 
 Compute shaders get the header the tests were written for: RSRC2 0x8088 (4 user SGPRs holding the V#, the
-workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group. The stage comes from the name's prefix. Mesh and
+workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group. A leading ``; rsrc2:`` / ``; group:`` comment
+overrides those two values (see cs_tgsize.asm). The stage comes from the name's prefix. Mesh and
 geometry shaders (ms_, gs_) also need a DXBC container with their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 """
@@ -26,17 +27,19 @@ LLVM_MC = os.environ.get("LLVM_MC", "llvm-mc")
 RSRC2, GROUP = 0x8088, (64, 1, 1)
 
 
-def asm_mattr(path):
+def header_attrs(path):
+    """Leading '; key: value' comments: mattr, and rsrc2/group for compute shaders (defaults RSRC2/GROUP)."""
+    attrs = {}
     for ln in Path(path).read_text(encoding="utf-8").splitlines():
         s = ln.strip()
         if not s:
             continue
         if not s.startswith(";"):
             break
-        m = re.match(r";\s*mattr:\s*(\S+)", s)
+        m = re.match(r";\s*(mattr|rsrc2|group):\s*(.+?)\s*$", s)
         if m:
-            return m.group(1)
-    return None
+            attrs[m.group(1)] = m.group(2)
+    return attrs
 
 
 def translate_tests(work, names):
@@ -45,10 +48,10 @@ def translate_tests(work, names):
     fssm.mkdir()
     for n in names:
         asm_path = os.path.join(HERE, n + ".asm")
-        mattr = asm_mattr(asm_path)
+        attrs = header_attrs(asm_path)
         cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
-        if mattr:
-            cmd.append(f"-mattr={mattr}")
+        if "mattr" in attrs:
+            cmd.append(f"-mattr={attrs['mattr']}")
         cmd += ["-show-encoding", asm_path]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
@@ -57,8 +60,10 @@ def translate_tests(work, names):
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
         (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
+            rsrc2 = int(attrs.get("rsrc2", hex(RSRC2)), 0)
+            group = tuple(int(x) for x in attrs["group"].split()) if "group" in attrs else GROUP
             header = bytearray(0x148)
-            struct.pack_into("<4I", header, 0x138, RSRC2, *GROUP)
+            struct.pack_into("<4I", header, 0x138, rsrc2, *group)
             (fssm / (n + ".fssm")).write_bytes(header)
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0

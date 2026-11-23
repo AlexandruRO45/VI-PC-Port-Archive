@@ -36,7 +36,9 @@ Background & Specification Rules:
       - Invocation coordinates LocalInvocationId (x, y, z) satisfy 0 <= x < lx, 0 <= y < ly, 0 <= z < lz.
       - LocalInvocationIndex = z * lx * ly + y * lx + x is bounded in [0, W - 1].
       - System register RSRC2 specifies USER_SGPR count [5:1], TGID enable bits [9:7], TG_SIZE_EN [10],
-        and TIDIG_COMP_CNT [12:11]. TG_SIZE_EN is unsupported and must be rejected.
+        and TIDIG_COMP_CNT [12:11]. With TG_SIZE_EN one extra SGPR follows the enabled workgroup ids
+        (Mesa radv_shader_args.c): waves in the group [5:0], wave id in the group [24:20] (GFX10.3) and in
+        the ordered id [11:6] (GFX6-10), per ac_nir_lower_intrinsics_to_args.c.
 """
 import os
 import re
@@ -436,7 +438,7 @@ class TestWorkgroupBounds(unittest.TestCase):
         # COMPUTE_PGM_RSRC2:
         # USER_SGPR [5:1]
         # TGID_X_EN [7], TGID_Y_EN [8], TGID_Z_EN [9]
-        # TG_SIZE_EN [10] (unsupported)
+        # TG_SIZE_EN [10]: one SGPR after the enabled workgroup ids (wave count and wave id)
         # TIDIG_COMP_CNT [12:11]
         rsrc2 = 0x8088  # user=4, TGID_X=1, LDS_SIZE=1
         user_sgprs = (rsrc2 >> 1) & 0x1F
@@ -446,9 +448,16 @@ class TestWorkgroupBounds(unittest.TestCase):
         tgid_z = (rsrc2 >> 9) & 1
         self.assertEqual((tgid_x, tgid_y, tgid_z), (1, 0, 0))
 
-        # TG_SIZE_EN bit 10 must raise unsupported
+        # TG_SIZE_EN bit 10: one SGPR after the enabled workgroup ids holds the wave count and wave id.
         rsrc2_with_tg_size = rsrc2 | (1 << 10)
         self.assertTrue((rsrc2_with_tg_size >> 10) & 1)
+        enabled_tgids = [i for i in range(3) if (rsrc2 >> (7 + i)) & 1]
+        size_sgpr = user_sgprs + len(enabled_tgids)
+        self.assertEqual(enabled_tgids, [0])
+        self.assertEqual(size_sgpr, 5)
+        # 64x2x1 = 128 threads: 4 waves of 32 lanes, 2 waves of 64.
+        self.assertEqual((64 * 2 * 1 + 31) // 32, 4)
+        self.assertEqual((64 * 2 * 1 + 63) // 64, 2)
 
     def test_linear_invocation_index_bounds(self):
         lx, ly, lz = 8, 4, 2

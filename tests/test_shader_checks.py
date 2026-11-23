@@ -15,7 +15,7 @@ import check
 WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS if n not in ("cs_store", "cs_wave64_ballot")}
 
 
-TOTAL = 19 + len(WAVE64_DUMPS)   # every test check.py runs (19 = the compute, store and pixel tests)
+TOTAL = 20 + len(WAVE64_DUMPS)   # every test check.py runs (20 = the compute, store and pixel tests)
 
 
 class Wave64Checks(unittest.TestCase):
@@ -37,6 +37,9 @@ class Wave64Checks(unittest.TestCase):
             self.assertNotIn("--require-wave64", args)
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
+            if name == "cs_tgsize":
+                self.assertEqual(args, ("2", "dump"))
+                return 0, "out[0..7] = 4 1048644 2097284 3145924 4 1048644 2097284 3145924\n"
             if name in ("cs_imgstore", "cs_imgload"):
                 return 0, "0 bad\n0 bad\n0 bad\n"
             return 0, "0 mismatches\n"

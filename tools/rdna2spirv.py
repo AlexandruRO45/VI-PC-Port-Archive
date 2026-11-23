@@ -4748,12 +4748,27 @@ def assemble(gen):
                f"%mwi = OpShiftLeftLogical %uint %wave {gen.cu(24)}",
                f"%s3p = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(3)}", "OpStore %s3p %mwi"]
     if cs:
-        # After the user-data copy: workgroup ids overwrite s[user..], thread ids go to v0..v2.
+        # After the user-data copy: the enabled workgroup ids, then the thread-group size word when TG_SIZE_EN;
+        # thread ids go to v0..v2.
         fn += ["%wgi = OpLoad %v3uint %wg_id", "%lci = OpLoad %v3uint %local_id"]
         for k, c in enumerate(gen.cs["tgid"]):
             r = gen.cs["user"] + k
             fn += [f"%wg{c} = OpCompositeExtract %uint %wgi {c}",
                    f"%wgp{c} = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", f"OpStore %wgp{c} %wg{c}"]
+        if gen.cs["size_en"]:
+            # Thread i of the group runs in wave i / W, so the wave id is LocalInvocationIndex >> log2(W).
+            sx, sy, _ = gen.cs["size"]
+            fn += ["%szx = OpCompositeExtract %uint %lci 0", "%szy = OpCompositeExtract %uint %lci 1",
+                   "%szz = OpCompositeExtract %uint %lci 2", f"%szty = OpIMul %uint %szy {gen.cu(sx)}",
+                   f"%sztz = OpIMul %uint %szz {gen.cu(sx * sy)}", "%szxy = OpIAdd %uint %szx %szty",
+                   "%szli = OpIAdd %uint %szxy %sztz",
+                   f"%szw = OpShiftRightLogical %uint %szli {gen.cu(gen.cs['wave_shift'])}",
+                   f"%szo = OpShiftLeftLogical %uint %szw {gen.cu(6)}",
+                   f"%szi = OpShiftLeftLogical %uint %szw {gen.cu(20)}",
+                   "%szoi = OpBitwiseOr %uint %szo %szi",
+                   f"%szv = OpBitwiseOr %uint %szoi {gen.cu(gen.cs['size_waves'])}",
+                   f"%szp = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(gen.cs['size_sgpr'])}",
+                   "OpStore %szp %szv"]
         for c in range(gen.cs["tid"] + 1):
             fn += [f"%li{c} = OpCompositeExtract %uint %lci {c}",
                    f"%lip{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(c)}", f"OpStore %lip{c} %li{c}"]
@@ -5206,17 +5221,32 @@ def translate(path):
         # what 2,689 CS read before writing: 2,281 fit exactly, the rest are loop artifacts of the straight-line
         # check): USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7], TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11]. Words
         # 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa radv_shader_args.c): s0..user-1 = user data,
-        # then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10).
+        # then the enabled workgroup ids, then the thread-group size word when TG_SIZE_EN; v0, v1, v2 = thread id
+        # x, y, z (separate VGPRs on GFX10).
         fssm = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm", info["name"] + ".fssm")
         hdr = open(fssm, "rb").read(0x148)
         rsrc2, lx, ly, lz = struct.unpack_from("<4I", hdr, 0x138)
-        if (rsrc2 >> 10) & 1:
-            raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
             raise Unsupported("CS group size")
         user = (rsrc2 >> 1) & 31
-        g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
+        tgid = [c for c in range(3) if (rsrc2 >> (7 + c)) & 1]
+        # TG_SIZE_EN appends one SGPR after the enabled workgroup ids (Mesa src/amd/vulkan/radv_shader_args.c:
+        # workgroup_ids[0..2], then tg_size). Its fields (src/amd/common/nir/ac_nir_lower_intrinsics_to_args.c):
+        # [5:0] = waves in the group (load_num_subgroups), [24:20] = this wave's id in the group on GFX10.3
+        # (load_subgroup_id), [11:6] = the ordered-append id, which Mesa reads as the wave id on GFX6-10 because
+        # ORDERED_APPEND is off in the dispatch initiator. Both fields get the wave id. Before, only the count was
+        # stored, so every wave of a multi-wave group read wave id 0.
+        size_en = (rsrc2 >> 10) & 1
+        g.cs = {"user": user, "tgid": tgid, "size_en": bool(size_en),
                 "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
+        if size_en:
+            wave = 64 if g.wave64 else 32
+            g.cs["size_sgpr"] = user + len(tgid)
+            g.cs["size_waves"] = (lx * ly * lz + wave - 1) // wave
+            g.cs["wave_shift"] = 6 if g.wave64 else 5
+            # The entry block uses these; constants are emitted before it.
+            for v in (g.cs["size_sgpr"], g.cs["size_waves"], g.cs["wave_shift"], 6, 20, lx, lx * ly):
+                g.cu(v)
         # LDS_SIZE [23:15] in 512-byte units (470 of 486 LDS-using CS stay below it; the rest index past it with
         # constant offsets, so the array also covers the largest offset in the code).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
