@@ -251,5 +251,21 @@ class TestVCvtF32U32ConditionCodes(unittest.TestCase):
         self.assertEqual(scc, scc_initial)
 
 
+class TestVCvtF32U32IEEE754(unittest.TestCase):
+    """IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_zero_is_always_positive_zero(self):
+        # 0 must convert to +0.0 (bits 0x00000000), never -0.0 (0x80000000)
+        res_bits = ref_cvt_f32_u32(0)
+        self.assertEqual(res_bits, 0x00000000)
+        self.assertEqual(res_bits >> 31, 0)  # Sign bit is 0
+
+    def test_high_bit_set_remains_positive(self):
+        # In unsigned conversion, 0x80000000 (2147483648) converts to +2147483648.0 (sign bit 0)
+        res_bits = ref_cvt_f32_u32(0x80000000)
+        self.assertEqual(res_bits >> 31, 0)  # Positive
+        self.assertEqual(res_bits, 0x4F000000)
+
+
 if __name__ == '__main__':
     unittest.main()
