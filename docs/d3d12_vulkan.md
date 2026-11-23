@@ -419,9 +419,22 @@ What is implemented (all of it testable without the game):
     `B8G8R8A8` or `B8G8R8X8` reads red and blue swapped through those views, as on the host (both orders share one
     T# format code, so the T#'s swizzle carries the order). An RTV in a format the list names stores clears and
     draws in the view's channel order and encoding, as on the host (see the castable-list RTVs under D3D-275 below).
-    As on the host runtime, the family has no typed UAV, and a typed `B8G8R8X8`
-    texture cannot allow unordered access (the host accepts one whose castable-format list names `B8G8R8A8`; the
-    layer doesn't yet). Blending into a `B8G8R8X8` render target reads destination
+    As on the host runtime, the family has no typed UAV, and a
+    typed `B8G8R8X8` texture can allow unordered access only when its castable-format list names a format with a
+    typed UAV (`B8G8R8A8_UNORM`, `R8G8B8A8_UNORM`, `R8G8B8A8_UINT`, `R32_UINT`, ...): WARP and AMD's D3D12 driver
+    (RX 9060 XT, 26.11.2) create it then, committed or placed, and refuse it without a list or with one naming
+    only sRGB or `B8G8R8X8` formats. The layer gives its BGRA8 image storage usage (with extended usage, so a
+    `B8G8R8X8_UNORM_SRGB` texture's sRGB image need not take storage writes itself; its views in formats without
+    storage keep to sampling) and takes a UAV in a listed `B8G8R8A8_UNORM` or one-channel 32-bit format. Through
+    `B8G8R8A8_UNORM` both drivers store the alpha in the X byte, from a shader store as from a clear (a float clear
+    of (0.2, 0.4, 0.6, 0.25) leaves 153, 102, 51, 64); the layer's clears are checked, its shader stores are not
+    (no store fixture for these views yet). A UAV in the other channel order (`R8G8B8A8`) stays refused:
+    the bindless set's storage view takes the image's channel order, so its stores would swap red and blue, and
+    whether the console applies a T#'s swizzle to image stores is not measured. `d3d12_vulkan_device_test` checks
+    the creation answers against the host, which UAV views get a descriptor, and the clears' bytes against both
+    drivers'. On a GPU whose BGRA8 can't take storage writes, `B8G8R8A8_UNORM` has no typed UAV, so only another
+    listed format gives one; the test skips there, so that case is untested. Blending into a `B8G8R8X8` render target
+    reads destination
     alpha as 1, as WARP and AMD's D3D12 driver do: the PSO turns `DEST_ALPHA` into `ONE`, `INV_DEST_ALPHA` into
     `ZERO` and the colour `SRC_ALPHA_SAT` into `ZERO`, where the BGRA8 image would read the X byte. What a draw
     leaves in the X byte is not defined (WARP writes 0, AMD the blended alpha), and no view reads it;
