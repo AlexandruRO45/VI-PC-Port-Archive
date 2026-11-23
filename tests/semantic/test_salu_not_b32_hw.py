@@ -415,5 +415,79 @@ class TestSaluNotB32SimdExecution(unittest.TestCase):
         words = run_salu_not_simd_ps(test_val)
         self.assertEqual(words, [expected, expected, expected, expected])
 
+# --- Section 5: Register Aliasing and In-Place Operand Preservation ---
+
+def run_salu_not_inplace_ps(src_val: int) -> Tuple[int, int]:
+    """Test in-place NOT (s_not_b32 s0, s0) via translator."""
+    lines = [
+        f"s_mov_b32 s0, {src_val & MASK32:#x}",
+        "s_not_b32 s0, s0",
+        "s_cselect_b32 s1, 1, 0",
+        "v_mov_b32 v0, s0",
+        "v_mov_b32 v1, s1",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_salu_not_inplace", lines)
+    words = mrt0_words(spv)
+    return words[0], words[1]
+
+
+class TestSaluNotB32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation tests."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = SaluInterpreter(self.rf)
+
+    def test_inplace_aliasing_execution(self) -> None:
+        test_values = [
+            0x00000000,
+            0xFFFFFFFF,
+            0x12345678,
+            0x80000000,
+            0x00000001,
+            0x55555555,
+            0xAAAAAAAA,
+            0xDEADBEEF,
+        ]
+        for val in test_values:
+            with self.subTest(val=hex(val)):
+                self.rf.write_sgpr(5, val)
+                inst = parse_salu_instruction("s_not_b32 s5, s5")
+                res = self.interp.execute(inst)
+                expected = ref_s_not_b32(val)
+                self.assertEqual(res, expected)
+                self.assertEqual(self.rf.read_sgpr(5), expected)
+                self.assertEqual(self.rf.scc, ref_s_not_b32_scc(val))
+
+    def test_unrelated_sgpr_preservation(self) -> None:
+        self.rf.write_sgpr(0, 0x11111111)
+        self.rf.write_sgpr(1, 0x22222222)
+        self.rf.write_sgpr(2, 0x33333333)
+        inst = parse_salu_instruction("s_not_b32 s1, s0")
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_sgpr(0), 0x11111111)
+        self.assertEqual(self.rf.read_sgpr(1), ref_s_not_b32(0x11111111))
+        self.assertEqual(self.rf.read_sgpr(2), 0x33333333)
+
+    def test_double_inplace_not_identity(self) -> None:
+        initial = 0xA5C3E187
+        self.rf.write_sgpr(10, initial)
+        inst = parse_salu_instruction("s_not_b32 s10, s10")
+        self.interp.execute(inst)
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_sgpr(10), initial)
+
+    def test_hardware_inplace_execution(self) -> None:
+        cases = [0x12345678, 0xCAFEBABE, 0xFFFFFFFF, 0x00000000]
+        for c in cases:
+            with self.subTest(case=hex(c)):
+                hw_res, hw_scc = run_salu_not_inplace_ps(c)
+                self.assertEqual(hw_res, ref_s_not_b32(c))
+                self.assertEqual(hw_scc, ref_s_not_b32_scc(c))
+
 if __name__ == "__main__":
     unittest.main()
