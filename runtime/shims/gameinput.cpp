@@ -2102,8 +2102,9 @@ void STDMETHODCALLTYPE ForceFeedbackEffect::GetParams(GameInputForceFeedbackPara
 }
 
 bool STDMETHODCALLTYPE ForceFeedbackEffect::SetParams(const GameInputForceFeedbackParams* params) {
-    if (!params || !valid_kind(params->kind)) return false;
+    if (!params) return false;
     std::lock_guard lock(g().mu);
+    if (params->kind != params_.kind) return false;
     params_ = *params;
     ++version_;
     return true;

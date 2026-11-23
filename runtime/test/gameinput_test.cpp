@@ -1430,17 +1430,27 @@ void test_force_feedback(IGameInput* input) {
     wave.data.sineWave.magnitude.linearX = 1.0f;
     wave.data.sineWave.frequency = 50.0f;
     wave.data.sineWave.phase = 90.0f;
-    check(effect->SetParams(&wave), "force feedback: SetParams for a sine wave");
-    rt::gameinput::poll();
-    check(g_fake.last.type == SDL_HAPTIC_SINE && g_fake.last.periodic.period == 20 &&
-              g_fake.last.periodic.magnitude == 32767 && g_fake.last.periodic.phase == 9000,
-          "force feedback: a 50 Hz sine with a 90 degree phase becomes SDL's period and hundredths of a degree");
-    check(g_fake.last.periodic.length == 100 && g_fake.last_iterations == 1,
-          "force feedback: the envelope's 100 ms is SDL's length and its playCount the iteration count");
-    Sleep(130);
-    rt::gameinput::poll();
-    check(effect->GetState() == GameInputFeedbackStopped && g_fake.stops >= 1,
-          "force feedback: an effect that ran its duration reports stopped");
+    check(!effect->SetParams(&wave), "force feedback: SetParams refuses parameters of another effect kind");
+    effect->GetParams(&read);
+    check(read.kind == GameInputForceFeedbackConstant && read.data.constant.magnitude.linearX == -1.0f,
+          "force feedback: and the effect keeps the parameters it had");
+    IGameInputForceFeedbackEffect* periodic = nullptr;
+    check(dev->CreateForceFeedbackEffect(0, &wave, reinterpret_cast<void**>(&periodic)) == S_OK && periodic,
+          "force feedback: CreateForceFeedbackEffect for a sine wave");
+    if (periodic) {
+        rt::gameinput::poll();
+        check(g_fake.last.type == SDL_HAPTIC_SINE && g_fake.last.periodic.period == 20 &&
+                  g_fake.last.periodic.magnitude == 32767 && g_fake.last.periodic.phase == 9000,
+              "force feedback: a 50 Hz sine with a 90 degree phase becomes SDL's period and hundredths of a degree");
+        check(g_fake.last.periodic.length == 100 && g_fake.last_iterations == 1,
+              "force feedback: the envelope's 100 ms is SDL's length and its playCount the iteration count");
+        Sleep(130);
+        rt::gameinput::poll();
+        check(periodic->GetState() == GameInputFeedbackStopped && g_fake.stops >= 1,
+              "force feedback: an effect that ran its duration reports stopped");
+        periodic->Release();
+        rt::gameinput::poll();
+    }
 
     // A condition effect: coefficients, saturations, dead zone and centre.
     GameInputForceFeedbackParams spring{};
@@ -1451,14 +1461,19 @@ void test_force_feedback(IGameInput* input) {
     spring.data.spring.maxPositiveMagnitude = 1.0f;
     spring.data.spring.maxNegativeMagnitude = 0.5f;
     spring.data.spring.deadZone = 0.1f;
-    check(effect->SetParams(&spring), "force feedback: SetParams for a spring");
-    effect->SetState(GameInputFeedbackRunning);
-    rt::gameinput::poll();
-    check(g_fake.last.type == SDL_HAPTIC_SPRING && g_fake.last.condition.right_coeff[0] == 16384 &&
-              g_fake.last.condition.left_coeff[0] == -8192 && g_fake.last.condition.right_sat[0] == 65535 &&
-              g_fake.last.condition.left_sat[0] == 32768 && g_fake.last.condition.deadband[0] == 6554 &&
-              g_fake.last.condition.center[0] == 16384,
-          "force feedback: a spring maps its coefficients, saturations, dead zone and centre");
+    IGameInputForceFeedbackEffect* condition = nullptr;
+    check(dev->CreateForceFeedbackEffect(0, &spring, reinterpret_cast<void**>(&condition)) == S_OK && condition,
+          "force feedback: CreateForceFeedbackEffect for a spring");
+    if (condition) {
+        rt::gameinput::poll();
+        check(g_fake.last.type == SDL_HAPTIC_SPRING && g_fake.last.condition.right_coeff[0] == 16384 &&
+                  g_fake.last.condition.left_coeff[0] == -8192 && g_fake.last.condition.right_sat[0] == 65535 &&
+                  g_fake.last.condition.left_sat[0] == 32768 && g_fake.last.condition.deadband[0] == 6554 &&
+                  g_fake.last.condition.center[0] == 16384,
+              "force feedback: a spring maps its coefficients, saturations, dead zone and centre");
+        condition->Release();
+        rt::gameinput::poll();
+    }
 
     effect->SetState(GameInputFeedbackPaused);
     const int stops0 = g_fake.stops;
@@ -1480,9 +1495,10 @@ void test_force_feedback(IGameInput* input) {
     rt::gameinput::poll();
     check(g_fake.runs == runs1 + 1, "force feedback: and it runs again once the mute is lifted");
 
+    const int destroys0 = g_fake.destroys;
     check(effect->Release() == 0, "force feedback: the effect is freed once the title releases it");
     rt::gameinput::poll();
-    check(g_fake.destroys == 1, "force feedback: its SDL effect is destroyed on the poll thread");
+    check(g_fake.destroys == destroys0 + 1, "force feedback: its SDL effect is destroyed on the poll thread");
 
     // RT-262: the title releases effects while the poll thread applies them. The poll thread used to AddRef an effect
     // whose count had already reached 0 (its destructor waiting for the lock), use it after it was freed, and free it
