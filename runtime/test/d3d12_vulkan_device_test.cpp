@@ -3143,6 +3143,25 @@ bool windows10_refusal(const char* name, ID3D12Device* host, HRESULT ours, HRESU
     return true;
 }
 
+// The layer reports resource heap tier 2 and accepts a heap that holds buffers and both kinds of texture together. A
+// tier 1 host (NVIDIA Pascal: GTX 1060 / 582.78, @ray3242 on #4420) refuses such a heap, so on that host only the
+// layer's acceptance against the host's refusal is excused: `theirs` is the host's answer when the call is the
+// CreateHeap itself, or E_UNEXPECTED when a placed-resource helper could not create its heap (D3D-504).
+bool host_heap_tier1(ID3D12Device* host) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
+    return SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))) &&
+           o.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_1;
+}
+
+bool tier1_mixed_heap_refusal(const char* name, ID3D12Device* host, HRESULT ours, HRESULT theirs,
+                              HRESULT host_refusal) {
+    if (theirs != host_refusal || ours == theirs || (host_refusal == E_INVALIDARG && ours != S_OK)) return false;
+    if (!host_heap_tier1(host)) return false;
+    std::printf("invalid arguments %s: the tier 1 host refuses a heap of mixed resources (ours 0x%08lx, host "
+                "0x%08lx)\n", name, ours, theirs);
+    return true;
+}
+
 int compare_invalid_arguments(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
@@ -4380,6 +4399,7 @@ int compare_heap_neighbours(ID3D12Device* ours) {
         const char* name;
         InvalidCase call;
         bool windows10_refuses = false;
+        bool mixed = true;  // allows buffers and textures together: a tier 1 host refuses it (D3D-504)
     };
     static const Case cases[] = {
         {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
@@ -4404,7 +4424,7 @@ int compare_heap_neighbours(ID3D12Device* ours) {
          }},
         {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
-         }},
+         }, false, false},
         // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
         // UHD 770, @CowBoYdu76). Windows 10's and Windows 11 23H2's runtimes refuse it, as they refuse the committed
         // case above.
@@ -4412,11 +4432,13 @@ int compare_heap_neighbours(ID3D12Device* ours) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
          }, true},
     };
+    std::printf("CreateHeap valid neighbours: host resource heap tier %d\n", host_heap_tier1(host.p) ? 1 : 2);
     int mismatches = 0;
     for (const Case& c : cases) {
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (a == b) continue;
         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
+        if (c.mixed && tier1_mixed_heap_refusal(c.name, host.p, a, b, E_INVALIDARG)) continue;
         ++mismatches;
         std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
     }
@@ -4915,6 +4937,8 @@ int compare_placed_reserved(ID3D12Device* ours) {
         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
         if (a == b) continue;
         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
+        // placed() answers E_UNEXPECTED when the device refuses the heap; PlacedArgs' heap allows every kind.
+        if (tier1_mixed_heap_refusal(c.name, host.p, a, b, E_UNEXPECTED)) continue;
         if (c.comparable && !c.comparable(host.p)) {
             std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
                         a, b);
@@ -7296,6 +7320,11 @@ int main() {
                 heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED),
             };
             for (const D3D12_HEAP_DESC& hd : accepted_heaps) EXPECT(heap_create(standalone.p, hd) == S_OK);
+            // The heaps above that allow every resource kind are tier 2 heaps, so the layer reports tier 2 (D3D-504).
+            D3D12_FEATURE_DATA_D3D12_OPTIONS heap_opts{};
+            EXPECT(SUCCEEDED(standalone->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &heap_opts,
+                                                             sizeof(heap_opts))));
+            EXPECT(heap_opts.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_2);
             const int heap_mismatches = compare_heap_neighbours(standalone.p);
             if (heap_mismatches < 0)
                 std::printf("CreateHeap valid neighbours: no host D3D12 device to compare with, skipped\n");
