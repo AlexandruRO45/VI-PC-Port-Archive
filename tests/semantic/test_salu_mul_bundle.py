@@ -588,5 +588,25 @@ class TestSMulHiU32TranslatorIntegration(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 1)
 
+class TestSMulHiU32Validation(unittest.TestCase):
+    def test_commutativity(self) -> None:
+        rng = random.Random(8888)
+        for _ in range(50):
+            a = rng.randint(0, MASK32)
+            b = rng.randint(0, MASK32)
+            self.assertEqual(ref_s_mul_hi_u32(a, b), ref_s_mul_hi_u32(b, a))
+
+    def test_unsigned_high_low_product_consistency(self) -> None:
+        # (hi << 32) | lo must equal full unsigned product
+        rng = random.Random(7777)
+        for _ in range(50):
+            a = rng.randint(0, MASK32)
+            b = rng.randint(0, MASK32)
+            full = a * b
+            hi = ref_s_mul_hi_u32(a, b)
+            lo = ref_s_mul_i32(a, b)
+            reconstructed = (hi << 32) | lo
+            self.assertEqual(reconstructed, full)
+
 if __name__ == "__main__":
     unittest.main()
