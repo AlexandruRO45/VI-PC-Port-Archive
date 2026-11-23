@@ -643,7 +643,12 @@ struct Asm<'t> {
     id_to_type: Vec<u32>,
     ext_imports: Vec<usize>,
     scratch: Vec<u8>,
+    spec_depth: u32,
 }
+
+/// Nesting of `OpSpecConstantOp` operands past which the native assembler declines, so the Python
+/// assembler (and its own `RecursionError` limit) handles the text; the native recursion stays shallow.
+const MAX_SPEC_CONSTANT_OP_DEPTH: u32 = 64;
 
 impl<'t> Asm<'t> {
     /// `get_id`: the number of `%name`, the next free one the first time the name is seen.
@@ -867,8 +872,14 @@ impl<'t> Asm<'t> {
                         tables.insn(&name).ok_or(Refuse)?
                     }
                 };
+                if self.spec_depth >= MAX_SPEC_CONSTANT_OP_DEPTH {
+                    return Err(Refuse);
+                }
                 out.push(sub.opcode);
-                self.operands(&sub.specs, toks, idx + 1, ctx, out)
+                self.spec_depth += 1;
+                let r = self.operands(&sub.specs, toks, idx + 1, ctx, out);
+                self.spec_depth -= 1;
+                r
             }
             Kind::Value(e) => {
                 let tables = self.tables;
@@ -1048,6 +1059,7 @@ fn assemble_into(tables: &Tables, text: &[u8], version: u32, words: &mut Vec<u32
         id_to_type: Vec::new(),
         ext_imports: Vec::new(),
         scratch: Vec::new(),
+        spec_depth: 0,
     };
     asm.short_syms.reserve(text.len() / 128);
     let mut toks: Vec<&[u8]> = Vec::with_capacity(16);
@@ -1236,6 +1248,14 @@ X GLSL.std.450 FAbs 4
     fn spec_constant_op_names() {
         let w = asm("%u = OpTypeInt 32 0\n%a = OpConstant %u 1\n%b = OpSpecConstantOp %u IAdd %a %a\n").unwrap();
         assert_eq!(&w[w.len() - 6..], &[(6 << 16) | 52, 1, 3, 128, 2, 2]);
+    }
+
+    #[test]
+    fn deeply_nested_spec_constant_op_is_declined() {
+        let nested = |n: usize| format!("%u = OpTypeInt 32 0\n%a = OpConstant %u 1\n%b = OpSpecConstantOp %u {}IAdd %a %a\n", "SpecConstantOp ".repeat(n));
+        assert!(asm(&nested(10)).is_some());
+        assert_eq!(asm(&nested(100)), None);
+        assert_eq!(asm(&nested(100_000)), None);
     }
 
     #[test]

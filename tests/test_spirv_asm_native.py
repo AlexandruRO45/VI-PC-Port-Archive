@@ -251,6 +251,27 @@ class NativeMatchesPython(unittest.TestCase):
             results = list(pool.map(lambda t: spirv_asm._native_assemble(t, "vulkan1.2"), texts * 4))
         self.assertEqual(results, expected * 4)
 
+    def test_deeply_nested_spec_constant_op_does_not_overflow_the_stack(self):
+        # Each `SpecConstantOp` token nests one more OpSpecConstantOp. The native assembler declines past a
+        # fixed depth, so Python decides: the same bytes at depth 100, its own RecursionError at depth 1100,
+        # and no crash of the interpreter in either case.
+        def nested(depth):
+            return ("%u = OpTypeInt 32 0\n%a = OpConstant %u 1\n"
+                    "%b = OpSpecConstantOp %u " + "SpecConstantOp " * depth + "IAdd %a %a\n")
+        shallow = nested(10)
+        self.assertEqual(spirv_asm._native_assemble(shallow, "vulkan1.2"), python_assemble(shallow))
+        for depth in (65, 100):
+            with self.subTest(depth=depth):
+                text = nested(depth)
+                self.assertIsNone(spirv_asm._native_assemble(text, "vulkan1.2"))
+                self.assertEqual(spirv_asm.assemble(text), python_assemble(text))
+        deep = nested(1100)
+        self.assertIsNone(spirv_asm._native_assemble(deep, "vulkan1.2"))
+        with self.assertRaises(RecursionError):
+            python_assemble(deep)
+        with self.assertRaises(RecursionError):
+            spirv_asm.assemble(deep)
+
 
 class Fallback(unittest.TestCase):
     def test_disabled_by_environment(self):
