@@ -284,6 +284,7 @@ public:
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
         if (list_.closed()) return;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) return hold(state);
         set_pipeline(state);
     }
@@ -366,6 +367,7 @@ public:
 
     void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::Dispatch");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (defer([=](GraphicsCommandList& l) { l.record_dispatch(x, y, z); }, true)) return;
         record_dispatch(x, y, z);
     }
@@ -374,7 +376,7 @@ public:
     // included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
         if (list_.closed()) return;
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (!list_.closed()) check(list_.set_predication({0, 0, 0}));
         reset_state(state);
     }
@@ -382,11 +384,13 @@ public:
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
         if (list_.closed()) return;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (defer([=](GraphicsCommandList& l) { l.topology_ = u(topology); })) return;
         topology_ = u(topology);
     }
 
     void STDMETHODCALLTYPE IASetVertexBuffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (std::uint64_t(start) + count > vertex_buffers_.size()) return check(false);
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
             std::vector<D3D12_VERTEX_BUFFER_VIEW> copy;
@@ -401,6 +405,7 @@ public:
 
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
         if (list_.closed()) return;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         const std::optional<D3D12_INDEX_BUFFER_VIEW> copy = view ? std::optional(*view) : std::nullopt;
         if (defer([=](GraphicsCommandList& l) { l.set_index_buffer(copy ? &*copy : nullptr); })) return;
         set_index_buffer(view);
@@ -408,7 +413,7 @@ public:
 
     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         if (!count) {
             viewport_ = {};
             return;
@@ -420,7 +425,7 @@ public:
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         // A zero-count call disables all previously bound rectangles; it is not a no-op.
         // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
         if (!count) {
@@ -435,7 +440,7 @@ public:
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
         render_targets_.fill({});
         render_target_count_ = count;
@@ -449,6 +454,7 @@ public:
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
         if (list_.closed()) return;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         const std::array<float, 4> value = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
                                                   : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
         if (defer([=](GraphicsCommandList& l) { l.blend_factor_ = value; })) return;
@@ -457,12 +463,14 @@ public:
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
         if (list_.closed()) return;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (defer([=](GraphicsCommandList& l) { l.front_stencil_ref_ = l.back_stencil_ref_ = reference; })) return;
         front_stencil_ref_ = back_stencil_ref_ = reference;
     }
 
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawInstanced");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (defer([=](GraphicsCommandList& l) { l.record_draw(false, vertices, instances, first_vertex, 0, first_instance); },
                   true))
             return;
@@ -472,6 +480,7 @@ public:
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index, INT base_vertex,
                                                 UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawIndexedInstanced");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (defer([=](GraphicsCommandList& l) {
                 l.record_draw(true, indices, instances, first_index, base_vertex, first_instance);
             }, true))
@@ -637,7 +646,7 @@ public:
     void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
                                               UINT src_subresource, DXGI_FORMAT format) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResolveSubresource");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         const auto integer_color = [](ID3D12Resource* resource) {
             if (!resource) return false;
             const auto desc = resource->GetDesc();
@@ -696,7 +705,7 @@ public:
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         if (!view.ptr || !color) return check(false);
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
@@ -706,7 +715,7 @@ public:
                                                  FLOAT depth, UINT8 stencil, UINT count,
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearDepthStencilView");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
@@ -790,6 +799,7 @@ public:
     // GCL8. Each draw applies the two faces with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT / BACK_BIT).
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT front, UINT back) override {
         d3d12_trace::record("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (list_.closed()) return check(false);
         if (defer([=](GraphicsCommandList& l) {
                 l.front_stencil_ref_ = front;
@@ -818,10 +828,12 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+            return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE && kind != leonida::IndirectKind::dispatch)
             return check(false);
         const auto arg_desc = argument_buffer->GetDesc();
         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
@@ -865,7 +877,8 @@ public:
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT postbuild_count,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY || !desc)
+            return check(false);
         if (postbuild_count && !postbuild) return check(false);
         for (UINT i = 0; i < postbuild_count; ++i) {
             if (!valid_postbuild_info_type(postbuild[i].InfoType)) return check(false);
@@ -950,7 +963,9 @@ public:
     void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* desc, UINT count,
         const D3D12_GPU_VIRTUAL_ADDRESS* sources) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY || !desc || !count ||
+            !sources)
+            return check(false);
         if (!valid_postbuild_info_type(desc->InfoType)) return check(false);
         leonida::AccelerationStructurePostbuild info{};
         info.dest_va = desc->DestBuffer;
@@ -962,7 +977,7 @@ public:
     void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS dest,
                                                                D3D12_GPU_VIRTUAL_ADDRESS source,
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (!valid_copy_mode(mode)) return check(false);
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
@@ -1160,7 +1175,14 @@ private:
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
     // signature that is already bound changes nothing: "existing root signature bindings do not become stale"
     // (D3D12, "Using a Root Signature"), and engines rebind routinely.
+    bool root_state_allowed(const RootState& state) const {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return false;
+        if (&state == &graphics_ && type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE) return false;
+        return true;
+    }
+
     void bind_root(RootState& state, ID3D12RootSignature* signature) {
+        if (!root_state_allowed(state)) return check(false);
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
                 l.bind_root(compute ? l.compute_ : l.graphics_, signature);
             }))
@@ -1205,6 +1227,7 @@ private:
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+        if (!root_state_allowed(state)) return check(false);
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
             // The layout is the executing list's, so the range is checked when it runs; no signature takes more
             // than D3D12_MAX_ROOT_COST dwords, which bounds what is copied from the caller's memory.
@@ -1230,6 +1253,7 @@ private:
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
+        if (!root_state_allowed(state)) return check(false);
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
                 l.address(compute ? l.compute_ : l.graphics_, index, va, type);
             }))
