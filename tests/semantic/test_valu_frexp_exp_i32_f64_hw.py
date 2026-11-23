@@ -183,5 +183,127 @@ class TestValuFrexpExpI32F64ReferenceOracle(unittest.TestCase):
         self.assertEqual(to_s32(oracle_frexp_exp_i32_f64(CANONICAL_QNAN)), 0)
 
 
+# ---------------------------------------------------------------------------
+# Stage 2: Symbolic AST definitions and typed expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    VGPR = enum.auto()
+    SGPR = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+        if self.kind == RegKind.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+
+    def __str__(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class RegisterPair:
+    kind: RegKind
+    lo: int
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR and not (0 <= self.lo <= 254):
+            raise ValueError(f"VGPR pair base {self.lo} out of range [0, 254]")
+        if self.kind == RegKind.SGPR and not (0 <= self.lo <= 104):
+            raise ValueError(f"SGPR pair base {self.lo} out of range [0, 104]")
+
+    @property
+    def hi(self) -> int:
+        return self.lo + 1
+
+    def __str__(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        return f"{prefix}[{self.lo}:{self.hi}]"
+
+
+class Opcode(enum.Enum):
+    V_FREXP_EXP_I32_F64 = "v_frexp_exp_i32_f64"
+    V_FREXP_EXP_I32_F64_E64 = "v_frexp_exp_i32_f64_e64"
+
+
+@dataclasses.dataclass
+class VOP1Instruction:
+    opcode: Opcode
+    dst: Register
+    src0: RegisterPair
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise ValueError("VOP1 destination must be VGPR")
+        if self.opcode != Opcode.V_FREXP_EXP_I32_F64:
+            raise ValueError(f"Invalid VOP1 opcode {self.opcode}")
+
+    def to_asm(self) -> str:
+        return f"{self.opcode.value} {self.dst}, {self.src0}"
+
+
+@dataclasses.dataclass
+class VOP3Instruction:
+    opcode: Opcode
+    dst: Register
+    src0: RegisterPair
+    abs_src0: bool = False
+    neg_src0: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise ValueError("VOP3 destination must be VGPR")
+        if self.opcode != Opcode.V_FREXP_EXP_I32_F64_E64:
+            raise ValueError(f"Invalid VOP3 opcode {self.opcode}")
+
+    def to_asm(self) -> str:
+        src = str(self.src0)
+        if self.abs_src0 and self.neg_src0:
+            src = f"-|{src}|"
+        elif self.abs_src0:
+            src = f"|{src}|"
+        elif self.neg_src0:
+            src = f"-{src}"
+        return f"{self.opcode.value} {self.dst}, {src}"
+
+
+class TestValuFrexpExpI32F64AST(unittest.TestCase):
+    """Stage 2: Symbolic AST definitions and typed expressions for v_frexp_exp_i32_f64."""
+
+    def test_vop1_creation_and_disasm(self) -> None:
+        dst = Register(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        self.assertEqual(inst.to_asm(), "v_frexp_exp_i32_f64 v0, v[2:3]")
+
+    def test_vop3_modifiers_and_disasm(self) -> None:
+        dst = Register(RegKind.VGPR, 4)
+        src = RegisterPair(RegKind.VGPR, 6)
+        inst = VOP3Instruction(Opcode.V_FREXP_EXP_I32_F64_E64, dst, src, abs_src0=True)
+        self.assertEqual(inst.to_asm(), "v_frexp_exp_i32_f64_e64 v4, |v[6:7]|")
+
+    def test_ast_emits_valid_spirv(self) -> None:
+        dst = Register(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        lines = [
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0x3ff00000",
+            inst.to_asm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_frexp", lines)
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("FindUMsb", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
