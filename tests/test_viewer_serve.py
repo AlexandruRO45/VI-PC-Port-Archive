@@ -232,6 +232,18 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, b"")
 
+    def test_world_path_is_resolved_once_per_request(self):
+        target = "/world/model.glb?cache=1"
+        world = str(Path(self._tmp.name) / "world")
+        with mock.patch.object(serve, "safe_world_path", wraps=serve.safe_world_path) as resolve:
+            for method in ("GET", "HEAD"):
+                with self.subTest(method=method):
+                    resolve.reset_mock()
+                    status, _, body = raw_request(self.port, target, method=method)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(body, b"glTF" if method == "GET" else b"")
+                    resolve.assert_called_once_with(world, target)
+
     def test_a_missing_host_header_is_served(self):
         status, _, body = raw_request(self.port, "/world/ok.bin", host=None)
         self.assertEqual(status, 200)
