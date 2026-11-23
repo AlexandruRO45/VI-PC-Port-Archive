@@ -390,7 +390,14 @@ def main(argv=None):
 
     try:
         names = read_mount_lists(a.mount)
-    except (OSError, ValueError) as error:
+    except OSError as error:
+        # error.filename is the directory os.walk could not read; naming it here rather than printing the
+        # exception puts the path in the report the way the user wrote it, which str(OSError) does not do on
+        # Windows (it renders the filename with %r, so every separator comes out doubled). Same as bink_index.
+        path = error.filename or ", ".join(a.mount)
+        print(f"bink_names: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+        return 1
+    except ValueError as error:
         print(f"bink_names: error: {error}", file=sys.stderr)
         return 1
     try:
