@@ -354,5 +354,20 @@ class VAddCoCiU32OracleTests(unittest.TestCase):
         self.assertEqual(s, 0)
         self.assertEqual(c, 1)
 
+class VAddCoCiU32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_add_co_ci_u32."""
+
+    def test_ast_emission(self):
+        node = CarryAstNode("v_add_co_ci_u32", "v0", "vcc", "v1", "v2", "vcc")
+        self.assertEqual(node.emit_asm(), "v_add_co_ci_u32 v0, vcc, v1, v2, vcc")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": 0x7FFFFFFF, "v2": 0x7FFFFFFF, "vcc": 1}
+        s, c = ref_add_co_ci_u32(regs["v1"], regs["v2"], regs["vcc"])
+        regs["v0"] = s
+        regs["vcc"] = c
+        self.assertEqual(regs["v0"], 0xFFFFFFFF)
+        self.assertEqual(regs["vcc"], 0)
+
 if __name__ == "__main__":
     unittest.main()
