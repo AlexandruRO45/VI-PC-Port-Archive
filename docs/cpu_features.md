@@ -66,23 +66,24 @@ in the image.
 `gta6rt` counts every emulated instruction against its address ([runtime/README.md](../runtime/README.md), "PE
 loader"): a `cpu_emulated` startup-trace event at each new site, a per-site summary at exit, and with
 `LEONIDA_CPU_EMU_STATS=N` the same summary every N seconds, so a run that stops on a crash or an assert keeps its
-counts. `cpu_emulation_test --bench` times one emulated instruction, the whole `#UD` round trip (kernel dispatch,
-the vectored handler, the return), against the same loop with a NOP in its place.
+counts. `cpu_emulation_test --bench` times each of CLWB, CLZERO and EXTRQ that the host lacks, the whole `#UD` round
+trip (kernel dispatch, the vectored handler, the return), against the same loop with a NOP of the same length; on a
+host that has all three it says there is nothing to time.
 
-Measured 2026-11-23 on an Intel Core i9-9900K (Coffee Lake: no SSE4a, CLZERO, MONITORX or CLWB), Windows 11, RTX
-2080 Ti, own 1.0.2.1 copy. Counts only; nothing from the executable is quoted.
+Measured 2026-11-23 with the retail 1.0.2.1 boot (own copies) on `main` plus the open boot-chain pull requests merged
+locally. Counts only; nothing from the executable is quoted.
 
-| What | Result |
-|---|---|
-| One emulated instruction (`--bench`, CLWB, 200,000 iterations) | 1.5 to 1.9 µs, against under 1 ns for the NOP loop |
-| Sites the boot reached | 1 of the 41: a CLWB in a cache-line write-back loop |
-| Hits at that site | 16 at the first compute pipeline (boot stop 18); 18 by the next stop |
-| Time in the emulation, boot so far | about 30 to 40 µs in all |
-| INSERTQ/EXTRQ, CLZERO, MONITORX/MWAITX | not reached yet |
+| Host | Lacks | One emulated instruction (`--bench`) | Sites the boot reached, up to the slot 41 assert |
+|---|---|---|---|
+| Intel Core i9-9900K (Coffee Lake), RTX 2080 Ti | SSE4a, CLZERO, MONITORX, CLWB | CLWB about 1.0 µs, CLZERO about 1.4 µs, EXTRQ about 1.0 µs (after #7111's hot-path change; 1.5 to 1.9 µs before) | 1 of the 41: a CLWB in a cache-line write-back loop, 16 to 19 hits, about 30 to 40 µs in all |
+| Intel Core i7-14700K (Raptor Lake), UHD 770 (`towade`, #8537) | SSE4a, CLZERO, MONITORX | | 0: CLWB is native |
+| AMD Ryzen 7 7800X3D (Zen 4) and Ryzen 7 9800X3D (Zen 5) (`fiestorra`, `SpaghettiMaster545`, #8537) | nothing | nothing to time | 0: nothing is emulated |
 
-The boot used `main` with the open boot-chain pull requests merged locally (stops 1-20, #7111 for this page, and
-#7516 for the BVH builder), and stopped about 4 s in, at a fatal assert right after the first device slot 41 command
-signature. So far the trap path costs nothing that matters, and no load-time patching is needed for the sites a boot
-reaches today. The vector-code SSE4a sites are the ones to watch: at about 2 µs a trap, a site reached once per
-object per frame would cost a frame budget's worth at around 8,000 hits a frame. A boot that gets further should
-re-run with `LEONIDA_CPU_EMU_STATS` and update this table.
+Up to the first device slot 41 command signature (about 4 s in) the trap path costs nothing that matters. Past it the
+picture changes. On the i9-9900K, a boot that reaches the frame loop (slot 80 `WaitFrameEventX`, about 2,300 D3D12
+calls, with #7201, #7330, #7356, #8529 and the layout mapping in the current #7075) adds 5 CLZERO sites within its
+first frames; it stopped 14 ms later, before a summary. `joroyt` measured the frame loop on a CPU without CLZERO in
+#8783: the zeroing loop takes one `#UD` per 64-byte line and holds the game at about 2.4 frames a second, about 46
+once the handler finishes the loop in its first trap. So CLZERO is the hot site, and #8783 is the load-time answer
+for it. The vector-code SSE4a sites are still unmeasured: at about 1 µs a trap, around 16,000 hits a frame would
+cost a 60 Hz frame. A boot that gets further should re-run with `LEONIDA_CPU_EMU_STATS` and update this table.

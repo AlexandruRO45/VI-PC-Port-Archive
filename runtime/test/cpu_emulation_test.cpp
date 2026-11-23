@@ -329,18 +329,35 @@ void test_live_sites(const ce::Host& host) {
 }
 
 // --bench: the cost of one emulated instruction, the whole #UD round trip (kernel dispatch, the vectored handler,
-// the return), against the same loop with a 4-byte NOP in its place. Prints nanoseconds per instruction; checks
-// nothing, so a slow machine cannot fail the test.
-//   mov ecx, N; loop: <4 bytes>; dec ecx; jnz loop; ret       (the 4 bytes: clwb [rdx] or nop dword [rax+0])
-double ns_per_iteration(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint32_t iterations, void* line) {
-    Code loop({0xB9, uint8_t(iterations), uint8_t(iterations >> 8), uint8_t(iterations >> 16),
-               uint8_t(iterations >> 24), b0, b1, b2, b3, 0xFF, 0xC9, 0x75, 0xF8, 0xC3});
+// the return), against the same loop with a NOP of the same length in its place. It times each of CLWB, CLZERO and
+// EXTRQ that this host lacks, so every number is the trap; on a host that has all three there is nothing to time and
+// it says so. Prints nanoseconds per instruction; checks nothing, so a slow machine cannot fail.
+//   mov ecx, N; loop: <body>; dec ecx; jnz loop; ret
+// Calls the generated loop; false when it raised (no C++ objects here, so __try is allowed).
+bool call_guarded(void* code, void* line) {
+    __try {
+        reinterpret_cast<Fn>(code)(nullptr, line);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+double ns_per_iteration(std::initializer_list<uint8_t> body, uint32_t iterations, void* line) {
+    std::vector<uint8_t> bytes{0xB9, uint8_t(iterations), uint8_t(iterations >> 8), uint8_t(iterations >> 16),
+                               uint8_t(iterations >> 24)};
+    bytes.insert(bytes.end(), body.begin(), body.end());
+    bytes.insert(bytes.end(), {0xFF, 0xC9, 0x75, uint8_t(-int(body.size() + 4)), 0xC3});
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!mem) return -1;
+    std::memcpy(mem, bytes.data(), bytes.size());
+    FlushInstructionCache(GetCurrentProcess(), mem, 4096);
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
-    DWORD ex = 0;
     QueryPerformanceCounter(&t0);
-    const bool ok = run(loop, nullptr, line, &ex);
+    const bool ok = call_guarded(mem, line);
     QueryPerformanceCounter(&t1);
+    VirtualFree(mem, 0, MEM_RELEASE);
     if (!ok) return -1;
     return double(t1.QuadPart - t0.QuadPart) * 1e9 / double(f.QuadPart) / iterations;
 }
@@ -348,10 +365,23 @@ double ns_per_iteration(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint32_t
 void bench(const ce::Host& host) {
     alignas(64) static uint8_t line[64];
     const uint32_t n = 200000;
-    const double nop = ns_per_iteration(0x0F, 0x1F, 0x40, 0x00, n, line);
-    const double wb = ns_per_iteration(0x66, 0x0F, 0xAE, 0x32, n, line);
-    std::printf("bench: %u iterations; nop %.1f ns, clwb (%s) %.1f ns per iteration; the emulation costs %.0f ns "
-                "per instruction\n", n, nop, path(host.clwb), wb, wb - nop);
+    int timed = 0;
+    auto time_one = [&](const char* what, std::initializer_list<uint8_t> nop_body, std::initializer_list<uint8_t> body) {
+        const double nop = ns_per_iteration(nop_body, n, line);
+        const double op = ns_per_iteration(body, n, line);
+        std::printf("bench: %u iterations; nop %.1f ns, %s (emulated) %.1f ns per iteration; one emulated %s costs "
+                    "%.0f ns\n", n, nop, what, op, what, op - nop);
+        ++timed;
+    };
+    if (!host.clwb)  // clwb [rdx]  /  nop dword [rax+0]
+        time_one("CLWB", {0x0F, 0x1F, 0x40, 0x00}, {0x66, 0x0F, 0xAE, 0x32});
+    if (!host.clzero)  // mov rax,rdx; clzero  /  mov rax,rdx; nop dword [rax]
+        time_one("CLZERO", {0x48, 0x89, 0xD0, 0x0F, 0x1F, 0x00}, {0x48, 0x89, 0xD0, 0x0F, 0x01, 0xFC});
+    if (!host.sse4a)  // extrq xmm0, 0, 0  /  nop word [rax+rax+0]
+        time_one("EXTRQ", {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00}, {0x66, 0x0F, 0x78, 0xC0, 0x00, 0x00});
+    if (!timed)
+        std::printf("bench: this CPU runs CLWB, CLZERO and EXTRQ natively; nothing is emulated, so there is no trap "
+                    "to time\n");
 }
 
 int main(int argc, char** argv) {
