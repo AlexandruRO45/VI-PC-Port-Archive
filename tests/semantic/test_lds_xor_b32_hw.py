@@ -95,6 +95,72 @@ class LDSStorage:
         self.write_dword(idx, new_val)
         return old_val, new_val
 
+class RegKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    LDS = "lds"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register representation."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count < 1 or self.index + self.count > 256:
+            raise ValueError(f"Register count exceeds bounds: {self.count} at {self.index}")
+
+    def format_asm(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        if self.count == 1:
+            return f"{prefix}{self.index}"
+        return f"{prefix}[{self.index}:{self.index + self.count - 1}]"
+
+
+class Opcode(enum.Enum):
+    DS_XOR_B32 = "ds_xor_b32"
+    DS_XOR_RTN_B32 = "ds_xor_rtn_b32"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST for Local Data Share XOR instructions."""
+    opcode: Opcode
+    vaddr: Register
+    vdata: Register
+    vdst: Register | None = None
+    offset: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if self.vaddr.kind != RegKind.VGPR:
+            raise ValueError("vaddr must be a VGPR")
+        if self.vdata.kind != RegKind.VGPR:
+            raise ValueError("vdata must be a VGPR")
+        if self.opcode == Opcode.DS_XOR_RTN_B32:
+            if self.vdst is None or self.vdst.kind != RegKind.VGPR:
+                raise ValueError("ds_xor_rtn_b32 requires a destination VGPR (vdst)")
+        elif self.vdst is not None:
+            raise ValueError("ds_xor_b32 does not accept a destination register")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"LDS immediate offset must be in range [0, 65535]: {self.offset}")
+
+    def format_asm(self) -> str:
+        parts = [self.opcode.value]
+        if self.vdst is not None:
+            parts.append(self.vdst.format_asm() + ",")
+        parts.append(self.vaddr.format_asm() + ",")
+        parts.append(self.vdata.format_asm())
+        if self.offset > 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
 class TestLdsXorB32Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -133,6 +199,28 @@ class TestLdsXorB32Oracle(unittest.TestCase):
         self.lds.atomic_xor(vaddr=66, vdata=0x00000002)
         self.lds.atomic_xor(vaddr=67, vdata=0x00000004)
         self.assertEqual(self.lds.read_dword(16), 0x00000007)
+
+class TestLdsXorB32AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_formatting_non_returning(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.DS_XOR_B32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+            offset=16,
+        )
+        self.assertEqual(inst.format_asm(), "ds_xor_b32 v1, v2 offset:16")
+
+    def test_instruction_formatting_returning(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.DS_XOR_RTN_B32,
+            vdst=Register(RegKind.VGPR, 5),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+            offset=32,
+        )
+        self.assertEqual(inst.format_asm(), "ds_xor_rtn_b32 v5, v1, v2 offset:32")
 
 if __name__ == "__main__":
     unittest.main()
