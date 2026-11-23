@@ -397,5 +397,33 @@ class TestValuDot4I32I8Aliasing(unittest.TestCase):
         ScalarInterpreter().step(instr, state)
         self.assertEqual(state.vgprs[0], val + 16)
 
+class TestValuDot4I32I8ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_scc_and_vcc_unmodified(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xDEADBEEFCAFEBABE
+
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.imm(pack_i8(0, 0, 0, 0)),
+            src1=Operand.imm(pack_i8(0, 0, 0, 0)),
+            src2=Operand.imm(0),
+        )
+        ScalarInterpreter().step(instr, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xDEADBEEFCAFEBABE)
+
+        instr_neg = VDot4I32I8Instruction(
+            dst=Operand.vgpr(1),
+            src0=Operand.imm(pack_i8(-1, -1, -1, -1)),
+            src1=Operand.imm(pack_i8(1, 1, 1, 1)),
+            src2=Operand.imm(0),
+        )
+        ScalarInterpreter().step(instr_neg, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xDEADBEEFCAFEBABE)
+
 if __name__ == "__main__":
     unittest.main()
