@@ -400,7 +400,14 @@ def parse_junit(xml):
 
 def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
     """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log."""
+    rows, _ = _parse_lasttest(text)
+    return rows
+
+
+def _parse_lasttest(text: str) -> tuple[list[tuple[str, str, float | None]], bool]:
+    """Return the observed verdicts and whether any outer test lacks a verdict."""
     out, name, secs = [], None, None
+    incomplete = False
     captured = False
     nested_runs = 0
     lines = text.splitlines()
@@ -417,6 +424,7 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             continue
         m = re.match(r"^\d+/\d+ Test: (.+)$", line)
         if m:
+            incomplete = incomplete or bool(name)
             name, secs = m.group(1).strip(), None
             continue
         if not name:
@@ -440,7 +448,7 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             continue
         out.append((name, res, secs))
         name = None
-    return out
+    return out, incomplete or bool(name)
 
 
 def collect_ctest(col, args):
@@ -450,8 +458,11 @@ def collect_ctest(col, args):
     log = os.path.join(ROOT, "runtime", "build", "Testing", "Temporary", "LastTest.log")
     sets = []
     if os.path.isfile(log):
-        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))], True))
-        col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
+        verdicts, incomplete = _parse_lasttest(read_utf8(log))
+        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in verdicts], True))
+        status = "incomplete" if incomplete else "ok"
+        note = "CTest started a test without recording its verdict" if incomplete else None
+        col.source("ctest_lasttest", log, status, len(verdicts), note=note)
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
     for path in args.junit or []:
