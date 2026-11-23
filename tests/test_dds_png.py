@@ -1230,6 +1230,24 @@ class HalfFloatTests(unittest.TestCase):
         raw = zlib.decompress(b"".join(p for t, p, _ in chunks if t == b"IDAT"))
         self.assertEqual(raw[1:], bytes((255, 0, 128, 255, 0, 255, 64, 128)))
 
+    def test_cli_uses_same_report_path_for_folding_alias(self):
+        import contextlib
+        import io
+        from unittest import mock
+        payload = halves(0x3C00, 0x0000, 0x3800, 0x3C00, 0x7E00, 0x7C00, 0x3400, 0x3800)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(2, 1, payload, pitch=16, dxgi=10, **HALF_FLOAT))
+            alias = os.path.join(tmp, "IN.DDS")
+            err = io.StringIO()
+            with mock.patch.object(dds, "same_report_path", return_value=True) as mocked, \
+                    contextlib.redirect_stderr(err):
+                rc = dds.main([src, alias])
+            self.assertEqual(rc, 1)
+            self.assertIn("output must not overwrite the input DDS", err.getvalue())
+            mocked.assert_called_once_with(src, alias)
+
 
 if __name__ == "__main__":
     unittest.main()

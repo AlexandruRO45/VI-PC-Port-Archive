@@ -33,6 +33,11 @@ import os
 import struct
 import sys
 from typing import BinaryIO, NamedTuple, TypedDict
+
+_TOOLS = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+from report_paths import same_report_path  # noqa: E402
 import zlib
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1485,11 +1490,7 @@ def main(argv: list[str] | None = None) -> int:
             with open(args.input, "rb") as f:
                 print(json.dumps(parse_dds_header(_read_header(f)), indent=2))
             return 0
-        try:
-            overwrites_input = os.path.samefile(args.input, args.output)
-        except FileNotFoundError:
-            overwrites_input = False
-        if overwrites_input:
+        if same_report_path(args.input, args.output):
             raise DdsError("output must not overwrite the input DDS")
         png = dds_file_to_png_bytes(
             args.input, args.max_size or 0, mip=args.mip or 0, layer=args.layer or 0,
