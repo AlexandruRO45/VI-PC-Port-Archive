@@ -175,7 +175,7 @@ class DrawBindingTests(unittest.TestCase):
             secondary = subprocess.run([*cmd, "--lod", "1"], capture_output=True, text=True)
             self.assertEqual(secondary.returncode, 0, secondary.stderr)
             self.assertEqual(json.loads(secondary.stdout)["bindings"],
-                             [{"geometry": 0, "vertex_block": 384, "meshlet_group": 256, "vertices": 8}])
+                             [{"lod": 1, "geometry": 0, "vertex_block": 384, "meshlet_group": 256, "vertices": 8}])
 
     def test_inconsistent_bindings(self):
         for offset, fmt, value in ((64, "Q", 0x50010000), (248, "H", 2),

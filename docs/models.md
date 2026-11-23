@@ -815,6 +815,59 @@ POSITION bounding box (marked `partial` when a POSITION accessor has no `min`/`m
 what the JSON chunk says — a field the exporter dropped reads `(missing)` — and never infers
 geometry from the BIN chunk. Standard library only; no game files.
 
+## Meshlet decoder, multi-LOD and CPU page assembly
+
+`tools/meshlet_page.py` validates paired drawable system/graphics segments and raw mesh pages across
+all four LOD levels and high-poly models (`>65,535` triangles or vertex references):
+
+- **Group header (`<HHII`) and `0x4000` per-meshlet tail.** A meshlet group begins with
+  `(u16 meshlets, u16 flags, u32 triangles, u32 refs)`. Bit 15 (`0x8000`) is set on every valid
+  group. Bit 14 (`0x4000`, matching bit 31 of the geometry descriptor's `binding` word on
+  **11,114 / 11,114** measured groups across high-poly models and vehicles) indicates a trailing
+  per-meshlet `u16[meshlets]` table immediately after the `u16[refs]` vertex-reference array. Its
+  allocated index-buffer byte size is `(((ref_end + 3) & ~3) + 2 * meshlets + 15) & ~15`, with zero
+  padding after `ref_end + 2 * meshlets` (verified **1,379 / 1,379** high-poly vehicle geometries,
+  0 failures; **10,730 / 10,730** non-`0x4000` groups use `(ref_end + 15) & ~15`).
+- **17-bit `vbase` and 17-bit `tbase` running sums.** Each 16-byte meshlet record stores the low 16
+  bits of `vbase` and `tbase` in `w1` (`w1 & 0xFFFF`, `w1 >> 16`) and bit 16 of each in `w0`:
+  `vbase |= ((w0 >> 14) & 1) << 16` and `tbase |= ((w0 >> 15) & 1) << 16` (`meshlet_bases`).
+  Measured across **622,621 meshlets** in 17,897 high-poly groups: **622,621 / 622,621** exact
+  running sums (0 mismatches), including **503** meshlets with `vbase >= 65,536` (`w0` bit 14 set)
+  and **1,048** meshlets with `tbase >= 65,536` (`w0` bit 15 set). Treating `w0` bits 14–15
+  together as an 18-bit `vbase` disagrees on 762 meshlets.
+- **High-poly geometry descriptors and vertex layouts.** At `descriptor + 8` (`<HHI` =
+  `meshlets, triangles_lo, binding`), the full counts are
+  `triangles = triangles_lo | ((binding & 0x7F) << 16)` and `refs = (binding >> 8) & 0x7FFFFF`
+  (**17,897 / 17,897** exact matches, 0 mismatches). `draw_binding` accepts both packed `0x4042`
+  (`pos_size=8, pos_fmt=16`) and float3 `0x3063` (`pos_size=12, pos_fmt=6`) vertex blocks.
+- **Multi-LOD `0..3` traversal.** Drawables store up to four LOD pointers at
+  `drawable + 0x50 + 8 * lod` (`lod` in `0..3`). Across 386,431 indexed package models, 338,515
+  have LOD 0 only, 29,315 have LODs 0–1, 5,188 have LODs 0–2, and 13,407 have all four LODs 0–3.
+  `drawable_lods` and `drawable_geometries(system, drawable, lod=...)` walk any present LOD, and the
+  CLI accepts `--lod`:
+
+```
+python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset> --lod all
+```
+
+- **Position-only blocks and CPU continuation / trailing pages.** `parse_block` and
+  `parse_other_block` accept an explicit `block_size` for position-only (`slot 0` alone) vertex
+  blocks used by far-LOD drawables. `read_zlib_stream`, `uncompressed_cpu_tail`,
+  `consume_trailing_cpu_page`, and `assemble_drawable_system` assemble multi-page CPU system
+  segments across 64 KiB zlib continuation pages, small 16-byte-aligned uncompressed CPU tails
+  (`<4096` bytes), and trailing unreferenced CPU pages ahead of the GPU stream.
+
+For SGD5 shader texture parameter hashes referenced by drawable materials, see
+[sgd5_render_states.md](sgd5_render_states.md#post-pass-texture-parameter-tables) and
+`tools/sgd5_params.py`.
+
+Synthetic unit tests (no game files needed):
+
+```
+python -I tests/test_meshlet_page.py
+python -I tests/test_meshlet_page_lod.py
+```
+
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.

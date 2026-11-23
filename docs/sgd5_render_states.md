@@ -23,3 +23,29 @@ Use the `shaders.rpf` listed in the [Xbox 1.0.2.1 manifest](../game/xbox-1.0.2.1
 The state names are supported by comparison with the public SGD2 reader and measurements of the Xbox rows. The 16-byte rows have fill mode 3, cull mode in `1..3` and a one-byte front-face flag. In all 124 depth/stencil rows the enable flags and write mask are in `0..1`, and the comparison function is in `1..8`. All 398 blend rows have a four-byte prefix and eight eight-byte render-target entries. Their enable flag is in `0..1` and their write mask is in `0..15`. Individual enum values do not establish the rest of the Xbox state layout. [SGD2 format comparison](https://github.com/Kalmarv/rage-engine-formats/blob/91e5abb68476709fac80f256bc64f928c6fc2d19/src/sgd2_effect.rs)
 
 The measurements identify the indices stored in the package. Runtime selection of a technique, application of overrides, and the resulting image still require execution evidence.
+
+## Post-pass texture parameter tables
+
+Immediately after each effect's 24-byte pass table, a u32 word count, that many u32 words, and the `0x80000000` marker precede two length-prefixed parameter tables. Each nonempty table starts with `<4H` (`resource_count`, `parameter_count`, `attribute_count`, `size16`), followed by `(resource_count + parameter_count)` 24-byte `<BBH5I` records (`type_code`, `flags`, `slot`, three u32 words, `primary_hash`, `secondary_hash`) and `attribute_count` 8-byte entries. Resource records with `type_code == 2` declare shader texture SRVs (whereas `type_code == 35` is sampler state and `48` is constant buffer); their `primary_hash` and `secondary_hash` are lowercased 32-bit `joaat` hashes (`tools/hashdict.py`) linking the shader-side parameter name to the drawable material slot hash.
+
+`tools/sgd5_params.py` provides a clean-room standard-library registry of **102** programmatically hashed shader texture parameters (12 aliased pairs with `primary_hash != secondary_hash` and 90 unaliased parameters across 8 normalized categories: `base_color`, `normal`, `specular`, `material_map`, `emissive`, `tint`, `mask`, and `detail`) together with a post-pass parameter table parser (`parse_parameter_table`, `effect_parameter_tables`, `scan_sgd5_archive`). Measured across all **932 effects** in both SGD5 databases of Xbox 1.0.2.1 `shaders.rpf`:
+
+| Metric | Count |
+|---|---:|
+| Total `type_code == 2` texture slots (`table 0` / `table 1`) | 4,916 (4,916 / 0) |
+| Distinct `(primary_hash, secondary_hash)` texture pairs | 635 |
+| Built-in registry entries matching exact pairs in `shaders.rpf` | 102 / 102 |
+| Texture slots matched by the built-in registry | 3,345 / 4,916 (68.0%) |
+| Aliased (`primary != secondary`) texture pairs matched | 12 / 12 |
+| Aliased texture slots matched | 1,140 / 1,140 (100.0%) |
+
+Category slot breakdown across the 3,345 matched slots: `normal` 805, `specular` 749, `material_map` 539, `base_color` 498, `tint` 371, `detail` 217, `mask` 122, and `emissive` 44.
+
+```
+python -I tools/sgd5_params.py --list
+python -I tools/sgd5_params.py --lookup <hash>
+python -I tools/sgd5_params.py --pair <primary_hash> <secondary_hash>
+python -I tools/sgd5_params.py --hash <name>
+python -I tools/sgd5_params.py --archive <path/to/shaders.rpf>
+python -I tests/test_sgd5_params.py
+```

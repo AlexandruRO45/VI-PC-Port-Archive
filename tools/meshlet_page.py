@@ -17,14 +17,18 @@ Vertex block (header 0x60 bytes, first u32 is 0x00003063):
     from slot 0 to the next stream in offset order, divided by 12; the block ends 8 * count bytes after its last
     slot.
 
-Meshlet group (first u32 has bit 31 set):
-    +0   u32  0x80000000 | meshlet count K
+Meshlet group (first u32 has bit 31 set; header is `<HHII`):
+    +0   u16  meshlet count K
+    +2   u16  group flags (bit 15 set: 0x8000, 0xc000, 0xe000+ in high-poly / skinned meshes)
     +4   u32  triangle count T
     +8   u32  vertex reference count V
     +12  K * 16-byte meshlet records:
-         u32 w0: bits 0-6 = vertices - 1, bits 7-13 = triangles - 1, bits 14-15 zero, bits 16-31 = the
-                 meshlet's bounding-sphere radius around the w2/w3 centre, as an f16 (measured on `42 40` geometry)
-         u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
+         u32 w0: bits 0-6 = vertices - 1, bits 7-13 = triangles - 1, bit 14 = bit 16 of first vertex reference
+                 (17-bit remap_base, 0..131071), bit 15 = bit 16 of first triangle (17-bit triangle base,
+                 0..131071), bits 16-31 = the meshlet's bounding-sphere radius around the w2/w3 centre, as an f16
+                 (measured on `42 40` geometry)
+         u32 w1: low u16 = low 16 bits of first vertex reference, high u16 = low 16 bits of first triangle
+                 (running sums; high bits live in w0 bits 14 and 15)
          u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
                      12-bit steps around 2047, (field - 2047) * step (measured on `42 40` geometry; the default
                      0x007FF7FF / 0x7FF is the origin). The step is 2^e / 16 m with e = w2 bits 28-31 (0 to 4
@@ -42,6 +46,7 @@ Meshlet group (first u32 has bit 31 set):
     A slot tag byte is (stride / 4) << 5 | type (tag_stride, SLOT_TYPES): 0x42 = 8 bytes, 0x21, 0x25, 0x26, 0x27 and
     0x28 = 4 bytes, and 0x63 in the `63 30` block = 12 bytes. The vertex count is the span
     from slot 0 to the next stream divided by 8; every stream is stride * count bytes and the block ends there.
+    Position-only blocks (slot 0 alone) can be sized when the caller supplies the buffer's declared `block_size`.
     Measured over every `42 40` block of `shared_minigame000.rpf`: 14,671 fit this exactly, and each one is
     followed by a `42 40` block, a meshlet group, a `63 30` block or the end of the stream.
     slot 0  tag 0x42  8 bytes/vertex  packed position, read as one u64 q:
@@ -64,7 +69,7 @@ Usage:
     python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet]
         [--faces] [--centres] [--normals] [--cones]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --geometry-offset <offset> [--json out.json]
-    python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
+    python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset> [--lod 0|1|2|3|all]
 """
 import argparse
 import json
@@ -83,6 +88,8 @@ SLOT_COUNT = 23
 SLOT_STRIDE = {0: 12, 1: 4, 2: 12, 3: 8, 4: 8}
 SLOT_TAG = {0: 0x63, 1: 0x26, 2: 0x63, 3: 0x42, 4: 0x42}
 OTHER_HEADER_SIZE = 0x80
+CPU_PAGE_SIZE = 65536
+ZLIB_HEADERS = (b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda")
 # A slot tag byte is (stride / 4) << 5 | type, as rpf9-explorer's RageModelDecoder reads vertex slots. Types seen in
 # shared_minigame000.rpf: 1, 2, 3, 6, 7, 8. Skinned blocks also use type 5 for joint indices.
 SLOT_TYPES = {1: "octahedral normal, 10 + 10 bits unorm", 2: "2 x f32 or a packed position", 3: "3 x f32",
@@ -95,6 +102,18 @@ def tag_stride(tag):
     """Bytes per vertex for a slot tag (bits 5-7 times 4), or None for a type not seen or a zero stride."""
     stride = ((tag >> 5) & 7) * 4
     return stride if stride and (tag & 15) in SLOT_TYPES else None
+
+
+def meshlet_bases(w0, w1):
+    """Return (first_vertex_ref, first_triangle) from meshlet record words w0 and w1.
+
+    w1 holds the low 16 bits of each running sum (low u16 = first vertex reference / remap_base,
+    high u16 = first triangle). w0 bit 14 is bit 16 of the vertex-reference base (17-bit range
+    0..131071) and w0 bit 15 is bit 16 of the triangle base (17-bit range 0..131071).
+    """
+    return (w1 & 0xFFFF) | (((w0 >> 14) & 1) << 16), (w1 >> 16) | (((w0 >> 15) & 1) << 16)
+
+
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 
@@ -108,8 +127,11 @@ def _u32(data, at):
     return struct.unpack_from("<I", data, at)[0]
 
 
-def parse_block(data, at):
-    """Parse a vertex block at `at`. Returns (record, end offset)."""
+def parse_block(data, at, *, block_size=None):
+    """Parse a vertex block at `at`. Returns (record, end offset).
+
+    When `block_size` is provided, a position-only block (slot 0 alone) is sized from `block_size - HEADER_SIZE`.
+    """
     if at + HEADER_SIZE > len(data):
         raise PageError(f"block header truncated at +0x{at:x}")
     words = struct.unpack_from("<24I", data, at)
@@ -121,20 +143,29 @@ def parse_block(data, at):
     if slots[0][1] != HEADER_SIZE:
         raise PageError(f"block at +0x{at:x}: slot 0 is not at +0x60")
     order = sorted(slots, key=lambda i: slots[i][1])
-    if len(order) < 2 or order[0] != 0:
-        raise PageError(f"block at +0x{at:x}: slot 0 is not followed by another stream")
-    span = slots[order[1]][1] - slots[0][1]
-    if span <= 0 or span % SLOT_STRIDE[0]:
-        raise PageError(f"block at +0x{at:x}: slot {order[1]} offset is not 12 * count past slot 0")
-    count = span // SLOT_STRIDE[0]
-    for here, nxt in zip(order, order[1:]):
-        stride = SLOT_STRIDE.get(here, tag_stride(slots[here][0]))   # a slot past 4: its tag's stride
-        if stride is None or slots[nxt][1] - slots[here][1] != stride * count:
-            raise PageError(f"block at +0x{at:x}: slot {here} size is not stride * count")
-    last = order[-1]
-    if last not in (3, 4):
-        raise PageError(f"block at +0x{at:x}: last slot is {last}, expected a float2 slot")
-    end = at + slots[last][1] + 8 * count
+    if order[0] != 0:
+        raise PageError(f"block at +0x{at:x}: slot 0 is not the first stream")
+    if len(order) < 2:
+        if block_size is None:
+            raise PageError(f"block at +0x{at:x}: slot 0 is not followed by another stream")
+        span = block_size - HEADER_SIZE
+        if span <= 0 or span % SLOT_STRIDE[0]:
+            raise PageError(f"block at +0x{at:x}: position-only span is not 12 * count")
+        count = span // SLOT_STRIDE[0]
+        end = at + block_size
+    else:
+        span = slots[order[1]][1] - slots[0][1]
+        if span <= 0 or span % SLOT_STRIDE[0]:
+            raise PageError(f"block at +0x{at:x}: slot {order[1]} offset is not 12 * count past slot 0")
+        count = span // SLOT_STRIDE[0]
+        for here, nxt in zip(order, order[1:]):
+            stride = SLOT_STRIDE.get(here, tag_stride(slots[here][0]))   # a slot past 4: its tag's stride
+            if stride is None or slots[nxt][1] - slots[here][1] != stride * count:
+                raise PageError(f"block at +0x{at:x}: slot {here} size is not stride * count")
+        last = order[-1]
+        if last not in (3, 4):
+            raise PageError(f"block at +0x{at:x}: last slot is {last}, expected a float2 slot")
+        end = at + slots[last][1] + 8 * count
     if end > len(data):
         raise PageError(f"block at +0x{at:x} runs past the page end")
     record = {"kind": "block", "offset": at, "vertices": count, "flags": words[23],
@@ -143,9 +174,10 @@ def parse_block(data, at):
     return record, end
 
 
-def parse_other_block(data, at):
+def parse_other_block(data, at, *, block_size=None):
     """Size a `42 40 00 00` vertex block at `at` from its slot words. Returns (record, end offset); the record holds
-    counts and tags only."""
+    counts and tags only. When `block_size` is provided, a position-only block (slot 0 alone) is sized from
+    `block_size - OTHER_HEADER_SIZE`."""
     if at + OTHER_HEADER_SIZE > len(data):
         raise PageError(f"42 40 block header truncated at +0x{at:x}")
     words = struct.unpack_from("<32I", data, at)
@@ -155,17 +187,26 @@ def parse_other_block(data, at):
     if any(tag_stride(tag) is None for tag, _ in slots.values()):
         raise PageError(f"42 40 block at +0x{at:x} has a slot tag with no known stride")
     order = sorted(slots, key=lambda i: slots[i][1])
-    if len(order) < 2 or order[0] != 0 or slots[0][1] != OTHER_HEADER_SIZE:
+    if not order or order[0] != 0 or slots[0][1] != OTHER_HEADER_SIZE:
         raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not at +0x80 or has no stream after it")
-    span = slots[order[1]][1] - OTHER_HEADER_SIZE
-    if span <= 0 or span % tag_stride(slots[0][0]):
-        raise PageError(f"42 40 block at +0x{at:x}: slot 0 span is not a whole number of vertices")
-    count = span // tag_stride(slots[0][0])
-    for here, nxt in zip(order, order[1:]):
-        if slots[nxt][1] - slots[here][1] != tag_stride(slots[here][0]) * count:
-            raise PageError(f"42 40 block at +0x{at:x}: slot {here} size is not stride * count")
-    last = order[-1]
-    end = at + slots[last][1] + tag_stride(slots[last][0]) * count
+    if len(order) < 2:
+        if block_size is None:
+            raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not at +0x80 or has no stream after it")
+        span = block_size - OTHER_HEADER_SIZE
+        if span <= 0 or span % tag_stride(slots[0][0]):
+            raise PageError(f"42 40 block at +0x{at:x}: slot 0 span is not a whole number of vertices")
+        count = span // tag_stride(slots[0][0])
+        end = at + block_size
+    else:
+        span = slots[order[1]][1] - OTHER_HEADER_SIZE
+        if span <= 0 or span % tag_stride(slots[0][0]):
+            raise PageError(f"42 40 block at +0x{at:x}: slot 0 span is not a whole number of vertices")
+        count = span // tag_stride(slots[0][0])
+        for here, nxt in zip(order, order[1:]):
+            if slots[nxt][1] - slots[here][1] != tag_stride(slots[here][0]) * count:
+                raise PageError(f"42 40 block at +0x{at:x}: slot {here} size is not stride * count")
+        last = order[-1]
+        end = at + slots[last][1] + tag_stride(slots[last][0]) * count
     if end > len(data):
         raise PageError(f"42 40 block at +0x{at:x} runs past the page end")
     record = {"kind": "block4240", "offset": at, "vertices": count, "flags": words[23], "axis": words[27],
@@ -198,9 +239,10 @@ def group_triangles(data, group):
     """Yield each triangle of a parsed group as three vertex references (indices into its vertex block)."""
     at, k = group["offset"], group["meshlets"]
     rec_at, tri_at = at + 12, at + 12 + 16 * k
+    vbases = [meshlet_bases(*struct.unpack_from("<2I", data, rec_at + 16 * m))[0] for m in range(k)]
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, tri_at + 4 * group["triangles"])
     for t in struct.unpack_from(f"<{group['triangles']}I", data, tri_at):
-        vbase = _u32(data, rec_at + 16 * (t >> 21) + 4) & 0xFFFF
+        vbase = vbases[t >> 21]
         yield refs[vbase + (t & 0x7F)], refs[vbase + ((t >> 7) & 0x7F)], refs[vbase + ((t >> 14) & 0x7F)]
 
 
@@ -272,7 +314,8 @@ def cone_agreement(data, group, positions):
         if cone is None:
             continue
         axis, cos_half = cone
-        vb, tb, tc = w1 & 0xFFFF, w1 >> 16, ((w0 >> 7) & 0x7F) + 1
+        vb, tb = meshlet_bases(w0, w1)
+        tc = ((w0 >> 7) & 0x7F) + 1
         normals, total = [], [0.0, 0.0, 0.0]
         for t in struct.unpack_from(f"<{tc}I", data, tri_at + 4 * tb):
             idx = [refs[vb + ((t >> s) & 0x7F)] for s in (0, 7, 14)]
@@ -312,7 +355,8 @@ def centre_agreement(data, group, positions):
     for m in range(k):
         w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
         out["default_words"] += w2 == 0x007FF7FF and w3 == 0x7FF
-        vb, vc = w1 & 0xFFFF, (w0 & 0x7F) + 1
+        vb, _ = meshlet_bases(w0, w1)
+        vc = (w0 & 0x7F) + 1
         pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
         if len(pts) != vc:
             raise PageError("meshlet references a vertex past its block")
@@ -481,15 +525,16 @@ def block4240_checks(data, block):
 
 def parse_group(data, at):
     """Parse and validate a meshlet group at `at`. Returns (record, end offset)."""
-    head = _u32(data, at)
-    if not head & 0x80000000:
+    if at + 12 > len(data):
+        raise PageError(f"truncated at +0x{at:x}")
+    meshlets, group_flags, triangles, refs = struct.unpack_from("<HHII", data, at)
+    if not group_flags & 0x8000:
         raise PageError(f"no group header at +0x{at:x}")
-    meshlets = head & 0x7FFFFFFF
-    triangles, refs = _u32(data, at + 4), _u32(data, at + 8)
     rec_at = at + 12
     tri_at = rec_at + 16 * meshlets
     ref_at = tri_at + 4 * triangles
-    end = ref_at + 2 * refs
+    ref_end = ref_at + 2 * refs
+    end = ref_end + (2 * meshlets if (group_flags & 0x4000) else 0)
     if end > len(data):
         raise PageError(f"group at +0x{at:x} runs past the page end")
     vbase = tbase = 0
@@ -497,7 +542,8 @@ def parse_group(data, at):
     for m in range(meshlets):
         w0, w1, _, _ = struct.unpack_from("<4I", data, rec_at + 16 * m)
         vcount, tcount = (w0 & 0x7F) + 1, ((w0 >> 7) & 0x7F) + 1
-        if (w1 & 0xFFFF) != (vbase & 0xFFFF) or (w1 >> 16) != (tbase & 0xFFFF):
+        got_vbase, got_tbase = meshlet_bases(w0, w1)
+        if got_vbase != vbase or got_tbase != tbase:
             raise PageError(f"group at +0x{at:x}: meshlet {m} offsets are not running sums")
         if tbase + tcount > triangles or vbase + vcount > refs:
             raise PageError(f"group at +0x{at:x}: meshlet {m} runs past the group")
@@ -511,7 +557,7 @@ def parse_group(data, at):
         raise PageError(f"group at +0x{at:x}: meshlet sums do not match the header")
     vref = struct.unpack_from(f"<{refs}H", data, ref_at) if refs else ()
     span = (max(vref) + 1) if vref else 0
-    record = {"kind": "group", "offset": at, "meshlets": meshlets, "triangles": triangles,
+    record = {"kind": "group", "offset": at, "flags": group_flags, "meshlets": meshlets, "triangles": triangles,
               "vertex_refs": refs, "vertex_span": span, "unique_refs": len(set(vref)),
               "full_meshlets": full}
     return record, end
@@ -823,24 +869,32 @@ def _resource_pointer(system, at, base, segment, size):
     return address
 
 
-def drawable_geometries(system, drawable, lod_index=0):
-    """Read one LOD geometry list at a caller-identified drawable."""
+def drawable_lods(system, drawable):
+    """Return the present LOD indices (subset of 0..3) at a caller-identified drawable."""
+    if not 0 <= drawable <= len(system) - 176:
+        raise PageError("drawable outside the system segment")
+    return [level for level in range(4) if struct.unpack_from("<Q", system, drawable + 80 + 8 * level)[0]]
+
+
+def drawable_geometries(system, drawable, lod=0):
+    """Read the geometry list for LOD `lod` (0..3, default 0) at a caller-identified drawable."""
+    if not isinstance(lod, int) or not 0 <= lod < 4:
+        raise PageError(f"invalid LOD level {lod}")
+
     def pointer(at, size):
         return _resource_pointer(system, at, 0x50000000, system, size)
 
     def count(at):
         used, capacity = struct.unpack_from("<HH", system, at)
-        if not 1 <= used <= 256 or used != capacity:
+        if not 1 <= used <= capacity <= 4096:
             raise PageError("invalid drawable array count")
         return used
 
     if not 0 <= drawable <= len(system) - 176:
         raise PageError("drawable outside the system segment")
-    if lod_index not in range(4):
-        raise PageError("drawable LOD index must be between 0 and 3")
-    lod = pointer(drawable + 80 + 8 * lod_index, 16)
-    models = count(lod + 8)
-    table = pointer(lod, 8 * models)
+    lod_at = pointer(drawable + 80 + 8 * lod, 16)
+    models = count(lod_at + 8)
+    table = pointer(lod_at, 8 * models)
     for i in range(models):
         model = pointer(table + 8 * i, 56)
         geometries = count(model + 16)
@@ -849,6 +903,146 @@ def drawable_geometries(system, drawable, lod_index=0):
         entries = pointer(model + 8, 8 * geometries)
         for j in range(geometries):
             yield pointer(entries + 8 * j, 160)
+
+
+def read_zlib_stream(source, pos, *, max_bytes=64 << 20):
+    """Inflate one zlib stream starting at `pos` in `source` and return (inflated_bytes, 16-byte-aligned next pos)."""
+    if pos < 0 or pos + 2 > len(source) or bytes(source[pos:pos + 2]) not in ZLIB_HEADERS:
+        raise PageError(f"no zlib stream header at +0x{pos:x}")
+    decoder = zlib.decompressobj()
+    out = bytearray()
+    cursor = pos
+    while not decoder.eof:
+        chunk = bytes(source[cursor:cursor + CPU_PAGE_SIZE])
+        if not chunk:
+            raise PageError(f"incomplete zlib stream at +0x{pos:x}")
+        try:
+            piece = decoder.decompress(chunk, max_bytes + 1 - len(out))
+        except zlib.error as exc:
+            raise PageError(f"corrupt zlib stream at +0x{pos:x}: {exc}") from exc
+        out.extend(piece)
+        if len(out) > max_bytes:
+            raise PageError(f"zlib stream at +0x{pos:x} exceeds size limit")
+        cursor += len(chunk) - len(decoder.unused_data)
+    aligned = (cursor + 15) & ~15
+    if aligned > len(source) or any(source[cursor:aligned]):
+        raise PageError(f"invalid 16-byte alignment padding after zlib stream at +0x{pos:x}")
+    return bytes(out), aligned
+
+
+def uncompressed_cpu_tail(source, start, *, max_tail=4096):
+    """Return length of a 16-byte-aligned uncompressed trailing CPU page (< max_tail) before the next zlib stream, or 0."""
+    if start < 0 or start >= len(source):
+        return 0
+    limit = min(max_tail, len(source) - start)
+    for off in range(16, limit, 16):
+        if bytes(source[start + off:start + off + 2]) in ZLIB_HEADERS:
+            try:
+                read_zlib_stream(source, start + off)
+                return off
+            except PageError:
+                continue
+    return 0
+
+
+def consume_trailing_cpu_page(source, system, gpu_start, *, max_tail=4096):
+    """Consume an unreferenced trailing CPU page when `system` ends on a 64 KiB boundary.
+
+    Returns `(extended_system, next_gpu_start)` or `None` if `system` is not on a 64 KiB page boundary or the
+    following stream already begins with a mesh vertex block (`0x4042` / `0x3063`) of a full page.
+    """
+    if not system or len(system) % CPU_PAGE_SIZE:
+        return None
+    if gpu_start + 2 <= len(source) and bytes(source[gpu_start:gpu_start + 2]) in ZLIB_HEADERS:
+        chunk, nxt = read_zlib_stream(source, gpu_start)
+        first = struct.unpack_from("<I", chunk, 0)[0] if len(chunk) >= 4 else 0
+        if len(chunk) < CPU_PAGE_SIZE or first not in (OTHER_BLOCK_MAGIC, BLOCK_MAGIC):
+            out = bytearray(system)
+            out.extend(chunk)
+            return out, nxt
+        return None
+    tail = uncompressed_cpu_tail(source, gpu_start, max_tail=max_tail)
+    if tail:
+        out = bytearray(system)
+        out.extend(source[gpu_start:gpu_start + tail])
+        return out, gpu_start + tail
+    return None
+
+
+def assemble_drawable_system(source, system, next_pos, drawable=0, *, lods=None, max_pages=256, max_tail=4096):
+    """Extend `system` with continuation CPU pages referenced by a drawable's LOD `0..3` geometry tables.
+
+    Appends 64 KiB zlib continuation streams and small uncompressed trailing CPU pages (`uncompressed_cpu_tail`)
+    whenever a `0x50000000`-based pointer reaches past the currently inflated system bytes. Returns
+    `(extended_system, gpu_start)`.
+    """
+    buf = bytearray(system)
+    cursor = next_pos
+    pages_added = 0
+
+    def ensure(at, size):
+        nonlocal cursor, pages_added
+        end = at + size
+        if at < 0 or size < 0 or end > (64 << 20):
+            raise PageError("system pointer outside supported address space")
+        while len(buf) < end:
+            if not buf or len(buf) % CPU_PAGE_SIZE:
+                raise PageError("system pointer reaches past a partial final page")
+            if pages_added >= max_pages:
+                raise PageError("system continuation page limit reached")
+            if cursor + 2 <= len(source) and bytes(source[cursor:cursor + 2]) in ZLIB_HEADERS:
+                chunk, cursor = read_zlib_stream(source, cursor)
+                if not chunk:
+                    raise PageError("empty system continuation page")
+                buf.extend(chunk)
+                pages_added += 1
+                continue
+            tail = uncompressed_cpu_tail(source, cursor, max_tail=max_tail)
+            if tail:
+                buf.extend(source[cursor:cursor + tail])
+                cursor += tail
+                pages_added += 1
+                continue
+            raise PageError(f"missing CPU continuation page at +0x{cursor:x}")
+
+    def ptr(field, size):
+        ensure(field, 8)
+        raw = struct.unpack_from("<Q", buf, field)[0]
+        if raw < 0x50000000:
+            raise PageError("non-system pointer in drawable table")
+        addr = raw - 0x50000000
+        ensure(addr, size)
+        return addr
+
+    def count(field):
+        ensure(field, 4)
+        used, capacity = struct.unpack_from("<HH", buf, field)
+        if not 1 <= used <= capacity <= 4096:
+            raise PageError("invalid drawable array count")
+        return used
+
+    ensure(drawable, 176)
+    levels = drawable_lods(buf, drawable) if lods is None else list(lods)
+    for level in levels:
+        if not isinstance(level, int) or not 0 <= level < 4:
+            raise PageError(f"invalid LOD level {level}")
+        if not struct.unpack_from("<Q", buf, drawable + 80 + 8 * level)[0]:
+            raise PageError(f"LOD {level} not present")
+        lod_at = ptr(drawable + 80 + 8 * level, 16)
+        models = count(lod_at + 8)
+        table = ptr(lod_at, 8 * models)
+        for i in range(models):
+            model = ptr(table + 8 * i, 56)
+            geometries = count(model + 16)
+            entries = ptr(model + 8, 8 * geometries)
+            for j in range(geometries):
+                geo = ptr(entries + 8 * j, 160)
+                vb = ptr(geo + 8, 80)
+                if struct.unpack_from("<Q", buf, vb + 64)[0] >= 0x50000000:
+                    ptr(vb + 64, 320)
+                desc = ptr(geo + 64, 16)
+                ptr(desc, 64)
+    return buf, cursor
 
 
 def draw_binding(system, graphics, geometry):
@@ -874,18 +1068,33 @@ def draw_binding(system, graphics, geometry):
     index, index_bytes, stride = buffer(ib)
     flags = _u32(system, layout + 0x138)
     count = flags >> 10
-    if (not flags & 1 or not count or _u32(system, layout) != 128
-            or system[layout + 0xD0] != 8 or system[layout + 0x104] != 16
-            or vertex_bytes < 128 + count * 8 or _u32(graphics, vertex) != OTHER_BLOCK_MAGIC):
+    header_bytes = _u32(system, layout)
+    pos_size = system[layout + 0xD0]
+    pos_fmt = system[layout + 0x104]
+    magic = _u32(graphics, vertex)
+    packed_ok = (header_bytes == OTHER_HEADER_SIZE and pos_size == 8 and pos_fmt == 16
+                 and vertex_bytes >= OTHER_HEADER_SIZE + count * 8 and magic == OTHER_BLOCK_MAGIC)
+    float3_ok = (header_bytes == HEADER_SIZE and pos_size == 12 and pos_fmt == 6
+                 and vertex_bytes >= HEADER_SIZE + count * 12 and magic == BLOCK_MAGIC)
+    if not (flags & 1) or not count or not (packed_ok or float3_ok):
         raise PageError("unsupported vertex layout or invalid position extent")
-    meshlets, triangles, binding = struct.unpack_from("<HHI", system, descriptor + 8)
+    meshlets, triangles_lo, binding = struct.unpack_from("<HHI", system, descriptor + 8)
+    triangles = triangles_lo | ((binding & 0x7F) << 16)
     refs = (binding >> 8) & 0x7FFFFF
-    if (stride != 4 or index_bytes < 12 or binding >> 31 or not (meshlets and triangles and refs)
-            or struct.unpack_from("<III", graphics, index) != (0x80000000 | meshlets, triangles, refs)):
+    if stride != 4 or index_bytes < 12 or not (meshlets and triangles and refs):
+        raise PageError("unsupported or inconsistent meshlet descriptor")
+    g_meshlets, g_flags, g_triangles, g_refs = struct.unpack_from("<HHII", graphics, index)
+    if (not (g_flags & 0x8000) or bool(g_flags & 0x4000) != bool(binding >> 31)
+            or (g_meshlets, g_triangles, g_refs) != (meshlets, triangles, refs)):
         raise PageError("unsupported or inconsistent meshlet descriptor")
     data = memoryview(graphics)[index:index + index_bytes]
     group, end = parse_group(data, 0)
-    if (group["vertex_span"] > count or ((end + 15) & ~15) != index_bytes or any(data[end:])):
+    if g_flags & 0x4000:
+        ref_end = end - 2 * meshlets
+        expected_bytes = (((ref_end + 3) & ~3) + 2 * meshlets + 15) & ~15
+    else:
+        expected_bytes = (end + 15) & ~15
+    if group["vertex_span"] > count or expected_bytes != index_bytes or any(data[end:]):
         raise PageError("group references or padded extent exceed the declared layout")
     return {"vertex_block": vertex, "meshlet_group": index, "vertices": count}
 
@@ -937,8 +1146,9 @@ def main(argv=None):
     select.add_argument("--geometry-offset", action="append", type=lambda s: int(s, 0),
                         help="known geometry record offset in the system segment (repeatable)")
     select.add_argument("--drawable-offset", type=lambda s: int(s, 0),
-                        help="walk geometry records from this system-segment drawable")
-    ap.add_argument("--lod", type=int, choices=range(4), help="drawable LOD index (default: 0)")
+                        help="walk LOD geometry records from this system-segment drawable")
+    ap.add_argument("--lod", choices=("0", "1", "2", "3", "all"), default=None,
+                    help="LOD level (0..3 or 'all') to inspect with --drawable-offset (default: 0)")
     args = ap.parse_args(argv)
     if args.lod is not None and args.drawable_offset is None:
         ap.error("--lod requires --drawable-offset")
@@ -962,15 +1172,36 @@ def main(argv=None):
             with open(args.inputs[0], "rb") as source:
                 graphics = source.read()
             rows = []
-            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset, args.lod or 0)
-            try:
-                for offset in offsets:
+            if args.geometry_offset:
+                for offset in args.geometry_offset:
                     try:
                         rows.append({"geometry": offset, **draw_binding(system, graphics, offset)})
                     except PageError as exc:
                         rows.append({"geometry": offset, "unresolved": str(exc)})
-            except PageError as exc:
-                rows.append({"drawable": args.drawable_offset, "unresolved": str(exc)})
+            elif args.lod is None:
+                try:
+                    for offset in drawable_geometries(system, args.drawable_offset, lod=0):
+                        try:
+                            rows.append({"geometry": offset, **draw_binding(system, graphics, offset)})
+                        except PageError as exc:
+                            rows.append({"geometry": offset, "unresolved": str(exc)})
+                except PageError as exc:
+                    rows.append({"drawable": args.drawable_offset, "unresolved": str(exc)})
+            else:
+                try:
+                    levels = drawable_lods(system, args.drawable_offset) if args.lod == "all" else [int(args.lod)]
+                    for level in levels:
+                        try:
+                            for offset in drawable_geometries(system, args.drawable_offset, lod=level):
+                                try:
+                                    rows.append({"lod": level, "geometry": offset,
+                                                 **draw_binding(system, graphics, offset)})
+                                except PageError as exc:
+                                    rows.append({"lod": level, "geometry": offset, "unresolved": str(exc)})
+                        except PageError as exc:
+                            rows.append({"lod": level, "drawable": args.drawable_offset, "unresolved": str(exc)})
+                except PageError as exc:
+                    rows.append({"drawable": args.drawable_offset, "unresolved": str(exc)})
             report = json.dumps({"bindings": rows}, indent=2)
             if args.json:
                 try:
