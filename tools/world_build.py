@@ -567,7 +567,7 @@ def _run_jobs(fn, jobs, workers: int):
             raise
 
 
-def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, region, out_dir, chunk_size,
+def _build_instanced_world(entries, texture_indexes, shared_textures, *, placements, lod_levels, region, out_dir, chunk_size,
                            textures, max_tex_size, base_color_param, workers, mode, glb_mod, limit,
                            lod_sets=False) -> dict:
     """``build_world --placements`` with shared geometry: memory holds about 100 bytes per placement plus the
@@ -624,7 +624,8 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
         for mid, (models_dir, item) in enumerate(model_src):
             rel_file = item.get("File")
             obj_path = os.path.join(models_dir, rel_file) if isinstance(rel_file, str) and rel_file.strip() else ""
-            tex_map = resolve_model_textures(models_dir, item, ttpf_index, base_color_param) if textures else {}
+            tex_map = (resolve_model_textures(models_dir, item, texture_indexes[models_dir], base_color_param, shared_textures)
+                       if textures else {})
             jobs.append((mid, obj_path, _list_field(item, "MeshShaders"), tex_map, textures,
                          os.path.join(pack_dir, f"{mid}.lpk")))
         info: list[dict | None] = [None] * len(model_src)
@@ -934,6 +935,7 @@ def resolve_model_textures(
     item: dict,
     ttpf_index: dict[str, str],
     base_color_param: str | None = None,
+    shared_textures: dict[str, str] | None = None,
 ) -> dict[int, str]:
     """Resolve shader_index -> existing absolute .dds path for a model manifest item.
 
@@ -978,6 +980,7 @@ def resolve_model_textures(
 
     materials = _list_field(item, "Materials")
     if materials:
+        fallback = {}
         for mat in materials:
             if not isinstance(mat, dict):
                 continue
@@ -1027,8 +1030,16 @@ def resolve_model_textures(
                         chosen = os.path.abspath(cand)
                         break
 
+                # Defer cross-export hits until all local references for this shader have been tried.
+                if shared_textures and sidx not in fallback:
+                    cand = shared_textures.get(id64)
+                    if cand and os.path.isfile(cand):
+                        fallback[sidx] = cand
+
             if chosen is not None:
                 result[sidx] = chosen
+        for sidx, path in fallback.items():
+            result.setdefault(sidx, path)
     elif dds_files and base_color_param is None:
         # Fallback when Materials is empty/missing and no parameter is selected: map embedded indices and 0.
         for idx, path in emb_by_index.items():
@@ -1505,18 +1516,31 @@ def build_world(
 
     if extra_assets and placements is None:
         raise ValueError("--extra-assets requires --placements")
-    manifests = discover_model_manifests(assets_dir)
-    if not manifests and limit != 0:
-        raise ValueError(f"No readable model manifests found in {assets_dir}; output left unchanged")
-    for root in extra_assets:
-        extra = discover_model_manifests(root)
-        if not extra:
-            raise ValueError(f"No readable model manifests found in {root}")
-        manifests.extend(extra)
-    manifests = sorted({os.path.realpath(path) for path in manifests})
+    manifest_roots = {}
+    root_indexes = {}
+    shared_textures = {}
+    for i, root in enumerate((assets_dir, *extra_assets)):
+        root = os.path.realpath(root)
+        if root in root_indexes:
+            continue
+        manifests = discover_model_manifests(root)
+        if not manifests and (i or limit != 0):
+            raise ValueError(f"No readable model manifests found in {root}; output left unchanged")
+        local = index_ttpf_textures(root) if textures else {}
+        if extra_assets:
+            for key, path in local.items():
+                shared_textures.setdefault(key, path)
+        root_indexes[root] = local
+        for manifest in manifests:
+            path = os.path.realpath(manifest)
+            # When roots overlap, the most specific supplied root owns the model.
+            if path not in manifest_roots or len(root) > len(manifest_roots[path]):
+                manifest_roots[path] = root
+
+    texture_indexes = {os.path.dirname(path): root_indexes[root] for path, root in manifest_roots.items()}
     source_entries = {}
     entries: list[tuple[str, dict]] = []
-    for mpath in manifests:
+    for mpath in sorted(manifest_roots):
         data = _load_json_dict(mpath)
         if data is None:
             continue
@@ -1551,16 +1575,9 @@ def build_world(
     if limit is not None:
         entries = entries[:limit]
 
-    ttpf_index = index_ttpf_textures(assets_dir) if textures else {}
-
-    if textures:
-        for root in extra_assets:
-            for key, path in index_ttpf_textures(root).items():
-                ttpf_index.setdefault(key, path)
-
     if placements is not None and instancing != "bake":
         return _build_instanced_world(
-            entries, ttpf_index, placements=placements, lod_levels=lod_levels, region=region, out_dir=out_dir,
+            entries, texture_indexes, shared_textures, placements=placements, lod_levels=lod_levels, region=region, out_dir=out_dir,
             chunk_size=chunk_size, textures=textures, max_tex_size=max_tex_size,
             base_color_param=base_color_param, workers=workers, mode=instancing, glb_mod=glb_mod, limit=limit,
             lod_sets=lod_sets,
@@ -1584,7 +1601,7 @@ def build_world(
             return None
 
         tex_map = (
-            resolve_model_textures(models_dir, item, ttpf_index, base_color_param)
+            resolve_model_textures(models_dir, item, texture_indexes[models_dir], base_color_param, shared_textures)
             if textures
             else {}
         )

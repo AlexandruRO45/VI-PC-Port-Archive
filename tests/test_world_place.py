@@ -23,6 +23,7 @@ for p in (os.path.join(ROOT, "tools"), TESTS):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import test_world_build as twb
 import test_world_index as twi  # noqa: E402  (synthetic 0x7a resource builder)
 import world_build  # noqa: E402
 import world_names  # noqa: E402
@@ -274,6 +275,40 @@ class PlacedBuildTest(unittest.TestCase):
                         stats = doc["stats"]["placements"]
                         self.assertEqual((stats["placed"], stats["distinct_models"], stats["ambiguous_model"]),
                                          (2, 2, 2))
+
+    def test_placement_prefers_own_export_texture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            roots = [base / "red", base / "blue"]
+            colors = [(255, 0, 0, 255), (0, 0, 255, 255)]
+            shared_key = twb.TTPF_ALBEDO_KEY
+            red_only_key = "1122334455667788"
+            for root, color in zip(roots, colors):
+                refs = [twb._param_ref(twb.ALBEDO_PARAM, -1, key) for key in (red_only_key, shared_key)]
+                twb._write_param_fixture(root, refs, ttpf=True)
+                manifest = root / "models" / "manifest.json"
+                data = json.loads(manifest.read_text())
+                data["Items"][0]["Name"] = root.name
+                manifest.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+                (root / "ttpf" / "albedo.dds").write_bytes(twb._uniform_bgra_dds(color))
+
+            manifest = roots[0] / "ttpf" / "manifest.json"
+            data = json.loads(manifest.read_text())
+            data["Textures"].append({"AssetKey": red_only_key, "File": "albedo.dds"})
+            manifest.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+
+            ents = base / "entities.jsonl"
+            write_entities(ents, [entity(root.name, (10000 * i, 10, 10)) for i, root in enumerate(roots)])
+            out = base / "world"
+            for mode in ("gpu", "nodes", "bake"):
+                for first, second in (roots, roots[::-1]):
+                    with self.subTest(mode=mode, first=first):
+                        doc = world_build.build_world(str(first), str(out), extra_assets=[str(second)],
+                                                      placements=str(ents), instancing=mode)
+                        chunks = sorted(doc["chunks"], key=lambda c: c["bounds"][0])
+                        pixels = [twb._glb_first_base_color_pixel(twb._chunk_disk_path(out, c["url"]))[1]
+                                  for c in chunks]
+                        self.assertEqual(pixels, colors)
 
     def test_counts_and_bounds(self):
         rows = [

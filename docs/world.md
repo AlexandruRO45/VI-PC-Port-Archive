@@ -585,6 +585,8 @@ MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout":
 `mirrored` and `distinct_models`.
 
 Pass `--extra-assets ROOT` once per additional cached export. Each OBJ is read relative to its own manifest.
+Each shader resolves its texture references against that export first. If none resolves locally, external
+TTPF keys can resolve from the other roots in command-line order.
 For exports of the same package, equal absolute archive paths (`src`), resource offsets, drawable offsets,
 export LOD and model names identify repeat observations. Keep exports from different package versions separate.
 Rows without a complete source address remain separate candidates. An ambiguous placement is skipped in all
