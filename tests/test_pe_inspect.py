@@ -235,6 +235,24 @@ class PackageDependenciesTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
+    def test_named_and_ordinal_symbols_with_the_same_display_text_are_distinct(self):
+        self.write("byord.dll", package_image(exports=with_exports([0x1000], {}, base=10)))
+        self.write("byname.dll", package_image(exports=with_exports([0x1000], {0: "#10"}, base=20)))
+
+        for ordinal_image_symbol, name_image_symbol, status, missing in (
+            ("#10", 10, "missing_exports", ["#10"]),
+            (10, "#10", "declared", []),
+        ):
+            with self.subTest(status=status):
+                entry = self.write("entry.exe", package_image([
+                    ("byord.dll", [ordinal_image_symbol]),
+                    ("byname.dll", [name_image_symbol]),
+                ]))
+                graph = pe_inspect.inspect(str(entry), str(self.package), dependencies=True)["dependency_graph"]
+                self.assertEqual([(edge["functions"], edge["status"], edge["missing_exports"])
+                                  for edge in graph["imports"]],
+                                 [(["#10"], status, missing), (["#10"], status, missing)])
+
     def test_cli_follows_delay_and_normal_edges_through_a_cycle(self):
         app = self.write("demo.exe", package_image([("eNGINE.dll", ["Start", 7])]))
         self.write("Engine.DLL", package_image(

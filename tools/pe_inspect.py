@@ -68,6 +68,10 @@ def _cstring(data: bytes, offset: int, limit: int = NAME_LIMIT) -> str | None:
     return data[offset:end].decode(errors="replace")
 
 
+def _symbol_text(symbol: str | int) -> str:
+    return f"#{symbol}" if isinstance(symbol, int) else symbol
+
+
 class PeImage:
     """The parts of a PE file this tool reports on, read in place from the file bytes."""
 
@@ -181,8 +185,8 @@ class PeImage:
     def word(self, at: int) -> int:
         return struct.unpack_from("<Q" if self.is64 else "<I", self.data, at)[0]
 
-    def thunk_names(self, lookup_rva: int, *, strict: bool = False) -> list[str]:
-        """Names (or '#ordinal') of one lookup table, which is terminated by a zero entry."""
+    def thunk_names(self, lookup_rva: int, *, strict: bool = False, keep_ordinals: bool = False) -> list[str | int]:
+        """Read one zero-terminated lookup table, optionally retaining ordinal numbers."""
         ordinal_flag = 1 << (63 if self.is64 else 31)
         out = []
         width = 8 if self.is64 else 4
@@ -194,7 +198,8 @@ class PeImage:
             if not value:
                 return out
             if value & ordinal_flag:
-                out.append(f"#{value & 0xFFFF}")
+                ordinal = value & 0xFFFF
+                out.append(ordinal if keep_ordinals else _symbol_text(ordinal))
                 continue
             name = self.string_at(value + 2)  # skip the 2-byte hint
             if strict and not name:
@@ -205,7 +210,8 @@ class PeImage:
         return out
 
 
-def _imports(img: PeImage, kind: str, index: int, delay: bool = False, *, strict: bool = False) -> list[dict]:
+def _imports(img: PeImage, kind: str, index: int, delay: bool = False, *, strict: bool = False,
+             keep_ordinals: bool = False) -> list[dict]:
     rva, size = img.directory(index)
     if strict and size and not rva:
         raise PeFormatError(f"the {kind} import directory has no RVA")
@@ -245,7 +251,7 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False, *, strict
         if strict and (not dll or lookup <= 0 or iat_rva <= 0):
             raise PeFormatError(f"a {kind} import descriptor has an unreadable DLL name or table")
         if dll is not None:
-            functions = img.thunk_names(lookup, strict=strict) if lookup > 0 else []
+            functions = img.thunk_names(lookup, strict=strict, keep_ordinals=keep_ordinals) if lookup > 0 else []
             symbol_count += len(functions)
             if strict and symbol_count > 4 * MAX_ENTRIES:
                 raise PeFormatError(f"the {kind} import table exceeds the inspection limit")
@@ -255,7 +261,8 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False, *, strict
     return entries
 
 
-def _exports(img: PeImage, *, strict: bool = False, include_named_ordinals: bool = False) -> list[str]:
+def _exports(img: PeImage, *, strict: bool = False, include_named_ordinals: bool = False,
+             keep_ordinals: bool = False) -> list[str | int]:
     rva, size = img.directory(DIR_EXPORT)
     if strict and size and (not rva or size < 40):
         raise PeFormatError("invalid export directory")
@@ -303,7 +310,8 @@ def _exports(img: PeImage, *, strict: bool = False, include_named_ordinals: bool
         named.add(index)
     for i in range(min(functions, MAX_ENTRIES)):
         if (include_named_ordinals or i not in named) and has_export_at(i):
-            names.append(f"#{base + i}")
+            ordinal = base + i
+            names.append(ordinal if keep_ordinals else _symbol_text(ordinal))
     return names
 
 
@@ -425,7 +433,7 @@ def dependency_graph(path: str, game_dir: str, root: PeImage) -> dict:
     candidates[root_name.lower()] = [root_name]
     modules = {root_name: {"name": root_name, "parent": None, "status": "ok"}}
     edges = []
-    exports: dict[str, set[str]] = {}
+    exports: dict[str, set[str | int]] = {}
     pending = deque([root_name])
     while pending:
         name = pending.popleft()
@@ -439,9 +447,9 @@ def dependency_graph(path: str, game_dir: str, root: PeImage) -> dict:
             if (image.machine, image.is64) != (root.machine, root.is64):
                 node.update(status="machine_mismatch", machine=MACHINES.get(image.machine, hex(image.machine)))
                 continue
-            imports = _imports(image, "normal", DIR_IMPORT, strict=True)
-            imports += _imports(image, "delay", DIR_DELAY_IMPORT, delay=True, strict=True)
-            exports[name] = set(_exports(image, strict=True, include_named_ordinals=True))
+            imports = _imports(image, "normal", DIR_IMPORT, strict=True, keep_ordinals=True)
+            imports += _imports(image, "delay", DIR_DELAY_IMPORT, delay=True, strict=True, keep_ordinals=True)
+            exports[name] = set(_exports(image, strict=True, include_named_ordinals=True, keep_ordinals=True))
         except (PeFormatError, OSError, struct.error) as e:
             detail = e.strerror if isinstance(e, OSError) else None
             node.update(status="unreadable", error=detail or str(e))
@@ -468,12 +476,14 @@ def dependency_graph(path: str, game_dir: str, root: PeImage) -> dict:
                 pending.append(target)
 
     for edge in edges:
+        functions = edge["functions"]
+        edge["functions"] = [_symbol_text(symbol) for symbol in functions]
         target = edge["target"]
         if target is None:
             continue
         edge["status"] = modules[target]["status"]
         if target in exports:
-            missing = sorted(set(edge["functions"]) - exports[target])
+            missing = sorted({_symbol_text(symbol) for symbol in set(functions) - exports[target]})
             edge.update(status="missing_exports" if missing else "declared", missing_exports=missing)
     return {"modules": list(modules.values()), "imports": edges}
 
