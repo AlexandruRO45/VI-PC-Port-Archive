@@ -478,5 +478,25 @@ class TestVSadHiU8SIMD(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0)
 
 
+def run_hw_sad_hi_u8(s0: int, s1: int, s2: int) -> int:
+    lines = [
+        f"v_mov_b32 v0, {s0 & MASK32:#x}",
+        f"v_mov_b32 v1, {s1 & MASK32:#x}",
+        f"v_mov_b32 v2, {s2 & MASK32:#x}",
+        "v_sad_hi_u8 v0, v0, v1, v2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_sad_hi_u8_hw", lines)
+    return support.mrt0_words(spv)[0]
+
+
+class TestVSadHiU8HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for v_sad_hi_u8."""
+
+    def test_translator_hardware_cases(self):
+        self.assertEqual(run_hw_sad_hi_u8(0x04030201, 0x01010101, 10), 0x0006000A)
+
+
 if __name__ == "__main__":
     unittest.main()
