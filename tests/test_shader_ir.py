@@ -253,6 +253,35 @@ class ParseLineTests(unittest.TestCase):
         self.assertEqual(len(ins["args"]), 1)
         self.assertEqual(ins["args"][0]["k"], "special")
 
+    def test_waitcnt_counters_are_one_operand_each(self):
+        for line, expected in (
+            ("\ts_waitcnt vmcnt(0)", ["vmcnt(0)"]),
+            ("\ts_waitcnt vmcnt(0) lgkmcnt(0)", ["vmcnt(0)", "lgkmcnt(0)"]),
+            ("\ts_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)", ["vmcnt(0)", "expcnt(0)", "lgkmcnt(0)"]),
+        ):
+            with self.subTest(line=line):
+                ins = shader_ir.parse_line(line)
+                self.assertEqual(ins["args"], [{"k": "special", "t": t} for t in expected])
+
+    def test_waitcnt_depctr_fields_are_one_operand_each(self):
+        ins = shader_ir.parse_line("\ts_waitcnt_depctr depctr_va_vdst(0) depctr_vm_vsrc(0) depctr_sa_sdst(0)")
+        self.assertEqual(
+            ins["args"],
+            [
+                {"k": "special", "t": "depctr_va_vdst(0)"},
+                {"k": "special", "t": "depctr_vm_vsrc(0)"},
+                {"k": "special", "t": "depctr_sa_sdst(0)"},
+            ],
+        )
+        imm = shader_ir.parse_line("\ts_waitcnt_depctr 0xffe3")
+        self.assertEqual(imm["args"], [{"k": "imm", "v": 0xFFE3}])
+
+    def test_setreg_hwreg_with_spaces_stays_whole(self):
+        ins = shader_ir.parse_line("\ts_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0")
+        self.assertEqual(len(ins["args"]), 2)
+        self.assertEqual(ins["args"][0], {"k": "special", "t": "hwreg(HW_REG_MODE, 2, 2)"})
+        self.assertEqual(ins["args"][1]["k"], "sgpr")
+
     def test_no_operands(self):
         self.assertEqual(shader_ir.parse_line("\ts_endpgm")["args"], [])
 

@@ -361,7 +361,11 @@ class ScalarNoopWaitcntParsingTests(unittest.TestCase):
             (
                 "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)",
                 "s_waitcnt",
-                [{"k": "special", "t": "vmcnt(0) expcnt(0) lgkmcnt(0)"}],
+                [
+                    {"k": "special", "t": "vmcnt(0)"},
+                    {"k": "special", "t": "expcnt(0)"},
+                    {"k": "special", "t": "lgkmcnt(0)"},
+                ],
             ),
             ("s_waitcnt 0", "s_waitcnt", [{"k": "imm", "v": 0}]),
             (
