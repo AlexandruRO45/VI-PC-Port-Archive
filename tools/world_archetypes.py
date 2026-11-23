@@ -202,6 +202,8 @@ def check_extents(maps, defs):
         ref_lo, ref_hi = row.get("entities_min"), row.get("entities_max")
         if not ref_lo or not ref_hi or not ents:
             continue
+        if not all(isinstance(v, (int, float)) for box in (ref_lo, ref_hi) for v in box):
+            continue  # world_index writes null for a non-finite bound (#5602); such a box is not judged
         if any(e.get("archetype") not in defs or not e.get("complete", True) for e in ents):
             continue
         if any("bb_min" not in defs[e["archetype"]] or "bb_max" not in defs[e["archetype"]] for e in ents):

@@ -257,6 +257,15 @@ class ExtentsTest(unittest.TestCase):
         row = WI.parse_resource(m, collect=ents)
         self.assertEqual(WA.check_extents([(row, ents)], defs)["maps_fully_defined"], 0)
 
+    def test_map_whose_reference_box_holds_a_none_is_not_judged(self):
+        defs = {ROCK: {"bb_min": ROCK_BOX[0], "bb_max": ROCK_BOX[1]}}
+        m = mapfile([entity(ROCK, (100.0, 50.0, 10.0), (0.0, 0.0, S, S))],
+                    (math.nan, -10.0, 0.0), (110.0, 60.0, 20.0))
+        ents = []
+        row = WI.parse_resource(m, collect=ents)
+        self.assertIn(None, row["entities_min"])
+        self.assertEqual(WA.check_extents([(row, ents)], defs)["maps_fully_defined"], 0)
+
     def test_zero_scale_maps_are_included_in_scale_comparisons(self):
         defs = {d["name"]: d for d in WA.parse_archetypes(maptypes([(CRATE, 1, *CRATE_BOX)]))}
         for zero in (0.0, -0.0):
