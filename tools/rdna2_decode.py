@@ -377,7 +377,7 @@ def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
         fixed32 += 2 * _MIMG_GRAD_COORDS.get(dim, 2)
     packable = base
     if "_l" in base_name and "_lz" not in base_name and not base_name.startswith(
-            ("image_load", "image_store", "image_atomic", "image_get")):
+            ("image_load", "image_msaa_load", "image_store", "image_atomic", "image_get")):
         packable += 1
     if has_cl:
         packable += 1
