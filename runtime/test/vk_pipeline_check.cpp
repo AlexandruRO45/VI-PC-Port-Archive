@@ -785,13 +785,14 @@ ChildRun run_child(const std::filesystem::path& exe, const std::string& dir,
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::fprintf(stderr,
+    const bool help = argc == 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h");
+    if (argc < 2 || help) {
+        std::fprintf(help ? stdout : stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
             "[--skip-file F]\n");
-        return 2;
+        return help ? 0 : 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
     std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path;

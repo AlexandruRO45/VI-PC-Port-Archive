@@ -62,6 +62,21 @@ class IndexTest(unittest.TestCase):
         self.assertIn(text, r.stderr)
         self.assertIn("index.json", r.stderr)
 
+    def test_help_prints_usage_without_an_index(self):
+        for flag in ("--help", "-h"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run([str(self.exe), flag], cwd=directory, capture_output=True,
+                                        text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage: vk_pipeline_check", result.stdout)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_no_arguments_print_usage_error(self):
+        result = subprocess.run([str(self.exe)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: vk_pipeline_check", result.stderr)
+
     def test_missing_index_is_an_error(self):
         self.assert_index_error(self.run_tool(None), "cannot read")
 
