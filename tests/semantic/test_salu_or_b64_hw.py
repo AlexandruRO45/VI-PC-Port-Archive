@@ -425,5 +425,69 @@ class TestSOrB64SIMDDivergence(unittest.TestCase):
         self.assertEqual(scc, 0)
         self.assertEqual(SIMDMultiLaneDivergenceModel.active_lanes_from_mask(d), set())
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestSOrB64Aliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self):
+        """s_or_b64 s[2:3], s[2:3], s[4:5]: D aliases S0."""
+        state = ScalarHardwareState()
+        s0_val = 0x1111_1111_1111_1111
+        s1_val = 0x3333_3333_3333_3333
+        state.set_sgpr_pair(2, s0_val)
+        state.set_sgpr_pair(4, s1_val)
+
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, state)
+
+        expected = s0_val | s1_val
+        self.assertEqual(state.get_sgpr_pair(2), expected)
+        self.assertEqual(state.get_sgpr_pair(4), s1_val)  # S1 untouched
+        self.assertEqual(state.scc, 1)
+
+    def test_alias_dst_equals_src1(self):
+        """s_or_b64 s[4:5], s[2:3], s[4:5]: D aliases S1."""
+        state = ScalarHardwareState()
+        s0_val = 0x00FF_0000_0000_0000
+        s1_val = 0x0000_0000_FFFF_0000
+        state.set_sgpr_pair(2, s0_val)
+        state.set_sgpr_pair(4, s1_val)
+
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=4, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, state)
+
+        expected = s0_val | s1_val
+        self.assertEqual(state.get_sgpr_pair(4), expected)
+        self.assertEqual(state.get_sgpr_pair(2), s0_val)  # S0 untouched
+        self.assertEqual(state.scc, 1)
+
+    def test_all_operands_aliased(self):
+        """s_or_b64 s[2:3], s[2:3], s[2:3]: D, S0, and S1 all share same pair."""
+        state = ScalarHardwareState()
+        val = 0x1234_5678_9ABC_DEF0
+        state.set_sgpr_pair(2, val)
+
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=2, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, state)
+
+        # x | x = x
+        self.assertEqual(state.get_sgpr_pair(2), val)
+        self.assertEqual(state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
