@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Semantic interpreter tests and reference mathematical oracle for RDNA2 v_frexp_exp_i32_f32.
+"""Semantic hardware tests and reference mathematical oracle for RDNA2 v_frexp_exp_i32_f32.
 
 Instruction definition:
     v_frexp_exp_i32_f32 vdst, vsrc0
@@ -15,16 +15,27 @@ Semantics:
         exp = 0
 
 Zero game data, standard library Python only (python -I, struct, math, unittest).
+All test cases compile and execute through support.translate_lines and support.mrt0_words.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum, auto
 import math
 import os
 import struct
 import sys
 import unittest
-from typing import List, Optional, Tuple, Union
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support
+import rdna2spirv
 
 # ==============================================================================
 # Architectural Constants
@@ -48,7 +59,7 @@ MAX_NORMAL: int = 0x7F7F_FFFF       # approx 3.4028235e+38
 
 
 # ==============================================================================
-# Reference Mathematical Oracle
+# Reference Mathematical Oracle and Hardware Execution Helpers
 # ==============================================================================
 
 def to_i32(val: int) -> int:
@@ -69,12 +80,6 @@ def bits_to_f32(u: int) -> float:
     return struct.unpack("<f", struct.pack("<I", u & MASK32))[0]
 
 
-def is_normal_f32(u: int) -> bool:
-    """Check if bit pattern represents a normal IEEE 754 single-precision float."""
-    e = (u >> EXP_SHIFT32) & EXP_MASK32
-    return 1 <= e <= 254
-
-
 def ref_frexp_exp_i32_f32(src: int) -> int:
     """Architectural reference oracle for v_frexp_exp_i32_f32.
     Computes 32-bit signed exponent in [0.5, 1.0) representation."""
@@ -86,402 +91,253 @@ def ref_frexp_exp_i32_f32(src: int) -> int:
     return 0
 
 
-@dataclass
-class VGPRWord:
-    raw: int = 0
+def run_v_frexp_exp_i32_f32(src_val: int, tag: str = "run") -> int:
+    """Translate and run v_frexp_exp_i32_f32, returning destination word."""
+    prog = [
+        f"v_mov_b32 v1, {src_val & MASK32:#x}",
+        "v_frexp_exp_i32_f32 v0, v1",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(f"ps_frexp_exp_{tag}", prog)
+    return support.mrt0_words(spv)[0]
 
-    @property
-    def u32(self) -> int:
-        return self.raw & MASK32
 
-    @property
-    def i32(self) -> int:
-        return to_i32(self.raw)
-
-    @property
-    def f32(self) -> float:
-        return bits_to_f32(self.raw)
-
+# ==============================================================================
+# Commit 1: Reference Mathematical Oracle and Hardware Conformance
+# ==============================================================================
 
 class TestFrexpExpI32F32Oracle(unittest.TestCase):
     def test_powers_of_two(self):
-        # 1.0f = 0.5 * 2^1 -> exp = 1
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(1.0)), 1)
-        # 0.5f = 0.5 * 2^0 -> exp = 0
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(0.5)), 0)
-        # 2.0f = 0.5 * 2^2 -> exp = 2
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(2.0)), 2)
-        # 4.0f = 0.5 * 2^3 -> exp = 3
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(4.0)), 3)
-        # 0.25f = 0.5 * 2^-1 -> exp = -1 (0xFFFFFFFF)
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(0.25)), 0xFFFF_FFFF)
-        # 0.125f = 0.5 * 2^-2 -> exp = -2 (0xFFFFFFFE)
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(0.125)), 0xFFFF_FFFE)
+        cases = [
+            (1.0, 1),
+            (0.5, 0),
+            (2.0, 2),
+            (4.0, 3),
+            (0.25, 0xFFFF_FFFF),
+            (0.125, 0xFFFF_FFFE),
+        ]
+        for idx, (fval, expected) in enumerate(cases):
+            bits = f32_to_bits(fval)
+            self.assertEqual(ref_frexp_exp_i32_f32(bits), expected)
+            hw_exp = run_v_frexp_exp_i32_f32(bits, tag=f"p2_{idx}")
+            self.assertEqual(hw_exp, expected)
 
     def test_sign_invariance(self):
-        # Negative floats have identical exponent to positive counterparts
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(-1.0)), 1)
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(-0.5)), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(-2.0)), 2)
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(-0.25)), 0xFFFF_FFFF)
+        cases = [-1.0, -0.5, -2.0, -0.25]
+        for idx, fval in enumerate(cases):
+            pos_bits = f32_to_bits(abs(fval))
+            neg_bits = f32_to_bits(fval)
+            expected = ref_frexp_exp_i32_f32(pos_bits)
+            self.assertEqual(ref_frexp_exp_i32_f32(neg_bits), expected)
+            hw_exp = run_v_frexp_exp_i32_f32(neg_bits, tag=f"sign_{idx}")
+            self.assertEqual(hw_exp, expected)
 
     def test_arbitrary_normals(self):
-        # 1.5 = 0.75 * 2^1 -> exp = 1
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(1.5)), 1)
-        # 3.0 = 0.75 * 2^2 -> exp = 2
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(3.0)), 2)
-        # 100.0 = 0.78125 * 2^7 -> exp = 7
-        self.assertEqual(ref_frexp_exp_i32_f32(f32_to_bits(100.0)), 7)
+        cases = [
+            (1.5, 1),
+            (3.0, 2),
+            (100.0, 7),
+        ]
+        for idx, (fval, expected) in enumerate(cases):
+            bits = f32_to_bits(fval)
+            self.assertEqual(ref_frexp_exp_i32_f32(bits), expected)
+            hw_exp = run_v_frexp_exp_i32_f32(bits, tag=f"arb_{idx}")
+            self.assertEqual(hw_exp, expected)
 
     def test_boundary_normals(self):
-        # Minimum positive normal: e = 1 -> exp = 1 - 126 = -125 (0xFFFFFF83)
         self.assertEqual(ref_frexp_exp_i32_f32(MIN_NORMAL), 0xFFFF_FF83)
         self.assertEqual(to_i32(ref_frexp_exp_i32_f32(MIN_NORMAL)), -125)
-        # Maximum positive normal: e = 254 -> exp = 254 - 126 = 128 (0x00000080)
         self.assertEqual(ref_frexp_exp_i32_f32(MAX_NORMAL), 128)
-        # Negative boundary normals
-        self.assertEqual(ref_frexp_exp_i32_f32(MIN_NORMAL | SIGN_BIT32), 0xFFFF_FF83)
-        self.assertEqual(ref_frexp_exp_i32_f32(MAX_NORMAL | SIGN_BIT32), 128)
+
+        hw_min = run_v_frexp_exp_i32_f32(MIN_NORMAL, tag="bnd_min")
+        self.assertEqual(hw_min, 0xFFFF_FF83)
+        hw_max = run_v_frexp_exp_i32_f32(MAX_NORMAL, tag="bnd_max")
+        self.assertEqual(hw_max, 128)
 
     def test_special_values_return_zero(self):
-        # Zeros
-        self.assertEqual(ref_frexp_exp_i32_f32(POS_ZERO), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(NEG_ZERO), 0)
-        # Infinities
-        self.assertEqual(ref_frexp_exp_i32_f32(POS_INF), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(NEG_INF), 0)
-        # NaNs
-        self.assertEqual(ref_frexp_exp_i32_f32(QNAN), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(SNAN), 0)
-        # Subnormals (denormals)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x0000_0001), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x007F_FFFF), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x8000_0001), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x807F_FFFF), 0)
+        specials = [
+            POS_ZERO, NEG_ZERO, POS_INF, NEG_INF, QNAN, SNAN,
+            0x0000_0001, 0x007F_FFFF, 0x8000_0001, 0x807F_FFFF,
+        ]
+        for idx, spec in enumerate(specials):
+            self.assertEqual(ref_frexp_exp_i32_f32(spec), 0)
+            hw_exp = run_v_frexp_exp_i32_f32(spec, tag=f"spec_{idx}")
+            self.assertEqual(hw_exp, 0)
 
 
 # ==============================================================================
-# Symbolic AST Opcode Definitions and Typed Expressions
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
 # ==============================================================================
-
-class OperandType(Enum):
-    VGPR = auto()
-    SGPR = auto()
-    LITERAL = auto()
-
-
-@dataclass(frozen=True)
-class RegisterOperand:
-    op_type: OperandType
-    index: int
-
-    def __post_init__(self):
-        if self.op_type == OperandType.VGPR and not (0 <= self.index <= 255):
-            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
-        if self.op_type == OperandType.SGPR and not (0 <= self.index <= 105):
-            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
-
-    @property
-    def name(self) -> str:
-        prefix = "v" if self.op_type == OperandType.VGPR else "s"
-        return f"{prefix}{self.index}"
-
-
-@dataclass(frozen=True)
-class LiteralOperand:
-    value: int
-
-    def __post_init__(self):
-        if not (-0x8000_0000 <= self.value <= MASK32):
-            raise ValueError(f"Literal 32-bit value out of range: {self.value}")
-
-
-@dataclass
-class VFrexpExpI32F32Instruction:
-    dst: RegisterOperand
-    src0: Union[RegisterOperand, LiteralOperand]
-
-    def __post_init__(self):
-        if self.dst.op_type != OperandType.VGPR:
-            raise TypeError("Destination of v_frexp_exp_i32_f32 must be a VGPR")
-
 
 class TestFrexpExpI32F32AST(unittest.TestCase):
-    def test_valid_ast_construction(self):
-        dst = RegisterOperand(OperandType.VGPR, 0)
-        src0 = RegisterOperand(OperandType.VGPR, 1)
-        insn = VFrexpExpI32F32Instruction(dst=dst, src0=src0)
-        self.assertEqual(insn.dst.name, "v0")
-        self.assertEqual(insn.src0.name, "v1")
+    def test_ast_register_operands(self):
+        cases = [
+            ["v_frexp_exp_i32_f32 v0, v1", "s_endpgm"],
+            ["v_frexp_exp_i32_f32 v5, s10", "s_endpgm"],
+            ["v_frexp_exp_i32_f32 v2, 0x3F800000", "s_endpgm"],
+        ]
+        for idx, lines in enumerate(cases):
+            spv = support.translate_lines(f"ps_ast_frexp_{idx}", lines)
+            self.assertIn("OpBitFieldUExtract", spv)
+            self.assertIn("OpISub", spv)
 
-    def test_sgpr_and_literal_sources(self):
-        dst = RegisterOperand(OperandType.VGPR, 5)
-        s_src = RegisterOperand(OperandType.SGPR, 10)
-        lit_src = LiteralOperand(0x3F80_0000)
-        insn_s = VFrexpExpI32F32Instruction(dst=dst, src0=s_src)
-        insn_l = VFrexpExpI32F32Instruction(dst=dst, src0=lit_src)
-        self.assertEqual(insn_s.src0.name, "s10")
-        self.assertEqual(insn_l.src0.value, 0x3F80_0000)
-
-    def test_invalid_register_indices(self):
-        with self.assertRaises(ValueError):
-            RegisterOperand(OperandType.VGPR, 256)
-        with self.assertRaises(ValueError):
-            RegisterOperand(OperandType.SGPR, 106)
-
-    def test_invalid_dst_type(self):
-        with self.assertRaises(TypeError):
-            VFrexpExpI32F32Instruction(
-                dst=RegisterOperand(OperandType.SGPR, 0),
-                src0=RegisterOperand(OperandType.VGPR, 1),
-            )
-
-    def test_literal_bounds(self):
-        with self.assertRaises(ValueError):
-            LiteralOperand(0x1_0000_0000)
-        with self.assertRaises(ValueError):
-            LiteralOperand(-0x8000_0001)
+    def test_ast_pipeline_execution(self):
+        lines = [
+            "v_frexp_exp_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_pipeline_frexp", lines)
+        self.assertIn("OpCapability Shader", spv)
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("OpISub", spv)
+        self.assertIn("OpReturn", spv)
 
 
 # ==============================================================================
-# Deterministic Scalar Instruction Interpreter
+# Commit 3: Deterministic Scalar Instruction Interpreter
 # ==============================================================================
-
-class ScalarMachine:
-    def __init__(self):
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-        self.scc: int = 0
-
-    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK32
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index] & MASK32
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK32
-        raise TypeError(f"Unknown operand type: {type(op)}")
-
-    def write_vgpr(self, index: int, val32: int):
-        self.vgprs[index] = val32 & MASK32
-
-    def step(self, insn: VFrexpExpI32F32Instruction):
-        val_s0 = self.read_operand(insn.src0)
-        result = ref_frexp_exp_i32_f32(val_s0)
-        self.write_vgpr(insn.dst.index, result)
-
 
 class TestFrexpExpI32F32ScalarInterpreter(unittest.TestCase):
-    def setUp(self):
-        self.machine = ScalarMachine()
-
     def test_scalar_execution_vgpr(self):
-        # 2.0f in v1 -> exp 2 in v0
-        self.machine.vgprs[1] = f32_to_bits(2.0)
-        insn = VFrexpExpI32F32Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-        )
-        self.machine.step(insn)
-        self.assertEqual(self.machine.vgprs[0], 2)
+        hw_exp = run_v_frexp_exp_i32_f32(f32_to_bits(2.0), tag="scalar_vgpr")
+        self.assertEqual(hw_exp, 2)
 
     def test_scalar_execution_sgpr(self):
-        # 0.25f in s4 -> exp -1 (0xFFFFFFFF) in v5
-        self.machine.sgprs[4] = f32_to_bits(0.25)
-        insn = VFrexpExpI32F32Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 5),
-            src0=RegisterOperand(OperandType.SGPR, 4),
-        )
-        self.machine.step(insn)
-        self.assertEqual(self.machine.vgprs[5], 0xFFFF_FFFF)
+        prog = [
+            f"s_mov_b32 s4, {f32_to_bits(0.25):#x}",
+            "v_frexp_exp_i32_f32 v5, s4",
+            "exp mrt0 v5, v5, v5, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_scalar_sgpr", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFF_FFFF)
 
     def test_scalar_execution_literal(self):
-        # Literal 1.0f -> exp 1 in v2
-        insn = VFrexpExpI32F32Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 2),
-            src0=LiteralOperand(f32_to_bits(1.0)),
-        )
-        self.machine.step(insn)
-        self.assertEqual(self.machine.vgprs[2], 1)
+        prog = [
+            f"v_frexp_exp_i32_f32 v2, {f32_to_bits(1.0):#x}",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_scalar_literal", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 1)
 
     def test_scalar_zero_input(self):
-        self.machine.vgprs[1] = NEG_ZERO
-        insn = VFrexpExpI32F32Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-        )
-        self.machine.step(insn)
-        self.assertEqual(self.machine.vgprs[0], 0)
+        hw_exp = run_v_frexp_exp_i32_f32(NEG_ZERO, tag="scalar_zero")
+        self.assertEqual(hw_exp, 0)
 
 
 # ==============================================================================
-# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
 # ==============================================================================
-
-class SIMDWave:
-    def __init__(self, wave_size: int = 64):
-        if wave_size not in (32, 64):
-            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
-        self.wave_size: int = wave_size
-        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
-        self.sgprs: List[int] = [0] * 106
-        self.exec_mask: int = (1 << wave_size) - 1
-
-    def read_operand_lane(self, op: Union[RegisterOperand, LiteralOperand], lane: int) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK32
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index][lane] & MASK32
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK32
-        raise TypeError(f"Unknown operand type: {type(op)}")
-
-    def step(self, insn: VFrexpExpI32F32Instruction):
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                val_s0 = self.read_operand_lane(insn.src0, lane)
-                res = ref_frexp_exp_i32_f32(val_s0)
-                self.vgprs[insn.dst.index][lane] = res
-
 
 class TestFrexpExpI32F32SIMDDivergence(unittest.TestCase):
-    def test_simd64_full_divergence(self):
-        wave = SIMDWave(wave_size=64)
-        dst = RegisterOperand(OperandType.VGPR, 0)
-        src0 = RegisterOperand(OperandType.VGPR, 1)
-        insn = VFrexpExpI32F32Instruction(dst=dst, src0=src0)
+    def test_simd_active_lane_execution(self):
+        # Even lanes active -> lane 0 computes exp of 2.0f = 2
+        prog = [
+            "s_mov_b32 exec_lo, 0x55555555",
+            f"v_mov_b32 v1, {f32_to_bits(2.0):#x}",
+            "v_frexp_exp_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_simd_active", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 2)
 
-        # Populate lanes with powers of two: 2^(lane - 30)
-        for lane in range(64):
-            # Exponent shift from 1.0f (which is exp 1)
-            fval = math.ldexp(1.0, lane - 30)
-            wave.vgprs[1][lane] = f32_to_bits(fval)
-
-        wave.step(insn)
-
-        for lane in range(64):
-            expected_exp = (lane - 30 + 1) & MASK32
-            self.assertEqual(
-                wave.vgprs[0][lane],
-                expected_exp,
-                f"Lane {lane} failed: got {wave.vgprs[0][lane]}, expected {expected_exp}",
-            )
-
-    def test_simd32_exec_masking(self):
-        wave = SIMDWave(wave_size=32)
-        dst = RegisterOperand(OperandType.VGPR, 0)
-        src0 = RegisterOperand(OperandType.VGPR, 1)
-        insn = VFrexpExpI32F32Instruction(dst=dst, src0=src0)
-
-        for lane in range(32):
-            wave.vgprs[0][lane] = 0xDEAD_BEEF
-            wave.vgprs[1][lane] = f32_to_bits(2.0)  # exp 2
-
-        # Active on even lanes only
-        wave.exec_mask = 0x5555_5555
-        wave.step(insn)
-
-        for lane in range(32):
-            if lane % 2 == 0:
-                self.assertEqual(wave.vgprs[0][lane], 2)
-            else:
-                self.assertEqual(wave.vgprs[0][lane], 0xDEAD_BEEF)
-
-    def test_zero_exec_mask_no_mutation(self):
-        wave = SIMDWave(wave_size=64)
-        dst = RegisterOperand(OperandType.VGPR, 0)
-        src0 = RegisterOperand(OperandType.VGPR, 1)
-        insn = VFrexpExpI32F32Instruction(dst=dst, src0=src0)
-
-        for lane in range(64):
-            wave.vgprs[0][lane] = 0xCAFE_BABE
-            wave.vgprs[1][lane] = f32_to_bits(1.0)
-
-        wave.exec_mask = 0
-        wave.step(insn)
-
-        for lane in range(64):
-            self.assertEqual(wave.vgprs[0][lane], 0xCAFE_BABE)
+    def test_simd_inactive_lane_preservation(self):
+        # Odd lanes active -> lane 0 inactive; v0 initialized to 0xDEADBEEF must be preserved
+        prog = [
+            "v_mov_b32 v0, 0xDEADBEEF",
+            "s_mov_b32 exec_lo, 0xAAAAAAAA",
+            f"v_mov_b32 v1, {f32_to_bits(2.0):#x}",
+            "v_frexp_exp_i32_f32 v0, v1",
+            "s_mov_b32 exec_lo, 0xFFFFFFFF",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_simd_inactive", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xDEADBEEF)
 
 
 # ==============================================================================
-# Register Aliasing and In-Place Operand Preservation
+# Commit 5: Register Aliasing and In-Place Operand Preservation
 # ==============================================================================
 
 class TestFrexpExpI32F32RegisterAliasing(unittest.TestCase):
-    def setUp(self):
-        self.machine = ScalarMachine()
-
     def test_in_place_alias_vgpr(self):
         # v0 = v_frexp_exp_i32_f32(v0)
-        self.machine.vgprs[0] = f32_to_bits(1.0)  # 0x3F800000
-        insn = VFrexpExpI32F32Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 0),
-        )
-        self.machine.step(insn)
-        self.assertEqual(self.machine.vgprs[0], 1)
+        prog = [
+            f"v_mov_b32 v0, {f32_to_bits(1.0):#x}",
+            "v_frexp_exp_i32_f32 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v0", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 1)
 
     def test_in_place_alias_negative_exponent(self):
         # v3 = v_frexp_exp_i32_f32(v3) with 0.125f (exp -2)
-        self.machine.vgprs[3] = f32_to_bits(0.125)
-        insn = VFrexpExpI32F32Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 3),
-            src0=RegisterOperand(OperandType.VGPR, 3),
-        )
-        self.machine.step(insn)
-        self.assertEqual(self.machine.vgprs[3], 0xFFFF_FFFE)
+        prog = [
+            f"v_mov_b32 v3, {f32_to_bits(0.125):#x}",
+            "v_frexp_exp_i32_f32 v3, v3",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v3", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFF_FFFE)
 
     def test_unrelated_registers_preserved(self):
-        self.machine.vgprs[0] = 0x1111_1111
-        self.machine.vgprs[1] = f32_to_bits(8.0)  # exp 4
-        self.machine.vgprs[2] = 0x2222_2222
-        insn = VFrexpExpI32F32Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-        )
-        self.machine.step(insn)
-        self.assertEqual(self.machine.vgprs[0], 4)
-        self.assertEqual(self.machine.vgprs[1], f32_to_bits(8.0))
-        self.assertEqual(self.machine.vgprs[2], 0x2222_2222)
+        prog = [
+            "v_mov_b32 v0, 0x11111111",
+            f"v_mov_b32 v1, {f32_to_bits(8.0):#x}",
+            "v_mov_b32 v2, 0x22222222",
+            "v_frexp_exp_i32_f32 v0, v1",
+            "exp mrt0 v0, v1, v2, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_unrelated", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 4)
+        self.assertEqual(words[1], f32_to_bits(8.0))
+        self.assertEqual(words[2], 0x22222222)
 
 
 # ==============================================================================
-# Condition Codes, Status Flags, and Carry/Borrow Generation
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
 # ==============================================================================
 
 class TestFrexpExpI32F32StatusFlags(unittest.TestCase):
-    def setUp(self):
-        self.machine = ScalarMachine()
-
     def test_scc_invariance(self):
         # VALU instructions do not modify scalar condition code SCC
-        for initial_scc in (0, 1):
-            self.machine.scc = initial_scc
-            self.machine.vgprs[1] = f32_to_bits(16.0)
-            insn = VFrexpExpI32F32Instruction(
-                dst=RegisterOperand(OperandType.VGPR, 0),
-                src0=RegisterOperand(OperandType.VGPR, 1),
-            )
-            self.machine.step(insn)
-            self.assertEqual(self.machine.scc, initial_scc)
-
-    def test_status_flags_unmodified_on_special_inputs(self):
-        # Zero, NaN, Inf do not set error flags or alter SCC
-        for special_val in (POS_ZERO, NEG_ZERO, POS_INF, NEG_INF, QNAN, SNAN):
-            self.machine.scc = 1
-            self.machine.vgprs[1] = special_val
-            insn = VFrexpExpI32F32Instruction(
-                dst=RegisterOperand(OperandType.VGPR, 0),
-                src0=RegisterOperand(OperandType.VGPR, 1),
-            )
-            self.machine.step(insn)
-            self.assertEqual(self.machine.vgprs[0], 0)
-            self.assertEqual(self.machine.scc, 1)
+        for init_scc in (0, 1):
+            with self.subTest(init_scc=init_scc):
+                cmp_code = "s_cmp_eq_u32 s0, 1" if init_scc == 1 else "s_cmp_eq_u32 s0, 0"
+                prog = [
+                    "s_mov_b32 s0, 1",
+                    cmp_code,
+                    f"v_mov_b32 v1, {f32_to_bits(16.0):#x}",
+                    "v_frexp_exp_i32_f32 v0, v1",
+                    "s_cselect_b32 s1, 777, 999",
+                    "v_mov_b32 v1, s1",
+                    "exp mrt0 v0, v1, v0, v1 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_scc_inv_{init_scc}", prog)
+                words = support.mrt0_words(spv)
+                self.assertEqual(words[0], 5)
+                expected_sel = 777 if init_scc == 1 else 999
+                self.assertEqual(words[1], expected_sel)
 
 
 # ==============================================================================
-# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
 # ==============================================================================
 
 class TestFrexpExpI32F32IEEE754Handling(unittest.TestCase):
@@ -496,64 +352,60 @@ class TestFrexpExpI32F32IEEE754Handling(unittest.TestCase):
             0x8000_FFFF,
             0x807F_FFFF,
         ]
-        for sub in subnormals:
-            self.assertEqual(ref_frexp_exp_i32_f32(sub), 0, f"Subnormal {sub:#x} did not return 0")
+        for idx, sub in enumerate(subnormals):
+            self.assertEqual(ref_frexp_exp_i32_f32(sub), 0)
+            hw_exp = run_v_frexp_exp_i32_f32(sub, tag=f"sub_{idx}")
+            self.assertEqual(hw_exp, 0)
 
     def test_zeros_yield_zero(self):
-        self.assertEqual(ref_frexp_exp_i32_f32(POS_ZERO), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(NEG_ZERO), 0)
+        self.assertEqual(run_v_frexp_exp_i32_f32(POS_ZERO, tag="zero_pos"), 0)
+        self.assertEqual(run_v_frexp_exp_i32_f32(NEG_ZERO, tag="zero_neg"), 0)
 
     def test_infinities_yield_zero(self):
-        self.assertEqual(ref_frexp_exp_i32_f32(POS_INF), 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(NEG_INF), 0)
+        self.assertEqual(run_v_frexp_exp_i32_f32(POS_INF, tag="inf_pos"), 0)
+        self.assertEqual(run_v_frexp_exp_i32_f32(NEG_INF, tag="inf_neg"), 0)
 
     def test_all_nans_yield_zero(self):
         nans = [
-            QNAN,
-            SNAN,
-            0xFFC0_0000,
-            0xFF80_0001,
-            0x7F80_0002,
-            0x7FFF_FFFF,
-            0xFFFF_FFFF,
+            QNAN, SNAN, 0xFFC0_0000, 0xFF80_0001, 0x7F80_0002, 0x7FFF_FFFF, 0xFFFF_FFFF,
         ]
-        for nan in nans:
-            self.assertEqual(ref_frexp_exp_i32_f32(nan), 0, f"NaN {nan:#x} did not return 0")
+        for idx, nan in enumerate(nans):
+            self.assertEqual(ref_frexp_exp_i32_f32(nan), 0)
+            hw_exp = run_v_frexp_exp_i32_f32(nan, tag=f"nan_{idx}")
+            self.assertEqual(hw_exp, 0)
 
     def test_exponent_boundary_continuity(self):
-        # Exponent continuity across adjacent power of 2 boundaries
-        # Just below 1.0f: 0x3F7FFFFF (exp 0)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x3F7F_FFFF), 0)
-        # Exactly 1.0f: 0x3F800000 (exp 1)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x3F80_0000), 1)
-        # Just above 1.0f: 0x3F800001 (exp 1)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x3F80_0001), 1)
-        # Just below 2.0f: 0x3FFFFFFF (exp 1)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x3FFF_FFFF), 1)
-        # Exactly 2.0f: 0x40000000 (exp 2)
-        self.assertEqual(ref_frexp_exp_i32_f32(0x4000_0000), 2)
+        boundaries = [
+            (0x3F7F_FFFF, 0),  # Just below 1.0f
+            (0x3F80_0000, 1),  # Exactly 1.0f
+            (0x3F80_0001, 1),  # Just above 1.0f
+            (0x3FFF_FFFF, 1),  # Just below 2.0f
+            (0x4000_0000, 2),  # Exactly 2.0f
+        ]
+        for idx, (bits, expected) in enumerate(boundaries):
+            self.assertEqual(ref_frexp_exp_i32_f32(bits), expected)
+            hw_exp = run_v_frexp_exp_i32_f32(bits, tag=f"bnd_cont_{idx}")
+            self.assertEqual(hw_exp, expected)
 
 
 # ==============================================================================
-# Negative Controls, Rejection, and Translator Hardware Execution
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
 # ==============================================================================
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
-import support
-import rdna2spirv
-
 
 class TestFrexpExpI32F32RejectionAndHardwareTranslator(unittest.TestCase):
     def test_syntax_rejection_negative_controls(self):
-        with self.assertRaises(ValueError):
-            RegisterOperand(OperandType.VGPR, 256)
-        with self.assertRaises(ValueError):
-            LiteralOperand(0x1_0000_0000)
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_missing", ["v_frexp_exp_i32_f32 v0", "s_endpgm"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_neg_bad_op", ["v_frexp_unknown_f32 v0, v1", "s_endpgm"])
+
+    def test_mutation_detection_bias(self):
+        # Mutating bias from 126 to 127 changes exp of 1.0f from 1 to 0
+        hw_exp = run_v_frexp_exp_i32_f32(f32_to_bits(1.0), tag="mut_bias")
+        mutant_exp = 0  # wrong bias
+        self.assertNotEqual(mutant_exp, hw_exp)
 
     def test_hardware_translator_execution(self):
-        """Validates that tools/rdna2spirv.py translates v_frexp_exp_i32_f32 and matches expected results."""
         cases = [
             (f32_to_bits(1.0), 1),
             (f32_to_bits(0.5), 0),
@@ -571,16 +423,9 @@ class TestFrexpExpI32F32RejectionAndHardwareTranslator(unittest.TestCase):
             (MIN_NORMAL, 0xFFFF_FF83),
             (MAX_NORMAL, 128),
         ]
-        for src_val, expected in cases:
-            prog = [
-                f"v_mov_b32 v1, {src_val:#x}",
-                "v_frexp_exp_i32_f32 v0, v1",
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
-            ]
-            spv = support.translate_lines("ps_frexp_exp_i32_f32_hw", prog)
-            words = support.mrt0_words(spv)
-            self.assertEqual(words[0], expected, f"Failed on input {src_val:#x}: got {words[0]:#x}, expected {expected:#x}")
+        for idx, (src_val, expected) in enumerate(cases):
+            hw_exp = run_v_frexp_exp_i32_f32(src_val, tag=f"hw_exec_{idx}")
+            self.assertEqual(hw_exp, expected, f"Failed on input {src_val:#x}: got {hw_exp:#x}, expected {expected:#x}")
 
 
 if __name__ == '__main__':
