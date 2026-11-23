@@ -254,5 +254,24 @@ class TestMul24RegisterPreservation(unittest.TestCase):
         self.assertEqual(words[3], 0x4444)
 
 
+class TestMul24ConditionCodesAndStatus(unittest.TestCase):
+    """Commit 6: condition codes, status flags, and carry/borrow generation for v_mul_i32_i24."""
+
+    def test_status_comparison_on_product(self):
+        # Multiply -1 * 5 = -5. Compare with 0 using v_cmp_lt_i32 (result is negative -> VCC is true)
+        lines = [
+            "v_mov_b32 v1, 0xFFFFFF",
+            "v_mov_b32 v2, 5",
+            "v_mul_i32_i24 v0, v1, v2",
+            "v_cmp_lt_i32 vcc, v0, 0",
+            "v_cndmask_b32 v1, 0x1111, 0x2222, vcc",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mul24_ps(lines, "ps_mul24_status")
+        self.assertEqual(words[0], (-5) & MASK32)
+        self.assertEqual(words[1], 0x2222)
+
+
 if __name__ == '__main__':
     unittest.main()
