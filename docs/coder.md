@@ -110,6 +110,27 @@ each length from 129 to 140. This excludes that contiguous byte representation
 for this image. Packed lengths, other code assignments and runtime construction
 remain open. No symbol mapping was recovered for a payload decode.
 
+### Candidate decoder and an unrelated descriptor array
+
+On the image above, file offsets 0x66381d1 and 0x6749570 map to .rdata
+RVAs 0x66393d1 and 0x674a770 respectively. Nearby runs of small integers
+are leads. A complete binary prefix code must have Kraft sum at most one;
+sums above one exclude treating the whole run directly as code lengths.
+A seven-bit lookup mask establishes the width of that lookup alone.
+
+File offset 0x5f414e0 maps to RVA 0x5f426e0. It falls inside an array of
+40-byte MSVC exception-handling FuncInfo records. At file offset 0x5f414f0
+and again 40 and 80 bytes later the header is EH_MAGIC_NUMBER3 (0x19930522).
+Reading from the header puts the apparent counts 56, 32 and 48 at offset
+0x1c, the x64 unwind-helper displacement. Offset 0x14 is the IP-to-state
+entry count and 0x18 is its table RVA (MSVC headers ehdata.h and
+ehdata_values.h). These records should be excluded from codec inputs.
+
+The reported decoder-region observations include a 0x7f mask and a 0x120
+constant. Connecting this routine to the story stream still requires
+tracing its input or reproducing a known decode. Neither the alphabet sizes
+alone nor the existence of a table builder identifies the archive codec.
+
 ## Recovered plaintext, for calibration
 
 Two independent extractions recovered 1,961,559 bytes and 855,961 bytes of payload (the second from
