@@ -24,8 +24,9 @@ struct.pack_into("<4I", FSSM, 0x138, 0x8088, 32, 1, 1)
 FSSM = bytes(FSSM)
 VSHARP = [0, 0, 0x1000, 0x31016FAC]
 # The .asm header (and check.py): readlane(40) = lane 8 = 25, readlane(5) = 16, writelane(40) lands on lane 8,
-# so readlane(8) and readlane(40) both give 777. Lane 0 stores the four words.
-EXPECTED = [25, 16, 777, 777]
+# so readlane(8) and readlane(40) both give 777. The last two words count lanes that restore the odd-lane
+# predicate through the alias and lanes that see it cleared after a plain write through the alias.
+EXPECTED = [25, 16, 777, 777, 32, 32]
 
 
 def translate():
@@ -37,10 +38,10 @@ def run(spv):
         spv, 32, 32,
         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
         push_constants=VSHARP + [0] * 28, memory={})
-    stray = sorted(a for a in memory if not 0 <= a < 16 or a % 4)
+    stray = sorted(a for a in memory if not 0 <= a < 4 * len(EXPECTED) or a % 4)
     if stray:
-        raise AssertionError(f"stores outside out[0..3]: {stray}")
-    return [memory.get(4 * k) for k in range(4)]
+        raise AssertionError(f"stores outside the {len(EXPECTED)}-word result: {stray}")
+    return [memory.get(4 * k) for k in range(len(EXPECTED))]
 
 
 class Wave32LaneSelect(unittest.TestCase):
@@ -55,8 +56,8 @@ class Wave32LaneSelect(unittest.TestCase):
         lines = spv.splitlines()
         sels = [i for i, ln in enumerate(lines)
                 if re.search(r"= OpBitwiseAnd %uint \S+ " + re.escape(c31) + "$", ln)]
-        # Four reads and one write select a lane, plus the wave lane (LocalInvocationIndex & 31), which a wider
-        # mask leaves unchanged in a 32-thread group.
+        # This includes the wave lane (LocalInvocationIndex & 31), which a wider mask leaves unchanged
+        # in a 32-thread group.
         self.assertGreaterEqual(len(sels), 5)
         for i in sels:
             lines[i] = lines[i][:-len(c31)] + "%neg_c63"

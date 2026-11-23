@@ -104,8 +104,8 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
 CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
-            # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
-            ("cs_w32_lane_wrap", [25, 16, 777, 777]),
+            # SHADER-52 / SHADER-540: lane 40 aliases lane 8 for scalar values and saved predicates.
+            ("cs_w32_lane_wrap", [25, 16, 777, 777, 32, 32]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
             ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
             # SHADER-90: ds_permute_b32, the forward (scatter) permute; unwritten lane 0, EXEC gates the destination
