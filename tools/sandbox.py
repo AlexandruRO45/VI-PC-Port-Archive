@@ -11,7 +11,8 @@ and TEXCOORD inputs, user SGPR 8 as its only user data and no bindings, whose li
 s[8:9] at 0x0/0x40/0x60, a world translation at 0x30 and a 4x4 at 0x160; and a pixel shader with TEXCOORD and
 COLOR inputs that loads one T# from s[8:9] + 0x20 and samples it once. vk_sandbox fills that table (see its
 header). --check renders one frame headless and prints only counts: exit 0 when the frame is covered and, with
-textures, shows texture detail; 77 when the package, the pair or a GPU is missing. Standard library only.
+textures, shows texture detail; 2 when an input or the scene path is refused; 77 when the package, the pair or a GPU
+is missing. Standard library only.
 Usage: `python -I tools/sandbox.py --help` lists the options.
 """
 import argparse
@@ -142,6 +143,9 @@ def main(argv=None):
         except SystemExit as e:   # build() exits when no entity resolves to an exported model
             print(f"unsupported: {e}")
             return 77
+        except OSError as e:      # the same one-line answer sandbox_scene.py gives for a refused --out
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         print(f"scene: {stats['placed']} props, {stats['draws']} draws, {stats['textures']} textures, "
               f"{stats['textured_draws']} textured draws")
         if stats["draws"] == 0:
