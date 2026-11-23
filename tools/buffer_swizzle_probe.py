@@ -30,6 +30,7 @@ Exit codes:
 import argparse
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -42,6 +43,8 @@ for p in (HERE, os.path.join(ROOT, "tests", "semantic")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp  # noqa: E402
 
@@ -645,12 +648,8 @@ def main(argv=None):
         if os.path.isdir(out_path):
             print(f"ERROR: --json path is a directory: {out_path}", file=sys.stderr)
             return 2
-        parent = os.path.dirname(out_path)
         try:
-            os.makedirs(parent, exist_ok=True)
-            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
-                f.write("\n")
+            write_json_report(out_path, {"device": hw_device, "waves": list(waves), "cases": records})
         except OSError as exc:
             print(f"ERROR: cannot write {out_path}: {exc.strerror or exc}", file=sys.stderr)
             return 2
@@ -658,6 +657,44 @@ def main(argv=None):
     if mismatches or wave_diffs or (args.strict and known_diffs):
         return 1
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file (with trailing newline), or write directly to a non-regular destination."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".buffer_swizzle_probe-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=2)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
