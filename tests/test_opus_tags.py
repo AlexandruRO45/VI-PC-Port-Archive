@@ -78,6 +78,28 @@ class TestPacket(unittest.TestCase):
 
 
 class TestRetag(unittest.TestCase):
+    def test_retag_requires_the_opus_identification_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stream.ogg")
+            make_ogg(path, packets=3)
+            original = Path(path).read_bytes()
+        _, head_end = next(T.pages(original))
+        body = 27 + original[26]
+        header = original[body:head_end]
+        serial, = struct.unpack_from("<I", original, 14)
+        cases = [
+            ("different codec", [b"NotOpus!" + header[8:]], 0x02),
+            ("short identification", [header[:18]], 0x02),
+            ("missing beginning flag", [header], 0x00),
+            ("another packet on the first page", [header, PACKET], 0x02),
+        ]
+        for name, packets, flags in cases:
+            with self.subTest(name=name):
+                data = awc_opus.ogg_page(serial, 0, 0, packets, flags) + original[head_end:]
+                self.assertTrue(crc_ok(data))
+                with self.assertRaisesRegex(ValueError, "Opus identification header"):
+                    T.retag(data, T.tags_packet([("TITLE", "new")]))
+
     def test_only_the_tags_page_changes(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "b", "0ABCDEF1.ogg")

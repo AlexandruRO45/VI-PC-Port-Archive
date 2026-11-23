@@ -90,9 +90,17 @@ def retag(data: bytes, packet: bytes) -> bytes:
         raise ValueError("tags do not fit in one page")
     it = checked_pages(data)
     try:
-        _, (tags_at, tags_end) = next(it), next(it)
+        (id_at, id_end), (tags_at, tags_end) = next(it), next(it)
     except StopIteration:
         raise ValueError("fewer than two Ogg pages") from None
+    # RFC 7845 §3 puts a single complete OpusHead packet on the beginning-of-stream page.
+    id_body = id_at + 27 + data[id_at + 26]
+    id_segments = data[id_at + 27:id_body]
+    if (data[id_at + 4:id_at + 6] != b"\x00\x02"
+            or id_end - id_body < 19 or data[id_body:id_body + 8] != b"OpusHead"
+            or not id_segments or id_segments[-1] == 255
+            or any(segment != 255 for segment in id_segments[:-1])):
+        raise ValueError("first Ogg page does not contain a complete Opus identification header")
     body = tags_at + 27 + data[tags_at + 26]
     if data[body:body + 8] != b"OpusTags":
         raise ValueError("page 1 does not start an OpusTags packet")
