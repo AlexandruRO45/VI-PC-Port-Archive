@@ -1,6 +1,8 @@
 """Synthetic tests for tools/opus_tags.py (no game data: invented banks, names and subtitles)."""
 import codecs
+import contextlib
 import csv
+import io
 import os
 from pathlib import Path
 import struct
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "opus_tags.py")
@@ -147,6 +150,20 @@ class TestFolder(unittest.TestCase):
         with open(path, "rb") as f:
             self.assertTrue(f.read() == original, "tagging changed a file whose tags page includes audio")
         self.assertEqual(stats["skipped: the OpusTags page contains another packet"], 1)
+
+    def test_a_folder_that_cannot_be_listed_fails_the_pass(self):
+        def fake_walk(root, onerror=None):
+            self.assertIsNotNone(onerror, "os.walk needs onerror, or an unlistable folder is skipped")
+            onerror(PermissionError(13, "permission denied", os.path.join(root, "story")))
+            return iter(())
+
+        err = io.StringIO()
+        with mock.patch.object(T.os, "walk", side_effect=fake_walk), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = T.main([self.opus, "--names", self.names])
+        self.assertEqual(rc, 2)
+        self.assertIn("permission denied", err.getvalue())
+        self.assertIn("story", err.getvalue())
 
     def test_names_and_dialogue(self):
         names, ambiguous = T.load_names(self.names, "story")

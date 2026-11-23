@@ -163,7 +163,11 @@ def tag_folder(root, names, dialogue=None, langs=(), dry_run=False, ambiguous=No
     stats = collections.Counter()
     dialogue = dialogue or {}
     ambiguous = ambiguous or {}
-    for folder, _dirs, files in os.walk(root):
+
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
+    for folder, _dirs, files in os.walk(root, onerror=scan_failed):
         rel = os.path.relpath(folder, root).replace(os.sep, "/")
         streams, label = None, None
         for fname in sorted(files):
