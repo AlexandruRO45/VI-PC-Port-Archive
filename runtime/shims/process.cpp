@@ -50,6 +50,8 @@ std::string g_cmdline;
 std::wstring g_wcmdline;
 int g_argc = 0;
 char** g_argv_ptr = nullptr;
+int g_argv_mode = 0;   // the mode g_argv_ptr was built with, 0 while unpublished
+int g_wargv_mode = 0;
 wchar_t** g_wargv_ptr = nullptr;
 
 std::atomic<bool> g_running{false};
@@ -240,21 +242,42 @@ std::vector<std::basic_string<C>> expand_arguments(const std::vector<std::basic_
     return result;
 }
 
+// The UCRT keeps the first argv valid for the life of the process, and a caller may hold it across a later
+// configuration (a second CRT's startup, say). A table replaced by a different mode is retired, never freed.
+template <typename C>
+struct RetiredArgv {
+    std::vector<std::basic_string<C>> strings;
+    std::vector<C*> pointers;
+};
+template <typename C>
+std::vector<RetiredArgv<C>>& retired_argv() {
+    static std::vector<RetiredArgv<C>> retired;
+    return retired;
+}
+
 template <typename C>
 int configure_argv(int mode, const std::vector<std::basic_string<C>>& input,
-                   std::vector<std::basic_string<C>>& strings, std::vector<C*>& pointers, C**& published) {
+                   std::vector<std::basic_string<C>>& strings, std::vector<C*>& pointers, C**& published,
+                   int& configured_mode) {
     // _crt_argv_no_arguments is a no-op, including after another width or mode has been configured.
     if (mode == 0) return 0;
     if (mode != 1 && mode != 2) return errno = EINVAL;
+    // Already configured this way: the published table stays as it is.
+    if (published && configured_mode == mode) return 0;
     try {
         auto next_strings = mode == 2 ? expand_arguments(input) : input;
         std::vector<C*> next_pointers;
         next_pointers.reserve(next_strings.size() + 1);
         for (auto& argument : next_strings) next_pointers.push_back(argument.data());
         next_pointers.push_back(nullptr);
+        auto& retired = retired_argv<C>();
+        retired.reserve(retired.size() + 1);
         // Publish only after every allocation succeeds. The other width keeps its own strings and pointer table.
         strings.swap(next_strings);
         pointers.swap(next_pointers);
+        // next_* now hold the previous tables; keep them alive (the reserve above makes this non-throwing).
+        if (published) retired.push_back({std::move(next_strings), std::move(next_pointers)});
+        configured_mode = mode;
         published = pointers.data();
         g_argc = static_cast<int>(strings.size());
         return 0;
@@ -264,10 +287,10 @@ int configure_argv(int mode, const std::vector<std::basic_string<C>>& input,
 }
 
 int __cdecl game_configure_narrow_argv(int mode) {
-    return configure_argv(mode, g_input_args, g_args, g_argv, g_argv_ptr);
+    return configure_argv(mode, g_input_args, g_args, g_argv, g_argv_ptr, g_argv_mode);
 }
 int __cdecl game_configure_wide_argv(int mode) {
-    return configure_argv(mode, g_input_wargs, g_wargs, g_wargv, g_wargv_ptr);
+    return configure_argv(mode, g_input_wargs, g_wargs, g_wargv, g_wargv_ptr, g_wargv_mode);
 }
 
 LPSTR __stdcall game_get_command_line_a() { return g_cmdline.data(); }
@@ -374,6 +397,8 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
     g_argc = 0;
     g_argv_ptr = nullptr;
     g_wargv_ptr = nullptr;
+    g_argv_mode = 0;
+    g_wargv_mode = 0;
 }
 
 int run_entry(void* entry, size_t stack_bytes) {

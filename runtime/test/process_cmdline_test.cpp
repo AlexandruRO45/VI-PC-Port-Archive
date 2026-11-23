@@ -58,6 +58,26 @@ void round_trip(const std::vector<std::wstring>& args, const char* what) {
     LocalFree(parsed);
 }
 
+void check_argv_lifetime() {
+    using Fn = int(__cdecl*)(int*, char***, char***, int, void*);
+    const auto get = reinterpret_cast<Fn>(rt::shims::find("msvcrt.dll", "__getmainargs"));
+    rt::process::set_command_line(L"synthetic-program-name.exe", {L"argument"});
+    int count = 0;
+    char** first = nullptr;
+    char** second = nullptr;
+    if (!get || get(&count, &first, nullptr, 0, nullptr) || !first ||
+        get(&count, &second, nullptr, 0, nullptr) || first != second ||
+        std::strcmp(first[0], "synthetic-program-name.exe") != 0) {
+        std::fprintf(stderr, "FAIL repeated __getmainargs must retain the first argv\n");
+        ++failures;
+        return;
+    }
+    if (configure(false, 2) || std::strcmp(first[0], "synthetic-program-name.exe") != 0) {
+        std::fprintf(stderr, "FAIL reconfiguration must retain the first argv\n");
+        ++failures;
+    }
+}
+
 void check_argv_reset() {
     const int host_argc = __argc;
     char** const host_argv = __argv;
@@ -229,6 +249,7 @@ int main() {
     check_non_ascii(L"\u0394\u0416\u6F22 x", "an argument outside any single-byte code page");
 
     check_import_names();
+    check_argv_lifetime();
     check_argv_reset();
     check_getmainargs_environment();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");
