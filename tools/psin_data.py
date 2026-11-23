@@ -57,8 +57,10 @@ In a carve directory, a stream that does not start with the `PSIN` magic is skip
 too). As the only argument it is a wrong path, so it is one `ERROR:` line and exit 2 rather than an empty count.
 """
 import argparse
+import array
 import bisect
 import collections
+import itertools
 import json
 import os
 import struct
@@ -85,6 +87,47 @@ CONTAINERS = {0x5C: 16, 0x52: 16, 0x73: 16, 0x75: 16, 0x71: 24, 0x44: 16}
 _HEADER_BYTES = {0x07: 8, 0x42: 8, 0x44: 16, 0x52: 12, 0x5C: 16, 0x71: 20, 0x73: 16, 0x75: 16}
 VECTOR16 = (0x31, 0x33, 0x34, 0x35, 0x36, 0x0C, 0x0D)
 
+# Per-type constants, built once so the walker does no format parsing or f-string work per value.
+_FIXED_SIZE = {}                      # byte size of a scalar, hash or enum member
+for _table in (ENUMS, HASHES, SCALARS):  # SCALARS wins if a type were ever listed twice
+    for _t, _fmt in _table.items():
+        _FIXED_SIZE[_t] = struct.calcsize(_fmt)
+_READ_SIZE = {**_HEADER_BYTES, **_FIXED_SIZE}   # bytes a member needs inside its block (0x40 is its `ref`)
+_SIZE_OF = {**{t: 8 for t in POINTERS}, **CONTAINERS, **_FIXED_SIZE}   # Container.size_of for the fixed types
+# type -> (bytes, unpack_from, components, hex format or None) for the members whose value is a plain unpack
+_UNPACK = {}
+for _table, _hex in ((HASHES, True), (SCALARS, False)):
+    for _t, _fmt in _table.items():
+        _st = struct.Struct(_fmt)
+        _UNPACK[_t] = (_st.size, _st.unpack_from, len(_st.unpack_from(bytes(_st.size))),
+                       f"0{_st.size * 2}x" if _hex else None)
+_ENUM_UNPACK = {t: struct.Struct(fmt).unpack_from for t, fmt in ENUMS.items()}
+_TYPE_KEY = {t: f"type {t:02x}" for t in range(256)}   # the stats key of a member type (a u8 in LSCH)
+_U32 = struct.Struct("<I").unpack_from
+_U64 = struct.Struct("<Q").unpack_from
+
+
+def _resolve_keys(kind):
+    """The four stats keys Container.resolve counts under for a pointer of this kind."""
+    return f"{kind} null", f"{kind} block out of range", f"{kind} past block end", f"{kind} resolved"
+
+
+# the kinds this tool resolves; any other kind formats its keys on each call, so nothing here grows with the file
+_RESOLVE_KEYS = {k: _resolve_keys(k) for k in (
+    "struct pointer", "string pointer", *(f"array {t:02x}" for t in (0x5C, 0x52)),
+    *(f"map {t:02x}" for t in (0x71, 0x73, 0x75)))}
+_UU = struct.Struct("<II").unpack_from
+_HH = struct.Struct("<HH").unpack_from
+# the stats keys of the two array layouts that point to a block: kind, empty, block type matches, block type differs
+_ARRAY_KEYS = {t: (f"array {t:02x}", f"array {t:02x} empty", f"array {t:02x} block type matches element",
+                   f"array {t:02x} block type differs") for t in (0x5C, 0x52)}
+_ONES = memoryview(b"\x01" * 65536)      # source of the coverage marks, so a large mark allocates nothing
+_CTRL_USED = bytes(1 if b < 0x80 else 0 for b in range(256))   # 0x75 control byte -> 1 when the slot is in use
+_ZERO16 = bytes(16)
+_KEY_INT = {1: "B", 2: "H", 4: "I", 8: "Q"}    # key sizes whose little-endian value orders like the reversed bytes
+_SCAN_SLOTS = 4096                             # map slots handled at a time, to bound the temporaries
+_CACHE_MAX = 4096                              # bound for every cache keyed by something the file chooses
+
 
 def block_table(blob, first):
     """The block table: a list of (type, offset, size) and whether the blocks end exactly at `first`.
@@ -93,12 +136,12 @@ def block_table(blob, first):
     """
     blocks, at = [], 8
     while at + 8 <= first:
-        kind = struct.unpack_from("<I", blob, at)[0]
+        kind = _U32(blob, at)[0]
         if kind == END_OF_TABLE:
             break
         if at + ROW > first or blob[at + 8:at + ROW] != FILL:
             raise ValueError(f"block table row at {at} has no 0xaa fill")
-        blocks.append((kind, struct.unpack_from("<I", blob, at + 4)[0]))
+        blocks.append((kind, _U32(blob, at + 4)[0]))
         at += ROW
     else:
         raise ValueError("block table has no 0x70 end padding before the first section")
@@ -144,16 +187,9 @@ class Container:
     # ---------------------------------------------------------------- layout
     def size_of(self, m):
         t = m["type"]
-        if t in SCALARS:
-            return struct.calcsize(SCALARS[t])
-        if t in HASHES:
-            return struct.calcsize(HASHES[t])
-        if t in ENUMS:
-            return struct.calcsize(ENUMS[t])
-        if t in POINTERS:
-            return 8
-        if t in CONTAINERS:
-            return CONTAINERS[t]
+        n = _SIZE_OF.get(t)
+        if n is not None:
+            return n
         if t == 0x05:
             s = self.structs.get(m["ref"])
             return s["size"] if s else None
@@ -188,28 +224,36 @@ class Container:
     # ---------------------------------------------------------------- pointers
     def pointer(self, at):
         """(block number, offset) of the u64 pointer at `at`; (0, 0) for null."""
-        v = struct.unpack_from("<Q", self.blob, at)[0]
+        v = _U64(self.blob, at)[0]
         return v & 0xFFFFF, v >> 20
 
     def resolve(self, at, need, stats, kind):
         """The (block type, absolute offset, block number) a pointer reaches, or None (null or out of range)."""
-        number, off = self.pointer(at)
+        v = _U64(self.blob, at)[0]
+        number, off = v & 0xFFFFF, v >> 20
+        keys = _RESOLVE_KEYS.get(kind) or _resolve_keys(kind)
         if number == 0 and off == 0:
-            stats[f"{kind} null"] += 1
+            stats[keys[0]] += 1
             return None
-        if not 1 <= number <= len(self.blocks):
-            stats[f"{kind} block out of range"] += 1
+        blocks = self.blocks
+        if not 1 <= number <= len(blocks):
+            stats[keys[1]] += 1
             return None
-        btype, base, size = self.blocks[number - 1]
+        btype, base, size = blocks[number - 1]
         if off + need > size:
-            stats[f"{kind} past block end"] += 1
+            stats[keys[2]] += 1
             return None
-        stats[f"{kind} resolved"] += 1
+        stats[keys[3]] += 1
         return btype, base + off, number
 
 
 class Walker:
-    """Visits every value reachable from the root; collects counts, byte coverage and (optionally) the values."""
+    """Visits every value reachable from the root; collects counts, byte coverage and (optionally) the values.
+
+    A subclass may override `value` and `struct`: they are called once per member and per struct, in file order, as
+    ever. Only a walker that overrides none of `value`, `struct`, `enum` and `mark` takes the batched paths (`_run`,
+    the per-struct plan, the map scans), which add up the same counts and visit the same bytes in the same order.
+    """
 
     def __init__(self, container, stats, keep=False):
         self.c = container
@@ -220,6 +264,9 @@ class Walker:
         self._block_bases = [base for _, base, _ in container.blocks]
         self._block_ends = [base + size for _, base, size in container.blocks]
         self._limit = None
+        self._plans = {}
+        self._plain = all(getattr(getattr(self, n), "__func__", None) is getattr(Walker, n)
+                          for n in ("value", "struct", "enum", "mark"))
 
     def _block_end(self, at):
         i = bisect.bisect_right(self._block_bases, at) - 1
@@ -232,20 +279,22 @@ class Walker:
 
     def _read_size(self, m):
         t = m["type"]
-        if t in SCALARS:
-            return struct.calcsize(SCALARS[t])
-        if t in HASHES:
-            return struct.calcsize(HASHES[t])
-        if t in ENUMS:
-            return struct.calcsize(ENUMS[t])
-        if t == 0x40:
-            return m["ref"]
-        return _HEADER_BYTES.get(t)
+        return m["ref"] if t == 0x40 else _READ_SIZE.get(t)
 
     def mark(self, number, absolute, n):
         btype, base, size = self.c.blocks[number - 1]
         lo = absolute - base
-        self.cover[number - 1][lo:min(size, lo + n)] = b"\x01" * max(0, min(size, lo + n) - lo)
+        hi = min(size, lo + n)
+        if 0 <= lo < hi:
+            cover = self.cover[number - 1]
+            if hi - lo <= len(_ONES):
+                cover[lo:hi] = _ONES[:hi - lo]
+            else:  # in pieces, so a large mark does not allocate a large temporary
+                for p in range(lo, hi, len(_ONES)):
+                    q = min(hi, p + len(_ONES))
+                    cover[p:q] = _ONES[:q - p]
+        else:
+            self.cover[number - 1][lo:hi] = b"\x01" * max(0, hi - lo)
 
     def run(self):
         c, st = self.c, self.stats
@@ -260,12 +309,41 @@ class Walker:
             st["root past block end"] += 1
             return None
         value = self.struct(btype, base, 0, c.root)
-        reached = sum(sum(b) for b in self.cover)
+        # the coverage bytes are 0 or 1, so the bytes reached are the length minus the zeros
+        reached = sum(len(b) - b.count(0) for b in self.cover)
         st["bytes"] += sum(size for _, _, size in c.blocks)
         st["bytes reached"] += reached
         st["blocks"] += len(c.blocks)
-        st["blocks reached"] += sum(1 for b in self.cover if any(b))
+        st["blocks reached"] += sum(1 for b in self.cover if b.count(0) != len(b))
         return value
+
+    def _plan(self, name, s):
+        """What struct() does for each member of `s`, worked out once: the (stats key, count) of the members it can
+        count without looking at them, the others to hand to `value`, and one row per member for a keeping walk."""
+        keep = self.keep
+        plan = self._plans.get(name)
+        if plan is not None and (plan[3] is not None or not keep):
+            return plan
+        size, members = s["size"], s["members"]
+        counts, generic, rows = collections.Counter(), [], []
+        for m in members:
+            if m["hash"] == ELEMENT:
+                continue
+            t, off = m["type"], m["offset"]
+            key = _TYPE_KEY.get(t) or f"type {t:02x}"
+            spec = _UNPACK.get(t)
+            if spec is not None and 0 <= off and off + spec[0] <= size:
+                # inside the struct, which struct() has already checked against its block: no bounds check needed
+                counts[key] += 1
+            else:
+                generic.append((m, off))
+                spec = None
+            if keep:
+                rows.append((f"{m['hash']:08x}", key, m, off, spec))
+        plan = (members, tuple(counts.items()), tuple(generic), tuple(rows) if keep else None)
+        if name in self._plans or len(self._plans) < _CACHE_MAX:
+            self._plans[name] = plan
+        return plan
 
     def struct(self, name, at, depth, number=None):
         c, st = self.c, self.stats
@@ -277,55 +355,119 @@ class Walker:
             _, base, size = c.blocks[number - 1]
             limit = base + size
         else:
-            limit = self._active_end(at)
+            limit = self._limit if self._limit is not None else self._block_end(at)
         if limit is None or at < 0 or at + s["size"] > limit:
             st["struct past block end"] += 1
             return None
         if number:
             self.mark(number, at, s["size"])
-        if (name, at) in self.seen or depth > MAX_DEPTH:
+        seen = self.seen
+        key = at << 32 | name   # a struct name is a u32 here, so this is the pair (name, at) as one int
+        if key in seen or depth > MAX_DEPTH:
             return None
-        self.seen.add((name, at))
+        seen.add(key)
         st["structs"] += 1
         out = {} if self.keep else None
         prev_limit = self._limit
         self._limit = limit
         try:
-            for m in s["members"]:
-                if m["hash"] == ELEMENT:
-                    continue
-                v = self.value(m, s["members"], at + m["offset"], depth)
-                if self.keep:
-                    out[f"{m['hash']:08x}"] = v
+            if self._plain:
+                members, counts, generic, rows = self._plan(name, s)
+                value = self.value
+                if not self.keep:
+                    for k, n in counts:
+                        st[k] += n
+                    for m, off in generic:
+                        value(m, members, at + off, depth)
+                else:
+                    blob = c.blob
+                    for hexname, k, m, off, spec in rows:
+                        if spec is None:
+                            out[hexname] = value(m, members, at + off, depth)
+                        else:
+                            st[k] += 1
+                            v = spec[1](blob, at + off)
+                            if spec[3] is not None:
+                                out[hexname] = format(v[0], spec[3])
+                            else:
+                                out[hexname] = v[0] if spec[2] == 1 else list(v)
+            else:
+                for m in s["members"]:
+                    if m["hash"] == ELEMENT:
+                        continue
+                    v = self.value(m, s["members"], at + m["offset"], depth)
+                    if self.keep:
+                        out[f"{m['hash']:08x}"] = v
         finally:
             self._limit = prev_limit
         return out
 
     def elements(self, el, members, base, count, depth):
         size = self.c.size_of(el)
+        if self._plain and count > 0 and size:
+            return self._run(el, members, range(base, base + count * size, size), depth + 1, True)
         return [self.value(el, members, base + i * size, depth + 1) for i in range(count)]
 
-    def value(self, m, members, at, depth):
-        c, st, blob = self.c, self.stats, self.c.blob
+    def _run(self, m, members, positions, depth, collect, shift=0):
+        """`value(m, members, p + shift, depth)` for each p of `positions`, in order, with the counts added in one go.
+
+        `positions` is a non-empty ascending range or list. Returns the list of values when `collect`, else None.
+        Only a plain walker calls this (see the class doc).
+        """
         t = m["type"]
-        st[f"type {t:02x}"] += 1
-        need = self._read_size(m)
+        n = len(positions)
+        st = self.stats
+        spec = _UNPACK.get(t)
+        limit = self._limit
+        if spec is not None and limit is not None and positions[0] + shift >= 0 \
+                and positions[-1] + shift + spec[0] <= limit:
+            st[_TYPE_KEY.get(t) or f"type {t:02x}"] += n    # all of them are inside the block
+            if not self.keep:
+                return [None] * n if collect else None
+            blob, unpack, width, fmt = self.c.blob, spec[1], spec[2], spec[3]
+            if fmt is not None:
+                return [format(unpack(blob, p + shift)[0], fmt) for p in positions]
+            if width == 1:
+                return [unpack(blob, p + shift)[0] for p in positions]
+            return [list(unpack(blob, p + shift)) for p in positions]
+        if t == 0x05:
+            st["type 05"] += n
+            struct_, ref, d = self.struct, m["ref"], depth + 1
+            if collect:
+                return [struct_(ref, p + shift, d) for p in positions]
+            for p in positions:
+                struct_(ref, p + shift, d)
+            return None
+        value = self.value
+        if collect:
+            return [value(m, members, p + shift, depth) for p in positions]
+        for p in positions:
+            value(m, members, p + shift, depth)
+        return None
+
+    def value(self, m, members, at, depth):
+        c, st = self.c, self.stats
+        t = m["type"]
+        st[_TYPE_KEY.get(t) or f"type {t:02x}"] += 1
+        need = m["ref"] if t == 0x40 else _READ_SIZE.get(t)
         if need is not None:
-            end = self._active_end(at)
+            end = self._limit if self._limit is not None else self._block_end(at)
             if end is None or at < 0 or at + need > end:
                 st["member past block end"] += 1
                 return None
-        if t in SCALARS:
-            v = struct.unpack_from(SCALARS[t], blob, at)
-            return (v[0] if len(v) == 1 else list(v)) if self.keep else None
-        if t in HASHES:
+        spec = _UNPACK.get(t)
+        if spec is not None:
+            v = spec[1](c.blob, at)
             if not self.keep:
                 return None
-            return f"{struct.unpack_from(HASHES[t], blob, at)[0]:0{struct.calcsize(HASHES[t]) * 2}x}"
+            if spec[3] is not None:
+                return format(v[0], spec[3])
+            return v[0] if spec[2] == 1 else list(v)
         if t in ENUMS:
             return self.enum(m, t, at)
         if t == 0x05:
             return self.struct(m["ref"], at, depth + 1)
+        blob = c.blob
         if t == 0x07:
             number, _ = c.pointer(at)
             need = 1
@@ -373,7 +515,7 @@ class Walker:
 
     def enum(self, m, t, at):
         c, st = self.c, self.stats
-        v = struct.unpack_from(ENUMS[t], c.blob, at)[0]
+        v = _ENUM_UNPACK[t](c.blob, at)[0]
         e = c.enums.get(m["ref"])
         if e is None:
             st["enum not in LENM"] += 1
@@ -405,17 +547,17 @@ class Walker:
         if t in (0x50, 0x53):
             st["fixed arrays"] += 1
             n = m["ref"] & 0xFFFF
-            end = self._active_end(at)
+            end = self._limit if self._limit is not None else self._block_end(at)
             if end is None or at < 0 or at + size * n > end:
                 st["fixed array out of bounds"] += 1
                 return None
             return self.elements(el, members, at, n, depth)
         if t == 0x54:
-            end = self._active_end(at)
+            end = self._limit if self._limit is not None else self._block_end(at)
             if end is None or at < 0 or at + 8 > end:
                 st["inline array out of bounds"] += 1
                 return None
-            capacity, count = struct.unpack_from("<II", blob, at)
+            capacity, count = _UU(blob, at)
             st["inline arrays"] += 1
             st["count <= capacity" if count <= capacity else "count > capacity"] += 1
             n = min(count, capacity)
@@ -424,22 +566,22 @@ class Walker:
                 return None
             return self.elements(el, members, at + 8, n, depth)
         if t == 0x5C:
-            count, capacity = struct.unpack_from("<II", blob, at)
+            count, capacity = _UU(blob, at)
             where = at + 8
         else:
-            count, capacity = struct.unpack_from("<HH", blob, at + 8)
+            count, capacity = _HH(blob, at + 8)
             where = at
-        kind = f"array {t:02x}"
+        kind, empty, matches, differs = _ARRAY_KEYS[t]
         st["count <= capacity" if count <= capacity else "count > capacity"] += 1
         if count == 0:
-            st[f"{kind} empty"] += 1
+            st[empty] += 1
             return []
         r = c.resolve(where, size * count, st, kind)
         if r is None:
             return None
         btype, absolute, number = r
         want = el["ref"] if el["type"] == 0x05 else el["type"]
-        st[f"{kind} block type matches element" if btype == want else f"{kind} block type differs"] += 1
+        st[matches if btype == want else differs] += 1
         self.mark(number, absolute, size * count)
         _, blk_base, blk_size = c.blocks[number - 1]
         prev_limit = self._limit
@@ -465,8 +607,8 @@ class Walker:
         kind = f"map {t:02x}"
         pairs = []
         if t == 0x71:
-            flag = struct.unpack_from("<Q", blob, at)[0]
-            count, capacity = struct.unpack_from("<HH", blob, at + 16)
+            flag = _U64(blob, at)[0]
+            count, capacity = _HH(blob, at + 16)
             st["map 71 first word 1" if flag == 1 else "map 71 first word not 1"] += 1
             st["count <= capacity" if count <= capacity else "count > capacity"] += 1
             if count == 0:
@@ -477,11 +619,21 @@ class Walker:
                 return None
             _, absolute, number = r
             self.mark(number, absolute, count * slot)
-            keys = [blob[absolute + i * slot:absolute + i * slot + c.size_of(key)][::-1] for i in range(count)]
-            st[f"{kind} keys ascending" if keys == sorted(keys) else f"{kind} keys not ascending"] += 1
-            slots = [absolute + i * slot for i in range(count)]
+            ks = c.size_of(key)
+            code = _KEY_INT.get(ks)
+            if code is not None and count > 8:
+                # a key's reversed bytes order like its little-endian value: read them all in one pass
+                last = absolute + (count - 1) * slot
+                ints = [k for (k,) in struct.iter_unpack(f"<{code}{slot - ks}x", memoryview(blob)[absolute:last])]
+                ints.append(int.from_bytes(blob[last:last + ks], "little"))
+                ascending = ints == sorted(ints)
+            else:
+                keys = [blob[absolute + i * slot:absolute + i * slot + ks][::-1] for i in range(count)]
+                ascending = keys == sorted(keys)
+            st[f"{kind} keys ascending" if ascending else f"{kind} keys not ascending"] += 1
+            slots = range(absolute, absolute + count * slot, slot)
         elif t == 0x75:
-            groups, count = struct.unpack_from("<II", blob, at)
+            groups, count = _UU(blob, at)
             if count == 0:
                 st[f"{kind} empty"] += 1
                 return {} if self.keep else None
@@ -493,15 +645,14 @@ class Walker:
             self.mark(number, absolute, groups * group)
             power = groups > 0 and (groups & (groups - 1) == 0)
             st[f"{kind} groups a power of two" if power else f"{kind} groups not a power of two"] += 1
-            slots = []
-            for g in range(groups):
-                base = absolute + g * group
-                for i in range(16):
-                    if not blob[base + i] & 0x80:
-                        slots.append(base + 16 + i * slot)
+            slots = array.array("q")    # 8 bytes a slot, where a list of ints takes 40
+            for base in range(absolute, absolute + groups * group, group):
+                used = blob[base:base + 16].translate(_CTRL_USED)   # 1 for a control byte with bit 7 clear
+                if used != _ZERO16:
+                    slots.extend(itertools.compress(range(base + 16, base + 16 + 16 * slot, slot), used))
             st[f"{kind} used slots == count" if len(slots) == count else f"{kind} used slots != count"] += 1
         else:
-            capacity, count = struct.unpack_from("<II", blob, at)
+            capacity, count = _UU(blob, at)
             if count == 0:
                 st[f"{kind} empty"] += 1
                 return {} if self.keep else None
@@ -511,19 +662,43 @@ class Walker:
             _, absolute, number = r
             self.mark(number, absolute, capacity * slot)
             ks = c.size_of(key)
-            slots = [absolute + i * slot for i in range(capacity)
-                     if blob[absolute + i * slot:absolute + i * slot + ks] != bytes(ks)]
+            slots = array.array("q")
+            if capacity <= 16:
+                zero = bytes(ks)
+                for at_ in range(absolute, absolute + capacity * slot, slot):
+                    if blob[at_:at_ + ks] != zero:
+                        slots.append(at_)
+            else:
+                # a slot is in use when any byte of its key is not zero: OR the key's byte columns, then pick the slots
+                region = memoryview(blob)[absolute:absolute + capacity * slot]
+                for lo in range(0, capacity, _SCAN_SLOTS):   # in pieces, so the masks stay small
+                    n = min(_SCAN_SLOTS, capacity - lo)
+                    piece = region[lo * slot:(lo + n) * slot]
+                    used = 0
+                    for j in range(ks):
+                        used |= int.from_bytes(piece[j::slot], "little")
+                    slots.extend(itertools.compress(range(absolute + lo * slot, absolute + (lo + n) * slot, slot),
+                                                    used.to_bytes(n, "little")))
             st[f"{kind} used slots == count" if len(slots) == count else f"{kind} used slots != count"] += 1
         st[f"{kind} pairs"] += len(slots)
         _, blk_base, blk_size = c.blocks[number - 1]
         prev_limit = self._limit
         self._limit = blk_base + blk_size
         try:
-            for s in slots:
-                k = self.value(key, members, s, depth + 1)
-                v = self.value(val, members, s + voff, depth + 1)
-                if self.keep:
-                    pairs.append([k, v])
+            if self._plain and slots and key["type"] in _UNPACK:
+                # a plain key has no effect but its count, so a piece of keys can be read, then a piece of values
+                for lo in range(0, len(slots), _SCAN_SLOTS):
+                    piece = slots[lo:lo + _SCAN_SLOTS]
+                    ks_ = self._run(key, members, piece, depth + 1, self.keep)
+                    vs_ = self._run(val, members, piece, depth + 1, self.keep, voff)
+                    if self.keep:
+                        pairs.extend([k, v] for k, v in zip(ks_, vs_))
+            else:
+                for s in slots:
+                    k = self.value(key, members, s, depth + 1)
+                    v = self.value(val, members, s + voff, depth + 1)
+                    if self.keep:
+                        pairs.append([k, v])
         finally:
             self._limit = prev_limit
         return pairs if self.keep else None
