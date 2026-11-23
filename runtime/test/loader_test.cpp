@@ -507,6 +507,24 @@ void test_imports() {
     } catch (const std::exception& e) {
         failed("the bundled-module ops answer module identity for mapped images", e.what());
     }
+    // A shim-owned module's unregistered imports never reach a host namesake. version.dll is claimed in the
+    // test table, so GetFileVersionInfoSizeA — a real System32 export the table does not carry — must end
+    // unimplemented instead of binding the host copy (Kam471's probe on #5731, made a check).
+    static const rt::shims::Entry owned_entries[] = {
+        {"version.dll", "LeonidaSentinel", reinterpret_cast<void*>(&test_shim_function)},
+    };
+    static const rt::shims::Table owned_table(owned_entries, 1);
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(write_image_as(
+            make_import_image("version.dll", "GetFileVersionInfoSizeA"), "importer_skip.exe"));
+        if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
+            return failed("an unregistered import of a shim-owned module does not host-bind",
+                          m.imports.empty() ? "no import record" : "it bound the host copy");
+        pass("an unregistered import of a shim-owned module ends unimplemented, not host");
+    } catch (const std::exception& e) {
+        failed("an unregistered import of a shim-owned module does not host-bind", e.what());
+    }
 }
 
 void test_import_name_rvas() {
