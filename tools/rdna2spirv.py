@@ -216,6 +216,12 @@ F1 = {"v_rcp_f32": "rcp", "v_rsq_f32": "InverseSqrt", "v_sqrt_f32": "Sqrt", "v_e
       "v_trunc_f32": "Trunc"}
 S2 = {"s_and_b32": "OpBitwiseAnd", "s_or_b32": "OpBitwiseOr",
       "s_lshl_b32": "OpShiftLeftLogical", "s_lshr_b32": "OpShiftRightLogical", "s_mul_i32": "OpIMul"}
+SOPK_CMP_OPS = frozenset(
+    f"s_cmpk_{cond}_{ty}"
+    for cond in ("eq", "lg", "gt", "ge", "lt", "le")
+    for ty in ("i32", "u32")
+)
+SOPK_SPECIAL_REGS = frozenset(("null", "m0", "vcc_lo", "vcc_hi", "exec_lo", "exec_hi"))
 
 # Runs of lane-local VALU instructions share one `if (active)` instead of an OpSelect per VGPR write (Gen.insns).
 # VALU ops that are not lane-local: they read other lanes, write a lane mask, SCC or EXEC, or write a carry or
@@ -5642,6 +5648,30 @@ class Gen:
             return
         self.dst(d, val)
 
+    def sopk_imm(self, ins, op, a, mods, *, signed=True):
+        """Validate a 32-bit SOPK instruction (SDST/SSRC0 + SIMM16) and return its extended immediate."""
+        raw_op = ins["op"]
+        if raw_op != op:
+            raise Unsupported(f"{raw_op}: SOPK does not allow encoding suffix")
+        if mods:
+            raise Unsupported(f"{raw_op}: unexpected modifiers {' '.join(mods)}")
+        if len(a) != 2:
+            raise Unsupported(f"{raw_op}: expected 2 operands, got {len(a)}")
+        if any(arg.get(m) for arg in a for m in ("neg", "abs", "sext", "sdwa_sel", "sdwa_dst")):
+            raise Unsupported(f"{raw_op}: operand modifiers not allowed")
+        reg = a[0]
+        if not ((reg["k"] == "sgpr" and reg.get("n", 1) == 1)
+                or (reg["k"] == "special" and reg["t"] in SOPK_SPECIAL_REGS)):
+            raise Unsupported(f"{raw_op}: invalid 32-bit scalar operand {reg.get('t', reg['k'])}")
+        imm = a[1]
+        if imm["k"] != "imm":
+            raise Unsupported(f"{raw_op}: expected 16-bit immediate, got {imm.get('t', imm['k'])}")
+        raw_v = imm["v"]
+        if not (-32768 <= raw_v <= 65535):
+            raise Unsupported(f"{raw_op}: immediate {raw_v} out of 16-bit range [-32768, 65535]")
+        imm16 = raw_v & 0xFFFF
+        return (imm16 - 0x10000 if (signed and (imm16 & 0x8000)) else imm16)
+
     def sop2_b32_srcs(self, op, a):
         """The two sources of a 32-bit SOP2. A bitwise op (or s_cselect) that writes EXEC / VCC reads both through
         _mask_b32_src / mask_src (in wave32 and on either half of a wave64 mask), so a constant, inline or held in
@@ -6901,8 +6931,7 @@ class Gen:
                 h = self.f16_bits(self.clamp_mods(f, ["clamp"]))     # exact: the clamped value is an f16
             self.write_lo16(a[0], h)
         elif op == "s_mulk_i32":
-            v = a[1]["v"] & 0xFFFF
-            k = v - 0x10000 if v & 0x8000 else v
+            k = self.sopk_imm(ins, op, a, mods, signed=True)
             x = self.src_u(a[0])
             r = self.tmp()
             self.emit(f"{r} = OpIMul %uint {x} {self.cu(k)}")
@@ -9124,8 +9153,7 @@ class Gen:
         elif op == "image_get_lod":
             self.image_get_lod(a, mods)
         elif op == "s_addk_i32":
-            v = a[1]["v"] & 0xFFFF
-            k = v - 0x10000 if v & 0x8000 else v
+            k = self.sopk_imm(ins, op, a, mods, signed=True)
             x = self.src_u(a[0])            # the destination can be m0/vcc_hi as well as an SGPR
             r = self.tmp()
             self.emit(f"{r} = OpIAdd %uint {x} {self.cu(k)}")
@@ -10164,20 +10192,24 @@ class Gen:
                 f = self.clamp_mods(f, mods)
             self.dst(a[0], self.tou(f))
         elif op == "s_movk_i32":
-            v = a[1]["v"] & 0xFFFF
-            val = (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
+            val = self.sopk_imm(ins, op, a, mods, signed=True) & 0xFFFFFFFF
             self.dst(a[0], self.cu(val))
             if a[0]["k"] == "sgpr" and self.desc_cache_ok():
                 self.sgpr_imm[a[0]["r"]] = val
-        elif op in ("s_cmov_b32", "s_cmovk_i32"):
-            # D = SCC ? S0 : D (s_cmovk_i32: S0 is the 16-bit immediate, sign-extended). SCC is read, not written.
+        elif op == "s_cmovk_i32":
+            # D = SCC ? sign_extend(simm16) : D. SCC is read, not written.
+            k = self.sopk_imm(ins, op, a, mods, signed=True)
+            x = self.cu(k)
+            old = self.src_u(a[0])
+            c, r = self.tmp(), self.tmp()
+            self.emit(f"{c} = OpLoad %uint %scc")
+            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {x} {old}")
+            self.dst(a[0], r)
+        elif op == "s_cmov_b32":
+            # D = SCC ? S0 : D. SCC is read, not written.
             if a[0]["k"] != "sgpr":
                 raise Unsupported(op + " destination")
-            if op == "s_cmovk_i32":
-                v = a[1]["v"] & 0xFFFF
-                x = self.cu((v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF)
-            else:
-                x = self.src_u(a[1])
+            x = self.src_u(a[1])
             old, c, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', a[0]['r'])}")
             self.emit(f"{c} = OpLoad %uint %scc")
@@ -10518,10 +10550,10 @@ class Gen:
             self.compare(op, a, scalar=True)
         elif op.startswith("s_cmpk_"):
             # s_cmpk_<cond>_<ty> sX, imm16: zero-extended for u32, sign-extended for i32.
+            if op not in SOPK_CMP_OPS:
+                raise Unsupported(ins["op"])
             ty = op.rsplit("_", 1)[1]
-            v = a[1]["v"] & 0xFFFF
-            if ty == "i32" and v & 0x8000:
-                v -= 0x10000
+            v = self.sopk_imm(ins, op, a, mods, signed=(ty == "i32"))
             self.compare("s_cmp_" + op[len("s_cmpk_"):], [a[0], {"k": "imm", "v": v}], scalar=True)
         elif op.startswith("s_bitcmp"):
             self.bitcmp(op, a)
