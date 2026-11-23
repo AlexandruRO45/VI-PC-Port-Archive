@@ -3,7 +3,7 @@
 > [!NOTE]
 > Die englische Dokumentation ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) und
 > [`docs/README.md`](../../README.md)) ist **maßgeblich**. Diese Anleitung enthält nur die stabilen Schritte zum
-> Einrichten und Bauen (abgeglichen mit Commit `aa2988cc`). Den aktuellen Projektstand findest du in der
+> Einrichten und Bauen (abgeglichen mit Commit `1cc6e3c12`). Den aktuellen Projektstand findest du in der
 > [`README.md`](../../../README.md).
 
 ## Was ist Leonida?
