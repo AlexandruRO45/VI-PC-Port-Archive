@@ -18,6 +18,8 @@ import meshlet_page as mp  # noqa: E402
 
 # The page from #5600: a group header with 0 meshlets, 0 triangles and 0 references, then the byte 1.
 EMPTY_GROUP = bytes.fromhex("00000080000000000000000001000000")
+# The same empty group header with zero padding behind it, as rows 2-4 of the #5600 review had it.
+EMPTY = struct.pack("<3I", 0x80000000, 0, 0)
 
 
 def group_page():
@@ -26,6 +28,11 @@ def group_page():
     triangle = struct.pack("<I", (1 << 7) | (2 << 14))     # meshlet 0; vertices 0, 1, 2
     refs = struct.pack("<3H", 0, 1, 2)
     return struct.pack("<3I", 0x80000001, 1, 3) + meshlet + triangle + refs
+
+
+def padded(*chunks):
+    """The chunks laid out as a page has them: each zero-padded to the next 16-byte boundary, padding after."""
+    return b"".join(chunk + bytes(-len(chunk) % 16) for chunk in chunks) + bytes(16)
 
 
 def run_with_timeout(call, seconds=10):
@@ -67,6 +74,18 @@ class EmptyGroupTest(unittest.TestCase):
         with self.assertRaises(mp.PageError) as caught:
             run_with_timeout(lambda: mp.parse_page(EMPTY_GROUP))
         self.assertIn("does not advance", str(caught.exception))
+
+    def test_a_padded_empty_group_is_one_group(self):
+        chunks = run_with_timeout(lambda: mp.parse_page(padded(EMPTY)))
+        self.assertEqual([c["meshlets"] for c in chunks], [0])
+
+    def test_groups_around_a_padded_empty_group_keep_parsing(self):
+        """The review's rows 3 and 4: the empty group sits between chunks and is no reason to drop them."""
+        two = run_with_timeout(lambda: mp.parse_page(padded(group_page(), EMPTY)))
+        self.assertEqual([c["meshlets"] for c in two], [1, 0])
+        three = run_with_timeout(lambda: mp.parse_page(padded(group_page(), EMPTY, group_page())))
+        self.assertEqual([c["meshlets"] for c in three], [1, 0, 1])
+        self.assertEqual([c["vertex_refs"] for c in three], [3, 0, 3])
 
     def test_cli_reports_the_page_and_exits_1(self):
         with tempfile.TemporaryDirectory() as scratch:
