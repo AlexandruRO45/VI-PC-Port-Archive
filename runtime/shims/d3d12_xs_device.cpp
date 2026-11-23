@@ -2904,7 +2904,20 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
 bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                             std::uint64_t a4, std::uint64_t a5, std::uint64_t& result) {
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
-    if (slot == routes.frame_interval) {
+    if (slot == 81) {
+        // ID3D12Device5::CreateLifetimeTracker. The title uses the tracker as a lifetime token; the Vulkan layer
+        // already owns resource lifetimes, so retain and return the supplied tracking object as the token.
+        auto** out = reinterpret_cast<void**>(a3);
+        if (out) *out = nullptr;
+        if (!out) result = hr_to_u64(E_POINTER);
+        else if (!a1) result = hr_to_u64(E_INVALIDARG);
+        else {
+            reinterpret_cast<IUnknown*>(a1)->AddRef();
+            *out = reinterpret_cast<void*>(a1);
+            result = hr_to_u64(S_OK);
+        }
+        log_xbox_route_once(slot, "CreateLifetimeTracker", a1, a2, a3, a4, a5);
+    } else if (slot == routes.frame_interval) {
         log_xbox_route_once(slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
         result = hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
     } else if (slot == routes.schedule_event) {
