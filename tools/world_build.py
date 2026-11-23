@@ -34,6 +34,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import statistics
 import sys
 import tempfile
@@ -1333,9 +1334,27 @@ def _holds_recovery_data(staging_dir: str) -> bool:
     return os.path.lexists(os.path.join(staging_dir, _STAGING_JOURNAL)) or _holds_unrestored_chunks(staging_dir)
 
 
+def _retry_readonly_backup_unlink(func, path, exc_info) -> None:
+    if os.name != "nt" or func is not os.unlink or not isinstance(exc_info[1], PermissionError):
+        return
+    try:
+        info = os.lstat(path)
+        mode = info.st_mode
+        # Clearing a hard link's read-only attribute also changes its other names.
+        if not stat.S_ISREG(mode) or info.st_nlink != 1 or mode & stat.S_IWRITE:
+            return
+        os.chmod(path, mode | stat.S_IWRITE)
+        try:
+            os.unlink(path)
+        except OSError:
+            os.chmod(path, mode)
+    except OSError:
+        pass  # Retain the journal while a backup cannot be removed.
+
+
 def _discard_publication_staging(staging_dir: str) -> None:
     # Keep the journal until the backups are gone, including if the process dies during cleanup.
-    shutil.rmtree(os.path.join(staging_dir, _STAGING_BACKUP), ignore_errors=True)
+    shutil.rmtree(os.path.join(staging_dir, _STAGING_BACKUP), onerror=_retry_readonly_backup_unlink)
     if not _holds_unrestored_chunks(staging_dir):
         shutil.rmtree(staging_dir, ignore_errors=True)
 

@@ -18,6 +18,7 @@ import json
 import math
 import os
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -2004,6 +2005,45 @@ world_build.build_world(assets, output)
             self._kill_during_publication(assets, output, "manifest")
             self._rerun_with_missing_assets(tmp, output)
             self.assertEqual(self._snapshot(output), expected)
+
+    @unittest.skipUnless(os.name == "nt", "Windows refuses to unlink read-only files")
+    def test_readonly_chunk_backup_is_removed_after_commit(self):
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted), tempfile.TemporaryDirectory() as tmp:
+                assets, output, before = self._previous_world(tmp)
+                name = next(name for name in before if name.startswith("chunks" + os.sep))
+                live = os.path.join(output, name)
+                os.chmod(live, stat.S_IREAD)
+
+                if interrupted:
+                    self._kill_during_publication(assets, output, "manifest")
+                    self._rerun_with_missing_assets(tmp, output)
+                else:
+                    world_build.build_world(assets, output)
+
+                self.assertEqual(sorted(os.listdir(output)), ["chunks", "world.json"])
+                self.assertFalse(os.stat(live).st_mode & stat.S_IWRITE)
+                with open(live, "rb") as f:
+                    self.assertNotEqual(f.read(), before[name])
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only attributes are shared by hard links")
+    def test_committed_cleanup_preserves_readonly_hard_link_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = os.path.join(tmp, world_build.CHUNK_STAGING_PREFIX + "committed")
+            backups = os.path.join(staging, "previous")
+            os.makedirs(backups)
+            original = os.path.join(tmp, "linked-chunk.glb")
+            backup = os.path.join(backups, "c_0_0.glb")
+            with open(original, "wb") as f:
+                f.write(b"original chunk")
+            os.link(original, backup)
+            os.chmod(original, stat.S_IREAD)
+
+            world_build._discard_publication_staging(staging)
+
+            self.assertFalse(os.stat(original).st_mode & stat.S_IWRITE)
+            with open(original, "rb") as f:
+                self.assertEqual(f.read(), b"original chunk")
 
     def test_recovery_that_cannot_restore_a_chunk_can_be_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
