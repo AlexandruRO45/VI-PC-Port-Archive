@@ -542,6 +542,18 @@ QueryThreadFn query_thread_fn() {
     return fn;
 }
 
+// NtGetNextThread walks only this process's threads, one handle per call. TH32CS_SNAPTHREAD below lists every thread
+// in the system and Thread32Next has to walk them all; on Windows 11 a dry run of the retail executable measured
+// 6-10 ms for the snapshot and 23-32 ms for the walk per mapped TLS module (three modules at startup). NtGetNextThread
+// is not in the documented API set, so a missing export or a refused call falls back to the Toolhelp walk.
+using NextThreadFn = LONG(NTAPI*)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
+NextThreadFn next_thread_fn() {
+    static const auto fn = reinterpret_cast<NextThreadFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtGetNextThread")));
+    return fn;
+}
+constexpr LONG kStatusNoMoreEntries = static_cast<LONG>(0x8000001Au);
+
 // The TEB's ThreadLocalStoragePointer field of a thread that is still running; null otherwise.
 void*** running_thread_tls_vector(HANDLE thread) {
     ThreadBasicInfo info{};
@@ -610,23 +622,51 @@ void install_on_existing_threads(Module& m) {
     struct Candidates {
         std::vector<Candidate> list;
         HANDLE snapshot = INVALID_HANDLE_VALUE;
-        ~Candidates() {
-            if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
-            for (const Candidate& c : list)
+        void close() {
+            if (snapshot != INVALID_HANDLE_VALUE) {
+                CloseHandle(snapshot);
+                snapshot = INVALID_HANDLE_VALUE;
+            }
+            for (Candidate& c : list)
                 if (c.handle) CloseHandle(c.handle);
+            list.clear();
         }
+        ~Candidates() { close(); }
     } found;
     std::vector<Candidate>& candidates = found.list;
-    // TH32CS_SNAPTHREAD lists the threads of every process; the loop keeps this one's.
-    found.snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (found.snapshot == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 entry{};
-    entry.dwSize = sizeof entry;
     const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
-    for (BOOL more = Thread32First(found.snapshot, &entry); more; more = Thread32Next(found.snapshot, &entry)) {
-        if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
-        candidates.push_back({entry.th32ThreadID, nullptr});  // the slot first, so the handle always has an owner
-        candidates.back().handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+
+    // Only this process's threads: NtGetNextThread returns a handle for each, and the calling thread's is kept too
+    // (skipped below) because it is the cursor for the next call. A call that fails part way falls back to Toolhelp.
+    bool complete = false;
+    if (const NextThreadFn next = next_thread_fn()) {
+        HANDLE current = nullptr;
+        LONG status = 0;
+        for (;;) {
+            HANDLE thread = nullptr;
+            status = next(GetCurrentProcess(), current, THREAD_QUERY_INFORMATION, 0, 0, &thread);
+            if (status < 0 || !thread) {
+                if (thread) CloseHandle(thread);
+                break;
+            }
+            candidates.push_back({GetThreadId(thread), thread});
+            current = thread;
+        }
+        complete = status == kStatusNoMoreEntries;
+        if (!complete) found.close();
+    }
+    // TH32CS_SNAPTHREAD lists the threads of every process; the loop keeps this one's. The fallback opens a handle
+    // per thread even for the calling thread, which the install loop then skips.
+    if (!complete) {
+        found.snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (found.snapshot == INVALID_HANDLE_VALUE) return;
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof entry;
+        for (BOOL more = Thread32First(found.snapshot, &entry); more; more = Thread32Next(found.snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != process) continue;
+            candidates.push_back({entry.th32ThreadID, nullptr});  // the slot first, so the handle always has an owner
+            candidates.back().handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+        }
     }
 
     {
@@ -634,7 +674,7 @@ void install_on_existing_threads(Module& m) {
         ExistingThreadsLock lock;
         ExistingThreads& state = existing_threads();
         for (const Candidate& c : candidates) {
-            if (!c.handle) continue;
+            if (!c.handle || c.id == self) continue;
             if (std::find(state.ended.begin(), state.ended.end(), c.id) != state.ended.end()) continue;
             void*** vector = running_thread_tls_vector(c.handle);
             void** slots = nullptr;
