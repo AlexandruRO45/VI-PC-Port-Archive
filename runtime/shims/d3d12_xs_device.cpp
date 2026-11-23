@@ -1468,6 +1468,13 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 }
                 return hr_to_u64(S_OK);
             }
+            if constexpr (Slot == 35) {
+                using ExecuteFn = void(WINAPI*)(void*, UINT, ID3D12CommandList* const*);
+                reinterpret_cast<ExecuteFn>(self->real_vtable[10])(
+                    self->real, static_cast<UINT>(a1), reinterpret_cast<ID3D12CommandList* const*>(a2));
+                d3d12_trace::record("XboxID3D12CommandQueue::ExecuteCommandListsX");
+                return 0;
+            }
             if (Slot == (newer ? 32u : 30u)) return queue_present_x(self, a1, a2, a3);  // PresentX
             if (Slot >= self->slot_count || (newer && (Slot == 14 || Slot == 15))) {
                 d3d12_trace::record(child_trace_name<K>(Slot), "console-only");
