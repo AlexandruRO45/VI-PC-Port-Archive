@@ -1111,6 +1111,8 @@ void* Loader::load_runtime_module_w(const std::wstring& basename, uint32_t flags
 
 void* Loader::load_runtime_candidate(Module* existing, const std::filesystem::path& candidate, uint32_t flags,
                                      const std::string& display) {
+    if (existing && (flags & DONT_RESOLVE_DLL_REFERENCES) != 0)
+        return static_cast<void*>(existing->base);
     // Win32 DONT_RESOLVE_DLL_REFERENCES (0x1) forbids resolving dependencies or running TLS/DllMain; refuse it
     // explicitly instead of silently performing a normal resolving + initialising load.
     if ((flags & DONT_RESOLVE_DLL_REFERENCES) != 0) {

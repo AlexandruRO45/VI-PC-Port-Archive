@@ -893,6 +893,20 @@ void test_datafile_load() {
     if (h) FreeLibrary(h);
 }
 
+void test_dont_resolve_existing() {
+    reset_notifications();
+    const auto path = write_image_as(make_lifecycle_image(), "dont_resolve_existing.dll");
+    rt::Loader loader(g_dir);
+    rt::Module& module = loader.load(path);
+    using LoadW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+    const auto load = reinterpret_cast<LoadW>(rt::shims::find("kernel32.dll", "LoadLibraryExW"));
+    HMODULE h = load(L"dont_resolve_existing.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+    if (h == reinterpret_cast<HMODULE>(module.base)) pass("dont resolve returns existing mapped handle");
+    else failed("dont resolve returns existing mapped handle", "wrong handle");
+    if (!g_attach_seen) pass("dont resolve does not run DllMain");
+    else failed("dont resolve does not run DllMain", "DllMain ran");
+}
+
 void test_attach_reserved() {
     reset_notifications();
     try {
@@ -1363,6 +1377,7 @@ int main() {
         test_process_detach_without_entry();
         test_attach_reserved();
         test_datafile_load();
+        test_dont_resolve_existing();
         test_process_detach_dependencies();
         test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
