@@ -65,6 +65,25 @@ class CpuScore(unittest.TestCase):
         self.assertIsNone(pc.cpu_score(""))
 
 
+class GuiRam(unittest.TestCase):
+    def test_invalid_input_is_unknown_and_valid_input_recovers(self):
+        class RamField:
+            value = ""
+
+            def get(self):
+                return self.value
+
+        field = RamField()
+        app = type("RamEditor", (), {"ram_var": field})()
+        for value in ("inf", "-inf", "1e400", "nan", ""):
+            with self.subTest(value=value):
+                field.value = value
+                self.assertIsNone(pc.App.get_ram(app))
+
+        field.value = "16.0"
+        self.assertEqual(pc.App.get_ram(app), 16)
+
+
 class Evaluate(unittest.TestCase):
     def test_in_range(self):
         head, _, rows = pc.evaluate(XBOX, "AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 32)
