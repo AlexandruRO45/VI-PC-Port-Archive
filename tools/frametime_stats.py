@@ -44,31 +44,60 @@ def parse_frametimes_ms(path: str) -> list[float]:
         col_idx = None
         mode = "auto"  # "ns", "ms", "fps", or "auto" (magnitude heuristic)
 
-        # Detect column header
+        # Detect column header by priority:
+        # 1) Direct millisecond frametime (MangoHud, CapFrameX, PresentMon MsBetweenPresents)
+        # 2) Direct nanosecond frametime (MangoHud frametime_ns)
+        # 3) Estimated FPS column (fps, current_fps)
+        ms_synonyms = {
+            "frametime_ms",
+            "frametime(ms)",
+            "frametime",
+            "frame_time",
+            "frametime_msec",
+            "ms",
+            "msbetweenpresents",
+            "msbetweenpresent",
+            "msbetweendisplaychange",
+            "msbetweendisplaychanges",
+            "frametimems",
+            "time_ms",
+        }
+        ns_synonyms = {
+            "frametime_ns",
+            "frametime(ns)",
+            "frametime_nsec",
+            "frametimens",
+            "time_ns",
+        }
+        fps_synonyms = {
+            "fps",
+            "current_fps",
+            "currentfps",
+            "instant_fps",
+        }
+
         lower_headers = [h.strip().lower() for h in header_row]
+
+        # Prioritize explicit frametimes over FPS columns regardless of column ordering
         for idx, h in enumerate(lower_headers):
-            if h in ("frametime_ns", "frametime(ns)", "frametime_nsec"):
-                col_idx = idx
-                mode = "ns"
-                break
-            if h in (
-                "frametime_ms",
-                "frametime(ms)",
-                "frametime",
-                "frame_time",
-                "frametime_msec",
-                "ms",
-                "msbetweenpresents",
-                "msbetweenpresent",
-                "msbetweendisplaychange",
-            ):
+            if h in ms_synonyms:
                 col_idx = idx
                 mode = "ms"
                 break
-            if h in ("fps", "current_fps"):
-                col_idx = idx
-                mode = "fps"
-                break
+
+        if col_idx is None:
+            for idx, h in enumerate(lower_headers):
+                if h in ns_synonyms:
+                    col_idx = idx
+                    mode = "ns"
+                    break
+
+        if col_idx is None:
+            for idx, h in enumerate(lower_headers):
+                if h in fps_synonyms:
+                    col_idx = idx
+                    mode = "fps"
+                    break
 
         if col_idx is None:
             # Maybe there are no headers and it's just raw numbers
@@ -88,7 +117,7 @@ def parse_frametimes_ms(path: str) -> list[float]:
             if not row:
                 continue
             if col_idx is None:
-                # Try to locate the numeric column
+                # Try to locate the first numeric column
                 for idx, cell in enumerate(row):
                     try:
                         v = float(cell.strip())
@@ -120,6 +149,7 @@ def parse_frametimes_ms(path: str) -> list[float]:
                 if val > 0:
                     frametimes.append(1000.0 / val)
             elif mode == "ms":
+                # Explicit ms header: do not guess magnitude
                 frametimes.append(val)
             else:  # mode == "auto" (unlabeled input)
                 if val > 100000.0:

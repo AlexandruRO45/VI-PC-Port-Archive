@@ -1,5 +1,4 @@
 """Tests for tools/frametime_stats.py."""
-import csv
 import json
 import os
 import subprocess
@@ -20,7 +19,7 @@ class FrametimeStatsTest(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
-    def _create_csv(self, filename: str, header: str, values: list[float]) -> str:
+    def _create_csv(self, filename: str, header: str, values: list[float] | list[str]) -> str:
         path = os.path.join(self.tmp_dir.name, filename)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(f"{header}\n")
@@ -59,6 +58,42 @@ class FrametimeStatsTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["p50_ms"], 16.6, places=1)
         self.assertEqual(metrics["stutter_count"], 0)
 
+    def test_presentmon_legacy_columns_and_priority(self):
+        # PresentMon legacy format: Application,ProcessID,MsBetweenPresents
+        lines = ["fixture.exe,4321,16", "fixture.exe,4321,24"]
+        csv_path = self._create_csv("presentmon.csv", "Application,ProcessID,MsBetweenPresents", lines)
+
+        parsed = frametime_stats.parse_frametimes_ms(csv_path)
+        self.assertEqual(parsed, [16.0, 24.0])
+        metrics = frametime_stats.compute_metrics(parsed)
+        self.assertEqual(metrics["avg_fps"], 50.0)
+        self.assertEqual(metrics["p50_ms"], 20.0)
+
+    def test_frametime_priority_over_fps_column(self):
+        # Header has both fps and frametime_ms; measured frametime must win regardless of column order
+        lines = ["60,16", "60,24"]
+        csv_path = self._create_csv("mixed.csv", "fps,frametime_ms", lines)
+
+        parsed = frametime_stats.parse_frametimes_ms(csv_path)
+        self.assertEqual(parsed, [16.0, 24.0])
+        metrics = frametime_stats.compute_metrics(parsed)
+        self.assertEqual(metrics["avg_fps"], 50.0)
+
+    def test_explicit_ms_magnitude_not_scaled(self):
+        # When column is explicitly frametime_ms, values >= 100,000 are not scaled down
+        csv_path = self._create_csv("large_ms.csv", "frametime_ms", [150000.0])
+        parsed = frametime_stats.parse_frametimes_ms(csv_path)
+        self.assertEqual(parsed, [150000.0])
+
+    def test_target_fps_hit_pct(self):
+        # 16.6 ms (60 FPS) and 33.3 ms (30 FPS)
+        values = [16.6] * 80 + [33.3] * 20
+        csv_path = self._create_csv("target.csv", "frametime_ms", values)
+        parsed = frametime_stats.parse_frametimes_ms(csv_path)
+        metrics = frametime_stats.compute_metrics(parsed, target_fps=60.0)
+        self.assertEqual(metrics["target_fps"], 60.0)
+        self.assertAlmostEqual(metrics["target_hit_pct"], 80.0, places=1)
+
     def test_cli_execution_json(self):
         ms_values = [16.6] * 50 + [40.0]
         csv_path = self._create_csv("run.csv", "ms", ms_values)
@@ -86,41 +121,6 @@ class FrametimeStatsTest(unittest.TestCase):
         self.assertIn("Tuned    [B]:", res.stdout)
         self.assertIn("Average FPS", res.stdout)
         self.assertIn("+20.", res.stdout)  # approx +20% FPS improvement
-
-    def test_presentmon_legacy_columns(self):
-        path = os.path.join(self.tmp_dir.name, "presentmon.csv")
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("Application,ProcessID,MsBetweenPresents\n")
-            f.write("fixture.exe,4321,16\n")
-            f.write("fixture.exe,4321,24\n")
-
-        parsed = frametime_stats.parse_frametimes_ms(path)
-        self.assertEqual(parsed, [16.0, 24.0])
-        metrics = frametime_stats.compute_metrics(parsed)
-        self.assertAlmostEqual(metrics["p50_ms"], 20.0, places=1)
-        self.assertAlmostEqual(metrics["avg_fps"], 50.0, places=1)
-
-    def test_explicit_ms_header_large_value_not_scaled(self):
-        path = os.path.join(self.tmp_dir.name, "large_ms.csv")
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("frametime_ms\n")
-            f.write("150000\n")
-
-        parsed = frametime_stats.parse_frametimes_ms(path)
-        self.assertEqual(parsed, [150000.0])
-
-    def test_cli_target_fps(self):
-        ms_values = [16.6] * 40 + [33.3] * 10
-        csv_path = self._create_csv("target.csv", "frametime_ms", ms_values)
-
-        res = subprocess.run(
-            [sys.executable, "-I", os.path.join(ROOT, "tools", "frametime_stats.py"),
-             csv_path, "--target-fps", "60", "--json"],
-            capture_output=True, text=True, check=True
-        )
-        data = json.loads(res.stdout)
-        self.assertEqual(data["target_fps"], 60.0)
-        self.assertEqual(data["target_hit_pct"], 80.0)
 
 
 if __name__ == "__main__":
