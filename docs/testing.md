@@ -145,6 +145,27 @@ python -I scripts/run_gpu_tests.py --build runtime/build/linux     # Windows: th
 Add `--require-pass` when verifying a specific path: an all-skipped run exits 1 instead of 0.
 Skips still appear as `SKIP`, and individual skips are allowed if at least one test passes and none fail.
 
+Pass `--json <file>` to also write a structured JSON report (revision, GPU, driver, effective run settings, and
+per-test outcomes) without changing terminal output or exit codes. To compare a baseline run with a pull request run:
+
+```sh
+python -I scripts/run_gpu_tests.py --build runtime/build/linux --json baseline.json
+python -I scripts/run_gpu_tests.py --build runtime/build/linux --json pr.json
+python -I scripts/compare_gpu_reports.py baseline.json pr.json [--json diff.json] [--allow-incompatible]
+```
+
+`compare_gpu_reports.py` distinguishes `pass -> fail`, `pass -> skip`, and missing tests, surfaces incompatible
+run settings, GPU, or driver mismatches between the two runs, rejects reports whose `summary` counts disagree with
+`tests`, and exits non-zero (not overridable by `--allow-incompatible`) if either run aborted with an error, recorded
+no tests, or contained duplicate test names. When every test in both reports was skipped, the output explicitly notes
+that no tests ran.
+
+To compare a pre-feature baseline commit (before `--json` existed) against a pull request using the same reporting
+tool, check out the baseline in a separate worktree, apply only the reporting patch there (e.g.
+`git worktree add ../baseline <base-sha>` followed by `git apply` of the reporting diff), run
+`scripts/run_gpu_tests.py --json baseline.json` from that worktree, and record both the original baseline source SHA
+and the instrumented baseline SHA in your validation notes.
+
 A GPU test program that runs longer than 120 seconds is killed and counted as a failure, so a hung driver does
 not stall the suite. `LEONIDA_GPU_TEST_TIMEOUT` sets the limit in seconds for `check.py`, `run_gpu_tests.py` and
 the `valu_fuzz.py` translator oracle; `0` turns the limit off.

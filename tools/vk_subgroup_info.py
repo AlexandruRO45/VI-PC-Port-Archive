@@ -82,6 +82,9 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
 # parts (Raven/Picasso gfx902, Vega 10/12/20 cards) are a different GPU and are not tested, so they are not listed.
 GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
+DRIVER_NAME_OFFSET = 20     # char driverName[256] in VkPhysicalDeviceDriverProperties
+DRIVER_INFO_OFFSET = 276    # char driverInfo[256] in VkPhysicalDeviceDriverProperties
+DRIVER_CONFORMANCE_OFFSET = 532   # VkConformanceVersion (4 x uint8_t) in VkPhysicalDeviceDriverProperties
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
@@ -104,6 +107,7 @@ F13_SUBGROUP_SIZE_CONTROL = 16 + 4 * 7
 F13_SYNCHRONIZATION2 = 16 + 4 * 9
 F13_DYNAMIC_RENDERING = 16 + 4 * 12
 PROPS_DEVICE_TYPE = 16      # offsets in VkPhysicalDeviceProperties
+PROPS_DRIVER_VERSION = 4
 PROPS_VENDOR_ID = 8
 PROPS_DEVICE_ID = 12
 PROPS_DEVICE_NAME = 20      # char[256]
@@ -236,7 +240,7 @@ def device_rank(device_type: int, vendor_id: int) -> int:
     return (0 if vendor_id == MICROSOFT_VENDOR_ID else 10) + type_rank
 
 
-def query(*, stage_caps=False) -> dict:
+def query(*, stage_caps=False, driver_info=False) -> dict:
     """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
     if sys.maxsize <= 2**32:
         # the struct sizes below are the 64-bit ones, and 32-bit Windows Vulkan is stdcall, not CDLL's cdecl
@@ -263,8 +267,12 @@ def query(*, stage_caps=False) -> dict:
         device_filter = os.environ.get("LEONIDA_VK_DEVICE", "")
         wanted = device_filter.lower()
         chosen = None
+        chosen_idx = -1
         chosen_rank = -1
-        for d in devs:
+        harness_idx = -1
+        harness_name = None
+        harness_rank = -1
+        for idx, d in enumerate(devs):
             d = ctypes.c_void_p(d)
             sg = SubgroupSizeControl(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES)
             subgroup = SubgroupProperties()
@@ -277,6 +285,15 @@ def query(*, stage_caps=False) -> dict:
             vk.vkGetPhysicalDeviceProperties2(d, props)
             raw = bytes(props)[16:]
             dev_name = raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace")
+            dtype = int.from_bytes(raw[PROPS_DEVICE_TYPE:PROPS_DEVICE_TYPE + 4], "little")
+            vendor_id = int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little")
+            # Match runtime/test/vk_device_pick.h::pick_device(): filter only by LEONIDA_VK_DEVICE and rank all devices.
+            if not wanted or wanted in dev_name.lower():
+                h_rank = device_rank(dtype, vendor_id)
+                if h_rank > harness_rank:
+                    harness_rank = h_rank
+                    harness_idx = idx
+                    harness_name = dev_name
             version = int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little")
             if version < VK_API_VERSION_1_2 or (wanted and wanted not in dev_name.lower()):
                 continue
@@ -310,12 +327,18 @@ def query(*, stage_caps=False) -> dict:
             vk.vkGetPhysicalDeviceQueueFamilyProperties(d, ctypes.byref(fam), fams)
             if not any(u32(fams, QUEUE_FAMILY_SIZE * i) & VK_QUEUE_GRAPHICS_BIT for i in range(fam.value)):
                 continue
-            dtype = int.from_bytes(raw[PROPS_DEVICE_TYPE:PROPS_DEVICE_TYPE + 4], "little")
-            vendor_id = int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little")
             # the runtime's and the harnesses' rule: the first usable device of the highest rank
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
+                chosen_idx = idx
+                drv_raw = bytes(drv)
+                drv_name = drv_raw[DRIVER_NAME_OFFSET:DRIVER_NAME_OFFSET + 256].split(b"\0")[0].decode("utf-8", "replace")
+                drv_info = drv_raw[DRIVER_INFO_OFFSET:DRIVER_INFO_OFFSET + 256].split(b"\0")[0].decode("utf-8", "replace")
+                conf = drv_raw[DRIVER_CONFORMANCE_OFFSET:DRIVER_CONFORMANCE_OFFSET + 4]
+                conformance = f"{conf[0]}.{conf[1]}.{conf[2]}.{conf[3]}"
+                api_ver_str = f"{version >> 22}.{(version >> 12) & 0x3FF}.{version & 0xFFF}"
+                driver_version = int.from_bytes(raw[PROPS_DRIVER_VERSION:PROPS_DRIVER_VERSION + 4], "little")
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
@@ -323,7 +346,8 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          drv_name, drv_info, driver_version, api_ver_str, conformance)
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -332,7 +356,8 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver,
+         drv_name, drv_info, driver_version, api_ver_str, conformance) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -367,14 +392,22 @@ def query(*, stage_caps=False) -> dict:
             result.update(supported_subgroup_stages=supported_stages,
                           required_subgroup_size_stages=required_stages,
                           max_compute_workgroup_subgroups=max_workgroup_subgroups)
+        if driver_info:
+            result.update(driver_name=drv_name,
+                          driver_info=drv_info,
+                          driver_version=driver_version,
+                          api_version=api_ver_str,
+                          conformance_version=conformance,
+                          harness_device=harness_name,
+                          harness_device_matches=(chosen_idx == harness_idx))
         return result
     finally:
         vk.vkDestroyInstance(inst, None)
 
 
-def main(*, stage_caps=False) -> int:
+def main(*, stage_caps=False, driver_info=False) -> int:
     try:
-        print(json.dumps(query(stage_caps=stage_caps)))
+        print(json.dumps(query(stage_caps=stage_caps, driver_info=driver_info)))
         return 0
     except Exception as e:      # any failure means "unknown": the caller falls back to emulation
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
@@ -388,4 +421,7 @@ if __name__ == "__main__":
         pass
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--stage-caps", action="store_true", help="include raw subgroup stage masks and limits")
-    sys.exit(main(stage_caps=parser.parse_args().stage_caps))
+    parser.add_argument("--driver-info", action="store_true",
+                        help="include driver_name, driver_info, driver_version, api_version and conformance_version")
+    parsed = parser.parse_args()
+    sys.exit(main(stage_caps=parsed.stage_caps, driver_info=parsed.driver_info))

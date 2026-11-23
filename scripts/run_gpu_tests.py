@@ -1,7 +1,7 @@
 """Assemble, translate, and run the synthetic RDNA2->SPIR-V GPU test suite on Vulkan.
 
 Usage:
-    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR] [--require-pass]
+    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR] [--require-pass] [--json FILE]
 
 --llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc".
 """
@@ -23,6 +23,7 @@ SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
@@ -728,6 +729,264 @@ def native_folder(path: str, ansi: str = "mbcs") -> str | None:
     return short if short and fits(short) else None
 
 
+REPORT_SCHEMA_VERSION = 1
+
+
+def skip_reason(detail: str) -> str | None:
+    """Extract the reason text from a SKIP detail string, or None when empty."""
+    text = detail.strip()
+    if not text:
+        return None
+    m = re.fullmatch(r"SKIP\s*\((.*)\)", text, re.S)
+    if m:
+        inner = m.group(1).strip()
+        return inner or None
+    return text
+
+
+def normalize_result(name: str, ok: bool | None, detail: str) -> dict:
+    """Normalize one raw (name, ok, detail) tuple into a structured per-test outcome dict.
+
+    Matches the terminal printer's rule: a check.py Skip detail always normalizes to 'skip' even when a caller
+    stored `ok = not problem` (False).
+    """
+    is_skip = ok is None or isinstance(detail, Skip)
+    status = "skip" if is_skip else "pass" if ok else "fail"
+    detail_text = "" if detail is None else str(detail)
+    entry = {
+        "name": name,
+        "status": status,
+        "detail": detail_text,
+    }
+    if status == "skip":
+        reason = skip_reason(detail_text)
+        if reason is not None:
+            entry["skip_reason"] = reason
+    return entry
+
+
+def effective_fma_mode() -> str:
+    """Effective --fma mode passed to tools/rdna2spirv.py ('glsl', 'khr', or 'exact')."""
+    val = os.environ.get("LEONIDA_FMA")
+    return val if val in ("glsl", "khr", "exact") else "glsl"
+
+
+def vk_validation_enabled() -> bool:
+    """Match runtime/test/vk_validation.h: enabled when LEONIDA_VK_VALIDATION is set and not '0'."""
+    val = os.environ.get("LEONIDA_VK_VALIDATION")
+    return val is not None and val != "0"
+
+
+def collect_effective_settings(
+    a,
+    *,
+    assembler: str,
+    no_validate: bool,
+    wave64_emulate: bool,
+    bary_fallback_on: bool,
+    f16_interp_fallback_on: bool,
+    texel_offset_fallback: bool,
+    mesh_compute: bool,
+    pc_tail_ubo_on: bool,
+    fma: str,
+) -> dict:
+    """Collect the effective run settings that determine test selection, translation, and judging."""
+    return {
+        "filter": getattr(a, "filter", "") or "",
+        "disasm_mode": "disasm-dir" if getattr(a, "disasm_dir", None) is not None else "llvm-mc",
+        "assembler": assembler,
+        "validate": not no_validate,
+        "require_pass": bool(getattr(a, "require_pass", False)),
+        "wave64_emulate": bool(wave64_emulate),
+        "bary_fallback": bool(bary_fallback_on),
+        "f16_interp_fallback": bool(f16_interp_fallback_on),
+        "texel_offset_fallback": bool(texel_offset_fallback),
+        "mesh_compute": bool(mesh_compute),
+        "pc_tail_ubo": bool(pc_tail_ubo_on),
+        "fma": fma,
+        "vk_device_filter": os.environ.get("LEONIDA_VK_DEVICE", ""),
+        "vk_validation": vk_validation_enabled(),
+        "gpu_test_timeout": gpu_test_timeout(),
+    }
+
+
+def probe_git_revision(repo: str = ROOT) -> dict:
+    """Return {'commit', 'short_commit', 'dirty'} for the checkout, or None fields when git is unavailable."""
+    try:
+        head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return {"commit": None, "short_commit": None, "dirty": None}
+    if head.returncode != 0:
+        return {"commit": None, "short_commit": None, "dirty": None}
+    commit = head.stdout.strip() or None
+    short_commit = commit[:12] if commit else None
+    dirty = None
+    try:
+        status = subprocess.run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"],
+                                capture_output=True, text=True, timeout=15)
+        if status.returncode == 0:
+            dirty = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"commit": commit, "short_commit": short_commit, "dirty": dirty}
+
+
+def probe_device_info() -> dict | None:
+    """Query tools/vk_subgroup_info.py --driver-info for GPU and driver metadata, or None."""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py"), "--driver-info"],
+            capture_output=True, text=True, timeout=60,
+        )
+        lines = r.stdout.strip().splitlines()
+        if not lines:
+            return None
+        payload = json.loads(lines[-1])
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def format_device_metadata(info: dict | None) -> tuple[dict, dict, str | None]:
+    """Split a vk_subgroup_info.py --driver-info payload into (gpu, driver, probe_error).
+
+    Requires harness_device_matches=True so the recorded GPU/driver is verified to match the
+    device selected by runtime/test/vk_device_pick.h; otherwise reports GPU/driver as unknown.
+    """
+    unknown_gpu = {
+        "name": None,
+        "vendor_id": None,
+        "device_id": None,
+        "subgroup_size": None,
+        "min_subgroup_size": None,
+        "max_subgroup_size": None,
+        "native64": None,
+        "native64_compute": None,
+        "max_push_constants_size": None,
+    }
+    unknown_driver = {
+        "id": None,
+        "name": None,
+        "info": None,
+        "version": None,
+        "api_version": None,
+        "conformance_version": None,
+    }
+    if not isinstance(info, dict) or "error" in info:
+        probe_error = info.get("error") if isinstance(info, dict) else None
+        return unknown_gpu, unknown_driver, probe_error
+    if info.get("harness_device_matches") is not True:
+        probed = info.get("device")
+        harness = info.get("harness_device")
+        if info.get("harness_device_matches") is False and harness is not None:
+            probe_error = (
+                f"unverified GPU metadata: vk_subgroup_info selected {probed!r}, "
+                f"but test harnesses select {harness!r}"
+            )
+        else:
+            probe_error = "unverified GPU metadata: harness device selection could not be verified"
+        return unknown_gpu, unknown_driver, probe_error
+    gpu = {
+        "name": info.get("device"),
+        "vendor_id": info.get("vendor_id"),
+        "device_id": info.get("device_id"),
+        "subgroup_size": info.get("subgroup_size"),
+        "min_subgroup_size": info.get("min_subgroup_size"),
+        "max_subgroup_size": info.get("max_subgroup_size"),
+        "native64": info.get("native64"),
+        "native64_compute": info.get("native64_compute"),
+        "max_push_constants_size": info.get("max_push_constants_size"),
+    }
+    driver = {
+        "id": info.get("driver_id"),
+        "name": info.get("driver_name"),
+        "info": info.get("driver_info"),
+        "version": info.get("driver_version"),
+        "api_version": info.get("api_version"),
+        "conformance_version": info.get("conformance_version"),
+    }
+    return gpu, driver, None
+
+
+def build_report(
+    normalized: list[dict],
+    *,
+    settings: dict,
+    exit_code: int,
+    revision: dict,
+    device_info: dict | None,
+    error: str | None = None,
+) -> dict:
+    """Build the schema v1 structured JSON report dict."""
+    gpu, driver, probe_error = format_device_metadata(device_info)
+    passed = sum(1 for row in normalized if row["status"] == "pass")
+    failed = sum(1 for row in normalized if row["status"] == "fail")
+    skipped = sum(1 for row in normalized if row["status"] == "skip")
+    report = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "runner": "scripts/run_gpu_tests.py",
+        "revision": revision,
+        "gpu": gpu,
+        "driver": driver,
+        "settings": settings,
+        "summary": {
+            "total": len(normalized),
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "exit_code": exit_code,
+        },
+        "tests": normalized,
+    }
+    if probe_error is not None:
+        report["device_probe_error"] = probe_error
+    if error is not None:
+        report["error"] = error
+    return report
+
+
+def validate_json_output_path(
+    json_out: str,
+    *,
+    work: str | None = None,
+    disasm_dir: str | None = None,
+    build: str | None = None,
+    input_files: list[str] | None = None,
+) -> str | None:
+    """Return an error string if json_out is a directory or collides with an input or runner artifact, else None."""
+    if os.path.isdir(json_out):
+        return f"--json path is a directory: {json_out}"
+    protected = [SHADER_DIR]
+    if build:
+        protected.append(build)
+    if work:
+        protected.append(work)
+        protected.append(os.path.join(work, "spirv", "index.json"))
+    if disasm_dir:
+        protected.append(disasm_dir)
+    if input_files:
+        protected.extend(input_files)
+    for target in protected:
+        if same_report_path(json_out, target):
+            return f"--json output must not overwrite input or runner path: {target}"
+    return None
+
+
+def write_json_report(path: str, report: dict) -> str | None:
+    """Write report as UTF-8 LF JSON. Return an error string on OSError, else None."""
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=2)
+            f.write("\n")
+    except OSError as exc:
+        return f"cannot write GPU test report {path}: {exc.strerror or exc}"
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
@@ -747,6 +1006,8 @@ def main() -> int:
     ap.add_argument("--disasm-dir", default=None,
                     help="folder of pre-disassembled <name>.s listings (e.g. tests/semantic/fixtures/disasm); "
                          "skips llvm-mc and runs only fixtures present there")
+    ap.add_argument("--json", dest="json_out", metavar="FILE", default=None,
+                    help="write structured GPU test report as JSON (preserves terminal output and exit codes)")
     a = ap.parse_args()
     # Some test programs run with their working directory in <work>/spirv (vk_texture_test), so a relative path
     # given here would point somewhere else for them.
@@ -757,6 +1018,12 @@ def main() -> int:
         a.disasm_dir = os.path.abspath(a.disasm_dir)
         if not os.path.isdir(a.disasm_dir):
             print(f"error: --disasm-dir is not a directory: {a.disasm_dir}", file=sys.stderr)
+            return 2
+    if a.json_out is not None:
+        a.json_out = os.path.abspath(a.json_out)
+        path_err = validate_json_output_path(a.json_out, work=a.work, disasm_dir=a.disasm_dir, build=a.build)
+        if path_err is not None:
+            print(f"error: {path_err}", file=sys.stderr)
             return 2
 
     ext = ".exe" if os.name == "nt" else ""
@@ -818,6 +1085,7 @@ def run_suite(a, work: str) -> int:
     explicit_no_validate = bool(getattr(a, "no_validate", False))
     no_validate = explicit_no_validate or (assembler == "python" and shutil.which("spirv-val") is None)
     disasm_src = getattr(a, "disasm_dir", None)
+    json_out = getattr(a, "json_out", None)
 
     asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
     # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
@@ -838,6 +1106,24 @@ def run_suite(a, work: str) -> int:
             print(f"error: --filter {a.filter!r} matched no GPU test cases", file=sys.stderr)
             return 2
     build_files = with_draw_shaders(asm_files)
+
+    if json_out is not None:
+        input_files = []
+        for fname in build_files:
+            name = os.path.splitext(fname)[0]
+            input_files.append(os.path.join(SHADER_DIR, shader_source(name) + ".asm"))
+            if disasm_src is not None:
+                input_files.append(os.path.join(disasm_src, f"{name}.s"))
+        path_err = validate_json_output_path(
+            json_out,
+            work=work,
+            disasm_dir=disasm_src,
+            build=getattr(a, "build", None),
+            input_files=input_files,
+        )
+        if path_err is not None:
+            print(f"error: {path_err}", file=sys.stderr)
+            return 2
 
     fssm_dir = os.path.join(work, "fssm")
     disasm_dir = os.path.join(work, "disasm")
@@ -903,17 +1189,24 @@ def run_suite(a, work: str) -> int:
             if not explicit_no_validate:
                 print("note: spirv-val not found on PATH; translating with --no-validate", flush=True)
             cmd.append("--no-validate")
-        if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
+        w64_on = w64_emulated()
+        bary_on = bary_fallback()
+        f16_on = f16_interp_fallback()
+        texoff_on = bool(TEXOFF_FALLBACK)
+        mesh_compute_on = bool(MESH_COMPUTE)
+        pc_tail_on = pc_tail_ubo()
+        fma_mode = effective_fma_mode()
+        if w64_on:   # wave64 compute/mesh exact on any subgroup size
             cmd.append("--wave64-emulate")
-        if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
+        if bary_on:   # raw barycentrics from an interpolated input, fed by a pass-through GS
             cmd.append("--bary-fallback")
-        if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
+        if f16_on:   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
             cmd.append("--f16-interp-fallback")
-        if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
+        if texoff_on:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
-        if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
+        if mesh_compute_on:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
-        if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
+        if pc_tail_on:   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
@@ -921,6 +1214,31 @@ def run_suite(a, work: str) -> int:
     print("=== rdna2spirv.py ===")
     print(out)
     if rc != 0:
+        if json_out is not None:
+            settings = collect_effective_settings(
+                a,
+                assembler=assembler,
+                no_validate=no_validate,
+                wave64_emulate=w64_on,
+                bary_fallback_on=bary_on,
+                f16_interp_fallback_on=f16_on,
+                texel_offset_fallback=texoff_on,
+                mesh_compute=mesh_compute_on,
+                pc_tail_ubo_on=pc_tail_on,
+                fma=fma_mode,
+            )
+            report = build_report(
+                [],
+                settings=settings,
+                exit_code=1,
+                revision=probe_git_revision(),
+                device_info=probe_device_info(),
+                error=f"rdna2spirv.py failed with exit code {rc}",
+            )
+            write_err = write_json_report(json_out, report)
+            if write_err is not None:
+                print(f"error: {write_err}", file=sys.stderr)
+                return 2
         return 1
     if bary_fallback():
         import bary_fallback_gs
@@ -1615,21 +1933,46 @@ def run_suite(a, work: str) -> int:
               file=sys.stderr)
         return 2
 
+    normalized = [normalize_result(name, ok, detail) for name, ok, detail in results]
     print("\n=== GPU TEST RESULTS ===")
     passed = skipped = 0
-    for name, ok, detail in results:
-        ok = None if isinstance(detail, Skip) else ok   # a check.py helper's "this device can't run it" (cs_fmt_*)
-        tag = "SKIP" if ok is None else "PASS" if ok else "FAIL"
-        passed += ok is True
-        skipped += ok is None
-        print(f"  {tag:4s}  {name:<20s}  {detail}")
-    print(f"\n{passed}/{len(results)} passed" + (f", {skipped} skipped" if skipped else ""))
-    if passed + skipped != len(results):
-        return 1
-    if getattr(a, "require_pass", False) and not passed:
+    for row in normalized:
+        tag = row["status"].upper()
+        passed += row["status"] == "pass"
+        skipped += row["status"] == "skip"
+        print(f"  {tag:4s}  {row['name']:<20s}  {row['detail']}")
+    print(f"\n{passed}/{len(normalized)} passed" + (f", {skipped} skipped" if skipped else ""))
+    exit_code = 0
+    if passed + skipped != len(normalized):
+        exit_code = 1
+    elif getattr(a, "require_pass", False) and not passed:
         print("error: --require-pass: no GPU tests passed", file=sys.stderr)
-        return 1
-    return 0
+        exit_code = 1
+    if json_out is not None:
+        settings = collect_effective_settings(
+            a,
+            assembler=assembler,
+            no_validate=no_validate,
+            wave64_emulate=w64_on,
+            bary_fallback_on=bary_on,
+            f16_interp_fallback_on=f16_on,
+            texel_offset_fallback=texoff_on,
+            mesh_compute=mesh_compute_on,
+            pc_tail_ubo_on=pc_tail_on,
+            fma=fma_mode,
+        )
+        report = build_report(
+            normalized,
+            settings=settings,
+            exit_code=exit_code,
+            revision=probe_git_revision(),
+            device_info=probe_device_info(),
+        )
+        write_err = write_json_report(json_out, report)
+        if write_err is not None:
+            print(f"error: {write_err}", file=sys.stderr)
+            return 2
+    return exit_code
 
 
 if __name__ == "__main__":

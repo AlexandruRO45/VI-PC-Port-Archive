@@ -71,6 +71,10 @@ class FakeDevice:
     fragment_shader_barycentric: bool = True
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
+    driver_name: str | bytes = ""
+    driver_info: str | bytes = ""
+    driver_version: int = 0
+    conformance_version: tuple[int, int, int, int] = (0, 0, 0, 0)
     vendor_id: int = 0
     device_id: int = 0
 
@@ -183,6 +187,7 @@ class FakeVulkan:
 
         base = addr + 16
         ctypes.c_uint32.from_address(base + vk_info.PROPS_API_VERSION).value = dev.api_version
+        ctypes.c_uint32.from_address(base + vk_info.PROPS_DRIVER_VERSION).value = dev.driver_version
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_TYPE).value = dev.device_type
         ctypes.c_uint32.from_address(base + vk_info.PROPS_VENDOR_ID).value = dev.vendor_id
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_ID).value = dev.device_id
@@ -208,6 +213,12 @@ class FakeVulkan:
                 sg.requiredSubgroupSizeStages = dev.required_subgroup_size_stages
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES:
                 ctypes.c_uint32.from_address(node_addr + 16).value = dev.driver_id
+                raw_drv_name = dev.driver_name.encode("utf-8") if isinstance(dev.driver_name, str) else dev.driver_name
+                ctypes.memmove(node_addr + vk_info.DRIVER_NAME_OFFSET, raw_drv_name[:256].ljust(256, b"\x00"), 256)
+                raw_drv_info = dev.driver_info.encode("utf-8") if isinstance(dev.driver_info, str) else dev.driver_info
+                ctypes.memmove(node_addr + vk_info.DRIVER_INFO_OFFSET, raw_drv_info[:256].ljust(256, b"\x00"), 256)
+                conf_bytes = bytes(dev.conformance_version)
+                ctypes.memmove(node_addr + vk_info.DRIVER_CONFORMANCE_OFFSET, conf_bytes, 4)
         if not found_subgroup:
             raise AssertionError("SubgroupProperties missing from vkGetPhysicalDeviceProperties2 pNext chain")
         if not found_sg:
@@ -880,6 +891,73 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(result["supported_subgroup_stages"], supported)
         self.assertEqual(result["required_subgroup_size_stages"], required)
         self.assertEqual(result["max_compute_workgroup_subgroups"], 17)
+
+    def test_driver_info_opt_in_reads_driver_properties_and_version(self):
+        api_ver = (1 << 22) | (3 << 12) | 296
+        device = FakeDevice(
+            name="AMD Radeon RX 7600 XT",
+            api_version=api_ver,
+            vendor_id=0x1002,
+            device_id=0x7480,
+            driver_id=3,
+            driver_name="radv",
+            driver_info="Mesa 26.2.6",
+            driver_version=109060102,
+            conformance_version=(1, 3, 8, 2),
+        )
+        vk = FakeVulkan(devices=(device,))
+        with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+            default_res = vk_info.query()
+            self.assertNotIn("driver_name", default_res)
+            self.assertNotIn("driver_info", default_res)
+            self.assertNotIn("driver_version", default_res)
+            res = vk_info.query(driver_info=True)
+        self.assertEqual(res["driver_name"], "radv")
+        self.assertEqual(res["driver_info"], "Mesa 26.2.6")
+        self.assertEqual(res["driver_version"], 109060102)
+        self.assertEqual(res["api_version"], "1.3.296")
+        self.assertEqual(res["conformance_version"], "1.3.8.2")
+        self.assertEqual(res["harness_device"], "AMD Radeon RX 7600 XT")
+        self.assertTrue(res["harness_device_matches"])
+
+    def test_driver_info_flags_harness_device_mismatch_on_vulkan_12_and_13_multi_device(self):
+        """A Vulkan 1.2 discrete GPU lacking dynamicRendering beats a Vulkan 1.3 CPU device in vk_device_pick.h,
+        while vk_subgroup_info.py picks the Vulkan 1.3 CPU device; driver_info must flag the mismatch."""
+        dgpu_12 = FakeDevice(
+            name="Discrete Vulkan 1.2 GPU",
+            api_version=vk_info.VK_API_VERSION_1_2,
+            device_type=vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+            dynamic_rendering=False,
+            vendor_id=0x10DE,
+            device_id=0x1234,
+            driver_id=4,
+            driver_name="NVIDIA",
+            driver_info="550.0",
+        )
+        cpu_13 = FakeDevice(
+            name="llvmpipe (LLVM 18.1)",
+            api_version=vk_info.VK_API_VERSION_1_3,
+            device_type=4,
+            vendor_id=0x10005,
+            device_id=0,
+            driver_id=13,
+            driver_name="llvmpipe",
+            driver_info="Mesa 25.0",
+        )
+        vk = FakeVulkan(devices=(dgpu_12, cpu_13))
+        with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+            res = vk_info.query(driver_info=True)
+        self.assertEqual(res["device"], "llvmpipe (LLVM 18.1)")
+        self.assertEqual(res["harness_device"], "Discrete Vulkan 1.2 GPU")
+        self.assertFalse(res["harness_device_matches"])
+
+        # Narrowing LEONIDA_VK_DEVICE to llvmpipe makes both selectors pick the same device.
+        with mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": "llvmpipe"}), \
+                mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+            narrowed = vk_info.query(driver_info=True)
+        self.assertEqual(narrowed["device"], "llvmpipe (LLVM 18.1)")
+        self.assertEqual(narrowed["harness_device"], "llvmpipe (LLVM 18.1)")
+        self.assertTrue(narrowed["harness_device_matches"])
 
     def test_rdna2_amd_windows(self):
         """#857: RDNA2 by PCI device ID, and only under AMD's proprietary driver (RADV takes the same modules)."""
