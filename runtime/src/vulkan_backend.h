@@ -2914,6 +2914,9 @@ private:
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
             slot.segments.clear();
+            slot.predicate.reset();
+            slot.predicated_copy.reset();
+            slot.counted_dispatch.reset();
             recycle_khr_stages(slot.khr_instances);
             for (VkEvent event : slot.events)
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
@@ -2969,9 +2972,6 @@ private:
         CommandSlot* reuse = recycle_finished();
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
-            reuse->predicate.reset();
-            reuse->predicated_copy.reset();
-            reuse->counted_dispatch.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }
