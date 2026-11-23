@@ -105,5 +105,35 @@ class CheckFrame(unittest.TestCase):
         self.assertTrue(sandbox.check_frame(self.frame(varied, 30, 20), True)[0])
 
 
+class FindTool(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.build = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def touch(self, *parts):
+        path = os.path.join(self.build, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").close()
+        return path
+
+    def test_missing_or_directory_returns_none(self):
+        self.assertIsNone(sandbox.find_tool(self.build))
+        os.makedirs(os.path.join(self.build, "RelWithDebInfo", "vk_sandbox.exe"))
+        self.assertIsNone(sandbox.find_tool(self.build))
+
+    def test_finds_in_cmake_config_subdirs(self):
+        dbg = self.touch("Debug", "vk_sandbox.exe")
+        self.assertEqual(sandbox.find_tool(self.build), dbg)
+        rel = self.touch("Release", "vk_sandbox.exe")
+        self.assertEqual(sandbox.find_tool(self.build), rel)
+        rwdi = self.touch("RelWithDebInfo", "vk_sandbox.exe")
+        self.assertEqual(sandbox.find_tool(self.build), rwdi)
+        flat = self.touch("vk_sandbox")
+        self.assertEqual(sandbox.find_tool(self.build), flat)
+
+
 if __name__ == "__main__":
     unittest.main()

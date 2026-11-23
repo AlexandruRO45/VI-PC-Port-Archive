@@ -76,11 +76,16 @@ def pick_pair(shaders_dir):
     return None
 
 
+BUILD_CONFIGS = ("", "RelWithDebInfo", "Release", "MinSizeRel", "Debug")
+
+
 def find_tool(build):
-    for name in ("vk_sandbox.exe", "vk_sandbox"):
-        path = os.path.join(build, name)
-        if os.path.isfile(path):
-            return path
+    for config in BUILD_CONFIGS:
+        directory = os.path.join(build, config) if config else build
+        for name in ("vk_sandbox.exe", "vk_sandbox"):
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                return path
     return None
 
 
