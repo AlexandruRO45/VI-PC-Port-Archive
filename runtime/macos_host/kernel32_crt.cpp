@@ -580,6 +580,10 @@ int SwitchToThread() { return sched_yield() == 0; }
 // ponytail: the handler is recorded nowhere; a fault reaches the host's signal handler and ends the run.
 void* AddVectoredExceptionHandler(uint32_t, void* handler) { return handler; }
 void* EncodePointer(void* p) { return p; }
+
+// advapi32: there are no Windows security tokens here, so no privilege is ever held.
+int OpenProcessToken(HANDLE, uint32_t, HANDLE*) { return set_last_error(5 /* ERROR_ACCESS_DENIED */), 0; }
+int OpenThreadToken(HANDLE, uint32_t, int32_t, HANDLE*) { return set_last_error(1008 /* ERROR_NO_TOKEN */), 0; }
 void* DecodePointer(void* p) { return p; }
 
 }  // namespace
@@ -605,7 +609,7 @@ Exports kernel32_crt_exports() {
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
         K(GetCurrentThread), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(ExitThread), K(FreeLibraryAndExitThread),
-        K(GetExitCodeThread), K(DecodePointer),
+        K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }
 
