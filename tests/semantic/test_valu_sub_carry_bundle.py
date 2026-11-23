@@ -477,5 +477,46 @@ class VSubCoCiU32OracleTests(unittest.TestCase):
         self.assertEqual(out[1], 1)
 
 
+class VSubCoCiU32AstInterpreterTests(unittest.TestCase):
+    """AST modeling, scalar simulation, and register aliasing for v_sub_co_ci_u32."""
+
+    def test_ast_emission_and_execution(self):
+        node = ValuSubAstNode("v_sub_co_ci_u32", "v3", "vcc", "v0", "v1", "vcc")
+        self.assertEqual(node.emit_asm(), "v_sub_co_ci_u32 v3, vcc, v0, v1, vcc")
+        out = run_prog([
+            "v_mov_b32 v0, 20",
+            "v_mov_b32 v1, 8",
+            "v_sub_co_u32 v2, vcc, 0, 1",  # vcc = 1
+            node.emit_asm(),
+            "v_mov_b32 v0, v3",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 11)
+        self.assertEqual(out[1], 0)
+
+    def test_register_aliasing_dst_equals_src0(self):
+        out = run_prog([
+            "v_mov_b32 v0, 60",
+            "v_mov_b32 v1, 20",
+            "v_sub_co_u32 v2, vcc, 0, 1",  # vcc = 1
+            "v_sub_co_ci_u32 v0, vcc, v0, v1, vcc",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 39)
+        self.assertEqual(out[1], 0)
+
+    def test_register_aliasing_dst_equals_src1(self):
+        out = run_prog([
+            "v_mov_b32 v0, 60",
+            "v_mov_b32 v1, 20",
+            "v_sub_co_u32 v2, vcc, 0, 1",  # vcc = 1
+            "v_sub_co_ci_u32 v1, vcc, v0, v1, vcc",
+            "v_mov_b32 v0, v1",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 39)
+        self.assertEqual(out[1], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
