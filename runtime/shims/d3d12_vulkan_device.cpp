@@ -25,6 +25,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
+#include "../src/bary_fallback_gs.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -2829,47 +2830,71 @@ public:
                 return E_FAIL;
             }
         }
-        for (Stage& stage : stages) {
-            if (!stage.entry) continue;
-            // After the f16 link above, which can also edit the pixel shader's words.
-            if (depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
-                std::string why;
-                std::vector<std::uint32_t> patched = leonida::depth24_patch_fragment(stage.words, depth24_bias, why);
-                if (patched.empty()) {
-                    std::fprintf(stderr, "[rt] d3d12: %s keeps float depth on a D24 target stored as D32: %s\n",
-                                 stage.entry->name.c_str(), why.c_str());
-                    depth24_fragment = false;
-                } else {
-                    stage.words = std::move(patched);
-                }
+        // After the f16 link above, which can also edit the pixel shader's words: D24 depth on a D32 target.
+        if (depth24_fragment && ps_stage.entry) {
+            std::string why;
+            std::vector<std::uint32_t> patched = leonida::depth24_patch_fragment(ps_stage.words, depth24_bias, why);
+            if (patched.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s keeps float depth on a D24 target stored as D32: %s\n",
+                             ps_stage.entry->name.c_str(), why.c_str());
+                depth24_fragment = false;
+            } else {
+                ps_stage.words = std::move(patched);
             }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
-            modules_.push_back(module);
-            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            info.stage = stage.bit;
-            info.module = module;
-            info.pName = "main";
-            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
-            stage_infos.push_back(info);
         }
-        if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
-            const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
+        // --bary-fallback (SHADER-98): a PS that reads its raw barycentrics from an input location is drawn through
+        // a pass-through geometry shader that writes them (bary_fallback_gs.h). That holds whether or not the device
+        // has VK_KHR_fragment_shader_barycentric, because the translation already chose the input. Built after the
+        // f16 link above, so it passes through the locations of the linked PS.
+        std::vector<std::uint32_t> bary_gs_words;
+        if (ps_stage.entry && ps_stage.entry->bary_fallback_location) {
+            if (gs_stage.entry) {
+                log_once("a --bary-fallback PS needs the pass-through geometry stage, but this PSO has its own GS", 0);
+                return E_NOTIMPL;
+            }
+            if (!device_.info.features.geometryShader) {
+                log_once("a --bary-fallback PS needs the Vulkan geometryShader feature; stage", 0);
+                return E_NOTIMPL;
+            }
+            if (desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+                log_once("a --bary-fallback PS is drawn through a triangle geometry stage; topology type",
+                         desc.PrimitiveTopologyType);
+                return E_NOTIMPL;
+            }
+            std::string bary_error;
+            bary_gs_words =
+                leonida::bary_fallback_gs_for(*vs_stage.entry, *ps_stage.entry, ps_stage.words, &bary_error);
+            if (bary_gs_words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s: %s\n", ps_stage.entry->name.c_str(), bary_error.c_str());
+                return E_NOTIMPL;
+            }
+        }
+        const auto add_stage = [&](VkShaderStageFlagBits bit, const std::vector<std::uint32_t>& words)
+            -> VkPipelineShaderStageCreateInfo* {
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = words.size() * 4;
             module_info.pCode = words.data();
             VkShaderModule module = VK_NULL_HANDLE;
-            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
-                return E_FAIL;
+            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return nullptr;
             modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            info.stage = bit;
             info.module = module;
             info.pName = "main";
             stage_infos.push_back(info);
+            return &stage_infos.back();
+        };
+        for (Stage& stage : stages) {
+            if (!stage.entry) continue;
+            VkPipelineShaderStageCreateInfo* info = add_stage(stage.bit, stage.words);
+            if (!info) return E_FAIL;
+            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size() - 1], *info);
+        }
+        // The pass-through GS asks for no subgroup size: it uses no subgroup operation.
+        if (!bary_gs_words.empty() && !add_stage(VK_SHADER_STAGE_GEOMETRY_BIT, bary_gs_words)) return E_FAIL;
+        if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
+            const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
+            if (words.empty() || !add_stage(VK_SHADER_STAGE_FRAGMENT_BIT, words)) return E_FAIL;
         }
 
         // Input layout -> vertex input, by semantic.

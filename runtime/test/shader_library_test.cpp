@@ -358,12 +358,14 @@ int main() {
                  "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
                  "\"system_value\": 0, \"component_type\": \"float\"}, "
                  "{\"semantic\": \"SV_VertexID\", \"semantic_index\": 0, \"register\": 2, \"mask\": 1, \"rw_mask\": 1, "
-                 "\"system_value\": 6, \"component_type\": \"uint\"}]},\n"
+                 "\"system_value\": 6, \"component_type\": \"uint\"}], \"clip_distance_count\": 3, "
+                 "\"capabilities\": [\"Shader\", \"ClipDistance\", \"ShaderLayer\"]},\n"
                  " \"vs_same_program\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
-                 "\"component_type\": \"float\"}]},\n"
+                 "\"component_type\": \"float\"}], \"cull_distance_count\": 2, \"capabilities\": [\"Shader\"]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
-                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}, "
+                 "\"bary_fallback_input\": {\"location\": 3}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
@@ -391,6 +393,10 @@ int main() {
     CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);
     CHECK(ps->f16_halves.size() == 2 && ps->f16_halves.at(0)[0] == 28 && ps->f16_halves.at(0)[1] == 29 &&
           ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
+    // --bary-fallback: the PS's barycentric input, and what the pass-through GS needs from a VS.
+    CHECK(ps->bary_fallback_location == 3u && !library.find("ps", hash2)->bary_fallback_location);
+    CHECK(vs->clip_distance_count == 3 && vs->cull_distance_count == 0 && vs->writes_layer_or_viewport);
+    CHECK(vs_all[1]->cull_distance_count == 2 && !vs_all[1]->writes_layer_or_viewport);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);

@@ -749,6 +749,12 @@ The compute path, end to end:
     standalone device enables where the GPU has it and reports in `VulkanDeviceInfo::features`; without it such a
     PSO is `E_NOTIMPL`. The PSO's topology type must be `TRIANGLE`, the GS's input (`E_INVALIDARG` otherwise). The
     push-constant range names the geometry stage only on such a device (`d3d12_geometry_test`).
+  - **Barycentric fallback:** a PS whose index entry has `bary_fallback_input` (`--bary-fallback`, SHADER-98) is
+    drawn through a pass-through geometry shader the layer builds at PSO creation (`runtime/src/bary_fallback_gs.h`,
+    the module `tools/bary_fallback_gs.py` writes). It copies Position, the linked PS's input locations and the VS's
+    `ClipDistance`/`CullDistance` arrays, and writes the one-hot barycentrics. A PSO with its own GS, a non-triangle
+    topology, a device without `geometryShader`, a VS writing `Layer`/`ViewportIndex` or a PS with `PerVertexKHR`
+    inputs is `E_NOTIMPL` with a log (`d3d12_bary_fallback_test`, `bary_fallback_gs_test`).
   - **Refused with a log:** hull and domain stages, stream output, MSAA, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole

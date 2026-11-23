@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -645,6 +646,14 @@ struct ShaderEntry {
     // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
     // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
     std::vector<std::array<std::uint32_t, 4>> literal_samplers;
+    // --bary-fallback (SHADER-98): the input location a pixel shader reads its raw barycentrics from, which a
+    // pass-through geometry stage must write (bary_fallback_gs.h). Unset for a PS that reads BaryCoordKHR or none.
+    std::optional<std::uint32_t> bary_fallback_location;
+    // Vertex shaders: the lengths of the ClipDistance and CullDistance arrays written (0: none), and whether Layer
+    // or ViewportIndex is written (the ShaderLayer or ShaderViewportIndex capability).
+    std::uint32_t clip_distance_count = 0;
+    std::uint32_t cull_distance_count = 0;
+    bool writes_layer_or_viewport = false;
 };
 
 class ShaderLibrary {
@@ -824,6 +833,15 @@ private:
                     e.literal_samplers.push_back(words);
                 }
             }
+            if (const Json* b = meta.find("bary_fallback_input"); b && b->kind == Json::Kind::object)
+                if (const Json* l = b->find("location"); l && l->kind == Json::Kind::number)
+                    e.bary_fallback_location = u32(l);
+            e.clip_distance_count = u32(meta.find("clip_distance_count"));
+            e.cull_distance_count = u32(meta.find("cull_distance_count"));
+            if (const Json* caps = meta.find("capabilities"); caps && caps->kind == Json::Kind::array)
+                for (const Json& c : caps->array)
+                    if (c.kind == Json::Kind::string && (c.string == "ShaderLayer" || c.string == "ShaderViewportIndex"))
+                        e.writes_layer_or_viewport = true;
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && prefix == "fspx/") ++fspx_count_;

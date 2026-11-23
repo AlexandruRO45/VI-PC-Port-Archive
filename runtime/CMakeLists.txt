@@ -707,6 +707,21 @@ if(BUILD_TESTING)
   add_test(NAME shader_library COMMAND shader_library_test)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
+  # The --bary-fallback pass-through geometry shader (bary_fallback_gs.h). The test writes its modules to a folder;
+  # where the Vulkan SDK's spirv-val is found, each is validated after it.
+  add_executable(bary_fallback_gs_test test/bary_fallback_gs_test.cpp)
+  set(LEONIDA_BARY_GS_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/bary_fallback_gs)
+  file(MAKE_DIRECTORY ${LEONIDA_BARY_GS_DIR})
+  add_test(NAME bary_fallback_gs COMMAND bary_fallback_gs_test ${LEONIDA_BARY_GS_DIR})
+  find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  if(LEONIDA_SPIRV_VAL)
+    set_tests_properties(bary_fallback_gs PROPERTIES FIXTURES_SETUP bary_fallback_gs_modules)
+    foreach(module plain bare clip clip_cull)
+      add_test(NAME bary_fallback_gs_val_${module}
+               COMMAND ${LEONIDA_SPIRV_VAL} --target-env vulkan1.0 ${LEONIDA_BARY_GS_DIR}/${module}.spv)
+      set_tests_properties(bary_fallback_gs_val_${module} PROPERTIES FIXTURES_REQUIRED bary_fallback_gs_modules)
+    endforeach()
+  endif()
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
@@ -1897,9 +1912,10 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_VS_FULLSCREEN ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_fullscreen.spv)
       set(LEONIDA_TEST_VS_INT ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw_int.spv)
       set(LEONIDA_TEST_GS_DOUBLE ${CMAKE_CURRENT_BINARY_DIR}/generated/gs_double.spv)
+      set(LEONIDA_TEST_PS_BARY ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_bary_fallback.spv)
       foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS}" "ps_draw.frag;${LEONIDA_TEST_PS}"
                    "vs_fullscreen.vert;${LEONIDA_TEST_VS_FULLSCREEN}" "vs_draw_int.vert;${LEONIDA_TEST_VS_INT}"
-                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}")
+                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}" "ps_bary_fallback.frag;${LEONIDA_TEST_PS_BARY}")
         list(GET pair 0 source)
         list(GET pair 1 output)
         add_custom_command(
@@ -1988,6 +2004,16 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_depth24_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_depth24_draw COMMAND d3d12_depth24_draw_test)
       set_tests_properties(d3d12_depth24_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # --bary-fallback (SHADER-98): the layer draws such a PS through its pass-through geometry shader.
+      add_executable(d3d12_bary_fallback_test test/d3d12_bary_fallback_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_GS_DOUBLE} ${LEONIDA_TEST_PS_BARY})
+      target_link_libraries(d3d12_bary_fallback_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_bary_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_GS_SPV="${LEONIDA_TEST_GS_DOUBLE}"
+                                 LEONIDA_TEST_PS_BARY_SPV="${LEONIDA_TEST_PS_BARY}")
+      target_compile_options(d3d12_bary_fallback_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_bary_fallback COMMAND d3d12_bary_fallback_test)
+      set_tests_properties(d3d12_bary_fallback PROPERTIES SKIP_RETURN_CODE 77)
       # Set 0 from the compute bind point: a compute PSO whose shader declares set-0 bindings samples through the
       # device's bindless set, which nothing but the layer binds.
       set(LEONIDA_TEST_CS_SET0_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_set0_sample.spv)
