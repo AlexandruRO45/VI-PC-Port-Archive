@@ -85,7 +85,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext", "cs_w32_ds_wrap",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                "cs_mask_vgpr_exec", "cs_w32_permlane_fi")
+                "cs_mask_vgpr_exec", "cs_w32_fcmpswap", "cs_w32_permlane_fi")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -117,6 +117,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # 64-bit scalar data ops and v_mad_u64_u32 (derivations in cs_w32_salu64.asm)
             # more ops with CPU-only checks until now (derivations in cs_w32_misc_ext.asm)
             # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)
+            # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
+            ("cs_w32_fcmpswap", [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000]),
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
             ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
@@ -373,6 +375,8 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
+              # exp mrt0 done (no vm) with every lane on, EXEC off afterwards: written (.asm header, measured on gfx1036)
+              "ps_exp_color_mask": (0x40000000, 0x40800000, 0x40000000, 0x40800000),
               "ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_mul_legacy_denorm": (0, 0, 0, 0x80000000),
               "ps_mul_legacy_denorm_mods": (0, 0, 0, 0x40400000),
@@ -524,6 +528,7 @@ PERSP_ATTR = ((0.25, -0.5), (2.25, 0.75), (-1.0, 3.0))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 SIGNED_MIP_TEST = "ps_sample_implicit_sint"
+UINT_MIP_TEST = "ps_sample_implicit_uint"
 GATHER_LOD_TEST = "ps_gather_sampler_lod"
 TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 # Each pair of draws expects mip 0, then mip 1. S# word 1 is minLOD[11:0], maxLOD[23:12], unsigned 4.8.
@@ -531,7 +536,10 @@ MIP_TEST_PASSES = {
     TEXTURE_MIP_TEST: ((TEXTURE_MIP_TEST, "c00000"), ("ps_texture_sample", "c00000")),
     GATHER_LOD_TEST: ((GATHER_LOD_TEST, "40000"), (GATHER_LOD_TEST, "1000c0")),
     SIGNED_MIP_TEST: ((SIGNED_MIP_TEST, "0"), (SIGNED_MIP_TEST, "100000")),
+    UINT_MIP_TEST: ((UINT_MIP_TEST, "0"), (UINT_MIP_TEST, "100000")),
 }
+# The integer fixtures sample the same two-mip image through the signed or unsigned view the harness binds for them.
+MIP_TEST_MODES = {SIGNED_MIP_TEST: "--two-mip-sint", UINT_MIP_TEST: "--two-mip-uint"}
 
 # TEST-184: vk_store_test "words" fills the r32 uint image with 100 + i, the r32 sint image with -2i (texel
 # i = 8y + x) and the r32 uint volume with 200 + i (texel i = 16z + 4y + x), and prints the three after the dispatch.
@@ -934,19 +942,32 @@ def shader_features(spirv, name):
         return set()
 
 
+def shader_fma_mode(spirv, name):
+    """How the translator emitted fused multiply-adds for a shader ('glsl', 'khr' or 'exact'), or '' if unrecorded.
+
+    Older indexes have no field: callers must fall back to the capability and LEONIDA_FMA as before.
+    """
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            mode = json.load(f).get(name, {}).get("fma") or ""
+            return mode if mode in ("glsl", "khr", "exact") else ""
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
 def judge_fma_fused(words, khr, exact=False):
-    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr and --fma exact (SHADER-497: the single rounding
-    built from plain f32 ops) every word must be exact fused; under --fma glsl each of the 7 f32 words may be either
-    fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the f16 round-to-odd word out[7] must
-    always be exact 0x00007351."""
+    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr every word must be exact fused; under --fma glsl
+    each of the 7 f32 words may be either fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the
+    f16 round-to-odd word out[7] must always be exact 0x00007351."""
     if not words or len(words) < 8:
         return False, "missing out[0..7] dump"
     if khr or exact:
         label = "OpFmaKHR" if khr else "--fma exact"
         for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
             if got != want:
-                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} ({label})"
-        return True, f"8/8 fused exact ({label})"
+                return False, (f"word {i}: got {got:#010x}, want fused {want:#010x} "
+                               "(single-rounded FMA: OpFmaKHR or --fma exact)")
+        return True, "8/8 fused exact (single-rounded FMA: OpFmaKHR or --fma exact)"
     if words[7] != FMA_FUSED[7]:
         return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
     n_split = 0
@@ -967,9 +988,16 @@ def fma_fused_test(tools, spirv):
     """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr and --fma exact, fused-or-split f32 under
     --fma glsl)."""
     shader = os.path.join(spirv, "cs_fma_fused.spv")
-    khr = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
-           or os.environ.get("LEONIDA_FMA") == "khr")
-    exact = os.environ.get("LEONIDA_FMA") == "exact"
+    # --fma exact also guarantees single rounding (built from NoContraction ops), but records no KHR capability.
+    # Without the index field a fresh shell cannot tell it from the default GLSL Fma (TEST-1147).
+    mode = shader_fma_mode(spirv, "cs_fma_fused")
+    if mode:
+        # A recorded mode is authoritative: a stale LEONIDA_FMA from the build shell must not override it.
+        strict = mode in ("khr", "exact")
+    else:
+        # An older index has no mode field: capability and environment are the only remaining signals.
+        strict = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
+                  or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
                     env=dict(os.environ, **FMA_FUSED_ENV))
     if code == UNSUPPORTED:
@@ -981,7 +1009,7 @@ def fma_fused_test(tools, spirv):
     if not m:
         return failure(code, out, 2)
     words = [int(x) for x in m.group(1).split()]
-    ok, detail = judge_fma_fused(words, khr=khr, exact=exact)
+    ok, detail = judge_fma_fused(words, khr=strict)
     return "" if ok else detail
 
 
@@ -1427,7 +1455,7 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
                 if not shader.is_file():
                     return f"missing {shader}"
             raw = Path(tmp) / f"mip{mip}.raw"
-            mode = "--two-mip-sint" if test == SIGNED_MIP_TEST else "--two-mip"
+            mode = MIP_TEST_MODES.get(test, "--two-mip")
             code, output = run(tool, vertex, fragment, raw, "0", "92", limits, "14500000", "0", mode)
             if code == UNSUPPORTED:
                 return Skip(f"SKIP (texture mip test: {output.strip() or 'unsupported device'})")
