@@ -49,6 +49,24 @@ class TestLdsAddU32Reference(unittest.TestCase):
         self.assertEqual(rtns, [0xDEAD])
         self.assertEqual(fin[0x40], 142)
 
+class TestLdsAddU32Offset(unittest.TestCase):
+    def test_byte_offset_addition(self):
+        init = {0x40: 10, 0x44: 20, 0x48: 30}
+        rtns, fin = L.run_chain([("ds_add_u32", 0x20, 0x24, (5,))], init)
+        self.assertEqual(fin[0x44], 25)
+
+    def test_multiple_offsets_same_base(self):
+        init = {0x40: 1, 0x44: 2, 0x48: 3}
+        ops = [
+            ("ds_add_u32", 0x40, 0, (10,)),
+            ("ds_add_u32", 0x40, 4, (20,)),
+            ("ds_add_u32", 0x40, 8, (30,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x40], 11)
+        self.assertEqual(fin[0x44], 22)
+        self.assertEqual(fin[0x48], 33)
+
 
 if __name__ == "__main__":
     unittest.main()
