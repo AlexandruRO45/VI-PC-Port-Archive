@@ -107,10 +107,11 @@ whose attribute is a constant pass `0xf0814000`, not that value, so it comes fro
 ## The boot's call order (measured)
 
 One `gta6rt --run --trace` on the retail executable, `main` `9f53c502e`, own 1.0.2.1 copy, Windows 11 26200, RTX
-3070 Ti (driver 32.0.15.9649), `LEONIDA_D3D12=vulkan`, MSVC `RelWithDebInfo`. Before the first allocation the title
-calls `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` once, unimplemented at `main`. The trace keeps only the first call
-for each distinct attribute word, so this is the first five distinct attribute words in first-seen order, not the 23
-sites:
+3070 Ti (driver 32.0.15.9649), `LEONIDA_D3D12=vulkan`, MSVC `RelWithDebInfo`. The first D3D12 call is
+`d3d12_xs.dll!D3D12ConfigureVirtualMemoryX`, once, before the first allocation; `main` serves it as a stub that
+returns `S_OK` without reading the descriptor (#6792), so the trace has no event for it. The xmem trace keeps only the
+first call for each distinct attribute word, so this is the first five distinct attribute words in first-seen order,
+not the 23 sites:
 
 | # | `attributes` | Size (bytes) | Page mode / type | Outcome |
 |---:|---|---|---|---|
