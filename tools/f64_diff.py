@@ -209,16 +209,23 @@ def compare(cond, a, b):
     return int(result[cond])
 
 
+# RDNA2 v_div_fixup_f64 under the game MODE (ieee=0, denorm16_64=3), measured on gfx1036
+# (docs/design.md, v_div_fixup_f16/f64 row): NaN(S2) then NaN(S1) pass through unchanged (a signalling NaN is
+# not quieted under IEEE=0); the exponent difference only underflows, at e2 - e1 <= -1076; there is no overflow
+# cutoff; NaN(S0) gives a signed infinity.
+FIXUP_UNDERFLOW_EDIFF = -1076
+
+
 def fixup(s0, s1, s2):
     sign = (s1 ^ s2) & 0x8000000000000000
-    if is_nan(s2): return s2 | (1 << 51)
-    if is_nan(s1): return s1 | (1 << 51)
+    if is_nan(s2): return s2
+    if is_nan(s1): return s1
     z1, z2, i1, i2 = is_zero(s1), is_zero(s2), is_inf(s1), is_inf(s2)
     if (z1 and z2) or (i1 and i2): return 0xFFF8000000000000
     e1, e2 = (s1 >> 52) & 0x7FF, (s2 >> 52) & 0x7FF
     ediff = e2 - e1
-    if i1 or z2 or ediff < -1074: return sign
-    if z1 or i2 or ediff >= 1024 or is_nan(s0): return sign | EXP
+    if i1 or z2 or ediff <= FIXUP_UNDERFLOW_EDIFF: return sign
+    if z1 or i2 or is_nan(s0): return sign | EXP
     return (s0 & 0x7FFFFFFFFFFFFFFF) | sign
 
 
@@ -347,7 +354,7 @@ def ref_program(lines, include_known=False):
             ediff = ((s2 >> 52) & 0x7FF) - ((s1 >> 52) & 0x7FF)
             normal_division = (not is_nan(s1) and not is_inf(s1) and not is_zero(s1)
                                and not is_nan(s2) and not is_inf(s2) and not is_zero(s2)
-                               and -1074 <= ediff < 1024)
+                               and ediff > FIXUP_UNDERFLOW_EDIFF)
             if not include_known and is_nan(s0) and normal_division:
                 raise SkipCase(f"KNOWN_DIVERGENCE div-fixup-nan-s0: {KNOWN_DIVERGENCES['div-fixup-nan-s0']}")
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*args))
@@ -375,7 +382,9 @@ def ref_program(lines, include_known=False):
             if any(is_nan(t) or is_inf(t) for t in (x, y, z)):
                 raise SkipCase("non-finite v_div_fmas_f64 operands are not judged")
             exact = to_fraction(x) * to_fraction(y) + to_fraction(z)
-            if vcc: exact *= 1 << 64
+            # RDNA2 v_div_fmas_f64 (docs/design.md): with VCC set the result is scaled by 2^+128 when
+            # exp(S2) > 1023 (|S2| >= 2.0) and by 2^-128 otherwise, rounded once.
+            if vcc: exact *= Fraction(2) ** (128 if ((z >> 52) & 0x7FF) > 1023 else -128)
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(round_fraction(exact))
         else:
             raise HarnessError(f"reference does not implement {op}")

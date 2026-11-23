@@ -201,9 +201,9 @@ class F64DiffTests(unittest.TestCase):
             ("sign_out_negative_from_s1", three, self.NEG2, one, three | self.NZ),
             ("sign_out_positive_both_negative", self.NEG3, self.NEG2, self.NEG1, three),
             ("sign_out_clears_s0_sign", self.NEG3, one, one, three),
-            ("nan_s2_quiets_s2", one, one, self.SNAN, 0x7FF8000000000001),
+            ("nan_s2_passes_unchanged", one, one, self.SNAN, self.SNAN),
             ("nan_s2_beats_nan_s1", one, self.SNAN, qn2, qn2),
-            ("nan_s1_quiets_s1", one, self.SNAN, one, 0x7FF8000000000001),
+            ("nan_s1_passes_unchanged", one, self.SNAN, one, self.SNAN),
             ("nan_s2_beats_zero_over_zero", one, self.PZ, qn2, qn2),
             ("zero_over_zero", one, self.PZ, self.NZ, 0xFFF8000000000000),
             ("inf_over_inf", one, self.PINF, self.NINF, 0xFFF8000000000000),
@@ -214,15 +214,23 @@ class F64DiffTests(unittest.TestCase):
             ("inf_over_y", one, self.NEG2, self.NINF, self.PINF),
             ("nan_s0_to_signed_inf_isa_rule", self.QNAN, one, one, self.PINF),
             ("nan_s0_to_signed_inf_negative", self.QNAN, self.NEG2, one, self.NINF),
-            ("underflow_edge_still_passes_s0", three, e(1075), e(1), three),
-            ("underflow_to_zero", three, e(1076), e(1), self.PZ),
-            ("underflow_beats_nan_s0", self.QNAN, e(1076), e(1), self.PZ),
-            ("overflow_edge_still_passes_s0", three, e(1), e(1024), three),
-            ("overflow_to_inf", three, e(1), e(1025), self.PINF),
+            ("underflow_edge_still_passes_s0", three, e(1076), e(1), three),
+            ("underflow_to_zero", three, e(1077), e(1), self.PZ),
+            ("underflow_beats_nan_s0", self.QNAN, e(1077), e(1), self.PZ),
+            ("no_overflow_cutoff_at_1024", three, e(1), e(1025), three),
+            ("no_overflow_cutoff_far", three, e(1), e(2046), three),
         ]
         for name, s0, s1, s2, want in table:
             with self.subTest(case=name):
                 self.assertEqual(fd.fixup(s0, s1, s2), want)
+
+    def test_div_fmas_scales_by_exponent_of_s2(self):
+        # RDNA2 (docs/design.md): VCC set scales by 2^+128 when |S2| >= 2.0 and by 2^-128 below it.
+        def fmas(x, y, z):
+            return fd.ref_program(["v_cmp_eq_i32_e32 vcc_lo, 0, 0", f"v_div_fmas_f64 v[8:9], {x}, {y}, {z}"])[:2]
+        self.assertEqual(fmas("1.0", "1.0", "2.0"), [0, 0x48080000])    # 3.0 * 2^128
+        self.assertEqual(fmas("1.0", "1.0", "-2.0"), [0, 0xC7F00000])   # -1.0 * 2^128
+        self.assertEqual(fmas("1.0", "1.0", "1.0"), [0, 0x38000000])    # 2.0 * 2^-128
 
     def test_frexp_table(self):
         half = 0x3FE0000000000000
