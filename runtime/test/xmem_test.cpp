@@ -517,7 +517,46 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 6, "every event names its caller");
+    check(count("\"caller\":\"") == 7, "every event names its caller, the result event included");
+    DeleteFileW(path.c_str());
+}
+
+// gta6rt --trace: one "xmem_virtual_result" event per distinct (type, attribute word, size) request, with the result
+// address and, when the shim refuses, GetLastError. The attribute word here is unique to this test so the event count
+// does not depend on which of the other traced calls ran first.
+void test_virtual_alloc_result_trace(XMemVirtualAllocFn virtual_alloc) {
+    if (!virtual_alloc) return;
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring path =
+        std::wstring(temp) + L"xmem_result_trace_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
+    DeleteFileW(path.c_str());
+    check(rt::startup_trace::open(path.c_str()), "open the startup trace file for the result event");
+    void* const first = virtual_alloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, 0x1a4, PAGE_READWRITE);
+    void* const again = virtual_alloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, 0x1a4, PAGE_READWRITE);
+    SetLastError(ERROR_SUCCESS);
+    void* const refused = virtual_alloc(nullptr, 0, MEM_RESERVE | MEM_COMMIT, 0x1a4, PAGE_READWRITE);
+    const DWORD refused_error = GetLastError();
+    check(refused == nullptr && refused_error == ERROR_INVALID_PARAMETER,
+          "a zero-size request is refused with ERROR_INVALID_PARAMETER");
+    if (first) VirtualFree(first, 0, MEM_RELEASE);
+    if (again) VirtualFree(again, 0, MEM_RELEASE);
+    rt::startup_trace::close();
+
+    std::ifstream in(path);
+    std::stringstream text;
+    text << in.rdbuf();
+    const std::string log = text.str();
+    auto count = [&](const std::string& needle) {
+        int n = 0;
+        for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
+        return n;
+    };
+    check(count("\"kind\":\"xmem_virtual_result\"") == 2,
+          "two results for one attribute word: the first call and the refusal");
+    check(count("\"size\":131072,\"result\":\"0x") == 1, "the accepted request is recorded once, not on every call");
+    check(count("\"last_error\":0") == 1, "the accepted request records no error");
+    check(count("\"result\":\"null\",\"last_error\":87") == 1, "the refusal records a null result and its error");
     DeleteFileW(path.c_str());
 }
 
@@ -707,6 +746,7 @@ int main() {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
     test_attribute_trace(alloc, free_mem, virtual_alloc);
+    test_virtual_alloc_result_trace(virtual_alloc);
     if (transfer) {
         test_transfer_memory(transfer);
         test_transfer_trace(transfer);

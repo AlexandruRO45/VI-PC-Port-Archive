@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -320,7 +321,8 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+void* WINAPI xmem_virtual_alloc_impl(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes,
+                                     DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -423,6 +425,34 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                                                 &parameter, 1);
     }
     return VirtualAlloc(address, size, host_type, host_prot);
+}
+
+// gta6rt --trace: the first result of each distinct (allocation type, attribute word, size) XMemVirtualAlloc request,
+// with GetLastError when the shim refuses. xmem_attributes records what the title asked for; this records what the
+// shim answered, so a refused reserve shows in the trace itself, not only in a debugger.
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    void* const result = xmem_virtual_alloc_impl(address, size, allocation_type, attributes, protect);
+    const DWORD error = result ? 0u : GetLastError();  // before the trace call, which sets its own
+    if (rt::startup_trace::enabled()) {
+        static std::mutex mutex;
+        static std::set<std::array<uint64_t, 3>> seen;
+        bool first = false;
+        {
+            const std::lock_guard lock(mutex);
+            first = seen.insert({allocation_type, attributes, size}).second;
+        }
+        if (first) {
+            const std::string fields =
+                std::string("\"type\":") + rt::startup_trace::quote(rt::startup_trace::hex(allocation_type)) +
+                ",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes)) +
+                ",\"size\":" + std::to_string(size) + ",\"result\":" +
+                rt::startup_trace::quote(result ? rt::startup_trace::hex(reinterpret_cast<uint64_t>(result)) : "null") +
+                ",\"last_error\":" + std::to_string(error) + caller_field(_ReturnAddress());
+            rt::startup_trace::event("xmem_virtual_result", fields);
+        }
+    }
+    if (!result) SetLastError(error);
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
