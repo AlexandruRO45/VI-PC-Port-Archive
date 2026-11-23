@@ -527,5 +527,43 @@ class TestVMax3I32RegisterAliasing(unittest.TestCase):
         self.assertEqual(res, (-5) & MASK32)
         self.assertEqual(state.get_vgpr(0), (-5) & MASK32)
 
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Invariance
+# ==============================================================================
+
+class TestVMax3I32ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow invariance."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        """Verify v_max3_i32 does not write or modify VCC or SCC condition codes."""
+        lines = [
+            "v_cmp_eq_u32 vcc, 42, 42",
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_mov_b32 v3, 30",
+            "v_max3_i32 v0, v1, v2, v3",
+            "v_cndmask_b32 v4, 0x11111111, 0x22222222, vcc",
+            "exp mrt0 v4, v0, v4, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_i32_vcc_invar", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x22222222)
+        self.assertEqual(words[1], 30)
+
+    def test_no_carry_borrow_generation(self) -> None:
+        """Verify integer comparison/selection has no arithmetic carry/borrow side-effects."""
+        lines = [
+            "v_mov_b32 v1, 0x7FFFFFFF",
+            "v_mov_b32 v2, 0x80000000",
+            "v_mov_b32 v3, 0",
+            "v_max3_i32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_i32_nocarry", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x7FFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
