@@ -633,10 +633,12 @@ elsewhere with the same geometry would fit as well.
 
 **The descriptor key (`+0x40`).** Over all 269,106 single-BLAS descriptors of `core_bvh4.rpf` and the BVH stream
 after each (the 235,533 distinct keys of §3.2; the descriptors that group several BLAS, #4199, are not counted here),
-2,873 keys occur more than once, 33,573 repeats in all, one key 3,198 times. A key always comes with
-the same transform, and with the same BLAS header (sizes, bounds, `crc32`) in all but one case: a 3-leaf BLAS seen 4
-times under one key, with the same sizes and bounds each time and a different `crc32` in one of the four. The
-converse fails: 1,008 (BLAS header, transform) pairs occur under more than one key, up to 60 keys. So distinct keys
+2,873 keys occur more than once, 33,573 repeats in all, one key 3,198 times. Here "BLAS header" means header bytes
+`0x104`-`0x128` (size in 64-byte nodes, `crc32`, element count, `sceneBounds`) and "transform" the exact 48 bytes at
+`+0x50`. A key always comes with the same transform, and with the same BLAS header in all but one case: a 3-leaf
+BLAS seen 4 times under one key, with the same sizes and bounds each time and a different `crc32` in one of the four.
+The converse fails: 1,008 (BLAS header, transform) pairs occur under more than one key, up to 60 keys (1,007 when
+the header is all 64 bytes `0x100`-`0x140`, as reviewers of PR #4265 measured). So distinct keys
 can share both the BLAS and its transform: the key identifies something finer than that pair. What it hashes is open;
 #4199 (open) finds no more matches between these keys and the values of the table descriptors than chance gives.
 
