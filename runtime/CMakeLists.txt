@@ -1265,6 +1265,17 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_queue_wait_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     set_tests_properties(d3d12_queue_share_one_queue d3d12_queue_wait_one_queue PROPERTIES
                          ENVIRONMENT "LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1;LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1")
+    # A misspelt case or count is refused with the usage line (exit code 2) before a device exists, instead of
+    # passing with nothing run. No GPU needed.
+    set(_share_bad_arguments "case_typo|--case|typo" "iterations_zero|--iterations|0"
+        "iterations_word|--iterations|banana" "iterations_too_many|--iterations|99999999999")
+    foreach(_bad IN LISTS _share_bad_arguments)
+      string(REPLACE "|" ";" _bad "${_bad}")
+      list(POP_FRONT _bad _bad_name)
+      add_test(NAME d3d12_queue_share_rejects_${_bad_name} COMMAND d3d12_queue_share_test ${_bad})
+      set_tests_properties(d3d12_queue_share_rejects_${_bad_name} PROPERTIES TIMEOUT 60
+                           PASS_REGULAR_EXPRESSION "\nusage: d3d12_queue_share_test ")
+    endforeach()
 
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.

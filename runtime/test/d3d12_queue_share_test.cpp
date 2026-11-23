@@ -21,6 +21,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -362,6 +363,31 @@ bool stress(ID3D12Device* device, int iterations) {
     return true;
 }
 
+constexpr int most_iterations = 1000000;
+
+// Exit code 2 and the usage line, before any device exists: a misspelt case or count must not pass with nothing run.
+int usage(const char* problem, const char* value) {
+    std::fprintf(stderr, "%s%s\nusage: d3d12_queue_share_test [--case many|deferred|release|stress|all] "
+                         "[--iterations N] (N from 1 to %d, default 100)\n",
+                 problem, value, most_iterations);
+    return 2;
+}
+
+bool known_case(const std::string& which) {
+    for (const char* name : {"many", "deferred", "release", "stress", "all"})
+        if (which == name) return true;
+    return false;
+}
+
+// The whole argument as a decimal count from 1 to most_iterations, or 0.
+int parse_iterations(const char* text) {
+    char* end = nullptr;
+    errno = 0;
+    const long value = std::strtol(text, &end, 10);
+    if (end == text || *end || errno == ERANGE || value < 1 || value > most_iterations) return 0;
+    return int(value);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -370,12 +396,12 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--case") && i + 1 < argc) {
             which = argv[++i];
+            if (!known_case(which)) return usage("unknown case: ", which.c_str());
         } else if (!std::strcmp(argv[i], "--iterations") && i + 1 < argc) {
-            iterations = std::atoi(argv[++i]);
+            iterations = parse_iterations(argv[++i]);
+            if (!iterations) return usage("not a whole number of iterations in range: ", argv[i]);
         } else {
-            std::fprintf(stderr, "usage: d3d12_queue_share_test [--case many|deferred|release|stress|all] "
-                                 "[--iterations N]\n");
-            return 2;
+            return usage("unknown argument: ", argv[i]);
         }
     }
     std::thread([] {
