@@ -283,5 +283,23 @@ class TestCeilRegisterPreservation(unittest.TestCase):
         self.assertEqual(words[3], 0x3333)
 
 
+class TestCeilConditionCodesAndStatus(unittest.TestCase):
+    """Commit 6: condition codes, status flags, and carry/borrow generation for v_ceil_f32."""
+
+    def test_status_comparison_on_ceil_result(self):
+        # ceil(-0.5) is -0.0 (0x80000000). Compare with 0.0 using v_cmp_eq_f32 (in IEEE 754 -0.0 == +0.0 is true)
+        lines = [
+            "v_mov_b32 v1, 0xBF000000",
+            "v_ceil_f32 v0, v1",
+            "v_cmp_eq_f32 vcc, v0, 0.0",
+            "v_cndmask_b32 v1, 0x1111, 0x2222, vcc",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_ceil_ps(lines, "ps_ceil_status")
+        self.assertEqual(words[0], 0x80000000)
+        self.assertEqual(words[1], 0x2222)
+
+
 if __name__ == '__main__':
     unittest.main()
