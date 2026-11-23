@@ -11,6 +11,11 @@ byte) decodes as transparent black. BC6H is not supported.
 DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG.
 For tagged sRGB images, unpremultiplication and downscaling use linear light. The PNG stores sRGB bytes.
 
+DX10 R16_FLOAT (54) and R16G16B16A16_FLOAT (10) are read as linear values and
+written like the UNORM formats, with no tone mapping or sRGB transfer: clamp to
+[0, 1], then round(v * 255) half up. +inf saturates to 255; -inf, negative values
+and NaN map to 0. R16_FLOAT fills red, with green and blue 0 and alpha 255;
+R16G16B16A16_FLOAT keeps its own alpha.
 R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alpha.
 
 Usage:
@@ -92,7 +97,13 @@ _DXGI_MAP: dict[int, str] = {
     97: "BC7",
     98: "BC7",
     99: "BC7",
+    10: "RGBA16_FLOAT",
+    54: "R16_FLOAT",
 }
+
+# Bytes per texel and channels per texel of the half-float formats.
+_HALF_FLOAT_LAYOUT = {"RGBA16_FLOAT": (8, 4), "R16_FLOAT": (2, 1)}
+_HALF_TO_U8: bytes | None = None
 
 _SRGB_DXGI_FORMATS = frozenset((29, 72, 75, 78, 91, 93, 99))
 
@@ -366,6 +377,45 @@ def _decode_uncompressed_32(
         out[dst + 2] = (((px >> b_shift) & b_max) * 255 + b_half) // b_max if b_max else 0
         out[dst + 3] = (((px >> a_shift) & a_max) * 255 + a_half) // a_max if a_max else 255
         dst += 4
+    return bytes(out)
+
+
+def _half_to_u8_lut() -> bytes:
+    """Byte for every IEEE 754 binary16 code: clamp to [0, 1], round half up; NaN -> 0, +inf -> 255."""
+    global _HALF_TO_U8
+    if _HALF_TO_U8 is None:
+        lut = bytearray(65536)
+        for code, (v,) in enumerate(struct.iter_unpack("<e", struct.pack("<65536H", *range(65536)))):
+            if v != v or v <= 0.0:  # NaN, -0, negatives and -inf
+                continue
+            lut[code] = 255 if v >= 1.0 else int(v * 255.0 + 0.5)  # v * 255 is exact in a double
+        _HALF_TO_U8 = bytes(lut)
+    return _HALF_TO_U8
+
+
+def _decode_half_float(payload: memoryview, width: int, height: int, fmt: str, pitch: int) -> bytes:
+    texel_bytes, channels = _HALF_FLOAT_LAYOUT[fmt]
+    row_bytes = width * texel_bytes
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
+
+    lut = _half_to_u8_lut()
+    row_count = width * channels
+    unpack_row = struct.Struct(f"<{row_count}H").unpack_from
+    out = bytearray(width * height * 4)
+    if channels == 1:
+        out[3::4] = b"\xff" * (width * height)
+    for y in range(height):
+        values = bytes(map(lut.__getitem__, unpack_row(payload, y * pitch)))
+        start = y * width * 4
+        if channels == 4:
+            out[start : start + row_bytes // 2] = values
+        else:
+            out[start : start + width * 4 : 4] = values
     return bytes(out)
 
 
@@ -1071,6 +1121,10 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
         rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+    elif fmt in _HALF_FLOAT_LAYOUT:
+        flags = struct.unpack_from("<I", data, 8)[0]
+        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
+        rgba = _decode_half_float(memoryview(data)[offset:], width, height, fmt, pitch)
     elif fmt in _RGB24_LAYOUTS.values():
         assert masks is not None
         flags = struct.unpack_from("<I", data, 8)[0]
