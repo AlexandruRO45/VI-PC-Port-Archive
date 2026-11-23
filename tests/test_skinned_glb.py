@@ -860,5 +860,16 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(_read(new_buf)).hexdigest(), before_hash)
 
 
+class ShortSectionTable(unittest.TestCase):
+    """A truncated graphics buffer reports one clean error instead of a struct.error traceback."""
+
+    def test_short_buffer_without_section_list(self):
+        with tempfile.TemporaryDirectory() as root:
+            component = _component(root, buffer=bytes(16))
+            model = _read_model(component)
+            with self.assertRaisesRegex(skinned_glb.SkinError, "too short for the 23-word mesh section table"):
+                skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+
+
 if __name__ == "__main__":
     unittest.main()

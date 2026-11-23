@@ -320,9 +320,14 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
         for row in raw_sections:
             if not isinstance(row, (list, tuple)) or len(row) != 3:
                 raise SkinError("mesh_blob.sections entries must be [semantic, offset, format]")
-            semantic, offset, fmt = (int(v) for v in row)
+            try:
+                semantic, offset, fmt = (int(v) for v in row)
+            except (TypeError, ValueError) as exc:
+                raise SkinError(f"mesh_blob.sections has a non-integer field: {exc}") from exc
             sections[semantic] = (offset, fmt)
     else:
+        if base + 23 * 4 > len(blob):
+            raise SkinError("vertex buffer is too short for the 23-word mesh section table")
         for semantic in range(23):
             word = struct.unpack_from("<I", blob, base + semantic * 4)[0]
             if word:
