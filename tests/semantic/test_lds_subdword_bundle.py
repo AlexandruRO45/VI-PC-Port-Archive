@@ -183,5 +183,34 @@ class TestDsReadU8SIMD(unittest.TestCase):
             self.assertEqual(wave.vgprs[2][i], (i * 7) & 0xFF)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_u8 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import lds_run as L
+import support
+
+
+class TestDsReadU8HardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 300)
+
+    def test_hardware_translator_execution(self):
+        body = [
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0xef",
+            "ds_write_b8 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_u8 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v3", 0)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(L.out(mem, 0, 0), 0xEF)
+
+
 if __name__ == '__main__':
     unittest.main()
