@@ -318,8 +318,52 @@ void test_multiple_tls_modules(const fs::path& dll, const fs::path& temp) {
     {
         rt::Loader loader(dll.parent_path());
         rt::Module& first = loader.load(dll);
+
+        // A thread created after the first module and before the other two has a block for the first from the helper's
+        // DLL_THREAD_ATTACH, but the later loads must still find it: the enumeration is per load, not per process.
+        struct LateCtx {
+            int(__cdecl* get1)() = nullptr;
+            void(__cdecl* set1)(int) = nullptr;
+            int(__cdecl* get2)() = nullptr;
+            void(__cdecl* set2)(int) = nullptr;
+            int(__cdecl* get3)() = nullptr;
+            void(__cdecl* set3)(int) = nullptr;
+            HANDLE started = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            HANDLE go = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            int v1 = -1, v2 = -1, v3 = -1;
+        } late;
+        late.get1 = find_export<int(__cdecl*)()>(first, "tiny_tls_get");
+        late.set1 = find_export<void(__cdecl*)(int)>(first, "tiny_tls_set");
+        std::thread late_thread([&late] {
+            SetEvent(late.started);
+            WaitForSingleObject(late.go, INFINITE);
+            late.v1 = late.get1();
+            late.v2 = late.get2();
+            late.v3 = late.get3();
+            late.set1(111);
+            late.set2(222);
+            late.set3(333);
+            SetEvent(late.done);
+        });
+        WaitForSingleObject(late.started, INFINITE);
+
         rt::Module& second = loader.load(copy2);
+        late.get2 = find_export<int(__cdecl*)()>(second, "tiny_tls_get");
+        late.set2 = find_export<void(__cdecl*)(int)>(second, "tiny_tls_set");
         rt::Module& third = loader.load(copy3);
+        late.get3 = find_export<int(__cdecl*)()>(third, "tiny_tls_get");
+        late.set3 = find_export<void(__cdecl*)(int)>(third, "tiny_tls_set");
+
+        SetEvent(late.go);
+        WaitForSingleObject(late.done, INFINITE);
+        late_thread.join();
+        CloseHandle(late.started);
+        CloseHandle(late.go);
+        CloseHandle(late.done);
+        check(late.v1 == 7 && late.v2 == 7 && late.v3 == 7,
+              "a thread created between module loads receives each later module's template");
+
         loader.initialise();
 
         check(first.tls_index != rt::kNoTlsIndex && second.tls_index != rt::kNoTlsIndex &&
