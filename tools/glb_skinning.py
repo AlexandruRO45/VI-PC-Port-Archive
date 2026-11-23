@@ -7,6 +7,7 @@ The tool parses the GLB container itself (12-byte header, JSON chunk, optional
 BIN chunk, 4-byte padding), then checks every skin and every mesh primitive:
 
 * skin names, joint counts and inverseBindMatrices counts,
+* the joint hierarchy, its declared skeleton root and its presence in each scene that uses the skin,
 * the inverseBindMatrices accessor type and finite values,
 * which mesh primitives carry skinning data and which are static,
 * JOINTS_n/WEIGHTS_n pairing, accessor types and vertex counts,
@@ -568,6 +569,87 @@ def _node_bindings(gltf, skin_count, mesh_count, warnings, errors):
     return bindings
 
 
+def _joint_tree_intervals(nodes, errors):
+    """Index the node forest. A subtree occupies one half-open interval in DFS order."""
+    parents = [None] * len(nodes)
+    for parent, node in enumerate(nodes):
+        for child in _list_field(node, "children", f"nodes[{parent}]"):
+            if not _is_int(child) or not 0 <= child < len(nodes):
+                errors.append(f"nodes[{parent}].children references invalid node {child!r}")
+                return None
+            if parents[child] is not None:
+                errors.append(f"node {child} occurs more than once in its parents' child lists")
+                return None
+            parents[child] = parent
+
+    trees = [None] * len(nodes)
+    start = [0] * len(nodes)
+    end = [0] * len(nodes)
+    visited = 0
+    for root, parent in enumerate(parents):
+        if parent is not None:
+            continue
+        stack = [(root, False)]
+        while stack:
+            index, leaving = stack.pop()
+            if leaving:
+                end[index] = visited
+                continue
+            trees[index] = root
+            start[index] = visited
+            visited += 1
+            stack.append((index, True))
+            stack.extend((child, False) for child in nodes[index].get("children") or ())
+    if visited != len(nodes):
+        errors.append("cycle in the node hierarchy")
+        return None
+    return trees, start, end
+
+
+def _check_joint_hierarchies(gltf, skins, mesh_bindings, errors):
+    if not skins:
+        return
+    nodes = _list_field(gltf, "nodes", "glTF")
+    forest = _joint_tree_intervals(nodes, errors)
+    if forest is None:
+        return
+    trees, start, end = forest
+    root_scenes = {}
+    for index, scene in enumerate(_list_field(gltf, "scenes", "glTF")):
+        if not isinstance(scene, dict):
+            raise GlbSkinError(f"scenes[{index}] is not an object")
+        for root in _list_field(scene, "nodes", f"scenes[{index}]"):
+            if not _is_int(root) or not 0 <= root < len(nodes) or trees[root] != root:
+                errors.append(f"scenes[{index}].nodes references invalid root {root!r}")
+                continue
+            root_scenes.setdefault(root, set()).add(index)
+
+    joint_trees = {}
+    for skin in skins:
+        index = skin["index"]
+        joints = [j for j in skin["joints"] if 0 <= j < len(nodes)]
+        if not joints:
+            continue
+        root = trees[joints[0]]
+        if any(trees[j] != root for j in joints):
+            errors.append(f"skins[{index}].joints have no common root")
+            continue
+        joint_trees[index] = root
+        pivot = skin["skeleton"]
+        if pivot is not None and 0 <= pivot < len(nodes):
+            if any(not start[pivot] <= start[j] < end[pivot] for j in joints):
+                errors.append(f"skins[{index}].skeleton node {pivot} must be an ancestor of all its joints")
+
+    for bindings in mesh_bindings.values():
+        for binding in bindings:
+            skin = binding["skin"]
+            if skin not in joint_trees:
+                continue
+            node = binding["node"]
+            for scene in sorted(root_scenes.get(trees[node], set()) - root_scenes.get(joint_trees[skin], set())):
+                errors.append(f"scenes[{scene}] contains skinned node {node} but lacks the joints of skins[{skin}]")
+
+
 def _read_weight_set(reader, accessor_index, primitive_path, set_index, errors):
     values, meta = reader.read(accessor_index, f"{primitive_path}.WEIGHTS_{set_index}")
     if meta["type"] != "VEC4":
@@ -908,6 +990,7 @@ def analyze_glb(data):
     skins = _validate_skins(gltf, reader, warnings, errors)
     meshes = _list_field(gltf, "meshes", "glTF")
     mesh_bindings = _node_bindings(gltf, len(skins), len(meshes), warnings, errors)
+    _check_joint_hierarchies(gltf, skins, mesh_bindings, errors)
     if not meshes:
         warnings.append("GLB has no meshes")
     mesh_reports = []

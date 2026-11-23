@@ -216,6 +216,32 @@ def make_glb(weights=None, joints=None, *, ibm_count=2, add_static=False,
 
 
 class GlbSkinningTests(unittest.TestCase):
+    def test_joint_tree_and_scene_membership(self):
+        def report(nodes, roots, skeleton=None):
+            doc, binary, _ = glb_skinning.parse_glb(make_glb())
+            doc["nodes"] = nodes
+            doc["scenes"] = [{"nodes": scene} for scene in roots]
+            if skeleton is not None:
+                doc["skins"][0]["skeleton"] = skeleton
+            return glb_skinning.analyze_glb(build_glb(doc, binary))
+
+        body = {"mesh": 0, "skin": 0}
+        # The common parent need not be a joint. Root nodes can be shared between scenes.
+        tree = [{}, {}, body, {"children": [0, 1]}, {"children": [3]}, {}]
+        valid = report(tree, [[2, 4], [2, 4, 5]], skeleton=4)
+        self.assertTrue(valid["ok"], valid["errors"])
+        for nodes, scenes, pivot, reason in (
+            ([{}, {}, body], [[0, 1, 2]], None, "common root"),
+            (tree, [[2, 4]], 0, "ancestor"),
+            (tree, [[2, 4], [2, 5]], 3, "scene"),
+            ([{"children": [1]}, {"children": [0]}, body], [[2]], None, "cycle"),
+            ([{"children": [1]}, {}, body, {"children": [1]}], [[0, 2, 3]], None, "parent"),
+        ):
+            with self.subTest(reason=reason):
+                invalid = report(nodes, scenes, pivot)
+                self.assertFalse(invalid["ok"])
+                self.assertIn(reason, " ".join(invalid["errors"]).lower())
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
