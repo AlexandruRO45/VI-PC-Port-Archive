@@ -613,7 +613,6 @@ class TestDSMinF32RegisterAliasing(unittest.TestCase):
         self.lds.write_dword(0x40, ONE_F32)
         state.set_vgpr(VGPR(1), 0x40)
 
-        inst = DSMinF32Instruction.parse("ds_min_i32 v1, v1")  # using ds_min_f32 AST
         inst_f32 = DSMinF32Instruction.parse("ds_min_f32 v1, v1")
         self.interp.execute(state, inst_f32)
 
