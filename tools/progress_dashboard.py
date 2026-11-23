@@ -373,10 +373,11 @@ def group_of_test(name):
 def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
     root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
-    if root.tag not in ("testsuite", "testsuites"):
-        return []
+    # Reports with a custom outer wrapper used to supply direct testsuite children.
+    roots = (root,) if root.tag in ("testsuite", "testsuites") else root.findall("testsuite")
+    cases = (tc for suite in roots for tc in suite.iter("testcase"))
     out = []
-    for tc in root.iter("testcase"):
+    for tc in cases:
         status = tc.get("status")
         st = (status or "").lower()
         fail = tc.find("failure") if tc.find("failure") is not None else tc.find("error")

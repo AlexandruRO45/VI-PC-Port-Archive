@@ -124,6 +124,13 @@ class Tests(unittest.TestCase):
             ("skips", "skip", None, ""),
         ])
 
+    def test_junit_keeps_suites_in_an_unrecognized_wrapper(self):
+        report = """<report>
+            <metadata><testcase name="not a suite result"/></metadata>
+            <testsuite><testcase name="kept"><skipped/></testcase></testsuite>
+        </report>"""
+        self.assertEqual(pd.parse_junit(report), [("kept", "skip", None, "")])
+
     def test_lasttest_log(self):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
