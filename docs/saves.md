@@ -126,6 +126,12 @@ The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`
 %-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads
 in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
 
+A container name has to pass the rule `XGameSaveCreateContainer` enforces, or the game refuses the container however
+complete the folder is ([runtime_imports.md](runtime_imports.md)): at most 256 characters, a path part up to the last
+`/` of letters, digits and `_`, then a non-empty file part of letters, digits, `_`, `.` and `-` that does not end in `.`
+and holds no `..`. The default container is the slot name, which breaks that rule as soon as it has a space, so
+`import` warns and prints the `--map` that renames the container.
+
 Checked earlier with the shim of the open #279, which used the same layout: four imported blobs (2 KB to 1.2 MB)
 read back byte-identical through its `XGameSaveReadBlobData`.
 
