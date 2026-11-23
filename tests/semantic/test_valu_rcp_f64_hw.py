@@ -436,5 +436,120 @@ class TestValuRcpF64ScalarInterpreter(unittest.TestCase):
         self.assertIn("OpCapability Float64", spv)
         self.assertIn("OpFDiv %double", spv)
 
+# ---------------------------------------------------------------------------
+# Phase 4: SIMD Multi-Lane Divergence and EXEC Masking
+# ---------------------------------------------------------------------------
+
+class SIMDState64:
+    """SIMD wavefront state supporting Wave32 and Wave64 execution."""
+
+    def __init__(self, num_lanes: int = 32, exec_mask: int = MASK32) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask & (MASK64 if num_lanes == 64 else MASK32)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(num_lanes)]
+        self.sgprs: List[int] = [0] * 106
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK32
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+    def get_vgpr64(self, lane: int, reg_idx: int) -> int:
+        lo = self.vgprs[lane][reg_idx] & MASK32
+        hi = self.vgprs[lane][(reg_idx + 1) & 0xFF] & MASK32
+        return (hi << 32) | lo
+
+    def set_vgpr64(self, lane: int, reg_idx: int, val: int) -> None:
+        u = val & MASK64
+        self.vgprs[lane][reg_idx] = u & MASK32
+        self.vgprs[lane][(reg_idx + 1) & 0xFF] = (u >> 32) & MASK32
+
+    def get_sgpr64(self, reg_idx: int) -> int:
+        lo = self.sgprs[reg_idx] & MASK32
+        hi = self.sgprs[(reg_idx + 1) % len(self.sgprs)] & MASK32
+        return (hi << 32) | lo
+
+
+class SIMDInterpreter64:
+    """SIMD wavefront execution engine for v_rcp_f64."""
+
+    def resolve_lane_source(self, src: Operand64, lane: int, state: SIMDState64) -> int:
+        if isinstance(src, InlineConstant64):
+            return f64_to_u64(src.val)
+        elif isinstance(src, Register):
+            if src.kind == RegKind.VGPR:
+                return state.get_vgpr64(lane, src.index)
+            else:
+                return state.get_sgpr64(src.index)
+        raise TypeError(f"Unknown operand kind: {type(src)}")
+
+    def step(self, instr: ValuRcpF64Instruction, state: SIMDState64) -> Dict[int, int]:
+        results: Dict[int, int] = {}
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                continue
+            src_bits = self.resolve_lane_source(instr.src, lane, state)
+            res_bits = oracle_rcp_f64_bits(
+                src_bits,
+                clamp=instr.clamp,
+                neg=instr.neg,
+                abs_val=instr.abs_val,
+            )
+            state.set_vgpr64(lane, instr.dst.index, res_bits)
+            results[lane] = res_bits
+        return results
+
+
+class TestValuRcpF64SIMD(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD divergence and EXEC masking."""
+
+    def test_simd_wave32_divergence(self) -> None:
+        # Alternating active lanes: 0x55555555
+        state = SIMDState64(num_lanes=32, exec_mask=0x55555555)
+        interp = SIMDInterpreter64()
+
+        # Initialize all lanes with 2.0
+        for lane in range(32):
+            state.set_vgpr64(lane, 2, f64_to_u64(2.0))
+            state.set_vgpr64(lane, 0, 0xDEADBEEFCAFEBABE)
+
+        inst = ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[2:3]")
+        results = interp.step(inst, state)
+
+        # 16 active lanes
+        self.assertEqual(len(results), 16)
+        for lane in range(32):
+            if lane % 2 == 0:
+                # Active: 1.0 / 2.0 = 0.5
+                self.assertEqual(state.get_vgpr64(lane, 0), f64_to_u64(0.5))
+            else:
+                # Inactive: untouched
+                self.assertEqual(state.get_vgpr64(lane, 0), 0xDEADBEEFCAFEBABE)
+
+    def test_simd_wave64_divergence(self) -> None:
+        # Low 32 lanes active: 0x00000000FFFFFFFF
+        state = SIMDState64(num_lanes=64, exec_mask=0x00000000FFFFFFFF)
+        interp = SIMDInterpreter64()
+
+        for lane in range(64):
+            state.set_vgpr64(lane, 2, f64_to_u64(4.0))
+            state.set_vgpr64(lane, 0, 0)
+
+        inst = ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[2:3]")
+        results = interp.step(inst, state)
+
+        self.assertEqual(len(results), 32)
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(state.get_vgpr64(lane, 0), f64_to_u64(0.25))
+            else:
+                self.assertEqual(state.get_vgpr64(lane, 0), 0)
+
 if __name__ == "__main__":
     unittest.main()
