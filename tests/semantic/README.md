@@ -125,6 +125,12 @@ instruction family per file; the list below describes some of them, not every fi
 - `test_alu_int_misc.py` translates one-instruction synthetic listings for `v_bfm_b32`, `v_and_or_b32`,
   `v_add_lshl_u32`, `v_lshl_or_b32`, `v_mad_i32_i24` and `v_mul_lo_u32` and checks the mrt0 word against
   hand-computed ISA values (masked shift counts, wrapping adds/products, 24-bit sign extension).
+- `test_ms_counts_atomic.py` translates three hand-written wave64 mesh programs (natively and with
+  `--wave64-emulate`, as a mesh stage and with `--mesh-compute`) and checks how the counts of
+  `s_sendmsg(MSG_GS_ALLOC_REQ)` reach the Workgroup variable `%ms_counts`: every send is one `OpAtomicStore` of
+  M0, no plain store names the variable, and its one load comes after a barrier that follows every store
+  (SHADER-766: every invocation of the sending wave runs that scalar instruction, and the sending wave need not
+  be the one that holds invocation 0).
 - `test_lds_subdword_wide.py` translates the GPU tests `cs_w32_lds_subdword` (`ds_write_b8`/`_b16` and their
   `_d16_hi` forms, `ds_read_u8`/`_i8`/`_u16`/`_i16`) and `cs_w32_lds_wide` (`ds_write`/`ds_read` `_b64`/`_b96`/`_b128`,
   `ds_read2st64_b32`) and runs 32 lanes in lockstep; the 16 words come from a byte-level LDS model of the ISA rules
