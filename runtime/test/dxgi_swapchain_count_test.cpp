@@ -183,6 +183,8 @@ VKAPI_ATTR void VKAPI_CALL cmd_blit(VkCommandBuffer, VkImage src, VkImageLayout,
     g.blit_src = src;
     g.blit_dst = dst;
 }
+VKAPI_ATTR void VKAPI_CALL cmd_clear_color(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue*,
+                                           std::uint32_t, const VkImageSubresourceRange*) {}
 VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) {
     return VK_SUCCESS;
 }
@@ -223,6 +225,7 @@ const Entry kEntries[] = {
     {"vkEndCommandBuffer", as_function(end_cmd_buf)},
     {"vkCmdPipelineBarrier", as_function(cmd_barrier)},
     {"vkCmdBlitImage", as_function(cmd_blit)},
+    {"vkCmdClearColorImage", as_function(cmd_clear_color)},
     {"vkQueueSubmit", as_function(queue_submit)},
 };
 
