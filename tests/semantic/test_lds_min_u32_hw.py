@@ -253,3 +253,86 @@ class TestDsMinU32AST(unittest.TestCase):
         expr = DsMinU32Expr("v0 + offset", "v1", "LDS[addr]")
         res = expr.evaluate(0x10, 50, 100)
         self.assertEqual(res, 50)
+
+
+# -----------------------------------------------------------------------------
+# Part 3: Deterministic Scalar Instruction Interpreter & Translator Integration
+# -----------------------------------------------------------------------------
+
+class ScalarRegisterFile:
+    def __init__(self):
+        self.vgprs: dict[int, int] = {}
+        self.sgprs: dict[int, int] = {}
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0)
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+
+class ScalarLDSInterpreter:
+    def __init__(self, lds: LDSModel32 | None = None):
+        self.rf = ScalarRegisterFile()
+        self.lds = lds or LDSModel32()
+
+    def execute(self, inst: DsInstruction) -> None:
+        vaddr = self.rf.get_vgpr(inst.vaddr.index)
+        vdata0 = self.rf.get_vgpr(inst.vdata0.index)
+        old_val = self.lds.ds_min_u32(vaddr, vdata0, inst.offset)
+        if inst.opcode == DsOpcode.DS_MIN_RTN_U32:
+            assert inst.vdst is not None
+            self.rf.set_vgpr(inst.vdst.index, old_val)
+
+
+class TestDsMinU32ScalarInterpreter(unittest.TestCase):
+    """Test suite for the scalar interpreter and rdna2spirv translator verification."""
+
+    def test_scalar_interpreter_chain(self):
+        interp = ScalarLDSInterpreter()
+        interp.lds.write_dword(0x20, 1000)
+
+        # Non-returning ds_min_u32
+        interp.rf.set_vgpr(0, 0x20)
+        interp.rf.set_vgpr(1, 500)
+        inst1 = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        interp.execute(inst1)
+        self.assertEqual(interp.lds.read_dword(0x20), 500)
+
+        # Returning ds_min_rtn_u32
+        interp.rf.set_vgpr(1, 200)
+        inst2 = DsInstruction(DsOpcode.DS_MIN_RTN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1),
+                              vdst=Register(RegKind.VGPR, 2))
+        interp.execute(inst2)
+        self.assertEqual(interp.rf.get_vgpr(2), 500)  # Old value
+        self.assertEqual(interp.lds.read_dword(0x20), 200)  # New min
+
+    @unittest.skipIf(not TRANSLATOR_AVAILABLE, "Translator not available in this environment")
+    def test_translator_spv_emission(self):
+        """Verify that tools/rdna2spirv.py emits OpAtomicUMin for ds_min_u32 and ds_min_rtn_u32."""
+        spv = L.translate([
+            "ds_min_u32 v0, v1",
+            "ds_min_rtn_u32 v2, v0, v1 offset:8"
+        ], name="cs_ds_min_u32_spv")
+        self.assertIn("OpAtomicUMin", spv)
+        self.assertIn("%_ptr_WG_uint", spv)
+        lines = [ln.strip() for ln in spv.splitlines() if "OpAtomicUMin" in ln]
+        self.assertEqual(len(lines), 2)
+
+    @unittest.skipIf(not TRANSLATOR_AVAILABLE, "Translator not available in this environment")
+    def test_translator_lds_run_chain(self):
+        """Verify execution through tools/rdna2spirv.py and spirv_mini_interp via lds_run."""
+        ops = [
+            ("ds_min_rtn_u32", 0x40, 0, (50,)),
+            ("ds_min_u32", 0x40, 0, (20,)),
+            ("ds_min_rtn_u32", 0x40, 0, (70,)),  # 70 > 20, min stays 20
+        ]
+        rtns, fin = L.run_chain(ops, {0x40: 100})
+        self.assertEqual(rtns, [100, 0xDEAD, 20])
+        self.assertEqual(fin, {0x40: 20})
