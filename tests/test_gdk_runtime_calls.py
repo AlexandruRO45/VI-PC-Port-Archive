@@ -383,6 +383,39 @@ class ImageTest(unittest.TestCase):
             with open(path, "rb") as f:
                 self.assertEqual(f.read(), original)
 
+    def test_main_refuses_reports_aliased_across_images(self):
+        second = self.write("second.dll", build_image())
+        third = self.write("third.dll", build_image())
+        for suffix in ("json", "txt"):
+            with self.subTest(suffix=suffix):
+                out = os.path.join(self.tmp, f"alias-images-{suffix}")
+                os.mkdir(out)
+                first_name = "thunks.dll.gdk_calls.json"
+                second_name = f"second.dll.gdk_calls.{suffix}"
+                first_report = os.path.join(out, first_name)
+                second_report = os.path.join(out, second_name)
+                original = b"previous report\n"
+                with open(first_report, "wb") as f:
+                    f.write(original)
+                try:
+                    os.link(first_report, second_report)
+                except OSError as e:
+                    self.skipTest(f"hard links unavailable: {e}")
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    rc = grc.main([self.path, second, third, "--out", out])
+                self.assertEqual(rc, 1)
+                self.assertIn("reports for different images name the same file", stderr.getvalue())
+                for path in (first_report, second_report):
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), original)
+                self.assertEqual(set(os.listdir(out)), {
+                    first_name, second_name, "third.dll.gdk_calls.json", "third.dll.gdk_calls.txt",
+                })
+                with open(os.path.join(out, "third.dll.gdk_calls.json"), encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["file"], "third.dll")
+
     def test_main_writes_text_and_json_with_lf(self):
         out = os.path.join(self.tmp, "out")
         source = self.write("xgameruntime.cpp", SERVED_SOURCE.encode())

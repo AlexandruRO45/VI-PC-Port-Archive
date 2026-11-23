@@ -1008,6 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rc = 0
     reports, used = [], set()
+    report_pairs = []
     for path in a.image:
         try:
             r = report(path, table, served)
@@ -1041,12 +1042,27 @@ def main(argv: list[str] | None = None) -> int:
              if any(same_report_path(inp, out_path) for inp in inputs)),
             None,
         )
+        report_pairs.append((path, r, (json_path, txt_path), collision))
+
+    # Check every pair before writing, so a collision leaves both existing names intact.
+    aliased_pairs = set()
+    for index, (_, _, paths, _) in enumerate(report_pairs):
+        for other_index in range(index + 1, len(report_pairs)):
+            _, _, other_paths, _ = report_pairs[other_index]
+            if any(same_report_path(first, second) for first in paths for second in other_paths):
+                aliased_pairs.update((index, other_index))
+
+    for index, (path, r, (json_path, txt_path), collision) in enumerate(report_pairs):
         if collision:
             print(f"{path}: report {collision} would overwrite input file", file=sys.stderr)
             rc = 1
             continue
         if same_report_path(json_path, txt_path):
             print(f"{path}: JSON and text reports name the same file ({json_path}, {txt_path})", file=sys.stderr)
+            rc = 1
+            continue
+        if index in aliased_pairs:
+            print(f"{path}: reports for different images name the same file", file=sys.stderr)
             rc = 1
             continue
         try:
