@@ -317,6 +317,16 @@ class TestSAddcU32AST(unittest.TestCase):
         expr = SAddcU32Expr(0x70000000, 0x10000000, 1)
         self.assertEqual(expr.eval(), (0x80000001, 0))
 
+class TestSAddcU32ChainingAndPropagation(unittest.TestCase):
+    def test_64bit_add_chain(self) -> None:
+        # 64-bit addition: A + B
+        a_lo, a_hi = 0xFFFFFFFF, 0x00000001
+        b_lo, b_hi = 0x00000001, 0x00000002
+        r_lo, cout = ref_s_add_u32(a_lo, b_lo)
+        r_hi, cout2 = ref_s_addc_u32(a_hi, b_hi, cout)
+        self.assertEqual((r_lo, r_hi), (0, 4))
+        self.assertEqual(cout2, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
