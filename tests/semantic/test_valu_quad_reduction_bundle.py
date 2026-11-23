@@ -646,3 +646,38 @@ class TestDsSwizzleB32Oracle(unittest.TestCase):
         res, _ = run_workgroup_lanes("ps_swiz_swap", lines, lanes=4)
         expected = ref_ds_swizzle_swap([0, 1, 2, 3])
         self.assertEqual(res, expected)
+
+
+# ------------------------------------------------------------------------------
+# ds_swizzle_b32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class DsSwizzleB32Instruction:
+    dst: RegisterOperand
+    src0: RegisterOperand
+    pattern: str
+
+
+class TestDsSwizzleB32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_add_nc_u32 v2, v0, 10",
+            "ds_swizzle_b32 v4, v2 offset:swizzle(QUAD_PERM,1,0,3,2)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_swiz_ast_scalar", lines, lanes=4)
+        self.assertEqual(res, [11, 10, 13, 12])
+
+    def test_reverse_swizzle_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_add_nc_u32 v2, v0, 20",
+            "ds_swizzle_b32 v4, v2 offset:swizzle(REVERSE,4)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_swiz_rev", lines, lanes=4)
+        self.assertEqual(res, [23, 22, 21, 20])
