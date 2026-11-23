@@ -121,6 +121,21 @@ class Cli(unittest.TestCase):
         self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
         self.assertIn("unavailable", r.stdout)
 
+    def test_exits_77_if_oracle_becomes_unavailable_after_open(self):
+        oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+        with tempfile.TemporaryDirectory() as d:
+            report = Path(d) / "report.json"
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                    mock.patch.object(sw, "check_modes", side_effect=runner.Unavailable("driver stopped")), \
+                    redirect_stdout(out), redirect_stderr(err):
+                rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(report)])
+            self.assertEqual(rc, 77)
+            self.assertIn("hardware oracle unavailable: driver stopped", out.getvalue())
+            self.assertEqual(err.getvalue(), "")
+            self.assertFalse(report.exists())
+            oracle.close.assert_called_once_with()
+
     def test_unknown_names_are_a_usage_error(self):
         r = subprocess.run([sys.executable, "-I", str(TOOLS / "f16_trans_sweep.py"), "--ops", "v_exp_f32"],
                            capture_output=True, text=True)

@@ -496,6 +496,9 @@ def main(argv=None):
                         print(f"    vs Sin/Cos(f32 6.2831855 * x), {band}: " + ", ".join(f"{k} {v}" for k, v in s.items()))
             print(f"{op} specials (hw, mode {modes[0]}): " + ", ".join(
                 f"{h} -> {v}" for h, v in report["ops"][op][modes[0]]["specials"].items()))
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}")
+        return 77
     except RuntimeError as e:
         print(f"harness error: {e}")
         return 2
