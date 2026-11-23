@@ -102,6 +102,7 @@ def broken_links(root, files):
                     problems.append((os.path.relpath(path, root), link, "same-page anchor not found"))
                 continue
             target, _, anchor = link.partition("#")
+            anchor = unquote(anchor)
             if not target:
                 continue
             target = unquote(target.split("?", 1)[0])
@@ -162,8 +163,9 @@ class RepositoryLinksTest(unittest.TestCase):
             def write(name, text):
                 with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
                     f.write(text)
-            write("good.md", "# Intro\n\n[other](other.md)\n[section](other.md#heading-one)\n[here](#intro)\n")
-            write("other.md", "## Heading one\n")
+            write("good.md", "# Intro\n\n[other](other.md)\n[section](other.md#heading-one)\n"
+                             "[encoded section](other.md#caf%C3%A9)\n[here](#intro)\n")
+            write("other.md", "## Heading one\n\n## Caf\u00e9\n")
             write("bad.md", "[missing](nope.md)\n[bad anchor](other.md#nope)\n")
             files = [os.path.join(tmp, name) for name in ("bad.md", "good.md", "other.md")]
             problems = sorted(broken_links(tmp, files))
