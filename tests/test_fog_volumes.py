@@ -1,4 +1,6 @@
 """Synthetic unit tests for tools/fog_volumes.py (ASSET-308). No game files."""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -232,6 +234,39 @@ class FogVolumesTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 fv.main([os.path.join(td, "missing.rpf")])
             self.assertEqual(cm.exception.code, 2)
+
+    def test_out_naming_a_file_in_the_scanned_folder_is_refused(self):
+        # A folder scan reads every top-level file in it, so a --out that names one of them used to replace the
+        # carved input with the report and still exit 0.
+        raw = build_synthetic_fog_0x7a([{"IsBox": 1, "ProfileIndex": 12}])
+        with tempfile.TemporaryDirectory() as td:
+            carved = os.path.join(td, "000000001000.bin")
+            with open(carved, "wb") as f:
+                f.write(raw)
+            for out in (carved, os.path.join(td, "alias.bin")):
+                if out != carved:
+                    os.link(carved, out)            # a second name for the same carved input
+                with self.subTest(out=os.path.basename(out)):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                        fv.main([td, "--out", out, "--jobs", "1"])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("--out would overwrite the input " + carved, err.getvalue())
+                    with open(carved, "rb") as f:
+                        self.assertEqual(f.read(), raw)
+
+    def test_report_in_the_scanned_folder_under_a_new_name_is_written(self):
+        raw = build_synthetic_fog_0x7a([{"IsBox": 1, "ProfileIndex": 12}])
+        with tempfile.TemporaryDirectory() as td:
+            carved = os.path.join(td, "000000001000.bin")
+            with open(carved, "wb") as f:
+                f.write(raw)
+            report = os.path.join(td, "fog.json")
+            self.assertEqual(fv.main([td, "--out", report, "--jobs", "1"]), 0)
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["volumes"], 1)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), raw)
 
     def test_jobs_below_one_is_a_usage_error(self):
         # A --jobs of 0 used to run with max(1, 0) = one worker and exit 0, so a caller that meant to ask for

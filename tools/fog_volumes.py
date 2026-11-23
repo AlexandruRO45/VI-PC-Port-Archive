@@ -422,6 +422,17 @@ def main(argv=None) -> int:
             ap.error(f"--out is a directory: {a.out}")
         if os.path.isfile(a.path) and same_report_path(a.path, a.out):
             ap.error(f"--out would overwrite input: {a.out}")
+        if os.path.isdir(a.path):
+            # A folder scan reads every top-level file in it (iter_fog_resources), so a report named like one of
+            # them replaces a carved input with the summary. A new name in the folder is still allowed.
+            try:
+                names = sorted(os.listdir(a.path))
+            except OSError:
+                names = []          # summarize() reports the unreadable folder with its own ERROR line
+            for name in names:
+                input_file = os.path.join(a.path, name)
+                if os.path.isfile(input_file) and same_report_path(a.out, input_file):
+                    ap.error(f"--out would overwrite the input {input_file}")
     try:
         doc = summarize(a.path, jobs=a.jobs)
         if a.out:
