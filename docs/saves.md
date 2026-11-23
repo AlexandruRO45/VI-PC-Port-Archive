@@ -126,15 +126,20 @@ The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`
 %-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads
 in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
 
-Checked earlier with the shim of the open #279, which used the same layout: four imported blobs (2 KB to 1.2 MB)
+Checked earlier with the shim of the open #279, which used the same layout: four payload files (2 KB to 1.2 MB)
 read back byte-identical through its `XGameSaveReadBlobData`.
 
 **Measured in the retail executable's XGameSave writer:** a save update submits two fixed blobs, `Save Game Header`
 (`0x128` bytes, serialized from the save object's fields) and `Save Game Data` (variable size), through two
-`XGameSaveSubmitBlobWrite` calls. The container name is assembled separately before `XGameSaveCreateContainer`, so
-container = slot name is still consistent. The import below instead writes each payload under its own file name;
-that is not a blob name the title reads, and the header is not an on-disk file, so an imported save is not loadable
-as-is. Use `--map` for the container and blob names, and produce the header separately once its format is known.
+`XGameSaveSubmitBlobWrite` calls. The container name is assembled separately before `XGameSaveCreateContainer`;
+`container = slot name` is **likely** (the same field is the suffix of the persistent-local-storage path), but not
+confirmed. The import above instead writes each payload under its own file name; that is not a blob name the title
+reads, and the header is not a separate file in the save folder, so an imported save is not loadable as-is. `--map`
+renames the single payload blob; it does not create the two blobs.
+
+**VERIFY:** the container name and the `0x128`-byte header's field layout. The blob names and the header size are
+measured; the header's serialization is not. `0x128` is also where the ASAV slot name begins, which would support
+`container = slot name`, but the executable's header is built from object fields, not copied from the ASAV file.
 
 ## Key names
 

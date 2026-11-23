@@ -285,7 +285,8 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Interfaces:** the class id doubles as `IXGameSaveImpl`'s; `IXGameSaveImpl2` (adds the three `XGameSaveFiles`
   slots, 30-32) and `IXGameSaveImpl3` (no methods of its own) answer with the same 33-slot vtable.
 - **Storage:** `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`,
-  names %-encoded: the layout `tools/saves.py import` writes ([saves.md](saves.md#importing-into-the-runtime)).
+  names %-encoded: the directory layout `tools/saves.py import` writes
+  ([saves.md](saves.md#importing-into-the-runtime)).
   `XGameSaveFilesGetFolderWithUi*` gives `<root>\files\<configId>`.
 - **Updates:** writes and deletes are buffered; `XGameSaveSubmitUpdate` writes each new blob beside its final name,
   then renames it over, so a failed write leaves the container as it was. One write or delete per blob per update;

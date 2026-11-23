@@ -18,10 +18,11 @@ Commands
                                  of the runtime's offline XGameSave (runtime/shims/xgameruntime_gamesave.cpp):
                                  DIR/local-user/<container>/<blob>, names %-encoded the same way.
                                  DIR defaults to %LOCALAPPDATA%\\Leonida\\saves (the shim's LEONIDA_SAVE_DIR default).
-                                 VERIFY: the executable submits two fixed blobs, "Save Game Header" (0x128 bytes,
-                                 serialized from the save object) and "Save Game Data" (variable), not the payload
-                                 file name. This import writes one blob per payload file, so the title will not read
-                                 it until the header/data split is implemented. Use --map for container/blob names.
+                                 Measured in the executable: it submits two fixed blobs, "Save Game Header"
+                                 (0x128 bytes, serialized from the save object) and "Save Game Data" (variable),
+                                 not the payload file name. This import writes one blob per payload file, so the
+                                 title will not read it until the header/data split is implemented. --map
+                                 renames that payload's container/blob; it does not create the two blobs.
 """
 import json
 import os
