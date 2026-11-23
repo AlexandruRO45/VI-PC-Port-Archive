@@ -401,10 +401,19 @@ struct BundledLoaderEntry {
     const BundledModuleOps* ops;
 };
 
+struct XMemHooksEntry {
+    const void* owner;
+    const XMemAllocationHooks* hooks;
+};
+
 // Immortal and constant-initialized: late mapped-DLL detach, atexit handlers, or guest threads (with TLS slot 0
 // owned by the mapped executable) may call GetProcAddress/FreeLibrary without tripping a function-local static guard.
 SRWLOCK g_bundled_lock = SRWLOCK_INIT;
 std::vector<BundledLoaderEntry>* g_bundled_loaders = nullptr;
+// Same rule as the registry table: the title's thread first asks for these hooks inside D3D12XboxCreateDevice, after
+// the loader has moved the process TLS, so no function-local static may guard this list.
+SRWLOCK g_xmem_hooks_lock = SRWLOCK_INIT;
+std::vector<XMemHooksEntry>* g_xmem_hooks = nullptr;
 
 struct SrwLockGuard {
     SRWLOCK* lock;
@@ -520,6 +529,31 @@ const std::filesystem::path* bundled_module_path(void* module) {
         if (entry.ops->module_path)
             if (const std::filesystem::path* p = entry.ops->module_path(entry.ctx, module)) return p;
     return nullptr;
+}
+
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
+    if (!owner || !hooks) return;
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    if (!g_xmem_hooks) g_xmem_hooks = new std::vector<XMemHooksEntry>;
+    g_xmem_hooks->push_back({owner, hooks});
+}
+
+void remove_xmem_allocation_hooks(const void* owner) {
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    if (!g_xmem_hooks) return;
+    auto& list = *g_xmem_hooks;
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner) {
+            it = list.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const XMemAllocationHooks* xmem_allocation_hooks() {
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    return (g_xmem_hooks && !g_xmem_hooks->empty()) ? g_xmem_hooks->back().hooks : nullptr;
 }
 
 Table::Table(const Entry* entries, size_t count) {

@@ -1070,6 +1070,7 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    shims::remove_xmem_allocation_hooks(this);
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
@@ -1480,6 +1481,17 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
         // and is therefore done first: until it succeeds the module has no state outside this function to roll back.
         parse_exports(*m);
 
+        // A title that intercepts its own descriptor-heap backing exports the callback struct. Register it before
+        // initialize_tls/DllMain can run image code, and remove it if publishing the module fails (the loader
+        // destructor also removes it on normal teardown).
+        if (auto it = m->exports.find("__XMemAllocationHooks__"); it != m->exports.end()) {
+            const auto offset = static_cast<uint64_t>(static_cast<uint8_t*>(it->second) - m->base);
+            if (offset <= m->size && m->size - offset >= sizeof(shims::XMemAllocationHooks)) {
+                shims::add_xmem_allocation_hooks(this,
+                                                 static_cast<const shims::XMemAllocationHooks*>(it->second));
+            }
+        }
+
         // Prepare every allocation needed to publish the module before installing TLS. Once initialize_tls succeeds,
         // committing the already-prepared pointer and range cannot throw.
         const auto key = module_key(path);
@@ -1504,6 +1516,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
         }
         return *m;
     } catch (...) {
+        shims::remove_xmem_allocation_hooks(this);
         if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
         delete m;
         throw;
