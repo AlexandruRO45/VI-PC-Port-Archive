@@ -353,5 +353,118 @@ class TestLdsOrB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.interp.read_vgpr(1), 0xDEADBEEF)
 
 
+# ---------------------------------------------------------------------------
+# SIMD Multi-Lane Wavefront Interpreter (Wave32 and Wave64)
+# ---------------------------------------------------------------------------
+
+class SIMDLdsWavefrontInterpreter:
+    """SIMD wavefront interpreter supporting Wave32 and Wave64 execution modes."""
+
+    def __init__(self, wave_size: int = 32, size_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got: {wave_size}")
+        self.wave_size: int = wave_size
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.lds: LDSMemory = LDSMemory(size_dwords)
+
+    def read_lane_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[lane][idx] & MASK32
+
+    def write_lane_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[lane][idx] = val & MASK32
+
+    def set_exec_mask(self, mask: int) -> None:
+        limit = (1 << self.wave_size) - 1
+        self.exec_mask = mask & limit
+
+    def step(self, inst: Instruction) -> list[int]:
+        """Executes ds_or_b32 across all active lanes; returns updated memory values."""
+        results: list[int] = []
+        for lane in range(self.wave_size):
+            lane_active = bool((self.exec_mask >> lane) & 1)
+            if not lane_active:
+                results.append(0)
+                continue
+
+            vaddr = self.read_lane_vgpr(lane, inst.vaddr.index)
+            vdata = self.read_lane_vgpr(lane, inst.vdata.index)
+            updated = self.lds.atomic_or_b32(vaddr, vdata, offset16=inst.mods.offset)
+            results.append(updated)
+        return results
+
+
+class TestLdsOrB32SIMD(unittest.TestCase):
+    """Unit tests for SIMD execution divergence across Wave32 and Wave64 wavefronts."""
+
+    def test_simd_wave32_all_active_independent_addresses(self) -> None:
+        simd = SIMDLdsWavefrontInterpreter(wave_size=32, size_dwords=1024)
+        for lane in range(32):
+            addr = lane * 4
+            simd.lds.write_dword(addr, 0x1000)
+            simd.write_lane_vgpr(lane, 0, addr)       # vaddr
+            simd.write_lane_vgpr(lane, 1, 1 << lane)  # vdata
+
+        inst = Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.step(inst)
+
+        for lane in range(32):
+            self.assertEqual(simd.lds.read_dword(lane * 4), 0x1000 | (1 << lane))
+
+    def test_simd_wave32_divergent_alternating_mask(self) -> None:
+        simd = SIMDLdsWavefrontInterpreter(wave_size=32, size_dwords=1024)
+        simd.set_exec_mask(0x55555555)  # Even lanes active, odd inactive
+
+        for lane in range(32):
+            addr = lane * 4
+            simd.lds.write_dword(addr, 0x00FF)
+            simd.write_lane_vgpr(lane, 0, addr)
+            simd.write_lane_vgpr(lane, 1, 0xFF00)
+
+        inst = Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.step(inst)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(simd.lds.read_dword(lane * 4), 0xFFFF)
+            else:
+                self.assertEqual(simd.lds.read_dword(lane * 4), 0x00FF)
+
+    def test_simd_wave64_divergent_half_mask(self) -> None:
+        simd = SIMDLdsWavefrontInterpreter(wave_size=64, size_dwords=1024)
+        simd.set_exec_mask(0x00000000FFFFFFFF)  # Lower 32 lanes active
+
+        for lane in range(64):
+            addr = lane * 4
+            simd.lds.write_dword(addr, 0x1200)
+            simd.write_lane_vgpr(lane, 0, addr)
+            simd.write_lane_vgpr(lane, 1, 0x0034)
+
+        inst = Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.step(inst)
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(simd.lds.read_dword(lane * 4), 0x1234)
+            else:
+                self.assertEqual(simd.lds.read_dword(lane * 4), 0x1200)
+
+    def test_simd_multi_lane_atomic_reduction_to_same_address(self) -> None:
+        # Multiple active lanes targeting the exact same LDS dword atomically aggregate their bits
+        simd = SIMDLdsWavefrontInterpreter(wave_size=32, size_dwords=1024)
+        simd.lds.write_dword(0x80, 0x00000000)
+
+        for lane in range(16):
+            simd.write_lane_vgpr(lane, 0, 0x80)       # Same address
+            simd.write_lane_vgpr(lane, 1, 1 << lane)  # Distinct bit
+        simd.set_exec_mask(0x0000FFFF)  # First 16 lanes active
+
+        inst = Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.step(inst)
+
+        # All 16 bits [0:15] must be atomically aggregated into memory
+        self.assertEqual(simd.lds.read_dword(0x80), 0x0000FFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
