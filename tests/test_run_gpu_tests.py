@@ -21,6 +21,32 @@ DEVICE_64 = "device: X (subgroup 32..64)\n"
 CONFIRMED = "compute subgroup size: 64\n"
 
 
+class BarycentricFallbackSelection(unittest.TestCase):
+    def setUp(self):
+        rgt._BARYCENTRIC_FALLBACK.clear()
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "1"}, clear=False):
+            self.assertTrue(rgt.bary_fallback())
+        with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "0"}, clear=False):
+            proc = SimpleNamespace(stdout='{"barycentric_fallback": true}\n')
+            with patch.object(rgt.subprocess, "run", return_value=proc):
+                self.assertFalse(rgt.bary_fallback())
+
+    def test_anv_probe_is_selected_when_env_is_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LEONIDA_BARY_FALLBACK", None)
+            proc = SimpleNamespace(stdout='{"barycentric_fallback": true}\n')
+            with patch.object(rgt.subprocess, "run", return_value=proc):
+                self.assertTrue(rgt.bary_fallback())
+
+    def test_probe_failure_is_not_a_fallback(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LEONIDA_BARY_FALLBACK", None)
+            with patch.object(rgt.subprocess, "run", side_effect=OSError("no Vulkan")):
+                self.assertIs(rgt.bary_fallback(), False)
+
+
 def dump(words, pad=8):
     return "out[0..7] = " + " ".join(str(w) for w in (list(words) + [0] * pad)[:8]) + "\n"
 

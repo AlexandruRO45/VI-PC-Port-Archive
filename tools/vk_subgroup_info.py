@@ -32,6 +32,11 @@ docs/design.md): the fragmentShaderBarycentric feature, and a driver other than 
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
+barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
+advertises fragmentShaderBarycentric but returns a zero BaryCoordKHR.i for translated pixel shaders on Intel Arc B580;
+the pass-through geometry-shader fallback is correct there. The builder therefore selects --bary-fallback for ANV
+until the driver issue is fixed.
+
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
@@ -55,6 +60,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
 VK_DRIVER_ID_MOLTENVK = 14
+VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
 # Navi 10, Navi 14, and Navi 12 PCI IDs from Linux amdgpu's chipset table.
@@ -160,6 +166,11 @@ def rdna2_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
     """An RDNA2 GPU under AMD's proprietary (Windows) driver: the one whose compiler crashes on #857's modules."""
     return (vendor_id == AMD_VENDOR_ID and driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
             and any(lo <= device_id <= hi for lo, hi in RDNA2_DEVICE_IDS))
+
+
+def barycentric_fallback(driver_id: int) -> bool:
+    """ANV exposes native barycentrics but currently miscomputes BaryCoordKHR.i on Intel Arc (#SHADER-925)."""
+    return driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
 
 
 def physical_devices(vk, instance):
@@ -324,6 +335,7 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            "barycentric_fallback": barycentric_fallback(driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,

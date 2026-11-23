@@ -797,6 +797,7 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "barycentric_fallback": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -819,6 +820,21 @@ class QueryTest(unittest.TestCase):
             with self.subTest(case=label):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_barycentric_fallback(self):
+        for label, driver, want in (("anv", vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, True),
+                                    ("radv", 3, False), ("intel_windows", 5, False)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(driver_id=driver))
+                self.assertIs(res["barycentric_fallback"], want)
+        self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
+        """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""
+        res, _vk = self._run_query(FakeDevice(name="Intel Arc", vendor_id=0x8086, device_id=0xE20B,
+                                               driver_id=5))
+        self.assertFalse(res["barycentric_fallback"])
+        self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
 
     def test_stage_caps_preserve_graphics_stage_bits(self):
         supported = 0x01 | 0x08 | 0x10 | 0x20

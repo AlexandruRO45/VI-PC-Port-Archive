@@ -439,6 +439,12 @@ too and which `--bary-fallback` can't express. With `LEONIDA_F16_INTERP_FALLBACK
 exports decoded instead (see Macs, below) and run with or without the bary fallback; `run_gpu_tests.py` turns that
 on by itself where the device lacks the extension. Under the bary fallback without it they skip.
 
+Intel Arc with Mesa ANV currently advertises the native barycentric feature but has a driver bug where translated
+pixel shaders can read `BaryCoordKHR.i` as zero (SHADER-925). `make_game.py` detects ANV and automatically translates
+with `--bary-fallback`; both entry points accept `LEONIDA_BARY_FALLBACK=1` to force it and
+`LEONIDA_BARY_FALLBACK=0` to force native barycentrics. The CLI `--bary-fallback` flag also remains available for
+game builds and other manually built fixtures.
+
 ## Macs: 16-bit interpolation without PerVertexKHR
 
 `ps_interp_f16_high` (and `ms_f16_pack`) normally read 16-bit interpolants through `PerVertexKHR` inputs, which
