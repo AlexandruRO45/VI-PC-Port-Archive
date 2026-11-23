@@ -153,6 +153,8 @@ def _parse_spv(asm):
     # --wave64-emulate's structured form calls single-block helpers (x_pre_mask_fn, x_pre_vote_fn) from %main.
     # Inline each call where it stands, with its ids renamed per call site, so the lockstep interpreter below
     # runs them as part of the calling block.
+    # Every id the module already spells is reserved, so an inlined id never takes the name of one the caller uses.
+    used_ids = {tok for tok in asm.split() if tok.startswith("%")}
     call_seq = 0
     for label, insns in blocks.items():
         inlined = []
@@ -178,6 +180,9 @@ def _parse_spv(asm):
                 new_res = None
                 if fres is not None:
                     new_res = f"%call{call_seq}_{fres[1:]}"
+                    while new_res in used_ids:
+                        new_res += "_"
+                    used_ids.add(new_res)
                     id_map[fres] = new_res
                 inlined.append((new_res, fop, fargs))
         blocks[label] = inlined
@@ -1552,6 +1557,45 @@ class BarrierInLoopsTests(unittest.TestCase):
                                        threads=threads, lds_bytes=threads * 4, emulate=emulate)
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 self.assertEqual([mem[4 * t] for t in range(threads)], oracle(threads, 64 if wave64 else 32))
+
+
+class HelperInlineTests(unittest.TestCase):
+    """_parse_spv inlines helper calls; an inlined id must not replace a value the caller holds."""
+
+    ASM = """
+%u = OpTypeInt 32 0
+%u64 = OpTypeInt 64 0
+%void = OpTypeVoid
+%ptr = OpTypePointer PhysicalStorageBuffer %u
+%ft = OpTypeFunction %u
+%mt = OpTypeFunction %void
+%one = OpConstant %u 1
+%two = OpConstant %u 2
+%addr = OpConstant %u64 4096
+%addr8 = OpConstant %u64 4104
+%helper = OpFunction %u None %ft
+%h = OpLabel
+%x = OpCopyObject %u %two
+OpReturnValue %x
+OpFunctionEnd
+%main = OpFunction %void None %mt
+%entry = OpLabel
+%held = OpCopyObject %u %one
+%r = OpFunctionCall %u %helper
+%p = OpConvertUToPtr %ptr %addr
+OpStore %p %held Aligned 4
+%q = OpConvertUToPtr %ptr %addr8
+OpStore %q %r Aligned 4
+OpReturn
+OpFunctionEnd
+"""
+
+    def test_caller_id_spelled_like_an_inlined_id_keeps_its_value(self):
+        # The first call names the helper's %x "%call1_x"; a caller id of that spelling must still hold 1.
+        for held in ("%held", "%call1_x", "%call1_x_"):
+            with self.subTest(held=held):
+                mem = run_compute_workgroup(self.ASM.replace("%held", held), 1, 1)
+                self.assertEqual(mem, {4096: 1, 4104: 2})
 
 
 if __name__ == "__main__":
