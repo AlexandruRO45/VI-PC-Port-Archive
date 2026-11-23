@@ -140,9 +140,20 @@ int main() {
     check(at<ErrorDialog>(ui, 14)(ui, &async, static_cast<HRESULT>(0x80830003), "save") == S_OK && finished(&async) &&
               at<AsyncOnly>(ui, 15)(ui, &async) == S_OK,
           "an error dialog is logged and dismissed");
+    XTaskQueueHandle uiQueue = nullptr;
+    if (FAILED(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::ThreadPool, &uiQueue))) {
+        check(false, "create offline UI queue");
+        return 1;
+    }
     for (int i = 0; i != 4; ++i) {
         HANDLE event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
         XAsyncBlock block{};
+        if (!event) {
+            check(false, "create offline UI event");
+            XTaskQueueCloseHandle(uiQueue);
+            return 1;
+        }
+        block.queue = uiQueue;
         block.context = event;
         block.callback = ui_done;
         HRESULT hr = E_FAIL;
@@ -152,7 +163,16 @@ int main() {
         if (i == 3) hr = at<Picker>(ui, 11)(ui, &block, nullptr, "pick", 0, nullptr, 0, nullptr, 0, 1);
         check(hr == S_OK, "offline UI async starts successfully");
         if (hr == S_OK) {
-            check(WaitForSingleObject(event, 5000) == WAIT_OBJECT_0, "offline UI callback runs");
+            check(XAsyncGetStatus(&block, false) == E_PENDING, "offline UI stays pending before dispatch");
+            XTaskQueueDispatch(uiQueue, XTaskQueuePort::Work, 5000);
+            DWORD wait = WaitForSingleObject(event, 5000);
+            check(wait == WAIT_OBJECT_0, "offline UI callback runs");
+            if (wait != WAIT_OBJECT_0) {
+                XAsyncCancel(&block);
+                while (XAsyncGetStatus(&block, false) == E_PENDING)
+                    XTaskQueueDispatch(uiQueue, XTaskQueuePort::Work, INFINITE);
+                WaitForSingleObject(event, INFINITE);
+            }
             check(XAsyncGetStatus(&block, false) == E_ABORT, "offline UI completes dismissed");
             if (i == 3) {
                 uint32_t count = 99, used = 99;
@@ -166,6 +186,7 @@ int main() {
         }
         CloseHandle(event);
     }
+    XTaskQueueCloseHandle(uiQueue);
     check(at<NoArgs>(ui, 20)(ui) == E_NOTIMPL, "an unknown slot answers E_NOTIMPL");
 
     // ---- XGameStreaming ----
