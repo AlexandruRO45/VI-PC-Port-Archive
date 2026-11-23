@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -533,6 +534,34 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                     make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
                 self.assertEqual(run.call_args_list, expected)
 
+    def test_assets_build_uses_the_windows_host_with_an_sdk(self) -> None:
+        programs = os.path.join(self.tmp.name, "Program Files")
+        native = os.path.join(programs, "dotnet", "dotnet.exe")
+        path_host = os.path.join(self.tmp.name, "runtime-only", "dotnet.exe")
+        os.makedirs(os.path.dirname(native))
+        with open(native, "wb") as f:
+            f.write(b"synthetic host")
+        os.makedirs(os.path.join(self.tmp.name, "third_party", "rpf9-explorer", "Core"))
+
+        for path_listing, status, expected in (("", 0, native), ("8.0.101 [SDK]\n", 1, native),
+                                              ("8.0.101 [SDK]\n", 0, path_host)):
+            with self.subTest(path_listing=path_listing, status=status):
+                def list_sdks(command, **kwargs):
+                    self.assertEqual(command[1:], ["--list-sdks"])
+                    if command[0] == native:
+                        return subprocess.CompletedProcess(command, 0, "8.0.200 [SDK]\n", "")
+                    return subprocess.CompletedProcess(command, status, path_listing, "")
+
+                with mock.patch.object(make_game.os, "name", "nt"), \
+                        mock.patch.dict(os.environ, {"ProgramW6432": programs}), \
+                        mock.patch.object(make_game.shutil, "which", return_value=path_host), \
+                        mock.patch.object(make_game.subprocess, "run", side_effect=list_sdks), \
+                        mock.patch.object(make_game, "ROOT", self.tmp.name), \
+                        mock.patch.object(make_game, "run") as build:
+                    self.assertTrue(make_game.dotnet_sdk_ok())
+                    make_game.rpf9dump(self.work_dir)
+                self.assertEqual(build.call_args.args[0][:2], [expected, "build"])
+
     def test_pending_exports_refresh_the_existing_helper_once(self) -> None:
         # Built under the repo (not --work) so `dotnet -o` is not pointed at a locked remote path.
         output = os.path.join(self.tmp.name, "tools", "rpf9dump", "bin", "Release", "net8.0")
@@ -545,7 +574,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
 
         with mock.patch.object(make_game, "ROOT", self.tmp.name), \
                 mock.patch.object(make_game, "MODEL_ARCHIVES", ["scene.rpf"]), \
-                mock.patch.object(make_game, "need"), mock.patch.object(make_game, "py"), \
+                mock.patch.object(make_game, "dotnet_sdk_host", return_value="dotnet"), mock.patch.object(make_game, "py"), \
                 mock.patch.object(make_game, "run") as run, mock.patch("shutil.which", return_value=None):
             make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
 

@@ -1013,16 +1013,30 @@ def cross_build_missing() -> list:
     return missing
 
 
+def dotnet_sdk_host() -> str | None:
+    """Find a dotnet host that can see SDK 8 or newer for the asset exporter."""
+    candidates = [shutil.which("dotnet")]
+    if os.name == "nt":
+        program_files = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles")
+        if program_files:
+            native = os.path.join(program_files, "dotnet", "dotnet.exe")
+            if os.path.isfile(native):
+                candidates.append(native)
+    # A Windows host on PATH may only have a runtime or may be the x86 host with no SDK of its own.
+    for host in dict.fromkeys(candidates):
+        if not host:
+            continue
+        try:
+            probe = subprocess.run([host, "--list-sdks"], capture_output=True, text=True, errors="replace", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", probe.stdout, re.M)):
+            return host
+    return None
+
+
 def dotnet_sdk_ok() -> bool:
-    """True if a .NET SDK 8 or newer is installed. `dotnet` is also on PATH with only a runtime, and then
-    `dotnet build` fails with "No .NET SDKs were found"."""
-    if not shutil.which("dotnet"):
-        return False
-    try:
-        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
+    return dotnet_sdk_host() is not None
 
 
 def submodule_ready() -> bool:
@@ -1950,9 +1964,11 @@ def rpf9dump(work: str) -> str:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if not os.path.isdir(core):
         fail("third_party/rpf9-explorer is empty. Run: git submodule update --init")
-    need("dotnet", "Install the .NET 8 SDK.")
+    dotnet = dotnet_sdk_host()
+    if dotnet is None:
+        fail("dotnet: Install the .NET 8 SDK.")
     log("assets: building rpf9dump")
-    run(["dotnet", "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
+    run([dotnet, "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
          "-o", out_dir, "--nologo", "-v", "q"])
     return exe
 
