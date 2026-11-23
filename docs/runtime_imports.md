@@ -71,10 +71,20 @@ pattern stays literal. Narrow expansion searches the ACP-converted pattern and c
 ACP, so its matches can differ from wide startup. The two widths retain independent tables, and the most recently
 configured width sets the shared `argc`. `noarg.obj` leaves the initial tables null; later no-argument
 configuration is a no-op that preserves existing pointers and counts. These are guest-owned tables, without
-changing the host CRT's argument globals. This does not add console-path wildcard routing or change the legacy
-`msvcrt!__getmainargs` wildcard policy. `run_argv_modes` compares the same six linker-selected MSVC fixtures
+changing the host CRT's argument globals. This does not add console-path wildcard routing.
+`run_argv_modes` compares the same six linker-selected MSVC fixtures
 natively and through the loader; `run_startup_cmdline` also checks native preconfiguration and command-line
 identity through attach and entry.
+
+The legacy `msvcrt.dll!__getmainargs` and `__wgetmainargs` imports select the same guest-owned configuration:
+their fourth argument is zero for literal arguments or nonzero for wildcard expansion. Legacy expansion sorts
+each pattern's matches case-insensitively after conversion to the requested width; UCRT startup retains its
+enumeration order. Repeated calls can switch between the two modes. `run_legacy_argv` compares an original fixture
+importing the real system CRT natively and through the loader, including both widths, quoted and unmatched
+patterns, path prefixes, ACP conversion and
+reconfiguration order, plus mixed-case sorting within separate pattern groups. Native program-token controls
+and `process_cmdline` also verify that expansion includes `argv[0]`; the loader's choice of program token is
+unchanged. No host CRT argument globals are modified.
 
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):

@@ -602,6 +602,18 @@ if(BUILD_TESTING)
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
         endforeach()
       endforeach()
+      # An import library only: the native oracle uses the real system msvcrt.dll, never a fixture DLL.
+      set(legacy_msvcrt_import "${CMAKE_CURRENT_BINARY_DIR}/legacy_msvcrt.lib")
+      add_custom_command(OUTPUT "${legacy_msvcrt_import}"
+        COMMAND "${CMAKE_AR}" /nologo /machine:x64
+          "/def:${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/legacy_msvcrt.def" "/out:${legacy_msvcrt_import}"
+        DEPENDS test/fixtures/legacy_msvcrt.def VERBATIM)
+      add_executable(tiny_legacy_argv test/fixtures/tiny_legacy_argv.cpp "${legacy_msvcrt_import}")
+      target_link_libraries(tiny_legacy_argv PRIVATE "${legacy_msvcrt_import}")
+      target_compile_definitions(tiny_legacy_argv PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(tiny_legacy_argv PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(tiny_legacy_argv PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
     endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1042,6 +1054,11 @@ if(BUILD_TESTING)
           --loader "$<TARGET_FILE:gta6rt>" --fixtures "$<TARGET_FILE_DIR:tiny_argv_default_a>"
           --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
         set_tests_properties(run_argv_modes PROPERTIES TIMEOUT 90)
+        add_test(NAME run_legacy_argv COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_legacy_argv.py"
+          --loader "$<TARGET_FILE:gta6rt>" --guest "$<TARGET_FILE:tiny_legacy_argv>"
+          --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+        set_tests_properties(run_legacy_argv PROPERTIES TIMEOUT 90)
       endif()
     endif()
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}

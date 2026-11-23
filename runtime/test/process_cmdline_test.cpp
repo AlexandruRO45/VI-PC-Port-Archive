@@ -215,6 +215,67 @@ void check_getmainargs_environment() {
         ++failures;
     }
 }
+// CreateProcess can supply a program token different from the opened image. Native msvcrt expands argv[0] too;
+// check_legacy_argv.py measures that rule. Exercise the actual registered shim without changing loader argv[0].
+void check_legacy_program_wildcard() {
+    using Narrow = int(__cdecl*)(int*, char***, char***, int, void*);
+    using Wide = int(__cdecl*)(int*, wchar_t***, wchar_t***, int, void*);
+    const auto narrow_fn = reinterpret_cast<Narrow>(rt::shims::find("msvcrt.dll", "__getmainargs"));
+    const auto wide_fn = reinterpret_cast<Wide>(rt::shims::find("msvcrt.dll", "__wgetmainargs"));
+    if (!narrow_fn || !wide_fn) return;  // check_getmainargs_environment reports missing imports.
+    auto check = [](bool ok, const char* what) {
+        if (!ok) { std::fprintf(stderr, "FAIL legacy program wildcard: %s\n", what); ++failures; }
+        return ok;
+    };
+    const DWORD length = GetCurrentDirectoryW(0, nullptr);
+    std::wstring previous(length, L'\0');
+    wchar_t parent[MAX_PATH]{}, temporary[MAX_PATH]{};
+    const DWORD temp_length = GetTempPathW(MAX_PATH, parent);
+    if (!check(length && GetCurrentDirectoryW(length, previous.data()) && temp_length && temp_length < MAX_PATH &&
+                   GetTempFileNameW(parent, L"lav", 0, temporary), "create isolated test directory name")) return;
+    if (!check(DeleteFileW(temporary) && CreateDirectoryW(temporary, nullptr), "create isolated test directory")) return;
+    struct Cleanup {
+        std::wstring previous, directory;
+        ~Cleanup() {
+            SetCurrentDirectoryW(previous.c_str());
+            DeleteFileW((directory + L"\\programA.exe").c_str());
+            DeleteFileW((directory + L"\\programB.exe").c_str());
+            RemoveDirectoryW(directory.c_str());
+        }
+    } cleanup{previous, temporary};
+    if (!check(SetCurrentDirectoryW(temporary) != FALSE, "enter isolated directory")) return;
+    for (const wchar_t* name : {L"programA.exe", L"programB.exe"}) {
+        const HANDLE file = CreateFileW(name, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (!check(file != INVALID_HANDLE_VALUE, "create name-only synthetic match")) return;
+        CloseHandle(file);
+    }
+    for (bool wide : {false, true}) {
+        rt::process::set_command_line(L"program?.exe", {L"literal"});
+        for (int expand : {0, 1, 0}) {
+            int count = -1;
+            char** narrow = nullptr;
+            wchar_t** wide_args = nullptr;
+            const int result = wide ? wide_fn(&count, &wide_args, nullptr, expand, nullptr)
+                                    : narrow_fn(&count, &narrow, nullptr, expand, nullptr);
+            if (!check(result == 0 && count == (expand ? 3 : 2) &&
+                           (wide ? wide_args && !wide_args[count] : narrow && !narrow[count]),
+                       "flag selects a complete program-token table")) continue;
+            std::vector<std::wstring> values;
+            for (int index = 0; index < count; ++index) {
+                if (wide) values.emplace_back(wide_args[index]);
+                else {
+                    const std::string text(narrow[index]);  // these test names are all ASCII.
+                    values.emplace_back(text.begin(), text.end());
+                }
+            }
+            check(values.back() == L"literal", "arguments after the program token remain intact");
+            if (!expand) check(values[0] == L"program?.exe", "zero flag retains the original program token");
+            else check((values[0] == L"programA.exe" && values[1] == L"programB.exe") ||
+                           (values[0] == L"programB.exe" && values[1] == L"programA.exe"),
+                       "nonzero flag expands the program token");
+        }
+    }
+}
 }  // namespace
 
 int main() {
@@ -231,6 +292,7 @@ int main() {
     check_import_names();
     check_argv_reset();
     check_getmainargs_environment();
+    check_legacy_program_wildcard();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");
     check_winmain(L"C:\\My Games\\game.exe", {L"-x"}, L"-x", "a quoted program name with a space");
     check_winmain(L"game.exe", {}, L"", "no arguments");

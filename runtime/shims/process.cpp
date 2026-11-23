@@ -21,6 +21,7 @@
 // import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll.
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -202,7 +203,7 @@ std::wstring widen_argument(const std::string& text) {
 // quoted. A failed search retains the pattern; a successful search omits "." and ".." and keeps the path prefix.
 // Narrow startup searches its ACP-converted text, which can have different wildcard matches from wide startup.
 template <typename C>
-std::vector<std::basic_string<C>> expand_arguments(const std::vector<std::basic_string<C>>& input) {
+std::vector<std::basic_string<C>> expand_arguments(const std::vector<std::basic_string<C>>& input, bool sort_matches) {
     std::vector<std::basic_string<C>> result;
     for (const auto& argument : input) {
         std::wstring pattern;
@@ -230,24 +231,33 @@ std::vector<std::basic_string<C>> expand_arguments(const std::vector<std::basic_
             ~Search() { ::FindClose(handle); }
         } search{handle};
         const std::wstring prefix = pattern.substr(0, separator == std::wstring::npos ? 0 : separator + 1);
+        const auto first_match = result.size();
         do {
             if (std::wcscmp(found.cFileName, L".") == 0 || std::wcscmp(found.cFileName, L"..") == 0) continue;
             const std::wstring match = prefix + found.cFileName;
             if constexpr (std::is_same_v<C, wchar_t>) result.push_back(match);
             else result.push_back(narrow(match));
         } while (::FindNextFileW(handle, &found));
+        // Legacy msvcrt sorts each pattern's matches after conversion to the requested width. UCRT startup
+        // retains enumeration order; sorting only this range also preserves intervening literal arguments.
+        if (sort_matches)
+            std::sort(result.begin() + first_match, result.end(), [](const auto& left, const auto& right) {
+                if constexpr (std::is_same_v<C, wchar_t>) return ::_wcsicmp(left.c_str(), right.c_str()) < 0;
+                else return ::_stricmp(left.c_str(), right.c_str()) < 0;
+            });
     }
     return result;
 }
 
 template <typename C>
 int configure_argv(int mode, const std::vector<std::basic_string<C>>& input,
-                   std::vector<std::basic_string<C>>& strings, std::vector<C*>& pointers, C**& published) {
+                   std::vector<std::basic_string<C>>& strings, std::vector<C*>& pointers, C**& published,
+                   bool sort_matches = false) {
     // _crt_argv_no_arguments is a no-op, including after another width or mode has been configured.
     if (mode == 0) return 0;
     if (mode != 1 && mode != 2) return errno = EINVAL;
     try {
-        auto next_strings = mode == 2 ? expand_arguments(input) : input;
+        auto next_strings = mode == 2 ? expand_arguments(input, sort_matches) : input;
         std::vector<C*> next_pointers;
         next_pointers.reserve(next_strings.size() + 1);
         for (auto& argument : next_strings) next_pointers.push_back(argument.data());
@@ -325,15 +335,15 @@ wchar_t** current_wide_environment() {
 }
 
 // msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo)
-int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
-    if (const int error = game_configure_narrow_argv(1)) return error;
+int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int expand, void*) {
+    if (const int error = configure_argv(expand ? 2 : 1, g_input_args, g_args, g_argv, g_argv_ptr, true)) return error;
     *argc = g_argc;
     *argv = g_argv_ptr;
     if (env) *env = current_environment();
     return 0;
 }
-int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, void*) {
-    if (const int error = game_configure_wide_argv(1)) return error;
+int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int expand, void*) {
+    if (const int error = configure_argv(expand ? 2 : 1, g_input_wargs, g_wargs, g_wargv, g_wargv_ptr, true)) return error;
     *argc = g_argc;
     *argv = g_wargv_ptr;
     if (env) *env = current_wide_environment();
