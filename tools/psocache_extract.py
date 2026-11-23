@@ -184,7 +184,7 @@ def extract(
 ):
     """Find, carve and validate the cache. Returns ``(archive_index, report, search)`` or raises NotFound."""
     if not inside_tempdir(out):
-        raise ValueError("--out must be a file inside the temporary directory")
+        raise ValueError("the output must be a file inside the temporary directory")
     paths = archives(source)
     left = budget
     spent = 0
