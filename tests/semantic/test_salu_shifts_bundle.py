@@ -349,6 +349,18 @@ class TestSLshrB64CrossDwordAndSCC(unittest.TestCase):
         res, scc = ref_s_lshr_b64(val, 63)
         self.assertEqual((res, scc), (1, 1))
 
+class TestSLshrB64Translator(unittest.TestCase):
+    def test_translator_s_lshr_b64_execution(self) -> None:
+        body = [
+            "s_mov_b64 s[4:5], 0x123456789abcdef0",
+            "s_lshr_b64 s[6:7], s[4:5], 8",
+            "v_mov_b32_e32 v1, s6",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_lshr_b64")
+        for l in range(32):
+            self.assertEqual(results[l], 0x789ABCDE)
+
 
 if __name__ == "__main__":
     unittest.main()
