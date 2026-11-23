@@ -280,6 +280,12 @@ public:
                 std::fprintf(stderr, "LEONIDA_VK_VALIDATION: the Vulkan loader does not list %s; relying on a "
                                      "layer enabled outside this program (VK_INSTANCE_LAYERS), checked by a probe\n",
                              layer);
+                // VkValidationFeaturesEXT goes on the instance only once a layer is known to be there: no loader lists
+                // VK_EXT_validation_features without one, and a layer that is there takes it (Wine passes it on).
+                if (!unlisted_layer_active()) {
+                    report_validation_inactive("a deliberate invalid call on a throwaway instance was not reported");
+                    return DeviceStatus::failed;
+                }
             }
             instance_info.pNext = &validation_features;
             debug_utils = true;  // the validation layer provides it; the loader too, when the layer is not listed
@@ -630,12 +636,60 @@ public:
         result = fn<PFN_vkCreateCommandPool>("vkCreateCommandPool")(device, &pool, nullptr, &pool_);
         if (result != VK_SUCCESS) return failure("vkCreateCommandPool", result);
         if (validation && !validation_probe()) {
-            std::fprintf(stderr, "LEONIDA_VK_VALIDATION is set but validation is not active: a deliberate invalid "
-                                 "call was not reported (on Windows, install the Vulkan SDK; under Wine, set "
-                                 "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation before wine)\n");
+            report_validation_inactive("a deliberate invalid call was not reported");
             return DeviceStatus::failed;
         }
         return DeviceStatus::ready;
+    }
+
+    static void report_validation_inactive(const char* why) {
+        std::fprintf(stderr, "LEONIDA_VK_VALIDATION is set but validation is not active: %s (on Windows, install the "
+                             "Vulkan SDK; under Wine, set VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation before wine)\n",
+                     why);
+    }
+
+    // Whether a validation layer the loader does not list (the host's, under Wine) watches new instances: a throwaway
+    // instance with VK_EXT_debug_utils, a messenger, and a second messenger with no severity bits, which breaks
+    // VUID-VkDebugUtilsMessengerCreateInfoEXT-messageSeverity-requiredbitmask. The probe's error is counted, not
+    // printed, and taken back off the count.
+    bool unlisted_layer_active() const {
+        const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(instance_proc(nullptr, "vkCreateInstance"));
+        const char* debug_utils_extension = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        info.pApplicationInfo = &app;
+        info.enabledExtensionCount = 1;
+        info.ppEnabledExtensionNames = &debug_utils_extension;
+        VkInstance probe = VK_NULL_HANDLE;
+        if (!create_instance || create_instance(&info, nullptr, &probe) != VK_SUCCESS) return false;
+        const auto get = [&](const char* name) { return instance_proc(probe, name); };
+        const auto destroy_instance = reinterpret_cast<PFN_vkDestroyInstance>(get("vkDestroyInstance"));
+        const auto create_messenger =
+            reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(get("vkCreateDebugUtilsMessengerEXT"));
+        const auto destroy_messenger =
+            reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(get("vkDestroyDebugUtilsMessengerEXT"));
+        const unsigned errors = validation_error_count();
+        if (create_messenger && destroy_messenger) {
+            VkDebugUtilsMessengerCreateInfoEXT listener{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            listener.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            listener.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
+            listener.pfnUserCallback = on_validation;
+            VkDebugUtilsMessengerEXT first = VK_NULL_HANDLE, second = VK_NULL_HANDLE;
+            if (create_messenger(probe, &listener, nullptr, &first) == VK_SUCCESS) {
+                VkDebugUtilsMessengerCreateInfoEXT invalid = listener;
+                invalid.messageSeverity = 0;
+                validation_probe_running() = true;
+                if (create_messenger(probe, &invalid, nullptr, &second) == VK_SUCCESS && second)
+                    destroy_messenger(probe, second, nullptr);
+                validation_probe_running() = false;
+                destroy_messenger(probe, first, nullptr);
+            }
+        }
+        if (destroy_instance) destroy_instance(probe, nullptr);
+        const bool reported = validation_error_count() > errors;
+        validation_error_count() = errors;
+        return reported;
     }
 
     // Whether a validation layer is really watching this device: a buffer with no usage bits breaks

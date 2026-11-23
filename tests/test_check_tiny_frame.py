@@ -1,7 +1,12 @@
 """The verdict logic of runtime/test/check_tiny_frame.py on synthetic output: no loader, GPU or game files."""
+import contextlib
 import importlib.util
+import io
+import subprocess
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("check_tiny_frame", ROOT / "runtime" / "test" / "check_tiny_frame.py")
@@ -66,6 +71,56 @@ class CheckOutputTest(unittest.TestCase):
         output = "\n".join(line for line in good_output().split("\n") if not line.startswith("[d3d12-trace]"))
         self.assertEqual(check.check_output(0, output), ["the trace has no `D3D12XboxCreateDevice ok` at its place "
                                                          "in the first-frame order"])
+
+
+RUNTIME_LINE = "[rt] d3d12: LEONIDA_VK_VALIDATION: VK_LAYER_KHRONOS_validation enabled with synchronization validation"
+OFF_LINE = ("[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list VK_LAYER_KHRONOS_validation and no "
+            "validation layer is active, so validation is off")
+
+
+def with_report(output, checks):
+    """output with the layer's CURRENT-VALIDATION-ENABLED report listing checks, before the run's lines."""
+    report = ["Information: [ CURRENT-VALIDATION-ENABLED ] | MessageID = 0x1", "Enabled checks:"]
+    report += [f"  - {check}" for check in checks]
+    return "\n".join([RUNTIME_LINE, *report, ""]) + output
+
+
+class ValidationTest(unittest.TestCase):
+    def test_a_report_with_synchronization_passes(self):
+        output = with_report(good_output(), ["Core", "Synchronization"])
+        self.assertEqual(check.check_output(0, output, validation=True), [])
+
+    def test_a_report_without_synchronization_fails(self):
+        output = with_report(good_output(), ["Core"])
+        self.assertEqual(check.check_output(0, output, validation=True),
+                         ["the validation layer ran without synchronization validation, which the device asks for"])
+
+    def test_a_report_whose_list_is_empty_fails(self):
+        output = with_report(good_output(), [])
+        problems = check.check_output(0, output, validation=True)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("the validation layer ran without synchronization validation"))
+
+
+class MainValidationTest(unittest.TestCase):
+    """main --validation on a run with no layer report: a skip only when nothing else is wrong."""
+
+    def main(self, code, output):
+        done = subprocess.CompletedProcess([], code, stdout=output, stderr="")
+        argv = ["check_tiny_frame.py", "gta6rt.exe", "tiny_frame.exe", "--validation"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(check.subprocess, "run", return_value=done), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return check.main()
+
+    def test_a_clean_run_with_no_layer_is_skipped(self):
+        self.assertEqual(self.main(0, "\n".join([OFF_LINE, good_output()])), check.SKIP)
+
+    def test_a_validation_error_without_a_report_fails(self):
+        output = "\n".join([OFF_LINE, "Validation Error: [ VUID-x ] something", good_output()])
+        self.assertEqual(self.main(0, output), 1)
+
+    def test_a_bad_exit_code_without_a_report_fails(self):
+        self.assertEqual(self.main(3, "\n".join([OFF_LINE, good_output()])), 1)
 
 
 class SubsequenceTest(unittest.TestCase):

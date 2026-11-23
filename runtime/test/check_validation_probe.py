@@ -11,7 +11,8 @@ the device and fails with "validation is not active" when that call is not repor
 - with the layer disabled in the loader (VK_LOADER_LAYERS_DISABLE): the test fails and says that validation is not
   active, instead of reporting 0 validation errors.
 
-Exits 77 (ctest: skipped) when the test has no Vulkan device, or the layer is not installed for the first run.
+Exits 77 (ctest: skipped) when the test has no Vulkan device, or the layer is not installed for the first run (the
+loader does not list it and nothing reports the probe, or vkCreateInstance says VK_ERROR_LAYER_NOT_PRESENT).
 """
 
 import argparse
@@ -23,8 +24,11 @@ SKIP = 77
 LAYER = "VK_LAYER_KHRONOS_validation"
 ACTIVE = "validation probe: reported, validation is active"
 # What the device says when no layer watches it: the probe went unreported, or (on a loader that refuses a disabled
-# layer the application names) the instance could not be created.
-NOT_ACTIVE = ("validation is not active", "vkCreateInstance failed")
+# layer the application names) the instance could not be created for that reason, VK_ERROR_LAYER_NOT_PRESENT (-6).
+# Any other vkCreateInstance failure is a failure.
+NOT_ACTIVE = ("validation is not active", "vkCreateInstance failed (VkResult -6)")
+# vk_test_device.h's line when the loader does not list the layer: only then can "not active" mean "not installed".
+UNLISTED = f"the Vulkan loader does not list {LAYER}"
 
 
 def run(command, environment, timeout):
@@ -51,7 +55,9 @@ def main():
         return SKIP
     if ACTIVE not in output:
         print(output)
-        if any(text in output for text in NOT_ACTIVE):
+        # Not installed: the loader does not list the layer (or refuses it) and nothing reported the probe. A layer the
+        # loader lists that then reports nothing, or an instance that fails for another reason, is a failure.
+        if (UNLISTED in output and NOT_ACTIVE[0] in output) or NOT_ACTIVE[1] in output:
             print(f"SKIP: {LAYER} is not installed here, so the probe cannot be shown to report")
             return SKIP
         print("FAIL: with the layer available, the device did not report its validation probe")

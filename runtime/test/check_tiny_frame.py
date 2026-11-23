@@ -12,8 +12,8 @@ there is no usable Vulkan device on this machine.
 set; under Wine only the environment variable reaches the layer, through the host's loader), with the layer's
 information messages on. It passes only when the layer shows it was active in that process: its
 CURRENT-VALIDATION-ENABLED report, with Synchronization among the enabled checks. No validation error may be printed.
-It exits 77 when no validation layer was active (none installed, or a layer too old to report), instead of passing a
-run that nothing validated.
+It exits 77 when no validation layer was active (none installed, or a layer too old to report) and the run is
+otherwise clean, instead of passing a run that nothing validated; a run with an error or a bad exit code still fails.
 """
 
 import argparse
@@ -97,8 +97,10 @@ def check_output(code, output, validation=False):
     if validation:
         if not any(line.startswith(VALIDATION_LINE) for line in lines):
             problems.append("LEONIDA_VK_VALIDATION=1, but the runtime said nothing about the validation layer")
-        if "Synchronization" not in (validation_checks(lines) or ["Synchronization"]):
-            problems.append("the validation layer ran without synchronization validation, which the device asks for")
+        checks = validation_checks(lines)  # None: no report, which main() turns into a skip if nothing else failed
+        if checks is not None and "Synchronization" not in checks:
+            problems.append("the validation layer ran without synchronization validation, which the device asks for"
+                            + ("" if checks else " (its report lists no checks)"))
         errors = [line for line in lines if "Validation Error" in line]
         if errors:
             problems.append(f"{len(errors)} validation error(s), the first: {errors[0]}")
@@ -154,13 +156,15 @@ def main():
                          text=True, encoding="utf-8", errors="replace", timeout=timeout)
     output = run.stdout + run.stderr
     lines = output.replace("\r\n", "\n").split("\n")
-    if options.validation and validation_checks(lines) is None:
+    problems = check_output(run.returncode, output, options.validation)
+    # No layer report: nothing validated the run, so a clean run is a skip. A run that failed anyway (an exit code, a
+    # validation error printed by a layer too old to report, a missing verdict) still fails.
+    if options.validation and validation_checks(lines) is None and not problems:
         print(output)
         off = any(line.startswith(VALIDATION_LINE) and VALIDATION_OFF in line for line in lines)
         print("SKIP: no validation layer was active in the run" + (" (the runtime says validation is off)" if off else
               " (it printed no CURRENT-VALIDATION-ENABLED report)"))
         return SKIP
-    problems = check_output(run.returncode, output, options.validation)
     if problems:
         print(output)
         for problem in problems:
