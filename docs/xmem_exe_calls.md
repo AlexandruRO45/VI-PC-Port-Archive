@@ -1,11 +1,12 @@
 # XMem: how the retail executable calls it (RT-5)
 
 `game_scarlett_master.exe` imports 12 functions from `xmem.dll` (`docs/runtime_imports.md`, "The retail executable").
-Seven have no shim yet. This page records, from the file alone, how the executable calls them: how many call sites each
-has and the constant arguments those sites pass. Nothing was run: `tools/import_call_sites.py` finds the call sites, and
-the instructions that load the argument registers before each call were read by hand. No code or data of the executable
-is quoted, only the constants a call passes and the counts. Measured at `main` `1cc6e3c1`, SHA-256
-`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`.
+This page records, from the file alone, how the executable calls them: how many call sites each has and the constant
+arguments those sites pass. Nothing was run: `tools/import_call_sites.py` finds the call sites, and the instructions
+that load the argument registers before each call were read by hand. No code or data of the executable is quoted, only
+the constants a call passes and the counts. The counts were measured at `main` `1cc6e3c1`, SHA-256
+`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. The shim column is current `main`: #6919 serves the
+seven imports that had none then.
 
 ```powershell
 python -I tools/import_call_sites.py game_scarlett_master.exe --dll xmem.dll --dll d3d12_xs.dll --dll xg_xs.dll
@@ -15,19 +16,19 @@ The tool finds each import's thunk (`jmp [rip+disp32]` through its address-table
 instructions that reach it. Its counts cover direct calls only, and a stray `E8`/`E9` byte could add one, so they are
 bounds, not a proof that every site is reached.
 
-| Import | Call sites | Shim at `main` `1cc6e3c1` |
+| Import | Call sites | Shim |
 |---|---:|---|
-| `XMemVirtualAlloc` | 23 | yes, refuses every one of these 23 (below) |
-| `XMemMapPhysicalPages` | 12 | no |
-| `XMemAllocatePhysicalPages` | 4 | no |
-| `XMemFreePhysicalPages` | 3 | no |
-| `XMemMapPhysicalPagesScatter` | 2 | no |
+| `XMemVirtualAlloc` | 23 | yes; a nonzero attribute word is recorded, not refused (#6919) |
+| `XMemMapPhysicalPages` | 12 | yes (#6919) |
+| `XMemAllocatePhysicalPages` | 4 | yes (#6919) |
+| `XMemFreePhysicalPages` | 3 | yes (#6919) |
+| `XMemMapPhysicalPagesScatter` | 2 | yes (#6919) |
 | `XMemAlloc` | 3 | yes |
 | `XMemFree` | 3 (2 calls, 1 tail jump) | yes |
 | `XMemGetWorkingSetStatistics` | 3 | yes |
 | `XMemTransferMemory` | 1 | yes |
-| `XMemIsToolsMemAvailable` | 1 | no |
-| `XMemAllocDefault`, `XMemFreeDefault` | 1 tail jump each, no call | no |
+| `XMemIsToolsMemAvailable` | 1 | yes; returns `FALSE` (#6919) |
+| `XMemAllocDefault`, `XMemFreeDefault` | 1 tail jump each, no call | yes (#6919) |
 
 The executable also exports one symbol, `__XMemAllocationHooks__`.
 
@@ -50,10 +51,12 @@ The 23 sites pass these constants (`allocation_type`, `attributes`, `protect`; t
 | `0x20406000` | `0x27` | `0x1004`, `0x1404`, `0x8404`, `0x2404`, `0x2004` | 5 (one each) |
 | `0x42000` | `0x7` | `0x1` | 1 |
 
-Every `attributes` value is nonzero, and `runtime/shims/xmem.cpp` returns `ERROR_NOT_SUPPORTED` for a nonzero value
-("until their host mapping is known"), so none of the 23 calls succeeds there. Past that check the shim would also
-refuse the calls with `allocation_type` `0x20003000` (5 sites: the 2 MiB page mode) and those with bits it does not
-know: `0x4000` in `0x20406000` (5 sites) and `0x40000` in `0x42000` (1 site).
+Every `attributes` value is nonzero. At the measured commit the shim returned `ERROR_NOT_SUPPORTED` for any nonzero
+attribute word, so none of the 23 calls succeeded. #6919 accepts the word and only records it (`xmem_attributes`);
+the bits themselves are still **unmeasured**. The five `0x20003000` sites are the 2 MiB page mode, committed
+2 MiB-aligned through `VirtualAlloc2`. `0x4000` in `0x20406000` and `0x40000` in `0x42000` are
+`MEM_REPLACE_PLACEHOLDER` and `MEM_RESERVE_PLACEHOLDER`, which that change passes through. The current rules are in
+`runtime/shims/xmem.cpp` (`XMemVirtualAlloc`) and [runtime_imports.md](runtime_imports.md).
 
 The `protect` values are not Win32 protections alone. The Windows SDK's `winnt.h` defines the graphics page protections
 the high bits match: `PAGE_GRAPHICS_NOACCESS` `0x800`, `_READONLY` `0x1000`, `_READWRITE` `0x2000`, `_EXECUTE_READ`
@@ -81,13 +84,12 @@ those two facts. The meaning of `flags`, and whether the page numbers in `pageAr
 are **unmeasured**.
 
 The sequence in the first function that calls them is: `XMemAllocatePhysicalPages`, then `XMemVirtualAlloc` of a range
-with `0x20402000` and attributes `0x23`, then `XMemMapPhysicalPages` of those pages at that range. So the physical-page calls depend on the
-attribute check above: until `XMemVirtualAlloc` accepts these attribute words, the map calls are never reached from
-there.
+with `0x20402000` and attributes `0x23`, then `XMemMapPhysicalPages` of those pages at that range. `XMemVirtualAlloc`
+accepts that attribute word (#6919), so a boot can reach those map calls.
 
-The host's own AWE functions need `SeLockMemoryPrivilege`, which an ordinary user does not hold, so a shim would
-emulate the pool (a pagefile-backed section of 64 KiB pages, with views placed at the reserved range) instead of
-forwarding. That is a design note, not a measurement.
+The host's own AWE functions need `SeLockMemoryPrivilege`, which an ordinary user does not hold. The shim does not
+forward them: #6919 keeps a pagefile-backed section of 64 KiB pages and maps views into the reserved range
+([runtime_imports.md](runtime_imports.md)).
 
 ## The other imports
 
