@@ -19,6 +19,8 @@
 
 #include "shims.h"
 
+void gamesave_test_gate(HANDLE started, HANDLE resume);
+
 namespace rt::shims {
 long xgameruntime_gamesave_open_handles();
 }
@@ -192,6 +194,44 @@ int main() {
     check(wait.result == E_ABORT, "cancelled quota job completes with E_ABORT");
     while (XTaskQueueDispatch(cancel_queue, XTaskQueuePort::Work, 0) ||
            XTaskQueueDispatch(cancel_queue, XTaskQueuePort::Completion, 0)) {}
+    // Deleting a real synthetic container tests both sides of the start boundary.
+    const auto cancel_dir = root / L"local-user" / L"cancel-test";
+    std::filesystem::create_directories(cancel_dir);
+    XAsyncBlock before{};
+    before.queue = cancel_queue;
+    check(at<ByNameAsync>(save, 11)(save, provider, "cancel-test", &before) == S_OK,
+          "queue delete before cancellation");
+    XAsyncCancel(&before);
+    check(XAsyncGetStatus(&before, true) == E_ABORT, "delete cancelled before start returns E_ABORT");
+    while (XTaskQueueDispatch(cancel_queue, XTaskQueuePort::Work, 0)) {}
+    check(std::filesystem::exists(cancel_dir), "cancelled delete leaves container intact");
+
+    HANDLE started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    gamesave_test_gate(started, resume);
+    XAsyncBlock started_delete{};
+    started_delete.queue = cancel_queue;
+    check(at<ByNameAsync>(save, 11)(save, provider, "cancel-test", &started_delete) == S_OK,
+          "queue delete for cancellation after start");
+    HANDLE worker = CreateThread(nullptr, 0, [](void* arg) -> DWORD {
+        XTaskQueueDispatch(static_cast<XTaskQueueHandle>(arg), XTaskQueuePort::Work, 0);
+        return 0;
+    }, cancel_queue, 0, nullptr);
+    if (!worker || WaitForSingleObject(started, 5000) != WAIT_OBJECT_0) {
+        std::printf("FAIL delete worker did not start within 5 seconds\n");
+        ExitProcess(1);
+    }
+    XAsyncCancel(&started_delete);
+    check(XAsyncGetStatus(&started_delete, false) == E_PENDING, "cancel after start leaves job pending");
+    SetEvent(resume);
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) ExitProcess(1);
+    check(XAsyncGetStatus(&started_delete, true) == S_OK, "delete after start returns its real result");
+    check(!std::filesystem::exists(cancel_dir), "started delete removes container");
+    gamesave_test_gate(nullptr, nullptr);
+    CloseHandle(worker);
+    CloseHandle(started);
+    CloseHandle(resume);
+    while (XTaskQueueDispatch(cancel_queue, XTaskQueuePort::Completion, 0)) {}
     XTaskQueueCloseHandle(cancel_queue);
 
     // ---- containers and names ----

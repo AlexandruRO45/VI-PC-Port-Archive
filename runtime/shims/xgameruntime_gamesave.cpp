@@ -45,6 +45,11 @@
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#ifdef GAMESAVE_TEST_HOOKS
+static HANDLE g_test_started = nullptr, g_test_resume = nullptr;
+void gamesave_test_gate(HANDLE started, HANDLE resume) { g_test_started = started; g_test_resume = resume; }
+#endif
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -461,7 +466,11 @@ HRESULT submit_update(XGameSaveUpdateHandle u) {
 // ---- Async: each *Async slot runs its work on the title's queue ----
 
 struct Job {
+    explicit Job(const void* id) : identity(id) {}
     const void* identity;
+    std::mutex sync;
+    std::atomic<bool> started{false};
+    bool cancelled = false;
     XUserHandle user = nullptr;
     std::string text;   // configId
     XGameSaveProviderHandle provider = nullptr;
@@ -541,14 +550,31 @@ HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::Begin:
         return XAsyncSchedule(data->async, 0);
     case XAsyncOp::DoWork: {
+        {
+            std::lock_guard<std::mutex> lock(job->sync);
+            if (job->cancelled) return E_PENDING;
+            job->started.store(true);
+        }
+#ifdef GAMESAVE_TEST_HOOKS
+        if (g_test_started) {
+            SetEvent(g_test_started);
+            WaitForSingleObject(g_test_resume, INFINITE);
+        }
+#endif
         size_t size = 0;
         const HRESULT hr = do_work(*job, size);
         XAsyncComplete(data->async, hr, SUCCEEDED(hr) ? size : 0);
         return S_OK;
     }
-    case XAsyncOp::Cancel:
+    case XAsyncOp::Cancel: {
+        {
+            std::lock_guard<std::mutex> lock(job->sync);
+            if (job->started.load() || job->cancelled) return S_OK;
+            job->cancelled = true;
+        }
         XAsyncComplete(data->async, E_ABORT, 0);
         return S_OK;
+    }
     case XAsyncOp::GetResult:
         if (!data->buffer) return E_INVALIDARG;
         if (job->identity == &kInitIdentity) {
