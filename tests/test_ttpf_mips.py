@@ -1772,6 +1772,46 @@ class BadPoolTest(unittest.TestCase):
         self.assertIn("cannot write", err.getvalue())
         self.assertEqual(json.loads(out.getvalue())["total"]["entries"], 1)
 
+    def test_vram_names_the_bad_pool(self):
+        code, err = self.run_main("vram", self.good, self.bad)
+        self.assertEqual(code, 2)
+        self.assertIn(self.bad, err)
+
+    def test_vram_json_over_an_input_pool_is_refused(self):
+        with open(self.good, "rb") as f:
+            before = f.read()
+        alias = os.path.join(self.tmp.name, ".", "good.ttpf")
+        code, err = self.run_main("vram", self.good, "--json", alias)
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input", err)
+        with open(self.good, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_vram_json_that_is_a_directory_is_refused(self):
+        code, err = self.run_main("vram", self.good, "--json", self.tmp.name)
+        self.assertEqual(code, 2)
+        self.assertIn("is a directory", err)
+
+    def test_vram_reports_drops_and_writes_json(self):
+        out = os.path.join(self.tmp.name, "reports", "vram.json")
+        import io
+        from contextlib import redirect_stdout
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            code = ttpf.main(["vram", self.good, "--json", out])
+        self.assertEqual(code, 0)
+        self.assertIn("TTPF VRAM Footprint Projection", captured.getvalue())
+        self.assertIn("Top Mips Dropped", captured.getvalue())
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["pools"], 1)
+        self.assertEqual(data["total_textures"], 1)
+        self.assertEqual(data["2d_textures"], 1)
+        self.assertEqual(data["shrinkable_textures"], 1)
+        self.assertEqual(len(data["drops"]), 4)
+        self.assertEqual(data["drops"][0]["pct"], 100.0)
+        self.assertLess(data["drops"][1]["bytes"], data["drops"][0]["bytes"])
+
     def test_index_past_the_pool(self):
         for index in ("1", "-1"):
             code, err = self.run_main("layout", self.good, index)
@@ -2946,6 +2986,46 @@ class BcFastDecodeParityTest(unittest.TestCase):
             for pw, ph in ((None, None), (bw * 4 - 3, bh * 4 - 1)):
                 self.assertEqual(_float_bits(ttpf.block_means(got, bw, bh, pw, ph)),
                                  _float_bits(_ref_block_means(want, bw, bh, pw, ph)))
+
+
+class TestVramProjection(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "synthetic.ttpf")
+        self.layout = build_pool(self.path)
+
+    def test_measure_vram_and_formatting(self):
+        res = ttpf.measure_vram([self.path])
+        self.assertEqual(res["pools"], 1)
+        self.assertEqual(res["total_textures"], 1)
+        self.assertEqual(res["2d_textures"], 1)
+        self.assertEqual(res["shrinkable_textures"], 1)
+        self.assertEqual(len(res["drops"]), 4)
+        self.assertEqual(res["drops"][0]["pct"], 100.0)
+        self.assertLess(res["drops"][1]["bytes"], res["drops"][0]["bytes"])
+        self.assertLess(res["drops"][2]["bytes"], res["drops"][1]["bytes"])
+        self.assertLess(res["drops"][3]["bytes"], res["drops"][2]["bytes"])
+        report = ttpf.format_vram_report(res)
+        self.assertIn("TTPF VRAM Footprint Projection", report)
+        self.assertIn("Top Mips Dropped", report)
+
+    def test_cli_vram(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ret = ttpf.main(["vram", self.path])
+        self.assertEqual(ret, 0)
+        self.assertIn("TTPF VRAM Footprint Projection", buf.getvalue())
+
+    def test_cli_vram_json(self):
+        json_out = os.path.join(self.tmp.name, "vram.json")
+        ret = ttpf.main(["vram", self.path, "--json", json_out])
+        self.assertEqual(ret, 0)
+        with open(json_out, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["pools"], 1)
+        self.assertEqual(data["total_textures"], 1)
+        self.assertEqual(len(data["drops"]), 4)
 
 
 if __name__ == "__main__":

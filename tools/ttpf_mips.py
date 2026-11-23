@@ -24,6 +24,7 @@ generated BC6H/BC7 initial history tables).
 
 Read-only: no texture bytes are printed or committed. `scan` emits aggregate
 counters only (both the zlib/raw baseline and the BCPack-enabled projection).
+`vram` projects linear VRAM footprint and mip-drop savings across pools.
 `layout` prints descriptor fields and offsets. `check` prints the BC
 block-average error against a 2x2 downsample of the parent mip (across all
 slices/faces for arrays and cubemaps; BC1, BC2, BC3, BC4_UNORM, BC5_UNORM, BC6H and
@@ -31,6 +32,7 @@ BC7) or 3D Z-continuity vs 2D control for float16 volumes. `export` writes a
 DX10 DDS when every source mip uses a supported codec.
 
     python -I tools/ttpf_mips.py scan <game root, pool folders or pool paths...> [--json out] [--tuples]
+    python -I tools/ttpf_mips.py vram <game root, pool folders or pool paths...> [--json out]
     python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
     python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional] [--history path]
     python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--mips N] [--force] [--allow-provisional] [--history path]
@@ -1761,6 +1763,97 @@ def scan_pools(paths, as_json=None, include_tuples=False):
             raise ValueError(f"cannot write {as_json}: {exc.strerror or exc}") from None
 
 
+def measure_vram(pools):
+    """Compute linear bytes across 2D textures at full size and drops 1..3."""
+    total_textures = 0
+    textures_2d = 0
+    other_textures = 0
+    shrinkable = 0
+    drop_bytes = [0, 0, 0, 0]
+
+    for path in pools:
+        try:
+            pool = Pool(path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{path}: {exc}") from None
+        try:
+            total_textures += pool.textures
+            for i in range(pool.textures):
+                d = pool.descriptor(i)
+                if d["dimension"] != 1 or d["depth"] != 1:
+                    other_textures += 1
+                    continue
+                textures_2d += 1
+                fmt = d["format"]
+                if fmt not in ELEMENT_BYTES:
+                    continue
+                eb = ELEMENT_BYTES[fmt]
+                block = 4 if fmt in BC_FORMATS else 1
+                ew = (d["width"] + block - 1) // block
+                eh = (d["height"] + block - 1) // block
+                mips = d["mips"]
+                if mips > 1:
+                    shrinkable += 1
+
+                mip_bytes = []
+                for m in range(mips):
+                    wc = max(1, (ew + (1 << m) - 1) >> m)
+                    hc = max(1, (eh + (1 << m) - 1) >> m)
+                    mip_bytes.append(wc * hc * eb)
+
+                for drop in range(4):
+                    start = min(drop, mips - 1)
+                    drop_bytes[drop] += sum(mip_bytes[start:])
+        finally:
+            pool.close()
+
+    full = drop_bytes[0]
+    drops = []
+    scales = [1.0, 0.5, 0.25, 0.125]
+    for drop in range(4):
+        b = drop_bytes[drop]
+        gib = b / (1024 ** 3)
+        pct = (b / full * 100.0) if full > 0 else 0.0
+        drops.append({
+            "drop": drop,
+            "per_axis": scales[drop],
+            "bytes": b,
+            "gib": round(gib, 2),
+            "pct": round(pct, 1),
+        })
+
+    return {
+        "pools": len(pools),
+        "total_textures": total_textures,
+        "2d_textures": textures_2d,
+        "other_textures": other_textures,
+        "shrinkable_textures": shrinkable,
+        "drops": drops,
+    }
+
+
+def format_vram_report(data):
+    lines = [
+        "=" * 67,
+        "TTPF VRAM Footprint Projection",
+        "=" * 67,
+        f"Pools scanned:       {data['pools']:,}",
+        f"Total textures:      {data['total_textures']:,} ({data['2d_textures']:,} 2D, {data['other_textures']:,} other)",
+        f"Shrinkable (mips>1): {data['shrinkable_textures']:,}",
+        "",
+        f"{'Top Mips Dropped':<18} | {'Per-Axis Size':<13} | {'Linear Size':<17} | {'% vs Full':<9}",
+        "-" * 18 + "-+-" + "-" * 13 + "-+-" + "-" * 17 + "-+-" + "-" * 9,
+    ]
+    labels = ["0 (Full)", "1", "2", "3"]
+    scales = ["1", "1/2", "1/4", "1/8"]
+    for row, lbl, sc in zip(data["drops"], labels, scales):
+        gib_str = f"{row['gib']:>10.2f} GiB"
+        pct_str = f"{row['pct']:>6.1f}%"
+        lines.append(f"{lbl:<18} | {sc:<13} | {gib_str:<17} | {pct_str:<9}")
+    lines.append("=" * 67)
+    return "\n".join(lines)
+
+
 def describe(pool, index):
     a = analyze(pool, index)
     d = a["descriptor"]
@@ -2148,6 +2241,9 @@ def main(argv=None):
     ps.add_argument("--json")
     ps.add_argument("--tuples", action="store_true",
                     help="include the distinct rejected compact-profile tuples")
+    pv = sub.add_parser("vram", help="project linear VRAM footprint and mip-drop savings")
+    pv.add_argument("paths", nargs="+")
+    pv.add_argument("--json")
     pl = sub.add_parser("layout", help="descriptor fields and mip offsets")
     pl.add_argument("pool")
     pl.add_argument("index", type=int)
@@ -2193,6 +2289,40 @@ def main(argv=None):
         except ValueError as exc:   # a truncated or unsupported pool: name it instead of a traceback
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
+        return 0
+    if a.cmd == "vram":
+        pools = []
+        for p in a.paths:
+            found = find_pools(p)
+            if not found:
+                why = "no such file or folder" if not os.path.exists(p) else "no .ttpf pool in it"
+                print(f"ERROR: {p}: {why}", file=sys.stderr)
+                return 2
+            pools += found
+        if a.json:
+            if os.path.isdir(a.json):
+                print(f"ERROR: --json {a.json} is a directory", file=sys.stderr)
+                return 2
+            for p in pools:
+                if same_output_path(a.json, p):
+                    print(f"ERROR: --json would overwrite the input {p}", file=sys.stderr)
+                    return 2
+        try:
+            data = measure_vram(pools)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(format_vram_report(data))
+        if a.json:
+            try:
+                dirname = os.path.dirname(os.path.abspath(a.json))
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
+                with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(data, f, indent=1)
+            except OSError as exc:
+                print(f"ERROR: cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)
+                return 2
         return 0
     if a.cmd == "export":
         # Refuse an output that aliases an input asset or metadata before the pool is
