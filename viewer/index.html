@@ -409,8 +409,16 @@ function stream(now = performance.now()) {
 
 // ---------- main loop ----------
 camera.position.fromArray(world.spawn);
-const startCam = parseCamHash(location.hash);
-if (startCam) { camera.position.fromArray(startCam.pos); yaw = startCam.yaw; pitch = THREE.MathUtils.clamp(startCam.pitch, -1.55, 1.55); }
+// A #cam= link applies at load and whenever the hash changes: a view link pasted into a tab that already shows
+// the viewer changes only the hash, so the page does not load again. P writes its link with replaceState, which
+// fires no hashchange.
+function applyCamHash() {
+  const cam = parseCamHash(location.hash);
+  if (!cam) return;
+  camera.position.fromArray(cam.pos); yaw = cam.yaw; pitch = THREE.MathUtils.clamp(cam.pitch, -1.55, 1.55);
+}
+applyCamHash();
+addEventListener("hashchange", applyCamHash);
 if (world.test) {
   document.getElementById("world-status").textContent = world.reason;
   document.getElementById("banner").classList.remove("hidden");

@@ -430,6 +430,52 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
     close(climb('ControlRight'), 0.8);
 });
 
+test('a camera link applies when the hash changes in an open viewer, and a malformed one is ignored', async () => {
+    class Vector3 {
+        constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
+        set(x, y, z) { return Object.assign(this, { x, y, z }); }
+        fromArray([x, y, z]) { return this.set(x, y, z); }
+    }
+    const handlers = new Map();
+    const location = { search: '', hash: '' };
+    const state = await vm.runInNewContext(
+        `(async () => { ${viewerModule}
+return () => [camera.position.x, camera.position.y, camera.position.z, yaw, pitch]; })()`, {
+        THREE: {
+            WebGLRenderer: class {
+                domElement = { addEventListener() {} };
+                setPixelRatio() {} setSize() {} setAnimationLoop() {}
+            },
+            Scene: class { add() {} },
+            PerspectiveCamera: class { position = new Vector3(); },
+            DirectionalLight: class { position = { set() {} }; },
+            Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Clock: class {},
+            Group: class { add() {} },
+            MathUtils: { clamp: (x, min, max) => Math.min(Math.max(x, min), max) },
+            Vector3,
+        },
+        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        addEventListener: (type, handler) => handlers.set(type, handler),
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location,
+        AbortController, setTimeout, clearTimeout,
+        fetch: manifestResponse({ spawn: [1, 2, 3], chunks: [] }), GLTFLoader: class {},
+    });
+    const view = () => [...state()];   // an array of this realm, for deepEqual
+    // No link at load: the spawn point and the default look direction.
+    assert.deepEqual(view(), [1, 2, 3, 0, -0.25]);
+    const go = hash => { location.hash = hash; handlers.get('hashchange')(); };
+    go('#cam=500.0,300.0,-700.0,1.000,-0.500');
+    assert.deepEqual(view(), [500, 300, -700, 1, -0.5]);
+    // The pitch of a link is clamped as at load.
+    go('#cam=10,20,30,2,9');
+    assert.deepEqual(view(), [10, 20, 30, 2, 1.55]);
+    // A hash that is not a camera link (an edited link, an in-page anchor) leaves the view alone.
+    for (const bad of ['', '#', '#cam=1,2,3', '#cam=1,2,3,4,x', '#other=1,2,3,4,5']) {
+        go(bad);
+        assert.deepEqual(view(), [10, 20, 30, 2, 1.55], bad);
+    }
+});
+
 const begin = html.indexOf('// ---------- chunk streaming ----------');
 const end = html.indexOf('// ---------- main loop ----------', begin);
 assert(begin >= 0 && end > begin, 'viewer streaming section must exist');
