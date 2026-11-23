@@ -276,6 +276,10 @@ def _native():
                                                   n, n, n, n, n, p, n]
                 for fn in (lib.ttpf_detile, lib.ttpf_decode_bc, lib.ttpf_decode_means):
                     fn.restype = ctypes.c_ssize_t
+                predict = getattr(lib, "ttpf_predict_child_means", None)
+                if predict is not None:  # older ABI 1 builds still provide the other kernels
+                    predict.argtypes = [ctypes.c_uint32, buf, n, n, n, buf, p, n, n, n, p, n]
+                    predict.restype = ctypes.c_ssize_t
         _NATIVE.append(lib)
     return _NATIVE[0]
 
@@ -409,6 +413,19 @@ def _native_means_raw(lib, fmt, data, dec_w, dec_h, blocks_w, blocks_h, rx, ry, 
     return list(struct.iter_unpack("<3d", memoryview(out).cast("B")))
 
 
+def _native_child_means_raw(lib, fmt, data, dec_w, dec_h, pw, ph, vw, vh):
+    import ctypes
+    bptc, bc6h = _native_tables()
+    kind = _NATIVE_BC_KIND[fmt]
+    if bptc is None or (kind in (4, 5) and bc6h is None):
+        return None
+    out = (ctypes.c_double * (3 * vw * vh))()
+    if lib.ttpf_predict_child_means(kind, data, len(data), dec_w, dec_h, bptc, bc6h,
+                                    0 if bc6h is None else len(bc6h), pw, ph, out, len(out)) != 0:
+        return None
+    return list(struct.iter_unpack("<3d", memoryview(out).cast("B")))
+
+
 def _native_ok(lib, fmt):
     """Whether this format's native decoder and means agree with the Python ones on seeded
     random blocks (every mode selector); checked once per block kind."""
@@ -436,13 +453,22 @@ def _native_self_check(lib, fmt, kind):
             blocks[at:at + 2] = blocks[at + 2:at + 4]
     data = bytes(blocks)
     pack = struct.Struct("<3d").pack
+    predicted = None
     try:
-        expected = decode_pixels(fmt, data, 8, 8)
-        means = block_means(list(expected), 8, 8, 29, 30, 4)
+        expected = list(decode_pixels(fmt, data, 8, 8))
+        means = block_means(expected, 8, 8, 29, 30, 4)
+        if hasattr(lib, "ttpf_predict_child_means"):
+            parent = dict(pixels_w=29, pixels_h=30, blocks_w=8, blocks_h=8)
+            child = dict(pixels_w=14, pixels_h=15, blocks_w=4, blocks_h=4)
+            predicted = predict_child_means(expected, parent, child)
     except Exception:  # noqa: BLE001 - a Python decoder that cannot run here is not compared
         return False
     native_px = _native_decode_raw(lib, kind, data, 8, 8)
     native_means = _native_means_raw(lib, fmt, data, 8, 8, 8, 8, 29, 30, 4)
+    if predicted is not None:
+        native = _native_child_means_raw(lib, fmt, data, 8, 8, 29, 30, 4, 4)
+        if native is None or b"".join(pack(*p) for p in predicted) != b"".join(pack(*p) for p in native):
+            return False
     return (native_px is not None and native_means is not None
             and b"".join(pack(*p) for p in expected) == b"".join(pack(*p) for p in native_px)
             and b"".join(pack(*p) for p in means) == b"".join(pack(*p) for p in native_means))
@@ -475,6 +501,22 @@ def _native_block_means(pixels, blocks_w, blocks_h, rx, ry, block):
     if lib is None or len(pixels) != 16 * dec_w * dec_h or not _native_ok(lib, fmt):
         return None
     return _native_means_raw(lib, fmt, data, dec_w, dec_h, blocks_w, blocks_h, rx, ry, block)
+
+
+def _native_predict_child_means(pixels, parent, vw, vh):
+    src = pixels._src if type(pixels) is _NativePixels and hasattr(pixels, "_src") else None
+    if src is None:
+        return None
+    fmt, data, dec_w, dec_h = src
+    pw, ph = parent["pixels_w"], parent["pixels_h"]
+    if (dec_w, dec_h) != (parent["blocks_w"], parent["blocks_h"]) or not all(
+        type(v) is int for v in (pw, ph, vw, vh)
+    ):
+        return None
+    lib = _native()
+    if lib is None or not hasattr(lib, "ttpf_predict_child_means") or not _native_ok(lib, fmt):
+        return None
+    return _native_child_means_raw(lib, fmt, data, dec_w, dec_h, pw, ph, vw, vh)
 
 
 def detile(layout, mip, tiled):
@@ -1250,6 +1292,10 @@ def predict_child_means(pixels, parent, child, block=4):
         raise MipGeometryError(
             f"mip {parent.get('index')} geometry: {len(pixels)} pixels for "
             f"{parent['blocks_w']}x{parent['blocks_h']} blocks")
+    if block == 4:
+        native = _native_predict_child_means(pixels, parent, vw, vh)
+        if native is not None:
+            return native
     if block == 1:
         out = []
         for y in range(ch):

@@ -5,7 +5,7 @@ An optional Rust build of the hot loops in `tools/ttpf_mips.py`. `src/lib.rs` po
 - the element copy of `detile` and `detile_volume_slice` (the X/Y bit tables and row bases are the ones
   `ttpf_mips.py` computes and passes in);
 - the BC1, BC2/BC3 colour, BC4, BC5, BC6H (UF16 and SF16) and BC7 block decoders behind `decode_pixels`;
-- `block_means`.
+- `block_means` and `predict_child_means` for BC mips.
 
 Every integer step and every double operation is the Python one, in the same order, so the detiled bytes and
 the IEEE bits of every decoded or averaged double are identical (including -0.0). The BPTC partition and anchor
@@ -31,11 +31,14 @@ How the pieces fit:
   blocks and returns each distinct channel value and each distinct pixel once, so equal pixels share one tuple and
   one float, as the Python BC1/BC4 decoders already do. BC1-BC3 keep the Python decoder: it already shares a tuple
   per palette entry, and building the list from native output is no faster.
-- The list is a `list` subclass that remembers the blocks it was decoded from. `block_means` on such a list
-  decodes the blocks again natively and averages them there, without reading the tuples back; any in-place change
-  to the list drops the blocks and `block_means` runs in Python.
+- The list is a `list` subclass that remembers the blocks it was decoded from. `block_means` and
+  `predict_child_means` can decode those blocks again in Rust and average them without reading the tuples back.
+  Child prediction follows the visible mip bounds even when the stored block grid is larger. Editing the list
+  drops the remembered blocks and sends both operations through Python. Older ABI 1 libraries without the
+  prediction export still provide the original kernels.
 - The first time each block kind is used, `ttpf_mips.py` decodes and averages 64 seeded random blocks (every BC6H
-  mode code, every BC7 mode and the reserved one, both BC1 colour orders) both ways and keeps that kind in Python
+  mode code, every BC7 mode and the reserved one, both BC1 colour orders) both ways, including child prediction
+  when the library has it, and keeps that kind in Python
   if any double differs. A change to a Python decoder that is not made here too therefore turns the native path
   off instead of giving different numbers; `tests/test_ttpf_native.py` fails on it as well.
 
@@ -43,7 +46,8 @@ How the pieces fit:
 with 4 KiB and 64 KiB tiles, including 1x1, 3x700 and 1023x5 surfaces and short allocations; 3D volume slices of
 every element size, including 1x1x1 and 33x1x2; every BC format at 1x1, 1x37, 37x1, 2x3, 13x7 and 64x64 blocks,
 BC6H extreme endpoints under every mode code, bytearray and memoryview inputs and truncated payloads; and
-`block_means` under several crops, block sizes and grids. It also checks the fallbacks. Its comparisons skip when
+`block_means` under several crops, block sizes and grids, and child prediction for clipped and padded mips. It also
+checks the fallbacks. Its comparisons skip when
 the library is not built.
 
 ## Speed

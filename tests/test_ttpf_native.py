@@ -250,6 +250,40 @@ class BlockMeansMatchesPython(unittest.TestCase):
 
 
 @unittest.skipIf(NATIVE is None, "tools/ttpf_native is not built")
+class ChildMeansMatchPython(unittest.TestCase):
+    def test_native_prediction_matches_python_for_each_format(self):
+        rng = random.Random(391)
+        for fmt in BC_FORMATS:
+            for pw, ph, bw, bh in ((1, 1, 1, 1), (1, 11, 2, 4), (13, 1, 5, 2),
+                                   (15, 19, 6, 5), (32, 32, 8, 8)):
+                with self.subTest(fmt=fmt, visible=(pw, ph), stored=(bw, bh)):
+                    px = ttpf.decode_pixels(fmt, random_blocks(rng, fmt, bw * bh), bw, bh)
+                    parent = dict(pixels_w=pw, pixels_h=ph, blocks_w=bw, blocks_h=bh)
+                    cw, ch = max(1, pw // 2), max(1, ph // 2)
+                    child = dict(pixels_w=cw, pixels_h=ch, blocks_w=(cw + 3) // 4 + 1,
+                                 blocks_h=(ch + 3) // 4 + 1)
+                    expected = ttpf.predict_child_means(list(px), parent, child)
+                    with mock.patch.object(ttpf._NativePixels, "__getitem__",
+                                           side_effect=AssertionError("Python prediction used")):
+                        actual = ttpf.predict_child_means(px, parent, child)
+                    self.assertEqual(bits(actual), bits(expected))
+
+    def test_mutation_and_missing_export_use_python(self):
+        data = random_blocks(random.Random(9), 98, 4)
+        parent = dict(pixels_w=8, pixels_h=8, blocks_w=2, blocks_h=2)
+        child = dict(pixels_w=4, pixels_h=4, blocks_w=1, blocks_h=1)
+        px = ttpf.decode_pixels(98, data, 2, 2)
+        expected = ttpf.predict_child_means(list(px), parent, child)
+        with mock.patch.object(ttpf, "_NATIVE", [object()]):
+            self.assertEqual(bits(ttpf.predict_child_means(px, parent, child)), bits(expected))
+        px[0] = (1000.0, -1000.0, 50.0)
+        with mock.patch.object(ttpf, "_native_child_means_raw", side_effect=AssertionError("native used")):
+            actual = ttpf.predict_child_means(px, parent, child)
+        self.assertNotEqual(bits(actual), bits(expected))
+        self.assertEqual(bits(actual), bits(ttpf.predict_child_means(list(px), parent, child)))
+
+
+@unittest.skipIf(NATIVE is None, "tools/ttpf_native is not built")
 class SelfCheck(unittest.TestCase):
     def setUp(self):
         ttpf._NATIVE_BC_OK.clear()
@@ -272,6 +306,10 @@ class SelfCheck(unittest.TestCase):
         def shifted(data, at):
             return [(r + 1.0, g, b) for r, g, b in real(data, at)]
         with mock.patch.dict(ttpf._BLOCK_DECODERS, {98: shifted}):
+            self.assertFalse(ttpf._native_ok(NATIVE, 98))
+
+    def test_a_diverging_child_prediction_is_noticed(self):
+        with mock.patch.object(ttpf, "_native_child_means_raw", return_value=[(0.0, 0.0, 0.0)] * 16):
             self.assertFalse(ttpf._native_ok(NATIVE, 98))
 
     def test_every_kind_passes(self):

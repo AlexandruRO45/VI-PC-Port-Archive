@@ -989,6 +989,72 @@ pub unsafe extern "C" fn ttpf_decode_means(kind: u32, data: *const u8, data_len:
     0
 }
 
+/// Predict the visible means of a half-resolution BC mip from its decoded parent. Each mean
+/// accumulates the clamped 2x2 parent neighborhoods in child-texel raster order, as in Python.
+fn predict_child_means(px: &[f64], stride: usize, pw: usize, ph: usize, out: &mut [f64]) {
+    let cw = (pw / 2).max(1);
+    let ch = (ph / 2).max(1);
+    let vw = cw.div_ceil(4);
+    for (i, mean) in out.chunks_exact_mut(3).enumerate() {
+        let x0 = 4 * (i % vw);
+        let y0 = 4 * (i / vw);
+        let x1 = (x0 + 4).min(cw);
+        let y1 = (y0 + 4).min(ch);
+        let mut sums = [0.0; 3];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                for dy in 0..2 {
+                    let row = (2 * y + dy).min(ph - 1) * stride;
+                    for dx in 0..2 {
+                        let at = 3 * (row + (2 * x + dx).min(pw - 1));
+                        for k in 0..3 {
+                            sums[k] += px[at + k];
+                        }
+                    }
+                }
+            }
+        }
+        let n = (4 * (x1 - x0) * (y1 - y0)) as f64;
+        for k in 0..3 {
+            mean[k] = sums[k] / n;
+        }
+    }
+}
+
+/// Decode the parent BC grid and return three doubles for each visible child block in raster
+/// order. Returns -1 for invalid arguments or a parent block the decoder does not cover.
+///
+/// # Safety
+/// As [`ttpf_decode_bc`] for the inputs; `out` must be valid for `out_len` writable doubles.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ttpf_predict_child_means(kind: u32, data: *const u8, data_len: usize, dec_w: usize,
+                                                  dec_h: usize, tables: *const u8, bc6h: *const i32,
+                                                  bc6h_len: usize, pw: usize, ph: usize,
+                                                  out: *mut f64, out_len: usize) -> isize {
+    if out.is_null() || pw == 0 || ph == 0 || pw.div_ceil(4) > dec_w || ph.div_ceil(4) > dec_h {
+        return -1;
+    }
+    let vw = (pw / 2).max(1).div_ceil(4);
+    let vh = (ph / 2).max(1).div_ceil(4);
+    if vw.checked_mul(vh).and_then(|n| n.checked_mul(3)) != Some(out_len) {
+        return -1;
+    }
+    // SAFETY: forwarded from the caller.
+    let args = match unsafe { decode_args(kind, data, data_len, dec_w, dec_h, tables, bc6h, bc6h_len) } {
+        Some(a) => a,
+        None => return -1,
+    };
+    let px = match args.decode() {
+        Some(p) => p,
+        None => return -1,
+    };
+    // SAFETY: the caller guarantees the length (see the safety section).
+    let out = unsafe { slice::from_raw_parts_mut(out, out_len) };
+    predict_child_means(&px, 4 * dec_w, pw, ph, out);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1171,12 @@ mod tests {
             // A visible row past the decoded grid.
             assert_eq!(ttpf_decode_means(0, data.as_ptr(), 8, 1, 1, tables.as_ptr(), nob, 0, 1, 2, 4, 5, 4,
                                          means.as_mut_ptr(), 3), -1);
+            assert_eq!(ttpf_predict_child_means(0, data.as_ptr(), 8, 1, 1, tables.as_ptr(), nob, 0, 4, 4,
+                                                means.as_mut_ptr(), 3), 0);
+            assert_eq!(ttpf_predict_child_means(0, data.as_ptr(), 8, 1, 1, tables.as_ptr(), nob, 0, 5, 4,
+                                                means.as_mut_ptr(), 3), -1);
+            assert_eq!(ttpf_predict_child_means(0, data.as_ptr(), 8, 1, 1, tables.as_ptr(), nob, 0, 4, 4,
+                                                means.as_mut_ptr(), 2), -1);
         }
     }
 
