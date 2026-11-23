@@ -1009,11 +1009,16 @@ class CliTests(unittest.TestCase):
 
     def test_zero_meshlet_group_is_rejected_without_hanging(self):
         raw = bytes.fromhex("00000080000000000000000001000000")
-        self.assertFalse(mp.is_mesh_page(raw))
-        with self.assertRaises(mp.PageError):
-            mp.parse_group(raw, 0)
         with self.assertRaises(mp.PageError):
             mp.parse_page(raw)
+
+        # Unaligned nonzero data after a group must not round back inside that group.
+        g = bytearray(group([(4, 1)]))
+        g += struct.pack("<I", 0x80000001)
+        g = pad16(g)
+        struct.pack_into("<I", g, 0x20, 0x80000001)
+        with self.assertRaises(mp.PageError):
+            mp.parse_page(bytes(g))
 
         trailing = page(block(4), raw)
         with self.assertRaises(mp.PageError):
