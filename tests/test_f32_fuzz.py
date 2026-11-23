@@ -2,17 +2,22 @@
 
     python -I tests/test_f32_fuzz.py
 """
+import ast
+import contextlib
+import io
 import os
 import random
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.dont_write_bytecode = True
 
 import f32_fuzz as ff  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402  (on sys.path through f32_fuzz)
 
 
 class ModelTests(unittest.TestCase):
@@ -105,6 +110,120 @@ class HarnessTests(unittest.TestCase):
                                  f"{op} v8, v0, 0x{ff.bits(3.0):x}, v1")
                 status, words = ff.run_translated(ff.listing(op, vals, srcs, False, [])[0])
                 self.assertEqual((status, words[:2]), ("ok", got_model))
+
+
+class InterpreterVerdicts(unittest.TestCase):
+    """What run_translated makes of each way the interpreter can refuse a module, and what main() exits with."""
+    ARGS = ["--programs", "20", "--ops", "v_add_f32"]
+    LISTING = ff.listing("v_add_f32", [ff.bits(1.0), ff.bits(2.0)] + [0] * 7, [(0, {}), (1, {})], False, [])[0]
+
+    @staticmethod
+    def quiet_main(argv):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = ff.main(argv)
+        return rc, out.getvalue()
+
+    def test_invalid_module_fails_the_run(self):
+        # The real translation with its Function variables moved out of the first block: spirv-val (and so every
+        # driver) rejects it, and the interpreter raises InvalidModule. Until 2026-11-23 that was a skip, exit 0.
+        real = ff.rdna2spirv.translate
+
+        def broken(path):
+            lines = real(path).splitlines()
+            k = next(i for i, ln in enumerate(lines) if "OpVariable %_ptr_Function_" in ln)
+            lines[k:k] = ["OpBranch %f32_fuzz_late", "%f32_fuzz_late = OpLabel"]
+            return "\n".join(lines) + "\n"
+
+        with mock.patch.object(ff.rdna2spirv, "translate", broken):
+            status, detail = ff.run_translated(self.LISTING)
+            self.assertEqual(status, "invalid", detail)
+            self.assertIn("InvalidModule", detail)
+            rc, out = self.quiet_main(self.ARGS)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("invalid SPIR-V", out)
+
+    def test_interpreter_crash_is_a_harness_error(self):
+        with mock.patch.object(ff, "run_fragment", side_effect=KeyError("x")):
+            status, detail = ff.run_translated(self.LISTING)
+            self.assertEqual(status, "error", detail)
+            self.assertIn("KeyError", detail)
+            rc, out = self.quiet_main(self.ARGS)
+        self.assertEqual(rc, 2, out)
+
+    def test_refusals_stay_skips_and_undefined_results(self):
+        for exc, want in ((si.UnsupportedConstruct("storage class Workgroup"), "skip"),
+                          (si.UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)"), "undefined"),
+                          (si.UnsupportedConstruct("GLSL.std.450 Log of 0.0 (undefined)"), "undefined"),
+                          (si.UnsupportedConstruct("OpStore uses an undefined value: OpStore %p %x"), "undefined"),
+                          (si.UndefinedResult("invocation 0: shuffle from lane 40"), "undefined")):
+            with self.subTest(exc=exc), mock.patch.object(ff, "run_fragment", side_effect=exc):
+                self.assertEqual(ff.run_translated(self.LISTING)[0], want)
+        with mock.patch.object(ff, "run_fragment", side_effect=si.UnsupportedConstruct("storage class Workgroup")):
+            rc, out = self.quiet_main(self.ARGS)
+        self.assertEqual(rc, 0, out)
+
+    def test_dangling_id_is_invalid_not_undefined(self):
+        # "use of undefined id %x" is a module that reads an id it never defined: spirv-val rejects it. It contains
+        # the word "undefined", which used to make it an "undefined in SPIR-V" result and kept the run at exit 0.
+        exc = si.UnsupportedConstruct("use of undefined id %never_defined")
+        with self.subTest(exc=exc), mock.patch.object(ff, "run_fragment", side_effect=exc):
+            status, detail = ff.run_translated(self.LISTING)
+            self.assertEqual(status, "invalid", detail)
+            rc, out = self.quiet_main(self.ARGS)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("invalid SPIR-V", out)
+        # The same through the real interpreter: the translation with an OpFAdd operand replaced by an id nothing
+        # defines.
+        real = ff.rdna2spirv.translate
+
+        def dangling(path):
+            lines = real(path).splitlines()
+            k = next(i for i, ln in enumerate(lines) if " OpFAdd " in ln)
+            parts = lines[k].split()
+            parts[-1] = "%f32_fuzz_never_defined"
+            lines[k] = " ".join(parts)
+            return "\n".join(lines) + "\n"
+
+        with self.subTest("real interpreter"), mock.patch.object(ff.rdna2spirv, "translate", dangling):
+            status, detail = ff.run_translated(self.LISTING)
+            self.assertEqual(status, "invalid", detail)
+            self.assertIn("use of undefined id", detail)
+
+    def test_every_undefined_refusal_of_the_interpreter_is_classified(self):
+        # Every UnsupportedConstruct the interpreter raises with "undefined" in its message, read from its source with
+        # the f-string fields filled in: a new raise site with another wording fails here instead of becoming a skip.
+        with open(si.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        msgs = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+                    and getattr(node.exc.func, "id", None) == "UnsupportedConstruct" and node.exc.args):
+                arg = node.exc.args[0]
+                if isinstance(arg, ast.Constant):
+                    msgs.append(str(arg.value))
+                elif isinstance(arg, ast.JoinedStr):
+                    msgs.append("".join(str(v.value) if isinstance(v, ast.Constant) else "X" for v in arg.values))
+        undefined = [m for m in msgs if "undefined" in m]
+        self.assertGreaterEqual(len(undefined), 5, undefined)
+        for msg in undefined:
+            want = "invalid" if msg.startswith("use of undefined id ") else "undefined"
+            with self.subTest(msg=msg):
+                self.assertEqual(ff.refusal_kind(msg), want)
+        for msg in msgs:
+            if "undefined" not in msg:
+                with self.subTest(msg=msg):
+                    self.assertEqual(ff.refusal_kind(msg), "skip")
+
+    def test_hardware_path_counts_invalid_and_error_verdicts(self):
+        case = ff.gen_cases(1, 1, ["v_add_f32"])[0]
+        for side_effect, kind in ((si.InvalidModule("phi after an instruction"), "invalid"),
+                                  (KeyError("x"), "error"),
+                                  (si.UnsupportedConstruct("storage class Workgroup"), None)):
+            tally = {"invalid": 0, "error": 0}
+            with self.subTest(kind=kind), mock.patch.object(ff, "run_fragment", side_effect=side_effect):
+                verdict = ff.counting_verdict(tally)(case, [0, 0], [0, 0])
+                self.assertEqual(tally, {"invalid": int(kind == "invalid"), "error": int(kind == "error")},
+                                 verdict)
 
 
 class CliTests(unittest.TestCase):

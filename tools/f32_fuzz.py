@@ -32,14 +32,16 @@ Usage:
     python -I tools/f32_fuzz.py --list-ops
     python -I tools/f32_fuzz.py --self-test
 
-Exit code: 0 when every program matches, 1 when any mismatches, 2 on a harness error. Nothing here reads game
-files.
+Exit code: 0 when every program matches, 1 when any mismatches or translates to SPIR-V the interpreter rejects as
+invalid (InvalidModule: a rule spirv-val enforces), 2 on a harness error (an interpreter crash included). Nothing
+here reads game files.
 """
 import argparse
 import gc
 import math
 import os
 import random
+import re
 import struct
 import sys
 import tempfile
@@ -56,7 +58,7 @@ if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
 
 import rdna2spirv  # noqa: E402
-from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_mini_interp import InvalidModule, UndefinedResult, UnsupportedConstruct, run_fragment  # noqa: E402
 
 M32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -686,6 +688,26 @@ def listing(op, vals, srcs, e64, out_mods):
     return "\n".join(out) + "\n", obs[:2]
 
 
+# spirv_mini_interp raises UnsupportedConstruct both for a value SPIR-V leaves undefined and for constructs it does not
+# model; it has no type or attribute that tells them apart, so these match the exact message shapes of its raise
+# sites (tests/test_f32_fuzz.py reads every one of them from the interpreter's source and checks this):
+#   "<op> uses an undefined value: <line>"                     an undefined operand reaching a non-pure operation
+#   "... (undefined in SPIR-V)" / "... (undefined)"           OpFDiv by zero, conversions, bit fields, GLSL.std.450
+# "use of undefined id %x" is not one: the module reads an id it never defined (or defines after the use), which
+# spirv-val rejects, so it is an invalid module, not an undefined value. Bare substring "undefined" matched it.
+_UNDEFINED_VALUE = re.compile(r" uses an undefined value: |\(undefined(?: in SPIR-V)?\)$")
+_DANGLING_ID = re.compile(r"^use of undefined id ")
+
+
+def refusal_kind(msg):
+    """Classify an UnsupportedConstruct message: "invalid", "undefined" or "skip"."""
+    if _DANGLING_ID.match(msg):
+        return "invalid"
+    if _UNDEFINED_VALUE.search(msg):
+        return "undefined"
+    return "skip"
+
+
 def run_translated(text, name="ps_f32_fuzz"):
     with tempfile.TemporaryDirectory(prefix="f32-fuzz-") as tmp:
         dis = os.path.join(tmp, "disasm")
@@ -702,13 +724,24 @@ def run_translated(text, name="ps_f32_fuzz"):
                 gc.collect()
         except rdna2spirv.Unsupported as e:
             return "skip", f"translator unsupported: {e}"
+    # Only a deliberate refusal is a skip. InvalidModule is SPIR-V that spirv-val (and so every driver) rejects: a
+    # translator failure, counted with the mismatches. Any other exception is the harness breaking (exit 2).
     try:
         out = run_fragment(spv)
-    except Exception as e:  # noqa: BLE001 - the interpreter is half of the comparison
+    except InvalidModule as e:
+        return "invalid", f"InvalidModule: {str(e)[:90]}"
+    except UndefinedResult as e:
+        return "undefined", str(e)[:90]
+    except UnsupportedConstruct as e:
         msg = str(e)
-        if "undefined" in msg:
+        kind = refusal_kind(msg)
+        if kind == "invalid":
+            return "invalid", f"UnsupportedConstruct: {msg[:90]}"
+        if kind == "undefined":
             return "undefined", msg[:90]
         return "skip", f"interpreter: {type(e).__name__}: {msg[:90]}"
+    except Exception as e:  # noqa: BLE001 - reported per program, then the run exits 2
+        return "error", f"interpreter: {type(e).__name__}: {str(e)[:90]}"
     if list(out) != ["%out_mrt0"]:
         return "skip", f"outputs {sorted(out)}"
     return "ok", [w & M32 for w in out["%out_mrt0"]]
@@ -753,7 +786,7 @@ def run_suite(programs, seed, ops, show=2, quiet=False):
 
 def translate_cases(cases, seed, show=2, quiet=False):
     """Judge each case against the translated SPIR-V. Cases of hardware-only ops are not sent to the translator."""
-    counts = {"match": 0, "mismatch": 0, "undefined": 0, "skip": {}}
+    counts = {"match": 0, "mismatch": 0, "undefined": 0, "skip": {}, "invalid": {}, "error": {}}
     by_op, undef_by_op, shown = {}, {}, {}
     programs = 0
     for case in cases:
@@ -763,8 +796,9 @@ def translate_cases(cases, seed, show=2, quiet=False):
         i = case.index
         op, vals, srcs, e64, out_mods = case.args()
         status, detail = check(op, vals, srcs, e64, out_mods)
-        if status == "skip":
-            counts["skip"][detail] = counts["skip"].get(detail, 0) + 1
+        if status in ("skip", "invalid", "error"):
+            key = detail if status == "skip" else f"{op}: {detail}"
+            counts[status][key] = counts[status].get(key, 0) + 1
             continue
         counts[status] += 1
         if status == "undefined":
@@ -784,8 +818,15 @@ def translate_cases(cases, seed, show=2, quiet=False):
                 print("    model v8/vcc:      " + " ".join(fdesc(w) for w in want[:2]))
                 print("    translated v8/vcc: " + " ".join(fdesc(w) for w in got[:2]))
     if not quiet:
+        n_invalid, n_error = sum(counts["invalid"].values()), sum(counts["error"].values())
         print(f"{programs} programs (seed {seed}): {counts['match']} match, {counts['mismatch']} mismatch, "
-              f"{counts['undefined']} undefined in SPIR-V, {sum(counts['skip'].values())} skipped")
+              f"{counts['undefined']} undefined in SPIR-V, {sum(counts['skip'].values())} skipped"
+              + (f", {n_invalid} invalid SPIR-V" if n_invalid else "")
+              + (f", {n_error} harness errors" if n_error else ""))
+        for reason, n in sorted(counts["invalid"].items(), key=lambda t: -t[1]):
+            print(f"  invalid SPIR-V x{n}: {reason}")
+        for reason, n in sorted(counts["error"].items(), key=lambda t: -t[1]):
+            print(f"  harness error x{n}: {reason}")
         for reason, n in sorted(counts["skip"].items(), key=lambda t: -t[1]):
             print(f"  skip x{n}: {reason}")
         for (op, reason), n in sorted(undef_by_op.items(), key=lambda t: -t[1]):
@@ -807,6 +848,19 @@ def translator_verdict(case, want, got):
     if hw_same(mine, want, case.op):
         return "matches the model, so it shares the model's answer (" + " ".join(fdesc(w) for w in mine) + ")"
     return "matches neither: " + " ".join(fdesc(w) for w in mine)
+
+
+def counting_verdict(tally):
+    """translator_verdict that also counts its "invalid" and "error" verdicts in `tally`. With --oracle
+    translator,hw the probe cases (gen_probes) reach the translator only through it, so main sets the exit code
+    from these counts as translate_cases does from its own."""
+    def verdict(case, want, got):
+        v = translator_verdict(case, want, got)
+        kind = v.split(":", 1)[0]
+        if kind in tally:
+            tally[kind] += 1
+        return v
+    return verdict
 
 
 # ---- the hardware oracle (--oracle hw) ----
@@ -1704,7 +1758,8 @@ def main(argv=None):
         cases = gen_cases(a.programs, a.seed, ops)
         if "translator" in backends:
             counts, _, _ = translate_cases(cases, a.seed, show=a.show)
-            rc |= bool(counts["mismatch"])
+            rc |= bool(counts["mismatch"] or counts["invalid"])
+            harness |= bool(counts["error"])
         if oracle:
             words = hw_probe_modes(oracle)
             print("MODE read back in the kernels: " + ", ".join(f"{n} 0x{w:x}" for n, w in words.items()))
@@ -1721,7 +1776,8 @@ def main(argv=None):
                     model_ctx.__exit__(None, None, None)
             print(f"\nhardware vs F32Model{' (perturbed: ' + a.perturb + ')' if a.perturb else ''}, "
                   f"{len(cases)} programs, mode {HW_PRIMARY} (MODE 0x{words[HW_PRIMARY]:x}), seed {a.seed}:")
-            tr = translator_verdict if "translator" in backends else None
+            tr_bad = {"invalid": 0, "error": 0}
+            tr = counting_verdict(tr_bad) if "translator" in backends else None
             n_mis = hw_print(rep, show=a.show, translator_check=tr)
             if any(r["asm"] for r in rep.per_op.values()):
                 harness = True
@@ -1734,6 +1790,11 @@ def main(argv=None):
                     tally[(name, verdict)] = tally.get((name, verdict), 0) + 1
                 for (name, verdict), n in sorted(tally.items()):
                     print(f"  translator on known deviation {name} x{n}: {verdict}")
+            if tr_bad["invalid"] or tr_bad["error"]:
+                print(f"translator on hardware-judged programs: {tr_bad['invalid']} invalid SPIR-V, "
+                      f"{tr_bad['error']} harness errors")
+            rc |= bool(tr_bad["invalid"])
+            harness |= bool(tr_bad["error"])
             if not a.no_info:
                 info_print(rep)
             if a.keep and rep.mismatches:
