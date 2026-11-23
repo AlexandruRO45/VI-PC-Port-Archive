@@ -208,7 +208,8 @@ def parse_line(line):
         rest = MODWORDS.sub(_take_mod, rest)
     parts = [a for a in split_args(rest) if a.strip()]
     # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
-    if parts and len(parts[0].split()) == 2:
+    # 's_waitcnt' / 's_waitcnt_depctr': up to three space-separated counters without commas.
+    if parts and (op in ("s_waitcnt", "s_waitcnt_depctr") or len(parts[0].split()) == 2):
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",

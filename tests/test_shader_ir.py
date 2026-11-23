@@ -253,6 +253,24 @@ class ParseLineTests(unittest.TestCase):
         self.assertEqual(len(ins["args"]), 1)
         self.assertEqual(ins["args"][0]["k"], "special")
 
+    def test_s_waitcnt_three_counters_split(self):
+        ins = shader_ir.parse_line("\ts_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)")
+        self.assertEqual(len(ins["args"]), 3)
+        self.assertEqual([a["t"] for a in ins["args"]], ["vmcnt(0)", "expcnt(0)", "lgkmcnt(0)"])
+        self.assertTrue(all(a["k"] == "special" for a in ins["args"]))
+
+    def test_s_waitcnt_depctr_three_counters_split(self):
+        ins = shader_ir.parse_line("\ts_waitcnt_depctr depctr_vmreq(0) depctr_va_vcmpx(0) depctr_sa_sdst(0)")
+        self.assertEqual(len(ins["args"]), 3)
+        self.assertEqual([a["t"] for a in ins["args"]], ["depctr_vmreq(0)", "depctr_va_vcmpx(0)", "depctr_sa_sdst(0)"])
+        self.assertTrue(all(a["k"] == "special" for a in ins["args"]))
+
+    def test_s_setreg_b32_hwreg_not_over_split(self):
+        ins = shader_ir.parse_line("\ts_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0")
+        self.assertEqual(len(ins["args"]), 2)
+        self.assertEqual(ins["args"][0], {"k": "special", "t": "hwreg(HW_REG_MODE, 2, 2)"})
+        self.assertEqual(ins["args"][1], {"k": "sgpr", "r": 0, "n": 1, "neg": False, "abs": False})
+
     def test_no_operands(self):
         self.assertEqual(shader_ir.parse_line("\ts_endpgm")["args"], [])
 
