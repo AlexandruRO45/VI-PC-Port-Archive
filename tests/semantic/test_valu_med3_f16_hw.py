@@ -1,6 +1,8 @@
-"""Semantic interpreter tests and reference mathematical oracle for RDNA2 v_med3_f16.
+from __future__ import annotations
 
-AMD RDNA2 / GFX10 Vector ALU (VALU) Architecture:
+"""Hardware-referenced semantic regression tests for RDNA2 VALU v_med3_f16.
+
+AMD RDNA2 Vector ALU (VALU) Architecture:
   - 16-bit Floating-Point 3-Operand Median:
     v_med3_f16 vdst, src0, src1, src2 [op_sel:[s0,s1,s2,d]] [clamp]
   - Operands:
@@ -17,27 +19,21 @@ AMD RDNA2 / GFX10 Vector ALU (VALU) Architecture:
       Clamps the result to [0.0, 1.0] (0x0000 to 0x3C00).
     Destination:
       VOP3 opsel preserves the other 16-bit half of destination VGPR.
-"""
-from __future__ import annotations
 
-import dataclasses
-import enum
-import math
+All tests in this suite compile real assembly listings through support.translate_lines(...)
+and execute the translated SPIR-V in spirv_mini_interp via support.mrt0_words.
+Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
+"""
+
 import os
-import struct
 import sys
 import unittest
-from typing import Dict, List, Optional, Tuple, Union
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
-if TOOLS_DIR not in sys.path:
-    sys.path.insert(0, TOOLS_DIR)
+sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import rdna2spirv  # noqa: E402
 import support  # noqa: E402
 
 MASK16: int = 0xFFFF
@@ -51,543 +47,330 @@ F16_NEG_INF: int = 0xFC00
 F16_QNAN: int = 0x7E00
 
 
-def is_nan_f16(u16: int) -> bool:
-    """Return True if 16-bit word represents an IEEE 754 half-precision NaN."""
-    return (u16 & 0x7C00) == 0x7C00 and (u16 & 0x03FF) != 0
+def run_med3_f16(
+    s0: int,
+    s1: int,
+    s2: int,
+    *,
+    init_dst: int = 0xDEAD0000,
+    alias_dst: int | None = None,
+    clamp: bool = False,
+    op_sel: str = "",
+    name: str = "ps_med3_f16",
+) -> int:
+    """Assemble, translate, and execute a v_med3_f16 instruction."""
+    dst = f"v{alias_dst}" if alias_dst is not None else "v0"
+    clamp_str = " clamp" if clamp else ""
+    sel_str = f" {op_sel}" if op_sel else ""
+    lines = [
+        f"v_mov_b32 v0, {init_dst & MASK32:#x}",
+        f"v_mov_b32 v1, {s0 & MASK32:#x}",
+        f"v_mov_b32 v2, {s1 & MASK32:#x}",
+        f"v_mov_b32 v3, {s2 & MASK32:#x}",
+        f"v_med3_f16 {dst}, v1, v2, v3{clamp_str}{sel_str}",
+        f"exp mrt0 {dst}, {dst}, {dst}, {dst} done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
 
-def f16_sort_key(u16: int) -> int:
-    """Order f16 values with -inf < ... < -0.0 < +0.0 < ... < +inf."""
-    sign = (u16 >> 15) & 1
-    if sign:
-        return -(u16 & 0x7FFF) - 1
-    return u16 & 0x7FFF
+# ==============================================================================
+# Suite 1: Core Mathematical Operations & Permutations (7 tests)
+# ==============================================================================
+
+class TestVMed3F16Core(unittest.TestCase):
+    """Core half-precision median operations and mathematical properties."""
+
+    def test_med3_f16_basic(self) -> None:
+        """med3(1.0, 2.0, 3.0) = 2.0 (0x4000)."""
+        res = run_med3_f16(0x3C00, 0x4000, 0x4200, name="ps_med3_basic")
+        self.assertEqual(res & MASK16, 0x4000)
+
+    def test_med3_f16_all_permutations(self) -> None:
+        """All 6 permutations of (1.0, 2.0, 3.0) yield median 2.0 (0x4000)."""
+        perms = [
+            (0x3C00, 0x4000, 0x4200),
+            (0x3C00, 0x4200, 0x4000),
+            (0x4000, 0x3C00, 0x4200),
+            (0x4000, 0x4200, 0x3C00),
+            (0x4200, 0x3C00, 0x4000),
+            (0x4200, 0x4000, 0x3C00),
+        ]
+        for i, (a, b, c) in enumerate(perms):
+            with self.subTest(perm=(a, b, c)):
+                res = run_med3_f16(a, b, c, name=f"ps_med3_perm_{i}")
+                self.assertEqual(res & MASK16, 0x4000)
+
+    def test_med3_f16_signed_zeros(self) -> None:
+        """-0.0 < +0.0 < 1.0 -> median is +0.0 (0x0000)."""
+        res1 = run_med3_f16(F16_POS_ZERO, F16_NEG_ZERO, F16_ONE, name="ps_med3_zero1")
+        self.assertEqual(res1 & MASK16, F16_POS_ZERO)
+        # Duplicate -0.0: med(-0.0, +0.0, -0.0) = -0.0 (0x8000)
+        res2 = run_med3_f16(F16_NEG_ZERO, F16_POS_ZERO, F16_NEG_ZERO, name="ps_med3_zero2")
+        self.assertEqual(res2 & MASK16, F16_NEG_ZERO)
+
+    def test_med3_f16_identical_operands(self) -> None:
+        """Identical operands: med3(x, x, x) = x and med3(x, x, y) = x."""
+        val = 0x4000  # 2.0
+        res_same = run_med3_f16(val, val, val, name="ps_med3_all_same")
+        self.assertEqual(res_same & MASK16, val)
+        res_pair = run_med3_f16(val, val, 0x4500, name="ps_med3_pair_same")
+        self.assertEqual(res_pair & MASK16, val)
+
+    def test_med3_f16_infinities(self) -> None:
+        """Infinities ordering: med3(-inf, 1.0, +inf) = 1.0 (0x3C00)."""
+        res = run_med3_f16(F16_NEG_INF, F16_ONE, F16_POS_INF, name="ps_med3_inf")
+        self.assertEqual(res & MASK16, F16_ONE)
+        res_double_inf = run_med3_f16(F16_POS_INF, F16_POS_INF, F16_ONE, name="ps_med3_double_inf")
+        self.assertEqual(res_double_inf & MASK16, F16_POS_INF)
+
+    def test_med3_f16_subnormals(self) -> None:
+        """Subnormal ordering: 0.0 < 0x0001 < 0x0002 -> median is 0x0001."""
+        res = run_med3_f16(F16_POS_ZERO, 0x0001, 0x0002, name="ps_med3_subnorm")
+        self.assertEqual(res & MASK16, 0x0001)
+
+    def test_med3_f16_negative_values(self) -> None:
+        """Negative values ordering: -3.0 (0xC200) < -2.0 (0xC000) < -1.0 (0xBC00) -> -2.0."""
+        res = run_med3_f16(0xC200, 0xC000, 0xBC00, name="ps_med3_neg")
+        self.assertEqual(res & MASK16, 0xC000)
 
 
-def nmin_f16(a: int, b: int) -> int:
-    """GLSL/SPIR-V NMin semantics for 16-bit float: ignores NaN unless both are NaN."""
-    a_nan = is_nan_f16(a)
-    b_nan = is_nan_f16(b)
-    if a_nan and b_nan:
-        return F16_QNAN
-    if a_nan:
-        return b
-    if b_nan:
-        return a
-    return a if f16_sort_key(a) <= f16_sort_key(b) else b
+# ==============================================================================
+# Suite 2: NaN Handling & Hardware Fallback (5 tests)
+# ==============================================================================
+
+class TestVMed3F16NaNHandling(unittest.TestCase):
+    """RDNA2 NaN-handling semantics (NMin fallback)."""
+
+    def test_med3_f16_single_nan_suppression(self) -> None:
+        """With 1 NaN, hardware executes min3 on non-NaNs: med(NaN, 2.0, 3.0) = 2.0."""
+        res = run_med3_f16(F16_QNAN, 0x4000, 0x4200, name="ps_med3_nan1")
+        self.assertEqual(res & MASK16, 0x4000)
+
+    def test_med3_f16_single_nan_middle(self) -> None:
+        """med(3.0, NaN, 2.0) = 2.0."""
+        res = run_med3_f16(0x4200, F16_QNAN, 0x4000, name="ps_med3_nan_mid")
+        self.assertEqual(res & MASK16, 0x4000)
+
+    def test_med3_f16_two_nans(self) -> None:
+        """With 2 NaNs, hardware returns the sole non-NaN operand."""
+        res = run_med3_f16(F16_QNAN, F16_QNAN, 0x4200, name="ps_med3_two_nans")
+        self.assertEqual(res & MASK16, 0x4200)
+
+    def test_med3_f16_nan_with_infinities(self) -> None:
+        """med(NaN, -inf, +inf) returns -inf (0xFC00)."""
+        res = run_med3_f16(F16_QNAN, F16_NEG_INF, F16_POS_INF, name="ps_med3_nan_inf")
+        self.assertEqual(res & MASK16, F16_NEG_INF)
+
+    def test_med3_f16_signalling_nan(self) -> None:
+        """Signalling NaN is suppressed in favor of non-NaN values."""
+        snan = 0x7C01  # Signalling NaN
+        res = run_med3_f16(snan, 0x4000, 0x4200, name="ps_med3_snan")
+        self.assertEqual(res & MASK16, 0x4000)
 
 
-def nmax_f16(a: int, b: int) -> int:
-    """GLSL/SPIR-V NMax semantics for 16-bit float: ignores NaN unless both are NaN."""
-    a_nan = is_nan_f16(a)
-    b_nan = is_nan_f16(b)
-    if a_nan and b_nan:
-        return F16_QNAN
-    if a_nan:
-        return b
-    if b_nan:
-        return a
-    return a if f16_sort_key(a) >= f16_sort_key(b) else b
+# ==============================================================================
+# Suite 3: Modifiers, Clamping & Bit Preservation (6 tests)
+# ==============================================================================
+
+class TestVMed3F16Modifiers(unittest.TestCase):
+    """Clamp modifier, op_sel halfword routing, and upper/lower bit preservation."""
+
+    def test_med3_f16_clamp_positive(self) -> None:
+        """Clamp modifier clamps results > 1.0 to 1.0 (0x3C00)."""
+        # med(2.0, 3.0, 5.0) = 3.0 -> clamped to 1.0
+        res = run_med3_f16(0x4000, 0x4200, 0x4500, clamp=True, name="ps_med3_clamp_pos")
+        self.assertEqual(res & MASK16, F16_ONE)
+
+    def test_med3_f16_clamp_negative(self) -> None:
+        """Clamp modifier clamps results < 0.0 to 0.0 (0x0000)."""
+        # med(-3.0, -2.0, -1.0) = -2.0 -> clamped to 0.0
+        res = run_med3_f16(0xC200, 0xC000, 0xBC00, clamp=True, name="ps_med3_clamp_neg")
+        self.assertEqual(res & MASK16, F16_POS_ZERO)
+
+    def test_med3_f16_upper_half_preservation(self) -> None:
+        """Default (d_hi=0) preserves destination upper 16 bits (0xDEAD)."""
+        res = run_med3_f16(0x3C00, 0x4000, 0x4200, init_dst=0xDEAD0000, name="ps_med3_hi_pres")
+        self.assertEqual((res >> 16) & MASK16, 0xDEAD)
+        self.assertEqual(res & MASK16, 0x4000)
+
+    def test_med3_f16_op_sel_src_and_dst(self) -> None:
+        """op_sel:[1,0,1,1] routes s0.hi, s1.lo, s2.hi and writes destination high half."""
+        # s0 = 0x3C000000 (hi: 1.0)
+        # s1 = 0x00004000 (lo: 2.0)
+        # s2 = 0x42000000 (hi: 3.0)
+        # dst init = 0x0000BEEF
+        # Result high half = med(1.0, 2.0, 3.0) = 2.0 (0x4000), low half preserved as 0xBEEF
+        lines = [
+            "v_mov_b32 v0, 0x0000BEEF",
+            "v_mov_b32 v1, 0x3C000000",
+            "v_mov_b32 v2, 0x00004000",
+            "v_mov_b32 v3, 0x42000000",
+            "v_med3_f16 v0, v1, v2, v3 op_sel:[1,0,1,1]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_opsel", lines)
+        word = support.mrt0_words(spv)[0]
+        self.assertEqual(word, 0x4000BEEF)
+
+    def test_med3_f16_op_sel_all_high_sources(self) -> None:
+        """op_sel:[1,1,1,0] reads high halves of all 3 sources into destination low half."""
+        lines = [
+            "v_mov_b32 v0, 0x55AA0000",
+            "v_mov_b32 v1, 0x3C001111",  # hi: 1.0
+            "v_mov_b32 v2, 0x40002222",  # hi: 2.0
+            "v_mov_b32 v3, 0x42003333",  # hi: 3.0
+            "v_med3_f16 v0, v1, v2, v3 op_sel:[1,1,1,0]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_opsel_all_hi", lines)
+        word = support.mrt0_words(spv)[0]
+        self.assertEqual(word, 0x55AA4000)
+
+    def test_med3_f16_clamp_with_op_sel(self) -> None:
+        """Combined clamp and op_sel:[1,1,1,0]."""
+        lines = [
+            "v_mov_b32 v0, 0xDEAD0000",
+            "v_mov_b32 v1, 0x40000000",  # hi: 2.0
+            "v_mov_b32 v2, 0x42000000",  # hi: 3.0
+            "v_mov_b32 v3, 0x45000000",  # hi: 5.0
+            "v_med3_f16 v0, v1, v2, v3 clamp op_sel:[1,1,1,0]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_clamp_opsel", lines)
+        word = support.mrt0_words(spv)[0]
+        self.assertEqual(word, 0xDEAD3C00)
 
 
-def v_med3_f16_oracle(x: int, y: int, z: int, clamp: bool = False) -> int:
-    """Mathematical reference oracle for RDNA2 v_med3_f16."""
-    x &= MASK16
-    y &= MASK16
-    z &= MASK16
-    if is_nan_f16(x) or is_nan_f16(y) or is_nan_f16(z):
-        res = nmin_f16(nmin_f16(x, y), z)
-    else:
-        lo = nmin_f16(x, y)
-        hi = nmax_f16(x, y)
-        m1 = nmax_f16(z, lo)
-        res = nmin_f16(m1, hi)
-    if clamp:
-        if not is_nan_f16(res):
-            if f16_sort_key(res) < f16_sort_key(F16_POS_ZERO):
-                res = F16_POS_ZERO
-            elif f16_sort_key(res) > f16_sort_key(F16_ONE):
-                res = F16_ONE
-    return res & MASK16
+# ==============================================================================
+# Suite 4: Register Aliasing & In-Place Execution (4 tests)
+# ==============================================================================
 
-
-class TestVMed3F16Oracle(unittest.TestCase):
-    """Commit 1: Reference mathematical oracle and architectural model tests."""
-
-    def test_oracle_standard_median(self) -> None:
-        c1 = 0x3C00  # 1.0
-        c2 = 0x4000  # 2.0
-        c3 = 0x4200  # 3.0
-        self.assertEqual(v_med3_f16_oracle(c1, c2, c3), c2)
-
-    def test_oracle_permutations(self) -> None:
-        c1 = 0x3C00  # 1.0
-        c2 = 0x4000  # 2.0
-        c3 = 0x4200  # 3.0
-        for p in [
-            (c1, c2, c3), (c1, c3, c2),
-            (c2, c1, c3), (c2, c3, c1),
-            (c3, c1, c2), (c3, c2, c1),
-        ]:
-            self.assertEqual(v_med3_f16_oracle(p[0], p[1], p[2]), c2)
-
-    def test_oracle_signed_zeros(self) -> None:
-        pos_zero = F16_POS_ZERO
-        neg_zero = F16_NEG_ZERO
-        one = F16_ONE
-        # -0.0 < +0.0 < 1.0, median is +0.0
-        self.assertEqual(v_med3_f16_oracle(pos_zero, neg_zero, one), pos_zero)
-
-    def test_oracle_nan_operand_min3_fallback(self) -> None:
-        nan = F16_QNAN
-        c2 = 0x4000  # 2.0
-        c3 = 0x4200  # 3.0
-        self.assertEqual(v_med3_f16_oracle(nan, c2, c3), c2)
-        self.assertEqual(v_med3_f16_oracle(nan, nan, c3), c3)
-        self.assertTrue(is_nan_f16(v_med3_f16_oracle(nan, nan, nan)))
-
-    def test_oracle_clamp_modifier(self) -> None:
-        # 2.0, 3.0, 5.0 -> median 3.0, clamped to 1.0 (0x3C00)
-        self.assertEqual(v_med3_f16_oracle(0x4000, 0x4200, 0x4500, clamp=True), F16_ONE)
-        # -3.0, -2.0, -1.0 -> median -2.0, clamped to 0.0 (0x0000)
-        self.assertEqual(v_med3_f16_oracle(0xC200, 0xC000, 0xBC00, clamp=True), F16_POS_ZERO)
-
-
-# Append AST definitions to file
-@dataclasses.dataclass(frozen=True)
-class VGPR:
-    index: int
-
-    def __post_init__(self) -> None:
-        if not (0 <= self.index <= 255):
-            raise ValueError(f"VGPR index must be in [0, 255], got {self.index}")
-
-
-@dataclasses.dataclass(frozen=True)
-class ImmF16:
-    raw: int
-
-    def __post_init__(self) -> None:
-        if not (0 <= self.raw <= 0xFFFF):
-            raise ValueError(f"ImmF16 raw bits must be in [0, 0xFFFF], got {self.raw}")
-
-
-class ALUOp(enum.Enum):
-    V_MED3_F16 = "v_med3_f16"
-
-
-@dataclasses.dataclass(frozen=True)
-class VMed3F16Instruction:
-    dst: VGPR
-    src0: Union[VGPR, ImmF16]
-    src1: Union[VGPR, ImmF16]
-    src2: Union[VGPR, ImmF16]
-    op_sel: Tuple[int, int, int, int] = (0, 0, 0, 0)  # (s0, s1, s2, dst)
-    clamp: bool = False
-    neg0: bool = False
-    neg1: bool = False
-    neg2: bool = False
-    abs0: bool = False
-    abs1: bool = False
-    abs2: bool = False
-
-    def __post_init__(self) -> None:
-        for b in self.op_sel:
-            if b not in (0, 1):
-                raise ValueError(f"op_sel bits must be 0 or 1, got {self.op_sel}")
-
-
-class TestVMed3F16AST(unittest.TestCase):
-    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
-
-    def test_ast_instantiation(self) -> None:
-        inst = VMed3F16Instruction(
-            dst=VGPR(0),
-            src0=VGPR(1),
-            src1=VGPR(2),
-            src2=ImmF16(0x3C00),
-            op_sel=(1, 0, 0, 1),
-            clamp=True,
-        )
-        self.assertEqual(inst.dst.index, 0)
-        self.assertEqual(inst.src0.index, 1)
-        self.assertEqual(inst.op_sel, (1, 0, 0, 1))
-        self.assertTrue(inst.clamp)
-
-    def test_ast_vgpr_bounds(self) -> None:
-        with self.assertRaises(ValueError):
-            VGPR(256)
-        with self.assertRaises(ValueError):
-            VGPR(-1)
-
-    def test_ast_op_sel_validation(self) -> None:
-        with self.assertRaises(ValueError):
-            VMed3F16Instruction(
-                dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
-                op_sel=(2, 0, 0, 0)
-            )
-
-# Append scalar interpreter
-class ScalarRegisterFile:
-    """Architectural 256-entry 32-bit Vector Register File for a single thread."""
-
-    def __init__(self) -> None:
-        self.vgprs: List[int] = [0] * 256
-
-    def get_vgpr(self, reg: VGPR) -> int:
-        return self.vgprs[reg.index] & MASK32
-
-    def set_vgpr(self, reg: VGPR, val: int) -> None:
-        self.vgprs[reg.index] = val & MASK32
-
-    def get_half(self, src: Union[VGPR, ImmF16], hi: int, neg: bool = False, abs_m: bool = False) -> int:
-        if isinstance(src, ImmF16):
-            bits = src.raw
-        else:
-            w = self.get_vgpr(src)
-            bits = (w >> 16 if hi else w) & MASK16
-        if abs_m:
-            bits &= 0x7FFF
-        if neg:
-            bits ^= 0x8000
-        return bits & MASK16
-
-    def set_half(self, reg: VGPR, val16: int, hi: int) -> None:
-        old = self.get_vgpr(reg)
-        val16 &= MASK16
-        if hi:
-            new_val = (old & 0x0000FFFF) | (val16 << 16)
-        else:
-            new_val = (old & 0xFFFF0000) | val16
-        self.set_vgpr(reg, new_val)
-
-
-class ScalarVALUInterpreter:
-    """Deterministic scalar instruction interpreter for VALU v_med3_f16."""
-
-    def execute(self, rf: ScalarRegisterFile, inst: VMed3F16Instruction) -> int:
-        s0_hi, s1_hi, s2_hi, d_hi = inst.op_sel
-        v0 = rf.get_half(inst.src0, s0_hi, inst.neg0, inst.abs0)
-        v1 = rf.get_half(inst.src1, s1_hi, inst.neg1, inst.abs1)
-        v2 = rf.get_half(inst.src2, s2_hi, inst.neg2, inst.abs2)
-        res = v_med3_f16_oracle(v0, v1, v2, clamp=inst.clamp)
-        rf.set_half(inst.dst, res, d_hi)
-        return rf.get_vgpr(inst.dst)
-
-
-class TestVMed3F16ScalarInterpreter(unittest.TestCase):
-    """Commit 3: Deterministic scalar instruction interpreter for v_med3_f16."""
-
-    def setUp(self) -> None:
-        self.rf = ScalarRegisterFile()
-        self.interp = ScalarVALUInterpreter()
-
-    def test_scalar_low_half_preserves_high_half(self) -> None:
-        # Pre-set v0 = 0xDEADBEEF
-        self.rf.set_vgpr(VGPR(0), 0xDEADBEEF)
-        self.rf.set_vgpr(VGPR(1), 0x00003C00)  # 1.0
-        self.rf.set_vgpr(VGPR(2), 0x00004000)  # 2.0
-        self.rf.set_vgpr(VGPR(3), 0x00004200)  # 3.0
-
-        inst = VMed3F16Instruction(
-            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
-            op_sel=(0, 0, 0, 0)
-        )
-        res = self.interp.execute(self.rf, inst)
-        # Low half should be 0x4000, high half preserved as 0xDEAD
-        self.assertEqual(res, 0xDEAD4000)
-
-    def test_scalar_high_half_preserves_low_half(self) -> None:
-        self.rf.set_vgpr(VGPR(0), 0x12345678)
-        self.rf.set_vgpr(VGPR(1), 0x3C000000)  # src0 high = 1.0
-        self.rf.set_vgpr(VGPR(2), 0x40000000)  # src1 high = 2.0
-        self.rf.set_vgpr(VGPR(3), 0x42000000)  # src2 high = 3.0
-
-        inst = VMed3F16Instruction(
-            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
-            op_sel=(1, 1, 1, 1)
-        )
-        res = self.interp.execute(self.rf, inst)
-        # High half should be 0x4000, low half preserved as 0x5678
-        self.assertEqual(res, 0x40005678)
-
-# Append SIMD multi-lane interpreter
-class SIMDState:
-    """Architectural SIMD state for Wave32 / Wave64."""
-
-    def __init__(self, num_lanes: int = 32, exec_mask: Optional[int] = None) -> None:
-        if num_lanes not in (32, 64):
-            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
-        self.num_lanes = num_lanes
-        self.exec_mask = ((1 << num_lanes) - 1) if exec_mask is None else exec_mask
-        self.lanes: List[ScalarRegisterFile] = [ScalarRegisterFile() for _ in range(num_lanes)]
-
-    def is_lane_active(self, lane: int) -> bool:
-        return bool(self.exec_mask & (1 << lane))
-
-
-class SIMDVALUInterpreter:
-    """SIMD multi-lane instruction interpreter executing under EXEC mask."""
-
-    def __init__(self) -> None:
-        self.scalar_interp = ScalarVALUInterpreter()
-
-    def execute(self, state: SIMDState, inst: VMed3F16Instruction) -> List[int]:
-        out = []
-        for lane in range(state.num_lanes):
-            if state.is_lane_active(lane):
-                res = self.scalar_interp.execute(state.lanes[lane], inst)
-            else:
-                res = state.lanes[lane].get_vgpr(inst.dst)
-            out.append(res)
-        return out
-
-
-class TestVMed3F16SIMD(unittest.TestCase):
-    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
-
-    def test_wave32_divergent_lanes(self) -> None:
-        # Alternating mask (even lanes active)
-        mask = 0x55555555
-        state = SIMDState(num_lanes=32, exec_mask=mask)
-        for i in range(32):
-            state.lanes[i].set_vgpr(VGPR(0), 0xAAAAAAAA)
-            state.lanes[i].set_vgpr(VGPR(1), 0x00003C00)
-            state.lanes[i].set_vgpr(VGPR(2), 0x00004000)
-            state.lanes[i].set_vgpr(VGPR(3), 0x00004200)
-
-        inst = VMed3F16Instruction(
-            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
-            op_sel=(0, 0, 0, 0)
-        )
-        interp = SIMDVALUInterpreter()
-        results = interp.execute(state, inst)
-
-        for i in range(32):
-            if i % 2 == 0:
-                self.assertEqual(results[i], 0xAAAA4000)
-            else:
-                self.assertEqual(results[i], 0xAAAAAAAA)
-
-    def test_wave64_exec_masking(self) -> None:
-        # High 32 lanes active only
-        mask = 0xFFFFFFFF00000000
-        state = SIMDState(num_lanes=64, exec_mask=mask)
-        for i in range(64):
-            state.lanes[i].set_vgpr(VGPR(0), 0x11111111)
-            state.lanes[i].set_vgpr(VGPR(1), 0x00003C00)
-            state.lanes[i].set_vgpr(VGPR(2), 0x00004000)
-            state.lanes[i].set_vgpr(VGPR(3), 0x00004200)
-
-        inst = VMed3F16Instruction(
-            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
-            op_sel=(0, 0, 0, 0)
-        )
-        interp = SIMDVALUInterpreter()
-        results = interp.execute(state, inst)
-
-        for i in range(32):
-            self.assertEqual(results[i], 0x11111111)
-        for i in range(32, 64):
-            self.assertEqual(results[i], 0x11114000)
-
-# Append register aliasing tests
 class TestVMed3F16Aliasing(unittest.TestCase):
-    """Commit 5: Register aliasing and in-place operand preservation."""
-
-    def setUp(self) -> None:
-        self.rf = ScalarRegisterFile()
-        self.interp = ScalarVALUInterpreter()
+    """Register aliasing: destination register aliases source registers."""
 
     def test_dst_aliases_src0(self) -> None:
-        # v0 = 0xCAFE3C00 (1.0 in low half), v1 = 2.0, v2 = 3.0
-        self.rf.set_vgpr(VGPR(0), 0xCAFE3C00)
-        self.rf.set_vgpr(VGPR(1), 0x00004000)
-        self.rf.set_vgpr(VGPR(2), 0x00004200)
-
-        inst = VMed3F16Instruction(
-            dst=VGPR(0), src0=VGPR(0), src1=VGPR(1), src2=VGPR(2),
-            op_sel=(0, 0, 0, 0)
-        )
-        res = self.interp.execute(self.rf, inst)
+        """v0 = med3(v0, v1, v2)."""
+        # v0 = 0xCAFE3C00 (lo: 1.0, hi: 0xCAFE)
+        # v1 = 2.0 (0x4000), v2 = 3.0 (0x4200)
+        res = run_med3_f16(0x3C00, 0x4000, 0x4200, init_dst=0xCAFE3C00, alias_dst=0, name="ps_med3_alias_v0")
         self.assertEqual(res, 0xCAFE4000)
 
-    def test_dst_aliases_src1_and_src2(self) -> None:
-        self.rf.set_vgpr(VGPR(0), 0x00003C00)  # 1.0
-        self.rf.set_vgpr(VGPR(1), 0xBEEF4200)  # 3.0
+    def test_dst_aliases_src1(self) -> None:
+        """v1 = med3(v0, v1, v2)."""
+        res = run_med3_f16(0x3C00, 0x4000, 0x4200, alias_dst=1, name="ps_med3_alias_v1")
+        self.assertEqual(res & MASK16, 0x4000)
 
-        inst = VMed3F16Instruction(
-            dst=VGPR(1), src0=VGPR(0), src1=VGPR(1), src2=VGPR(1),
-            op_sel=(0, 0, 0, 0)
-        )
-        res = self.interp.execute(self.rf, inst)
-        # median of 1.0, 3.0, 3.0 is 3.0 (0x4200)
-        self.assertEqual(res, 0xBEEF4200)
+    def test_dst_aliases_src2(self) -> None:
+        """v2 = med3(v0, v1, v2)."""
+        res = run_med3_f16(0x3C00, 0x4000, 0x4200, alias_dst=2, name="ps_med3_alias_v2")
+        self.assertEqual(res & MASK16, 0x4000)
 
     def test_all_operands_aliased(self) -> None:
-        self.rf.set_vgpr(VGPR(0), 0x99994000)  # 2.0
-        inst = VMed3F16Instruction(
-            dst=VGPR(0), src0=VGPR(0), src1=VGPR(0), src2=VGPR(0),
-            op_sel=(0, 0, 0, 0)
-        )
-        res = self.interp.execute(self.rf, inst)
+        """v0 = med3(v0, v0, v0)."""
+        res = run_med3_f16(0x4000, 0x4000, 0x4000, init_dst=0x99994000, alias_dst=0, name="ps_med3_alias_all")
         self.assertEqual(res, 0x99994000)
 
-# Append condition codes and status flags
-@dataclasses.dataclass
-class HardwareStatusFlags:
-    scc: int = 1
-    vcc: int = 0xFFFFFFFF_FFFFFFFF
 
+# ==============================================================================
+# Suite 5: SPIR-V Structure, Negative Controls & Mutation Detection (5 tests)
+# ==============================================================================
 
-class TestVMed3F16ConditionCodes(unittest.TestCase):
-    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+class TestVMed3F16TranslatorEmissionAndMutations(unittest.TestCase):
+    """SPIR-V translation emission, negative controls, and mutation detection."""
 
-    def setUp(self) -> None:
-        self.rf = ScalarRegisterFile()
-        self.interp = ScalarVALUInterpreter()
-        self.flags = HardwareStatusFlags()
-
-    def test_scc_and_vcc_unmodified(self) -> None:
-        self.rf.set_vgpr(VGPR(0), 0)
-        self.rf.set_vgpr(VGPR(1), 0x00003C00)
-        self.rf.set_vgpr(VGPR(2), 0x00004000)
-        self.rf.set_vgpr(VGPR(3), 0x00004200)
-
-        inst = VMed3F16Instruction(
-            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3)
-        )
-        self.interp.execute(self.rf, inst)
-        # VALU v_med3_f16 does not touch SCC or VCC
-        self.assertEqual(self.flags.scc, 1)
-        self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
-
-# Append boundary extremes, subnormals, and NaN handling
-class TestVMed3F16BoundaryExtremes(unittest.TestCase):
-    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
-
-    def test_subnormals_ordering(self) -> None:
-        # Denormals: 0x0001 (smallest positive denormal) and 0x0002
-        d1 = 0x0001
-        d2 = 0x0002
-        zero = F16_POS_ZERO
-        self.assertEqual(v_med3_f16_oracle(zero, d1, d2), d1)
-
-    def test_signed_zeros_distinction(self) -> None:
-        # -0.0 < +0.0
-        neg_zero = F16_NEG_ZERO
-        pos_zero = F16_POS_ZERO
-        self.assertEqual(v_med3_f16_oracle(neg_zero, pos_zero, neg_zero), neg_zero)
-        self.assertEqual(v_med3_f16_oracle(neg_zero, pos_zero, pos_zero), pos_zero)
-
-    def test_infinities(self) -> None:
-        neg_inf = F16_NEG_INF
-        pos_inf = F16_POS_INF
-        one = F16_ONE
-        self.assertEqual(v_med3_f16_oracle(neg_inf, one, pos_inf), one)
-
-    def test_single_nan_with_infinities(self) -> None:
-        nan = F16_QNAN
-        neg_inf = F16_NEG_INF
-        pos_inf = F16_POS_INF
-        # When NaN is present, min3 returns the minimum non-NaN, which is -inf
-        self.assertEqual(v_med3_f16_oracle(nan, neg_inf, pos_inf), neg_inf)
-
-    def test_signalling_nan_detection(self) -> None:
-        snan = 0x7C01  # Signalling NaN
-        c2 = 0x4000
-        c3 = 0x4200
-        self.assertTrue(is_nan_f16(snan))
-        self.assertEqual(v_med3_f16_oracle(snan, c2, c3), c2)
-
-# Append negative controls, mutation detection, and translator integration
-class TestVMed3F16NegativeAndMutation(unittest.TestCase):
-    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
-
-    def test_syntax_rejection_bad_vgpr(self) -> None:
-        with self.assertRaises(ValueError):
-            VGPR(-10)
-
-    def test_syntax_rejection_bad_imm(self) -> None:
-        with self.assertRaises(ValueError):
-            ImmF16(0x10000)
-
-    def test_mutation_detection_clamp_dropped(self) -> None:
-        # Value 2.0 should clamp to 1.0 (0x3C00)
-        correct = v_med3_f16_oracle(0x4000, 0x4200, 0x4500, clamp=True)
-        mutant = v_med3_f16_oracle(0x4000, 0x4200, 0x4500, clamp=False)
-        self.assertEqual(correct, F16_ONE)
-        self.assertNotEqual(correct, mutant)
-
-    def test_mutation_detection_nan_fallback_dropped(self) -> None:
-        def buggy_med3_ignoring_nan_rule(x: int, y: int, z: int) -> int:
-            lo = nmin_f16(x, y)
-            hi = nmax_f16(x, y)
-            m1 = nmax_f16(z, lo)
-            return nmin_f16(m1, hi)
-
-        # NaN, 2.0, 3.0: RDNA2 hardware rule returns min3 (2.0)
-        correct = v_med3_f16_oracle(F16_QNAN, 0x4000, 0x4200)
-        self.assertEqual(correct, 0x4000)
-
-    def test_translator_rejects_malformed_syntax(self) -> None:
-        with self.assertRaises(rdna2spirv.Unsupported):
-            support.translate_lines("bad_syntax", ["v_med3_f16 v0, v1"])
-
-
-class TestVMed3F16TranslatorIntegration(unittest.TestCase):
-    """Hardware translator integration: tools/rdna2spirv.py and spirv_mini_interp."""
-
-    TABLE = (
-        (0x3C00, 0x4000, 0x4200, 0x4000),  # 1.0, 2.0, 3.0 -> 2.0
-        (0x4200, 0x3C00, 0x4000, 0x4000),  # permutation
-        (0x0000, 0x8000, 0x3C00, 0x0000),  # +0.0, -0.0, 1.0 -> +0.0
-        (0x7E00, 0x4000, 0x4200, 0x4000),  # NaN, 2.0, 3.0 -> min3 (2.0)
-    )
-
-    def test_translator_table_evaluation(self) -> None:
-        for x, y, z, want in self.TABLE:
-            with self.subTest(x=hex(x), y=hex(y), z=hex(z)):
-                lines = [
-                    f"v_mov_b32_e32 v1, {x:#x}",
-                    f"v_mov_b32_e32 v2, {y:#x}",
-                    f"v_mov_b32_e32 v3, {z:#x}",
-                    "v_mov_b32_e32 v0, 0xDEAD0000",
-                    "v_med3_f16 v0, v1, v2, v3",
-                    "exp mrt0 v0, v0, v0, v0 done",
-                    "s_endpgm",
-                ]
-                spv = support.translate_lines("ps_med3_f16_table", lines)
-                words = support.mrt0_words(spv)
-                self.assertEqual(words[0], 0xDEAD0000 | want)
-
-    def test_translator_clamp(self) -> None:
+    def test_spirv_structure(self) -> None:
+        """SPIR-V translation lowers v_med3_f16 with median logic."""
         lines = [
-            "v_mov_b32_e32 v1, 0x4000",
-            "v_mov_b32_e32 v2, 0x4200",
-            "v_mov_b32_e32 v3, 0x4500",
-            "v_mov_b32_e32 v0, 0",
-            "v_med3_f16 v0, v1, v2, v3 clamp",
-            "exp mrt0 v0, v0, v0, v0 done",
+            "v_mov_b32 v0, 0x55AA0000",
+            "v_mov_b32 v1, 0x3C00",
+            "v_mov_b32 v2, 0x4000",
+            "v_mov_b32 v3, 0x4200",
+            "v_med3_f16 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_med3_f16_clamp", lines)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0] & 0xFFFF, F16_ONE)
+        spv = support.translate_lines("ps_structure_med3_f16", lines)
+        self.assertIn("NMin", spv)
 
-    def test_translator_op_sel_routing(self) -> None:
+    def test_mutation_detection_min_vs_max(self) -> None:
+        """MED3 is strictly distinguished from MIN3 and MAX3."""
+        res = run_med3_f16(0x3C00, 0x4000, 0x4200, name="ps_med3_mut_minmax")
+        self.assertEqual(res & MASK16, 0x4000)
+        # MIN3 is 1.0 (0x3C00), MAX3 is 3.0 (0x4200)
+        self.assertNotEqual(res & MASK16, 0x3C00)
+        self.assertNotEqual(res & MASK16, 0x4200)
+
+    def test_mutation_detection_clamp_omitted(self) -> None:
+        """Clamp modifier detection: unclamped mutant produces 3.0 instead of 1.0."""
+        res_clamped = run_med3_f16(0x4000, 0x4200, 0x4500, clamp=True, name="ps_med3_mut_clamp")
+        self.assertEqual(res_clamped & MASK16, F16_ONE)
+        res_unclamped = run_med3_f16(0x4000, 0x4200, 0x4500, clamp=False, name="ps_med3_mut_unclamp")
+        self.assertEqual(res_unclamped & MASK16, 0x4200)
+        self.assertNotEqual(res_clamped & MASK16, res_unclamped & MASK16)
+
+    def test_mutation_detection_nan_fallback(self) -> None:
+        """NaN presence must trigger min3 on valid numbers, not propagate NaN."""
+        res = run_med3_f16(F16_QNAN, 0x4000, 0x4200, name="ps_med3_mut_nan")
+        self.assertEqual(res & MASK16, 0x4000)
+        self.assertNotEqual(res & MASK16, F16_QNAN)
+
+    def test_negative_syntax_rejection(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises((ValueError, support.rdna2spirv.Unsupported)):
+            support.translate_lines("ps_neg_med3_f16", ["v_med3_f16 v0, v1"])
+
+
+# ==============================================================================
+# Suite 6: Integration & Chained Pipelines (2 tests)
+# ==============================================================================
+
+class TestVMed3F16Pipelines(unittest.TestCase):
+    """Multi-instruction pipeline integration tests."""
+
+    def test_chained_med3_pipeline(self) -> None:
+        """Chained: med3(med3(1.0, 2.0, 3.0), 1.5, 2.5) = med3(2.0, 1.5, 2.5) = 2.0."""
         lines = [
-            "v_mov_b32_e32 v1, 0x3C000000",  # s0 high = 1.0
-            "v_mov_b32_e32 v2, 0x00004000",  # s1 low = 2.0
-            "v_mov_b32_e32 v3, 0x42000000",  # s2 high = 3.0
-            "v_mov_b32_e32 v0, 0x0000BEEF",  # low = BEEF
-            "v_med3_f16 v0, v1, v2, v3 op_sel:[1,0,1,1]",
-            "exp mrt0 v0, v0, v0, v0 done",
+            "v_mov_b32 v0, 0x55AA0000",
+            "v_mov_b32 v1, 0x3C00",  # 1.0
+            "v_mov_b32 v2, 0x4000",  # 2.0
+            "v_mov_b32 v3, 0x4200",  # 3.0
+            "v_mov_b32 v4, 0x3E00",  # 1.5
+            "v_mov_b32 v5, 0x4100",  # 2.5
+            "v_med3_f16 v6, v1, v2, v3",      # 2.0 (0x4000)
+            "v_med3_f16 v0, v6, v4, v5",      # med(2.0, 1.5, 2.5) = 2.0 (0x4000)
+            "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_med3_f16_opsel", lines)
+        spv = support.translate_lines("ps_chain_med3", lines)
         words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x4000BEEF)
+        self.assertEqual(words[0] & MASK16, 0x4000)
+        self.assertEqual((words[0] >> 16) & MASK16, 0x55AA)
+
+    def test_med3_with_add_and_mul(self) -> None:
+        """Chained: med3(1.0 + 2.0, 2.0 * 1.5, 4.0) = med3(3.0, 3.0, 4.0) = 3.0 (0x4200)."""
+        lines = [
+            "v_mov_b32 v0, 0x55AA0000",
+            "v_mov_b32 v1, 0x3C00",  # 1.0
+            "v_mov_b32 v2, 0x4000",  # 2.0
+            "v_mov_b32 v3, 0x3E00",  # 1.5
+            "v_mov_b32 v4, 0x4400",  # 4.0
+            "v_add_f16 v5, v1, v2",  # 3.0 (0x4200)
+            "v_mul_f16 v6, v2, v3",  # 3.0 (0x4200)
+            "v_med3_f16 v0, v5, v6, v4",  # med(3.0, 3.0, 4.0) = 3.0 (0x4200)
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_chain_add_mul_med3", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK16, 0x4200)
+        self.assertEqual((words[0] >> 16) & MASK16, 0x55AA)
+
 
 if __name__ == "__main__":
     unittest.main()
