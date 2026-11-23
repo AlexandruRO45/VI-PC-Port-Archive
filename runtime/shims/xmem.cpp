@@ -263,18 +263,42 @@ std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
 std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
 
-// With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
-// kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
-void record_window(void* base, SIZE_T size, DWORD protect) {
+// With g_phys_mutex held. Removes [base, base + size) from g_windows, preserving any prefix or suffix of an existing
+// window that extends outside the range, and drops stale g_mapped entries inside it. Callers invoke this only for a
+// range the host just freshly reserved (previously MEM_FREE, e.g. after kernel32!UnmapViewOfFile / VirtualFree outside
+// the shim) or confirmed MEM_RESERVE via isolate_placeholder, so no live mapped view exists in [base, base + size).
+void clear_window_range(void* base, SIZE_T size) {
+    if (!base || size == 0) return;
     const uintptr_t start = reinterpret_cast<uintptr_t>(base);
-    const uintptr_t end = start + size;
+    const uintptr_t max_addr = (std::numeric_limits<uintptr_t>::max)();
+    const uintptr_t end = size > max_addr - start ? max_addr : start + size;
     auto it = g_windows.lower_bound(start);
     if (it != g_windows.begin()) {
         const auto prev = std::prev(it);
         if (prev->first + prev->second.size > start) it = prev;
     }
-    while (it != g_windows.end() && it->first < end) it = g_windows.erase(it);
-    g_windows[start] = Window{size, protect};
+    while (it != g_windows.end() && it->first < end) {
+        const uintptr_t win_start = it->first;
+        const uintptr_t win_end = win_start + it->second.size;
+        const DWORD win_protect = it->second.protect;
+        it = g_windows.erase(it);
+        if (win_start < start) g_windows[win_start] = Window{start - win_start, win_protect};
+        if (win_end > end) g_windows[end] = Window{win_end - end, win_protect};
+    }
+    for (auto mit = g_mapped.begin(); mit != g_mapped.end();) {
+        if (mit->first >= start && mit->first < end) {
+            mit = g_mapped.erase(mit);
+        } else {
+            ++mit;
+        }
+    }
+}
+
+// With g_phys_mutex held. Records [base, base + size) as a physical-page window, trimming any overlapping window and
+// clearing stale mapped-page records in the replaced range.
+void record_window(void* base, SIZE_T size, DWORD protect) {
+    clear_window_range(base, size);
+    g_windows[reinterpret_cast<uintptr_t>(base)] = Window{size, protect};
 }
 
 // With g_phys_mutex held: the window holding [address, address + bytes), if one does.
@@ -402,14 +426,17 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
             record_window(address, size, host_prot);
             return address;
         }
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
-                                                nullptr, 0);
+        void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size,
+                                                              host_type | MEM_RESERVE, host_prot, nullptr, 0);
+        if (result) clear_window_range(result, size);
+        return result;
     }
     if (new_placeholder || window) {
         void* const result = reserve_placeholder(address, size, base_granularity);
-        if (result && window) {
+        if (result) {
             const std::lock_guard lock(g_phys_mutex);
-            record_window(result, size, host_prot);
+            if (window) record_window(result, size, host_prot);
+            else clear_window_range(result, size);
         }
         return result;
     }
@@ -419,10 +446,20 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
-                                                &parameter, 1);
+        void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size,
+                                                              host_type | MEM_RESERVE, host_prot, &parameter, 1);
+        if (result) {
+            const std::lock_guard lock(g_phys_mutex);
+            clear_window_range(result, size);
+        }
+        return result;
     }
-    return VirtualAlloc(address, size, host_type, host_prot);
+    void* const result = VirtualAlloc(address, size, host_type, host_prot);
+    if (result && (host_type & MEM_RESERVE)) {
+        const std::lock_guard lock(g_phys_mutex);
+        clear_window_range(result, size);
+    }
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
