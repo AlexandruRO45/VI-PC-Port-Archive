@@ -27,10 +27,14 @@ import fnmatch
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import fssm_header  # noqa: E402
 
 INSTRUCTION = re.compile(r"^\t([a-z][a-z0-9_]*)", re.M)
@@ -185,13 +189,45 @@ def main(argv=None):
         print(f"{row['op']:32s} {row['shaders']:7d} shaders {row['instructions']:9d} instructions{detail}")
     if a.json:
         try:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"listings": result["listings"], **groups,
-                           "after_last_endpgm": result["after_last_endpgm"], "rows": rows}, f, indent=1)
+            write_json_report(a.json, {"listings": result["listings"], **groups,
+                                       "after_last_endpgm": result["after_last_endpgm"], "rows": rows})
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".op_reach-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

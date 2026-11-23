@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "op_reach.py")
@@ -167,6 +168,17 @@ class OpReachTests(unittest.TestCase):
         p = run(self.disasm, "--fssm", os.path.join(self._tmp.name, "no-such-fssm"))
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}'
+        path = os.path.join(self._tmp.name, "keep.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(op_reach, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                op_reach.write_json_report(path, {"listings": 0, "rows": []})
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":
