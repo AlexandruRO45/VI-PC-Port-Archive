@@ -108,13 +108,21 @@ class Camera(unittest.TestCase):
 
 
 class Raster(unittest.TestCase):
+    def test_coverage_is_4809s_snapped_rasteriser(self):
+        tris = [((4.5 + 1 / 1024, 2.0), (13.0, 2.0), (4.5 + 1 / 1024, 14.0)), ((2.0, 2.0), (10.0, 10.0), (2.0, 10.0))]
+        covered, _ = mp.rasterize(tris, 16, 16)
+        self.assertEqual(covered, {i for i, v in enumerate(mp.mpc.rasterize(tris, 16, 16, 8)) if v})
+        # the snap moves 4.5 + 1/1024 to 4.5, so the column at x = 4 (centre 4.5) is covered by the top-left rule
+        self.assertIn(5 * 16 + 4, covered)
+
     def test_square_from_two_triangles_either_winding(self):
         a, b, c, d = (2.0, 2.0), (10.0, 2.0), (10.0, 10.0), (2.0, 10.0)
         for tris in ([(a, b, c), (a, c, d)], [(a, c, b), (a, d, c)]):
-            covered, edge = mp.rasterize(tris, 16, 16)
+            covered, band = mp.rasterize(tris, 16, 16)
             self.assertEqual(covered, {y * 16 + x for y in range(2, 10) for x in range(2, 10)})
-            self.assertIn(2 * 16 + 2, edge)
-            self.assertNotIn(6 * 16 + 6, edge)
+            self.assertIn(2 * 16 + 2, band)                  # next to a silhouette edge
+            self.assertNotIn(6 * 16 + 6, band)               # on the shared diagonal: not excused
+            self.assertNotIn(4 * 16 + 8, band)               # interior
 
     def test_degenerate_and_offscreen(self):
         self.assertEqual(mp.rasterize([((1, 1), (5, 5), (9, 9))], 16, 16), (set(), set()))
@@ -127,37 +135,52 @@ class Compare(unittest.TestCase):
         self.tris = [((4.0, 4.0), (28.0, 6.0), (8.0, 27.0))]
         self.cpu, self.edge = mp.rasterize(self.tris, 32, 32)
 
+    def check(self, gpu, colour=mp.COLOR, painted=None):
+        return mp.compare(gpu, frame(self.cpu if painted is None else painted, 32, 32, colour), self.cpu, self.edge)
+
     def test_exact_match_passes(self):
-        r = mp.compare(frame(self.cpu, 32, 32), self.cpu, self.edge)
-        self.assertEqual((r["iou"], r["missing"], r["extra"], r["off_edge"]), (1.0, 0, 0, 0))
+        r = self.check(set(self.cpu))
+        self.assertEqual((r["iou"], r["missing"], r["extra"], r["off_edge"], r["wrong_colour"]), (1.0, 0, 0, 0, 0))
         self.assertTrue(mp.passed(r))
 
     def test_edge_disagreement_alone_passes_but_interior_does_not(self):
         on_edge = next(iter(self.edge & self.cpu))
-        r = mp.compare(frame(self.cpu - {on_edge}, 32, 32), self.cpu, self.edge)
+        r = self.check(self.cpu - {on_edge})
         self.assertEqual((r["missing"], r["off_edge"]), (1, 0))
         self.assertTrue(mp.passed(r))
         inside = next(iter(self.cpu - self.edge))
-        r = mp.compare(frame(self.cpu - {inside}, 32, 32), self.cpu, self.edge)
+        r = self.check(self.cpu - {inside})
         self.assertEqual(r["off_edge"], 1)
         self.assertFalse(mp.passed(r))
 
-    def test_shifted_empty_full_and_wrong_colour_fail(self):
-        shifted = {i + 3 for i in self.cpu if (i % 32) < 28}
-        empty, full = set(), set(range(32 * 32))
-        for gpu in (shifted, empty, full):
-            self.assertFalse(mp.passed(mp.compare(frame(gpu, 32, 32), self.cpu, self.edge)))
-        r = mp.compare(frame(self.cpu, 32, 32, colour=(1.0, 0.5, 0.25, 0.5)), self.cpu, self.edge)
-        self.assertEqual(r["wrong_colour"], len(self.cpu))
+    def test_coverage_comes_from_the_mask_not_the_colour(self):
+        # a covered pixel painted the clear colour still counts as covered, and fails as a wrong colour
+        r = self.check(set(self.cpu), painted=set())
+        self.assertEqual((r["gpu"], r["missing"], r["wrong_colour"]), (len(self.cpu), 0, len(self.cpu)))
         self.assertFalse(mp.passed(r))
 
-    def test_raw_of_the_wrong_length_is_refused(self):
+    def test_shifted_empty_full_wrong_colour_and_nan_fail(self):
+        shifted = {i + 3 for i in self.cpu if (i % 32) < 28}
+        for gpu in (shifted, set(), set(range(32 * 32))):
+            self.assertFalse(mp.passed(self.check(gpu, painted=gpu)))
+        for colour in ((1.0, 0.5, 0.25, 0.5), (1.0, float("nan"), 0.25, 1.0), (1.0, 0.125, 0.25, 1.0)):
+            r = self.check(set(self.cpu), colour=colour)
+            self.assertEqual(r["wrong_colour"], len(self.cpu), colour)
+            self.assertFalse(mp.passed(r))
+
+    def test_mask_and_raw_of_the_wrong_length_are_refused(self):
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "image.raw")
-            with open(path, "wb") as f:
+            raw, mask = os.path.join(td, "image.raw"), os.path.join(td, "coverage.bin")
+            with open(raw, "wb") as f:
                 f.write(b"\0" * (32 * 32 * 16 - 4))
+            with open(mask, "wb") as f:
+                f.write(b"\1" * (32 * 32 + 1))
             with self.assertRaises(ValueError):
-                mp.read_raw(path, 32, 32)
+                mp.read_raw(raw, 32, 32)
+            with self.assertRaises(ValueError):
+                mp.read_mask(mask, 32, 32)
+        with self.assertRaises(ValueError):
+            mp.compare(set(self.cpu), [mp.CLEAR] * 16, self.cpu, self.edge)
 
 
 class Inflate(unittest.TestCase):

@@ -29,10 +29,12 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
 import first_light as fl  # noqa: E402  (run(), find_harness())
 import meshlet_page as mp  # noqa: E402
+import mesh_pass_coverage as mpc  # noqa: E402  (#4809: snapped CPU coverage)
 
 CLEAR = -1.0                       # vk_harness clears the target to -1.0 in every channel
 COLOR = (1.0, 0.5, 0.25, 1.0)      # what the fixture fragment shader writes on every covered pixel
 MIN_IOU = 0.99
+SUBPIXEL_BITS = 8                  # VkPhysicalDeviceLimits::subPixelPrecisionBits on the GPUs measured so far
 HEAP_BYTES = 0x10000               # vk_harness's heap (VKH_HEAP), runtime/test/vk_harness.cpp
 HEAP_ENV_LIMIT = 32000             # stay under the 32,767-character environment limit of Windows
 INFLATE_CAP = 64 << 20
@@ -272,16 +274,15 @@ def _edge_key(p, q):
     return tuple(sorted((tuple(round(v, 6) for v in p), tuple(round(v, 6) for v in q))))
 
 
-def rasterize(tris2d, width: int, height: int):
-    """Pixel-centre coverage of framebuffer triangles (either winding) and the pixels within about one pixel of a
-    silhouette edge (an edge only one triangle has), where a GPU and a double-precision CPU may disagree. An edge two
-    triangles share is not in that band: one of them covers the pixel either way, so a mismatch there is a crack or
-    an overlap. Returns (covered, edge) as sets of y * width + x."""
+def silhouette_band(tris2d, width: int, height: int) -> set:
+    """The pixels within about one pixel of a silhouette edge (an edge only one triangle has), where the GPU and the
+    CPU projection may disagree by a pixel. An edge two triangles share is not in that band: one of them covers the
+    pixel either way, so a mismatch there is a crack or an overlap. Returns a set of y * width + x."""
     uses = {}
     for a, b, c in tris2d:
         for p, q in ((a, b), (b, c), (c, a)):
             uses[_edge_key(p, q)] = uses.get(_edge_key(p, q), 0) + 1
-    covered, edge = set(), set()
+    band = set()
     for a, b, c in tris2d:
         area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
         if abs(area) < 1e-12:
@@ -297,11 +298,16 @@ def rasterize(tris2d, width: int, height: int):
                 e = [((q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])) / area
                      for p, q in ((a, b), (b, c), (c, a))]
                 dist = min(abs(e[i] * area) / lens[i] if lens[i] else math.inf for i in range(3))
-                if min(e) >= 0:
-                    covered.add(y * width + x)
                 if dist < 1.0 and min(e) > -1.0:
-                    edge.add(y * width + x)
-    return covered, edge
+                    band.add(y * width + x)
+    return band
+
+
+def rasterize(tris2d, width: int, height: int, subpixel_bits: int = SUBPIXEL_BITS):
+    """CPU coverage, from #4809's mesh_pass_coverage.rasterize (vertices snapped to the device's subpixel grid, top-left
+    rule at pixel centres), and the silhouette band. Returns (covered, band) as sets of y * width + x."""
+    mask = mpc.rasterize(tris2d, width, height, subpixel_bits)
+    return {i for i, v in enumerate(mask) if v}, silhouette_band(tris2d, width, height)
 
 
 def read_raw(path: str, width: int, height: int):
@@ -311,11 +317,21 @@ def read_raw(path: str, width: int, height: int):
     return struct.unpack(f"<{width * height * 4}f", data)
 
 
-def compare(pixels, cpu: set, edge: set) -> dict:
-    """GPU coverage = every pixel the draw changed from the clear value; it must be exactly COLOR."""
-    n = len(pixels) // 4
-    gpu = {i for i in range(n) if any(pixels[4 * i + k] != CLEAR for k in range(4))}
-    wrong_colour = sum(1 for i in gpu if any(abs(pixels[4 * i + k] - COLOR[k]) > 1e-6 for k in range(4)))
+def read_mask(path: str, width: int, height: int) -> set:
+    """GPU coverage from vk_harness's VKH_COVERAGE_MASK: one stencil byte per pixel, non-zero where a fragment ran."""
+    data = open(path, "rb").read()
+    if len(data) != width * height:
+        raise ValueError(f"{path}: {len(data)} bytes, expected {width * height} (one per pixel)")
+    return {i for i, v in enumerate(data) if v}
+
+
+def compare(gpu: set, pixels, cpu: set, edge: set) -> dict:
+    """`gpu` is the stencil coverage, so a covered pixel counts even if its colour equals the clear value. Every
+    covered pixel must hold COLOR in all four channels (a NaN is a wrong colour)."""
+    if len(pixels) // 4 <= max(gpu | cpu, default=-1):
+        raise ValueError("readback smaller than the coverage")
+    wrong_colour = sum(1 for i in gpu if not all(math.isclose(pixels[4 * i + k], COLOR[k], rel_tol=0.0, abs_tol=1e-6)
+                                                 for k in range(4)))
     union = gpu | cpu
     return {"gpu": len(gpu), "cpu": len(cpu), "iou": len(gpu & cpu) / len(union) if union else 0.0,
             "missing": len(cpu - gpu), "extra": len(gpu - cpu), "off_edge": len((gpu ^ cpu) - edge),
@@ -386,7 +402,8 @@ def draw(harness: str, ms: str, out: str, spec: dict, heap: bytes, sgprs: list[i
     with open(fs_asm, "w", encoding="utf-8", newline="\n") as f:
         f.write(FS_ASM)
     subprocess.run(["spirv-as", "--target-env", "vulkan1.2", fs_asm, "-o", fs_spv], check=True)
-    env = dict(os.environ, VKH_MESH="1", VKH_SGPRS=",".join(hex(x) for x in sgprs), VKH_HEAP=heap_env(heap))
+    env = dict(os.environ, VKH_MESH="1", VKH_SGPRS=",".join(hex(x) for x in sgprs), VKH_HEAP=heap_env(heap),
+               VKH_COVERAGE_MASK=os.path.join(out, "coverage.bin"))
     env.pop("VKH_SUBGROUP_SIZE", None)
     if not emulate:
         env["VKH_SUBGROUP_SIZE"] = str(spec["subgroup_size"])
@@ -417,6 +434,8 @@ def main(argv=None) -> int:
     ap.add_argument("--list", action="store_true", help="list static drawables, smallest first, and exit")
     ap.add_argument("--run", action="store_true", help="draw and compare")
     ap.add_argument("--check", action="store_true", help="compare the draw in --out again and fail if it differs")
+    ap.add_argument("--subpixel-bits", type=int, default=SUBPIXEL_BITS,
+                    help="the GPU's subPixelPrecisionBits, for the CPU's vertex snap (default 8)")
     ap.add_argument("--wave64-emulate", choices=("auto", "on", "off"), default="auto",
                     help="translate the mesh shader with --wave64-emulate: auto (default) does when the GPU can't "
                          "require 64-wide mesh subgroups (tools/vk_subgroup_info.py), as make_game.py does")
@@ -463,7 +482,7 @@ def main(argv=None) -> int:
     ms = translate_ms(a.work, sha, emulate)
     draw(fl.find_harness(a.harness), ms, out, spec, heap, sgpr_words(spec, layout), a.width, a.height, emulate)
     mode = "wave64 emulated" if emulate else f"native wave64 (required subgroup {spec['subgroup_size']})"
-    man = {"fssm_sha256": sha, "subgroup_mode": mode, "width": a.width, "height": a.height, "yaw": a.yaw,
+    man = {"fssm_sha256": sha, "subgroup_mode": mode, "subpixel_bits": a.subpixel_bits, "width": a.width, "height": a.height, "yaw": a.yaw,
            "pitch": a.pitch,
            "vertices": d["vertices"], "triangles": len(d["triangles"]), "meshlets": d["meshlets"],
            "axis_word": d["axis"], "triangles_2d": tris2d}
@@ -480,10 +499,11 @@ def main(argv=None) -> int:
 
 def run_controls(a, d, m, lo, hi, spec, ms, out) -> bool:
     """Negative controls: each must fail, or the comparison could not tell a wrong draw from a right one."""
-    raw = read_raw(os.path.join(out, "image.raw"), a.width, a.height)
+    drawn = (read_mask(os.path.join(out, "coverage.bin"), a.width, a.height),
+             read_raw(os.path.join(out, "image.raw"), a.width, a.height))
     swapped = [(p[1], p[0], p[2]) for p in d["positions"]]
-    controls = [("CPU camera 3 degrees off", camera(lo, hi, a.yaw + 3.0, a.pitch), d["positions"], raw),
-                ("CPU x and y axes swapped", m, swapped, raw)]
+    controls = [("CPU camera 3 degrees off", camera(lo, hi, a.yaw + 3.0, a.pitch), d["positions"], drawn),
+                ("CPU x and y axes swapped", m, swapped, drawn)]
     heap, layout = build_heap(spec, d["vertex_block"], d["meshlet_group"], view_proj_words(m))
     slot = layout["table"] + spec["slots"]["meshlet_group"]
     heap[slot + 16:slot + 32], heap[slot:slot + 16] = heap[slot:slot + 16], bytes(16)   # V# one slot too far
@@ -491,16 +511,17 @@ def run_controls(a, d, m, lo, hi, spec, ms, out) -> bool:
     os.makedirs(wrong, exist_ok=True)
     draw(fl.find_harness(a.harness), ms, wrong, spec, heap, sgpr_words(spec, layout), a.width, a.height, a.emulate)
     controls.append(("meshlet V# in the next table slot", m, d["positions"],
-                     read_raw(os.path.join(wrong, "image.raw"), a.width, a.height)))
+                     (read_mask(os.path.join(wrong, "coverage.bin"), a.width, a.height),
+                      read_raw(os.path.join(wrong, "image.raw"), a.width, a.height))))
     all_failed = True
-    for name, mat, pos, pixels in controls:
+    for name, mat, pos, (gpu, pixels) in controls:
         try:
             tris2d = [tuple(project(mat, pos[i], a.width, a.height) for i in t) for t in d["triangles"]]
         except CameraError:
             print(f"control '{name}': camera clips, refused (counts as failed)")
             continue
-        cpu, edge = rasterize(tris2d, a.width, a.height)
-        r = compare(pixels, cpu, edge)
+        cpu, edge = rasterize(tris2d, a.width, a.height, a.subpixel_bits)
+        r = compare(gpu, pixels, cpu, edge)
         print(f"control '{name}': {summary(r)}")
         all_failed = all_failed and not passed(r)
     print("controls: " + ("all fail, as they must" if all_failed else "a control PASSED: the comparison is too weak"))
@@ -508,8 +529,11 @@ def run_controls(a, d, m, lo, hi, spec, ms, out) -> bool:
 
 
 def check_folder(out: str, man: dict) -> dict:
-    cpu, edge = rasterize([tuple(map(tuple, t)) for t in man["triangles_2d"]], man["width"], man["height"])
-    return compare(read_raw(os.path.join(out, "image.raw"), man["width"], man["height"]), cpu, edge)
+    w, h = man["width"], man["height"]
+    cpu, edge = rasterize([tuple(map(tuple, t)) for t in man["triangles_2d"]], w, h,
+                          man.get("subpixel_bits", SUBPIXEL_BITS))
+    return compare(read_mask(os.path.join(out, "coverage.bin"), w, h), read_raw(os.path.join(out, "image.raw"), w, h),
+                   cpu, edge)
 
 
 def summary(r: dict) -> str:

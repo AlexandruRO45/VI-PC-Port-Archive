@@ -40,10 +40,13 @@ matrix M: the transpose of M, row by row. Measured: the other order draws nothin
 
 ## 3. The check
 
-- The GPU side is every pixel the draw changed from the clear value (-1.0 in every channel); each must hold exactly
-  the fixture colour.
+- The GPU side is the stencil coverage `vk_harness` writes with `VKH_COVERAGE_MASK` (#4809), so a covered pixel
+  counts whatever colour it holds. Every covered pixel must hold the fixture colour in all four channels
+  (`math.isclose`, absolute 1e-6; a NaN is a wrong colour).
 - The CPU side projects the same triangles (`meshlet_page.group_triangles`, positions from
-  `meshlet_page.positions_4240`) with the same matrix in double precision and rasterises them at pixel centres.
+  `meshlet_page.positions_4240`) with the same matrix in double precision and rasterises them with #4809's
+  `mesh_pass_coverage.rasterize`: vertices snapped to the device's subpixel grid (`--subpixel-bits`, default 8),
+  top-left rule at pixel centres.
 - **Pass:** IoU of at least 0.99, no wrong colour, and **no mismatching pixel more than about one pixel from a
   silhouette edge** (an edge only one triangle has). IoU alone is not enough: a camera 3 degrees off still gives
   0.98 on this drawable. An edge two triangles share is not in the edge band, because one of them covers the pixel
@@ -96,4 +99,3 @@ zlib reader on synthetic inputs without the package or a GPU; with `LEONIDA_MS_P
 - **A fixture pixel shader.** The deferred pass pairs a mesh shader that reads s16 and s17 as pointers with a pixel
   shader that reads s16 as a pointer and s17 as a constant, and `vk_harness` pushes one SGPR block to both stages.
 - **64 KiB heap.** The heap is passed as `VKH_HEAP` words; larger drawables need a heap loaded from a file.
-- The CPU rasteriser here is local to the tool; the shared comparator of #4770 is meant to replace it.
