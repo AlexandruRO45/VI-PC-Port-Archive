@@ -204,6 +204,23 @@ class SlotControls(unittest.TestCase):
         with self.assertRaises(ValueError):
             S.slots(desc, block)
 
+    def test_save_evidence_uses_shared_same_report_path_and_rejects_input_aliases(self):
+        import report_paths
+        from unittest import mock
+
+        self.assertIs(S.same_report_path, report_paths.same_report_path)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive, index, manifest = export_fixture(root)
+            folded_index = root / "INDEX.JSON"
+            with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+                  mock.patch.object(report_paths, "_resolved_key", side_effect=str),
+                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe):
+                with self.assertRaisesRegex(ValueError, "overwrite a census input"):
+                    S.census(archive, index, [manifest], save=folded_index)
+            self.assertGreaterEqual(probe.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

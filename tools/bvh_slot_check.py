@@ -24,6 +24,7 @@ import bvh_geometry_check as C
 import bvh_index as I
 import bvh_match as M
 import bvh_rehydrate as R
+from report_paths import same_report_path  # noqa: E402
 
 
 # Bump when signature ordering, source matching or matrix verdict semantics change.
@@ -234,7 +235,7 @@ def save_evidence(path, record):
 
 
 def census(archive, index, manifests, prior=(), save=None):
-    if save and save.resolve() in {path.resolve() for path in (archive, index, *manifests)}:
+    if save and any(same_report_path(save, path) for path in (archive, index, *manifests)):
         raise ValueError("evidence output would overwrite a census input")
     raw = index.read_bytes()
     digest = hashlib.sha256(raw) if prior or save else None
