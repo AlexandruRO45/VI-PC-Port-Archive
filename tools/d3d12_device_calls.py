@@ -18,6 +18,10 @@ How it follows the device (x86-64 images only):
    loads of a device global, register copies, stores to and loads from the same `[reg+disp]` slot (stack slots
    survive calls; other memory doesn't), and stores to another global, which becomes a device global too. Every
    function that references a device global is walked again until no new global turns up.
+   The walk is linear, with forward branches followed: a `jmp` or conditional branch to a later address in the
+   walked range carries what is known at the branch to its target, where it is met with the fall-through's state
+   (a fact is kept when both paths agree on it) or, past a `ret` or unconditional jump, replaces it. Only a `jmp`
+   out of the walked range is a tail call; one back into it (a loop) carries nothing.
 4. A device call is `mov v,[dev]` (the vtable) then `call [v+disp]`, or `mov m,[v+disp]` then `call m`, or a direct
    call to a dispatch routine with the method in rax (the CFG form). The routine must be verified: the target (for
    `call [rip+p]`, the code the file's pointer p holds) reaches `jmp rax` or `call rax` within DISPATCH_WINDOW
@@ -30,8 +34,8 @@ How it follows the device (x86-64 images only):
    previous call, or the stack arguments [rsp+20h+8k] stored since then from k = 0 up without a gap.
 
 What it reports as not resolved, never guessing a slot: a vtable load from the device not followed by a call the
-patterns above match (an indexed or unaligned method load, a method pointer compared or stored, or a call behind an
-unconditional jump, which is not followed: a call two paths share is counted once), a direct call with a method in
+patterns above match (an indexed or unaligned method load, a method pointer compared or stored, a path the walk
+loses, such as a loop's back edge), a direct call with a method in
 rax whose target isn't a verified dispatch routine, a call with the
 device in an argument register that isn't a vtable call (the device handed to another function, which is not
 followed into), the device stored to non-stack memory (followed only within the function), and creator calls whose
@@ -198,14 +202,17 @@ class Census:
 
     def walk(self, start: int, stop: int, window: bool) -> None:
         dev: set[int] = set()                       # registers holding the device
-        vt: dict[int, int] = {}                     # register -> rva of the vtable load it holds
-        meth: dict[int, tuple[int, int]] = {}       # register -> (slot, vtable load rva) of the method it holds
+        vt: dict[int, frozenset] = {}               # register -> rvas of the vtable loads it may hold
+        meth: dict[int, tuple[int, frozenset]] = {}  # register -> (slot, vtable load rvas) of the method it holds
         addr: dict[int, tuple] = {}                 # register -> ("g", G) or ("m", base, disp): an address it holds
         creator_reg: dict[int, str] = {}            # register -> creator import loaded from its IAT slot
         mem: set[tuple[int, int]] = set()           # [base+disp] slots holding the device
         written: set[int] = set()
         stack: set[int] = set()
         frame_rbp = False
+        pending: dict[int, tuple] = {}              # forward branch target -> the state the branches carry there
+        dead = False                                # past an unconditional jump, ret or tail call, before the
+                                                    # next forward-branch target: no known path reaches here
 
         def clear() -> None:
             dev.clear(), vt.clear(), meth.clear(), addr.clear(), creator_reg.clear(), mem.clear()
@@ -222,15 +229,60 @@ class Census:
         def survives_call(base: int) -> bool:
             return base == RSP or (base == RBP and frame_rbp)
 
+        def snapshot() -> tuple:
+            return (set(dev), dict(vt), dict(meth), dict(addr), dict(creator_reg), set(mem), set(written),
+                    set(stack))
+
+        def restore(state: tuple) -> None:
+            for mine, theirs in zip((dev, vt, meth, addr, creator_reg, mem, written, stack), state):
+                mine.clear()
+                mine.update(theirs)
+
+        def meet(a: tuple, b: tuple) -> tuple:
+            """What holds on both paths into a join: a register keeps a fact only when both paths agree on it
+            (vtable loads are merged, since either path's load is the device's vtable)."""
+            same = lambda x, y: {r: x[r] for r in x.keys() & y.keys() if x[r] == y[r]}  # noqa: E731
+            return (a[0] & b[0],
+                    {r: a[1][r] | b[1][r] for r in a[1].keys() & b[1].keys()},
+                    {r: (a[2][r][0], a[2][r][1] | b[2][r][1]) for r in a[2].keys() & b[2].keys()
+                     if a[2][r][0] == b[2][r][0]},
+                    same(a[3], b[3]), same(a[4], b[4]), a[5] & b[5], a[6] | b[6], a[7] | b[7])
+
+        def carry(target: int) -> None:
+            state = snapshot()
+            pending[target] = meet(pending[target], state) if target in pending else state
+
+        def mark_used(loads) -> None:
+            for load in loads:
+                self.vtable_loads[load] = True
+
         self.walked += 1
         rva = start
         while rva < stop:
+            if rva in pending:                      # a forward branch's target: the branches' state, met with
+                carried_in = pending.pop(rva)       # the fall-through's when the code before it is reached
+                restore(carried_in if dead else meet(snapshot(), carried_in))
+                dead = False
             i = self.code.decode(rva)
             if i is None:
                 self.undecodable += 1
                 return
             rva = i.end
             op, mod, base = i.op, i.mod, i.base
+            if op in (0xE9, 0xEB) and start <= i.target < stop and i.target not in self.thunks:
+                # An unconditional jump within the walked range is a branch, not a tail call: a forward one
+                # carries its state to its target; a backward one (a loop) is not followed. Either way the
+                # next instruction is not reached from here.
+                if i.target > i.rva and not dead:
+                    carry(i.target)
+                clear()
+                written.clear()
+                stack.clear()
+                dead = True
+                continue
+            if (0x70 <= op <= 0x7F or 0x180 <= op <= 0x18F) and start <= i.target < stop and i.target > i.rva \
+                    and not dead:
+                carry(i.target)                     # a conditional branch: both paths go on
             indirect = op == 0xFF and mod is not None and i.reg & 7 in (2, 4)
             if op in (0xE8, 0xE9) or indirect:
                 tail = op == 0xE9 or (indirect and i.reg & 7 == 4)
@@ -247,7 +299,7 @@ class Census:
                         slot, vload = meth[RAX]                        # dispatch routine, method in rax
                     elif not (i.target in self.thunks or (indirect and i.target in self.creators)):
                         self.unverified.add(i.rva)
-                        self.vtable_loads[meth[RAX][1]] = True         # reported here, not as an unused load
+                        mark_used(meth[RAX][1])                        # reported here, not as an unused load
                 creator = None
                 if indirect and base == RIP and i.target in self.creators:
                     creator = self.creators[i.target]
@@ -272,7 +324,7 @@ class Census:
                     args = argument_count(written, stack)
                     self.sites[i.rva] = {"rva": i.rva, "slot": slot, "kind": "jmp" if tail else "call",
                                          "this": this, "args": args}
-                    self.vtable_loads[vload] = True
+                    mark_used(vload)
                 elif (creator is None and not (indirect and mod != 3 and base in vt) and i.rva not in self.unverified
                       and dev & {RCX, RDX, 8, 9}):
                     self.passed.add(i.rva)
@@ -287,11 +339,13 @@ class Census:
                 stack.clear()
                 if tail:
                     clear()
+                    dead = True
                     if window:
                         return
                 continue
             if i.ends_flow():
                 clear()
+                dead = True
                 if window:
                     return
                 continue
@@ -310,7 +364,7 @@ class Census:
                     elif i.target in self.creators:
                         new_creator = self.creators[i.target]
                 elif base in dev and i.disp == 0:
-                    new_vt = i.rva
+                    new_vt = frozenset((i.rva,))
                 elif base in vt and i.disp >= 0 and i.disp % 8 == 0:
                     new_meth = (i.disp // 8, vt[base])
                 elif (base, i.disp) in mem:
@@ -358,7 +412,7 @@ class Census:
                 dev.add(dst)
             elif new_vt is not None:
                 vt[dst] = new_vt
-                self.vtable_loads.setdefault(new_vt, False)
+                self.vtable_loads.setdefault(i.rva, False)
             elif new_meth is not None:
                 meth[dst] = new_meth
             elif new_addr is not None:

@@ -124,13 +124,14 @@ calls and tail jumps, whether the device is in `rcx` or in `rdx` (the return-buf
 argument-count estimate. Slots 0-43 carry the PC method names, which the console keeps where measured (8, 9, 14, 26,
 36); past 43 only the slots `runtime/shims/d3d12_xs_device.h` and §3 name are named.
 
-What it doesn't see, and says so: the device reached through an object member, a function parameter or a getter's
-return value; a vtable load whose call is behind an unconditional jump (a call two paths share is counted once);
-an indexed method load. The report counts the vtable loads with no matched call, the calls with a method in `rax`
+The walk follows forward branches within a function (a `jmp rel32` there is a branch, not a tail call) and keeps
+a fact at a join only when both paths agree. What it doesn't see, and says so: the device reached through an object
+member, a function parameter or a getter's return value; a path it loses, such as a loop's back edge; an indexed
+method load. The report counts the vtable loads with no matched call, the calls with a method in `rax`
 to a target that isn't a verified dispatch routine, the calls that are handed the device (not followed into), and
 the stores of the device to non-stack memory, so each slot's count is a lower bound.
 
-On the 1.0.2.1 executable it finds one `D3D12XboxCreateDevice` call site writing a global, 83 call sites across
+On the 1.0.2.1 executable it finds one `D3D12XboxCreateDevice` call site writing a global, 95 call sites across
 42 slots, all of them the `call [vtable+disp]` form (none through a dispatch routine), the `rdx` form at slots 25,
 26 and 108 only, and 12 sites it reports as not resolved. Every device slot
 the chain above reached (8, 26, 48, 73, 133) is among them; slots like 49, 55, 57, 61, 70, 71, 74, 81, 86, 101,

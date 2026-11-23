@@ -258,6 +258,24 @@ class DeviceCallsTest(unittest.TestCase):
         start, stop = self.funcs["unrelated"], self.funcs["passed"]
         self.assertFalse(any(start <= rva < stop for rva in rvas))
 
+    def test_a_jump_within_the_function_is_a_branch_not_a_tail_call(self):
+        # pr-sorter's repro on #7998: `xor edx,edx; mov r8d,1` in `copy` replaced by `jmp rel32 +3; nop x3`.
+        data = bytearray(self.data)
+        start, stop = self.funcs["copy"], self.funcs["method"]
+        at = data.index(b"\x31\xd2\x41\xb8\x01\x00\x00\x00", start, stop)
+        data[at:at + 8] = b"\xe9\x03\x00\x00\x00\x90\x90\x90"
+        r = ddc.scan(bytes(data))
+        self.assertIn(14, {s["slot"] for s in r["slots"]})
+        self.assertEqual(r["sites"], self.r["sites"])
+        self.assertEqual(r["unresolved"]["device_passed_to_other_calls"], 1)
+        # The same with a short jump (EB +3), and a backward jump in range: neither is a tail call.
+        data[at:at + 8] = b"\xeb\x03\x90\x90\x90\x90\x90\x90"
+        self.assertIn(14, {s["slot"] for s in ddc.scan(bytes(data))["slots"]})
+        data[at:at + 8] = b"\x90\x90\x90\xe9" + struct.pack("<i", start - (at + 8))
+        r = ddc.scan(bytes(data))
+        self.assertEqual(r["unresolved"]["device_passed_to_other_calls"], 1)
+        self.assertNotIn(14, {s["slot"] for s in r["slots"]})   # past a backward jump nothing is known
+
     def test_creators_and_globals(self):
         self.assertEqual(self.r["creators"], [{"import": "d3d12_xs.dll!D3D12XboxCreateDevice", "call_sites": 2,
                                                "out": {"global": 1, "memory slot": 1}}])
