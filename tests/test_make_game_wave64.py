@@ -152,6 +152,31 @@ class DetectionGapsTest(unittest.TestCase):
         self.assertEqual(make_game.smallest_max_subgroup(real_format(("A", 64, ALL))), 64)
         self.assertEqual(make_game.smallest_max_subgroup(real_format(("A", 64, ALL), ("B", 32, ALL))), 32)
 
+    def test_llvmpipe_lavapipe_software_devices_are_ignored(self):
+        gpu = ("VkPhysicalDeviceProperties:
+	deviceName        = AMD Radeon RX 6700 XT
+"
+               "VkPhysicalDeviceSubgroupSizeControlProperties:
+	maxSubgroupSize = 64
+")
+        llvmpipe = ("VkPhysicalDeviceProperties:
+	deviceName        = llvmpipe (LLVM 18.1.8, 256 bits)
+"
+                    "	deviceType        = PHYSICAL_DEVICE_TYPE_CPU
+"
+                    "VkPhysicalDeviceSubgroupSizeControlProperties:
+	maxSubgroupSize = 32
+")
+        self.assertEqual(make_game.smallest_max_subgroup(gpu + llvmpipe), 64)
+
+    def test_llvmpipe_lavapipe_software_devices_are_ignored(self):
+        gpu = ("VkPhysicalDeviceProperties:\n\tdeviceName        = AMD Radeon RX 6700 XT\n"
+               "VkPhysicalDeviceSubgroupSizeControlProperties:\n\tmaxSubgroupSize = 64\n")
+        llvmpipe = ("VkPhysicalDeviceProperties:\n\tdeviceName        = llvmpipe (LLVM 18.1.8, 256 bits)\n"
+                    "\tdeviceType        = PHYSICAL_DEVICE_TYPE_CPU\n"
+                    "VkPhysicalDeviceSubgroupSizeControlProperties:\n\tmaxSubgroupSize = 32\n")
+        self.assertEqual(make_game.smallest_max_subgroup(gpu + llvmpipe), 64)
+
     def decide(self, vulkaninfo, tool, *, mesh_compute=False):
         def fake_run(args, **kw):
             if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":

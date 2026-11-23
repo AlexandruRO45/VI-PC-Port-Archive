@@ -1561,25 +1561,29 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
 
 
 def smallest_max_subgroup(vulkaninfo_text: str):
-    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
+    """The smallest maxSubgroupSize vulkaninfo reports over all physical GPUs (text or --json output), or None."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
     # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
     # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
-    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]', vulkaninfo_text))
+    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]\s*"?([^"\r\n]+)"?', vulkaninfo_text))
     depth = min((len(m.group(1)) for m in names), default=0)
-    starts = [m.start() for m in names if len(m.group(1)) == depth]
+    starts = [(m.start(), m.group(2)) for m in names if len(m.group(1)) == depth]
     if not starts:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
         return min(sizes) if sizes else None
     # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
     # and a device that prints none makes the answer unknown rather than being left out of the smallest.
+    # Ignore CPU software drivers (llvmpipe / lavapipe) when determining GPU wave64 capabilities.
     per_device = []
-    for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
-        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
+    for (a, name), b in zip(starts, [s[0] for s in starts[1:]] + [len(vulkaninfo_text)]):
+        block = vulkaninfo_text[a:b]
+        if "PHYSICAL_DEVICE_TYPE_CPU" in block or "llvmpipe" in name.lower() or "lavapipe" in name.lower():
+            continue
+        sizes = [int(n) for n in re.findall(size, block)]
         if not sizes:
             return None
         per_device.append(min(sizes))
-    return min(per_device)
+    return min(per_device) if per_device else None
 
 
 def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
