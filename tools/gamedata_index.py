@@ -87,8 +87,42 @@ def has_xml_decl(data: bytes) -> bool:
     return bool(XML_DECL.match(text) or XML_DECL.match(text.lstrip(b" \t\r\n")))
 
 
+def _doctype_end(text: bytes) -> int:
+    """Offset just past a leading <!DOCTYPE ...>, or -1 when it is not terminated.
+
+    Quoted strings and an internal subset [...] (with its comments, PIs and quoted strings) may hold '>'.
+    """
+    i, n, subset = len(b"<!DOCTYPE"), len(text), False
+    while i < n:
+        ch = text[i:i + 1]
+        if ch in (b'"', b"'"):
+            end = text.find(ch, i + 1)
+            if end < 0:
+                return -1
+            i = end + 1
+        elif subset and text.startswith(b"<!--", i):
+            end = text.find(b"-->", i + 4)
+            if end < 0:
+                return -1
+            i = end + 3
+        elif subset and text.startswith(b"<?", i):
+            end = text.find(b"?>", i + 2)
+            if end < 0:
+                return -1
+            i = end + 2
+        elif ch == b"[" and not subset:
+            subset, i = True, i + 1
+        elif ch == b"]" and subset:
+            subset, i = False, i + 1
+        elif ch == b">" and not subset:
+            return i + 1
+        else:
+            i += 1
+    return -1
+
+
 def xml_root(data: bytes) -> str:
-    """First element name after the XML declaration/comments/PIs, or ""."""
+    """First element name after the XML declaration/comments/PIs/DOCTYPE, or ""."""
     text = data[3:] if data.startswith(BOM) else data
     text = text.lstrip(b" \t\r\n")
     while True:
@@ -103,6 +137,10 @@ def xml_root(data: bytes) -> str:
         if text.startswith(b"<?"):
             end = text.find(b"?>")
             text = text[end + 2:].lstrip(b" \t\r\n") if end >= 0 else b""
+            continue
+        if text.startswith(b"<!DOCTYPE"):
+            end = _doctype_end(text)
+            text = text[end:].lstrip(b" \t\r\n") if end >= 0 else b""
             continue
         break
     m = XML_OPEN.match(text)

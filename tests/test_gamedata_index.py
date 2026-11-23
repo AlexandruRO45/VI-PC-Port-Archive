@@ -267,6 +267,17 @@ class XmlClassificationTest(unittest.TestCase):
                 self.assertFalse(self.tool.has_xml_decl(data))
                 self.assertEqual(self.tool.xml_root(data), "Root" if b"<Root>" in data else "")
 
+    def test_doctype_prologue_is_skipped_before_the_root(self):
+        subset = b'<!DOCTYPE Root SYSTEM "x>y" [<!ENTITY e \'a]>b\'> <!-- ] > --> <?pi ]>?>]>'
+        for prologue in (b"<!DOCTYPE Root>", subset, self.bom + self.decl + b"\n<!-- c -->\n" + subset + b"\n"):
+            with self.subTest(prologue=prologue):
+                data = prologue + b"<Root><a/></Root>"
+                self.assertEqual(self.tool.xml_root(data), "Root")
+                self.assertTrue(self.tool.standalone_xml(data))
+        # An unterminated DOCTYPE has no root; a start inside the document keeps its first element.
+        self.assertEqual(self.tool.xml_root(b"<!DOCTYPE Root [<!ENTITY e 'x'>"), "")
+        self.assertEqual(self.tool.xml_root(b"<a/></Root>"), "a")
+
     def test_nested_same_name_root_is_not_a_closed_document(self):
         for data in (b"<Foo><Foo></Foo>", b"<Foo><Foo></Foo>\n", b"<Foo><Foo>x</Foo>"):
             with self.subTest(data=data):

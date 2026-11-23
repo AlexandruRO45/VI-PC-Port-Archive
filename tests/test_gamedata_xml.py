@@ -225,6 +225,31 @@ class GamedataXmlTest(unittest.TestCase):
                 p = self.run_tool(broken, "--check")
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
 
+    def test_check_doctype_prologue_is_not_a_truncated_start(self):
+        # A standalone file opening with <!DOCTYPE> starts at its root: malformed stays malformed.
+        subset = b'<!DOCTYPE R [<!ENTITY e "a>b"> <!-- ] > --> <?pi ]>?>]>\n'
+        for prologue in (b"<!DOCTYPE R>\n", subset, b'<?xml version="1.0"?>\n<!-- c -->\n' + subset):
+            with self.subTest(prologue=prologue):
+                bad = self.write("doctype_bad.xml", prologue + b"<R><a>&bogus;</a></R>\n")
+                p = self.run_tool(bad, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("0 truncated at the start", p.stdout)
+                self.assertIn("1 malformed", p.stdout)
+
+                good = self.write("doctype_good.xml", prologue + b"<R><a>1</a></R>\n")
+                out = os.path.join(self.root, "doctype_good.json")
+                p = self.run_tool(good, "--check", "--json", out)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("1 well-formed", p.stdout)
+                with open(out, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["rows"][0]["root"], "R")
+
+        # A file that really starts inside its document stays truncated.
+        tail = self.write("doctype_tail.xml", b"<a>&bogus;</a></R>\n")
+        p = self.run_tool(tail, "--check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("1 truncated at the start", p.stdout)
+
     def test_check_reports_unknown_encoding_as_malformed(self):
         unknown = self.write("unknown.xml", b'<?xml version="1.0" encoding="not-a-charset"?><root/>')
         valid = self.write("valid.xml", b"<root/>")
