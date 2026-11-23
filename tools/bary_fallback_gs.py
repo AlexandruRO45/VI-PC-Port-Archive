@@ -178,27 +178,59 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
     built = []
     for asm, shader in _helpers_for_index(spirv_dir, pair):
         spv = asm[: -len(".spvasm")] + ".spv"
-        with tempfile.TemporaryDirectory(prefix=".bary-gs-", dir=os.path.dirname(spv)) as staging:
-            staged_asm = os.path.join(staging, os.path.basename(asm))
-            staged_spv = os.path.join(staging, os.path.basename(spv))
+        staging = tempfile.mkdtemp(prefix=".bary-gs-", dir=os.path.dirname(spv))
+        staged_asm = os.path.join(staging, os.path.basename(asm))
+        staged_spv = os.path.join(staging, os.path.basename(spv))
+        backup_asm = os.path.join(staging, os.path.basename(asm) + ".bak")
+        asm_published = False
+        had_prior_asm = False
+        try:
+            Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
+            for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
+                        ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode:
+                    raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+            asm_mode = published_mode(asm)
+            spv_mode = published_mode(spv)
+            os.chmod(staged_asm, asm_mode)
+            os.chmod(staged_spv, spv_mode)
             try:
-                Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
-                for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
-                            ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
-                    r = subprocess.run(cmd, capture_output=True, text=True)
-                    if r.returncode:
-                        raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
-                os.chmod(staged_asm, published_mode(asm))
-                os.chmod(staged_spv, published_mode(spv))
-                replace_retry(staged_asm, asm)
-                replace_retry(staged_spv, spv)
-            finally:
-                for leftover in (staged_asm, staged_spv):
-                    if os.path.exists(leftover):
-                        with suppress(OSError):
-                            # Staging files may inherit a read-only target's mode; restore write bits so
-                            # TemporaryDirectory cleanup does not fail or strand them on Windows.
-                            os.chmod(leftover, 0o600)
+                prior_asm_bytes = Path(asm).read_bytes()
+            except FileNotFoundError:
+                prior_asm_bytes = None
+            if prior_asm_bytes is not None:
+                Path(backup_asm).write_bytes(prior_asm_bytes)
+                os.chmod(backup_asm, asm_mode)
+                had_prior_asm = True
+            replace_retry(staged_asm, asm)
+            asm_published = True
+            replace_retry(staged_spv, spv)
+        except BaseException:
+            if asm_published:
+                # Roll back the already-published .spvasm so a failed .spv publish cannot leave a mixed pair.
+                if had_prior_asm:
+                    with suppress(OSError):
+                        if os.name == "nt":
+                            os.chmod(asm, 0o600)
+                    with suppress(OSError):
+                        replace_retry(backup_asm, asm)
+                else:
+                    with suppress(OSError):
+                        os.chmod(asm, 0o600)
+                    with suppress(OSError):
+                        os.unlink(asm)
+            raise
+        finally:
+            for leftover in (staged_asm, staged_spv, backup_asm):
+                if os.path.exists(leftover):
+                    # Isolate chmod and unlink so a permission failure on cleanup never masks the publish error.
+                    with suppress(OSError):
+                        os.chmod(leftover, 0o600)
+                    with suppress(OSError):
+                        os.unlink(leftover)
+            with suppress(OSError):
+                os.rmdir(staging)
         built.append(spv)
     return built
 

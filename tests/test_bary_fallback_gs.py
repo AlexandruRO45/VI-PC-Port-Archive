@@ -660,6 +660,83 @@ class TestBuildForIndex(unittest.TestCase):
                 self.assertEqual(os.stat(asm).st_mode & 0o777, 0o640)
                 self.assertEqual(os.stat(spv).st_mode & 0o777, 0o604)
 
+    def test_build_rolls_back_asm_when_spv_publish_fails(self):
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        real_replace = bary_fallback_gs.replace_retry
+
+        def fail_spv_only(src, dst, **kwargs):
+            if str(dst).endswith(".spv"):
+                raise PermissionError("spv locked")
+            return real_replace(src, dst, **kwargs)
+
+        # Case 1: existing pair ? .spvasm must roll back to previous bytes and mode, leaving no mixed pair.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            asm = Path(tmp) / "ps_a.bary_gs.spvasm"
+            spv = Path(tmp) / "ps_a.bary_gs.spv"
+            asm.write_text("; previous asm\n", encoding="utf-8", newline="\n")
+            spv.write_bytes(b"previous spv")
+            if os.name != "nt":
+                os.chmod(asm, 0o640)
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools), \
+                    mock.patch.object(bary_fallback_gs, "replace_retry", side_effect=fail_spv_only):
+                with self.assertRaisesRegex(PermissionError, "spv locked"):
+                    bary_fallback_gs.build_for_index(tmp)
+            self.assertEqual(asm.read_text(encoding="utf-8"), "; previous asm\n")
+            self.assertEqual(spv.read_bytes(), b"previous spv")
+            if os.name != "nt":
+                self.assertEqual(os.stat(asm).st_mode & 0o777, 0o640)
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm"])
+
+        # Case 2: fresh pair ? newly published .spvasm must be unlinked so no orphan .spvasm remains.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools), \
+                    mock.patch.object(bary_fallback_gs, "replace_retry", side_effect=fail_spv_only):
+                with self.assertRaisesRegex(PermissionError, "spv locked"):
+                    bary_fallback_gs.build_for_index(tmp)
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json"])
+
+    def test_build_failed_cleanup_chmod_does_not_mask_replace_error(self):
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        real_chmod = os.chmod
+
+        def fail_cleanup_chmod(path, mode):
+            if mode == 0o600:
+                raise PermissionError("cleanup chmod denied")
+            return real_chmod(path, mode)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools), \
+                    mock.patch.object(bary_fallback_gs, "replace_retry", side_effect=PermissionError("publish locked")), \
+                    mock.patch.object(bary_fallback_gs.os, "chmod", side_effect=fail_cleanup_chmod):
+                with self.assertRaisesRegex(PermissionError, "publish locked"):
+                    bary_fallback_gs.build_for_index(tmp)
+            # On both POSIX and Windows (staging files are writable for fresh targets), cleanup still completes.
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only destination blocks os.replace")
+    def test_build_real_windows_read_only_spv_rolls_back_writable_asm(self):
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        real_replace = bary_fallback_gs.replace_retry
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            asm = Path(tmp) / "ps_a.bary_gs.spvasm"
+            spv = Path(tmp) / "ps_a.bary_gs.spv"
+            asm.write_text("; previous asm\n", encoding="utf-8", newline="\n")
+            spv.write_bytes(b"previous spv")
+            os.chmod(spv, 0o444)
+            self.addCleanup(lambda: spv.exists() and os.chmod(spv, 0o600))
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools), \
+                    mock.patch.object(bary_fallback_gs, "replace_retry",
+                                      side_effect=lambda s, d: real_replace(s, d, seconds=0)):
+                with self.assertRaises(PermissionError):
+                    bary_fallback_gs.build_for_index(tmp)
+            self.assertEqual(asm.read_text(encoding="utf-8"), "; previous asm\n")
+            self.assertEqual(spv.read_bytes(), b"previous spv")
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm"])
+
 class TestMainAndCLI(unittest.TestCase):
     def _call_main(self, argv):
         stdout, stderr = io.StringIO(), io.StringIO()
