@@ -121,5 +121,32 @@ class TestFrexpExpF64OracleAndNormals(unittest.TestCase):
                 self.assertEqual(got, expected)
 
 
+class TestFrexpExpF64AstAndTypes(unittest.TestCase):
+    def test_spirv_emission_structure(self):
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0x3ff00000",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_ast", lines)
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("OpISub", spv)
+        self.assertIn("OpSelect", spv)
+
+    def test_single_vgpr_destination_type(self):
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0x40100000",
+            "v_frexp_exp_i32_f64 v5, v[0:1]",
+            "exp mrt0 v5, v5, v5, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_dst", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(s32(words[0]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
