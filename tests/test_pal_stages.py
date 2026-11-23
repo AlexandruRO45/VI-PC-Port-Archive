@@ -212,6 +212,19 @@ class TestCli(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stdout)["tally"]["errors"], 1)
 
+    def test_a_folder_with_one_unreadable_file_still_exits_0(self):
+        # A partly readable folder is a report with errors, not a failed run.
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            with open(os.path.join(folder, "not-a-shader.fssm"), "wb") as f:
+                f.write(b"not a container\n")
+            result = subprocess.run([sys.executable, "-I", TOOL, folder, "--json"],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tally = json.loads(result.stdout)["tally"]
+        self.assertEqual((tally["blobs"], tally["errors"]), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
