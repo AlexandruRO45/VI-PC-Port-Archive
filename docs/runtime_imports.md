@@ -221,9 +221,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   folder on its own (left by a file deleted below it) does not hide anything.
 - `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
   marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
-  `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Replacing a read-only destination or moving a
-  package folder fails with `ERROR_ACCESS_DENIED`. A move between `GAME:` and a host path fails with
-  `ERROR_NOT_SAME_DEVICE`, and `MOVEFILE_DELAY_UNTIL_REBOOT` fails with `ERROR_INVALID_PARAMETER`.
+  `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Replacing a package-only read-only destination or
+  moving a package folder fails with `ERROR_ACCESS_DENIED`. A package-source move onto an existing overlay file
+  uses `CopyFileW`, so it also refuses hidden and system overlay destinations. A move between `GAME:` and a host
+  path fails with `ERROR_NOT_SAME_DEVICE`, and `MOVEFILE_DELAY_UNTIL_REBOOT` fails with `ERROR_INVALID_PARAMETER`.
 - `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
   overlay; fail-if-exists counts a name only the package has. Overwriting an existing read-only, hidden or system
   destination fails with `ERROR_ACCESS_DENIED`, including when only the package has it. Either side can be a host path.

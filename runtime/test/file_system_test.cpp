@@ -788,20 +788,24 @@ void run_checks(const std::filesystem::path& root) {
         // Some Wine filesystems cannot persist HIDDEN or SYSTEM. Only compare attributes the host exposes.
         if (copy_attributes != INVALID_FILE_ATTRIBUTES && move_attributes != INVALID_FILE_ATTRIBUTES &&
             (copy_attributes & move_attributes & attribute) != 0) {
-            check(!copy_w(copy_from, copy_to.c_str(), TRUE) && GetLastError() == ERROR_FILE_EXISTS,
-                  "CopyFileW keeps fail-if-exists precedence on a protected destination");
-            const auto check_copy_error = [&](LPCWSTR from, DWORD error) {
-                check(!copy_w(from, copy_to.c_str(), FALSE) && GetLastError() == error,
+            const auto check_copy_error = [&](LPCWSTR from, DWORD error, bool fail_if_exists = false) {
+                const DWORD flags = fail_if_exists ? COPY_FILE_FAIL_IF_EXISTS : 0;
+                COPYFILE2_EXTENDED_PARAMETERS parameters{};
+                parameters.dwSize = sizeof(parameters);
+                parameters.dwCopyFlags = flags;
+                check(!copy_w(from, copy_to.c_str(), fail_if_exists ? TRUE : FALSE) && GetLastError() == error,
                       "CopyFileW reports the expected error for the protected copy");
-                check(!copy_ex_w(from, copy_to.c_str(), nullptr, nullptr, nullptr, 0) && GetLastError() == error,
+                check(!copy_ex_w(from, copy_to.c_str(), nullptr, nullptr, nullptr, flags) && GetLastError() == error,
                       "CopyFileExW reports the expected error for the protected copy");
                 for (const bool fallback : {false, true}) {
                     rt::fs::force_copy_file2_fallback(fallback);
-                    check(copy2(from, copy_to.c_str(), nullptr) == HRESULT_FROM_WIN32(error),
+                    check(copy2(from, copy_to.c_str(), fail_if_exists ? &parameters : nullptr) ==
+                              HRESULT_FROM_WIN32(error),
                           "CopyFile2 reports the expected error for the protected copy");
                 }
                 rt::fs::force_copy_file2_fallback(false);
             };
+            check_copy_error(copy_from, ERROR_FILE_EXISTS, true);
             check_copy_error(copy_from, ERROR_ACCESS_DENIED);
             check_copy_error(L"GAME:\\misc\\missing-protected-copy-source.txt", ERROR_FILE_NOT_FOUND);
             const auto package_source = package / "misc" / "keep.txt";
