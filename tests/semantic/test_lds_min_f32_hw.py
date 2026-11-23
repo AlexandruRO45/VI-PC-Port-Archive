@@ -374,6 +374,86 @@ class TestDSMinF32ASTAndOpcodeDefinitions(unittest.TestCase):
         with self.assertRaises(ValueError):
             DSMinF32Instruction.parse("ds_min_f32 s1, v2")
 
+class ScalarThreadState:
+    """State of a single hardware execution lane / thread."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.lds = lds
+        self.lgkm_cnt = 0
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarDSInterpreter:
+    """Deterministic instruction interpreter for scalar LDS float min executions."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.lds = lds
+
+    def execute(self, state: ScalarThreadState, inst: DSMinF32Instruction) -> Optional[int]:
+        addr = state.get_vgpr(inst.vaddr)
+        data = state.get_vgpr(inst.vdata0)
+
+        old_val, new_val = self.lds.atomic_min_f32(addr, data, offset=inst.offset, rtn=inst.is_return)
+
+        if inst.is_return and inst.vdst is not None:
+            assert old_val is not None
+            state.set_vgpr(inst.vdst, old_val)
+
+        state.lgkm_cnt += 1
+        return old_val
+
+
+class TestDSMinF32ScalarInterpreter(unittest.TestCase):
+    """Part 3: Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = ScalarDSInterpreter(self.lds)
+        self.state = ScalarThreadState(self.lds)
+
+    def test_scalar_execution_non_returning(self) -> None:
+        self.lds.write_dword(0x10, TEN_F32)
+        self.state.set_vgpr(VGPR(1), 0x10)
+        self.state.set_vgpr(VGPR(2), TWO_F32)
+
+        inst = DSMinF32Instruction.parse("ds_min_f32 v1, v2")
+        res = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(res)
+        self.assertEqual(self.lds.read_dword(0x10), TWO_F32)
+
+    def test_scalar_execution_returning(self) -> None:
+        self.lds.write_dword(0x20, ONE_F32)
+        self.state.set_vgpr(VGPR(10), 0x20)
+        self.state.set_vgpr(VGPR(11), NEG_TWO_F32)
+        self.state.set_vgpr(VGPR(12), 0xDEADBEEF)
+
+        inst = DSMinF32Instruction.parse("ds_min_rtn_f32 v12, v10, v11")
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(VGPR(12)), ONE_F32)
+        self.assertEqual(self.lds.read_dword(0x20), NEG_TWO_F32)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        self.lds.write_dword(0x34, HALF_F32)
+        self.state.set_vgpr(VGPR(1), 0x30)
+        self.state.set_vgpr(VGPR(2), NEG_HALF_F32)
+
+        inst = DSMinF32Instruction.parse("ds_min_rtn_f32 v0, v1, v2 offset:4")
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, HALF_F32)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), HALF_F32)
+        self.assertEqual(self.lds.read_dword(0x34), NEG_HALF_F32)
+
 
 if __name__ == '__main__':
     unittest.main()
