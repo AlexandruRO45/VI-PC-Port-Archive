@@ -705,6 +705,19 @@ class SkinnedGlbTest(unittest.TestCase):
                     handle.write(data)
                 self._assert_one_line_error(self._run_cli(skeleton, component), path)
 
+    def test_cli_rejects_non_object_skeleton_entries(self):
+        skeleton = os.path.join(self.root, "skeleton.json")
+        component = os.path.join(self.root, "component.json")
+        _write_json(component, {})
+        for invalid in ([1, 2], None, 7, "bone"):
+            with self.subTest(invalid=invalid):
+                bones = [_skeleton()[0], invalid]
+                _write_json(skeleton, {"drawable": {"skeleton": bones}})
+                result = self._run_cli(skeleton, component)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), ["error: skeleton bone at index 1 must be an object"])
+                self.assertFalse(os.path.exists(os.path.join(self.root, "out.glb")))
+
     def test_cli_bad_component_json_is_one_error_line(self):
         for name, data in self.BAD_JSON.items():
             with self.subTest(name):
