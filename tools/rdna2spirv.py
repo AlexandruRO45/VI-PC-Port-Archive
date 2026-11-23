@@ -17388,6 +17388,15 @@ def merge_shard_parts(out):
             raise ShardSetError(f"cannot read {part}: {e}; delete that part and run --shard <i>/<n> again") from None
         if not isinstance(doc, dict):
             raise ShardSetError(f"{part} does not contain a shader index object")
+        # Two parts holding one shader means the file set changed between shard runs (a bucket assignment moves when
+        # the listing does), so one of the two says something about a translation that the other run replaced. The
+        # merge would otherwise publish whichever part was read last and drop the other silently.
+        overlap = merged.keys() & doc.keys()
+        if overlap:
+            names = sorted(overlap)
+            raise ShardSetError(
+                f"{len(names)} shader(s) are in more than one part, for example {', '.join(names[:3])}; the file set "
+                "changed between shard runs, so delete the parts and run every shard again")
         merged.update(doc)
     if not merged:
         raise ShardSetError(f"the shard set in {out} holds no shaders: every part is empty; "

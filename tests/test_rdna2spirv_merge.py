@@ -43,6 +43,19 @@ class MergeShardPartsTest(unittest.TestCase):
         self.marker(1, 2)
         self.assertEqual(R.merge_shard_parts(str(self.out)), {"a": {"r": 1}, "b": {"r": 2}})
 
+    def test_a_shader_in_two_parts_is_refused(self):
+        # A bucket assignment moves when the listing changes, so a part left from an earlier run can hold a shader
+        # another part also holds: one of them describes a translation the other replaced. Publishing either
+        # silently is how the index ends up claiming a shader that its own run did not write.
+        self.part(0, {"a": {"r": 1}, "b": {"r": 2}})
+        self.part(1, {"b": {"r": 3}, "c": {"r": 4}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        message = self.merge_error()
+        self.assertIn("more than one part", message)
+        self.assertIn("b", message)
+        self.assertIn("run every shard again", message)
+
     def test_a_complete_set_of_empty_parts_is_refused(self):
         # Every shard finished but translated nothing: index.json must not say the corpus is done.
         self.part(0, {})
