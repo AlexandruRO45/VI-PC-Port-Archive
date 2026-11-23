@@ -1,6 +1,6 @@
 // A stand-in game executable for `gta6rt --run`: what a real title does in its first second, run through the
 // loader instead of the Windows one. Test code, not game content. Run as
-//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [stack] [game-file] [exit-code] [abort-mode]
+//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [stack] [alloc] [game-file] [exit-code] [abort-mode]
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, and the
 // xgameruntime.dll imports (answered by the shim registry: the stub DLL it links against would fail them), then
 // calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by argument (CTest's
@@ -109,6 +109,20 @@ int main(int argc, char** argv) {
     check(XGameRuntimeInitialize() == S_OK, "XGameRuntimeInitialize is answered by the gta6rt shim (S_OK)");
     check(XSystemGetDeviceType() == 7, "XSystemGetDeviceType is answered by the gta6rt shim (Series X)");
     XGameRuntimeUninitialize();
+
+    if (has_arg(argc, argv, "alloc")) {
+        constexpr DWORD graphics = 0x10000000;
+        constexpr DWORD console_protect = 0x04000000;
+        void* const allocation =
+            VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT | graphics, PAGE_READWRITE | console_protect);
+        check(allocation != nullptr, "the mapped image's VirtualAlloc import accepts console tags");
+        if (allocation) {
+            auto* const page = static_cast<volatile uint8_t*>(allocation);
+            page[0] = 17;
+            check(page[0] == 17, "the mapped image can write to the allocation");
+            check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "the mapped image can release the allocation");
+        }
+    }
 
     if (has_arg(argc, argv, "tls")) {
         int seen = -1;

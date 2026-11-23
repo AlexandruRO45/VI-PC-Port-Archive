@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -28,6 +29,7 @@ using XMemVirtualQueryFn = SIZE_T(__stdcall*)(HANDLE, const void*, void*);
 // BOOL XMemGetWorkingSetStatistics(UINT32 kind, stats*): the FSR DLL passes kind 0x20000001 at every call site.
 using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
 using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+using VirtualAllocFn = decltype(&VirtualAlloc);
 using XMemGetWriteWatchFn = UINT(WINAPI*)(DWORD, void*, SIZE_T, void**, ULONG_PTR*, ULONG*);
 using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
 // BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE, SIZE_T): the shape Microsoft's public NetRumble and NativeAOT-Xbox
@@ -260,6 +262,71 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
           "other attribute and CPU protection pairs stay unsupported");
 }
 
+void check_console_allocation(void* base, SIZE_T expected_size, const char* message) {
+    check(base != nullptr, message);
+    if (!base) return;
+
+    MEMORY_BASIC_INFORMATION info{};
+    const bool queried = VirtualQuery(base, &info, sizeof(info)) == sizeof(info);
+    check(queried && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
+          "console allocation preserves host commit and write protection");
+    check(queried && info.RegionSize >= expected_size, "console allocation covers the requested extent");
+    if (queried && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE) {
+        auto* bytes = static_cast<volatile uint8_t*>(base);
+        check(bytes[0] == 0, "console allocation starts zeroed");
+        bytes[0] = 0x5a;
+        check(bytes[0] == 0x5a, "console allocation is writable");
+    }
+    check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic console allocation through Win32");
+}
+
+void test_console_virtual_alloc(XMemVirtualAllocFn xmem_alloc) {
+    constexpr DWORD graphics = 0x10000000;
+    constexpr DWORD title = 0x40000000;
+    constexpr DWORD console_protect = 0x04000000;
+    constexpr DWORD console_64k = 0x20400000;
+    constexpr DWORD type = MEM_RESERVE | MEM_COMMIT;
+    const auto alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
+    const auto base_alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find("kernelbase.dll", "VirtualAlloc"));
+    check(alloc && base_alloc == alloc, "kernel32 and kernelbase bind to the same VirtualAlloc shim");
+    for (const char* dll : {"api-ms-win-core-memory-l1-1-0.dll", "api-ms-win-core-memory-l1-1-1.dll",
+                            "api-ms-win-core-memory-l1-1-2.dll", "api-ms-win-core-memory-l1-1-3.dll",
+                            "api-ms-win-core-memory-l1-1-4.dll", "api-ms-win-core-memory-l1-1-5.dll",
+                            "api-ms-win-core-memory-l1-1-6.dll"}) {
+        const auto api_alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find(dll, "VirtualAlloc"));
+        check(api_alloc && api_alloc == alloc, "memory API-set import binds to the VirtualAlloc shim");
+    }
+
+    if (alloc) {
+        check_console_allocation(alloc(nullptr, 0x1000, type, PAGE_READWRITE | console_protect), 0x1000,
+                                 "the console protection annotation is accepted without allocation tags");
+        check_console_allocation(alloc(nullptr, 1, type | graphics | console_64k, PAGE_READWRITE), 0x10000,
+                                 "a tagged 64 KiB reservation uses the guest page size");
+
+        SetLastError(0);
+        void* const no_operation = alloc(nullptr, 1, graphics | console_64k, PAGE_READWRITE);
+        check(!no_operation && GetLastError() == ERROR_INVALID_PARAMETER,
+              "tagged Win32 VirtualAlloc still requires an allocation operation");
+        if (no_operation) VirtualFree(no_operation, 0, MEM_RELEASE);
+
+        void* const host = VirtualAlloc(nullptr, 0x1000, type, 0);
+        const DWORD host_error = GetLastError();
+        void* const plain = alloc(nullptr, 0x1000, type, 0);
+        const DWORD shim_error = GetLastError();
+        check(!host && !plain && shim_error == host_error, "ordinary invalid Win32 protection keeps the host error");
+        if (host) VirtualFree(host, 0, MEM_RELEASE);
+        if (plain) VirtualFree(plain, 0, MEM_RELEASE);
+    }
+
+    if (xmem_alloc) {
+        check_console_allocation(xmem_alloc(nullptr, 1, console_64k, 0, PAGE_READWRITE), 0x10000,
+                                 "XMemVirtualAlloc retains its default reserve and commit");
+        check_console_allocation(xmem_alloc(nullptr, 1, type | graphics | title | console_64k, 0,
+                                            PAGE_READWRITE | console_protect),
+                                 0x10000, "XMemVirtualAlloc also accepts the console allocation and protection tags");
+    }
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     wchar_t temp[MAX_PATH];
@@ -282,7 +349,7 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     free_mem(nullptr, 0x77);  // a free-only word is recorded too
     rt::startup_trace::close();
 
-    std::ifstream in(path);
+    std::ifstream in(std::filesystem::path{path});
     std::stringstream text;
     text << in.rdbuf();
     const std::string log = text.str();
@@ -467,6 +534,7 @@ int main() {
     }
 
     test_title_virtual_alloc();
+    test_console_virtual_alloc(virtual_alloc);
 
     print_result();
     return g_failures ? 1 : 0;

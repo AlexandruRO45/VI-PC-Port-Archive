@@ -131,8 +131,12 @@ constexpr DWORD kXmemLargePages = 0x20000000;
 constexpr DWORD kXmem64kPages = 0x20400000;
 constexpr DWORD kXmemPageModeMask = kXmem64kPages;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
+constexpr DWORD kVirtualAllocOperations = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_RESET_UNDO;
 constexpr DWORD kXmemHostAllocationTypeMask =
-    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+    kVirtualAllocOperations | MEM_TOP_DOWN | MEM_WRITE_WATCH;
+// Console-only allocation annotations. Preserve the caller's ordinary Win32 protection bits.
+constexpr DWORD kConsoleAllocationTags = 0x10000000 | 0x40000000;  // MEM_GRAPHICS | MEM_TITLE
+constexpr DWORD kConsoleProtectionTag = 0x04000000;
 
 bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
@@ -175,7 +179,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    const DWORD unsupported = allocation_type & ~(kXmemHostAllocationTypeMask | kXmemPageModeMask);
+    const DWORD unsupported = allocation_type & ~(kXmemHostAllocationTypeMask | kXmemPageModeMask | kConsoleAllocationTags);
     if (unsupported != 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -219,7 +223,21 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    return VirtualAlloc(address, size, host_type, protect);
+    return VirtualAlloc(address, size, host_type, protect & ~kConsoleProtectionTag);
+}
+
+LPVOID WINAPI TitleVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, DWORD protect) {
+    // An explicit console tag distinguishes guest page modes from overlapping Win32 flags such as MEM_PHYSICAL.
+    const bool console = (allocation_type & kConsoleAllocationTags) || (protect & kConsoleProtectionTag);
+    if (console && (allocation_type & kXmemPageModeMask)) {
+        // VirtualAlloc requires an explicit operation. Only the XMem API defaults to reserve and commit.
+        if (!(allocation_type & kVirtualAllocOperations)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        return XMemVirtualAlloc(address, size, allocation_type, 0, protect);
+    }
+    return VirtualAlloc(address, size, allocation_type & ~kConsoleAllocationTags, protect & ~kConsoleProtectionTag);
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
@@ -275,20 +293,6 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
         }
     }
     return TRUE;
-}
-
-// kernel32!VirtualAlloc as a title calls it. The console's allocation type has two bits of its own, MEM_GRAPHICS
-// (0x10000000, memory the GPU reads) and MEM_TITLE (0x40000000, the title's own heap). On a PC the host rejects both
-// with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
-// 0x10000000, PAGE_READWRITE) returns NULL; so does 0x40000000), so an engine allocating its heaps this way gets
-// NULL at boot. Both are hints about where the memory lives; the host has no such split, so they are dropped and
-// the rest is passed through. Not done: the console protection bits, and whether graphics memory has to come from
-// an arena the D3D12 layer can see (#313).
-constexpr DWORD kMemGraphics = 0x10000000;
-constexpr DWORD kMemTitle = 0x40000000;
-
-LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), protect);
 }
 
 }  // namespace

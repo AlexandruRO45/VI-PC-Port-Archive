@@ -96,6 +96,23 @@ space with the corresponding CPU protection. Both ranges remain uncommitted. The
 uses separate access attributes and CPU/GPU protection flags for a reserve-only range.
 [Microsoft AdvancedESRAM sample](https://github.com/microsoft/Xbox-GDK-Samples/blob/main/Samples/Graphics/AdvancedESRAM/TransientAllocator.cpp).
 
+## Console allocation flags
+
+Mapped `VirtualAlloc` imports through `kernel32.dll`, `kernelbase.dll`, and the memory API sets
+`api-ms-win-core-memory-l1-1-0.dll` through `-1-6.dll`, and `xmem.dll!XMemVirtualAlloc`, accept the
+console allocation tags `MEM_GRAPHICS` (`0x10000000`), `MEM_TITLE` (`0x40000000`), and the protection tag
+`0x04000000`. Stock Win32 `VirtualAlloc` rejects those tags. The shim drops them before allocating host memory and
+keeps the ordinary Win32 protection bits. Where a mapped `VirtualAlloc` call also carries a console-only tag,
+guest page modes use the same rules as `XMemVirtualAlloc`: 64 KiB requests are rounded to guest pages and the
+unsupported 2 MiB mode fails explicitly. Mapped `VirtualAlloc` still requires an explicit memory operation.
+The default reserve and commit applies only to `XMemVirtualAlloc`. Untagged `VirtualAlloc` calls retain Win32's
+interpretation of those bits.
+
+This is host-backed allocation. `MEM_GRAPHICS` does not reserve from a Vulkan or D3D12 allocation arena. The flag
+values and Win32 rejection were [reported in the RT-217 finding](https://github.com/ItsNotRexed/Leonida/issues/3232#issuecomment-7085092261).
+`xmem_test` verifies the shim registrations, committed memory, protection, size and release. `run_tiny_game_alloc`
+checks the same import path from a synthetic mapped executable.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.
