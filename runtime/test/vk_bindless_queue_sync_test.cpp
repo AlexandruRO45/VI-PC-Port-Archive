@@ -1,16 +1,21 @@
 // Cross-queue synchronization regressions for BindlessSet / VulkanContext / VulkanQueue (shdann audit item 7):
-//   1. First bindless upload (fallback image initialization + vkCmdCopyBuffer) on queue A must gate queue B's
-//      bindless dispatch via a shared timeline semaphore so queue B cannot read stale/empty table bytes.
-//   2. Once queue A's upload completes, subsequent queue B dispatches emit zero redundant bindless waits.
-//   3. Incremental updates (vkCmdUpdateBuffer) on queue A also gate queue B until completed.
-//   4. A failed vkQueueSubmit rolls back both fallbacks_ready() and table_dirty_ so the retry uploads cleanly.
+//   0. Multi-family CONCURRENT / single-family EXCLUSIVE sharingMode on BindlessSet buffers and fallback images.
+//   1. First bindless upload on queue A gates queue B's shader dispatches without blocking non-shader work
+//      (empty / copy-only batches emit zero bindless waits and complete while queue A is gated).
+//   2. Once queue A's upload has been waited on by queue B, subsequent dispatches on queue B emit zero waits.
+//   3. A fresh consumer queue submitting a shader after queue A's upload already finished on the GPU still emits
+//      one timeline wait to establish Vulkan's signal-to-batch memory dependency, then zero on later batches.
+//   4. Incremental updates (vkCmdUpdateBuffer) on queue A also gate queue B until completed.
 //   5. Destroying queue A after its upload does not break queue B's bindless sync or leak/invalidate semaphores.
+//   6. Failed vkQueueSubmit rolls back fallbacks_ready()/table_dirty_ on upload and preserves consumer wait on retry.
+//   7. Bindless timeline semaphore creation failure marks VulkanContext unloaded and VulkanQueue unusable.
 // Skips with exit code 77 when no Vulkan 1.3 device with bindless, bufferDeviceAddress, and 144-byte push
 // constants is available. Set LEONIDA_VK_VALIDATION=1 to check with VK_LAYER_KHRONOS_validation. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 #include "../src/vulkan_bindless.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -126,11 +131,24 @@ namespace driver {
 
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkQueueSubmit real_submit = nullptr;
+PFN_vkCreateSemaphore real_create_semaphore = nullptr;
+PFN_vkCreateBuffer real_create_buffer = nullptr;
+PFN_vkCreateImage real_create_image = nullptr;
 
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
+std::atomic<VkResult> fail_next_create_semaphore{VK_SUCCESS};
 std::atomic<std::uint32_t> last_wait_count{0};
 std::atomic<std::uint32_t> last_signal_count{0};
 std::atomic<std::uintptr_t> last_queue{0};
+
+struct SharingRecord {
+    VkSharingMode mode = VK_SHARING_MODE_EXCLUSIVE;
+    std::vector<std::uint32_t> families;
+};
+
+bool capture_sharing = false;
+std::vector<SharingRecord> captured_buffers;
+std::vector<SharingRecord> captured_images;
 
 VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
                                             VkFence fence) {
@@ -144,14 +162,58 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, 
     return real_submit(queue, count, submits, fence);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL create_semaphore(VkDevice device, const VkSemaphoreCreateInfo* info,
+                                                const VkAllocationCallbacks* alloc, VkSemaphore* out) {
+    const VkResult armed = fail_next_create_semaphore.exchange(VK_SUCCESS);
+    if (armed != VK_SUCCESS) {
+        if (out) *out = VK_NULL_HANDLE;
+        return armed;
+    }
+    return real_create_semaphore(device, info, alloc, out);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_buffer(VkDevice device, const VkBufferCreateInfo* info,
+                                             const VkAllocationCallbacks* alloc, VkBuffer* out) {
+    if (capture_sharing && info) {
+        SharingRecord rec{};
+        rec.mode = info->sharingMode;
+        if (info->sharingMode == VK_SHARING_MODE_CONCURRENT && info->pQueueFamilyIndices && info->queueFamilyIndexCount) {
+            rec.families.assign(info->pQueueFamilyIndices,
+                                info->pQueueFamilyIndices + info->queueFamilyIndexCount);
+        }
+        captured_buffers.push_back(std::move(rec));
+    }
+    return real_create_buffer(device, info, alloc, out);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice device, const VkImageCreateInfo* info,
+                                            const VkAllocationCallbacks* alloc, VkImage* out) {
+    if (capture_sharing && info) {
+        SharingRecord rec{};
+        rec.mode = info->sharingMode;
+        if (info->sharingMode == VK_SHARING_MODE_CONCURRENT && info->pQueueFamilyIndices && info->queueFamilyIndexCount) {
+            rec.families.assign(info->pQueueFamilyIndices,
+                                info->pQueueFamilyIndices + info->queueFamilyIndexCount);
+        }
+        captured_images.push_back(std::move(rec));
+    }
+    return real_create_image(device, info, alloc, out);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     if (std::strcmp(name, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
+    if (std::strcmp(name, "vkCreateSemaphore") == 0) return reinterpret_cast<PFN_vkVoidFunction>(create_semaphore);
+    if (std::strcmp(name, "vkCreateBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(create_buffer);
+    if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(create_image);
     return real_get_device(device, name);
 }
 
 void install(PFN_vkGetDeviceProcAddr proc, VkDevice device) {
     real_get_device = proc;
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(proc(device, "vkQueueSubmit"));
+    real_create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(proc(device, "vkCreateSemaphore"));
+    real_create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(proc(device, "vkCreateBuffer"));
+    real_create_image = reinterpret_cast<PFN_vkCreateImage>(proc(device, "vkCreateImage"));
 }
 
 }  // namespace driver
@@ -278,8 +340,28 @@ int main() {
     bfeat.partially_bound = d.partially_bound;
     bfeat.update_after_bind = d.bindless;
     bfeat.queue_families = {queue_a_family, queue_b_family};
+    driver::captured_buffers.clear();
+    driver::captured_images.clear();
+    driver::capture_sharing = true;
     BindlessSet bindless(driver::get_device, d.device, mem_props, bfeat);
+    driver::capture_sharing = false;
     EXPECT(bindless.ok());
+
+    EXPECT(!driver::captured_buffers.empty());
+    EXPECT(!driver::captured_images.empty());
+    const bool expect_concurrent = (queue_a_family != queue_b_family);
+    const auto check_sharing = [&](const driver::SharingRecord& rec) {
+        if (!expect_concurrent) return rec.mode == VK_SHARING_MODE_EXCLUSIVE;
+        if (rec.mode != VK_SHARING_MODE_CONCURRENT || rec.families.size() != 2) return false;
+        const bool has_a = std::find(rec.families.begin(), rec.families.end(), queue_a_family) != rec.families.end();
+        const bool has_b = std::find(rec.families.begin(), rec.families.end(), queue_b_family) != rec.families.end();
+        return has_a && has_b;
+    };
+    for (const auto& rec : driver::captured_buffers) EXPECT(check_sharing(rec));
+    for (const auto& rec : driver::captured_images) EXPECT(check_sharing(rec));
+    std::printf("bindless queue sync 0: verified %zu buffers and %zu fallback images use %s sharing\n",
+                driver::captured_buffers.size(), driver::captured_images.size(),
+                expect_concurrent ? "CONCURRENT" : "EXCLUSIVE");
 
     VkShaderModuleCreateInfo sm_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     sm_info.codeSize = sizeof(kBindlessProbeSpv);
@@ -313,13 +395,38 @@ int main() {
     EXPECT(out_addr != 0);
     auto* out_words = static_cast<volatile std::uint32_t*>(out_mapped);
 
+    void* copy_src_mapped = nullptr;
+    void* copy_dst_mapped = nullptr;
+    const VkBuffer copy_src_buf =
+        d.buffer(64, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &copy_src_mapped);
+    const VkBuffer copy_dst_buf =
+        d.buffer(64, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &copy_dst_mapped);
+    EXPECT(copy_src_buf && copy_src_mapped && copy_dst_buf && copy_dst_mapped);
+    auto* copy_src_words = static_cast<std::uint32_t*>(copy_src_mapped);
+    auto* copy_dst_words = static_cast<volatile std::uint32_t*>(copy_dst_mapped);
+    const std::uint32_t copy_pattern[4] = {0x11223344u, 0x55667788u, 0x99aabbcdu, 0xdeadcafeu};
+    for (int i = 0; i < 4; ++i) {
+        copy_src_words[i] = copy_pattern[i];
+        copy_dst_words[i] = 0u;
+    }
+
     SemaphoreOwner gate_owner{destroy_semaphore, d.device, make_timeline()};
     SemaphoreOwner done_b_owner{destroy_semaphore, d.device, make_timeline()};
-    EXPECT(gate_owner.sem && done_b_owner.sem);
+    SemaphoreOwner copy_done_owner{destroy_semaphore, d.device, make_timeline()};
+    EXPECT(gate_owner.sem && done_b_owner.sem && copy_done_owner.sem);
 
     {
         VulkanContext context(driver::get_device, d.device, true);
         EXPECT(context.loaded());
+        ResourceBinding src_rb{};
+        src_rb.buffer = copy_src_buf;
+        src_rb.size = 64;
+        ResourceBinding dst_rb{};
+        dst_rb.buffer = copy_dst_buf;
+        dst_rb.size = 64;
+        dst_rb.host_readable = true;
+        context.add_resource(1, src_rb);
+        context.add_resource(2, dst_rb);
         context.set_bindless_prepare([&](VkCommandBuffer cb, bool* recorded) {
             if (!bindless.fallbacks_ready()) bindless.record_fallback_init(cb);
             const bool ok = bindless.flush(cb);
@@ -346,11 +453,28 @@ int main() {
         EXPECT(empty_list.close());
         const CommandList* empty_ptr = &empty_list;
 
-        // 1. First upload (fallback init + vkCmdCopyBuffer) gated on queue A must block queue B.
+        // 1. First upload on queue A gates queue B's shader dispatch without blocking empty or copy-only work.
         const DescriptorKey k1 = make_key(1);
         EXPECT(bindless.insert_key(k1, 42));
         queue_a->wait(gate_owner.sem, 1);
         EXPECT(queue_a->execute({&empty_ptr, 1}) == ReplayResult::success);
+
+        driver::last_wait_count.store(99);
+        EXPECT(queue_b.execute({&empty_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::last_wait_count.load() == 0);
+
+        CommandList copy_list;
+        EXPECT(copy_list.copy_buffer({2, 0, 1, 0, sizeof(copy_pattern)}));
+        EXPECT(copy_list.close());
+        const CommandList* copy_ptr = &copy_list;
+        driver::last_wait_count.store(99);
+        EXPECT(queue_b.execute({&copy_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::last_wait_count.load() == 0);
+        EXPECT(queue_b.signal(copy_done_owner.sem, 1));
+        if (distinct_vk_queues) {
+            EXPECT(wait_val(copy_done_owner.sem, 1, 5'000'000'000ull) == VK_SUCCESS);
+            for (int i = 0; i < 4; ++i) EXPECT(copy_dst_words[i] == copy_pattern[i]);
+        }
 
         out_words[0] = 0xdeadbeefu;
         out_words[1] = 0xdeadbeefu;
@@ -372,13 +496,14 @@ int main() {
         EXPECT(signal_val(gate_owner.sem, 1));
         EXPECT(wait_val(done_b_owner.sem, 1, 5'000'000'000ull) == VK_SUCCESS);
         EXPECT(queue_a->idle() && queue_b.idle());
+        for (int i = 0; i < 4; ++i) EXPECT(copy_dst_words[i] == copy_pattern[i]);
 
         if (waits_first == 0 || !blocked_first || out_words[0] != 63u || out_words[1] != 42u) {
             std::fprintf(stderr, "subtest 1 failed: waits=%u blocked=%d mask=%u found=%u\n",
                          waits_first, int(blocked_first), out_words[0], out_words[1]);
             return 1;
         }
-        std::printf("bindless queue sync 1: first upload gated queue B (mask=%u found=%u)\n",
+        std::printf("bindless queue sync 1: non-shader batches unblocked; upload gated shader on queue B (mask=%u found=%u)\n",
                     out_words[0], out_words[1]);
 
         // 2. After queue A's upload completed, subsequent dispatches on queue B must emit zero redundant waits.
@@ -389,9 +514,39 @@ int main() {
         EXPECT(queue_b.idle());
         EXPECT(driver::last_wait_count.load() == 0);
         EXPECT(out_words[0] == 63u && out_words[1] == 42u);
-        std::printf("bindless queue sync 2: no redundant wait after upload completed\n");
+        std::printf("bindless queue sync 2: no redundant wait on queue B after upload completed\n");
 
-        // 3. Incremental slot update (vkCmdUpdateBuffer) on queue A must also gate queue B.
+        // 3. After an upload has already finished on the GPU, a fresh consumer queue still emits one timeline wait
+        //    to establish the Vulkan signal-to-batch memory dependency, and zero on subsequent shader batches.
+        const DescriptorKey k_done = make_key(10);
+        EXPECT(bindless.insert_key(k_done, 55));
+        EXPECT(queue_a->execute({&empty_ptr, 1}) == ReplayResult::success);
+        EXPECT(queue_a->idle());
+
+        VulkanQueue queue_c(context, queue_b_handle, queue_b_family, queue_b_kind);
+        EXPECT(queue_c.ok());
+        out_words[0] = 0u;
+        out_words[1] = 0u;
+        CommandList probe_done;
+        EXPECT(probe_done.dispatch(make_probe_dispatch(kPipeId, k_done, out_addr)));
+        EXPECT(probe_done.close());
+        const CommandList* probe_done_ptr = &probe_done;
+
+        driver::last_wait_count.store(0);
+        EXPECT(queue_c.execute({&probe_done_ptr, 1}) == ReplayResult::success);
+        const std::uint32_t waits_completed_first = driver::last_wait_count.load();
+        EXPECT(queue_c.idle());
+        EXPECT(waits_completed_first >= 1 && out_words[0] == 63u && out_words[1] == 55u);
+
+        out_words[0] = 0u;
+        out_words[1] = 0u;
+        driver::last_wait_count.store(99);
+        EXPECT(queue_c.execute({&probe_done_ptr, 1}) == ReplayResult::success);
+        EXPECT(queue_c.idle());
+        EXPECT(driver::last_wait_count.load() == 0 && out_words[0] == 63u && out_words[1] == 55u);
+        std::printf("bindless queue sync 3: fresh consumer kept memory-dep wait after GPU completion then elided\n");
+
+        // 4. Incremental slot update (vkCmdUpdateBuffer) on queue A must also gate queue B.
         const DescriptorKey k2 = make_key(2);
         EXPECT(bindless.insert_key(k2, 77));
         queue_a->wait(gate_owner.sem, 2);
@@ -418,10 +573,10 @@ int main() {
         EXPECT(wait_val(done_b_owner.sem, 2, 5'000'000'000ull) == VK_SUCCESS);
         EXPECT(queue_a->idle() && queue_b.idle());
         EXPECT(waits_inc >= 1 && blocked_inc && out_words[0] == 63u && out_words[1] == 77u);
-        std::printf("bindless queue sync 3: incremental vkCmdUpdateBuffer gated queue B (found=%u)\n",
+        std::printf("bindless queue sync 4: incremental vkCmdUpdateBuffer gated queue B (found=%u)\n",
                     out_words[1]);
 
-        // 4. Destroying queue A leaves queue B able to synchronize and upload safely.
+        // 5. Destroying queue A leaves queue B able to synchronize and upload safely.
         queue_a.reset();
         const DescriptorKey k3 = make_key(3);
         EXPECT(bindless.insert_key(k3, 99));
@@ -434,10 +589,10 @@ int main() {
         EXPECT(queue_b.execute({&probe3_ptr, 1}) == ReplayResult::success);
         EXPECT(queue_b.idle());
         EXPECT(out_words[0] == 63u && out_words[1] == 99u);
-        std::printf("bindless queue sync 4: queue B works after queue A destroyed (found=%u)\n", out_words[1]);
+        std::printf("bindless queue sync 5: queue B works after queue A destroyed (found=%u)\n", out_words[1]);
     }
 
-    // 5. Failed vkQueueSubmit must roll back both fallbacks_ready() and table_dirty_ so the retry succeeds.
+    // 6. Failed vkQueueSubmit rolls back upload obligations and preserves consumer wait until retry succeeds.
     {
         BindlessSet fresh_bindless(driver::get_device, d.device, mem_props, bfeat);
         EXPECT(fresh_bindless.ok());
@@ -474,20 +629,42 @@ int main() {
         EXPECT(queue_a.execute({&empty_ptr, 1}) == ReplayResult::unsupported);
         EXPECT(!fresh_bindless.fallbacks_ready());
 
-        // Retry on queue_a must now initialize fallbacks, upload k4 -> 123, and gate queue_b.
+        // Retry on queue_a must now initialize fallbacks and upload k4 -> 123.
         EXPECT(queue_a.execute({&empty_ptr, 1}) == ReplayResult::success);
         EXPECT(fresh_bindless.fallbacks_ready());
 
+        // Failing queue_b's consumer submit must not mark queue_b as having seen the upload.
         out_words[0] = 0u;
         out_words[1] = 0u;
         CommandList probe4;
         EXPECT(probe4.dispatch(make_probe_dispatch(kPipeId, k4, out_addr)));
         EXPECT(probe4.close());
         const CommandList* probe4_ptr = &probe4;
+        driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+        EXPECT(queue_b.execute({&probe4_ptr, 1}) == ReplayResult::unsupported);
+
+        driver::last_wait_count.store(0);
         EXPECT(queue_b.execute({&probe4_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::last_wait_count.load() >= 1);
         EXPECT(queue_a.idle() && queue_b.idle());
         EXPECT(out_words[0] == 63u && out_words[1] == 123u);
-        std::printf("bindless queue sync 5: failed submit rolled back fallbacks_ready and retried cleanly\n");
+        std::printf("bindless queue sync 6: failed upload and consumer submits roll back and retry cleanly\n");
+    }
+
+    // 7. Bindless timeline semaphore creation failure leaves VulkanContext unloaded and VulkanQueue unusable.
+    {
+        driver::fail_next_create_semaphore.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+        VulkanContext bad_ctx(driver::get_device, d.device, true);
+        EXPECT(driver::fail_next_create_semaphore.load() == VK_SUCCESS);
+        EXPECT(!bad_ctx.loaded());
+
+        VulkanQueue bad_queue(bad_ctx, queue_a_handle, queue_a_family, VulkanQueue::QueueKind::direct);
+        EXPECT(!bad_queue.ok());
+        CommandList empty_list;
+        EXPECT(empty_list.close());
+        const CommandList* empty_ptr = &empty_list;
+        EXPECT(bad_queue.execute({&empty_ptr, 1}) == ReplayResult::unsupported);
+        std::printf("bindless queue sync 7: timeline creation failure propagated to VulkanContext/VulkanQueue\n");
     }
 
     destroy_pipe(d.device, pipeline, nullptr);
