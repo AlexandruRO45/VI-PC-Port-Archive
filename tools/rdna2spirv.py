@@ -5963,7 +5963,7 @@ class Gen:
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.trig_exact_zero(op, f, r)
             r = self.clamp_mods(r, mods)
-            self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
+            self.write_lo16(a[0], self.f16_bits(r))    # sin/cos ignore MODE rounding on hardware; all seven f16 transcendentals are measured (f16 transcendentals row, docs/design.md)
         elif op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16", "v_pk_mul_lo_u16",
                     "v_pk_mad_u16", "v_pk_mad_i16", "v_pk_max_u16", "v_pk_max_i16", "v_pk_min_u16", "v_pk_min_i16"):
             # Packed 16-bit integer ops (VOP3P, RDNA2 ISA): result half 0 takes each source's half from op_sel[i],
@@ -7759,8 +7759,8 @@ class Gen:
                 r = result
             # 0x3c00 -> 0x3bff only when 0x3c00 is Fract's own rounding: after mul:2 fract(0.5) is a true 1.0.
             omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
-            # rcp/rsq/sqrt (and sin below) ignore MODE rounding on hardware (RX 6800, SHADER-35); exp, log (and cos
-            # below) are unmeasured, assumed like them: nearest even always.
+            # rcp/rsq/sqrt (and sin below) ignore MODE rounding on hardware, as do exp, log and cos: all seven f16
+            # transcendentals are measured (f16 transcendentals row, docs/design.md), so nearest even always.
             self.f16_out(a[0], r, dhi, fract=fn == "Fract" and not omod,
                          mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16"))  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
