@@ -239,3 +239,55 @@ class TestCmpClassF16ASTAndScalar(unittest.TestCase):
     def test_scalar_sgpr_dst_hardware(self):
         val_sgpr, _ = run_cmp_shader("f16", 0xFC00, CLASS_NEG_INF, is_cmpx=False, test_id="sgpr_dst")
         self.assertEqual(val_sgpr, 1)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f16 SIMD Divergence & 10-Bit Class Mapping
+# ------------------------------------------------------------------------------
+
+class SIMDWaveClassLogic:
+    def __init__(self, wave_size: int = 32):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.vcc: int = 0
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step_cmp_class_f16(self, insn: VCmpClassF16Instruction):
+        mask = insn.mask.value if isinstance(insn.mask, LiteralOperand) else self.vgprs[insn.mask.index][0]
+        out_vcc = 0
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.vgprs[insn.src0.index][lane] & 0xFFFF
+                if ref_cmp_class_f16(s0, mask):
+                    out_vcc |= (1 << lane)
+        self.vcc = out_vcc
+
+
+class TestCmpClassF16SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveClassLogic(wave_size=32)
+        # Lane 0: +1.0 (normal), Lane 1: +0.0 (zero)
+        wave.vgprs[1][0] = 0x3C00
+        wave.vgprs[1][1] = 0x0000
+
+        insn = VCmpClassF16Instruction(
+            dst=RegisterOperand(OperandType.VCC),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        wave.step_cmp_class_f16(insn)
+
+        # Check lane 0 matches (+normal) and lane 1 does not (+zero)
+        val_lane0, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=False, test_id="simd_l0")
+        val_lane1, _ = run_cmp_shader("f16", 0x0000, CLASS_POS_NORMAL, is_cmpx=False, test_id="simd_l1")
+        self.assertEqual(val_lane0, 1)
+        self.assertEqual(val_lane1, 0)
+        self.assertEqual(wave.vcc & 1, 1)
+        self.assertEqual((wave.vcc >> 1) & 1, 0)
+
+    def test_algebraic_partition_hardware(self):
+        # Union of disjoint classes: (+0 | -0) matches exactly +0.0
+        val_zero_match, _ = run_cmp_shader("f16", 0x0000, CLASS_POS_ZERO | CLASS_NEG_ZERO, is_cmpx=False, test_id="zero_part")
+        val_norm_nomatch, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_ZERO | CLASS_NEG_ZERO, is_cmpx=False, test_id="norm_part")
+        self.assertEqual(val_zero_match, 1)
+        self.assertEqual(val_norm_nomatch, 0)
