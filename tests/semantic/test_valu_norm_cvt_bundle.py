@@ -304,5 +304,28 @@ class TestVCvtNormU16F16Oracle(unittest.TestCase):
         res_neg = ref_v_cvt_norm_u16_f16(0xBC00, old_dst=0x55550000)
         self.assertEqual(res_neg & 0xFFFF, 0)
 
+class TestVCvtNormU16F16ASTAndInterpreter(unittest.TestCase):
+    def test_ast_disassembly(self) -> None:
+        inst = ASTInstruction(
+            Opcode.V_CVT_NORM_U16_F16,
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(0),
+        )
+        self.assertEqual(inst.disasm(), "v_cvt_norm_u16_f16 v1, v0")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x3C00)
+        state.write_vgpr(1, 0x99990000)
+        inst = ASTInstruction(
+            Opcode.V_CVT_NORM_U16_F16,
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(0),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res & 0xFFFF, 0xFFFF)
+        self.assertEqual(res >> 16, 0x9999)
+        self.assertEqual(state.vgprs[1], res)
+
 if __name__ == "__main__":
     unittest.main()
