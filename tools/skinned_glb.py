@@ -586,7 +586,12 @@ def own_parent_name(record, own_skeleton) -> str | None:
     if parent_name is None:
         parent = record.get("parent")
         if isinstance(parent, int) and 0 <= parent < len(own_skeleton):
-            parent_name = own_skeleton[parent].get("name")
+            # PaletteResolver.__init__ rejects a non-object entry before the export gets here, so the
+            # own_skeleton this helper reads in a build is all objects. A caller that only has parsed
+            # JSON (a test, a small tool) would otherwise get a raw AttributeError out of the index.
+            ancestor = own_skeleton[parent]
+            if isinstance(ancestor, dict):
+                parent_name = ancestor.get("name")
     return parent_name if isinstance(parent_name, str) and parent_name else None
 
 

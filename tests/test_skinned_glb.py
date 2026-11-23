@@ -517,6 +517,41 @@ class SkinnedGlbTest(unittest.TestCase):
         with self.assertRaises(skinned_glb.SkinError):
             skinned_glb.normalise_weights(bytes(broken), j1, w0, w1, 3, 2, [1, 3], 4)
 
+    def test_own_parent_name_reads_an_index_into_a_non_object_ancestor(self):
+        # A palette entry may name its parent by index. On (an old or hand-built) drawable skeleton the
+        # entry at that index can be anything, so the index read itself must not be an AttributeError.
+        for ancestor in (7, ["not", "an", "object"], "HelperParent"):
+            with self.subTest(ancestor=ancestor):
+                self.assertIsNone(skinned_glb.own_parent_name({"parent": 0}, [ancestor]))
+        self.assertIsNone(skinned_glb.own_parent_name({"parent": 4}, [{"name": "HelperParent"}]))
+        self.assertEqual(skinned_glb.own_parent_name({"parent": 0}, [{"name": "HelperParent"}]), "HelperParent")
+        # An explicit parent_name still wins over the index, and an object entry's own name still wins
+        # over an ancestor whose entry cannot be read.
+        self.assertEqual(skinned_glb.own_parent_name({"parent_name": "SKEL_Spine", "parent": 0},
+                                                     [7]), "SKEL_Spine")
+        self.assertEqual(skinned_glb.own_parent_name({"name": "HelperChild", "parent": 0},
+                                                     [7]), None)
+
+    def test_build_keeps_a_parent_named_by_index(self):
+        # The guarded index read still yields the link: the child lands under its parent.
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        model = _read_model(component)
+        model["drawable"]["skeleton"] = [
+            {"name": "HelperParent", "parent_name": "SKEL_Spine", "bind_matrix": _matrix((0.0, 0.0, 2.0))},
+            {"name": "HelperChild", "parent": 0, "bind_matrix": _matrix((0.0, 0.0, 3.0))},
+        ]
+        model["drawable"]["models"][0]["bone_palette"] = [
+            skinned_glb.joaat32("HelperChild"),
+            skinned_glb.joaat32("GM_TEST_L_UpperArm01_O"),
+        ]
+        _write_json(os.path.join(component, "model.json"), model)
+        payload, _stats = skinned_glb.build_skinned_glb(skeleton, [component])
+        gltf, _binary = skinned_glb.read_glb(self._write(payload))
+        by_name = {node.get("name"): index for index, node in enumerate(gltf["nodes"])}
+        # HelperChild names HelperParent by index (0) and lands under it, not under the ped spine.
+        self.assertIn(by_name["HelperChild"], gltf["nodes"][by_name["HelperParent"]].get("children", []))
+
     def test_zero_weight_padding_joint_index_outside_local_palette_is_zeroed(self):
         j0, j1, w0, w1 = _streams()
         padded_j1 = bytearray(j1)
