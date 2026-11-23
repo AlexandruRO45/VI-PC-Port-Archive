@@ -60,6 +60,7 @@ Text output prints one line per PSIN file and a summary; `--json` writes `{files
 decoded LSCH structs and LENM enums (hashes as hex) to each JSON record, or prints them in text mode.
 """
 import argparse
+import itertools
 import json
 import os
 import struct
@@ -75,6 +76,23 @@ ENUM_VALUE = 16
 ARRAY_ELEMENT = 0x100   # member name hash of an array's element descriptor
 ARRAY_TYPE = 0x5C
 
+_SECTION = struct.Struct(">4sI").unpack_from
+_FIRST = struct.Struct(">4xI").unpack_from
+_VERSION_TABLE = struct.Struct("<8xII").unpack_from
+_U32_BE = struct.Struct(">I").unpack_from
+_U32_LE = struct.Struct("<I").unpack_from
+# The six measured tags, so the walk skips the printable-ASCII check and the decode for them.
+_KNOWN_TAGS = {b"LSCH": ("LSCH", 1), b"LENM": ("LENM", 2), b"LSNS": ("LSNS", 3),
+               b"LGID": ("LGID", 0), b"LRSC": ("LRSC", 4), b"CHKS": ("CHKS", 5)}
+_PRINTABLE = bytes(range(0x20, 0x7F))   # bytes.translate(None, _PRINTABLE) is empty for a printable-ASCII tag
+_LSCH_COUNTS = struct.Struct("<30xH")   # the member count of each 32-byte struct header
+_LENM_COUNTS = struct.Struct("<16xI4x")   # the value count of each 24-byte enum header
+_LSCH_SUMMARY = struct.Struct("<I20xI2xH")   # name hash, byte size, member count
+_LSCH_HEAD = struct.Struct("<IIBBHI8xIHH")
+_LSCH_MEMBER = struct.Struct("<IIBBHI")
+_LENM_HEAD = struct.Struct("<II8xII")
+_LENM_VALUE = struct.Struct("<qQ")
+
 
 def _u32_be(blob, off):
     return struct.unpack_from(">I", blob, off)[0]
@@ -84,37 +102,38 @@ def _u32_le(blob, off):
     return struct.unpack_from("<I", blob, off)[0]
 
 
-def _header_count(payload, header, element, count_at, count_fmt):
-    """The header count k for which k headers and their elements fill the payload exactly.
+def _fit(payload, header, element, counts):
+    """(k, elements): the header count k for which k headers and their `elements` elements fill the payload exactly.
 
-    Neither LSCH nor LENM stores this count. Returns None when no k fits.
+    Neither LSCH nor LENM stores this count. `counts` unpacks the element count of one header. Returns None
+    when no k fits.
     """
-    if not payload:
-        return 0
+    length = len(payload)
+    if not length:
+        return 0, 0
     elements = 0
-    for k in range(1, len(payload) // header + 1):
-        elements += struct.unpack_from(count_fmt, payload, header * (k - 1) + count_at)[0]
-        if header * k + element * elements == len(payload):
-            return k
+    k = 0
+    for (count,) in counts.iter_unpack(memoryview(payload)[:length - length % header]):
+        k += 1
+        elements += count
+        if header * k + element * elements == length:
+            return k, elements
     return None
 
 
 def decode_lsch(payload):
     """Decode an LSCH payload into a list of structs; raises ValueError when no struct count fits."""
-    k = _header_count(payload, STRUCT_HEADER, MEMBER, 30, "<H")
-    if k is None:
+    fit = _fit(payload, STRUCT_HEADER, MEMBER, _LSCH_COUNTS)
+    if fit is None:
         raise ValueError(f"LSCH: no struct count fills {len(payload)} bytes")
-    structs = []
+    k = fit[0]
+    view = memoryview(payload)
     at = STRUCT_HEADER * k
-    for i in range(k):
-        name, sig, flags, align, _z10, _z12, size, _z28, count = struct.unpack_from(
-            "<IIBBHI8xIHH", payload, STRUCT_HEADER * i)
-        members = []
-        for _ in range(count):
-            mname, off, mtype, sub, index, ref = struct.unpack_from("<IIBBHI", payload, at)
-            at += MEMBER
-            members.append({"hash": mname, "offset": off, "type": mtype, "sub": sub,
-                            "index": index, "ref": ref})
+    rows = _LSCH_MEMBER.iter_unpack(view[at:])
+    structs = []
+    for name, sig, flags, align, _z10, _z12, size, _z28, count in _LSCH_HEAD.iter_unpack(view[:at]):
+        members = [{"hash": mname, "offset": off, "type": mtype, "sub": sub, "index": index, "ref": ref}
+                   for mname, off, mtype, sub, index, ref in itertools.islice(rows, count)]
         structs.append({"hash": name, "signature": sig, "flags": flags, "align_log2": align,
                         "size": size, "members": members})
     return structs
@@ -122,21 +141,98 @@ def decode_lsch(payload):
 
 def decode_lenm(payload):
     """Decode an LENM payload into a list of enums; raises ValueError when no enum count fits."""
-    k = _header_count(payload, ENUM_HEADER, ENUM_VALUE, 16, "<I")
-    if k is None:
+    fit = _fit(payload, ENUM_HEADER, ENUM_VALUE, _LENM_COUNTS)
+    if fit is None:
         raise ValueError(f"LENM: no enum count fills {len(payload)} bytes")
-    enums = []
+    k = fit[0]
+    view = memoryview(payload)
     at = ENUM_HEADER * k
-    for i in range(k):
-        name, sig = struct.unpack_from("<II", payload, ENUM_HEADER * i)
-        count = _u32_le(payload, ENUM_HEADER * i + 16)
-        values = []
-        for _ in range(count):
-            value, vname = struct.unpack_from("<qQ", payload, at)
-            at += ENUM_VALUE
-            values.append({"value": value, "hash": vname})
+    rows = _LENM_VALUE.iter_unpack(view[at:])
+    enums = []
+    for name, sig, count, _z20 in _LENM_HEAD.iter_unpack(view[:at]):
+        values = [{"value": value, "hash": vname} for value, vname in itertools.islice(rows, count)]
         enums.append({"hash": name, "signature": sig, "values": values})
     return enums
+
+
+def _struct_problem(name, size, rows):
+    """check_schema's verdict on one struct, from its member rows (hash, offset, type, sub, index, ref)."""
+    for i, (mname, off, mtype, _sub, index, _ref) in enumerate(rows):
+        if mname != ARRAY_ELEMENT and off >= size:
+            return f"struct {name:08x} member {i} at offset {off} is past size {size}"
+        if mtype == ARRAY_TYPE and (index >= len(rows) or rows[index][0] != ARRAY_ELEMENT):
+            return f"struct {name:08x} array member {i} points at {index}, not an element descriptor"
+    return ""
+
+
+def lsch_summary(payload):
+    """(structs, members, problem) of an LSCH payload without building the struct dicts.
+
+    Equal to `len(decode_lsch(payload))`, the member total and `check_schema(decode_lsch(payload))`, and it
+    raises the same ValueError. The member total is the element count the header fit found.
+    """
+    fit = _fit(payload, STRUCT_HEADER, MEMBER, _LSCH_COUNTS)
+    if fit is None:
+        raise ValueError(f"LSCH: no struct count fills {len(payload)} bytes")
+    k, members = fit
+    view = memoryview(payload)
+    at = STRUCT_HEADER * k
+    rows = _LSCH_MEMBER.iter_unpack(view[at:])
+    for name, size, count in _LSCH_SUMMARY.iter_unpack(view[:at]):
+        problem = _struct_problem(name, size, list(itertools.islice(rows, count)))
+        if problem:
+            return k, members, problem
+    return k, members, ""
+
+
+def lsch_hexed(payload):
+    """(structs with hashes as 8-digit hex, members, problem) of an LSCH payload, for the "schema" entry.
+
+    The structs are the dicts of `decode_lsch` with the name, signature and reference hashes formatted as hex;
+    the other two are as in `lsch_summary`.
+    """
+    fit = _fit(payload, STRUCT_HEADER, MEMBER, _LSCH_COUNTS)
+    if fit is None:
+        raise ValueError(f"LSCH: no struct count fills {len(payload)} bytes")
+    k, members = fit
+    view = memoryview(payload)
+    at = STRUCT_HEADER * k
+    rows = _LSCH_MEMBER.iter_unpack(view[at:])
+    out = []
+    problem = ""
+    for name, sig, flags, align, _z10, _z12, size, _z28, count in _LSCH_HEAD.iter_unpack(view[:at]):
+        chunk = list(itertools.islice(rows, count))
+        if not problem:
+            problem = _struct_problem(name, size, chunk)
+        out.append({"hash": "%08x" % name, "signature": "%08x" % sig, "flags": flags, "align_log2": align,
+                    "size": size,
+                    "members": [{"hash": "%08x" % mname, "offset": off, "type": mtype, "sub": sub,
+                                 "index": index, "ref": "%08x" % ref}
+                                for mname, off, mtype, sub, index, ref in chunk]})
+    return out, members, problem
+
+
+def lenm_summary(payload):
+    """(enums, values) of an LENM payload: the counts `decode_lenm` would give, without the enum dicts."""
+    fit = _fit(payload, ENUM_HEADER, ENUM_VALUE, _LENM_COUNTS)
+    if fit is None:
+        raise ValueError(f"LENM: no enum count fills {len(payload)} bytes")
+    return fit
+
+
+def lenm_hexed(payload):
+    """(enums with hashes as 8-digit hex, values) of an LENM payload: the dicts of `decode_lenm` with hex hashes."""
+    fit = _fit(payload, ENUM_HEADER, ENUM_VALUE, _LENM_COUNTS)
+    if fit is None:
+        raise ValueError(f"LENM: no enum count fills {len(payload)} bytes")
+    k, values = fit
+    view = memoryview(payload)
+    at = ENUM_HEADER * k
+    rows = _LENM_VALUE.iter_unpack(view[at:])
+    out = [{"hash": "%08x" % name, "signature": "%08x" % sig,
+            "values": [{"value": value, "hash": "%08x" % vname} for value, vname in itertools.islice(rows, count)]}
+           for name, sig, count, _z20 in _LENM_HEAD.iter_unpack(view[:at])]
+    return out, values
 
 
 LSNS_RECORD = 16
@@ -172,17 +268,6 @@ def check_schema(structs):
     return ""
 
 
-def _hexed(structs, enums):
-    """The decoded schema with hashes as 8-digit hex, for JSON and text output."""
-    out_s = [dict(s, hash=f"{s['hash']:08x}", signature=f"{s['signature']:08x}",
-                  members=[dict(m, hash=f"{m['hash']:08x}", ref=f"{m['ref']:08x}") for m in s["members"]])
-             for s in structs]
-    out_e = [dict(e, hash=f"{e['hash']:08x}", signature=f"{e['signature']:08x}",
-                  values=[{"value": v["value"], "hash": f"{v['hash']:08x}"} for v in e["values"]])
-             for e in enums]
-    return {"structs": out_s, "enums": out_e}
-
-
 def parse(blob, schema=False):
     """Parse one PSIN container. Returns None when the blob is not PSIN.
 
@@ -190,9 +275,8 @@ def parse(blob, schema=False):
     """
     if len(blob) < HEADER or blob[:4] != MAGIC:
         return None
-    first = _u32_be(blob, 4)
-    version = _u32_le(blob, 8)
-    table_bytes = _u32_le(blob, 12)
+    first = _FIRST(blob)[0]
+    version, table_bytes = _VERSION_TABLE(blob)
     record = {
         "magic": "PSIN",
         "size": len(blob),
@@ -224,63 +308,84 @@ def parse(blob, schema=False):
         record["error"] = f"missing or truncated first section header at {first}"
         return _with_schema(record, schema, structs, enums)
     offset = first
-    while offset + SECTION_HEADER <= len(blob):
-        tag = blob[offset:offset + 4]
-        size = _u32_be(blob, offset + 4)
-        if any(c < 0x20 or c > 0x7E for c in tag):
-            record["error"] = f"non-text section tag at {offset}"
-            break
-        if size < SECTION_HEADER or offset + size > len(blob):
-            record["error"] = f"section {tag.decode('latin-1')} at {offset} has size {size}"
+    length = len(blob)
+    sections = record["sections"]
+    known = _KNOWN_TAGS
+    while offset + SECTION_HEADER <= length:
+        tag, size = _SECTION(blob, offset)
+        entry = known.get(tag)
+        if entry is None:
+            if tag.translate(None, _PRINTABLE):
+                record["error"] = f"non-text section tag at {offset}"
+                break
+            entry = (tag.decode("latin-1"), 0)
+        name, kind = entry
+        end = offset + size
+        if size < SECTION_HEADER or end > length:
+            record["error"] = f"section {name} at {offset} has size {size}"
             break
         payload_off = offset + SECTION_HEADER
+        payload = size - SECTION_HEADER
         section = {
-            "tag": tag.decode("latin-1"),
+            "tag": name,
             "offset": offset,
             "size": size,
-            "payload": size - SECTION_HEADER,
+            "payload": payload,
         }
-        if tag == b"LRSC" and size - SECTION_HEADER >= 8 and blob[payload_off:payload_off + 4] == b"0DRP":
-            section["rsc_magic"] = "0DRP"
-            section["rsc_version"] = _u32_le(blob, payload_off + 4)
-            if record["rsc_version"] is None:
-                record["rsc_version"] = section["rsc_version"]
-        elif tag == b"CHKS" and size - SECTION_HEADER >= 8:
-            section["checksum_size"] = _u32_be(blob, payload_off)
-            section["checksum"] = blob[payload_off + 4:payload_off + 8].hex()
-            if record["checksum_size"] is None:
-                record["checksum_size"] = section["checksum_size"]
-                record["checksum"] = section["checksum"]
-        elif tag == b"LSNS":
+        if kind == 0:
+            pass
+        elif kind == 3:   # LSNS
             try:
-                blocks = decode_lsns(blob[payload_off:offset + size])
+                blocks = decode_lsns(blob[payload_off:end])
             except ValueError as e:
                 section["lsns_error"] = record["lsns_error"] = str(e)
             else:
                 section["blocks"] = [{"kind": f"0x{k:x}", "bytes": b} for k, b in blocks]
                 record["lsns_blocks"] = len(blocks)
-                record["lsns_records"] = sum(b for _k, b in blocks) // LSNS_RECORD
-        elif tag == b"LSCH" and not lsch_seen:
-            lsch_seen = True
-            try:
-                structs = decode_lsch(blob[payload_off:offset + size])
-            except ValueError as e:
-                lsch_error = str(e)
-            else:
-                record["structs"] = len(structs)
-                record["members"] = sum(len(s["members"]) for s in structs)
-                lsch_error = check_schema(structs)
-        elif tag == b"LENM" and not lenm_seen:
-            lenm_seen = True
-            try:
-                enums = decode_lenm(blob[payload_off:offset + size])
-            except ValueError as e:
-                lenm_error = str(e)
-            else:
-                record["enums"] = len(enums)
-                record["enum_values"] = sum(len(e["values"]) for e in enums)
-        record["sections"].append(section)
-        offset += size
+                record["lsns_records"] = sum([b for _k, b in blocks]) // LSNS_RECORD
+        elif kind == 1:   # LSCH
+            if not lsch_seen:
+                lsch_seen = True
+                try:
+                    if schema:
+                        structs, n_members, problem = lsch_hexed(blob[payload_off:end])
+                        n_structs = len(structs)
+                    else:
+                        n_structs, n_members, problem = lsch_summary(blob[payload_off:end])
+                except ValueError as e:
+                    lsch_error = str(e)
+                else:
+                    record["structs"] = n_structs
+                    record["members"] = n_members
+                    lsch_error = problem
+        elif kind == 2:   # LENM
+            if not lenm_seen:
+                lenm_seen = True
+                try:
+                    if schema:
+                        enums, n_values = lenm_hexed(blob[payload_off:end])
+                        n_enums = len(enums)
+                    else:
+                        n_enums, n_values = lenm_summary(blob[payload_off:end])
+                except ValueError as e:
+                    lenm_error = str(e)
+                else:
+                    record["enums"] = n_enums
+                    record["enum_values"] = n_values
+        elif kind == 4:   # LRSC
+            if payload >= 8 and blob[payload_off:payload_off + 4] == b"0DRP":
+                section["rsc_magic"] = "0DRP"
+                section["rsc_version"] = _U32_LE(blob, payload_off + 4)[0]
+                if record["rsc_version"] is None:
+                    record["rsc_version"] = section["rsc_version"]
+        elif payload >= 8:   # CHKS
+            section["checksum_size"] = _U32_BE(blob, payload_off)[0]
+            section["checksum"] = blob[payload_off + 4:payload_off + 8].hex()
+            if record["checksum_size"] is None:
+                record["checksum_size"] = section["checksum_size"]
+                record["checksum"] = section["checksum"]
+        sections.append(section)
+        offset = end
     record["schema_error"] = "; ".join(e for e in (lsch_error, lenm_error) if e)
     if not record["error"] and offset != len(blob):
         record["error"] = f"section walk ended at {offset} of {len(blob)}"
@@ -291,12 +396,14 @@ def parse(blob, schema=False):
 def _with_schema(record, schema, structs, enums, lsch_error="", lenm_error=""):
     """With `schema`, give every record the same "schema" shape, whether or not the sections were reached.
 
+    `structs` and `enums` are what `lsch_hexed` and `lenm_hexed` returned, or None for a section not decoded.
+
     "lsch" and "lenm" say whether each section was decoded; "reason" says why one was not (a structural error
     that stopped the walk first, a missing section, or the decode error), and is "" when both were.
     """
     if not schema:
         return record
-    entry = _hexed(structs or [], enums or [])
+    entry = {"structs": structs or [], "enums": enums or []}
     entry["lsch"] = structs is not None
     entry["lenm"] = enums is not None
     reasons = []
