@@ -209,6 +209,15 @@ and `vk_presenter_sync`, `xbox_present` and `dxgi_swapchain` pass, while they fa
 compositor for those three. Six still failed with a real display: `device_proxy`, `d3d12_xs_root_signature`,
 `xdxr_build`, `d3d12_xdxr_rt`, `d3d12_present` and `d3d12_compute`.
 
+A repeat on the 12:28 main artifact `d0835dd9` (148 tests) on Wine 11.22 with an RX 9070 (RADV, Mesa 26.3.1) gave
+106 passed, 11 failed and 31 skipped in two consecutive runs. Six are Wine-host differences (`device_proxy`'s WARP
+device creation, `d3d12_xs_root_signature`'s duplicate constants, `d3d12_fence_timing`, `d3d12_private_data`,
+`d3d12_subresource_copy`, `d3d12_compute`), two are artifact packaging (`xdxr_build` and `d3d12_xdxr_rt`: the zip
+drops their empty case folders), two are a tiling window manager resizing the test window (`d3d12_present`,
+`xbox_present`), and `loader_tls` only times out because `conhost.exe --headless` keeps the inherited stdout pipe
+after the test exits (standalone it passes). Several are fixed after `d0835dd` (`b136ee468`, `421bf0bf3`,
+`e9fe34851`, `7d60a27a6`), so re-run current `main` before treating the list as live.
+
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
 runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
