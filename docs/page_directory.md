@@ -22,7 +22,8 @@ payload, carved stream or name list is in this document or the repository.
 
 The walk is the fixed `tools/rpf9_carve.py` zlib walk from PR #90: find a zlib header, inflate to `eof`, advance by
 the bytes actually consumed, and never read the encrypted TOC. A page is counted when the inflated stream has
-`30 44 52 50` at +0x10.
+`30 44 52 50` at +0x10. The no-game-data check (`scripts/check_no_game_data.py`) matches the marker at that offset
+too, so a page stream renamed to a text extension is still caught.
 
 | Archive | Scope | Streams | `0DRP` pages | Version |
 |---|---:|---:|---:|---:|
