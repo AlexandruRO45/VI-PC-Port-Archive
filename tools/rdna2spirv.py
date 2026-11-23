@@ -11397,8 +11397,16 @@ class Gen:
         if self.emulate:
             return r
         if self.wave32_fragment:
-            b = self.tmp()
-            self.g_shuffle(b, r, self.cu(0))
+            # The index is uniform within this invocation's 32-lane half (the descriptor words are that wave's
+            # SGPRs), but logical lane 0 of the half need not be running: at a primitive's edge a half can start
+            # with empty quads, and a shuffle from a lane that isn't running is undefined (zero on RDNA1). Read it
+            # from the half's first running invocation instead, which exists because this one runs.
+            ballot, first, b = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+            word = self.wave32_ballot_word(ballot)
+            self.emit(f"{first} = OpExtInst %uint %glsl FindILsb {word}")
+            self.g_shuffle(b, r, first)
+            self.uses_subgroup = self.uses_ballot = True
             return b
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
         # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV
@@ -14214,6 +14222,10 @@ def assemble(gen):
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
     if gen.uses_ballot:
+        if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
+            # dedupe_types keeps the first uvec4 it sees: declared here, the typed views keep their name when the
+            # shader also takes a ballot (every wave32 pixel shader's image lookups do).
+            types.append("%v4uint_st = OpTypeVector %uint 4")
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
