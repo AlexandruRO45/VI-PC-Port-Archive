@@ -31,6 +31,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rsc8_audio import parse_adat_at_file  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 TAG_MUSIC, TAG_DATA, TAG_FORMAT, TAG_MARKER = 0x48, 0x55, 0x76, 0xBD
 EVENT = struct.Struct("<IIII")      # type, value (the bits of an f32), time, flags
@@ -201,11 +202,25 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_markers: error: {a.src}: no such file or directory", file=sys.stderr)
         return 2
+    # Refuse a report that would land on a bank before the scan: writing it after the scan still destroyed the input.
+    if a.out:
+        inputs = ([os.path.join(root, f) for root, _dirs, files in os.walk(a.src) for f in files]
+                  if os.path.isdir(a.src) else [a.src])
+        if any(same_report_path(path, a.out) for path in inputs):
+            print(f"awc_markers: error: --out {a.out} would overwrite the input", file=sys.stderr)
+            return 2
+        if os.path.isdir(a.out):
+            print(f"awc_markers: error: --out {a.out} is a folder, not a report file", file=sys.stderr)
+            return 2
     report = scan(a.src)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
-            f.write("\n")
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"awc_markers: error: --out {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
     print(f"{report['banks']} banks, {report['streams']} streams")
     for name in ("streamed_music", "other"):
         g = report[name]

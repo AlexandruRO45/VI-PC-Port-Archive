@@ -193,6 +193,32 @@ class ScanTest(unittest.TestCase):
         self.assertEqual((report["banks"], report["streamed_music"]["events"], report["other"]["chunks"]), (1, 1, 0))
         self.assertIsNone(report["other"]["events_per_chunk"])
 
+    def test_out_may_not_replace_an_input(self):
+        bank = self.write("keep.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
+        with open(bank, "rb") as f:
+            before = f.read()
+        for out in (bank, os.path.join(self.tmp.name, "report", "..", "keep.awc")):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(awc_markers.main([bank, "--out", out]), 2)
+            self.assertIn("would overwrite", err.getvalue())
+        with open(bank, "rb") as f:
+            self.assertEqual(f.read(), before)          # the bank is still a bank
+        folder = os.path.join(self.tmp.name, "tree")
+        os.makedirs(folder)
+        inner = os.path.join(folder, "b.awc")
+        with open(inner, "wb") as f:
+            f.write(speech_bank(0x66, 48000, event(TICK, 2.0, 0)))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_markers.main([folder, "--out", inner]), 2)
+        self.assertIn("would overwrite", err.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_markers.main([bank, "--out", folder]), 2)
+        self.assertIn("is a folder", err.getvalue())
+        # A report path under a missing folder is one error line, not a traceback after the scan.
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_markers.main([bank, "--out", os.path.join(folder, "missing", "r.json")]), 2)
+        self.assertIn("error:", err.getvalue())
+
     def test_runs_under_python_dash_i(self):
         path = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
         proc = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True, timeout=120)
