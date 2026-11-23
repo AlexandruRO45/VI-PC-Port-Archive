@@ -251,7 +251,12 @@ Bound to the host, those calls would load the PC's Gaming Services runtime, or f
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
 shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`) with a
 pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
-with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
+with `ERROR_PROC_NOT_FOUND` and is logged once. The same lookup boundary applies when a caller supplies a real host
+`HMODULE` for a DLL the registry owns: registered names and ordinals resolve to their shims, while missing names,
+missing ordinals and null names return `NULL` / `ERROR_PROC_NOT_FOUND`. A real handle cannot expose an unregistered
+host export of that owned DLL. Bundled handles keep their mapped exports; modules outside `owns_dll` still use any
+registered shim first and otherwise preserve native lookup. `dll_thread_calls_test` checks this with synthetic
+registry entries, real System32 export addresses and a mapped fixture, without calling any network export.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
 version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,

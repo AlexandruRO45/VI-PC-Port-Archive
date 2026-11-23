@@ -8,9 +8,10 @@
 //
 // So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
 // return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the
-// registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
-// other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
-// loader see these: they are bound through the registry, the runtime's own code calls the host directly.
+// registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND and is logged once. A real host handle for an owned
+// DLL also resolves only registered exports, so it cannot bypass that boundary. Other modules use registered shims
+// first, then the host. Only images mapped by the loader see these: they are bound through the registry, while the
+// runtime's own code calls the host directly.
 #include <windows.h>
 
 #include <cstdint>
@@ -234,10 +235,12 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     }
 
     if (!name) {
-        if (owns_bundled_module_handle(module)) {
+        const DWORD error = GetLastError();
+        if (owns_bundled_module_handle(module) || (module && owns_dll(host_module_name(module)))) {
             SetLastError(ERROR_PROC_NOT_FOUND);
             return nullptr;
         }
+        SetLastError(error);
         return GetProcAddress(module, name);
     }
 
@@ -255,6 +258,10 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         void* shim = dll.empty() ? nullptr : find(dll, what);
         SetLastError(error);
         if (shim) return reinterpret_cast<FARPROC>(shim);
+        if (owns_dll(dll)) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return nullptr;
+        }
     }
     return GetProcAddress(module, name);
 }

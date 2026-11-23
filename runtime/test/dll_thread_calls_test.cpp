@@ -64,6 +64,101 @@ struct BundledGuard {
     BundledGuard& operator=(const BundledGuard&) = delete;
 };
 
+// Inspect addresses only. Loading System32's DLL and querying its exports never calls a Winsock function.
+void test_owned_host_exports(const rt::Module& mapped) {
+    using GetProcFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    using GetModuleFn = HMODULE(WINAPI*)(LPCSTR);
+    using FreeLibFn = BOOL(WINAPI*)(HMODULE);
+    const auto get_proc = reinterpret_cast<GetProcFn>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+    const auto get_module = reinterpret_cast<GetModuleFn>(rt::shims::find("kernel32.dll", "GetModuleHandleA"));
+    const auto free_lib = reinterpret_cast<FreeLibFn>(rt::shims::find("kernel32.dll", "FreeLibrary"));
+    check(get_proc && get_module && free_lib, "the registry serves the host export lookup controls");
+    if (!get_proc || !get_module || !free_lib) return;
+
+    HMODULE host = ::LoadLibraryExW(L"ws2_32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    check(host != nullptr, "load the native Winsock module for address comparisons only");
+    if (!host) return;
+    const FARPROC native_connect = ::GetProcAddress(host, "connect");
+    const FARPROC native_socket = ::GetProcAddress(host, "socket");
+    const FARPROC native_resolver = ::GetProcAddress(host, "getaddrinfo");
+    check(native_connect && native_socket && native_resolver &&
+              ::GetProcAddress(host, MAKEINTRESOURCEA(4)) == native_connect &&
+              ::GetProcAddress(host, MAKEINTRESOURCEA(23)) == native_socket,
+          "native named and ordinal exports exist independently of the shim table");
+    check(!rt::shims::owns_dll("ws2_32.dll") && get_proc(host, "socket") == native_socket &&
+              get_proc(host, MAKEINTRESOURCEA(23)) == native_socket,
+          "an unowned real module preserves native named and ordinal lookup");
+    SetLastError(0x12345678);
+    const FARPROC native_null = ::GetProcAddress(host, nullptr);
+    const DWORD native_null_error = GetLastError();
+    std::printf("NATIVE_NULL returned=%d error=%lu\n", native_null != nullptr,
+                static_cast<unsigned long>(native_null_error));
+    SetLastError(0x12345678);
+    const FARPROC unowned_null = get_proc(host, nullptr);
+    const DWORD unowned_null_error = GetLastError();
+    check(unowned_null == native_null && unowned_null_error == native_null_error,
+          "an unowned real module preserves the native null-name result");
+
+    const rt::shims::Entry entries[] = {
+        {"ws2_32.dll", "connect", reinterpret_cast<void*>(&fake_host_named_shim)},
+        {"ws2_32.dll", "#4", reinterpret_cast<void*>(&fake_host_ordinal_shim)},
+    };
+    const rt::shims::Table table(entries, 2);
+    const HMODULE owned = get_module("ws2_32.dll");
+    check(rt::shims::owns_dll("ws2_32.dll") && owned && owned != host,
+          "the same DLL has distinct owned pseudo and native host handles");
+    for (HMODULE handle : {host, owned}) {
+        if (!handle) continue;
+        const std::string kind = handle == host ? "real owned handle: " : "pseudo handle: ";
+        SetLastError(0x12345678);
+        const FARPROC named = get_proc(handle, "connect");
+        const DWORD named_error = GetLastError();
+        check(named == reinterpret_cast<FARPROC>(&fake_host_named_shim) && named_error == 0x12345678,
+              kind + "registered name keeps its shim and last error");
+        SetLastError(0x12345678);
+        const FARPROC ordinal = get_proc(handle, MAKEINTRESOURCEA(4));
+        const DWORD ordinal_error = GetLastError();
+        check(ordinal == reinterpret_cast<FARPROC>(&fake_host_ordinal_shim) && ordinal_error == 0x12345678,
+              kind + "registered ordinal keeps its shim and last error");
+        struct MissingExport { LPCSTR name; const char* label; };
+        const MissingExport missing[] = {
+            {"socket", "unregistered native socket name"},
+            {MAKEINTRESOURCEA(23), "unregistered native socket ordinal"},
+            {"getaddrinfo", "unregistered native resolver name"},
+            {"leonida_missing_export", "absent name"},
+            {MAKEINTRESOURCEA(65535), "absent ordinal"},
+            {nullptr, "null name"},
+        };
+        for (const auto& item : missing) {
+            SetLastError(0x12345678);
+            const FARPROC result = get_proc(handle, item.name);
+            const DWORD error = GetLastError();
+            std::printf("EXPORT_LOOKUP %s%s returned=%d error=%lu\n", kind.c_str(), item.label,
+                        result != nullptr, static_cast<unsigned long>(error));
+            check(!result && error == ERROR_PROC_NOT_FOUND, kind + item.label + " is refused");
+        }
+    }
+
+    // The mapped copy is still a bundled module, even though the earlier test owns its DLL name in the registry.
+    const HMODULE bundled = reinterpret_cast<HMODULE>(mapped.base);
+    check(get_proc(bundled, "dll_thread_calls_bogus_handle") ==
+              reinterpret_cast<FARPROC>(mapped.exports.at("dll_thread_calls_bogus_handle")) &&
+              get_proc(bundled, MAKEINTRESOURCEA(1)) == reinterpret_cast<FARPROC>(mapped.exports.at("#1")),
+          "bundled named and ordinal exports retain precedence over host ownership");
+    const LPCSTR bundled_missing[] = {"leonida_missing_export", MAKEINTRESOURCEA(65535), nullptr};
+    for (LPCSTR name : bundled_missing) {
+        SetLastError(0x12345678);
+        const FARPROC result = get_proc(bundled, name);
+        const DWORD error = GetLastError();
+        check(!result && error == ERROR_PROC_NOT_FOUND, "bundled missing name, ordinal or null name is refused");
+    }
+    HMODULE kernel = ::GetModuleHandleW(L"kernel32.dll");
+    check(!rt::shims::owns_dll("kernel32.dll") &&
+              get_proc(kernel, "GetCurrentProcessId") == ::GetProcAddress(kernel, "GetCurrentProcessId"),
+          "a host-preferred module still resolves an unregistered native export");
+    check(free_lib(host) != FALSE, "release the native Winsock module reference");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -182,6 +277,7 @@ int main(int argc, char** argv) {
                       "GetProcAddress does not return stale ordinal shim after FreeLibrary");
             }
         }
+        test_owned_host_exports(m);
     } catch (const std::exception& e) {
         std::printf("FAIL unexpected exception: %s\n", e.what());
         ++g_failures;
