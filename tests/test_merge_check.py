@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -20,6 +21,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import merge_check as mc  # noqa: E402
+
+# The cases that reach `git merge-tree --write-tree` cannot run on a git before 2.38: they skip, with the release.
+RELEASE = mc.git_release()
+NEEDS_NEWER_GIT = (f"merge-tree --write-tree needs git {mc.MIN_GIT[0]}.{mc.MIN_GIT[1]} or newer; "
+                   f"the git on PATH is {RELEASE}" if mc.too_old(RELEASE) else "")
 
 PARAGRAPH = ("The effect record is a fixed 48-byte header followed by its parameters, one 16-byte slot each.\n"
              "A slot whose type is zero ends the list early, before the count in the header says it should.\n"
@@ -79,16 +85,72 @@ class MergeCheckTest(unittest.TestCase):
         self.git("commit", "-q", "-m", f"{title} (#{number})")
 
     def run_check(self, *pairs):
+        if NEEDS_NEWER_GIT:
+            self.skipTest(NEEDS_NEWER_GIT)
         out = io.StringIO()
         with redirect_stdout(out):
             code = mc.main(["--repo", self.repo, "--main", "main", "--json", *pairs])
         return code, json.loads(out.getvalue())
 
     def run_text(self, *pairs):
+        if NEEDS_NEWER_GIT:
+            self.skipTest(NEEDS_NEWER_GIT)
         out = io.StringIO()
         with redirect_stdout(out):
             code = mc.main(["--repo", self.repo, "--main", "main", *pairs])
         return code, out.getvalue()
+
+    def run_with_failing_merge_tree(self, release, stderr):
+        """main() on the branch `fresh`, with a merge-tree that fails with `stderr` on a git of that release."""
+        real = mc.git
+
+        def git(repo, *args, check=True):
+            if args[0] == "merge-tree":
+                return types.SimpleNamespace(returncode=128, stdout="", stderr=stderr)
+            return real(repo, *args, check=check)
+
+        err = io.StringIO()
+        with mock.patch.object(mc, "git", git), mock.patch.object(mc, "git_release", return_value=release), \
+                mock.patch("sys.stderr", err), redirect_stdout(io.StringIO()):
+            code = mc.main(["--repo", self.repo, "--main", "main", "12=fresh"])
+        return code, err.getvalue()
+
+    def test_a_git_before_2_38_is_named_in_one_line(self):
+        # merge-tree --write-tree is new in git 2.38. An older git reads the option as a revision, and the only
+        # message was its own "fatal: unknown rev --write-tree" (seen with git 2.37.3 first on PATH).
+        self.pr_branch("fresh", self.git("rev-parse", "main"), "\n" + PARAGRAPH)
+        code, err = self.run_with_failing_merge_tree("2.37.3.windows.1", "fatal: unknown rev --write-tree\n")
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "merge_check: git 2.38 or newer is needed for merge-tree --write-tree; "
+                              "the git on PATH is 2.37.3.windows.1\n")
+
+    def test_a_merge_tree_failure_on_a_new_enough_git_keeps_gits_message(self):
+        self.pr_branch("fresh", self.git("rev-parse", "main"), "\n" + PARAGRAPH)
+        for release in ("2.38.0", "2.52.0.windows.1", ""):
+            with self.subTest(release=release):
+                code, err = self.run_with_failing_merge_tree(release, "fatal: something else\n")
+                self.assertEqual(code, 2)
+                self.assertEqual(err, "merge_check: git merge-tree main fresh: fatal: something else\n")
+
+    def test_which_releases_are_too_old(self):
+        for release, old in (("2.37.3.windows.1", True), ("2.9.5", True), ("1.8.3.1", True), ("2.38.0", False),
+                             ("2.38.1.windows.1", False), ("2.52.0", False), ("3.0.0", False), ("", False),
+                             ("unknown", False)):
+            with self.subTest(release=release):
+                self.assertIs(mc.too_old(release), old)
+
+    def test_the_release_is_read_from_git_version(self):
+        self.assertRegex(mc.git_release(), r"^\d+\.\d+")
+        answer = types.SimpleNamespace(returncode=0, stdout=b"git version 2.37.3.windows.1\n", stderr=b"")
+        with mock.patch.object(mc.subprocess, "run", return_value=answer) as run:
+            self.assertEqual(mc.git_release(), "2.37.3.windows.1")
+        self.assertEqual(run.call_args.args[0], ["git", "--version"])
+        for answer in (types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"no"),
+                       types.SimpleNamespace(returncode=0, stdout=b"something else\n", stderr=b"")):
+            with mock.patch.object(mc.subprocess, "run", return_value=answer):
+                self.assertEqual(mc.git_release(), "")
+        with mock.patch.object(mc.subprocess, "run", side_effect=OSError("no git")):
+            self.assertEqual(mc.git_release(), "")
 
     def test_a_fresh_pr_is_clean(self):
         base = self.git("rev-parse", "main")

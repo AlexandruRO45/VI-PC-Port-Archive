@@ -19,7 +19,8 @@ against `--main` (default `origin/main`), using one history scan for the whole b
 Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
 tree matches main, as after a multi-commit squash merge), `duplicates`, `conflict` or `clean`.
 Exit 0 when every PR is clean, 1 when any is not, 2 on a usage or git error. Read-only: `merge-tree --write-tree`
-writes only objects, no refs. Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`.
+writes only objects, no refs. Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`, and says
+so in one line (exit 2) when the git on PATH is older.
 """
 import argparse
 import codecs
@@ -35,10 +36,27 @@ REVERT_SUBJECT = re.compile(r"^Revert\b", re.IGNORECASE)
 # Where a doubled block is the repeated-merge damage. In code, three equal lines in two functions are ordinary, so a
 # block there is listed but does not change the verdict.
 TEXT_SUFFIXES = (".md", ".txt", ".rst")
+MIN_GIT = (2, 38)  # the first git whose merge-tree takes --write-tree
 
 
 class GitError(Exception):
     pass
+
+
+def git_release():
+    """The release of the git on PATH as it prints it ("2.37.3.windows.1"), or "" when it cannot be asked."""
+    try:
+        r = subprocess.run(["git", "--version"], capture_output=True)
+    except OSError:
+        return ""
+    words = r.stdout.decode("utf-8", "replace").split()
+    return words[2] if r.returncode == 0 and words[:2] == ["git", "version"] and len(words) > 2 else ""
+
+
+def too_old(release):
+    """Whether `release` is a git before MIN_GIT. A release that cannot be read is not called old."""
+    m = re.match(r"(\d+)\.(\d+)", release)
+    return bool(m) and (int(m.group(1)), int(m.group(2))) < MIN_GIT
 
 
 def git(repo, *args, check=True):
@@ -85,6 +103,12 @@ def rev_tree(repo, rev):
 def merged_tree(repo, main, ref):
     r = git(repo, "merge-tree", "--write-tree", main, ref, check=False)
     if r.returncode not in (0, 1) or not r.stdout.strip():
+        # A git before 2.38 reads --write-tree as a revision and answers "fatal: unknown rev --write-tree", which
+        # says nothing about the cause. The release is asked only here, after a failure.
+        release = git_release()
+        if too_old(release):
+            raise GitError(f"git {MIN_GIT[0]}.{MIN_GIT[1]} or newer is needed for merge-tree --write-tree; "
+                           f"the git on PATH is {release}")
         raise GitError(f"git merge-tree {main} {ref}: {r.stderr.strip() or r.returncode}")
     return r.stdout.split()[0], r.returncode == 1
 
