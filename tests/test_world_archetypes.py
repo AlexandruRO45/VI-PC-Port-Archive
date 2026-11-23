@@ -324,8 +324,44 @@ class CliTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertNotIn("Traceback", err.getvalue())
         return err.getvalue()
+    def test_limit_must_be_positive_or_it_scans_nothing(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        out = os.path.join(self.tmp.name, "out", "archetypes.json")
+        for limit in ("0", "-5"):
+            with self.subTest(limit=limit):
+                err = self.cli_error([path, "--limit", limit, "--out", out])
+                self.assertIn("--limit must be at least 1 byte", err)
+                self.assertFalse(os.path.exists(out))  # no report for a window that would scan nothing
+
+    def test_start_outside_the_data_area_is_one_line(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        size = os.path.getsize(path)
+        out = os.path.join(self.tmp.name, "out", "archetypes.json")
+        for start, why in ((-16, "--start must not be negative"), (16, "outside the data area"), (size, "outside the data area")):
+            with self.subTest(start=start):
+                err = self.cli_error([path, "--start", str(start), "--out", out])
+                self.assertIn(why, err)
+                self.assertFalse(os.path.exists(out))
+
+    def test_start_inside_the_data_area_matches_the_whole_archive(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(WA.main([path, "--start", "64", "--check-extents",
+                                      "--out", os.path.join(self.tmp.name, "a.json")]), 0)
+        with open(os.path.join(self.tmp.name, "a.json"), encoding="utf-8") as f:
+            self.check(json.load(f))
 
     def test_out_equal_to_the_input_is_refused_and_leaves_it_alone(self):
+
         path = os.path.join(self.tmp.name, "carved.bin")
         with open(path, "wb") as f:
             f.write(b"\x00" * 3000)
