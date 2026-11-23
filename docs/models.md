@@ -301,7 +301,9 @@ embedded. `--up z` (the default) rotates RAGE's Z-up into glTF's Y-up, `--up y` 
 and `--max-tex-size` caps the dimension of a decoded DDS (0 leaves it unconstrained). A texture that
 cannot be read or decoded is left out of that model and printed on one line, the run ends with
 `converted <n>/<total> models`, and the exit status is 1 only when a model failed to convert (or the
-input folder is missing).
+input folder is missing). The GLBs are what `tools/gallery.py --models-dir` previews and what
+`tools/glb_inspect.py` and `tools/glb_skinning.py` read back; `python -I tests/test_batch_glb.py` runs
+13 synthetic tests and needs no game files.
 
 Three arrays describe the geometries one by one, in the same order as the OBJ's `o` groups:
 `MeshTris` (triangles), `MeshModels` (the position of the model in the drawable's primary-LOD model
