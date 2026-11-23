@@ -129,7 +129,16 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
         with pytest.raises(SystemExit) as exc:
             usc.main([str(index), "--json", str(output)])
     if output_kind == "folding-volume-case":
-        probe.assert_called_once()
+        # How often the volume has to be asked depends on the path rules of the volume the reports are on. Where
+        # they already fold case -- Windows' `normcase`, a macOS APFS volume, a Linux mount that folds -- the
+        # resolved names are one key and `same_report_path` answers before the probe; the probe is the route that
+        # remains where the name rules keep case, so it has to run there and only there. Asserting the count keeps
+        # that route covered without demanding it of a volume that does not need it (this test was red on Windows,
+        # where `os.path.realpath` answers an existing `index.json` for `INDEX.JSON`).
+        names_already_fold_case = report_paths.path_key(index) == report_paths.path_key(output)
+        assert probe.call_count == (0 if names_already_fold_case else 1), (
+            f"the volume probe ran {probe.call_count} times, and the name rules "
+            f"{'already' if names_already_fold_case else 'do not'} fold these two names")
 
     assert exc.value.code == 2
     assert "--json must not overwrite the input index" in capsys.readouterr().err
