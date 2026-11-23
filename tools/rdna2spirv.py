@@ -15668,13 +15668,21 @@ def halves_analysis(g, blocks, succ):
 def fold_far_branches(insns):
     """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] is a far
     branch (s_branch only reaches +-32K dwords): the target is the address after s_getpc plus K. Fold the four
-    instructions into one s_branch with an explicit byte target so the CFG sees an ordinary branch."""
+    instructions into one s_branch with an explicit byte target so the CFG sees an ordinary branch. Keep gaps
+    and normalized encodings visible to the reachability checks after re-anchoring."""
+    forms = (
+        ["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"],
+        ["s_getpc_b64", "s_sub_u32", "s_subb_u32", "s_setpc_b64"],
+    )
     out, i = [], 0
     while i < len(insns):
         w = insns[i:i + 4]
         ops4 = [base_op(x["op"]) for x in w]
-        if len(w) == 4 and all(x.get("enc") for x in w) and ops4 in (["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"],
-                                    ["s_getpc_b64", "s_sub_u32", "s_subb_u32", "s_setpc_b64"]):
+        if (
+            ops4 in forms
+            and all(ins.get("enc") and not ins.get("normalized") for ins in w)
+            and all(left["pc"] + len(left["enc"]) // 2 == right["pc"] for left, right in zip(w, w[1:]))
+        ):
             g, ad, ac, sp = w
             r = g["args"][0].get("r") if g["args"] and g["args"][0]["k"] == "sgpr" else None
             ok = r is not None and                 [x.get("r") for x in ad["args"][:2]] == [r, r] and ad["args"][2]["k"] == "imm" and                 [x.get("r") for x in ac["args"][:2]] == [r + 1, r + 1] and ac["args"][2]["k"] == "imm" and                 sp["args"] and sp["args"][0].get("r") == r

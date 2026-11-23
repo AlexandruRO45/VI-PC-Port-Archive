@@ -66,6 +66,48 @@ class FarBranch(unittest.TestCase):
         self.assertEqual([f"{w:#010x}" for w in words], [f"{w:#010x}" for w in EXPECTED])
 
 
+class FarBranchReanchoring(unittest.TestCase):
+    def translate_jump(self, gap_after, mismatched_setpc=False):
+        # The jump targets the v_mov at byte 24, including one skipped dword in the blob.
+        program = (
+            ("s_getpc_b64 s[4:5]", "00 1f 84 be"),
+            ("s_add_u32 s4, s4, 0x14", "04 ff 04 80 14 00 00 00"),
+            ("s_addc_u32 s5, s5, 0", "05 80 05 82"),
+            ("s_setpc_b64 s[4:5]", "04 20 80 be"),
+            ("v_mov_b32_e32 v0, 1.0", "f2 02 00 7e"),
+            ("exp mrt0 v0, v0, v0, v0 done vm", "0f 18 00 f8 00 00 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        )
+        listing = ["; ps_reanchored_far_branch  code 0x0..0x28 (header), gfx1013, 1 invalid words"]
+        native = bytearray()
+        for index, (asm, hex_bytes) in enumerate(program):
+            encoding = bytes.fromhex(hex_bytes)
+            printed = ",".join(f"0x{byte:02x}" for byte in encoding)
+            listing.append(f"\t{asm} ; encoding: [{printed}]")
+            if index == 3 and mismatched_setpc:
+                encoding = bytes.fromhex("06 20 80 be")  # stored instruction reads s[6:7]
+            native.extend(encoding)
+            if index == gap_after:
+                listing.append("; invalid instruction encoding")
+                native.extend(b"\xff" * 4)
+        data = ("\n".join(listing) + "\n").encode("utf-8")
+        return support.translate_listing("ps_reanchored_far_branch", data, fssm=bytes(native))
+
+    def test_contiguous_jump_can_skip_an_undecodable_word(self):
+        spv = self.translate_jump(gap_after=3)
+        self.assertEqual(support.mrt0_words(spv), [0x3F800000] * 4)
+
+    def test_gap_inside_jump_is_refused(self):
+        for gap_after in range(3):
+            with self.subTest(gap_after=gap_after):
+                with self.assertRaisesRegex(support.rdna2spirv.Unsupported, "fall-through into undecodable words"):
+                    self.translate_jump(gap_after)
+
+    def test_mismatched_encoding_inside_jump_is_refused(self):
+        with self.assertRaisesRegex(support.rdna2spirv.Unsupported, "reachable instruction with normalized encoding"):
+            self.translate_jump(gap_after=3, mismatched_setpc=True)
+
+
 class FarBranchWithoutEncoding(unittest.TestCase):
     def test_idiom_without_encoding_is_unsupported_not_a_crash(self):
         """A hand-written listing has no `; encoding:` bytes, so the idiom's size is unknown: Unsupported, as for a
