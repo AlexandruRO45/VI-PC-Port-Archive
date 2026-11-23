@@ -372,6 +372,33 @@ class DirectoryScanTest(unittest.TestCase):
                 f.write(self.jsav(0xABCDEF01))
             self.assertEqual(sk.collect_keys([path]), sk.collect_keys([tmp]))
 
+    def test_sub_folders_are_read_in_sorted_order_whatever_the_file_system_lists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in ("a", "b"):
+                os.mkdir(os.path.join(tmp, sub))
+                with open(os.path.join(tmp, sub, "x.jsav"), "wb") as f:
+                    f.write(b"JSAV" + bytes(4))   # hand-written 8-byte stub: header too short, warns
+            real_walk = os.walk
+
+            def walk_with(order):
+                def walk(top, *args, **kwargs):
+                    for dp, dirs, fs in real_walk(top, *args, **kwargs):
+                        dirs[:] = sorted(dirs, reverse=(order == "reversed"))
+                        yield dp, dirs, fs
+                return walk
+
+            results = {}
+            for order in ("forward", "reversed"):
+                err = io.StringIO()
+                with mock.patch.object(os, "walk", walk_with(order)), contextlib.redirect_stderr(err):
+                    files = list(sk.input_files([tmp]))
+                    sk.collect_keys([tmp])
+                results[order] = (files, [ln.split(": JSAV")[0] for ln in err.getvalue().splitlines()])
+            expected = [os.path.join(tmp, "a", "x.jsav"), os.path.join(tmp, "b", "x.jsav")]
+            self.assertEqual(results["forward"][0], expected)
+            self.assertEqual(results["reversed"], results["forward"])
+            self.assertEqual(len(results["forward"][1]), 2)
+
 
 
 class LongIdentifiers(unittest.TestCase):

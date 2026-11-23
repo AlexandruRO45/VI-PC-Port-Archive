@@ -175,7 +175,8 @@ def input_files(paths):
     """Every save file (.jsav, .asav, .bin or no extension) or .json under the given paths, in reading order."""
     for p in paths:
         if os.path.isdir(p):
-            for dp, _, fs in os.walk(p, onerror=_walk_error):
+            for dp, dirs, fs in os.walk(p, onerror=_walk_error):
+                dirs.sort()      # walk sub-folders in name order, not the file system's
                 for f in sorted(fs):
                     if f.lower().endswith(INPUT_EXTENSIONS) or "." not in f:
                         yield os.path.join(dp, f)
