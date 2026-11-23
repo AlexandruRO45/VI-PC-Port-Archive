@@ -451,6 +451,37 @@ class TestManifestVerifier(unittest.TestCase):
             self.assertEqual(len(report.unreadable), 1)
             self.assertEqual(report.unreadable[0][0], "alpha.bin")
 
+    def test_unreadable_text_report_separates_the_label_and_shows_the_reason(self) -> None:
+        # UNREADABLE fills the 10-character status column, so a plain f"{kind:<10}{rel}" runs the two together.
+        report = mv.ManifestReport(
+            passed=False,
+            total_manifest_files=1,
+            problems={"blocked.bin": "UNREADABLE"},
+            unreadable=[("blocked.bin", "Permission denied")],
+        )
+        out = io.StringIO()
+        mv.print_report(report, out=out)
+        text = out.getvalue()
+        self.assertNotIn("UNREADABLEblocked.bin", text)
+        self.assertIn("UNREADABLE blocked.bin: Permission denied\n", text)
+        self.assertIn("1 problem(s)", text)
+
+    def test_short_status_labels_keep_their_existing_column(self) -> None:
+        report = mv.ManifestReport(
+            passed=False,
+            total_manifest_files=2,
+            problems={"a.bin": "MISSING", "b.bin": "CHANGED"},
+            missing=["a.bin"],
+            hash_mismatch=["b.bin"],
+            untracked=["c.bin"],
+        )
+        out = io.StringIO()
+        mv.print_report(report, out=out)
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            ["MISSING   a.bin", "CHANGED   b.bin", "NEW       c.bin", "2 problem(s)"],
+        )
+
     def test_empty_manifest_and_zero_byte_file(self) -> None:
         zero_p = os.path.join(self.game_dir, "empty.bin")
         with open(zero_p, "wb"):

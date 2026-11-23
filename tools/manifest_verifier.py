@@ -372,11 +372,21 @@ def print_report(
     verbose: bool = False,
     strict: Optional[bool] = None,
 ) -> None:
+    reasons = dict(report.unreadable)
+
+    def label(kind: str) -> str:
+        # A status that fills the column (UNREADABLE) needs an explicit separator, or it runs into the filename.
+        return f"{kind:<10}" if len(kind) < 10 else f"{kind} "
+
     for rel in sorted(report.problems.keys()):
         kind = report.problems[rel]
-        out.write(f"{kind:<10}{rel}\n")
+        line = f"{label(kind)}{rel}"
+        if kind == "UNREADABLE" and reasons.get(rel):
+            reason = str(reasons[rel]).replace("\r", " ").replace("\n", " ")
+            line += f": {reason}"
+        out.write(line + "\n")
     for rel in report.untracked:
-        out.write(f"{'NEW':<10}{rel}\n")
+        out.write(f"{label('NEW')}{rel}\n")
 
     bad = report.count_problems(strict=strict)
 
