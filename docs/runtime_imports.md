@@ -147,10 +147,11 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   the package name is hidden too. A package folder that still holds files fails with `ERROR_DIR_NOT_EMPTY`. Other
   classes and host handles go to the host unchanged. `msvcp140.dll` itself still exports the older
   `std::experimental::filesystem` (`_Stat`, `_Open_dir`/`_Read_dir`, `_Make_dir`, `_Copy_file`, ...), which calls
-  kernel32 directly; the host CRT copy's imports of `CopyFile2`, `CreateDirectoryW`, `CreateFile2`, `FindClose`,
-  `FindFirstFileExW`, `FindNextFileW`, `GetFileAttributesExW`, `SetFileAttributesW` and `SetFileInformationByHandle`
-  are pointed at the shims with the CRT names above (dumpbin of `msvcp140.dll` 14.51: its kernel32 imports that have
-  a file shim). `CreateHardLinkW` and `CreateSymbolicLinkW` have no shim and stay with the host. `loader_test`
+  kernel32 directly; the host CRT copy's imports of every wide kernel32 file call with a shim (`CopyFile2`,
+  `CopyFileW`, `CreateFile2`, `CreateFileW`, `CreateDirectoryW`, `FindFirstFileExW`, `GetFileAttributesExW`,
+  `SetFileInformationByHandle`, ...) are pointed at the shims with the CRT names above. The whole set is listed
+  because versions differ: `msvcp140.dll` 14.51 imports `CopyFile2`/`CreateFile2`, 14.44 `CopyFileW`/`CreateFileW`
+  (dumpbin). `CreateHardLinkW` and `CreateSymbolicLinkW` have no shim and stay with the host. `loader_test`
   checks `_Stat`, the merged listing, `_Make_dir` and `_Copy_file`; `file_system_test` checks the remove. Not covered:
   `std::filesystem::canonical` (`GetFinalPathNameByHandleW`), hard and symbolic links, and `absolute`
   (`GetFullPathNameW`, a separate pull request).

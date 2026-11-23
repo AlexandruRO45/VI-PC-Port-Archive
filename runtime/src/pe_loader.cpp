@@ -482,15 +482,18 @@ PVOID NTAPI pc_to_file_header(PVOID pc, PVOID* base) {
 // (std::_Fiopen calls _wfsopen), which the Windows loader binds to the host ucrtbase, so a GAME: path never reached
 // the CRT shims of file_system.cpp; its std::experimental::filesystem exports (_Stat, _Open_dir/_Read_dir, _Make_dir,
 // _Copy_file, ...) call kernel32 the same way. Each of these is pointed at the shim registered under the same import
-// name, when there is one; a host path goes through the shim unchanged. These are the CRT path calls and the kernel32
-// calls with a file shim that the host CRT copies import (dumpbin: only msvcp140.dll has any); its CreateHardLinkW and
-// CreateSymbolicLinkW have no shim and stay with the host. C++17 std::filesystem is not among them: msvcprt.lib links
-// it into the title, whose own imports the loader binds to the shims.
-constexpr const char* kHostFileImports[] = {"_fsopen",          "_wfsopen",         "_wremove",
-                                            "_wrename",         "_wrmdir",          "CopyFile2",
-                                            "CreateDirectoryW", "CreateFile2",      "FindClose",
-                                            "FindFirstFileExW", "FindNextFileW",    "GetFileAttributesExW",
-                                            "SetFileAttributesW", "SetFileInformationByHandle"};
+// name, when there is one; a host path goes through the shim unchanged. These are the CRT path calls the host CRT copies
+// import (dumpbin: only msvcp140.dll has any) and every wide kernel32 file call with a shim: msvcp140 versions differ
+// (14.51 imports CopyFile2 and CreateFile2, 14.44 CopyFileW and CreateFileW), and a name a copy does not import costs
+// nothing. CreateHardLinkW and CreateSymbolicLinkW have no shim and stay with the host. C++17 std::filesystem is not
+// among them: msvcprt.lib links it into the title, whose own imports the loader binds to the shims.
+constexpr const char* kHostFileImports[] = {
+    "_fsopen",          "_wfsopen",           "_wremove",           "_wrename",
+    "_wrmdir",          "CopyFile2",          "CopyFileExW",        "CopyFileW",
+    "CreateDirectoryExW", "CreateDirectoryW", "CreateFile2",        "CreateFileW",
+    "DeleteFileW",      "FindClose",          "FindFirstFileExW",   "FindFirstFileW",
+    "FindNextFileW",    "GetFileAttributesExW", "GetFileAttributesW", "MoveFileExW",
+    "MoveFileW",        "RemoveDirectoryW",   "SetFileAttributesW", "SetFileInformationByHandle"};
 
 bool is_host_file_import(const char* name) {
     for (const char* n : kHostFileImports)
