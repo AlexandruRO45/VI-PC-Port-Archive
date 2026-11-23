@@ -146,6 +146,18 @@ class TestReadFirstLaneTranslator(unittest.TestCase):
         self.assertTrue("OpGroupNonUniformShuffle" in spv or "OpGroupNonUniformBallot" in spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestReadLaneOracle(unittest.TestCase):
+    def test_oracle_indexing(self):
+        lanes = [1000 + i for i in range(64)]
+        for i in range(64):
+            self.assertEqual(model_readlane(lanes, i), 1000 + i)
+
+    def test_translator_readlane_oracle(self):
+        prog = ["v_mov_b32_e32 v1, 123", "s_mov_b32 s1, 4", "v_readlane_b32 s0, v1, s1", "s_endpgm"]
+        spv = support.translate_lines("cs_rl_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
