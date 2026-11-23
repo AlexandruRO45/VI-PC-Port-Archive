@@ -350,6 +350,24 @@ class TestSBcnt0I32B64ASTAndInterpreter(unittest.TestCase):
         words = run_salu_bundle_ps(exec_prog, "ps_exec_s_bcnt0_i32_b64")
         self.assertEqual(words[0], 0x1)
 
+class TestSBcnt0I32B64SIMDAndEdgeCases(unittest.TestCase):
+    """Stage 3 for s_bcnt0_i32_b64: boundary edge cases and status flag tracking."""
+
+    def test_s_bcnt0_i32_b64_edge_cases(self):
+        cases = [(['s_mov_b32 s2, 0', 's_mov_b32 s3, 0', 's_bcnt0_i32_b64 s0, s[2:3]'], 64), (['s_mov_b32 s2, 0xFFFFFFFF', 's_mov_b32 s3, 0xFFFFFFFF', 's_bcnt0_i32_b64 s0, s[2:3]'], 0), (['s_mov_b32 s2, 0xFFFFFFFE', 's_mov_b32 s3, 0xFFFFFFFF', 's_bcnt0_i32_b64 s0, s[2:3]'], 1), (['s_mov_b32 s2, 0x55555555', 's_mov_b32 s3, 0x55555555', 's_bcnt0_i32_b64 s0, s[2:3]'], 32), (['s_mov_b32 s2, 0', 's_mov_b32 s3, 0xFFFFFFFF', 's_bcnt0_i32_b64 s0, s[2:3]'], 32)]
+        for idx, (lines, expected) in enumerate(cases):
+            with self.subTest(case_idx=idx):
+                prog = list(lines) + [
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                words = run_salu_bundle_ps(prog, f"ps_edge_s_bcnt0_i32_b64_{idx}")
+                self.assertEqual(words[0], expected)
+
 
 if __name__ == '__main__':
     unittest.main()
