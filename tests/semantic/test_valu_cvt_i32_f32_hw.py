@@ -248,3 +248,88 @@ class TestASTDefinitions(unittest.TestCase):
         ]
         spv = support.translate_lines("ps_ast_cvt", lines)
         self.assertEqual(support.mrt0_words(spv)[0], 2)
+
+
+# ==============================================================================
+# SECTION 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarState:
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0)
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK_32
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK_32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter executing VCvtI32F32Instruction."""
+
+    def eval_operand(self, op: Operand, state: ScalarState) -> int:
+        if op.kind == OperandKind.VGPR:
+            raw = state.get_vgpr(int(op.value))
+        elif op.kind == OperandKind.SGPR:
+            raw = state.get_sgpr(int(op.value))
+        elif op.kind == OperandKind.FLOAT_IMM:
+            raw = f32_to_bits(float(op.value))
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+        f = bits_to_f32(raw)
+        if op.abs_val:
+            f = abs(f)
+        if op.neg:
+            f = -f
+        return f32_to_bits(f)
+
+    def step(self, instr: VCvtI32F32Instruction, state: ScalarState) -> None:
+        src_bits = self.eval_operand(instr.src, state)
+        res = oracle_cvt_i32_f32(src_bits)
+        state.set_vgpr(int(instr.dst.value), res)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        interp = ScalarInterpreter()
+        state = ScalarState()
+        state.set_vgpr(1, f32_to_bits(55.8))
+        state.set_sgpr(2, f32_to_bits(-12.4))
+
+        instr1 = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
+        interp.step(instr1, state)
+        self.assertEqual(state.get_vgpr(0), 55)
+
+        instr2 = VCvtI32F32Instruction(dst=VGPR(3), src=SGPR(2))
+        interp.step(instr2, state)
+        self.assertEqual(state.get_vgpr(3), (-12) & MASK_32)
+
+    def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
+        interp = ScalarInterpreter()
+        test_values = [
+            f32_to_bits(0.0),
+            f32_to_bits(-0.0),
+            f32_to_bits(3.14159),
+            f32_to_bits(-3.14159),
+            f32_to_bits(1e10),
+            0x7FC0_0000,
+        ]
+        for idx, bits in enumerate(test_values):
+            state = ScalarState()
+            state.set_vgpr(1, bits)
+            instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
+            interp.step(instr, state)
+            expected = state.get_vgpr(0)
+            translated = run_translator_cvt_i32_f32(bits, name=f"ps_interp_{idx}")
+            self.assertEqual(translated, expected)
