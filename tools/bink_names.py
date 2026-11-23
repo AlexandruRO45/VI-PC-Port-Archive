@@ -391,7 +391,8 @@ def main(argv=None):
     try:
         names = read_mount_lists(a.mount)
     except OSError as error:
-        print(f"bink_names: error: {error.filename or a.mount}: {error.strerror or error}", file=sys.stderr)
+        paths = f"{error.filename} -> {error.filename2}" if error.filename and error.filename2 else f"{error.filename or a.mount}"
+        print(f"bink_names: error: {paths}: {error.strerror or error}", file=sys.stderr)
         return 1
     except ValueError as error:
         print(f"bink_names: error: {error}", file=sys.stderr)

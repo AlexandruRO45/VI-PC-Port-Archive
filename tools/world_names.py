@@ -672,7 +672,9 @@ def main(argv=None) -> int:
         return args.func(args)
     except OSError as exc:
         if exc.filename:
-            print(f"ERROR: {exc.filename}: {exc.strerror or exc}", file=sys.stderr)
+            # os.replace and os.rename carry both paths: the temp file is filename, the --out path filename2.
+            paths = f"{exc.filename} -> {exc.filename2}" if exc.filename2 else f"{exc.filename}"
+            print(f"ERROR: {paths}: {exc.strerror or exc}", file=sys.stderr)
         else:
             print(f"ERROR: {exc.strerror or exc}", file=sys.stderr)
         return 1

@@ -259,7 +259,8 @@ def main(argv=None) -> int:
     try:
         stats = tag_folder(a.opus, names, dialogue, langs, a.dry_run, ambiguous)
     except OSError as e:
-        print(f"opus_tags: error: {e.filename or a.opus}: {e.strerror or e}", file=sys.stderr)
+        paths = f"{e.filename} -> {e.filename2}" if e.filename and e.filename2 else f"{e.filename or a.opus}"
+        print(f"opus_tags: error: {paths}: {e.strerror or e}", file=sys.stderr)
         return 2
     for k, v in stats.items():
         print(f"{k:32} {v:,}")

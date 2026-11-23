@@ -50,6 +50,24 @@ class ManifestEnumerationTest(unittest.TestCase):
             with open(output, "rb") as f:
                 self.assertEqual(f.read(), b"existing dictionary")
 
+    def test_a_failed_replace_names_both_the_temp_file_and_the_out_path(self):
+        # os.replace puts the temp file in filename and the --out path in filename2; the message must keep both.
+        with tempfile.TemporaryDirectory() as directory:
+            blocked = os.path.join(directory, "report_out")
+            os.mkdir(blocked)
+            with open(os.path.join(blocked, "keep.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("x")
+            names = os.path.join(directory, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("synthetic_model\n")
+            manifests = os.path.join(directory, "manifests")
+            os.mkdir(manifests)
+            with contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--manifest", manifests, "--names", names, "--out", blocked]), 1)
+            message = err.getvalue()
+            self.assertIn(blocked, message)
+            self.assertIn(" -> ", message)
+
 
 class HashTest(unittest.TestCase):
     def test_joaat_case_sensitive_field_names(self):
