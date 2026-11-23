@@ -805,5 +805,44 @@ class TestTruncF16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[0], f16_to_bits(-3.0))
 
 
+# ------------------------------------------------------------------------------
+# v_trunc_f16 SIMD & IEEE 754
+# ------------------------------------------------------------------------------
+
+class SIMDWaveTruncF16:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VTruncF16Instruction):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.vgprs[insn.src0.index][lane] & MASK16
+                res = ref_trunc_f16(s0)
+                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
+
+
+class TestTruncF16SIMDAndIEEE(unittest.TestCase):
+    def test_simd_divergence(self):
+        wave = SIMDWaveTruncF16(wave_size=32)
+        for lane in range(32):
+            sign = -1.0 if lane % 2 else 1.0
+            wave.vgprs[1][lane] = f16_to_bits(sign * (float(lane) + 0.9))
+            wave.vgprs[0][lane] = 0
+
+        insn = VTruncF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
+        wave.step(insn)
+
+        for lane in range(32):
+            sign = -1.0 if lane % 2 else 1.0
+            expected = f16_to_bits(sign * float(lane))
+            self.assertEqual(wave.vgprs[0][lane], expected)
+
+    def test_nans_pass_through(self):
+        self.assertEqual(ref_trunc_f16(QNAN16), QNAN16)
+        self.assertEqual(ref_trunc_f16(SNAN16), SNAN16)
+
+
 if __name__ == '__main__':
     unittest.main()
