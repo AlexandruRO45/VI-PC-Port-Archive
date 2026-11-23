@@ -10,6 +10,12 @@
 //     top half of the bottom-right one, so the X, Y and Z counts each reach the slot index. The rest stays blue.
 //     Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO fails at execution (ReplayResult::invalid_draw).
+//   - A PS reading the f16 halves of some of the layout's params at its locations links; one reading them elsewhere
+//     is refused.
+//   - Where a --mesh-compute PSO can't be run as built, the tier is NOT_SUPPORTED and the PSO is refused: a device
+//     with 144 bytes of push constants (enough for every other pipeline, not for the 152-byte block), and one whose
+//     subgroup sizes can't be required, where the 32-wide mesh shader would only get its size as the default. A
+//     mesh shader translated with --wave64-emulate, exact on any size, is still created there.
 // Shaders: test/glsl/ms_draw_compute.comp, ps_draw.frag. No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -17,6 +23,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "../src/subgroup_size.h"
 
 #include <array>
 #include <cstring>
@@ -90,38 +97,73 @@ int main() {
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
 
-    const auto ms_program = fssm_program({0x4d530001, 0xbf810000});
-    const auto ms_plain_program = fssm_program({0x4d530002, 0xbf810000});
-    const auto ps_program = fssm_program({0x50530001, 0xbf810000});
+    // One FSSM program per index entry; the entries share the two compiled modules.
+    const auto program = [](std::uint32_t tag) { return fssm_program({tag, 0xbf810000}); };
+    const auto ms_program = program(0x4d530001), ms_plain_program = program(0x4d530002),
+               ms_halves_program = program(0x4d530003), ms_emulated_program = program(0x4d530004),
+               ps_program = program(0x50530001), ps_half_program = program(0x50530002),
+               ps_half_elsewhere_program = program(0x50530003);
     const auto ms_container = shader_container(ms_program), ms_plain_container = shader_container(ms_plain_program),
-               ps_container = shader_container(ps_program);
+               ms_halves_container = shader_container(ms_halves_program),
+               ms_emulated_container = shader_container(ms_emulated_program),
+               ps_container = shader_container(ps_program), ps_half_container = shader_container(ps_half_program),
+               ps_half_elsewhere_container = shader_container(ps_half_elsewhere_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_compute_test";
     std::filesystem::create_directories(library);
     const auto overwrite = std::filesystem::copy_options::overwrite_existing;
-    std::filesystem::copy_file(LEONIDA_TEST_MS_COMPUTE_SPV, library / "ms_draw_compute.spv", overwrite);
-    std::filesystem::copy_file(LEONIDA_TEST_MS_COMPUTE_SPV, library / "ms_plain.spv", overwrite);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", overwrite);
+    for (const char* name : {"ms_draw_compute", "ms_plain", "ms_halves", "ms_emulated"})
+        std::filesystem::copy_file(LEONIDA_TEST_MS_COMPUTE_SPV, library / (std::string(name) + ".spv"), overwrite);
+    for (const char* name : {"ps_draw", "ps_half", "ps_half_elsewhere"})
+        std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / (std::string(name) + ".spv"), overwrite);
     {
         // ms_draw_compute's layout is rdna2spirv.mesh_compute_layout(4, 2, 0, 0, [0]). ms_plain has the same module
-        // but no layout, as a mesh shader translated without --mesh-compute has.
+        // but no layout, as a mesh shader translated without --mesh-compute has. ms_halves's layout (only created,
+        // never drawn) exports the halves of params 0 and 1, as --f16-interp-fallback does; ps_half reads param 0's
+        // at the same locations, ps_half_elsewhere at others. ms_emulated is ms_draw_compute translated with
+        // --wave64-emulate as far as the index says.
+        const std::string layout =
+            "\"mesh_compute\": {\"slot_bytes\": 176, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 144, "
+            "\"primitive_stride\": 16, \"max_vertices\": 4, \"max_primitives\": 2, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}";
+        const std::string halves_layout =
+            "\"mesh_compute\": {\"slot_bytes\": 240, \"vertices\": 16, \"vertex_stride\": 48, \"primitives\": 208, "
+            "\"primitive_stride\": 16, \"max_vertices\": 4, \"max_primitives\": 2, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16, \"1\": 32}, "
+            "\"f16_halves\": {\"0\": [28, 29], \"1\": [26, 27]}, \"push_constant_bytes\": 152, "
+            "\"address_dwords\": [36, 37]}";
+        const auto ms = [&](const char* name, const std::vector<std::uint8_t>& p, const std::string& extra) {
+            return "\"" + std::string(name) + "\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + leonida::sha256_hex(p) +
+                   "\", \"bindings\": [], \"push_constant_bytes\": 152, \"local_size\": [32, 1, 1], "
+                   "\"max_vertices\": 4, \"max_primitives\": 2" + extra + "}";
+        };
+        const auto ps = [&](const char* name, const std::vector<std::uint8_t>& p, const std::string& extra) {
+            return "\"" + std::string(name) + "\": {\"stage\": \"ps\", \"fssm_sha256\": \"" + leonida::sha256_hex(p) +
+                   "\", \"bindings\": [], \"push_constant_bytes\": 144, \"inputs\": [0], \"outputs\": [0]" + extra +
+                   "}";
+        };
         std::ofstream index(library / "index.json", std::ios::binary);
-        index << "{\"ms_draw_compute\": {\"stage\": \"ms\", \"fssm_sha256\": \"" << leonida::sha256_hex(ms_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 152, \"local_size\": [32, 1, 1], "
-                 "\"max_vertices\": 4, \"max_primitives\": 2, \"mesh_compute\": {\"slot_bytes\": 176, "
-                 "\"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 144, \"primitive_stride\": 16, "
-                 "\"max_vertices\": 4, \"max_primitives\": 2, \"clip_count\": 0, \"clip_offset\": 16, "
-                 "\"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, \"push_constant_bytes\": 152, "
-                 "\"address_dwords\": [36, 37]}},\n"
-                 " \"ms_plain\": {\"stage\": \"ms\", \"fssm_sha256\": \"" << leonida::sha256_hex(ms_plain_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [32, 1, 1], "
-                 "\"max_vertices\": 4, \"max_primitives\": 2},\n"
-                 " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"inputs\": [0], \"outputs\": [0]}}";
+        index << "{" << ms("ms_draw_compute", ms_program, ", " + layout) << ",\n"
+              << ms("ms_plain", ms_plain_program, "") << ",\n"
+              << ms("ms_halves", ms_halves_program, ", " + halves_layout) << ",\n"
+              << ms("ms_emulated", ms_emulated_program,
+                    ", \"wave64\": true, \"subgroup_size\": null, \"wave64_exchange\": \"workgroup\", " + layout)
+              << ",\n"
+              << ps("ps_draw", ps_program, "") << ",\n"
+              << ps("ps_half", ps_half_program, ", \"f16_halves\": {\"0\": [28, 29]}") << ",\n"
+              << ps("ps_half_elsewhere", ps_half_elsewhere_program, ", \"f16_halves\": {\"0\": [20, 21]}") << "}";
     }
+    const D3D12_SHADER_BYTECODE ms{ms_container.data(), ms_container.size()};
+    const D3D12_SHADER_BYTECODE ms_plain{ms_plain_container.data(), ms_plain_container.size()};
+    const D3D12_SHADER_BYTECODE ms_halves{ms_halves_container.data(), ms_halves_container.size()};
+    const D3D12_SHADER_BYTECODE ms_emulated{ms_emulated_container.data(), ms_emulated_container.size()};
+    const D3D12_SHADER_BYTECODE ps{ps_container.data(), ps_container.size()};
+    const D3D12_SHADER_BYTECODE ps_half{ps_half_container.data(), ps_half_container.size()};
+    const D3D12_SHADER_BYTECODE ps_half_elsewhere{ps_half_elsewhere_container.data(),
+                                                  ps_half_elsewhere_container.size()};
 
-    constexpr UINT size = 64;
-    std::vector<std::uint8_t> pixels(size * 256);
-    {
+    // The layer's device, always without VK_EXT_mesh_shader, with the GPU's subgroup sizes unless changed.
+    const auto device_info = [&] {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
@@ -130,17 +172,22 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        info.subgroup = d.subgroup;
         info.shader_dir = library.string();
         info.mesh_shader = false;  // as on a GPU without VK_EXT_mesh_shader, whatever this one has
+        return info;
+    };
+    const auto make_device = [&](const rt::d3d12::VulkanDeviceInfo& info, Ref<ID3D12Device>& device) {
         ID3D12Device* inner = nullptr;
-        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
-        Ref<ID3D12Device> device;
-        EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner)))) return false;
+        if (FAILED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
+                                                     reinterpret_cast<void**>(&device.p))))
+            return false;
         rt::d3d12::set_device_outer(inner, device.p);
-        EXPECT(mesh_tier(device.p) == D3D12_MESH_SHADER_TIER_1);
-
-        // [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint), as in d3d12_mesh_test.
+        return true;
+    };
+    // [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint), as in d3d12_mesh_test.
+    const auto make_root = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root) {
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
@@ -150,16 +197,72 @@ int main() {
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
         root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         const auto blob = serialize_root_signature(root_desc);
-        EXPECT(!blob.empty());
-        Ref<ID3D12RootSignature> root;
-        EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p))));
+        return !blob.empty() &&
+               SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)));
+    };
 
-        const D3D12_SHADER_BYTECODE ms{ms_container.data(), ms_container.size()};
-        const D3D12_SHADER_BYTECODE ms_plain{ms_plain_container.data(), ms_plain_container.size()};
-        const D3D12_SHADER_BYTECODE ps{ps_container.data(), ps_container.size()};
-        Ref<ID3D12PipelineState> mesh_pso, refused;
+    // Where a --mesh-compute PSO can't run as built: no tier, and the PSO refused.
+    {
+        // 144 bytes of push constants: every other pipeline fits, the 152-byte block doesn't.
+        auto info = device_info();
+        info.max_push_constants_size = 144;
+        Ref<ID3D12Device> device;
+        Ref<ID3D12RootSignature> root;
+        Ref<ID3D12PipelineState> refused;
+        EXPECT(make_device(info, device) && make_root(device.p, root));
+        EXPECT(mesh_tier(device.p) == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED);
+        EXPECT(create(device.p, root.p, ms, ps, refused) == E_NOTIMPL && !refused.p);
+        root.reset();
+        EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+    }
+    {
+        // Subgroup sizes 32 to 64 that can't be required, 32 by default: the 32-wide mesh shader would only get its
+        // size by default. The emulated one is exact on any size.
+        auto info = device_info();
+        info.subgroup = {};
+        info.subgroup.min_size = 32;
+        info.subgroup.max_size = 64;
+        info.subgroup.default_size = 32;
+        info.subgroup.max_compute_workgroup_subgroups = 32;
+        Ref<ID3D12Device> device;
+        Ref<ID3D12RootSignature> root;
+        Ref<ID3D12PipelineState> refused, emulated;
+        EXPECT(make_device(info, device) && make_root(device.p, root));
+        EXPECT(mesh_tier(device.p) == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED);
+        EXPECT(create(device.p, root.p, ms, ps, refused) == E_NOTIMPL && !refused.p);
+        EXPECT(SUCCEEDED(create(device.p, root.p, ms_emulated, ps, emulated)));
+        emulated.reset();
+        root.reset();
+        EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+    }
+    // The GPU's own sizes must guarantee 32 for compute (required, or its only size) for the rest.
+    {
+        leonida::ShaderEntry cs;
+        cs.stage = "cs";
+        cs.local_size = {32, 1, 1};
+        const auto outcome = leonida::decide_subgroup_size(cs, d.subgroup).outcome;
+        if (outcome != leonida::SubgroupOutcome::required && outcome != leonida::SubgroupOutcome::device_fixed) {
+            std::filesystem::remove_all(library);
+            std::printf("SKIP: this GPU can't require 32-wide compute subgroups; only the refusals were checked\n");
+            return 77;
+        }
+    }
+
+    constexpr UINT size = 64;
+    std::vector<std::uint8_t> pixels(size * 256);
+    {
+        Ref<ID3D12Device> device;
+        Ref<ID3D12RootSignature> root;
+        EXPECT(make_device(device_info(), device) && make_root(device.p, root));
+        EXPECT(mesh_tier(device.p) == D3D12_MESH_SHADER_TIER_1);
+
+        Ref<ID3D12PipelineState> mesh_pso, refused, halves_pso;
         EXPECT(SUCCEEDED(create(device.p, root.p, ms, ps, mesh_pso)));
         EXPECT(create(device.p, root.p, ms_plain, ps, refused) == E_NOTIMPL && !refused.p);
+        // f16 halves: param 0's where the layout exports them (param 1's go unread) links; elsewhere is refused.
+        EXPECT(SUCCEEDED(create(device.p, root.p, ms_halves, ps_half, halves_pso)));
+        EXPECT(create(device.p, root.p, ms_halves, ps_half_elsewhere, refused) == E_NOTIMPL && !refused.p);
+        halves_pso.reset();
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -301,7 +404,10 @@ int main() {
     }
     std::printf("mesh compute: without VK_EXT_mesh_shader, mesh tier 1 through --mesh-compute; a stream MS + PS PSO "
                 "drew DispatchMesh over X, Y and Z (each slot a workgroup's quad) and matched all %u pixels; a mesh "
-                "shader without a mesh_compute layout refused; a vertex draw with the mesh PSO fails at execution\n",
+                "shader without a mesh_compute layout refused; f16 halves read where exported linked, elsewhere "
+                "refused; no tier and the PSO refused at 144 push-constant bytes and with unguaranteed subgroup "
+                "sizes (an emulated mesh shader still created); a vertex draw with the mesh PSO fails at "
+                "execution\n",
                 size * size);
     return 0;
 }

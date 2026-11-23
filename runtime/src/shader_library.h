@@ -777,6 +777,14 @@ public:
     std::size_t fspx_size() const { return fspx_count_; }
     // Mesh-shader entries translated with --mesh-compute (a "mesh_compute" layout).
     std::size_t mesh_compute_count() const { return mesh_compute_count_; }
+    // Whether `ok` holds for every such entry (true when there are none).
+    template <typename Predicate>
+    bool all_mesh_compute(Predicate&& ok) const {
+        for (const auto& [key, list] : entries_)
+            for (const ShaderEntry& e : list)
+                if (e.stage == "ms" && e.mesh_compute && !ok(e)) return false;
+        return true;
+    }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.

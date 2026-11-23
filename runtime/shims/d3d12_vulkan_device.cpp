@@ -556,6 +556,9 @@ struct DeviceState {
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     bool mesh_properties_read = false;
     std::mutex mesh_properties_mutex;
+    // Whether the Direct queue's family has VK_QUEUE_COMPUTE_BIT, read on first use by a --mesh-compute mesh PSO.
+    bool direct_computes = false;
+    bool direct_computes_read = false;
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties2 image_format_properties2 = nullptr;
@@ -925,6 +928,40 @@ struct DeviceState {
         properties2(info.physical, &properties);
         mesh_properties.pNext = nullptr;
         return mesh_properties;
+    }
+
+    // Whether the Direct queue's family can record vkCmdDispatch, as a --mesh-compute mesh draw does on that queue
+    // (VUID-vkCmdDispatch-commandBuffer-02707). The device is picked for VK_QUEUE_GRAPHICS_BIT only, and a family
+    // may have graphics without compute. False when it cannot be asked.
+    bool direct_family_computes() {
+        std::lock_guard lock(mesh_properties_mutex);
+        if (direct_computes_read) return direct_computes;
+        direct_computes_read = true;
+        const auto queue_families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+            info.get_instance_proc ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties")
+                                   : nullptr);
+        if (!queue_families || !info.physical) return direct_computes;
+        std::uint32_t count = 0;
+        queue_families(info.physical, &count, nullptr);
+        std::vector<VkQueueFamilyProperties> queues(count);
+        queue_families(info.physical, &count, queues.data());
+        direct_computes = info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT);
+        return direct_computes;
+    }
+
+    // Whether a --mesh-compute mesh shader runs here at the subgroup size it was translated for, guaranteed: it is
+    // emulated (exact on any size), the compute stage requires the size, or that size is the device's only one. A
+    // size that is only the default, or cannot be had, could change the result of its subgroup operations.
+    bool mesh_compute_subgroup_guaranteed(const leonida::ShaderEntry& entry) const {
+        leonida::ShaderEntry as_compute;  // what decide_subgroup_size reads, for the compute stage
+        as_compute.stage = "cs";
+        as_compute.wave64 = entry.wave64;
+        as_compute.subgroup_size = entry.subgroup_size;
+        as_compute.wave64_exchange = entry.wave64_exchange;
+        as_compute.local_size = entry.local_size;
+        const leonida::SubgroupOutcome outcome = leonida::decide_subgroup_size(as_compute, info.subgroup).outcome;
+        return outcome == leonida::SubgroupOutcome::emulated || outcome == leonida::SubgroupOutcome::required ||
+               outcome == leonida::SubgroupOutcome::device_fixed;
     }
 
     // Integer sampled images need not support multisampling. Pick a supported count for the
@@ -3165,12 +3202,18 @@ public:
         // Without VK_EXT_mesh_shader a mesh PSO runs through --mesh-compute (rdna2spirv.py, #1053): the mesh shader
         // as a compute pipeline writing one output slot per workgroup, drawn by a vertex shader built here
         // (mesh_compute_vs.h). Its MS entry must be such a module (checked below), and both take 152 bytes of push
-        // constants.
+        // constants. The dispatch is recorded on the Direct queue, whose family must then have compute.
         const bool mesh_compute = mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT);
         if (mesh_compute && device_.info.max_push_constants_size &&
             device_.info.max_push_constants_size < sizeof(leonida::MeshComputeUserData)) {
             log_once("--mesh-compute PSOs need 152 bytes of push constants; maxPushConstantsSize",
                      int(device_.info.max_push_constants_size));
+            return E_NOTIMPL;
+        }
+        if (mesh_compute && !device_.direct_family_computes()) {
+            log_once("--mesh-compute PSOs dispatch on the Direct queue, whose family has no VK_QUEUE_COMPUTE_BIT; "
+                     "family",
+                     int(device_.info.queue_family));
             return E_NOTIMPL;
         }
         if (!device_.arena.mapped) {
@@ -3337,9 +3380,9 @@ public:
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
         // --mesh-compute: the MS module becomes the compute pipeline (create_mesh_compute, below), and stages[0] the
-        // vertex shader that draws its slots. That shader exports a param's decoded halves where the layout says, so
-        // a PS reading halves must read them there: pairing them per pipeline, as tools/mesh_compute_vs.py's
-        // pair_f16_halves does, is not built yet.
+        // vertex shader that draws its slots. That shader exports each param's decoded halves where the layout says,
+        // so a PS reading halves must read each of them there (a subset is fine: the rest go unread). Moving them per
+        // pipeline, as tools/mesh_compute_vs.py's pair_f16_halves does, is not built yet.
         std::vector<std::uint32_t> mesh_compute_words;
         if (mesh_compute) {
             const leonida::ShaderEntry& ms_entry = *vs_stage.entry;
@@ -3349,12 +3392,26 @@ public:
                              ms_entry.name.c_str());
                 return E_NOTIMPL;
             }
-            if (ps_stage.entry && ps_stage.entry->f16_halves != ms_entry.mesh_compute->f16_halves &&
-                !ps_stage.entry->f16_halves.empty()) {
-                std::fprintf(stderr, "[rt] d3d12: %s reads f16 halves at other locations than %s's mesh_compute "
-                                     "layout exports them (per-pipeline pairing not built yet)\n",
-                             ps_stage.entry->name.c_str(), ms_entry.name.c_str());
+            // Its subgroup operations are exact only at the size it was translated for: refused where the compute
+            // stage cannot be guaranteed that size (the tier is hidden there too). --wave64-emulate makes a wave64
+            // mesh shader exact on any size.
+            if (!device_.mesh_compute_subgroup_guaranteed(ms_entry)) {
+                std::fprintf(stderr, "[rt] d3d12: %s: this device cannot guarantee the %u-wide subgroups it was "
+                                     "translated for in a compute pipeline (translate it with --wave64-emulate)\n",
+                             ms_entry.name.c_str(),
+                             ms_entry.subgroup_size ? ms_entry.subgroup_size : (ms_entry.wave64 ? 64u : 32u));
                 return E_NOTIMPL;
+            }
+            if (ps_stage.entry) {
+                const auto& exported = ms_entry.mesh_compute->f16_halves;
+                for (const auto& [param, halves] : ps_stage.entry->f16_halves) {
+                    const auto it = exported.find(param);
+                    if (it != exported.end() && it->second == halves) continue;
+                    std::fprintf(stderr, "[rt] d3d12: %s reads param %u's f16 halves where %s's mesh_compute layout "
+                                         "does not export them (per-pipeline pairing not built yet)\n",
+                                 ps_stage.entry->name.c_str(), param, ms_entry.name.c_str());
+                    return E_NOTIMPL;
+                }
             }
             std::string vs_error;
             std::vector<std::uint32_t> vs_words = leonida::mesh_compute_vs(*ms_entry.mesh_compute, &vs_error);
@@ -3702,8 +3759,8 @@ public:
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
         const VkPushConstantRange push{graphics_.push_stages, 0,
-                                       mesh_compute ? sizeof(leonida::MeshComputeUserData)
-                                                    : sizeof(leonida::ShaderUserData)};
+                                       static_cast<std::uint32_t>(mesh_compute ? sizeof(leonida::MeshComputeUserData)
+                                                                               : sizeof(leonida::ShaderUserData))};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -7318,13 +7375,19 @@ public:
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(data);
             *opts = {};
             // Tier 1 is mesh PSOs and DispatchMesh, on VK_EXT_mesh_shader, or without it where the translated mesh
-            // shaders are --mesh-compute ones and the device can run them (buffer device addresses, 152 bytes of push
-            // constants). Amplification shaders are part of the tier but refused at PSO creation (the game has none);
-            // OPTIONS9's mesh statistics and full-range render target array index stay FALSE.
+            // shaders are --mesh-compute ones and the device can run them all as create_graphics does: buffer device
+            // addresses, 152 bytes of push constants, compute on the Direct queue's family, and each one's subgroup
+            // size guaranteed. Amplification shaders are part of the tier but refused at PSO creation (the game has
+            // none); OPTIONS9's mesh statistics and full-range render target array index stay FALSE.
             const leonida::ShaderLibrary* library = state_.library();
             const std::uint32_t push_limit = state_.info.max_push_constants_size;
-            const bool mesh_compute = library && library->mesh_compute_count() && state_.info.buffer_device_address &&
-                                      (!push_limit || push_limit >= sizeof(leonida::MeshComputeUserData));
+            const bool mesh_compute =
+                !state_.info.mesh_shader && library && library->mesh_compute_count() &&
+                state_.info.buffer_device_address &&
+                (!push_limit || push_limit >= sizeof(leonida::MeshComputeUserData)) &&
+                state_.direct_family_computes() &&
+                library->all_mesh_compute(
+                    [this](const leonida::ShaderEntry& e) { return state_.mesh_compute_subgroup_guaranteed(e); });
             opts->MeshShaderTier = state_.info.mesh_shader || mesh_compute ? D3D12_MESH_SHADER_TIER_1
                                                                            : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;

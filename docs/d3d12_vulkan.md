@@ -2103,8 +2103,16 @@ The trace will enumerate them.
     graphics pipeline gets, in place of the mesh stage, the vertex shader `runtime/src/mesh_compute_vs.h` builds
     from the layout (the module `tools/mesh_compute_vs.py` writes, instruction for instruction): a vertex pipeline
     with input assembly and no vertex input. Both layouts take the 152-byte block, the output address in dwords
-    36..37, so a device under 152 bytes of push constants refuses such PSOs. A PS that reads `--f16-interp-fallback`
-    halves at other locations than the layout exports them is `E_NOTIMPL` (per-pipeline pairing is not built).
+    36..37.
+  - **Refused with `E_NOTIMPL` and a log**, and the tier hidden where any `--mesh-compute` mesh shader would be:
+    - a device under 152 bytes of push constants;
+    - a Direct queue family without `VK_QUEUE_COMPUTE_BIT` (the dispatch is recorded on that queue;
+      VUID-vkCmdDispatch-commandBuffer-02707);
+    - a mesh shader whose subgroup size the compute stage can't be guaranteed: it must be emulated
+      (`--wave64-emulate`), required by the stage, or the device's only size. A size that is only the default could
+      change its subgroup operations' results;
+    - a PS that reads a param's `--f16-interp-fallback` halves where the layout doesn't export them (reading some of
+      the exported params' halves is fine). Per-pipeline pairing is not built.
   - **`DispatchMesh`:** groups × `slot_bytes` of the queue's scratch (`vulkan_scratch.h`, device-local, with a
     device address, alive until the submission completes), then `vkCmdDispatch` with the counts, a compute-write →
     vertex-read barrier, and in the draw's rendering scope a triangle-list `vkCmdDraw(groups × max_primitives × 3)`.
@@ -2113,7 +2121,9 @@ The trace will enumerate them.
     is too); its signatures stay `E_NOTIMPL` without the extension.
   - **Test:** `d3d12_mesh_compute_test` makes the layer's device without the extension on any GPU and draws
     `test/glsl/ms_draw_compute.comp`, `ms_draw.mesh` written to the `--mesh-compute` contract: tier 1, a stream PSO,
-    `DispatchMesh` over X, Y and Z, every pixel checked; a mesh shader without a layout is refused.
+    `DispatchMesh` over X, Y and Z, every pixel checked; a mesh shader without a layout is refused, f16 halves read
+    where exported link and elsewhere are refused, and devices with 144 push-constant bytes or unguaranteed subgroup
+    sizes hide the tier and refuse the PSO (an emulated mesh shader is still created).
 - **Translated mesh shaders through the layer:** `d3d12_m5_mesh_test` (section 6, M5) draws `ms_m5.asm`, an NGG
   wave64 mesh shader of 128 threads written with the corpus's idioms (group index from `v5`, thread id from `s3` and
   `mbcnt`, `GS_ALLOC_REQ`, per-thread exports), translated by `rdna2spirv.py`; the mesh stage asks for subgroup size 64 (required on the RX 9070 XT), and the test
