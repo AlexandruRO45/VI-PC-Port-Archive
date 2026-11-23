@@ -2207,6 +2207,29 @@ reads per vertex. Not shown: the 61 individually (a 12-shader subset of the 190 
 the RTX 4080 SUPER; draws of these shaders take about 20 s each). Only 9 of the 480 read raw
 barycentrics and need the geometry shader; all 9 agree on both GPUs.
 
+### TEST-71 on RDNA1 (Navi 12, gfx1011)
+
+*Measured on eight AMD Radeon Pro V540 cards (Navi 12, PCI 1002:7360; `tools/hw_oracle` reports gfx1011) on bare
+metal, RADV Mesa 25.2.8-0ubuntu0.24.04.4, Ubuntu 24.04.4, kernel 7.0.0-31-generic, Vulkan device 1.4.318,
+subgroup 32..64; tools: llvm-mc 21.1.8, SPIRV-Tools 2026.1, GCC 13.3.0.*
+
+One card was pinned per process with `DRI_PRIME=pci-<BDF>!`, disjoint seeds were used, and logs were kept per card.
+Counts and pass/fail only; no game files were used.
+
+- Single card at `c0ac5fd6`, seed 1, `--programs 200` with the default `--wave both`: 400 programs per family, each
+  run natively and emulated, so `f16` 400/400 both, `mem` 400/400 both, `lds` 400/400 both.
+- Eight-card farm at `f85582e2`, seeds 4-11, `--programs 200`: **9,600 generated cases, 19,200 executions across the
+  native and emulated runs**. That is 3,200 generated cases per family, and each family and mode runs 3,200
+  executions split equally between wave32 and wave64; the emulated run keeps native wave width, so a wave32 case is
+  emulated at wave32. `f16` 3199/3200 native and 3199/3200 emulated, `mem` 3200/3200 native and emulated, `lds`
+  3200/3200 native and emulated; 0 harness errors. The single `f16` miss is a signed-zero multiply of the #1203
+  class, whose V540 cause stays unresolved in the public reports; the later sweep at `bb2e1842` reports a different
+  emulated `mem` count (3,195/3,200).
+- `vk_harness` heads that use `VK_KHR_pipeline_binary` were **reported** to need Khronos Vulkan-Headers 1.4.335, since
+  Ubuntu 24.04's 1.3.275 headers do not compile those programs. The pipeline-binary declarations are already present
+  in Vulkan-Headers 1.4.304, and TEST-71 itself uses the separate `vk_compute_test` target; the minimum headers for a
+  complete build were not verified here.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
