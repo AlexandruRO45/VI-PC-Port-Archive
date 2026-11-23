@@ -243,6 +243,7 @@ class FindHashLookupTest(unittest.TestCase):
             tracemalloc.start()
         try:
             tracemalloc.reset_peak()
+            baseline, _ = tracemalloc.get_traced_memory()
             report = fhl.rank(data, [("sample", 0x12345678)])
             _, peak = tracemalloc.get_traced_memory()
         finally:
@@ -250,7 +251,7 @@ class FindHashLookupTest(unittest.TestCase):
                 tracemalloc.stop()
         self.assertEqual(report["candidates"], [])
         self.assertEqual(report["hashes"][0]["occurrences"], 0)
-        self.assertLess(peak, size // 2)
+        self.assertLess(peak - baseline, size // 2)
 
 
 if __name__ == "__main__":
