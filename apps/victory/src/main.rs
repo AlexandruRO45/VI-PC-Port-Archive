@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -69,6 +70,7 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    #[cfg(windows)]
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -146,6 +148,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
