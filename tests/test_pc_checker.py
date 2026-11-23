@@ -153,6 +153,109 @@ class Api(unittest.TestCase):
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
 
+    def test_rebar_advisory_for_8gb_gpu_when_disabled(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, rebar=False)
+        self.assertIn("Resizable BAR is disabled", report.rebar_note)
+        self.assertIn("Resizable BAR is disabled", report.as_text())
+
+    def test_no_rebar_advisory_when_enabled(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, rebar=True)
+        self.assertEqual(report.rebar_note, "")
+        self.assertNotIn("Resizable BAR is disabled", report.as_text())
+
+    def test_no_rebar_advisory_for_16gb_gpu(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 4080 (16 GB VRAM)", 32, rebar=False)
+        self.assertEqual(report.rebar_note, "")
+
+    def test_detect_rebar_from_vulkan(self):
+        from unittest import mock
+        mock_vk = mock.MagicMock()
+        mock_vk.query.return_value = {
+            "device": "NVIDIA GeForce RTX 5060",
+            "rebar_active": True,
+            "rebar_heap_mb": 8192,
+        }
+        with mock.patch.dict(sys.modules, {"vk_subgroup_info": mock_vk}), \
+             mock.patch("shutil.which") as mock_which:
+            active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 5060")
+            self.assertTrue(active)
+            self.assertEqual(size, 8192)
+            mock_which.assert_not_called()
+
+    def test_detect_rebar_vulkan_device_mismatch(self):
+        from unittest import mock
+        mock_vk = mock.MagicMock()
+        mock_vk.query.return_value = {
+            "device": "AMD Radeon 660M",
+            "rebar_active": True,
+            "rebar_heap_mb": 8075,
+        }
+        with mock.patch.dict(sys.modules, {"vk_subgroup_info": mock_vk}), \
+             mock.patch("shutil.which", return_value=None):
+            active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 3050 Laptop")
+            self.assertIsNone(active)
+            self.assertIsNone(size)
+
+    def test_detect_rebar_from_nvidia_smi(self):
+        from unittest import mock
+        smi_out_on = (
+            "GPU 00000000:01:00.0\n"
+            "    Product Name                          : NVIDIA GeForce RTX 5060\n"
+            "    BAR1 Memory Usage\n"
+            "        Total                             : 8192 MiB\n"
+        )
+        mock_vk = mock.MagicMock()
+        mock_vk.query.side_effect = RuntimeError("Vulkan unavailable")
+        with mock.patch.dict(sys.modules, {"vk_subgroup_info": mock_vk}), \
+             mock.patch("shutil.which", return_value="nvidia-smi"), \
+             mock.patch.object(pc, "_run", return_value=smi_out_on):
+            active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 5060")
+            self.assertTrue(active)
+            self.assertEqual(size, 8192)
+
+        smi_out_off = (
+            "GPU 00000000:01:00.0\n"
+            "    Product Name                          : NVIDIA GeForce RTX 5060\n"
+            "    BAR1 Memory Usage\n"
+            "        Total                             : 256 MiB\n"
+        )
+        mock_vk = mock.MagicMock()
+        mock_vk.query.side_effect = RuntimeError("Vulkan unavailable")
+        with mock.patch.dict(sys.modules, {"vk_subgroup_info": mock_vk}), \
+             mock.patch("shutil.which", return_value="nvidia-smi"), \
+             mock.patch.object(pc, "_run", return_value=smi_out_off):
+            active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 5060")
+            self.assertFalse(active)
+            self.assertEqual(size, 256)
+
+    def test_detect_rebar_nvidia_smi_multi_gpu(self):
+        from unittest import mock
+        smi_multi = (
+            "GPU 00000000:01:00.0\n"
+            "    Product Name                          : NVIDIA GeForce RTX 4060\n"
+            "    BAR1 Memory Usage\n"
+            "        Total                             : 256 MiB\n\n"
+            "GPU 00000000:02:00.0\n"
+            "    Product Name                          : NVIDIA GeForce RTX 5060\n"
+            "    BAR1 Memory Usage\n"
+            "        Total                             : 8192 MiB\n"
+        )
+        mock_vk = mock.MagicMock()
+        mock_vk.query.side_effect = RuntimeError("Vulkan unavailable")
+        with mock.patch.dict(sys.modules, {"vk_subgroup_info": mock_vk}), \
+             mock.patch("shutil.which", return_value="nvidia-smi"), \
+             mock.patch.object(pc, "_run", return_value=smi_multi):
+            active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 5060")
+            self.assertTrue(active)
+            self.assertEqual(size, 8192)
+
+            active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 4060")
+            self.assertFalse(active)
+            self.assertEqual(size, 256)
+
 
 if __name__ == "__main__":
     unittest.main()

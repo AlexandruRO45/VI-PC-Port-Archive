@@ -388,11 +388,13 @@ def evaluate(profile_name: str, cpu: str, gpu: str, ram):
     return ("Looks good", p["subtitle"], rows)
 
 
-def result_as_text(profile_name, headline, sub, rows):
+def result_as_text(profile_name, headline, sub, rows, rebar_note=""):
     lines = [f"Leonida PC Checker - vs {profile_name}", headline, sub, ""]
     for label, st, ref, mine, est in rows:
         note = ", score estimated" if est else ""
         lines.append(f"{label}: {STATUS_TEXT[st]} (ref: {ref}; your PC: {mine or '?'}{note})")
+    if rebar_note:
+        lines += ["", rebar_note]
     lines += ["", f"{BOOT_NOTE[0]} ({BOOT_NOTE[1].rstrip('.')})."]
     return "\n".join(lines)
 
@@ -559,6 +561,63 @@ def detect_ram_gb():
     return max(4, min(128, round(gb)))
 
 
+def detect_rebar(target_gpu: str | None = None) -> tuple[bool | None, int | None]:
+    """Detect whether Resizable BAR is active and the aperture size in MiB.
+    Returns (rebar_active, bar1_mb)."""
+    try:
+        tools_dir = os.path.dirname(os.path.abspath(__file__))
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import vk_subgroup_info as vk_info
+        info = vk_info.query(memory=True)
+        device = info.get("device", "")
+        if target_gpu and device:
+            tg = target_gpu.lower()
+            dev = device.lower()
+            is_tg_nv = "nvidia" in tg or "geforce" in tg or "rtx" in tg or "gtx" in tg
+            is_dev_nv = "nvidia" in dev or "geforce" in dev or "rtx" in dev or "gtx" in dev
+            is_tg_amd = "amd" in tg or "radeon" in tg
+            is_dev_amd = "amd" in dev or "radeon" in dev
+            is_tg_intel = "intel" in tg or "arc" in tg
+            is_dev_intel = "intel" in dev or "arc" in dev
+            if (is_tg_nv and not is_dev_nv) or (is_tg_amd and not is_dev_amd) or (is_tg_intel and not is_dev_intel):
+                info = None
+        if info:
+            return info.get("rebar_active"), info.get("rebar_heap_mb")
+    except Exception:
+        pass
+
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        out = _run([smi, "-q", "-d", "MEMORY"])
+        if out:
+            sections = re.split(r"\n(?=GPU [0-9a-fA-F:]+)", out)
+            matched_section = None
+            tg_clean = clean_name(target_gpu).lower() if target_gpu else ""
+
+            if tg_clean:
+                if ("amd" in tg_clean or "radeon" in tg_clean or "intel" in tg_clean) and "nvidia" not in tg_clean:
+                    return None, None
+                for sec in sections:
+                    prod_m = re.search(r"Product Name\s*:\s*(.+)", sec)
+                    if prod_m:
+                        prod = clean_name(prod_m.group(1).strip()).lower()
+                        if prod in tg_clean or tg_clean in prod:
+                            matched_section = sec
+                            break
+
+            if matched_section is None and len(sections) == 1:
+                matched_section = sections[0]
+
+            if matched_section:
+                m = re.search(r"BAR1 Memory Usage\s+Total\s*:\s*(\d+)\s*MiB", matched_section, re.I)
+                if m:
+                    bar1_mb = int(m.group(1))
+                    return bar1_mb > 256, bar1_mb
+
+    return None, None
+
+
 def detect_all() -> dict:
     best = None
     for name, vram in detect_gpus():  # with several GPUs, use the strongest
@@ -567,11 +626,15 @@ def detect_all() -> dict:
         if best is None or sc > best[0]:
             best = (sc, name, vram)
     gpu = ""
+    vram_gb = None
     if best:
         gpu = clean_name(best[1])
-        if best[2]:
-            gpu += f" ({best[2]} GB VRAM)"
-    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb()}
+        vram_gb = best[2]
+        if vram_gb:
+            gpu += f" ({vram_gb} GB VRAM)"
+    rebar_active, bar1_mb = detect_rebar(target_gpu=gpu)
+    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb(),
+            "vram_gb": vram_gb, "rebar_active": rebar_active, "bar1_mb": bar1_mb}
 
 
 # ----------------------------------------------------------------------------
@@ -596,6 +659,7 @@ class Report:
     headline: str
     summary: str
     checks: list
+    rebar_note: str = ""
 
     @property
     def verdict(self) -> str:
@@ -611,7 +675,8 @@ class Report:
     def as_text(self) -> str:
         rows = [(c.component, c.status, c.reference, c.detected, c.estimated)
                 for c in self.checks]
-        return result_as_text(self.profile, self.headline, self.summary, rows)
+        return result_as_text(self.profile, self.headline, self.summary, rows,
+                              rebar_note=self.rebar_note)
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -632,15 +697,27 @@ class SpecChecker:
         if self.profile not in PROFILES:
             raise ValueError(f"unknown profile {self.profile!r}; use one of {list(PROFILES)}")
 
-    def check(self, cpu=None, gpu=None, ram=None) -> Report:
+    def check(self, cpu=None, gpu=None, ram=None, rebar=None) -> Report:
         """Anything left as None is detected from this PC."""
+        rebar_detected = None
         if cpu is None or gpu is None or ram is None:
             info = detect_all()
             cpu = info["cpu"] if cpu is None else cpu
             gpu = info["gpu"] if gpu is None else gpu
             ram = info["ram"] if ram is None else ram
+            rebar_detected = info.get("rebar_active")
+        if rebar is None:
+            rebar = rebar_detected
         headline, summary, rows = evaluate(self.profile, cpu, gpu, ram)
-        return Report(self.profile, headline, summary, [Check(*r) for r in rows])
+        rebar_note = ""
+        m = re.search(r"\((\d+)\s*GB\s*VRAM\)", gpu)
+        vram_gb = int(m.group(1)) if m else None
+        if vram_gb is not None and vram_gb <= 8 and rebar is False:
+            rebar_note = (
+                "Tip: Resizable BAR is disabled (BAR1 <= 256 MiB). Enabling Resizable BAR / SAM in UEFI "
+                "prevents severe PCIe latency penalties (16x-269x) on bindless descriptor lookups and texture streaming."
+            )
+        return Report(self.profile, headline, summary, [Check(*r) for r in rows], rebar_note=rebar_note)
 
     def warn_if_weak(self, report=None) -> bool:
         """Show a popup if the PC is weak. Returns False only if the player
@@ -931,7 +1008,12 @@ def _pick_profile(n: int) -> str:
 def run_check(args) -> int:
     """No window. Exit code: 0 good, 1 weak, 2 unknown, 3 player declined (--warn)."""
     checker = SpecChecker(_pick_profile(args.profile))
-    report = checker.check(args.cpu, args.gpu, args.ram)
+    rebar = None
+    if getattr(args, "rebar", "auto") == "on":
+        rebar = True
+    elif getattr(args, "rebar", "auto") == "off":
+        rebar = False
+    report = checker.check(args.cpu, args.gpu, args.ram, rebar=rebar)
     print(json.dumps(report.as_dict(), indent=2) if args.json else report.as_text())
     if args.warn and not checker.warn_if_weak(report):
         return 3
@@ -940,12 +1022,19 @@ def run_check(args) -> int:
 
 def run_cli(args):
     profile = _pick_profile(args.profile)
+    rebar = None
+    if getattr(args, "rebar", "auto") == "on":
+        rebar = True
+    elif getattr(args, "rebar", "auto") == "off":
+        rebar = False
+    checker = SpecChecker(profile)
+    report = checker.check(args.cpu, args.gpu, args.ram, rebar=rebar)
     info = detect_all() if not (args.cpu and args.gpu and args.ram) else {}
     cpu = args.cpu or info.get("cpu", "")
     gpu = args.gpu or info.get("gpu", "")
     ram = args.ram or info.get("ram")
     print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram or '?'} GB\n")
-    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram)))
+    print(report.as_text())
 
 
 def main():
@@ -956,6 +1045,8 @@ def main():
     ap.add_argument("--cpu", help="override the detected CPU")
     ap.add_argument("--gpu", help="override the detected GPU")
     ap.add_argument("--ram", type=int, help="override the detected RAM, in GB")
+    ap.add_argument("--rebar", choices=["auto", "on", "off"], default="auto",
+                    help="override Resizable BAR detection")
     ap.add_argument("--check", action="store_true",
                     help="no window; exit code 0 good, 1 weak, 2 unknown (3 with --warn if declined)")
     ap.add_argument("--json", action="store_true", help="with --check: print JSON")
