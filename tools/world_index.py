@@ -28,6 +28,7 @@ JSON summary. Place reports outside a directory input if you want to overwrite t
 import argparse
 import csv
 import json
+import math
 import mmap
 import os
 import re
@@ -146,10 +147,6 @@ def _value(b, base, member):
     if ty == 0x60:
         return b[p] if p < len(b) else None
     return None
-
-
-def _r4(values):
-    return [round(v, 4) for v in values] if values else None
 
 
 def _typed_member(schema, key, ty, width):
@@ -279,7 +276,7 @@ def parse_resource(b, collect=None):
             if level in LOD_NAMES:
                 lod[LOD_NAMES[level]] = lod.get(LOD_NAMES[level], 0) + 1
             dist = _value(b, o, em.get(FIELD["lodDist"]))
-            if isinstance(dist, float) and dist >= 0:
+            if isinstance(dist, float) and math.isfinite(dist) and dist >= 0:
                 lod_dists.append(dist)
             if collect is not None:
                 entity = {
@@ -319,8 +316,11 @@ def parse_resource(b, collect=None):
         "lod_dist_max": max(lod_dists) if lod_dists else None,
     })
     if positions:
-        row["position_min"] = _r4([min(p[i] for p in positions) for i in range(3)])
-        row["position_max"] = _r4([max(p[i] for p in positions) for i in range(3)])
+        # A NaN or infinity cannot be compared: leave that component out of the min/max and write null, so the
+        # report stays valid JSON for a strict reader (#5602).
+        for key, pick in (("position_min", min), ("position_max", max)):
+            row[key] = [round(pick(vals), 4) if vals else None
+                        for vals in ([p[i] for p in positions if math.isfinite(p[i])] for i in range(3))]
 
     for name, size, off in blocks:
         if name != MAPDATA or off is None or map_size == 0:
@@ -332,8 +332,8 @@ def parse_resource(b, collect=None):
         for key, field in (("extent_min", "streamingExtentsMin"), ("extent_max", "streamingExtentsMax"),
                            ("entities_min", "entitiesExtentsMin"), ("entities_max", "entitiesExtentsMax")):
             v = _value(b, off, mm.get(FIELD[field]))
-            if v:
-                row[key] = _r4(v)
+            if isinstance(v, list) and v:
+                row[key] = [round(x, 4) if math.isfinite(x) else None for x in v]
         row["map_flags"] = _value(b, off, mm.get(FIELD["flags_map"]))
         row["content_flags"] = _value(b, off, mm.get(FIELD["contentFlags"]))
         break
@@ -823,7 +823,8 @@ def _write_reports(a, rows, stats, agg):
     doc = {"summary": summary, "resources": rows}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=1, sort_keys=True)
+        # allow_nan=False: a non-finite value that reaches this point is an error line, never NaN/Infinity in the file.
+        json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
                 "root_objects", "entities", "entity_size", "archetypes", "map_name", "map_name64", "parent",

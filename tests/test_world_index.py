@@ -8,6 +8,7 @@ import errno
 import importlib.util
 import io
 import json
+import math
 import os
 import struct
 import sys
@@ -145,6 +146,28 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(row["position_min"], [1.5, 2.5, 3.5])
         self.assertEqual(row["lod"], {"LOD": 1})
         self.assertEqual(row["lod_dist_min"], 250.0)
+
+    def test_non_finite_placements_keep_the_report_valid_json(self):
+        # A NaN/infinite position, extent and LOD distance must not reach the report: null, never NaN/Infinity (#5602).
+        b = bytearray(make_resource())
+        struct.pack_into("<3f", b, 0x400 + 0x38, math.nan, 2.5, math.inf)
+        struct.pack_into("<f", b, 0x400 + 0x60, math.inf)
+        struct.pack_into("<3f", b, 0x500 + 0x70, math.nan, -20.0, -30.0)
+        src = os.path.join(self.dir, "nonfinite.bin")
+        out = os.path.join(self.dir, "nonfinite.json")
+        with open(src, "wb") as f:
+            f.write(bytes(b))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([src, "--out", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f, parse_constant=lambda c: self.fail("non-finite %s written to the report" % c))
+        row = doc["resources"][0]
+        self.assertEqual(row["position_min"], [None, 2.5, None])
+        self.assertEqual(row["position_max"], [None, 2.5, None])
+        self.assertEqual(row["extent_min"], [None, -20.0, -30.0])
+        self.assertEqual(row["extent_max"], [10.0, 20.0, 30.0])
+        self.assertIsNone(row["lod_dist_min"])
+        self.assertIsNone(row["lod_dist_max"])
 
     def test_non_map_resource_is_meta(self):
         row = WI.parse_resource(make_resource(map_file=False))
