@@ -523,5 +523,62 @@ class TestDsPermuteRegisterAliasing(unittest.TestCase):
         for i in range(32):
             self.assertEqual(res[i], i * 4)
 
+
+class TestDsPermuteCollisionsAndUnwritten(unittest.TestCase):
+    """Part 6: Collision resolution and unwritten lane semantics."""
+
+    def test_all_lanes_target_single_lane(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        # All 32 lanes target lane 7 (byte address 28)
+        engine.set_vgpr(1, [28] * 32)
+        engine.set_vgpr(2, [100 + i for i in range(32)])
+        engine.set_vgpr(0, [OLD_VDST] * 32)
+
+        engine.step_ds_permute(dst_idx=0, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(0)
+
+        # Lane 7 receives the highest active writer (lane 31)
+        self.assertEqual(res[7], 100 + 31)
+        # All other active destination lanes receive 0
+        for i in range(32):
+            if i != 7:
+                self.assertEqual(res[i], 0)
+
+    def test_two_to_one_pairing_collision(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        # Lanes 2i and 2i+1 both target lane i (for i in 0..15)
+        addrs = [(i // 2) * 4 for i in range(32)]
+        datas = [1000 + i for i in range(32)]
+        engine.set_vgpr(1, addrs)
+        engine.set_vgpr(2, datas)
+        engine.set_vgpr(0, [OLD_VDST] * 32)
+
+        engine.step_ds_permute(dst_idx=0, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(0)
+
+        # Lanes 0..15 receive the higher odd writer (2i + 1)
+        for i in range(16):
+            self.assertEqual(res[i], 1000 + 2 * i + 1)
+        # Lanes 16..31 are unwritten and receive 0
+        for i in range(16, 32):
+            self.assertEqual(res[i], 0)
+
+    def test_inactive_higher_source_does_not_win(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        # Lane 0 and lane 1 both target lane 0
+        addrs = [0] * 32
+        datas = [50 + i for i in range(32)]
+        # EXEC mask has lane 0 active, but lane 1 inactive (exec_mask = 0x1)
+        engine.exec_mask = 0x1
+        engine.set_vgpr(1, addrs)
+        engine.set_vgpr(2, datas)
+        engine.set_vgpr(0, [OLD_VDST] * 32)
+
+        engine.step_ds_permute(dst_idx=0, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(0)
+
+        # Since lane 1 is inactive, active lane 0 wins!
+        self.assertEqual(res[0], 50)
+
 if __name__ == "__main__":
     unittest.main()
