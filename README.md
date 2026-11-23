@@ -1,10 +1,12 @@
 # Xbox2Windows
 
-Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. The public tests build their own inputs and run without a game installation.
+Xbox2Windows is a static recompilation research project. The goal is to run the target Xbox Series X|S (Scarlett) build on x64 Windows. The project translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. The public tests build their own inputs and run without a game installation.
 
-**Startup status.** Source-built Windows programs run from entry to process exit. The main executable was absent from the inspected package. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
+> **Current status.** A source-built EXE runs from PE entry to exit and draws two D3D12 shadow frames. Native Windows, `pe_map` and AOT agree on color, depth, surface releases and exit status on RTX 4060 Laptop and WARP. [Run the two-frame check](docs/experiments.md#two-shadow-frames-from-the-exe-entry)
+>
+> The target executable was absent from the inspected package. The target build's CPU execution, full-game startup and frame rate remain unverified.
 
-[Results](#current-results-and-open-work) · [Coverage chart](#instruction-coverage) · [Community and contributions](#community-and-contributions) · [Build on Windows](#first-build) · [Choose an experiment](#choose-an-experiment) · [Run the GPU check](#run-the-gpu-check)
+[Project status](#current-results-and-open-work) · [Find a task](#community-and-contributions) · [Build on Windows](#first-build) · [Choose an experiment](#choose-an-experiment) · [Coverage chart](#instruction-coverage) · [Run the GPU check](#run-the-gpu-check)
 
 ## Current results and open work
 
@@ -29,7 +31,7 @@ Both Windows jobs on `main` must pass before CI publishes a new chart. The image
 
 ## Community and contributions
 
-- **Claim a task.** Search for the behavior or test name in [open issues](https://github.com/R0Y00/Xbox2Windows/issues) and [open PRs](https://github.com/R0Y00/Xbox2Windows/pulls). On the issue, say what you will test, on which platform, and which shared interface or other PR your work depends on. For a first patch, start with [good first issues](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+- **Claim a task.** Start with [open tasks tagged help wanted](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) or [good first issues](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22). Check for existing claims and [open PRs](https://github.com/R0Y00/Xbox2Windows/pulls). On the issue, say what you will test, on which platform, and which shared interface or other PR your work depends on.
 - **Submit a change.** Keep the PR focused on one behavior. Link the task it advances and any prerequisite PR. Include the exact command, expected and observed results, and a negative control for a new fixture. [Patch and evidence guide](CONTRIBUTING.md#submit-and-review-a-patch)
 - **Review a PR.** For CPU translation or PE loading, reproduce the comparison with the original fixture. For shaders or GPU compatibility, check the DXIL and relevant WARP or hardware results. Both reviewers cover shared CPU/GPU interfaces. Record your verdict and the commit you tested. The Maintainer merges after review threads are resolved and the required Windows check passes. [Review responsibilities](CONTRIBUTING.md#who-reviews-and-merges-a-pr)
 - **Contribute a hardware result.** Run the [standalone GPU check](#run-the-gpu-check) and post the report in [issue #1](https://github.com/R0Y00/Xbox2Windows/issues/1). You can also claim a batch there without owning a GPU. Verify the original logs, add new adapters as rows in the [hardware table](#hardware-coverage), and link driver retests in the existing row.
