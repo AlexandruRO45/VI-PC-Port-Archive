@@ -3,6 +3,7 @@ lookup CLI, case-insensitivity, and collision handling.
 
     python -I tests/test_hashdict.py
 """
+import contextlib
 import errno
 import io
 import json
@@ -274,6 +275,52 @@ class LookupBadInputTest(unittest.TestCase):
                 self.assertEqual(p.returncode, 2)
                 self.assertIn(path, p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
+
+
+class LookupDuplicateKeysTest(unittest.TestCase):
+    def run_lookup(self, path, *hashes):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, "--lookup", path, *hashes]), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = hashdict.main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_duplicate_keys_fail_before_any_batch_output(self):
+        # Even an unqueried or identically repeated key makes the input ambiguous.
+        bodies = (
+            '{"88f08ef3":"first", "88f08ef3":"second"}',
+            '{"88f08ef3":"same", "88f08ef3":"same"}',
+            '{"b779a091":"first", "88f08ef3":"apple", "b779a091":"second"}',
+            r'{"88f08ef3":"first", "\u00388f08ef3":"second"}',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hashes.json")
+            for body in bodies:
+                with self.subTest(body=body):
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(body)
+                    code, stdout, stderr = self.run_lookup(path, "deadbeef", "88f08ef3")
+                    self.assertEqual(code, 2)
+                    self.assertEqual(stdout, "")
+                    self.assertIn("duplicate dictionary key", stderr)
+                    self.assertIn(path, stderr)
+                    self.assertEqual(len(stderr.splitlines()), 1)
+                    self.assertNotIn("Traceback", stderr)
+                    with open(path, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), body)
+
+    def test_unique_keys_and_empty_dictionary_keep_lookup_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hashes.json")
+            for body, expected in (
+                ({}, "88f08ef3 ?\n0xdeadbeef ?\n"),
+                ({"88f08ef3": "apple"}, "88f08ef3 apple\n0xdeadbeef ?\n"),
+            ):
+                with self.subTest(body=body):
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(body, f)
+                    self.assertEqual(self.run_lookup(path, "88f08ef3", "0xdeadbeef"),
+                                     (0, expected, ""))
 
 
 class CarveAndExtraCLITest(unittest.TestCase):

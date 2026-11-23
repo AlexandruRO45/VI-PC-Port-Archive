@@ -71,6 +71,15 @@ def _raise_scan_error(error):
     raise error
 
 
+def _unique_dictionary_keys(pairs):
+    dictionary = {}
+    for key, value in pairs:
+        if key in dictionary:
+            raise ValueError(f"duplicate dictionary key {key!r}")
+        dictionary[key] = value
+    return dictionary
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve", nargs="?")
@@ -91,7 +100,7 @@ def main():
                 ap.error(f"--lookup: {h!r} is not a hexadecimal hash")
         try:
             with open(a.lookup[0], encoding="utf-8") as f:
-                d = json.load(f)
+                d = json.load(f, object_pairs_hook=_unique_dictionary_keys)
         except (OSError, ValueError) as e:
             print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
                   file=sys.stderr)
