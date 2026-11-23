@@ -154,7 +154,7 @@ rpf9dump textures <archive.rpf> <work>\assets
 rpf9dump ttpf <pool.ttpf> <work>\assets\ttpf
 rpf9dump audio <audio.rpf> <work>\assets
 rpf9dump xma <audio.rpf> <work>\assets
-python -I make_game.py --stages assets   # everything, in order; skips what is done
+python -I make_game.py   # everything, in order; skips what is done
 ```
 
 Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the rpf9-explorer GUI opens these archives with complete listings instead of its 16 MiB preview scan.
