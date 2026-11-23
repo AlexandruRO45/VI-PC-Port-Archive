@@ -7775,6 +7775,49 @@ class Gen:
                 self.dst_f64(a[0], r, mods, op)
         elif op in ("v_cmp_class_f64", "v_cmpx_class_f64"):
             self.cmp_class_f64(op, a, exec_only=op == "v_cmpx_class_f64", mods=mods)
+        elif op in ("v_cvt_i32_f64", "v_cvt_u32_f64"):
+            def read_f64(sv):
+                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                    lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+                elif sv.get("f64_literal"):
+                    lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
+                elif sv["k"] in ("imm", "fimm"):
+                    bits = (struct.unpack("<Q", struct.pack("<d", sv["v"]))[0]
+                            if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+                    lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+                else:
+                    raise Unsupported(op + " operand")
+                v2, d = self.tmp(), self.tmp()
+                self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
+                self.emit(f"{d} = OpBitcast %double {v2}")
+                if sv.get("abs"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
+                    d = t
+                if sv.get("neg"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %double {d}")
+                    d = t
+                return d
+
+            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                raise Unsupported(op + " modifiers")
+            self.uses_f64 = True
+            x = read_f64(a[1])
+            is_nan, z_sel, tr, cl = (self.tmp() for _ in range(4))
+            self.emit(f"{is_nan} = OpIsNan %bool {x}")
+            self.emit(f"{z_sel} = OpSelect %double {is_nan} {self.dconst(0.0)} {x}")
+            self.emit(f"{tr} = OpExtInst %double %glsl Trunc {z_sel}")
+            if op == "v_cvt_i32_f64":
+                self.emit(f"{cl} = OpExtInst %double %glsl FClamp {tr} {self.dconst(-2147483648.0)} {self.dconst(2147483647.0)}")
+                signed, res = self.tmp(), self.tmp()
+                self.emit(f"{signed} = OpConvertFToS %int {cl}")
+                self.emit(f"{res} = OpBitcast %uint {signed}")
+            else:
+                self.emit(f"{cl} = OpExtInst %double %glsl FClamp {tr} {self.dconst(0.0)} {self.dconst(4294967295.0)}")
+                res = self.tmp()
+                self.emit(f"{res} = OpConvertFToU %uint {cl}")
+            self.dst(a[0], res)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64" and not self.wave64:
