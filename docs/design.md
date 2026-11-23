@@ -115,6 +115,10 @@ It sets up MSVC through `vcvars64.bat` and builds at BelowNormal priority on hal
 If VS's "C++ CMake tools" component is installed, it uses CMake and Ninja. Otherwise it calls `cl` directly. That
 component may not be installed, and the devkitPro MSYS `cmake` on PATH can't build MSVC projects. When you
 add a source file, add it to `runtime\CMakeLists.txt` and to the file list in `build_runtime.ps1`.
+A checkout under a folder whose name is not ASCII builds too (RT-518): `glslangValidator` reads its arguments in the
+ANSI code page and, with `-V`, aborts with `0xC0000409` in a working directory that page cannot spell, so CMake runs
+it there through the folders' 8.3 short names (`runtime\cmake\glslang_short_paths.cmake`). On a drive with 8.3 names
+turned off the configure warns, and the GLSL test shaders need an ASCII folder.
 
 ## Asset status (no exe needed)
 

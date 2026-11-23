@@ -1212,6 +1212,25 @@ if(NOT TARGET Vulkan::Headers)
     FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
+# glslangValidator cannot run in a folder whose name is not ASCII (RT-518, runtime/cmake/glslang_short_paths.cmake):
+# there every glslangValidator command below starts with LEONIDA_GLSLANG_RUN, which runs it through the folders'
+# 8.3 short names. Elsewhere it is empty and the commands are unchanged.
+set(LEONIDA_GLSLANG_RUN)
+if(WIN32 AND NOT "${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_BINARY_DIR}" MATCHES "^[ -~]*$")
+  foreach(dir SOURCE BINARY)
+    execute_process(COMMAND cmd /d /c for %I in (.) do @echo %~sI WORKING_DIRECTORY "${CMAKE_CURRENT_${dir}_DIR}"
+                    OUTPUT_VARIABLE short OUTPUT_STRIP_TRAILING_WHITESPACE)
+    file(TO_CMAKE_PATH "${short}" LEONIDA_GLSLANG_${dir}_SHORT)
+    if(NOT LEONIDA_GLSLANG_${dir}_SHORT MATCHES "^[ -~]*$")
+      message(WARNING "${CMAKE_CURRENT_${dir}_DIR} has no ASCII 8.3 short name (8.3 names are off on its drive): "
+                      "glslangValidator cannot compile the GLSL test shaders there. Build from an ASCII folder.")
+    endif()
+  endforeach()
+  set(LEONIDA_GLSLANG_RUN "${CMAKE_COMMAND}"
+      "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}" "-DSOURCE_SHORT=${LEONIDA_GLSLANG_SOURCE_SHORT}"
+      "-DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}" "-DBINARY_SHORT=${LEONIDA_GLSLANG_BINARY_SHORT}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/glslang_short_paths.cmake" --)
+endif()
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
@@ -1332,7 +1351,7 @@ if(TARGET Vulkan::Headers)
       set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/overlapping_occlusion.${stage}")
       set(output "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.${stage}.spv")
       add_custom_command(OUTPUT "${output}"
-                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                         COMMAND ${LEONIDA_GLSLANG_RUN} "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
                                  -o "${output}" "${source}"
                          DEPENDS "${source}" VERBATIM)
       target_sources(vk_overlapping_occlusion_test PRIVATE "${output}")
@@ -1432,7 +1451,7 @@ if(TARGET Vulkan::Headers)
       set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/binary_occlusion.${stage}")
       set(output "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.${stage}.spv")
       add_custom_command(OUTPUT "${output}"
-                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                         COMMAND ${LEONIDA_GLSLANG_RUN} "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
                                  -o "${output}" "${source}"
                          DEPENDS "${source}" VERBATIM)
       target_sources(vk_binary_occlusion_test PRIVATE "${output}")
@@ -1701,7 +1720,7 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_CS_R9G9B9E5_UAV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_r9g9b9e5_uav.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_CS_R9G9B9E5_UAV}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_R9G9B9E5_UAV}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_R9G9B9E5_UAV}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
         COMMENT "Compiling cs_r9g9b9e5_uav.comp"
@@ -1822,7 +1841,7 @@ if(TARGET Vulkan::Headers)
         set(source ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader})
         set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${definition}.spv)
         add_custom_command(OUTPUT ${binary}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 ${ARGN} -o ${binary} ${source}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 ${ARGN} -o ${binary} ${source}
           DEPENDS ${source} COMMENT "Compiling descriptor test shader ${shader}" VERBATIM)
         target_sources(d3d12_descriptor_test PRIVATE ${binary})
         target_compile_definitions(d3d12_descriptor_test PRIVATE ${definition}="${binary}")
@@ -1849,7 +1868,7 @@ if(TARGET Vulkan::Headers)
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       set(_indirect_count_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_indirect_dispatch_count.spv)
       add_custom_command(OUTPUT ${_indirect_count_spv}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2
           -o ${_indirect_count_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         COMMENT "Compiling the counted indirect dispatch test shader" VERBATIM)
@@ -1931,7 +1950,7 @@ if(TARGET Vulkan::Headers)
         list(GET pair 2 name)
         set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${name})
         add_custom_command(OUTPUT ${binary}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
           COMMENT "Compiling the typeless draw test shader ${shader}" VERBATIM)
@@ -1956,7 +1975,7 @@ if(TARGET Vulkan::Headers)
         list(GET pair 2 name)
         set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${name})
         add_custom_command(OUTPUT ${binary}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
           COMMENT "Compiling the state sweep test shader ${shader}" VERBATIM)
@@ -1988,7 +2007,7 @@ if(TARGET Vulkan::Headers)
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/depth_edge_vs.spv)
       add_custom_command(OUTPUT ${binary}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_depth_edge.vert
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_depth_edge.vert
         COMMENT "Compiling the depth resolve test shader vs_depth_edge.vert" VERBATIM)
@@ -2388,21 +2407,21 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_CS_RAYQUERY ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_rayquery.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_VS_TRI}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_VS_TRI}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_VS_TRI}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
         COMMENT "Compiling vs_tri.vert"
         VERBATIM)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_FS_SOLID}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_FS_SOLID}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_FS_SOLID}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
         COMMENT "Compiling fs_solid.frag"
         VERBATIM)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_CS_RAYQUERY}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_RAYQUERY}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_RAYQUERY}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
         COMMENT "Compiling cs_rayquery.comp"
@@ -2426,7 +2445,7 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_CS ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_user_data.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_CS}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_user_data.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_user_data.comp
         COMMENT "Compiling the compute test shader"
@@ -2460,7 +2479,7 @@ if(TARGET Vulkan::Headers)
         list(GET pair 1 output)
         add_custom_command(
           OUTPUT ${output}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           COMMENT "Compiling the draw test shader ${source}"
@@ -2484,7 +2503,7 @@ if(TARGET Vulkan::Headers)
         list(GET pair 0 source)
         list(GET pair 1 output)
         add_custom_command(OUTPUT ${output}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source} VERBATIM)
       endforeach()
@@ -2503,7 +2522,7 @@ if(TARGET Vulkan::Headers)
         list(GET pair 0 source)
         list(GET pair 1 output)
         add_custom_command(OUTPUT ${output}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source} VERBATIM)
       endforeach()
@@ -2517,7 +2536,7 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_conservative_tier2 PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_HOST_ADAPTER=warp")
       set(LEONIDA_CONSERVATIVE_TIER3_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative_tier3.spv)
       add_custom_command(OUTPUT ${LEONIDA_CONSERVATIVE_TIER3_PS}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_CONSERVATIVE_TIER3_PS}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_CONSERVATIVE_TIER3_PS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_conservative_tier3.frag
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_conservative_tier3.frag VERBATIM)
       add_executable(d3d12_conservative_tier3_test test/d3d12_conservative_tier3_test.cpp
@@ -2563,7 +2582,7 @@ if(TARGET Vulkan::Headers)
         list(GET pair 1 output)
         add_custom_command(
           OUTPUT ${output}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           COMMENT "Compiling the D24 draw test shader ${source}"
@@ -2586,7 +2605,7 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_CS_SET0_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_set0_sample.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_CS_SET0_SAMPLE}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SET0_SAMPLE}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SET0_SAMPLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_set0_sample.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_set0_sample.comp
         COMMENT "Compiling the set-0 compute test shader"
@@ -2641,7 +2660,7 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_PS_ATOMIC ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_image_atomic.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_PS_ATOMIC}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_PS_ATOMIC}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_PS_ATOMIC}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_image_atomic.frag
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_image_atomic.frag
         COMMENT "Compiling the stores-and-atomics test shader ps_image_atomic.frag"
@@ -2662,7 +2681,7 @@ if(TARGET Vulkan::Headers)
       add_custom_command(
         OUTPUT ${LEONIDA_TEST_MS}
         # Vulkan 1.2 (SPIR-V 1.5), the translator's target: 1.3 would emit LocalSizeId, which needs maintenance4.
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${LEONIDA_TEST_MS}
+        COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${LEONIDA_TEST_MS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
         COMMENT "Compiling the mesh test shader ms_draw.mesh"
@@ -2728,7 +2747,7 @@ if(TARGET Vulkan::Headers)
         add_custom_command(
           OUTPUT ${output}
           COMMAND ${CMAKE_COMMAND} -E make_directory ${LEONIDA_SG_DIR}/glsl
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+          COMMAND ${LEONIDA_GLSLANG_RUN} ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           COMMENT "Compiling ${source}"
