@@ -2646,7 +2646,8 @@ class Gen:
         if (kind not in self.BUF_ATOMICS and not is_inc_dec) or "x2" in kind:
             raise Unsupported(op)
         vd = a[0]
-        if is_inc_dec and (vd["k"] != "vgpr" or vd.get("n", 1) != 1):
+        need_n = 2 if kind == "cmpswap" else 1
+        if vd["k"] != "vgpr" or vd.get("n", 1) != need_n:
             raise Unsupported(op + " data")
         addr, _, in_b, _ = self.buffer_address(a, mods)
         val = self.load_reg("vgpr", vd["r"])
