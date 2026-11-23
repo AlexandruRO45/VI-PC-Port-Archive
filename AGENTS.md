@@ -102,19 +102,13 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
 
 ## Delegation and context
 
-When running as an orchestrator, manage: specialists read, edit and check; frontier tokens stay on planning,
-judgment and review.
+For multi-step work, delegate recon and bounded edits, and keep planning, judgment and final review with the
+orchestrator. Give each helper a bounded brief: goal, files, constraints, acceptance check and report shape.
+Parallelize independent reads; do not parallelize edits to the same files.
 
-- **Recon first.** Delegate discovery to `explorer` before opening large files: paths, symbols, call sites and a
-  compact map, not file dumps. Follow up with the same subagent instead of re-reading its output.
-- **Then decide.** Architecture, format ambiguity, or a second failed fix goes to `oracle`. Bounded, specified edits
-  go to `fixer`; UI work to `designer`.
-- **Then verify.** `validator` runs the build and tests above, keeps full logs on disk and returns PASS/FAIL/BLOCKED
-  with exact commands and exit codes. `arbiter` reviews the diff read-only before the pull request. Pair them.
-- **Briefs are bounded.** Goal, scope, files, constraints, acceptance check, report shape. Parallelize independent
-  recon and review; do not serialize work with no dependency.
-- **Context stays lean.** Logs and build output go to files, not chat. Close a phase, then compress. Fresh session
-  per unrelated task. Code, commands, paths and errors stay exact.
-- **The claim rules still apply.** Check the coordination issue before starting, and a pull request still needs its
-  item ID, `Depends on:`, the AI-assisted note, and the GPU and driver tested.
-- **Stop and surface** on security, data loss, irreversible operations, or a conflict with a claimed item.
+A helper's report is not verification. Run the checks in this file, keep long logs on disk, and report the exact
+commands, exit codes and counts. Before any work starts, post the claim required by `CONTRIBUTING.md`; a pull request
+still needs its item ID, `Depends on:` links and the AI-assisted note. Report GPU and driver results as
+`CONTRIBUTING.md` describes.
+
+Stop and surface on security, data loss, irreversible operations, or a conflict with a claimed item.
