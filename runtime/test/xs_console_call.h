@@ -20,6 +20,13 @@ R console_call(void* object, unsigned slot, A... args) {
 // The console slot of a public ID3D12Device1..8 method, from its PC slot.
 constexpr unsigned device_slot(unsigned pc_slot) { return rt::d3d12_xs::console::device_console_slot(pc_slot); }
 
+// An ID3D12Device1..8 method by its PC slot: called there on a real device, at its console slot on a device proxy.
+template <class... A>
+HRESULT device_method(void* device, unsigned pc_slot, A... args) {
+    const bool proxy = rt::d3d12_xs::device_proxy_real_device(device) != nullptr;
+    return console_call(device, proxy ? device_slot(pc_slot) : pc_slot, args...);
+}
+
 // The object a queue or device proxy wraps, or the object itself when it is no proxy: for the PC methods the console
 // does not have (the queue's GetTimestampFrequency, GetClockCalibration; ID3D12Device9 and later).
 inline ID3D12CommandQueue* pc_queue(ID3D12CommandQueue* queue) {

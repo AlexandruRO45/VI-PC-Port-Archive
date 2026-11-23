@@ -18,6 +18,7 @@
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "xs_console_call.h"
 #include "../src/shader_library.h"
 
 #include <array>
@@ -83,7 +84,9 @@ HRESULT create(ID3D12Device* device, Stream& stream, Ref<ID3D12PipelineState>& o
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device2.p)))) return E_NOINTERFACE;
     const D3D12_PIPELINE_STATE_STREAM_DESC desc = stream.desc(trim);
     out.reset();
-    return device2->CreatePipelineState(&desc, IID_PPV_ARGS(&out.p));
+    // ID3D12Device2::CreatePipelineState (PC slot 47) is at its console slot on the proxy.
+    return xs_test::device_method(device2.p, 47, &desc, &__uuidof(ID3D12PipelineState),
+                                  reinterpret_cast<void**>(&out.p));
 }
 
 D3D12_MESH_SHADER_TIER mesh_tier(ID3D12Device* device) {

@@ -23,6 +23,7 @@
 
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "xs_console_call.h"
 #include "shims.h"
 
 namespace {
@@ -193,12 +194,12 @@ int main(int argc, char** argv) {
     check(FAILED(hr) && !not_a_device, "QueryInterface rejects a non-device IID");
     check(rt::d3d12_xs::device_slot_hits(0) >= 3, "slot 0 hit counter moves");
 
-    // Generic-forwarder coverage: slot 43 returns an 8-byte struct through the hidden pointer, and slot 30 has
-    // two stack arguments. Both must reach the PC device unchanged (they are not measured overrides).
-    const LUID proxy_luid = device->GetAdapterLuid();
+    // Slot 43 is GetAdapterLuid in its console form: the 8-byte LUID comes back in RAX, where the PC method writes
+    // it through a hidden pointer. Slot 30 has two stack arguments and must reach the PC device unchanged.
+    const LUID proxy_luid = xs_test::console_call<LUID>(device.Get(), 43);
     const LUID real_luid = real ? real->GetAdapterLuid() : LUID{};
     check(proxy_luid.LowPart == real_luid.LowPart && proxy_luid.HighPart == real_luid.HighPart,
-          "slot 43 forwards GetAdapterLuid (struct return)");
+          "slot 43 returns the PC device's GetAdapterLuid in RAX");
     D3D12_RESOURCE_DESC reserved_desc = buffer_desc();
     reserved_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> reserved;

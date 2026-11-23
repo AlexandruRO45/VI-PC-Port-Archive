@@ -6577,7 +6577,7 @@ int main() {
                 EXPECT(SUCCEEDED(xs_test::console_call(
                     device4.p, xs_test::device_slot(55), &tiled_desc, D3D12_RESOURCE_STATE_COMMON,
                     static_cast<const D3D12_CLEAR_VALUE*>(nullptr), static_cast<ID3D12ProtectedResourceSession*>(nullptr),
-                    &__uuidof(ID3D12Resource), reinterpret_cast<void**>(&one.p)))));
+                    &__uuidof(ID3D12Resource), reinterpret_cast<void**>(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
                 UINT tiles = 0;

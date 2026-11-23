@@ -774,7 +774,8 @@ int run_env_slots(bool valid) {
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
     if (valid) {
-        // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
+        // Every route moved: the new slot is handled. The default slot falls back to the console table, which
+        // refuses SetFrameIntervalX without a route: it never reaches the PC method at 78.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
         EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
@@ -790,17 +791,17 @@ int run_env_slots(bool valid) {
         const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
         void* list = nullptr;
         EXPECT(hr_of(raw(device, 100, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);
+        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == E_NOTIMPL && mock->calls[78] == 0);
         EXPECT(release(list) == 0);
         EXPECT(release(allocator) == 0);
         EXPECT(release(queue) == 0);
     } else {
-        // Values outside 3..127 are ignored: the five defaults still answer, and a PC slot that is not a default is
-        // forwarded unchanged.
+        // Values outside 3..127 are ignored: the five defaults still answer, and a public method that is not a
+        // default is forwarded unchanged (console slot 86 is the PC's ID3D12Device2 slot 47).
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);  // not an Xbox slot: forwarded
+        EXPECT(hr_of(raw(device, 86)) == S_OK && mock->calls[47] == 1 && mock->calls[86] == 0);  // forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,

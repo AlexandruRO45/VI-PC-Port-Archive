@@ -90,11 +90,9 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
     ID3D12Fence* both[] = {a.p, b.p};
     constexpr auto ALL = D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, ANY = D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
     // On the proxy SetEventOnMultipleFenceCompletion is at its console slot (84), which unwraps the fence proxies.
-    const bool proxy = rt::d3d12_xs::device_proxy_real_device(device) != nullptr;
     const auto set_event = [&](ID3D12Fence* const* fences, const UINT64* values, UINT count,
                                D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
-        if (!proxy) return device1->SetEventOnMultipleFenceCompletion(fences, values, count, flags, event);
-        return xs_test::console_call(device1.p, xs_test::device_slot(45), fences, values, count, flags, event);
+        return xs_test::device_method(device1.p, 45, fences, values, count, flags, event);
     };
 
     // ALL with an event: one fence is not enough.
