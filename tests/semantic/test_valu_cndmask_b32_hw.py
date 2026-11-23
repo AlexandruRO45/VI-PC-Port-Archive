@@ -272,5 +272,35 @@ class TestValuCndmaskB32SimdExecution(unittest.TestCase):
         self.assertEqual(words_bit0_off[0], 0x11111111)
         self.assertEqual(words_bit0_off[1], 0x22222222)
 
+# --- Section 5: Register Aliasing and In-Place Operand Preservation ---
+
+def run_valu_cndmask_inplace_ps(init_val: int, other_val: int, cond_bit: int) -> int:
+    """Execute in-place v_cndmask_b32 v0, v0, s1 (or v_cndmask_b32 v0, s0, v0)."""
+    lines = [
+        f"v_mov_b32 v0, {init_val & MASK32:#x}",
+        f"s_mov_b32 s1, {other_val & MASK32:#x}",
+        f"s_mov_b64 s[2:3], {1 if cond_bit else 0}",
+        "v_cndmask_b32_e64 v0, v0, s1, s[2:3]",
+        "v_mov_b32 v1, 0",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_cndmask_inplace", lines)
+    return mrt0_words(spv)[0]
+
+
+class TestValuCndmaskB32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation tests."""
+
+    def test_inplace_dst_aliases_src0(self) -> None:
+        init_val = 0x12345678
+        other_val = 0x87654321
+        # When cond=0, v0 remains init_val
+        self.assertEqual(run_valu_cndmask_inplace_ps(init_val, other_val, cond_bit=0), init_val)
+        # When cond=1, v0 updates to other_val
+        self.assertEqual(run_valu_cndmask_inplace_ps(init_val, other_val, cond_bit=1), other_val)
+
 if __name__ == "__main__":
     unittest.main()
