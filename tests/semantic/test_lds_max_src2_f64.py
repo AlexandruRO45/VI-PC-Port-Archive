@@ -840,5 +840,108 @@ class TestRegisterAliasing64(unittest.TestCase):
         self.assertEqual(self.lds.read_qword(0x100), HALF_F64)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class Float64ConditionCodes:
+    """Architectural condition codes evaluating double-precision float maximum results."""
+    zero: bool
+    negative: bool
+    nan: bool
+    infinity: bool
+    subnormal: bool
+    updated: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class LDSStatusFlags64:
+    """Status flags for 64-bit LDS addressing and dual-bank mapping."""
+    qword_aligned: bool
+    address_wrapped: bool
+    bank_span: Tuple[int, int]
+
+
+def compute_float64_condition_codes(old_val_a: int, val_b: int, result: int) -> Float64ConditionCodes:
+    """Compute condition codes from double-precision float atomic max result."""
+    res_u = u64(result)
+    old_u = u64(old_val_a)
+    return Float64ConditionCodes(
+        zero=is_zero64(res_u),
+        negative=bool(res_u & SIGN_MASK64),
+        nan=is_nan64(res_u),
+        infinity=is_inf64(res_u),
+        subnormal=is_subnormal64(res_u),
+        updated=(res_u != old_u),
+    )
+
+
+def compute_lds64_src2_status_flags(
+    vaddr: int,
+    offset0: int = 0,
+    offset1: int = 0,
+    lds_size_bytes: int = DEFAULT_LDS_SIZE_BYTES,
+) -> Tuple[LDSStatusFlags64, LDSStatusFlags64]:
+    """Evaluate 8-byte alignment, dual-bank span, and boundary wrap for both locations."""
+    eff_a, eff_b, _, _ = calc_lds_src2_effective_addresses(vaddr, offset0, offset1, lds_size_bytes // 8)
+    st_a = LDSStatusFlags64(
+        qword_aligned=((eff_a & 7) == 0),
+        address_wrapped=(eff_a >= lds_size_bytes),
+        bank_span=(calc_lds_bank(eff_a), calc_lds_bank(eff_a + 4)),
+    )
+    st_b = LDSStatusFlags64(
+        qword_aligned=((eff_b & 7) == 0),
+        address_wrapped=(eff_b >= lds_size_bytes),
+        bank_span=(calc_lds_bank(eff_b), calc_lds_bank(eff_b + 4)),
+    )
+    return st_a, st_b
+
+
+class TestConditionCodesAndStatusFlags64(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and update detection."""
+
+    def test_condition_code_zero(self) -> None:
+        cc_pos = compute_float64_condition_codes(NEG_ONE_F64, POS_ZERO64, POS_ZERO64)
+        self.assertTrue(cc_pos.zero)
+        self.assertFalse(cc_pos.negative)
+        self.assertTrue(cc_pos.updated)
+
+    def test_condition_code_negative(self) -> None:
+        cc = compute_float64_condition_codes(NEG_TEN_F64, NEG_TWO_F64, NEG_TWO_F64)
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.negative)
+        self.assertTrue(cc.updated)
+
+    def test_condition_code_nan(self) -> None:
+        res_nan = oracle_max_f64(QNAN_PAYLOAD_A64, QNAN_PAYLOAD_B64)
+        cc = compute_float64_condition_codes(QNAN_PAYLOAD_A64, QNAN_PAYLOAD_B64, res_nan)
+        self.assertTrue(cc.nan)
+
+    def test_condition_code_infinity(self) -> None:
+        cc_pos_inf = compute_float64_condition_codes(TEN_F64, POS_INF64, POS_INF64)
+        self.assertTrue(cc_pos_inf.infinity)
+        self.assertTrue(cc_pos_inf.updated)
+
+    def test_condition_code_subnormal(self) -> None:
+        cc = compute_float64_condition_codes(NEG_ONE_F64, SUBNORM_MIN64, SUBNORM_MIN64)
+        self.assertTrue(cc.subnormal)
+        self.assertTrue(cc.updated)
+
+    def test_condition_code_updated_flag(self) -> None:
+        cc1 = compute_float64_condition_codes(ONE_F64, TEN_F64, TEN_F64)
+        self.assertTrue(cc1.updated)
+
+        cc2 = compute_float64_condition_codes(TEN_F64, ONE_F64, TEN_F64)
+        self.assertFalse(cc2.updated)
+
+    def test_lds_status_flags(self) -> None:
+        st_a, st_b = compute_lds64_src2_status_flags(0x100, offset0=0, offset1=1)
+        self.assertTrue(st_a.qword_aligned)
+        self.assertTrue(st_b.qword_aligned)
+        self.assertFalse(st_a.address_wrapped)
+        self.assertFalse(st_b.address_wrapped)
+
+
 if __name__ == "__main__":
     unittest.main()
