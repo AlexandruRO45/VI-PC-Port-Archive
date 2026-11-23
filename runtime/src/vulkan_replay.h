@@ -3428,6 +3428,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.reset_query_pool(command_buffer, prepared.statistics_pool, index, 1);
             vk.begin_query(command_buffer, prepared.statistics_pool, index, 0);
         };
+        // A draw of the other kind starts a statistics segment before its rendering scope (D3D-291).
+        // Counted dispatches split their query around the helper in the dispatch path below.
+        if (const auto* indirect = std::get_if<ExecuteIndirect>(&command);
+            std::holds_alternative<Draw>(command) || (indirect && indirect->kind != IndirectKind::dispatch)) {
+            end_statistics();
+            begin_statistics();
+        }
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
