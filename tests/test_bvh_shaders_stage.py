@@ -29,6 +29,7 @@ from test_pe_shader_containers import container, ildn, xdat  # noqa: E402
 
 TOOLS = ["pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py", "rdna2spirv.py"]
 ENDPGM = b"\x00\x00\x81\xbf"
+SPIRV_HEADER = struct.pack("<5I", 0x07230203, 0x00010000, 0, 1, 0)
 
 
 def fssm_blob(seed: int) -> bytes:
@@ -134,7 +135,7 @@ class BvhStage(unittest.TestCase):
             with open(os.path.join(os.path.dirname(args[0]), "fssm", name + ".fssm"), "rb") as f:
                 index[name] = {"stage": "cs", "fssm_sha256": hashlib.sha256(f.read()).hexdigest()}
             with open(os.path.join(out, name + ".spv"), "wb") as f:
-                f.write(b"module of " + name.encode())
+                f.write(SPIRV_HEADER)
         with open(os.path.join(out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(index, f)
 
@@ -184,6 +185,30 @@ class BvhStage(unittest.TestCase):
         self.assertIn(f"shaders: 3 of 3 {make_game.BVH_DLL} programs translated", self.logs)
         self.assertEqual(self.run_step(), [])
         self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.BVH_DLL} programs translated"])
+
+    def test_bad_module_framing_rebuilds_the_cached_builder(self):
+        self.run_step()
+        for content in (b"", SPIRV_HEADER[:16], SPIRV_HEADER + b"x", bytes(20)):
+            with self.subTest(content=content):
+                with open(os.path.join(self.spirv, "SortKeys.spv"), "wb") as f:
+                    f.write(content)
+                self.assertEqual(self.run_step(), TOOLS)
+                self.assertEqual(self.run_step(), [])
+
+    def test_bad_module_from_a_fresh_translation_is_not_published(self):
+        def truncate(tool, *args):
+            self.fake_py(tool, *args)
+            if tool == "rdna2spirv.py":
+                with open(os.path.join(self.spirv, "SortKeys.spv"), "wb") as f:
+                    f.write(SPIRV_HEADER[:8])
+
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.run_step(py=truncate)
+        self.assertIn("unreadable index or module", err.getvalue())
+        self.assertTrue(any("SortKeys.spv" in line for line in self.logs))
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "bvh_build.json")))
+        self.assertEqual(self.run_step(), TOOLS)
 
     def test_the_real_tools_fill_the_folder_and_a_second_run_leaves_no_duplicates(self):
         """Extraction, unpacking and disassembly by the repository's tools (llvm-mc stood in for), twice: the
@@ -313,7 +338,7 @@ class BvhStage(unittest.TestCase):
         os.remove(module)
         self.assertEqual(self.run_step(), TOOLS)
         with open(module, "rb") as f:
-            self.assertEqual(f.read(), b"module of SortKeys")
+            self.assertEqual(f.read(), SPIRV_HEADER)
         self.assertEqual(self.run_step(), [])
         os.remove(os.path.join(self.unpacked, "index.json"))     # the list of programs the report counts against
         self.assertEqual(self.run_step(), TOOLS)
@@ -380,7 +405,8 @@ class ShadersStageWithTheDlls(unittest.TestCase):
                     name = "SortKeys" if builder else "Upscale"
                     write('{"%s": {"stage": "cs", "fssm_sha256": "%s"}}' % (name, "a" * 64) if builder else
                           '{"%s": {"stage": "cs"}}' % name, out, "index.json")
-                    write("", out, name + ".spv")
+                    with open(os.path.join(out, name + ".spv"), "wb") as f:
+                        f.write(SPIRV_HEADER)
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")

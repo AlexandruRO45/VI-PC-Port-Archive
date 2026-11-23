@@ -1441,18 +1441,34 @@ def bvh_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[st
                        "max_shared_memory": BVH_MAX_SHARED_MEMORY}, sort_keys=True)
 
 
+def bvh_module_readable(path: str) -> bool:
+    """Match runtime/src/spirv_words.h's framing checks without loading the whole cached module."""
+    try:
+        info = os.stat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size < 20 or info.st_size % 4:
+            return False
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x03\x02\x23\x07"
+    except OSError:
+        return False
+
+
 def bvh_programs(unpacked: str, spirv: str) -> "tuple[list[str], list[str]] | None":
     """The programs pe_shader_containers.py extracted, by file stem, and the ones among them the runtime cannot
     find: no entry with an fssm_sha256 in <spirv>/index.json, or no module beside it. None when either index is
-    missing or unreadable, or names a module that is not there."""
+    missing or unreadable, or names a module without the binary framing the runtime requires."""
     try:
         extracted = sorted(shader_stems(os.path.join(unpacked, "index.json"), "file", ".dxbc"))
         with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
             index = json.load(f)
     except (OSError, ValueError):
         return None
-    if not isinstance(index, dict) or not all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index):
+    if not isinstance(index, dict):
         return None
+    for name in index:
+        if not bvh_module_readable(os.path.join(spirv, name + ".spv")):
+            log(f"shaders: {name}.spv in the BVH index is missing, unreadable or has invalid SPIR-V framing")
+            return None
     found = {name for name, meta in index.items()
              if isinstance(meta, dict) and isinstance(meta.get("fssm_sha256"), str)}
     return extracted, [name for name in extracted if name not in found]
@@ -1519,7 +1535,11 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", "--max-shared-memory", BVH_MAX_SHARED_MEMORY, *extra)
     programs = bvh_programs(unpacked, spirv)
-    if not programs or len(programs[1]) == len(programs[0]):
+    if programs is None:
+        drop(translated)
+        fail(f"shaders: {BVH_DLL} produced an unreadable index or module, so its index is not kept. "
+             "Run the shaders stage again.")
+    if len(programs[1]) == len(programs[0]):
         drop(translated)   # an empty or unreadable index would read as a finished step
         fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
              "stage again; if it happens again, the tool output above is why.")
