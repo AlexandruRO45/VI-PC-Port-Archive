@@ -1664,6 +1664,31 @@ void run_checks(const std::filesystem::path& root) {
               "a ReplaceFileW the host refuses removes the marker it wrote");
         rt::fs::configure(package, overlay);
     }
+
+    // RT-294: an explicit GAME: path into the overlay's own folders is refused by these calls too.
+    {
+        const auto free_r = resolve<GetDiskFreeSpaceExWFn>("kernel32.dll", "GetDiskFreeSpaceExW");
+        const auto long_r = resolve<PathNameWFn>("kernel32.dll", "GetLongPathNameW");
+        const auto compressed_r = resolve<GetCompressedFileSizeWFn>("kernel32.dll", "GetCompressedFileSizeW");
+        const auto move_r = resolve<MoveFileWithProgressWFn>("kernel32.dll", "MoveFileWithProgressW");
+        const auto replace_r = resolve<ReplaceFileWFn>("kernel32.dll", "ReplaceFileW");
+        write_path(overlay / ".gta6rt-temp" / "reserved.tmp", "reserved");
+        wchar_t r_buffer[MAX_PATH] = {};
+        check(error_of([&] { free_r(L"GAME:\\.gta6rt-temp", nullptr, nullptr, nullptr); }) == ERROR_INVALID_NAME &&
+                  error_of([&] { long_r(L"GAME:\\.gta6rt-temp\\reserved.tmp", r_buffer, MAX_PATH); }) ==
+                      ERROR_INVALID_NAME &&
+                  error_of([&] { compressed_r(L"GAME:\\.gta6rt-deleted\\x", nullptr); }) == ERROR_INVALID_NAME &&
+                  error_of([&] {
+                      move_r(L"GAME:\\.gta6rt-temp\\reserved.tmp", L"GAME:\\moved.tmp", nullptr, nullptr, 0);
+                  }) == ERROR_INVALID_NAME &&
+                  error_of([&] {
+                      replace_r(L"GAME:\\data\\hello.txt", L"GAME:\\.gta6rt-temp\\reserved.tmp", nullptr, 0, nullptr,
+                                nullptr);
+                  }) == ERROR_INVALID_NAME &&
+                  read_path(overlay / ".gta6rt-temp" / "reserved.tmp") == "reserved",
+              "free space, name, size, move-with-progress and replace refuse GAME: paths into the overlay's folders");
+    }
+
     check_replace_marker_failure(root);
 }
 

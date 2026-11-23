@@ -95,7 +95,7 @@ A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file 
 [ivall/xcl](https://github.com/ivall/xcl) (GPL-2.0-only; facts only, no code) documents for Xbox Series GDK titles that
 `GAME:` maps to the game folder and that writes go to a writable overlay instead of the package, which stays read-only.
 `gta6rt` therefore shims `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`, `GetFileAttributesA/W`,
-`GetFileAttributesExA/W` and `DeleteFileA/W`, and the folder, move, copy, attribute, full-path and free-space calls
+`GetFileAttributesExA/W` and `DeleteFileA/W`, and the folder, move, copy, attribute, free-space, name and replace calls
 listed below (`runtime/shims/file_system.cpp`), under `kernel32.dll`, `kernelbase.dll`
 and the `api-ms-win-core-file-*` sets a GDK title links against.
 
