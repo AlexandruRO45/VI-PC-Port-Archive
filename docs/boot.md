@@ -44,7 +44,10 @@ python -I tools\boot_trace.py $trace --d3d12 $log
 
 The capture pipeline writes each message as text to avoid PowerShell 5.1 wrapping the first stderr record at a
 narrow output width. The tool also reads existing UTF-16LE logs saved with `2>` in PowerShell 5.1 and recognizes
-the `program.exe : ` prefix on the first stderr line.
+the `program.exe : ` prefix on the first stderr line. Capture with `$ErrorActionPreference` set to `Continue`:
+with a profile's `Stop` the first stderr record becomes a terminating error and the log stays empty (PROC-271
+measured 19 trace lines with `Continue`, 0 with `Stop` on 5.1.26100; `scripts/first_look.ps1` captures under
+`Continue` for the same reason).
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
