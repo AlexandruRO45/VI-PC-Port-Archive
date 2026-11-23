@@ -1674,34 +1674,61 @@ class Gen:
                 raise AssertionError(f"{ins['op']} is not lane-local inside an active run: {s}")
 
     def mov64(self, d, s):
-        """64-bit scalar move, including EXEC save/restore (EXEC = this lane's active bit)."""
+        """64-bit scalar move, including EXEC/VCC lane-mask copies and 64-bit data pairs."""
         if d["k"] == "special" and d["t"] == "exec":
             self.set_exec(self.mask_src(s))
             return
-        if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
+        to_vcc = d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")
+        if to_vcc and (self.holds_lane_mask(s) or s["k"] == "imm"):
             self.emit(f"OpStore %vcc {self.mask_src(s)}")
+            if s["k"] == "imm":
+                v = s["v"] & 0xFFFFFFFFFFFFFFFF
+                self.emit(f"OpStore %vcc_hi {self.cu((v >> 32) & 0xFFFFFFFF)}")
             return
-        if d["k"] != "sgpr" or d.get("n") != 2:
+        if not to_vcc and (d["k"] != "sgpr" or d.get("n") != 2):
             raise Unsupported("s_mov_b64 destination")
         lit_lo = lit_hi = None
         if s["k"] == "special" and s["t"] == "exec":
             lo = hi = self.exec_value()
         elif s["k"] == "sgpr" and s.get("n") == 2:
-            lit_lo = self.sgpr_imm.get(s["r"])
-            lit_hi = self.sgpr_imm.get(s["r"] + 1)
-            lo, hi = self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
+            if not self.holds_lane_mask(s) and self.any_mask_word(s):
+                # Mixed mask/data SGPR pair (one word is a lane mask, the other data): materialize any mask word.
+                words = []
+                for i in range(2):
+                    r = s["r"] + i
+                    rk = self.cur_masks.get(r)
+                    if rk is not None:
+                        lo_w, hi_w = self.wave_mask({"k": "sgpr", "r": r, "n": 1})
+                        words.append(hi_w if (self.wave64 and rk == lane_masks.MASK_HI) else lo_w)
+                    else:
+                        words.append(self.load_reg("sgpr", r))
+                lo, hi = words
+            else:
+                lit_lo = self.sgpr_imm.get(s["r"])
+                lit_hi = self.sgpr_imm.get(s["r"] + 1)
+                lo, hi = self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
         elif s["k"] == "imm":
             v = s["v"] & 0xFFFFFFFFFFFFFFFF
-            if s["v"] < 0:
-                v = s["v"] & 0xFFFFFFFFFFFFFFFF
             lit_lo = v & 0xFFFFFFFF
             lit_hi = (v >> 32) & 0xFFFFFFFF
             lo, hi = self.cu(lit_lo), self.cu(lit_hi)
-        elif s["k"] == "special" and s["t"] == "vcc":
-            lo = hi = self.tmp()            # this lane's bit in both halves, as for EXEC
+        elif s["k"] == "special" and s["t"] in ("vcc", "vcc_lo"):
+            lo = self.tmp()
             self.emit(f"{lo} = OpLoad %uint %vcc")
+            if self.holds_lane_mask(s):
+                hi = lo                     # this lane's bit in both halves, as for EXEC
+            else:
+                hi = self.tmp()
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+        elif s["k"] == "special" and s["t"] == "null":
+            lit_lo = lit_hi = 0
+            lo = hi = self.cu(0)
         else:
             raise Unsupported("s_mov_b64 source")
+        if to_vcc:
+            self.emit(f"OpStore %vcc {lo}")
+            self.emit(f"OpStore %vcc_hi {hi}")
+            return
         self.store_reg("sgpr", d["r"], lo)
         self.store_reg("sgpr", d["r"] + 1, hi)
         if self.desc_cache_ok():
