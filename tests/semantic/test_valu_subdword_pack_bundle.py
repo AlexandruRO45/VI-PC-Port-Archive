@@ -277,6 +277,19 @@ class TestPermLaneX16Nibbles(unittest.TestCase):
         self.assertIn("OpBitFieldUExtract", spv)
         self.assertIn("OpGroupNonUniformShuffle", spv)
 
+class TestPermLaneX16Aliasing(unittest.TestCase):
+    def test_aliasing(self):
+        code = [
+            "v_mov_b32_e32 v3, 500",
+            "s_mov_b32 s4, 0x76543210",
+            "s_mov_b32 s5, 0xFEDCBA98",
+            "v_permlanex16_b32 v3, v3, s4, s5",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_px16_alias", code, fssm=saveexec_run.fssm())
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+        self.assertIn("OpBitwiseXor", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
