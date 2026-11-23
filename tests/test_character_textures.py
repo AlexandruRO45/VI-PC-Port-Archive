@@ -238,6 +238,18 @@ class CharacterTextureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("must use different paths", result.stderr)
 
+    def test_an_unwritable_report_path_is_one_error_line_and_exit_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, model([{"Name": "head", "Shader": "a1b2c3d4", "Textures": []}]))
+            blocker = pathlib.Path(td) / "blocker"
+            blocker.write_text("not a folder", encoding="utf-8")
+            for flag in ("--json", "--csv"):
+                result = run_tool(path, flag, blocker / "report.out")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
     def test_unlistable_subfolder_is_an_error_not_a_silent_skip(self):
         import io
         from unittest import mock
