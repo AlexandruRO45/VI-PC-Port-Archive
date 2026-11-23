@@ -296,6 +296,10 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 class JobsHandlingTest(unittest.TestCase):
     """Test --jobs default computation, command-line overrides, and forwarding."""
 
+    # main() clamps --jobs to the CPU count, so the forwarding tests pin one above the --jobs they pass; without it
+    # they failed on any machine with fewer CPUs (a 4-CPU CI runner, an 8-CPU laptop for --jobs 10).
+    CPUS = 16
+
     def test_jobs_default_calculation_scenarios(self):
         scenarios = [
             (None, 1),
@@ -320,7 +324,7 @@ class JobsHandlingTest(unittest.TestCase):
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
                                             "--no-tui", "--stages", "shaders", "--jobs", "6"]):
-                with patch("make_game.below_normal"):
+                with patch("make_game.below_normal"), patch("os.cpu_count", return_value=self.CPUS):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight") as mock_preflight:
                             with patch("make_game.log"):
@@ -345,7 +349,7 @@ class JobsHandlingTest(unittest.TestCase):
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
                                             "--no-tui", "--stages", "assets", "--wav", "--jobs", "10"]):
-                with patch("make_game.below_normal"):
+                with patch("make_game.below_normal"), patch("os.cpu_count", return_value=self.CPUS):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
                             with patch("make_game.log"):
@@ -354,6 +358,26 @@ class JobsHandlingTest(unittest.TestCase):
                                     self.assertEqual(ret, 0)
                                     mock_assets.assert_called_once_with(
                                         os.path.abspath(game), os.path.abspath(work), True, 10, dump_jobs=None)
+
+    def test_jobs_above_the_cpu_count_are_clamped_to_it(self):
+        # main() clamps --jobs to os.cpu_count() (leonida_tui.clamp_jobs), so the forwarding tests above pin the CPU
+        # count; this one checks the clamp itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "game")
+            out = os.path.join(tmp, "out")
+            work = os.path.join(tmp, "work")
+            os.makedirs(game)
+            with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
+                                            "--no-tui", "--stages", "assets", "--wav", "--jobs", "10"]):
+                with patch("make_game.below_normal"), patch("os.cpu_count", return_value=4):
+                    with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
+                        with patch("make_game.preflight") as mock_preflight:
+                            with patch("make_game.log"):
+                                with patch("make_game.assets") as mock_assets:
+                                    self.assertEqual(make_game.main(), 0)
+                                    self.assertEqual(mock_preflight.call_args.kwargs["jobs"], 4)
+                                    mock_assets.assert_called_once_with(
+                                        os.path.abspath(game), os.path.abspath(work), True, 4, dump_jobs=None)
 
     def test_translate_spawns_exact_job_count(self):
         with tempfile.TemporaryDirectory() as tmp:
