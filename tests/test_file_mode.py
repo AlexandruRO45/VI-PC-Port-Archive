@@ -13,12 +13,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import file_mode  # noqa: E402
+import anim_move  # noqa: E402
 import awc_manifest  # noqa: E402
 import classify_carve  # noqa: E402
 import glb_writer  # noqa: E402
 import rbf0_tree  # noqa: E402
 import rsc8_audio  # noqa: E402
 import rtti_scan  # noqa: E402
+import timecycle_pairs  # noqa: E402
 
 PRIMS = glb_writer.parse_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", is_path=False)
 
@@ -40,6 +42,10 @@ class NoUmaskFlipTests(unittest.TestCase):
             ("classify_carve", os.path.join(directory, "types.json"), self.classify_carve),
             ("rbf0_tree", os.path.join(directory, "tree.json"), lambda p: rbf0_tree.write_json(p, [], {})),
             ("rsc8_audio", os.path.join(directory, "rsc8.json"), lambda p: rsc8_audio.write_report(p, [], {})),
+            ("anim_move", os.path.join(directory, "move.json"),
+             lambda p: anim_move._write_json_atomic(p, {"version": anim_move.VERSION})),
+            ("timecycle_pairs", os.path.join(directory, "timecycle.json"),
+             lambda p: timecycle_pairs._write_json_atomic(p, {"keyframe_docs": 0})),
         ]
 
     @staticmethod
@@ -95,6 +101,28 @@ class NoUmaskFlipTests(unittest.TestCase):
             Path(path).write_bytes(b"")
             os.chmod(path, 0o604)
             self.assertEqual(file_mode.published_mode(path), 0o604)
+
+
+class AtomicJsonPublishTests(unittest.TestCase):
+    # anim_move and timecycle_pairs staged the report with mkstemp and os.replace()d it as it was, so a fresh
+    # report came out 0600: the staging file's bits, not the ones open() would have given the report.
+    WRITERS = (
+        ("anim_move", anim_move._write_json_atomic),
+        ("timecycle_pairs", timecycle_pairs._write_json_atomic),
+    )
+
+    def test_the_staged_file_is_published_with_published_mode(self):
+        for name, write in self.WRITERS:
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "report.json")
+                with mock.patch.object(file_mode, "published_mode", return_value=0o604) as published, \
+                        mock.patch("os.chmod") as chmod:
+                    write(path, {"ok": True})
+                published.assert_called_once_with(path)
+                staged, bits = chmod.call_args.args
+                self.assertTrue(staged.endswith(".tmp"), staged)
+                self.assertEqual(bits, 0o604)
+                self.assertEqual(sorted(os.listdir(directory)), ["report.json"])
 
 
 if __name__ == "__main__":
