@@ -142,27 +142,17 @@ def run_ps_cubema(instructions: Sequence[str]) -> list[int]:
 
 class TestReferenceOracleAndTranslator(unittest.TestCase):
     def test_basic_axis_faces(self):
-        # +X face: (4.0, 1.0, 2.0) -> major X (4.0) -> 8.0
         self.assertEqual(ref_cubema_f32(FOUR_F32, ONE_F32, TWO_F32), EIGHT_F32)
-        # -X face: (-4.0, 1.0, 2.0) -> major X (-4.0) -> -8.0
         self.assertEqual(ref_cubema_f32(f32_to_u32(-4.0), ONE_F32, TWO_F32), f32_to_u32(-8.0))
-        # +Y face: (1.0, 3.0, 2.0) -> major Y (3.0) -> 6.0
         self.assertEqual(ref_cubema_f32(ONE_F32, THREE_F32, TWO_F32), SIX_F32)
-        # -Y face: (1.0, -3.0, 2.0) -> major Y (-3.0) -> -6.0
         self.assertEqual(ref_cubema_f32(ONE_F32, f32_to_u32(-3.0), TWO_F32), f32_to_u32(-6.0))
-        # +Z face: (1.0, 2.0, 5.0) -> major Z (5.0) -> 10.0
         self.assertEqual(ref_cubema_f32(ONE_F32, TWO_F32, FIVE_F32), TEN_F32)
-        # -Z face: (1.0, 2.0, -5.0) -> major Z (-5.0) -> -10.0
         self.assertEqual(ref_cubema_f32(ONE_F32, TWO_F32, f32_to_u32(-5.0)), f32_to_u32(-10.0))
 
     def test_tie_breaking_precedence(self):
-        # Y beats X in |x| == |y| > |z|: (2.0, 2.0, 0.5) -> major Y (2.0) -> 4.0
         self.assertEqual(ref_cubema_f32(TWO_F32, TWO_F32, f32_to_u32(0.5)), FOUR_F32)
-        # Z beats Y in |y| == |z| > |x|: (0.5, 2.0, 2.0) -> major Z (2.0) -> 4.0
         self.assertEqual(ref_cubema_f32(f32_to_u32(0.5), TWO_F32, TWO_F32), FOUR_F32)
-        # Z beats X in |x| == |z| > |y|: (2.0, 0.5, 2.0) -> major Z (2.0) -> 4.0
         self.assertEqual(ref_cubema_f32(TWO_F32, f32_to_u32(0.5), TWO_F32), FOUR_F32)
-        # Z beats both in 3-way tie: (1.5, 1.5, 1.5) -> major Z (1.5) -> 3.0
         self.assertEqual(ref_cubema_f32(f32_to_u32(1.5), f32_to_u32(1.5), f32_to_u32(1.5)), THREE_F32)
 
     def test_translator_basic_execution(self):
@@ -175,7 +165,6 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
         self.assertEqual(words[0], EIGHT_F32)
 
     def test_clamp_output_modifier(self):
-        # 2.0 * 4.0 = 8.0, clamped to 1.0
         r_clamped = ref_cubema_f32(FOUR_F32, ONE_F32, TWO_F32, clamp=True)
         self.assertEqual(r_clamped, ONE_F32)
 
@@ -188,7 +177,6 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
         self.assertEqual(words[0], ONE_F32)
 
     def test_input_modifiers(self):
-        # -|v0| with v0 = -4.0 -> -4.0, major is X (-4.0), 2.0 * -4.0 = -8.0
         r = ref_cubema_f32(f32_to_u32(-4.0), ONE_F32, TWO_F32, neg=(True, False, False), abs_=(True, False, False))
         self.assertEqual(r, f32_to_u32(-8.0))
 
@@ -199,6 +187,108 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
             "v_cubema_f32 v3, -|v0|, v1, v2",
         ])
         self.assertEqual(words[0], f32_to_u32(-8.0))
+
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    literal_val: int = 0
+    neg: bool = False
+    abs_: bool = False
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of bounds [0, 255]")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of bounds [0, 105]")
+
+    @classmethod
+    def vgpr(cls, idx: int, neg: bool = False, abs_: bool = False) -> Operand:
+        return cls(RegType.VGPR, index=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def sgpr(cls, idx: int, neg: bool = False, abs_: bool = False) -> Operand:
+        return cls(RegType.SGPR, index=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def literal(cls, val: int, neg: bool = False, abs_: bool = False) -> Operand:
+        return cls(RegType.LITERAL, literal_val=val & MASK32, neg=neg, abs_=abs_)
+
+    def to_asm(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            base = f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            base = f"s{self.index}"
+        else:
+            base = f"{self.literal_val:#x}"
+
+        if self.abs_:
+            base = f"|{base}|"
+        if self.neg:
+            base = f"-{base}"
+        return base
+
+
+@dataclass(frozen=True)
+class VCubemaF32Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination must be a VGPR for VALU instruction v_cubema_f32")
+        if self.dst.neg or self.dst.abs_:
+            raise ValueError("Destination cannot have neg or abs modifiers")
+
+    def to_asm(self) -> str:
+        s0 = self.src0.to_asm()
+        s1 = self.src1.to_asm()
+        s2 = self.src2.to_asm()
+        clamp_str = " clamp" if self.clamp else ""
+        return f"v_cubema_f32 {self.dst.to_asm()}, {s0}, {s1}, {s2}{clamp_str}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_ast_construction_and_formatting(self):
+        insn = VCubemaF32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0, neg=True, abs_=True),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(FOUR_F32),
+            clamp=True,
+        )
+        self.assertEqual(insn.to_asm(), f"v_cubema_f32 v3, -|v0|, s4, {FOUR_F32:#x} clamp")
+
+    def test_ast_immutability(self):
+        insn = VCubemaF32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        with self.assertRaises(Exception):
+            insn.clamp = True  # type: ignore
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(TypeError):
+            VCubemaF32Instruction(
+                dst=Operand.sgpr(3),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+        with self.assertRaises(ValueError):
+            Operand.vgpr(300)
 
 
 if __name__ == "__main__":
