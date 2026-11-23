@@ -225,7 +225,7 @@ def collect(src, min_ms=MIN_MS, max_ms=MAX_MS, names=None, join=False):
                 record["file"] = name
                 record["file_offset"] = record["offset"]
                 records.append(record)
-    if names:
+    if names is not None:     # an empty pool was still supplied: every record gets name "" (not no key)
         for record in records:
             record["name"] = names.get(record["hash_b"], "")
     return records
@@ -291,7 +291,7 @@ def main():
     print(f"{summary['records']} records, {summary['distinct_ids']} distinct ids, "
           f"ids 0x{summary['id_min']:04X}-0x{summary['id_max']:04X}, "
           f"{summary['duration_s']:.1f} s total"
-          + (f", {summary['named']} named" if names else ""))
+          + (f", {summary['named']} named" if names is not None else ""))
     return 0
 
 

@@ -67,6 +67,40 @@ class TestHash(unittest.TestCase):
                          A.joaat(A.normalized_name("Test Song")) & A.STREAM_MASK)
 
 
+    def test_normalized_name_edges(self):
+        for text, want in (("", ""), ("!!!", ""), ("  a  ", "a"), ("_lead", "lead"),
+                           ("x__y", "x_y"), ("A1 B2", "a1_b2"), ("Ça va", "ça_va")):
+            with self.subTest(text=text):
+                self.assertEqual(A.normalized_name(text), want)
+
+    def test_joaat_is_lowercased_latin_1_not_utf_8(self):
+        # "É" is one byte 0xC9 (lowercased 0xE9); its UTF-8 pair would hash to a different value.
+        def over(data):
+            h = 0
+            for c in data:
+                h = (h + c) & 0xFFFFFFFF
+                h = (h + (h << 10)) & 0xFFFFFFFF
+                h ^= h >> 6
+            h = (h + (h << 3)) & 0xFFFFFFFF
+            h ^= h >> 11
+            return (h + (h << 15)) & 0xFFFFFFFF
+
+        self.assertEqual(A.joaat("CAF\u00c9"), A.joaat("caf\u00e9"))
+        self.assertEqual(A.joaat("caf\u00e9"), over(b"caf\xe9"))
+        self.assertEqual(A.joaat("caf\u00e9"), hashdict.joaat("caf\u00e9"))
+        self.assertNotEqual(A.joaat("caf\u00e9"), over("caf\u00e9".encode("utf-8")))
+
+    def test_title_stream_id_keeps_only_the_low_29_bits(self):
+        titles = ("Test Song", "Radio_Test", "a", "b", "c", "d", "e", "f")
+        for title in titles:
+            with self.subTest(title=title):
+                full = A.joaat(A.normalized_name(title))
+                self.assertLessEqual(A.title_stream_id(title), A.STREAM_MASK)
+                self.assertEqual(A.title_stream_id(title), full & A.STREAM_MASK)
+        # the mask must matter for at least one of them, or the test proves nothing
+        self.assertTrue(any(A.joaat(A.normalized_name(t)) > A.STREAM_MASK for t in titles))
+
+
 class TestScan(unittest.TestCase):
     def test_single_record(self):
         blob = b"\x00\x00\x00\x00" + make_record(0xB422, 264_091, 0x49FC8153, 0xDAA8AC2F)
@@ -131,6 +165,37 @@ class TestScan(unittest.TestCase):
             rows = A.collect(tmp, join=True)
         self.assertEqual([(row["offset"], row["file"], row["file_offset"]) for row in rows],
                          [(4, name, 0)])
+
+
+    def test_duration_bounds_are_inclusive_and_configurable(self):
+        for duration, want in ((A.MIN_MS - 1, 0), (A.MIN_MS, 1), (A.MAX_MS, 1), (A.MAX_MS + 1, 0)):
+            with self.subTest(duration=duration):
+                self.assertEqual(len(A.scan(b"\x00" * 4 + make_record(0x1000, duration))), want)
+        blob = b"\x00" * 4 + make_record(0x1000, 100_000) + make_record(0x1001, 300_000)
+        self.assertEqual([r["id"] for r in A.scan(blob, min_ms=200_000)], [0x1001])
+        self.assertEqual([r["id"] for r in A.scan(blob, max_ms=150_000)], [0x1000])
+        self.assertEqual([r["id"] for r in A.scan(blob, min_ms=100_000, max_ms=300_000)], [0x1000, 0x1001])
+
+    def test_marker_in_the_first_four_bytes_has_no_duration_and_is_not_a_record(self):
+        # A record needs its 4 duration bytes before the marker; a marker at 0 would read blob[-4:].
+        blob = make_record(0x1000, 100_000)[4:]
+        self.assertEqual(A.scan(blob), [])
+        self.assertEqual(list(A.scan_stream([blob])), [])
+        self.assertEqual([r["offset"] for r in A.scan(struct.pack("<I", 100_000) + blob)], [4])
+
+
+class TestSummarize(unittest.TestCase):
+    def test_empty_table(self):
+        self.assertEqual(A.summarize([]), {"records": 0, "distinct_ids": 0, "id_min": None, "id_max": None,
+                                           "duration_s": 0.0, "named": 0, "duplicate_ids": []})
+
+    def test_counts_range_duplicates_and_names(self):
+        blob = (b"\x00" * 4 + make_record(0x10, 100_001) + make_record(0x12, 200_002)
+                + make_record(0x10, 300_003))
+        rows = A.scan(blob)
+        rows[0]["name"], rows[1]["name"], rows[2]["name"] = "A", "", "C"
+        self.assertEqual(A.summarize(rows), {"records": 3, "distinct_ids": 2, "id_min": 0x10, "id_max": 0x12,
+                                             "duration_s": 600.006, "named": 2, "duplicate_ids": [0x10]})
 
 
 class TestJoin(unittest.TestCase):
@@ -328,6 +393,49 @@ class TestCli(unittest.TestCase):
         rows = json.loads(doc.stdout)["records"]
         self.assertEqual([(r["file"], r["offset"], r["file_offset"]) for r in rows],
                          [("middle.bin", 132, 0), ("middle.bin", 218, 86)])
+
+
+    def test_empty_name_pool_is_still_a_supplied_pool(self):
+        blob = b"\x00" * 4 + make_record(0x2000, 123_456)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(blob)
+            self.assertNotIn("name", A.collect(tmp)[0])
+            self.assertEqual(A.collect(tmp, names={})[0]["name"], "")
+            pool = os.path.join(tmp, "empty.txt")
+            for content in (b"", b"\x00\x00"):
+                with open(pool, "wb") as f:
+                    f.write(content)
+                with self.subTest(pool=content):
+                    text = subprocess.run([sys.executable, "-I", TOOL, tmp, "--names", pool],
+                                          capture_output=True, text=True)
+                    doc = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", "--names", pool],
+                                         capture_output=True, text=True)
+                    self.assertEqual(text.returncode, 0, text.stderr)
+                    self.assertTrue(text.stdout.splitlines()[-1].endswith(", 0 named"), text.stdout)
+                    self.assertEqual(doc.returncode, 0, doc.stderr)
+                    parsed = json.loads(doc.stdout)
+                    self.assertEqual(parsed["records"][0]["name"], "")
+                    self.assertEqual(parsed["summary"]["named"], 0)
+
+    def test_min_and_max_ms_filter_records_and_no_match_is_one_line(self):
+        blob = b"\x00" * 4 + make_record(0x1000, 100_000) + make_record(0x1001, 300_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "00000001.bin")
+            with open(path, "wb") as f:
+                f.write(blob)
+            run = lambda *extra: subprocess.run([sys.executable, "-I", TOOL, path, "--json", *extra],
+                                                capture_output=True, text=True)
+            p = run("--min-ms", "200000")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual([r["id"] for r in json.loads(p.stdout)["records"]], [0x1001])
+            p = run("--max-ms", "150000")
+            self.assertEqual([r["id"] for r in json.loads(p.stdout)["records"]], [0x1000])
+            p = run("--min-ms", "400000")
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("no audio-config records found", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertEqual(p.stdout, "")
 
 
 if __name__ == "__main__":
