@@ -1435,21 +1435,49 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
     return nullptr;
 }
 
-// Why the host would refuse this CreateHeap description, or null if these checks pass (D3D-238). A probe on an
-// RX 5700 and WARP refuses an alignment other than 0, 64 KiB and 4 MiB, the heap properties above (a type of 0, a
-// custom heap without a CPU page property), and a heap that denies buffers and both kinds of texture. ALLOW_DISPLAY
-// (CreateCommittedResource on a default heap only, per the D3D12_HEAP_FLAGS documentation) is refused too, confirmed
-// on an RTX 4070 SUPER and a UHD 770 host by @CowBoYdu76. Those hosts accept HARDWARE_PROTECTED, so it is not refused.
+// Why the host would refuse this CreateHeap description, or null if these checks pass (D3D-238). Measured on an
+// RTX 5090, RX 5700, RTX 4070 SUPER, UHD 770 and WARP: refuses zero size, alignment other than 0 / 64 KiB / 4 MiB,
+// invalid heap properties, unknown D3D12_HEAP_FLAGS bits, ALLOW_DISPLAY (committed resources only), single-bit or
+// all-three DENY combinations (only ALLOW_ALL or ALLOW_ONLY_* are valid), SHARED on CPU-accessible heaps,
+// SHARED_CROSS_ADAPTER without SHARED or with DENY flags or on L1, ALLOW_WRITE_WATCH on non-CPU-accessible heaps,
+// and ALLOW_SHADER_ATOMICS on UPLOAD/READBACK heaps. HARDWARE_PROTECTED is accepted on Win11 hosts, so not refused.
 const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
     if (!desc.SizeInBytes) return "zero size";
     if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
         desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
         return "alignment (0, 64 KiB or 4 MiB)";
     if (const char* why = heap_properties_refusal(desc.Properties)) return why;
+    const UINT flags = UINT(desc.Flags);
+    constexpr UINT known_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
+                                 D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                 D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_HARDWARE_PROTECTED |
+                                 D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS |
+                                 D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    if (flags & ~known_flags) return "unknown heap flags";
+    if (flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) return "ALLOW_DISPLAY (committed resources only)";
     constexpr UINT deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
                               D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
-    if ((UINT(desc.Flags) & deny_all) == deny_all) return "heap flags denying every resource kind";
-    if (UINT(desc.Flags) & D3D12_HEAP_FLAG_ALLOW_DISPLAY) return "ALLOW_DISPLAY (committed resources only)";
+    const UINT deny = flags & deny_all;
+    if (deny != D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES && deny != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS &&
+        deny != D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES && deny != D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES)
+        return "heap DENY flags (must allow all or allow only one resource kind)";
+    const bool cpu_accessible =
+        desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD || desc.Properties.Type == D3D12_HEAP_TYPE_READBACK ||
+        (desc.Properties.Type == D3D12_HEAP_TYPE_CUSTOM &&
+         desc.Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+    if ((flags & D3D12_HEAP_FLAG_SHARED) && cpu_accessible) return "SHARED on a CPU-accessible heap";
+    if (flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) {
+        if (!(flags & D3D12_HEAP_FLAG_SHARED)) return "SHARED_CROSS_ADAPTER without SHARED";
+        if (deny != D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES) return "SHARED_CROSS_ADAPTER with DENY flags";
+        if (desc.Properties.Type == D3D12_HEAP_TYPE_CUSTOM &&
+            desc.Properties.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
+            return "SHARED_CROSS_ADAPTER on L1 memory pool";
+    }
+    if ((flags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) && !cpu_accessible)
+        return "ALLOW_WRITE_WATCH on a non-CPU-accessible heap";
+    if ((flags & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) &&
+        (desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD || desc.Properties.Type == D3D12_HEAP_TYPE_READBACK))
+        return "ALLOW_SHADER_ATOMICS on upload or readback heap";
     return nullptr;
 }
 
@@ -6022,7 +6050,11 @@ public:
     void STDMETHODCALLTYPE CopyDescriptors(UINT destination_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* destinations,
                                            const UINT* destination_sizes, UINT source_ranges,
                                            const D3D12_CPU_DESCRIPTOR_HANDLE* sources, const UINT* source_sizes,
-                                           D3D12_DESCRIPTOR_HEAP_TYPE) override {
+                                           D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        if (UINT(type) >= UINT(D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES)) {
+            log_once("CopyDescriptors ignored invalid descriptor heap type", int(type));
+            return;
+        }
         if (!destinations || !sources) return;
         UINT d = 0, s = 0, d_at = 0, s_at = 0;  // the range on each side, and the position in it
         while (d < destination_ranges && s < source_ranges) {
@@ -6042,8 +6074,12 @@ public:
 
     void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE destination,
                                                  D3D12_CPU_DESCRIPTOR_HANDLE source,
-                                                 D3D12_DESCRIPTOR_HEAP_TYPE) override {
-        if (!destination.ptr || !source.ptr) return;
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        if (UINT(type) >= UINT(D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES)) {
+            log_once("CopyDescriptorsSimple ignored invalid descriptor heap type", int(type));
+            return;
+        }
+        if (!count || !destination.ptr || !source.ptr) return;
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
                      std::size_t(count) * kDescriptorSize);
     }
@@ -6700,16 +6736,13 @@ public:
                      int(desc->SizeInBytes / 1024));
             return E_NOTIMPL;
         }
+        if (!out) return S_FALSE;
         auto* heap = new Heap(state_, *desc);
         heap->attach_device(identity());
         if (!heap->reserved()) {
             log_once("GPU address arena full (raise LEONIDA_ARENA_MB); heap size in KiB:", int(desc->SizeInBytes / 1024));
             heap->Release();
             return E_OUTOFMEMORY;
-        }
-        if (!out) {
-            heap->Release();
-            return S_FALSE;
         }
         return hand_out(heap, riid, out);
     }

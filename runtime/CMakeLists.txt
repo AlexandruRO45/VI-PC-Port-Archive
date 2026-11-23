@@ -1874,6 +1874,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_heap_properties COMMAND d3d12_heap_properties_test)
     set_tests_properties(d3d12_heap_properties PROPERTIES SKIP_RETURN_CODE 77)
 
+    # CreateHeap description / null-output capability-probe parity against host D3D12 + WARP, and CopyDescriptors heap-type guard.
+    add_executable(d3d12_heap_desc_parity_test test/d3d12_heap_desc_parity_test.cpp)
+    target_link_libraries(d3d12_heap_desc_parity_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_heap_desc_parity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_heap_desc_parity_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_heap_desc_parity COMMAND d3d12_heap_desc_parity_test)
+    set_tests_properties(d3d12_heap_desc_parity PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # CreatePipelineLibrary and ID3D12PipelineLibrary1 arguments, compared with the host runtime.
     add_executable(d3d12_pipeline_library_host_test test/d3d12_pipeline_library_host_test.cpp)
     target_link_libraries(d3d12_pipeline_library_host_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
