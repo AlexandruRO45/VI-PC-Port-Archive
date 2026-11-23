@@ -72,7 +72,7 @@ $batchText = "@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`n
 [System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
 # /s with a second pair of quotes: cmd.exe strips only the outer pair, so a path holding & or ^ stays quoted.
-$p = Start-Process cmd.exe -ArgumentList "/s", "/c", "`"`"$bat`"`"" -NoNewWindow -PassThru
+$p = Start-Process $env:ComSpec -ArgumentList "/s", "/c", "`"`"$bat`"`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit
 try { $p.PriorityClass = "BelowNormal" } catch {}
 $p.WaitForExit()
