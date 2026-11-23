@@ -6988,14 +6988,30 @@ class Gen:
             # (measured on gfx1036). Positive inlines zero-extend, negative inlines sign-extend, 32-bit literals
             # retain their full dword; OpBitField*Extract at 16*sl[i] lowers this directly.
             def bits(name, default):
-                m = next((m for m in mods if m.startswith(name + ":")), None)
-                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+                matches = [m for m in mods if m.startswith(name + ":")]
+                if not matches:
+                    return default
+                if len(matches) > 1:
+                    raise Unsupported(op + " modifiers")
+                val = matches[0][len(name) + 1:]
+                if not (val.startswith("[") and val.endswith("]")):
+                    raise Unsupported(op + " modifiers")
+                try:
+                    return [int(v) for v in val[1:-1].split(",")]
+                except ValueError:
+                    raise Unsupported(op + " modifiers") from None
             ns = 3 if "_mad_" in op else 2
-            sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
-            if (len(sel) != ns or len(selhi) != ns
+            if (ins["op"].endswith(("_dpp", "_sdwa"))
                     or any(m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
-                    or any(any(bits(n, [0] * ns)) for n in ("neg_lo", "neg_hi"))):
+                    or any(s.get("neg") or s.get("abs") for s in a)):
                 raise Unsupported(op + " modifiers")
+            sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
+            neg_lo, neg_hi = bits("neg_lo", [0] * ns), bits("neg_hi", [0] * ns)
+            if (any(len(v) not in (ns, 3) for v in (sel, selhi, neg_lo, neg_hi))
+                    or any(b not in (0, 1) for b in sel + selhi)
+                    or any(neg_lo) or any(neg_hi)):
+                raise Unsupported(op + " modifiers")
+            sel, selhi = sel[:ns], selhi[:ns]
             kind = op[len("v_pk_"):].rsplit("_", 1)[0]          # add, sub, mul_lo, mad, max, min
             signed = op.endswith("i16")
             clamp = "clamp" in mods and kind in ("add", "sub", "mad")
