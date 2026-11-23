@@ -23,6 +23,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)  # python -I leaves the script's folder off sys.path
 
 import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 rdna2spirv = support.rdna2spirv
 
@@ -53,18 +54,31 @@ def mesh_dxbc(group_shared, threads=THREADS):
     return b"DXBC" + bytes(16) + struct.pack("<IIII", 1, head + len(part), 1, head) + part
 
 
-def translate_ms(group_shared, *, mesh_compute=True, emulate=True, limit=None):
+def translate_ms(group_shared, *, mesh_compute=True, emulate=True, limit=None, program=PROGRAM, threads=THREADS):
     prev = rdna2spirv.MESH_COMPUTE, rdna2spirv.WAVE64_EMULATE, rdna2spirv.MAX_SHARED_BYTES
     rdna2spirv.MESH_COMPUTE = mesh_compute
     rdna2spirv.WAVE64_EMULATE = emulate
     if limit is not None:
         rdna2spirv.MAX_SHARED_BYTES = limit
     try:
-        spv = support.translate_lines("ms_shared_limit", PROGRAM, dxbc=mesh_dxbc(group_shared))
+        spv = support.translate_lines("ms_shared_limit", program, dxbc=mesh_dxbc(group_shared, threads=threads))
         meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
     finally:
         rdna2spirv.MESH_COMPUTE, rdna2spirv.WAVE64_EMULATE, rdna2spirv.MAX_SHARED_BYTES = prev
     return spv, meta
+
+
+def validate_spv(tc, spv):
+    if shutil.which("spirv-as") and shutil.which("spirv-val"):
+        with tempfile.TemporaryDirectory() as tmp:
+            asm = os.path.join(tmp, "ms.spvasm")
+            bin_path = os.path.join(tmp, "ms.spv")
+            with open(asm, "w", encoding="utf-8", newline="\n") as f:
+                f.write(spv)
+            for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", bin_path],
+                        ["spirv-val", "--target-env", "vulkan1.2", bin_path]):
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                tc.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 def workgroup_bytes(spv):
@@ -113,16 +127,7 @@ class MeshComputeSharedMemoryLimitTests(unittest.TestCase):
         self.assertEqual(meta["lds_bytes"], sum(wg.values()))
         self.assertEqual(lds_index_ops(spv), set())
         self.assertEqual(bounds_checks(spv), 2)
-        if shutil.which("spirv-as") and shutil.which("spirv-val"):
-            with tempfile.TemporaryDirectory() as tmp:
-                asm = os.path.join(tmp, "ms.spvasm")
-                bin_path = os.path.join(tmp, "ms.spv")
-                with open(asm, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(spv)
-                for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", bin_path],
-                            ["spirv-val", "--target-env", "vulkan1.2", bin_path]):
-                    r = subprocess.run(cmd, capture_output=True, text=True)
-                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        validate_spv(self, spv)
 
     def test_exact_limit_accepted_and_one_dword_less_refused(self):
         exact = 32768 + X_BUF + MS_COUNTS
@@ -156,6 +161,112 @@ class MeshComputeSharedMemoryLimitTests(unittest.TestCase):
     def test_native_mesh_ext_is_unaffected_by_compute_shared_limit(self):
         spv, _ = translate_ms(36864, mesh_compute=False, emulate=False, limit=49152)
         self.assertEqual(workgroup_bytes(spv), {"%lds": 65536, "%ms_counts": MS_COUNTS})
+
+    def test_shrunk_lds_addtid_and_float_atomics_preserve_addressing(self):
+        # 36 KiB declared LDS (9216 dwords, non-power-of-two) shrunk under a 48 KiB cap.
+        # Direct lds_ptr() bitmasking (idx & 0x23ff) would map dword 1027 (byte 4108) onto dword 3 (byte 12).
+        f_1 = 0x3F800000     # 1.0f
+        f_2 = 0x40000000     # 2.0f
+        f_half = 0x3F000000  # 0.5f
+        f_3_5 = 0x40600000   # 3.5f
+        f_7 = 0x40E00000     # 7.0f
+        f_9 = 0x41100000     # 9.0f
+
+        def store_out(slot, vreg):
+            return [f"v_mov_b32_e32 v30, {4 * slot}", f"buffer_store_dword v{vreg}, v30, s[4:7], 0 offen"]
+
+        prog = [
+            "s_mov_b32 exec_lo, -1",
+            # Seed dword 0 (sentinel for OOB checks), dword 3 (alias target of 1027 & 0x23ff), and dword 1027 (byte 4108).
+            "s_mov_b32 m0, 0",
+            "v_mov_b32_e32 v1, 0x5e17",
+            "ds_write_addtid_b32 v1",
+            "s_mov_b32 m0, 12",
+            "v_mov_b32_e32 v1, 0x3333",
+            "ds_write_addtid_b32 v1",
+            "s_mov_b32 m0, 4108",
+            f"v_mov_b32_e32 v1, {hex(f_1)}",
+            "ds_write_addtid_b32 v1",
+            "s_waitcnt lgkmcnt(0)",
+            # In-bounds ds_read_addtid_b32 at M0=4108 (lane 0 -> dword 1027, NOT dword 3).
+            "v_mov_b32_e32 v10, 0xdead",
+            "ds_read_addtid_b32 v10",
+            "s_waitcnt lgkmcnt(0)",
+            # In-bounds ds_add_rtn_f32 & ds_add_f32 at byte 4108 (dword 1027).
+            "v_mov_b32_e32 v2, 4108",
+            f"v_mov_b32_e32 v3, {hex(f_2)}",
+            "v_mov_b32_e32 v11, 0xdead",
+            "ds_add_rtn_f32 v11, v2, v3",
+            f"v_mov_b32_e32 v3, {hex(f_half)}",
+            "ds_add_f32 v2, v3",
+            "s_waitcnt lgkmcnt(0)",
+            # In-bounds ds_cmpst_rtn_f32 & ds_cmpst_f32 at byte 4108 (dword 1027).
+            f"v_mov_b32_e32 v3, {hex(f_3_5)}",
+            f"v_mov_b32_e32 v4, {hex(f_7)}",
+            "v_mov_b32_e32 v12, 0xdead",
+            "ds_cmpst_rtn_f32 v12, v2, v3, v4",
+            f"v_mov_b32_e32 v3, {hex(f_7)}",
+            f"v_mov_b32_e32 v4, {hex(f_9)}",
+            "ds_cmpst_f32 v2, v3, v4",
+            "s_waitcnt lgkmcnt(0)",
+            # Read back dword 1027 and dword 3 after in-bounds ops.
+            "ds_read_addtid_b32 v13",
+            "s_mov_b32 m0, 12",
+            "ds_read_addtid_b32 v14",
+            "s_waitcnt lgkmcnt(0)",
+            # Out-of-bounds (byte 36864 == dword 9216 == lds_bound): writes/atomics dropped, reads/returns give 0.
+            "s_mov_b32 m0, 36864",
+            "v_mov_b32_e32 v1, 0xbad",
+            "ds_write_addtid_b32 v1",
+            "v_mov_b32_e32 v15, 0xdead",
+            "ds_read_addtid_b32 v15",
+            "v_mov_b32_e32 v2, 36864",
+            f"v_mov_b32_e32 v3, {hex(f_2)}",
+            "v_mov_b32_e32 v16, 0xdead",
+            "ds_add_rtn_f32 v16, v2, v3",
+            "ds_add_f32 v2, v3",
+            "v_mov_b32_e32 v17, 0xdead",
+            "v_mov_b32_e32 v3, 0x5e17",
+            "v_mov_b32_e32 v4, 0xbad",
+            "ds_cmpst_rtn_f32 v17, v2, v3, v4",
+            "ds_cmpst_f32 v2, v3, v4",
+            "s_waitcnt lgkmcnt(0)",
+            # Verify dword 0 sentinel is untouched by OOB writes/atomics.
+            "s_mov_b32 m0, 0",
+            "ds_read_addtid_b32 v18",
+            "s_waitcnt lgkmcnt(0)",
+        ]
+        for slot, vreg in enumerate((10, 11, 12, 13, 14, 15, 16, 17, 18)):
+            prog += store_out(slot, vreg)
+        prog.append("s_endpgm")
+
+        # Validate both wave32 (non-emulated) and wave64-emulated shrunk --mesh-compute SPIR-V.
+        for emulate, threads, expected_wg in (
+            (False, 32, {"%lds": 36864, "%ms_counts": MS_COUNTS}),
+            (True, THREADS, {"%lds": 36864, "%x_buf": X_BUF, "%ms_counts": MS_COUNTS}),
+        ):
+            with self.subTest(emulate=emulate):
+                p = (["s_mov_b64 exec, -1"] + prog[1:]) if emulate else prog
+                spv, meta = translate_ms(36864, mesh_compute=True, emulate=emulate, limit=49152,
+                                         program=p, threads=threads)
+                self.assertEqual(workgroup_bytes(spv), expected_wg)
+                self.assertEqual(meta["lds_bytes"], sum(expected_wg.values()))
+                self.assertEqual(lds_index_ops(spv), set())
+                self.assertEqual(bounds_checks(spv), 17)
+                validate_spv(self, spv)
+                if not emulate:
+                    # Execute lane 0 through spirv_mini_interp (output V# in s[4:7], base 0x1000 away from moa=0).
+                    out_base = 0x1000
+                    vsharp = [out_base, 0, 0x1000, 0x31016FAC]
+                    mem = si.run_workgroup(
+                        spv, 1, 32,
+                        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%num_wg": (1, 1, 1),
+                                              "%local_id": (i, 0, 0), "%local_index": i, "%sg_lane": i},
+                        push_constants=[0, 0, 0, 0] + vsharp + [0] * 24,
+                        memory={},
+                    )
+                    got = tuple(mem.get(out_base + 4 * k) for k in range(9))
+                    self.assertEqual(got, (f_1, f_1, f_3_5, f_9, 0x3333, 0, 0, 0, 0x5E17))
 
 
 if __name__ == "__main__":

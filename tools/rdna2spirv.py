@@ -4480,6 +4480,8 @@ class Gen:
 
     def lds_ptr(self, addr, byte_off):
         """Pointer to the LDS dword at (addr + byte_off) / 4, wrapped to the array (LDS is a Workgroup uint array)."""
+        assert self.lds_dwords and (self.lds_dwords & (self.lds_dwords - 1)) == 0, \
+            f"lds_ptr requires power-of-two lds_dwords (got {self.lds_dwords})"
         s1, i, m, p = self.tmp(), self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(byte_off)}")
         self.emit(f"{i} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
@@ -4608,13 +4610,10 @@ class Gen:
             self.emit(f"{base} = OpBitwiseAnd %uint {m0} {self.cu(0xFFFF)}")
             self.emit(f"{lane_bytes} = OpShiftLeftLogical %uint {self.wave_lane()} {self.cu(2)}")
             self.emit(f"{addr} = OpIAdd %uint {base} {lane_bytes}")
-            ptr = self.lds_ptr(addr, off)
             if op == "ds_read_addtid_b32":
-                value = self.tmp()
-                self.emit(f"{value} = OpLoad %uint {ptr} Volatile")       # as lds_load
-                self.dst(a[0], value)
+                self.dst(a[0], self.lds_load(addr, off))
             else:
-                self.emit(f"OpStore {ptr} {self.src_u(a[0])} Volatile")
+                self.lds_store(addr, off, self.src_u(a[0]))
         elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
@@ -4820,34 +4819,43 @@ class Gen:
             # value it read. How the LDS adder treats denormals and NaN payloads is not measured: OpFAdd's IEEE
             # result is what is computed.
             d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
-            p = self.lds_ptr(self.src_u(ad), off)
+            addr = self.src_u(ad)
             x = self.tof(self.src_u(dat))
-            lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + t for t in ("_hdr", "_cont", "_exit"))
-            init = self.tmp()
-            self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
-            entry = self.current_label_placeholder()
-            self.emit(f"OpBranch {lbl_hdr}")
-            self.emit(f"{lbl_hdr} = OpLabel")
-            cur, cur_f, sum_f, new, got, done = (self.tmp() for _ in range(6))
-            self.emit(f"{cur} = OpPhi %uint {init} {entry} {got} {lbl_cont}")
-            self.emit(f"{cur_f} = OpBitcast %float {cur}")
-            self.emit(f"{sum_f} = OpFAdd %float {cur_f} {x}")
-            self.emit(f"{new} = OpBitcast %uint {sum_f}")
-            self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new} {cur}")
-            self.emit(f"{done} = OpIEqual %bool {got} {cur}")
-            self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
-            self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
-            self.emit(f"{lbl_cont} = OpLabel")
-            self.emit(f"OpBranch {lbl_hdr}")
-            self.emit(f"{lbl_exit} = OpLabel")
+
+            def add_f32(p):
+                lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + t for t in ("_hdr", "_cont", "_exit"))
+                init = self.tmp()
+                self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
+                entry = self.current_label_placeholder()
+                self.emit(f"OpBranch {lbl_hdr}")
+                self.emit(f"{lbl_hdr} = OpLabel")
+                cur, cur_f, sum_f, new, got, done = (self.tmp() for _ in range(6))
+                self.emit(f"{cur} = OpPhi %uint {init} {entry} {got} {lbl_cont}")
+                self.emit(f"{cur_f} = OpBitcast %float {cur}")
+                self.emit(f"{sum_f} = OpFAdd %float {cur_f} {x}")
+                self.emit(f"{new} = OpBitcast %uint {sum_f}")
+                self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new} {cur}")
+                self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+                self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+                self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+                self.emit(f"{lbl_cont} = OpLabel")
+                self.emit(f"OpBranch {lbl_hdr}")
+                self.emit(f"{lbl_exit} = OpLabel")
+                return cur if d is not None else None
+
+            old = self.lds_access(addr, off, add_f32)     # bounds-checked when lds_bound is set (SHADER-309)
             if d is not None:
-                self.dst(d, cur)
+                self.dst(d, old)
         elif op in ("ds_cmpst_rtn_f32", "ds_cmpst_f32"):
-            # ds_cmpst_b32's operands (DATA = the compare value, DATA2 = the new one), compared as binary32. A CAS
-            # loop, so lds_ptr as the other CAS-loop LDS atomics (lds_access's merge assumes a single-block access).
+            # ds_cmpst_b32's operands (DATA = the compare value, DATA2 = the new one), compared as binary32.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
-            p = self.lds_ptr(self.src_u(ad), off)
-            old = self.float_cmpswap_loop(p, self.src_u(src), self.src_u(cmp_), sc)
+            addr, new_v, cmp_v = self.src_u(ad), self.src_u(src), self.src_u(cmp_)
+
+            def cmpst_f32(p):
+                cur = self.float_cmpswap_loop(p, new_v, cmp_v, sc)
+                return cur if d is not None else None
+
+            old = self.lds_access(addr, off, cmpst_f32)   # bounds-checked when lds_bound is set (SHADER-309)
             if d is not None:
                 self.dst(d, old)
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
