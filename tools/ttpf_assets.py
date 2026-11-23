@@ -5,15 +5,14 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 import zlib
 
 # `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bcpack
-from file_mode import published_mode
 import ttpf_mips as ttpf
+from ttpf_output import staged_output
 
 
 def load_profile(work):
@@ -43,16 +42,8 @@ def load_profile(work):
 
 
 def publish(path, data):
-    f = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
-    tmp = Path(f.name)
-    try:
-        with f:
-            f.write(data)
-        if os.name != "nt":
-            tmp.chmod(published_mode(path))
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    with staged_output(path, replace=True) as output:
+        output.write(data)
 
 
 def file_identity(path):
@@ -157,19 +148,20 @@ def complete_pool(source, directory, manifest, settings):
                         continue
                     if decoder and desc["dimension"] == 1 and desc["format"] in decoder.formats:
                         method = stamp
-                        blob = decoder.dds(index)
+                        parts = decoder.dds_parts(index)
                     else:
                         method = "v1-strict"
                         analysis = ttpf.analyze(pool, index)
-                        blob = ttpf.texture_dds(pool, analysis)
+                        parts = ttpf.texture_dds_parts(pool, analysis)
+                    # Keep the lower-mip file until the manifest switches to this complete chain.
+                    name = f"{index:06d}_bcpack_{method[:19]}.dds"
+                    with staged_output(directory / name, replace=True) as output:
+                        output.writelines(parts)
                 except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
                         bcpack.BcpackUnsupportedCodec, zlib.error) as exc:
                     row["BCPackLimitation"] = str(exc)
                     blocked += 1
                     continue
-                # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
-                name = f"{index:06d}_bcpack_{method[:19]}.dds"
-                publish(directory / name, blob)
                 if isinstance(row.get("File"), str) and row["File"] != name:
                     superseded.add(row["File"])
                 row.update(File=name, Mips=desc["mips"], BaseMipLevel=0, Limitation=None, BCPackDecoder=method)

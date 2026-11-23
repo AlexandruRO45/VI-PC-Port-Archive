@@ -1107,6 +1107,27 @@ class SyntheticPoolTest(unittest.TestCase):
         linear = solid_chain(self.layout)
         self.assertEqual(data[148:], b"".join(linear[m["index"]] for m in self.layout["mips"]))
 
+    def test_dds_parts_check_limit_and_read_one_mip_at_a_time(self):
+        analysis = ttpf.analyze(self.pool, 0)
+        linear = solid_chain(self.layout)
+        top, child = linear[0], linear[1]
+        header = ttpf.dds_bytes(256, 256, 71, 2, len(top), b"")
+        limit = len(header) + len(top) + len(child)
+        with mock.patch.object(self.pool, "read_range", wraps=self.pool.read_range) as read:
+            with mock.patch.object(ttpf, "MAX_OUTPUT", limit - 1):
+                with self.assertRaisesRegex(ValueError, "DDS exceeds"):
+                    next(ttpf.texture_dds_parts(self.pool, analysis, mips=2))
+            read.assert_not_called()
+            with mock.patch.object(ttpf, "MAX_OUTPUT", limit):
+                parts = ttpf.texture_dds_parts(self.pool, analysis, mips=2)
+                self.assertEqual(next(parts), header)
+                read.assert_not_called()
+                self.assertEqual(next(parts), top)
+                self.assertEqual(read.call_count, 1)
+                self.assertEqual(list(parts), [child])
+                self.assertEqual(read.call_count, 2)
+        self.assertEqual(ttpf.texture_dds(self.pool, analysis, 2), header + top + child)
+
     def test_export_requested_mip_prefix_with_unavailable_lower_mips(self) -> None:
         layout = self.layout
         linear = solid_chain(layout)
@@ -1149,6 +1170,48 @@ class SyntheticPoolTest(unittest.TestCase):
             self.assertEqual(ttpf.export(self.pool, 0, out, force=True), 1)
         self.assertIn(out, error.getvalue())
         self.assertIn("cannot write", error.getvalue())
+
+    def test_late_input_error_keeps_previous_dds_and_cleans_stage(self):
+        out = os.path.join(self.tmp.name, "texture.dds")
+        with open(out, "wb") as output:
+            output.write(b"previous export")
+        read = self.pool.read_range
+        count = 0
+
+        def fail_second_read(*args, **kwargs):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise OSError("read interrupted")
+            return read(*args, **kwargs)
+
+        with mock.patch.object(self.pool, "read_range", fail_second_read), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ttpf.export(self.pool, 0, out, force=True), 2)
+        self.assertIn("texture 0: read interrupted", err.getvalue())
+        with open(out, "rb") as output:
+            self.assertEqual(output.read(), b"previous export")
+        self.assertEqual(set(os.listdir(self.tmp.name)), {"synthetic.ttpf", "texture.dds"})
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permissions and symlinks")
+    def test_force_preserves_output_symlink_and_write_permissions(self):
+        target = os.path.join(self.tmp.name, "target.dds")
+        link = os.path.join(self.tmp.name, "link.dds")
+        with open(target, "wb") as output:
+            output.write(b"old")
+        os.symlink(target, link)
+        os.chmod(target, 0o444)
+        if not os.access(target, os.W_OK):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(ttpf.export(self.pool, 0, link, force=True), 1)
+            with open(target, "rb") as output:
+                self.assertEqual(output.read(), b"old")
+        os.chmod(target, 0o640)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.export(self.pool, 0, link, force=True), 0)
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o640)
+        with open(target, "rb") as output:
+            self.assertEqual(output.read(4), b"DDS ")
 
     def test_scan_reports_the_whitelist_gate(self):
         # The synthetic tuple is validated, so it is not gated: the partial export is
@@ -1389,6 +1452,22 @@ class AssetKeyStraddleTest(unittest.TestCase):
 
 
 class PoolCacheTest(unittest.TestCase):
+    def test_export_cache_evicts_by_decoded_bytes_and_reuses_one_large_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cache.ttpf")
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            write_rds5_pool(path, [record], [b"a" * 4096, b"b" * 4096, b"c" * 4096, b"d" * 12288])
+            cache = ttpf._DdsChunkCache(8192)
+            with closing(ttpf.Pool(path)) as pool, mock.patch.object(
+                    zlib, "decompressobj", wraps=zlib.decompressobj) as decode:
+                # Refresh a, evict b for c, then reuse the single oversized d alone.
+                for block, byte, decodes in ((1, b"a", 1), (2, b"b", 2), (1, b"a", 2),
+                                             (3, b"c", 3), (1, b"a", 3), (2, b"b", 4),
+                                             (4, b"d", 5), (5, b"d", 5), (1, b"a", 6),
+                                             (4, b"d", 7)):
+                    self.assertEqual(pool.read_range(block * 4096, 1, cache), byte)
+                    self.assertEqual(decode.call_count, decodes)
+
     def test_zlib_chunk_rejects_a_decoded_size_larger_than_its_range(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = os.path.join(temp, "pool.ttpf")
@@ -1893,6 +1972,26 @@ class SyntheticArrayPoolTest(unittest.TestCase):
         self.assertEqual((total["arrays"], total["arrays_2d"], total["arrays_2d_full"]), (1, 1, 1))
         self.assertEqual((total["after_full"], total["after_skip"]), (1, 0))
 
+    def test_array_prefix_streams_each_layer_once_from_one_oversize_chunk(self):
+        path = os.path.join(self.tmp.name, "array_prefix.ttpf")
+        _, layers = self._build_array_pool(path)
+        with closing(ttpf.Pool(path)) as pool:
+            analysis = ttpf.analyze(pool, 0)
+            expected = [layer[mip] for layer in layers for mip in range(2)]
+            length = 148 + sum(map(len, expected))
+            with mock.patch.object(ttpf, "MAX_OUTPUT", length - 1), \
+                    mock.patch.object(pool, "read_range") as read:
+                with self.assertRaisesRegex(ValueError, "DDS exceeds"):
+                    next(ttpf.texture_dds_parts(pool, analysis, 2))
+                read.assert_not_called()
+            with mock.patch.object(ttpf, "DDS_CHUNK_CACHE_BYTES", 8192), \
+                    mock.patch.object(zlib, "decompressobj", wraps=zlib.decompressobj) as decode:
+                parts = ttpf.texture_dds_parts(pool, analysis, 2)
+                header = next(parts)
+                self.assertEqual(struct.unpack_from("<I", header, 28), (2,))
+                self.assertEqual(list(parts), expected)
+                self.assertEqual(decode.call_count, 1)
+
     def test_2d_array_negative_controls(self):
         import io
         from contextlib import redirect_stdout, redirect_stderr
@@ -2032,6 +2131,10 @@ class SyntheticCubemapPoolTest(unittest.TestCase):
                     for m in layout["mips"]
                 )
                 self.assertEqual(dds[148:], expected_payload)
+
+                prefix = ttpf.texture_dds_parts(pool, a, 2)
+                self.assertEqual(struct.unpack_from("<I", next(prefix), 28), (2,))
+                self.assertEqual(list(prefix), [face[mip] for face in linear_faces for mip in range(2)])
 
                 scan_out = os.path.join(self.tmp.name, f"scan_cube{mode}.json")
                 with redirect_stdout(io.StringIO()):
@@ -2174,6 +2277,25 @@ class SyntheticVolumePoolTest(unittest.TestCase):
         rec = pack_etpf_record(width, height, mips, 0, fmt, depth, 3, mode, base)
         write_rds5_pool(path, [rec], [tiled])
         return layout, linear, tiled
+
+    def test_stream_volume_z_slices_across_tile_slabs(self):
+        path = os.path.join(self.tmp.name, "slices.ttpf")
+        w, h, depth = 16, 8, 19
+        layout, linear, _ = self._build_volume_pool(path, w, h, depth, 54)
+        with closing(ttpf.Pool(path)) as pool:
+            analysis = ttpf.analyze(pool, 0)
+            with mock.patch.object(pool, "read_range", wraps=pool.read_range) as read:
+                parts = ttpf.texture_dds_parts(pool, analysis)
+                header = next(parts)
+                self.assertEqual(header, ttpf.dds_bytes(w, h, 54, 1, w * 2, b"", depth=depth, is_volume=True))
+                read.assert_not_called()
+                for z in range(depth):
+                    self.assertEqual(next(parts), linear[z * w * h * 2:(z + 1) * w * h * 2])
+                    self.assertEqual(read.call_count, 1 + z // layout["block_d"])
+                self.assertEqual(list(parts), [])
+                self.assertEqual([call.args[:2] for call in read.call_args_list],
+                                 [(analysis["descriptor"]["base"] + i * layout["z_tile_stride"],
+                                   layout["z_tile_stride"]) for i in range(2)])
 
     def test_volume_fmt54_and_fmt10_round_trip_check_export_and_scan(self):
         import io

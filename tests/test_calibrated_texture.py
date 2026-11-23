@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tools")]
@@ -26,6 +27,24 @@ def synthetic_profile():
 
 @unittest.skipUnless(importlib.util.find_spec("numpy"), "install NumPy for calibrated export")
 class CalibratedExport(unittest.TestCase):
+    def test_wide_tile_row_decompresses_each_chunk_once(self):
+        import calibrated_texture as ct
+
+        # A physical row spans 64 tiles, more than the decoder's 32 cached
+        # chunks. Each tile contributes 64 identical BC7 blocks per output row.
+        chunks = [bytes([tile]) * 65536 for tile in range(64)]
+        row = b"".join(chunk[:64 * 16] for chunk in chunks)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wide.ttpf"
+            desc = fixtures.pack_etpf_record(16384, 256, 1, 0, 98, 1, 1, 0, 4096)
+            fixtures.write_rds5_pool(path, [desc], chunks)
+            with closing(ct.ttpf.Pool(path)) as pool, mock.patch.object(
+                    ct.zlib, "decompress", wraps=ct.zlib.decompress) as decompress:
+                parts = ct.LocalDecoder(pool, {"version": 1}).dds_parts(0)
+                self.assertEqual(len(next(parts)), 148)
+                self.assertEqual(b"".join(parts), row * 64)
+                self.assertEqual(decompress.call_count, len(chunks))
+
     def test_mode1_array_dds_writes_slice_major_subresources(self) -> None:
         import calibrated_texture as ct
         import tex_headers

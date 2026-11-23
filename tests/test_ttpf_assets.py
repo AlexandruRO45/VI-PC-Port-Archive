@@ -1,6 +1,7 @@
 """Exercise the assets stage, existing C# catalogs and downstream texture lookup."""
 import contextlib
 from contextlib import ExitStack
+import errno
 import io
 import json
 import os
@@ -105,6 +106,24 @@ class TextureAssets(unittest.TestCase):
         self.assertTrue(rows[0]["File"].startswith("000000_bcpack_"))
         self.assertEqual(rows[1]["File"], "partial.dds")
         self.assertEqual(old.read_bytes(), b"previous mip chain")
+
+    def test_late_decode_failure_preserves_both_exports(self):
+        old = self.upgrade()
+        target = self.folder / "000000_bcpack_v1-strict.dds"
+        target.write_bytes(b"previous complete export")
+        before = set(self.folder.iterdir())
+
+        def broken_parts(*args, **kwargs):
+            yield b"DDS header and first level"
+            raise ValueError("unavailable mip")
+
+        with mock.patch.object(ttpf_assets.ttpf, "texture_dds_parts", broken_parts, create=True):
+            self.build()
+        self.assertEqual(target.read_bytes(), b"previous complete export")
+        self.assertEqual(old.read_bytes(), b"previous mip chain")
+        self.assertEqual(self.row_after_export()["BCPackLimitation"], "unavailable mip")
+        self.assertEqual(self.row_after_export()["File"], old.name)
+        self.assertEqual(set(self.folder.iterdir()), before)
 
     def test_superseded_file_that_cannot_be_removed_does_not_fail_the_export(self):
         old = self.upgrade()
@@ -269,6 +288,27 @@ def synthetic_row(**changes):
 
 
 class PublishWriter(unittest.TestCase):
+    def test_competing_output_created_during_staging_is_kept(self):
+        target = self.dir / "texture.dds"
+        with self.assertRaises(FileExistsError):
+            with ttpf_assets.staged_output(target, replace=False) as output:
+                output.write(b"our complete texture")
+                target.write_bytes(b"other export")
+        self.assertEqual(target.read_bytes(), b"other export")
+        self.assertEqual(self.names(), ["texture.dds"])
+
+    @unittest.skipUnless(sys.platform in ("darwin", "linux"), "requires a POSIX exclusive rename")
+    def test_no_clobber_on_a_volume_without_hard_links(self):
+        target = self.dir / "texture.dds"
+        with mock.patch.object(os, "link", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")):
+            with ttpf_assets.staged_output(target, replace=False) as output:
+                output.write(b"first")
+            with self.assertRaises(FileExistsError):
+                with ttpf_assets.staged_output(target, replace=False) as output:
+                    output.write(b"second")
+        self.assertEqual(target.read_bytes(), b"first")
+        self.assertEqual(self.names(), ["texture.dds"])
+
     """`publish` stages in the destination folder and must never leave the staging file behind."""
 
     def setUp(self):

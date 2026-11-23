@@ -1999,6 +1999,51 @@ class TestLocalDecoder(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DDS exceeds output limit"):
             dec.dds(4)
 
+    def test_dds_parts_stream_block_rows_in_linear_order(self):
+        # A partial last tile in X and Y; every BC7 block carries its own ordinal.
+        width, height = 68, 132
+        layout = ttpf.surface_layout(width, height, 98, 1, 4096)
+        linear = b"".join(struct.pack("<QQ", i, i) for i in range(17 * 33))
+        tiled = bytearray(layout["size"])
+        ttm.retile_to(layout, layout["mips"][0], linear, tiled)
+        pool, _ = self._open_pool(
+            "strips.ttpf", [ttm.pack_etpf_record(width, height, 1, 0, 98, 1, 1, 4, 4096)],
+            [(0, bytes(tiled), len(tiled))],
+        )
+        decoder = ct.LocalDecoder(pool, {"version": 1})
+        with mock.patch.object(ct, "_BLOCKS_PER_PART", 256):
+            parts = decoder.dds_parts(0)
+            header = next(parts)
+            self.assertEqual(len(header), 148)
+            self.assertEqual(decoder.read_chunk.cache_info().currsize, 0)
+            first = next(parts)
+            self.assertLess(len(first), len(linear))
+            self.assertEqual(first + b"".join(parts), linear)
+            self.assertEqual(decoder.dds(0), header + linear)
+
+    def test_dds_parts_refined_key_includes_missing_blocks_across_rows(self):
+        # One calibrated BC7 chunk covers two 4K tile rows; its adjustment is
+        # named by the two missing block indices together, in surface order.
+        count = 512
+        desc = ttm.pack_etpf_record(64, 128, 1, 0, 98, 1, 1, 4, 4096)
+        pool, _ = self._open_pool("refined.ttpf", [desc], [(7, _encode_bc7_mode6_solid(count), count * 16)])
+        cfg = _empty_bc7_section()
+        decoder = ct.LocalDecoder(pool, {"version": 1, "entries": {"refined.ttpf": {"0": "refined"}}, "bc7": cfg})
+
+        def rebuild(s_ptr, n, lab_ptr, seed_ptr, anc_ptr, out_ptr, ok_ptr):
+            valid = bytearray([1]) * n
+            if _read_u8_buf(seed_ptr, 1) != bytes([99]):
+                valid[0] = valid[256] = 0
+            _write_u8_buf(out_ptr, b"Z" * (n * 16))
+            _write_u8_buf(ok_ptr, bytes(valid))
+
+        with _fake_native_context(rebuild_fn=rebuild), mock.patch.object(ct, "_BLOCKS_PER_PART", 256):
+            key = hashlib.sha256(decoder.symbols(0).tobytes() + struct.pack("<qq", 0, 256)).hexdigest()
+            cfg["adjustments"][key] = [(0, 0, 99)]
+            parts = decoder.dds_parts(0)
+            self.assertEqual(len(next(parts)), 148)
+            self.assertEqual(b"".join(parts), b"Z" * (count * 16))
+
     def test_dds_no_tail_64k_tile_layout(self):
         # 512x256 BC7 (fmt 98, bs=16, 64K tile -> bw=64, bh=64) with 2 mips:
         # mip 0 is 128x64 blocks (2 tiles), mip 1 is 64x32 blocks (> bw//2=32 -> 1 tile), so tail == 2 == levels.
@@ -2132,11 +2177,16 @@ class TestExportFileAndCli(unittest.TestCase):
         self.assertEqual(replaced[148:], self.linear[0] + self.linear[1])
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["out.dds", "pool.ttpf", "profile.json"])
 
-        # 4. Cache is cleared even if dds() fails
+        # 4. A failure after writing a header and a prefix leaves a previous file intact.
         clear_calls = []
 
+        def broken_parts(*args):
+            yield b"DDS " + bytes(144)
+            yield b"partial surface"
+            raise ValueError("boom")
+
         with _fake_native_context(), \
-                mock.patch.object(ct.LocalDecoder, "dds", side_effect=ValueError("boom")):
+                mock.patch.object(ct.LocalDecoder, "dds_parts", broken_parts):
             orig_init = ct.LocalDecoder.__init__
 
             def tracked_init(self_dec, p, c):
@@ -2146,8 +2196,10 @@ class TestExportFileAndCli(unittest.TestCase):
 
             with mock.patch.object(ct.LocalDecoder, "__init__", tracked_init):
                 with self.assertRaisesRegex(ValueError, "boom"):
-                    ct.export_file(pool, 0, self.root / "unused.dds", None, False, self.profile)
+                    ct.export_file(pool, 0, out, None, True, self.profile)
         self.assertEqual(len(clear_calls), 1)
+        self.assertEqual(out.read_bytes(), replaced)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["out.dds", "pool.ttpf", "profile.json"])
 
         # 5. Missing or invalid profile JSON
         with self.assertRaises(FileNotFoundError):

@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 import zlib
 
 # `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
@@ -17,6 +16,11 @@ import numpy as np
 import bcpack
 import bcpack_tables
 import ttpf_mips as ttpf
+from ttpf_output import staged_output
+
+
+# Aim for 1 MiB at 16 bytes per BC block, with at least one physical tile row.
+_BLOCKS_PER_PART = 65536
 
 
 @lru_cache(maxsize=1)
@@ -246,7 +250,8 @@ class LocalDecoder:
             result[mask] = chosen
         return result.tobytes()
 
-    def dds(self, index, mips=None):
+    def dds_parts(self, index, mips=None):
+        """Yield the DX10 header, then linear block rows in slice-major DDS order."""
         d = self.pool.descriptor(index)
         width, height, fmt = d["width"], d["height"], d["format"]
         if fmt not in self.formats or d["dimension"] != 1:
@@ -291,22 +296,30 @@ class LocalDecoder:
         span = self.pool.span(index, d["base"])
         if not span or d["base"] < self.edges[0]:
             raise ValueError("Texture has no mapped allocation")
-        payload = bytearray()
+        yield ttpf.dds_bytes(width, height, fmt, count, linear, b"", array_size=faces)
         for face in range(faces):
             for i, (w, h) in enumerate(grids[:count]):
                 offset, x, y, slice_stride = offsets[i]
-                at = (
-                    addresses(tile, bs, bw, bh, w, h, x, y)
-                    + d["base"]
-                    + face * slice_stride
-                    + offset
-                )
-                if at.max() + bs > d["base"] + span:
-                    raise ValueError("Texture crosses its allocation boundary")
-                payload.extend(self.surface(at, bs, profile))
-        return ttpf.dds_bytes(
-            width, height, fmt, count, linear, bytes(payload), array_size=faces
-        )
+                base = d["base"] + face * slice_stride + offset
+                tile_pitch = ((w + bw - 1) // bw) * tile
+                # A wide tile row can span more chunks than read_chunk caches.
+                # Visit all its block rows together to avoid decoding them again.
+                rows = max(1, _BLOCKS_PER_PART // (w * bh)) * bh
+                # Refined BC7 adjustment keys depend on every missing block of a
+                # chunk across the surface. Keep that view together, outside the
+                # shared address cache if it exceeds the usual band size.
+                if profile == "refined":
+                    rows = h
+                grid = addresses.__wrapped__ if min(rows, h) * w > _BLOCKS_PER_PART else addresses
+                for row in range(0, h, rows):
+                    tile_row, tile_y = divmod(y + row, bh)
+                    at = grid(tile, bs, bw, bh, w, min(rows, h - row), x, tile_y) + (base + tile_row * tile_pitch)
+                    if at.max() + bs > d["base"] + span:
+                        raise ValueError("Texture crosses its allocation boundary")
+                    yield self.surface(at, bs, profile)
+
+    def dds(self, index, mips=None):
+        return b"".join(self.dds_parts(index, mips))
 
 
 def compact_dds_layout(width, height, fmt, levels, tile):
@@ -421,23 +434,11 @@ def local_bc3(symbols, profile):
 
 
 def export_file(pool, index, target, mips, force, profile):
-    target = Path(target)
     with open(profile, encoding="utf-8") as source:
         decoder = LocalDecoder(pool, json.load(source))
     try:
-        data = decoder.dds(index, mips)
+        with staged_output(target, replace=force, preserve_mode=False) as output:
+            output.writelines(decoder.dds_parts(index, mips))
     finally:
         decoder.read_chunk.cache_clear()
-    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as f:
-        tmp = Path(f.name)
-        try:
-            f.write(data)
-            f.close()
-            if force:
-                os.replace(tmp, target)
-            else:
-                os.link(tmp, target)
-        finally:
-            f.close()
-            tmp.unlink(missing_ok=True)
     return 0

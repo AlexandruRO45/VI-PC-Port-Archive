@@ -48,10 +48,12 @@ import os
 import struct
 import sys
 import zlib
+from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bcpack  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
+from ttpf_output import staged_output  # noqa: E402
 from tex_headers import (  # noqa: E402
     array_surface_layout, compact_surface_layout, cubemap_surface_layout,
     decode_etpf_chunk_pages, etpf_streaming_padding, gfx10_tile_bytes,
@@ -59,6 +61,7 @@ from tex_headers import (  # noqa: E402
 )
 
 MAX_OUTPUT = 256 * 1024 * 1024
+DDS_CHUNK_CACHE_BYTES = 16 * 1024 * 1024
 MAX_TEXTURES = 250_000
 ETPF_VERSION = 634
 
@@ -1030,6 +1033,28 @@ def predict_child_means(pixels, parent, child, block=4):
 
 # --- RDS5 / ETPF container ------------------------------------------------
 
+class _DdsChunkCache:
+    """Keep recent decoded chunks up to the byte budget, or one larger chunk on its own."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.size = 0
+        self.entries = OrderedDict()
+
+    def get(self, key):
+        value = self.entries.get(key)
+        if value is not None:
+            self.entries.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value):
+        while self.entries and self.size + len(value) > self.limit:
+            _, evicted = self.entries.popitem(last=False)
+            self.size -= len(evicted)
+        self.entries[key] = value
+        self.size += len(value)
+
+
 class Pool:
     """Read-only RDS5 texture pool, mirroring TtpfReader's catalog checks."""
 
@@ -1161,7 +1186,8 @@ class Pool:
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
             key = (self._cache_token, src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
                    hist_key if codec not in (0, 8) else None)
-            if key not in cache:
+            decoded = cache.get(key)
+            if decoded is None:
                 raw = self.data[src:src + packed]
                 if codec == 0:
                     decoded = bytes(raw)
@@ -1184,7 +1210,7 @@ class Pool:
                     raise ValueError("decoded chunk length disagrees with its range")
                 cache[key] = decoded
             lo, hi = max(start, virt), min(start + size, virt + csize)
-            out[lo - start:hi - start] = cache[key][lo - virt:hi - virt]
+            out[lo - start:hi - start] = memoryview(decoded)[lo - virt:hi - virt]
         return bytes(out)
 
     def span(self, index, base):
@@ -2051,8 +2077,8 @@ def dds_bytes(width, height, fmt, mips, linear, payload,
     return bytes(hdr) + struct.pack("<IIIII", fmt, dim, misc, dx10_array, 0) + payload
 
 
-def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
-    """Build the complete DDS in memory before publishing it to disk."""
+def texture_dds_parts(pool, a, mips=None, *, allow_provisional=False, history=None):
+    """Yield a DX10 DDS header followed by each visible mip surface or volume Z slice."""
     if "layout" not in a or "available" not in a:
         raise ValueError(a.get("blocked", "layout unavailable"))
     d = a["descriptor"]
@@ -2069,73 +2095,107 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
         raise ValueError("not every requested mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     layout = a["layout"]
     block = 4 if d["format"] in BC_FORMATS else 1
-    cache = {}
-    bcpack_mode = "provisional" if allow_provisional else "strict"
-    payload = bytearray()
-    if shape == "volume":
-        tiled = pool.read_range(d["base"], layout["size"], cache,
-                                bcpack_mode=bcpack_mode, bcpack_history=history)
-        payload += detile_volume(layout, tiled)
-    elif shape == "2d_array":
-        for s in range(d["depth"]):
-            for mip in layout["mips"][:count]:
-                tiled = pool.read_range(d["base"] + mip["offset"] + s * mip["slice_stride"],
-                                        mip["region"], cache,
-                                        bcpack_mode=bcpack_mode, bcpack_history=history)
-                payload += _visible_rows(layout, mip, detile(layout, mip, tiled), block)
-    elif shape == "cubemap":
-        face_base = d["base"] + layout["data_offset"]
-        for face in range(6):
-            for mip in layout["mips"][:count]:
-                tiled = pool.read_range(face_base + face * layout["face_size"] + mip["offset"],
-                                        mip["region"], cache,
-                                        bcpack_mode=bcpack_mode, bcpack_history=history)
-                payload += _visible_rows(layout, mip, detile(layout, mip, tiled), block)
-    else:
-        for mip in layout["mips"][:count]:
-            tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache,
-                                    bcpack_mode=bcpack_mode, bcpack_history=history)
-            payload += _visible_rows(layout, mip, detile(layout, mip, tiled), block)
-    if 148 + len(payload) > MAX_OUTPUT:
+    levels = layout["mips"][:count]
+    slices = 1
+    if shape == "cubemap":
+        slices = 6
+    elif shape in ("2d_array", "volume"):
+        slices = d["depth"]
+    chain_bytes = 0
+    for mip in levels:
+        w, h = _visible_grid(mip, block)
+        chain_bytes += w * h * layout["element_bytes"]
+    if 148 + slices * chain_bytes > MAX_OUTPUT:
         raise ValueError("DDS exceeds the 256 MiB output limit")
-    top_w, top_h = (_visible_grid(layout["mips"][0], block) if d["format"] in BC_FORMATS else (0, 0))
-    linear = (top_w * top_h * layout["element_bytes"]
-              if d["format"] in BC_FORMATS else d["width"] * layout["element_bytes"])
-    return dds_bytes(
-        d["width"], d["height"], d["format"], count, linear, bytes(payload),
+    top_w, top_h = _visible_grid(levels[0], block)
+    linear = (top_w * top_h if block == 4 else d["width"]) * layout["element_bytes"]
+    yield dds_bytes(
+        d["width"], d["height"], d["format"], count, linear, b"",
         depth=d["depth"] if shape == "volume" else 1,
         array_size=d["depth"] if shape == "2d_array" else 1,
         is_cube=(shape == "cubemap"),
         is_volume=(shape == "volume"),
     )
 
+    cache = _DdsChunkCache(DDS_CHUNK_CACHE_BYTES)
+    bcpack_mode = "provisional" if allow_provisional else "strict"
+
+    def read(offset, size):
+        return pool.read_range(d["base"] + offset, size, cache, bcpack_mode=bcpack_mode,
+                               bcpack_history=history)
+
+    if shape == "volume":
+        # Each block_d slices occupy one contiguous slab of Gfx10 tiles. Inside
+        # that slab the Z coordinate has the same swizzle bits as in slab zero.
+        block_d, stride = layout["block_d"], layout["z_tile_stride"]
+        for first_z in range(0, slices, block_d):
+            tiled = read(first_z // block_d * stride, stride)
+            for local_z in range(min(block_d, slices - first_z)):
+                yield detile_volume_slice(layout, tiled, local_z)
+            del tiled
+        return
+
+    for index in range(slices):
+        for mip in levels:
+            offset = mip["offset"]
+            if shape == "2d_array":
+                offset += index * mip["slice_stride"]
+            elif shape == "cubemap":
+                offset += layout["data_offset"] + index * layout["face_size"]
+            yield _visible_rows(layout, mip, detile(layout, mip, read(offset, mip["region"])), block)
+
+
+def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
+    """Return the complete DDS for callers that need its bytes in memory."""
+    return b"".join(texture_dds_parts(pool, a, mips, allow_provisional=allow_provisional, history=history))
+
 
 def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=False, history=None):
     a = analyze(pool, index)
-    try:
-        blob = texture_dds(pool, a, mips, allow_provisional=allow_provisional, history=history)
-    except bcpack.BcpackProvisionalError as exc:
-        print(f"texture {index}: provisional BCPack history required ({exc}); pass --allow-provisional", file=sys.stderr)
-        return 2
-    except (BcpackRequired, OSError, ValueError) as exc:
-        print(f"texture {index}: {exc}", file=sys.stderr)
-        return 2
     if os.path.exists(out_path) and not force:
         print(f"{out_path} exists; pass --force to replace it", file=sys.stderr)
         return 2
+
+    def parts():
+        try:
+            yield from texture_dds_parts(pool, a, mips, allow_provisional=allow_provisional, history=history)
+        except OSError as exc:
+            # Input/history failures have the same exit code as other decode errors.
+            raise ValueError(str(exc)) from exc
+
     d = a["descriptor"]
     count = d["mips"] if mips is None else mips
     shape = a.get("shape", "2d")
     try:
-        with open(out_path, "wb") as f:
-            f.write(blob)
+        target = os.path.realpath(out_path) if force else out_path
+        if force and os.path.exists(target):
+            # The direct writer followed links and needed write access to the file.
+            # A replace in a writable directory alone would discard read-only files.
+            if not os.path.isfile(target):
+                raise OSError("destination is not a regular file")
+            os.close(os.open(target, os.O_WRONLY))
+        with staged_output(target, replace=force) as output:
+            output.writelines(parts())
+            size = output.tell()
+    except bcpack.BcpackProvisionalError as exc:
+        print(f"texture {index}: provisional BCPack history required ({exc}); pass --allow-provisional", file=sys.stderr)
+        return 2
+    except (BcpackRequired, ValueError, zlib.error) as exc:
+        print(f"texture {index}: {exc}", file=sys.stderr)
+        return 2
+    except FileExistsError as exc:
+        if force:
+            print(f"{out_path}: cannot write: {exc.strerror or exc}", file=sys.stderr)
+            return 1
+        print(f"{out_path} exists; pass --force to replace it", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"{out_path}: cannot write: {exc.strerror or exc}", file=sys.stderr)
         return 1
     dims = (f"{d['width']}x{d['height']}x{d['depth']}" if shape in ("2d_array", "volume")
             else f"{d['width']}x{d['height']}")
     print(f"texture {index}: {shape} {dims} fmt {d['format']} {count} mips "
-          f"({len(blob)} bytes) -> {out_path}")
+          f"({size} bytes) -> {out_path}")
     return 0
 
 

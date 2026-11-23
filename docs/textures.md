@@ -1085,6 +1085,11 @@ inputs across all six codecs, `tests/test_tex_headers.py` tests the layout rule 
 headers, and `tests/test_ttpf_mips.py` builds synthetic zlib, uncompressed 2D, and BCPack (BC1
 and BC7) RDS5 pools.
 
+The Python pool exporter and the assets build's BCPack completion pass write DDS data
+in parts to a temporary file beside the destination. Allow space for one complete new
+DDS alongside the previous file. If decoding or writing fails, the previous export is
+still usable. The 256 MiB limit applies to the complete DDS, including its header.
+
 The earlier BCPack header counts and 200-chunk entropy check came from a read-only
 aggregation over the same `Pool` parser using the public MDU tables from `silicon-rans`;
 those probes are not committed because `tools/bcpack.py` supersedes them.
