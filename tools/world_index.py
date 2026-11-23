@@ -38,6 +38,7 @@ import sys
 import tempfile
 import unicodedata
 import zlib
+from collections import Counter
 from contextlib import contextmanager
 
 SIGNATURE = b"0DRP"
@@ -147,16 +148,18 @@ def _ptr(value, size):
     return off if off < size else None
 
 
+_MEMBER = struct.Struct("<IIBBHI")
+
+
 def _members(b, table, count, size):
     if count > 256 or (count and table is None) or (table is not None and table + 16 * count > size):
         return None
-    out = {}
     if not count:
-        return out
-    for k in range(count):
-        o = table + 16 * k
-        out[_u32(b, o)] = (_u32(b, o + 4), b[o + 8], b[o + 9], _u16(b, o + 10), _u32(b, o + 12))
-    return out
+        return {}
+    # The bounds check above leaves every 16-byte member record inside `b`.
+    with memoryview(b) as view:
+        return {key: (off, ty, sub, ref, extra)
+                for key, off, ty, sub, ref, extra in _MEMBER.iter_unpack(view[table:table + 16 * count])}
 
 
 def _value(b, base, member):
@@ -239,14 +242,162 @@ def _placement_tables(b, blocks, map_schema, entity_schema):
     return f"{_u32(b, at + name[0]):08x}", ordinals, parents
 
 
-def parse_resource(b, collect=None):
-    """Return a row dict for a 0x7a resource, or None if the header/schema does not validate.
+# Entity fields read a chunk of records at a time. Same struct codes as `_value`: one column per member.
+_COLUMN_CODE = {0x10: "b", 0x11: "B", 0x12: "h", 0x13: "H", 0x14: "i", 0x15: "I", 0x4A: "I", 0x21: "f",
+                0x60: "B", 0x08: "Q", 0x4F: "Q", 0x32: "3f", 0x33: "3f", 0x34: "4f"}
+# (column, member hash, struct code the member must have for a bulk read; None = any single value)
+_ENTITY_COLUMNS = (
+    ("archetype", FIELD["archetypeName"], None), ("key", ARCHETYPE_KEY, None), ("position", FIELD["position"], "3f"),
+    ("rotation", FIELD["rotation"], "4f"), ("scale_xy", FIELD["scaleXY"], "f"), ("scale_z", FIELD["scaleZ"], "f"),
+    ("flags", FIELD["flags"], None), ("guid", FIELD["guid"], None), ("lod_level", FIELD["lodLevel"], None),
+    ("parent_index", FIELD["parentIndex"], None), ("parent_instance", FIELD["parentInstance"], None),
+    ("num_children", FIELD["numChildren"], None), ("lod_dist", FIELD["lodDist"], "f"),
+    ("child_lod_dist", FIELD["childLodDist"], "f"),
+)
+_STATS_COLUMNS = frozenset(("archetype", "position", "lod_level", "lod_dist"))
+_BULK_MIN = 16      # a block with fewer entities keeps the per-entity reader
+_BULK_CHUNK = 1024  # entities per bulk read: bounds the lists alive at once
 
-    When ``collect`` is given (a list, or an object with ``append`` such as ``ArchetypeCounts``), one dict per
-    CEntityDef is appended to it. ``complete`` is False for an entity whose record is not entirely inside ``b``,
-    including every entity of a block whose start lies past the end of ``b``. The CLI uses collectors for
-    ``--archetypes-out`` counts and ``--entities-out`` placement rows.
-    """
+
+def _column_struct(entity_size, offset, code):
+    """A Struct that reads one member of every `entity_size`-byte record in a buffer of whole records."""
+    return struct.Struct(f"<{offset}x{code}{entity_size - offset - struct.calcsize('<' + code)}x")
+
+
+def _column_plan(em, entity_size, collecting):
+    """{column: (Struct, is_vector), or None when the member is absent}, or None when a present member cannot
+    be read in bulk exactly as `_value` reads it (the per-entity reader then handles the resource)."""
+    plan = {}
+    for name, key, code in _ENTITY_COLUMNS:
+        if not collecting and name not in _STATS_COLUMNS:
+            continue
+        m = em.get(key)
+        if m is None:
+            plan[name] = None
+            continue
+        have = _COLUMN_CODE.get(m[1])
+        if have is None or (code is None and len(have) != 1) or (code is not None and have != code):
+            return None
+        if m[0] + struct.calcsize("<" + have) > entity_size:
+            return None
+        plan[name] = (_column_struct(entity_size, m[0], have), len(have) > 1)
+    return plan
+
+
+def _clean_scalars(col):
+    """Each float as the entity rows report it: the value when finite, else None."""
+    return col if math.isfinite(sum(col)) else [v if v - v == 0.0 else None for v in col]
+
+
+def _clean_vectors(rows):
+    if math.isfinite(sum(map(sum, rows))):
+        return [list(r) for r in rows]
+    return [[v if v - v == 0.0 else None for v in r] for r in rows]
+
+
+class _EntityStats:
+    """Archetype set, LOD counts and extremes of one resource's entities, fed per entity or per column."""
+
+    def __init__(self):
+        self.archetypes = set()
+        self.lod = {}
+        self.positions = []     # per-entity reader rows, folded into the extremes before any bulk chunk
+        self.lod_dists = []
+        self.pos_lo = [None, None, None]
+        self.pos_hi = [None, None, None]
+        self.dist_lo = self.dist_hi = None
+
+    def add_positions(self, rows):
+        for i, axis in enumerate(zip(*rows)):
+            if not math.isfinite(sum(axis)):
+                axis = [v for v in axis if v - v == 0.0]
+                if not axis:
+                    continue
+            lo, hi = min(axis), max(axis)
+            if self.pos_lo[i] is None or lo < self.pos_lo[i]:
+                self.pos_lo[i] = lo
+            if self.pos_hi[i] is None or hi > self.pos_hi[i]:
+                self.pos_hi[i] = hi
+
+    def add_dists(self, dists):
+        dists = [d for d in dists if 0.0 <= d < math.inf]
+        if dists:
+            lo, hi = min(dists), max(dists)
+            if self.dist_lo is None or lo < self.dist_lo:
+                self.dist_lo = lo
+            if self.dist_hi is None or hi > self.dist_hi:
+                self.dist_hi = hi
+
+    def fold(self):
+        """Move the per-entity rows into the extremes, keeping entity order."""
+        if self.positions:
+            self.add_positions(self.positions)
+            self.positions.clear()
+        if self.lod_dists:
+            self.add_dists(self.lod_dists)
+            self.lod_dists.clear()
+
+    def add_levels(self, levels):
+        for level, n in Counter(levels).items():
+            name = LOD_NAMES.get(level)
+            if name is not None:
+                self.lod[name] = self.lod.get(name, 0) + n
+
+
+def _bulk_entities(b, em, plan, first, count, off, entity_size, block_number, stats, collect, placement):
+    """Read entities `first`..`count` of one block (all of them complete) a chunk at a time."""
+    ordinals, parents, map_name = placement
+    stats.fold()
+    with memoryview(b) as view:
+        for k in range(first, count, _BULK_CHUNK):
+            n = min(_BULK_CHUNK, count - k)
+            chunk = view[off + k * entity_size:off + (k + n) * entity_size]
+            cols = {name: None if read is None
+                    else (list(read[0].iter_unpack(chunk)) if read[1] else [v for v, in read[0].iter_unpack(chunk)])
+                    for name, read in plan.items()}
+            if cols["archetype"] is not None:
+                stats.archetypes.update(cols["archetype"])
+            if cols["position"] is not None:
+                stats.add_positions(cols["position"])
+            if cols["lod_level"] is not None:
+                stats.add_levels(cols["lod_level"])
+            if cols["lod_dist"] is not None:
+                stats.add_dists(cols["lod_dist"])
+            if collect is None:
+                continue
+            blank = [None] * n
+
+            def column(name, clean=None):
+                col = cols[name]
+                return blank if col is None else col if clean is None else clean(col)
+
+            entities = [
+                {"complete": True, "archetype": a, "archetype_key": key, "position": p, "rotation": r,
+                 "scale_xy": sxy, "scale_z": sz, "flags": fl, "guid": g, "lod_level": lv, "parent_index": pi,
+                 "parent_instance": pn, "num_children": nc, "lod_dist": d, "child_lod_dist": c}
+                for a, key, p, r, sxy, sz, fl, g, lv, pi, pn, nc, d, c in zip(
+                    column("archetype"), column("key"), column("position", _clean_vectors),
+                    column("rotation", _clean_vectors), column("scale_xy", _clean_scalars),
+                    column("scale_z", _clean_scalars), column("flags"), column("guid"), column("lod_level"),
+                    column("parent_index"), column("parent_instance"), column("num_children"),
+                    column("lod_dist", _clean_scalars), column("child_lod_dist", _clean_scalars))]
+            if ordinals:
+                for j, entity in enumerate(entities, k):
+                    # Match a typed record start exactly, without renumbering or reordering the legacy rows.
+                    ordinal = ordinals.get(((j * entity_size) << 20) | block_number)
+                    if ordinal is not None:
+                        entity.update(map_name=map_name, entity_index=ordinal)
+                        if parents and entity["parent_instance"] == -1 and entity["parent_index"] >= 0:
+                            slot = _value(b, off + j * entity_size, em[PARENT_MAP_SLOT])
+                            if slot is not None and 0 <= slot < len(parents):
+                                entity["parent_map_name"] = f"{parents[slot]:08x}"
+            for entity in entities:
+                collect.append(entity)
+
+
+def _layout(b):
+    """(struct, enum and block counts, structs by name, blocks) of a 0x7a resource whose header and schema
+    validate, else None. ``parse_resource`` returns None exactly when this does."""
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return None
     nst, nen, nbl = _u16(b, 0x48), _u16(b, 0x4A), _u16(b, 0x4C)
@@ -295,7 +446,21 @@ def parse_resource(b, collect=None):
         blocks.append((name, size, off))
     if not any(name in structs and off is not None for name, _, off in blocks):
         return None
+    return nst, nen, nbl, structs, blocks
 
+
+def parse_resource(b, collect=None):
+    """Return a row dict for a 0x7a resource, or None if the header/schema does not validate.
+
+    When ``collect`` is given (a list, or an object with ``append`` such as ``ArchetypeCounts``), one dict per
+    CEntityDef is appended to it. ``complete`` is False for an entity whose record is not entirely inside ``b``,
+    including every entity of a block whose start lies past the end of ``b``. The CLI uses collectors for
+    ``--archetypes-out`` counts and ``--entities-out`` placement rows.
+    """
+    layout = _layout(b)
+    if layout is None:
+        return None
+    nst, nen, nbl, structs, blocks = layout
     entity_size = structs.get(ENTITY, (0, {}))[0]
     map_size = structs.get(MAPDATA, (0, {}))[0]
     row = {
@@ -315,10 +480,9 @@ def parse_resource(b, collect=None):
     map_name, ordinals, parents = None, {}, ()
     if getattr(collect, "placement_ids", False):
         map_name, ordinals, parents = _placement_tables(b, blocks, structs[MAPDATA], structs[ENTITY])
-    lod = {}
-    archetypes = set()
-    positions = []
-    lod_dists = []
+    stats = _EntityStats()
+    lod, archetypes, positions, lod_dists = stats.lod, stats.archetypes, stats.positions, stats.lod_dists
+    plan = ()   # the bulk-read plan, made when the first block long enough for it is met
     for block_number, (name, size, off) in enumerate(blocks, 1):
         if name != ENTITY or entity_size == 0 or size % entity_size:
             continue
@@ -328,7 +492,16 @@ def parse_resource(b, collect=None):
                 for _ in range(size // entity_size):
                     collect.append({"complete": False, "archetype": None})
             continue
-        for k in range(size // entity_size):
+        count = size // entity_size
+        first = 0
+        if count >= _BULK_MIN and plan == ():
+            plan = _column_plan(em, entity_size, collect is not None)
+        if plan and count >= _BULK_MIN:
+            # Every record that lies entirely inside `b` is read a chunk at a time; the rest, if any, below.
+            first = min(count, (len(b) - off) // entity_size)
+            _bulk_entities(b, em, plan, 0, first, off, entity_size, block_number, stats, collect,
+                           (ordinals, parents, map_name))
+        for k in range(first, count):
             o = off + k * entity_size
             a = _value(b, o, em.get(FIELD["archetypeName"]))
             if a is not None and isinstance(a, int):
@@ -373,6 +546,7 @@ def parse_resource(b, collect=None):
                         if slot is not None and 0 <= slot < len(parents):
                             entity["parent_map_name"] = f"{parents[slot]:08x}"
                 collect.append(entity)
+    stats.fold()
     row.update({
         "kind": "map",
         "entity_size": entity_size,
@@ -380,19 +554,12 @@ def parse_resource(b, collect=None):
                         if n == ENTITY and off is not None and size % entity_size == 0),
         "archetypes": len(archetypes),
         "lod": lod,
-        "lod_dist_min": min(lod_dists) if lod_dists else None,
-        "lod_dist_max": max(lod_dists) if lod_dists else None,
+        "lod_dist_min": stats.dist_lo,
+        "lod_dist_max": stats.dist_hi,
     })
-    if positions:
-        pos_min = []
-        pos_max = []
-        for i in range(3):
-            axis_vals = [p[i] for p in positions if isinstance(p[i], (int, float)) and math.isfinite(p[i])]
-            pos_min.append(round(min(axis_vals), 4) if axis_vals else None)
-            pos_max.append(round(max(axis_vals), 4) if axis_vals else None)
-        if any(v is not None for v in pos_min):
-            row["position_min"] = pos_min
-            row["position_max"] = pos_max
+    if any(v is not None for v in stats.pos_lo):
+        row["position_min"] = [None if v is None else round(v, 4) for v in stats.pos_lo]
+        row["position_max"] = [None if v is None else round(v, 4) for v in stats.pos_hi]
 
     for name, size, off in blocks:
         if name != MAPDATA or off is None or map_size == 0:
@@ -500,7 +667,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                 # Large resources put the system page in one stream and a small continuation in the next.
                 # Append contiguous zlib streams until the resource's own schema resolves.
                 for _ in range(2):
-                    if parse_resource(data) is not None and not _needs_continuation(data):
+                    if _layout(data) is not None and not _needs_continuation(data):
                         break
                     nxt = (tail + 15) & ~15
                     if nxt >= end:
@@ -600,7 +767,7 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
             nxt = successors[root]
             current = os.path.basename(p)
             for _ in range(2):
-                if b[0x10:0x15] != b"0DRPz" or (parse_resource(b) is not None and not _needs_continuation(b)):
+                if b[0x10:0x15] != b"0DRPz" or (_layout(b) is not None and not _needs_continuation(b)):
                     break
                 follow = nxt.get(current)
                 q = os.path.join(root, follow) if follow is not None else None
@@ -683,19 +850,24 @@ class EntityRows:
         self.written = 0
         self.incomplete = 0
 
+    # What json.dumps(row, separators=(",", ":"), allow_nan=False) builds on every call, built once.
+    _encode = json.JSONEncoder(separators=(",", ":"), allow_nan=False).encode
+
     def append(self, entity):
-        if not entity.get("complete", True) or entity.get("archetype") is None:
+        get = entity.get
+        archetype = get("archetype")
+        if not get("complete", True) or archetype is None:
             self.incomplete += 1
             return
-        row = {"archetype": f"{entity['archetype']:08x}"}
-        if entity.get("archetype_key"):
-            row["key"] = f"{entity['archetype_key']:016x}"
-        for k in self.FIELDS:
-            row[k] = entity.get(k)
+        row = {"archetype": f"{archetype:08x}"}
+        key = get("archetype_key")
+        if key:
+            row["key"] = f"{key:016x}"
+        row.update(zip(self.FIELDS, map(get, self.FIELDS)))
         for k in ("map_name", "entity_index", "parent_map_name"):
             if k in entity:
                 row[k] = entity[k]
-        self.handle.write(json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n")
+        self.handle.write(self._encode(row) + "\n")
         self.written += 1
 
 
