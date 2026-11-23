@@ -11,6 +11,7 @@
 // "xgameruntime.dll" is the name the PC GDK uses. If the executable's import table names another module, register
 // the same functions under that name too; nothing else changes.
 #include <windows.h>
+#include <dxgi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +34,8 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "../src/device_profile.h"
+#include "../src/vulkan_device_filter.h"
 
 namespace rt::shims {
 bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
@@ -546,8 +549,43 @@ enum class XSystemDeviceType : uint32_t {
     XboxScarlettLockhart = 6, XboxScarlettAnaconda = 7, XboxScarlettDevkit = 8,
 };
 
-// XSystemDeviceType XSystemGetDeviceType(). The package is the Xbox Series build, so report Series X (Anaconda).
-// LEONIDA_DEVICE_TYPE=<0..8> overrides it, for trying other code paths on day one.
+// The dedicated video memory of the GPU the runtime draws with, in bytes; 0 when it can't be read. Read once, through
+// DXGI, which needs no Vulkan headers here and can answer before the title creates its device: DedicatedVideoMemory
+// is the GPU's largest DEVICE_LOCAL heap, the value the layer's own IDXGIAdapter (dxgi_com.cpp) reports. The GPU is
+// the runtime's: LEONIDA_VK_DEVICE filters by name, software and Microsoft adapters are left out (vulkan_device_rank
+// puts them last), and the one with the most dedicated memory wins, the discrete GPU on a machine with an iGPU too.
+std::uint64_t runtime_gpu_vram() {
+    static const std::uint64_t bytes = [] {
+        using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+        const HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+        const auto create = dxgi ? reinterpret_cast<CreateFactory>(
+                                       reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
+                                 : nullptr;
+        IDXGIFactory1* factory = nullptr;
+        if (!create || FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))))
+            return std::uint64_t(0);
+        std::uint64_t best = 0;
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                desc.VendorId != leonida::microsoft_vulkan_vendor_id) {
+                char name[128 * 4] = {};
+                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, int(sizeof(name)), nullptr, nullptr);
+                if (leonida::vulkan_device_wanted(name))
+                    best = std::max<std::uint64_t>(best, desc.DedicatedVideoMemory);
+            }
+            adapter->Release();
+        }
+        factory->Release();
+        return best;
+    }();
+    return bytes;
+}
+
+// XSystemDeviceType XSystemGetDeviceType(). The package is the Xbox Series build, one executable for both consoles:
+// Series S (Lockhart) on a GPU with less than Series X's 10 GB of GPU-optimal memory, Series X (Anaconda) otherwise
+// or when the VRAM can't be read (device_profile.h). LEONIDA_DEVICE_TYPE=<0..8> overrides it.
 uint32_t __stdcall XSystemGetDeviceType() {
     char s[16];
     const DWORD n = GetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", s, sizeof(s));
@@ -555,7 +593,16 @@ uint32_t __stdcall XSystemGetDeviceType() {
         int v = std::atoi(s);
         if (v >= 0 && v <= 8) return static_cast<uint32_t>(v);
     }
-    return static_cast<uint32_t>(XSystemDeviceType::XboxScarlettAnaconda);
+    const std::uint64_t vram = runtime_gpu_vram();
+    const std::uint32_t type = leonida::default_device_type(vram);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xgameruntime: reporting Xbox Series %s: the GPU has %llu MiB of VRAM%s "
+                             "(LEONIDA_DEVICE_TYPE=6 or 7 picks Series S or X)\n",
+                     type == leonida::device_type_lockhart ? "S" : "X",
+                     static_cast<unsigned long long>(vram >> 20),
+                     !vram ? " (unknown)" : type == leonida::device_type_lockhart ? ", less than 10 GiB" : "");
+    return type;
 }
 
 // HRESULT XSystemGetConsoleId(size_t consoleIdSize, char* consoleId, size_t* consoleIdUsed).

@@ -23,6 +23,9 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "../src/device_profile.h"
+
+#include <tuple>
 
 namespace {
 
@@ -730,7 +733,18 @@ int main() {
     check(init() == S_OK, "XGameRuntimeInitialize returns S_OK");
     check(init() == S_OK, "a second XGameRuntimeInitialize also returns S_OK (reference counted)");
 
-    check(get<DeviceTypeFn>("XSystemGetDeviceType")() == 7, "XSystemGetDeviceType reports XboxScarlettAnaconda (7)");
+    // The console type: Series S under 10 GiB of VRAM, Series X from it or when it's unknown (device_profile.h).
+    check(leonida::default_device_type(std::uint64_t(8) << 30) == 6 &&
+              leonida::default_device_type(std::uint64_t(4) << 30) == 6,
+          "a GPU with 4 or 8 GiB of VRAM gets XboxScarlettLockhart (6)");
+    check(leonida::default_device_type(std::uint64_t(10) << 30) == 7 &&
+              leonida::default_device_type(std::uint64_t(16) << 30) == 7,
+          "a GPU with 10 or 16 GiB of VRAM gets XboxScarlettAnaconda (7)");
+    check(leonida::default_device_type(0) == 7, "unknown VRAM keeps XboxScarlettAnaconda (7)");
+    SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", nullptr);
+    const uint32_t device_type = get<DeviceTypeFn>("XSystemGetDeviceType")();
+    std::printf("XSystemGetDeviceType on this machine's GPU: %u\n", device_type);
+    check(device_type == 6 || device_type == 7, "XSystemGetDeviceType reports Series S (6) or Series X (7) by default");
 
     auto console_id = get<ConsoleIdFn>("XSystemGetConsoleId");
     char id[64] = {};
@@ -749,7 +763,16 @@ int main() {
               info.hostingOsVersion.build == 22000 && info.hostingOsVersion.revision == 0,
           "XSystemGetAnalyticsInfo returns hostingOsVersion 10.0.22000.0");
     check(std::strcmp(info.family, "Xbox") == 0, "XSystemGetAnalyticsInfo returns family 'Xbox'");
-    check(std::strcmp(info.form, "Xbox Series X") == 0, "XSystemGetAnalyticsInfo returns form 'Xbox Series X'");
+    check(std::strcmp(info.form, device_type == 6 ? "Xbox Series S" : "Xbox Series X") == 0,
+          "XSystemGetAnalyticsInfo's form follows the default device type");
+    // LEONIDA_DEVICE_TYPE still decides, whatever the GPU, and the form follows it.
+    for (const auto& [value, want, form] :
+         {std::tuple{"7", 7u, "Xbox Series X"}, std::tuple{"6", 6u, "Xbox Series S"}}) {
+        SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", value);
+        check(get<DeviceTypeFn>("XSystemGetDeviceType")() == want && std::strcmp(analytics_info().form, form) == 0,
+              "LEONIDA_DEVICE_TYPE picks the device type and the analytics form");
+    }
+    SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", nullptr);
 
     auto package_id = get<PackageIdentifierFn>("XPackageGetCurrentProcessPackageIdentifier");
     check(package_id(0, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackageIdentifier rejects null buffer and size 0");

@@ -85,7 +85,9 @@ int main(int argc, char** argv) {
     check(sum == 500500, "a second thread ran and joined");
 
     check(XGameRuntimeInitialize() == S_OK, "XGameRuntimeInitialize is answered by the gta6rt shim (S_OK)");
-    check(XSystemGetDeviceType() == 7, "XSystemGetDeviceType is answered by the gta6rt shim (Series X)");
+    // Series S (6) or X (7), by the GPU's VRAM; the stub DLL a host would load answers 0.
+    const uint32_t device_type = XSystemGetDeviceType();
+    check(device_type == 6 || device_type == 7, "XSystemGetDeviceType is answered by the gta6rt shim (Series S or X)");
     XGameRuntimeUninitialize();
 
     if (has_arg(argc, argv, "tls")) {
