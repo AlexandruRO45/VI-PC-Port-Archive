@@ -101,9 +101,22 @@ class VFloorF32Oracle:
 
     @staticmethod
     def translate_and_validate(val: int) -> str:
-        """Exercise tools/rdna2spirv.py via support.translate_lines."""
-        name, lines, fssm = VFloorF32Oracle.build_compute_shader(val)
-        return support.translate_lines(name, lines, fssm=fssm)
+        """Exercise tools/rdna2spirv.py via support.translate_lines (pixel shader form)."""
+        lines = [
+            f"v_mov_b32_e32 v1, {val & 0xFFFF_FFFF:#x}",
+            "v_floor_f32 v2, v1",
+            "v_mov_b32_e32 v3, 0",
+            "exp mrt0 v2, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        return support.translate_lines("ps_floor_f32_hw", lines)
+
+    @staticmethod
+    def execute_and_verify(val: int) -> int:
+        """Translate and execute; return first mrt0 word."""
+        spv = VFloorF32Oracle.translate_and_validate(val)
+        out = support.mrt0_words(spv)
+        return out[0]
 
 
 class TestVFloorF32Oracle(unittest.TestCase):
@@ -140,6 +153,85 @@ class TestVFloorF32Oracle(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         self.assertIn("OpFunction", spv)
         self.assertIn("OpReturn", spv)
+
+    def test_translator_emits_floor_not_ceil(self):
+        """Verify SPIR-V contains OpExtInst Floor and not Ceil - catches Floor->Ceil mutation."""
+        spv = VFloorF32Oracle.translate_and_validate(0x3FC0_0000)
+        self.assertIn("OpExtInst %float %glsl Floor", spv)
+        self.assertNotIn("Ceil", spv)
+
+    def test_translator_positive_fractional_inputs(self):
+        """Verify translator execution for positive fractional values."""
+        # +1.5 -> +1.0
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x3FC0_0000), 0x3F80_0000)
+        # +0.75 -> +0.0
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x3F400000), 0x0000_0000)
+        # +2.9999 -> +2.0
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x403FFFFF), 0x4000_0000)
+        # +0.9999999 -> +0.0 (0x3F7FFFFF)
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x3F7FFFFF), 0x0000_0000)
+
+    def test_translator_negative_fractional_inputs(self):
+        """Verify translator execution for negative fractional values (critical: floor vs trunc differ here)."""
+        # -0.5 -> -1.0
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0xBF000000), 0xBF800000)
+        # -0.75 -> -1.0
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0xBF400000), 0xBF800000)
+        # -1.5 -> -2.0
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0xBFC00000), 0xC0000000)
+        # -0.9999999 -> -1.0 (0xBF7FFFFF)
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0xBF7FFFFF), 0xBF800000)
+
+    def test_translator_integral_values_unchanged(self):
+        """Verify translator leaves exact integers unchanged."""
+        # +1.0 -> +1.0 (0x3F800000)
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x3F800000), 0x3F800000)
+        # -1.0 -> -1.0 (0xBF800000)
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0xBF800000), 0xBF800000)
+        # +4.0 -> +4.0 (0x40800000)
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x40800000), 0x40800000)
+
+    def test_translator_special_values_passthrough(self):
+        """Verify translator preserves infinities and NaN bit-exact."""
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x7F800000), 0x7F800000)  # +inf
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0xFF800000), 0xFF800000)  # -inf
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x7FC00000), 0x7FC00000)  # qNaN
+
+    def test_translator_signed_zeros_passthrough(self):
+        """Verify translator preserves signed zero identity."""
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x00000000), 0x00000000)  # +0.0
+        self.assertEqual(VFloorF32Oracle.execute_and_verify(0x80000000), 0x80000000)  # -0.0
+
+    def test_translator_mutation_floor_to_ceil_caught(self):
+        """Verify that the oracle and translator agree, and that a ceil mutant would differ.
+
+        This test acts as a mutation-catching guard: if tools/rdna2spirv.py emits Ceil
+        instead of Floor, the translated result will differ from the oracle for fractional values.
+        """
+        # -0.5 floor -> -1.0
+        translated = VFloorF32Oracle.execute_and_verify(0xBF000000)
+        oracle = VFloorF32Oracle.eval(0xBF000000)
+        self.assertEqual(translated, oracle)
+        self.assertEqual(translated, 0xBF800000)
+
+        # Explicitly verify that ceil gives a different answer (proving this input can catch mutation)
+        ceil_result = to_u32(math.ceil(to_f32(0xBF000000)))
+        self.assertNotEqual(translated, ceil_result)
+
+    def test_translator_clamp_modifier(self):
+        """Verify VOP3 clamp modifier clips floor result to [0.0, 1.0]."""
+        lines = [
+            "v_mov_b32_e32 v1, 0xbf000000",   # -0.5
+            "v_floor_f32 v2, v1 clamp",
+            "v_mov_b32_e32 v3, 0",
+            "exp mrt0 v2, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_floor_clamp", lines)
+        out = support.mrt0_words(spv)
+        # floor(-0.5) = -1.0, clamped to [0,1] = 0.0
+        self.assertEqual(out[0], 0x00000000)
+        self.assertIn("OpExtInst %float %glsl FClamp", spv)
 
 # -----------------------------------------------------------------------------
 # Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
