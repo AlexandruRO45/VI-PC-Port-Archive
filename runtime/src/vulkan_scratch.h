@@ -11,6 +11,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <utility>
@@ -46,8 +47,11 @@ public:
         constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
         if (!loaded_ || !bytes) return false;
         for (auto& chunk : current_.chunks) {
-            const VkDeviceSize start = (chunk.used + alignment - 1) / alignment * alignment;
-            if (start <= chunk.size && bytes <= chunk.size - start) {
+            const VkDeviceSize rem = chunk.used % alignment;
+            const VkDeviceSize pad = rem ? alignment - rem : 0;
+            if (chunk.used <= chunk.size && pad <= chunk.size - chunk.used &&
+                bytes <= chunk.size - chunk.used - pad) {
+                const VkDeviceSize start = chunk.used + pad;
                 chunk.used = start + bytes;
                 buffer = chunk.buffer;
                 offset = start;
@@ -55,12 +59,14 @@ public:
             }
         }
         Chunk chunk;
+        std::size_t best = spare_.size();
         for (std::size_t i = 0; i < spare_.size(); ++i)
-            if (spare_[i].size >= bytes) {
-                chunk = spare_[i];
-                spare_.erase(spare_.begin() + std::ptrdiff_t(i));
-                break;
-            }
+            if (spare_[i].size >= bytes && (best == spare_.size() || spare_[i].size < spare_[best].size))
+                best = i;
+        if (best < spare_.size()) {
+            chunk = spare_[best];
+            spare_.erase(spare_.begin() + std::ptrdiff_t(best));
+        }
         if (!chunk.buffer && !make_chunk(std::max<std::uint64_t>(bytes, minimum), chunk)) return false;
         chunk.used = bytes;
         buffer = chunk.buffer;
@@ -81,6 +87,7 @@ public:
 
     // The submissions on `timeline` are over and the semaphore is about to go (its queue is idle).
     void forget(VkSemaphore timeline) {
+        if (!timeline) return;
         for (std::size_t i = 0; i < retired_.size();) {
             if (retired_[i].timeline != timeline) {
                 ++i;
@@ -134,6 +141,7 @@ private:
 #undef LEONIDA_SCRATCH_MEMBER
 
         bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
+            if (!get || !device) return false;
             bool all = true;
 #define LEONIDA_SCRATCH_LOAD(name)                              \
     name = reinterpret_cast<PFN_##name>(get(device, #name));    \
