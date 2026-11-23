@@ -485,6 +485,73 @@ class Run(unittest.TestCase):
         r_nested = R.recover_fragments(b"<Item>" * 50 + b"</Item>" * 50)
         self.assertEqual((r_nested[0], r_nested[1], len(r_nested[2])), ("", {}, 1))
 
+        # Pin gap taint in _recover_prefix_items, gap reset in _trailing_siblings, and root-opener skip.
+        _, _, tainted_items = R.recover_fragments(b'<Item><id value="2"/><bro<Item><id value="3"/></Item></Item><x')
+        self.assertEqual(tainted_items, [{"id": 3}])
+
+        tag_gap, secs_gap, _ = R.recover_fragments(b'x</Item><A value="1"/><bro<B value="2"/></Root>')
+        self.assertEqual((tag_gap, secs_gap), ("Root", {"B": 2}))
+
+        tag_root, _, root_items = R.recover_fragments(
+            b'<Root><Item><id value="1"/></Item><Item><id',
+            root_hint="Root",
+        )
+        self.assertEqual((tag_root, root_items), ("Root", [{"id": 1}]))
+
+        # Direct unkeyed <Item>s immediately before </Root> stay in items rather than sections={"$items": ...}.
+        tag_dir, secs_dir, items_dir = R.recover_fragments(
+            b'x"/></Item><Item><v value="1"/></Item><Item><v value="2"/></Item></MaterialDataList>',
+            root_hint="MaterialDataList",
+        )
+        self.assertEqual((tag_dir, secs_dir, items_dir), ("MaterialDataList", {}, [{"v": 1}, {"v": 2}]))
+
+        # Fragment starting mid-comment skips the commented-out item before -->.
+        _, _, mid_cmt = R.recover_fragments(b'old <Item><id value="999"/></Item> --><Item><id value="1"/></Item><x')
+        self.assertEqual(mid_cmt, [{"id": 1}])
+
+        # Unterminated comments and CDATA blocks scan in linear time.
+        for markup in (b"<!--", b"<![CDATA["):
+            t1 = time.monotonic()
+            res = R.recover_fragments(markup * 5000)
+            self.assertLess(time.monotonic() - t1, 0.5)
+            self.assertEqual(res, ("", {}, []))
+
+    def test_cli_recover_error_handling_and_fragments_only_exit_codes(self):
+        # Well-formed docs failing with ValueError (bad array width) or LookupError (unknown encoding) must not
+        # be re-read as fragments or abort the run under --recover.
+        bad_dir = os.path.join(self.tmp.name, "mixed_errs")
+        os.makedirs(bad_dir)
+        with open(os.path.join(bad_dir, "good.xml"), "wb") as f:
+            f.write(b'<R><ok value="1"/></R>')
+        with open(os.path.join(bad_dir, "bad_vec.xml"), "wb") as f:
+            f.write(b'<R><pos content="vec3v_array">1 2</pos></R>')
+        with open(os.path.join(bad_dir, "bad_enc.xml"), "wb") as f:
+            f.write(b'<?xml version="1.0" encoding="x-unknown-enc"?><R><a value="1"/><b value="2"/></R>')
+        r = self._cli(bad_dir, "--recover")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("1 documents read, 1 roots, 2 not well-formed", r.stdout)
+        self.assertIn("recovered: 0 payloads (0 sections, 0 items)", r.stdout)
+
+        # A truncated payload containing one valid <Item> and one <Item> with a malformed array skips only the bad one.
+        trunc_dir = os.path.join(self.tmp.name, "trunc_arr")
+        os.makedirs(trunc_dir)
+        with open(os.path.join(trunc_dir, "trunc.xml"), "wb") as f:
+            f.write(b'</x><Item><v value="1"/></Item><Item><pos content="vec3v_array">1 2</pos></Item><cut')
+        out_trunc = os.path.join(self.tmp.name, "out_trunc")
+        r2 = self._cli(trunc_dir, "--recover", "--out", out_trunc)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("recovered: 1 payloads (0 sections, 1 items)", r2.stdout)
+        self.assertIn("wrote 1 JSON files", r2.stdout)
+
+        # Unrecoverable truncated file with --recover still exits 1 with "no document could be read".
+        unrec_dir = os.path.join(self.tmp.name, "unrec")
+        os.makedirs(unrec_dir)
+        with open(os.path.join(unrec_dir, "bad.xml"), "wb") as f:
+            f.write(b'<COther><x value="1"/>')
+        r3 = self._cli(unrec_dir, "--recover")
+        self.assertEqual(r3.returncode, 1, r3.stderr)
+        self.assertIn("no document could be read", r3.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,7 +51,7 @@ INT = re.compile(r"[-+]?\d+")
 HEX = re.compile(r"0x[0-9A-Fa-f]+")
 FLOAT = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?f?|[-+]?(inf|nan)", re.I)
 _XML_TOKEN_RE = re.compile(
-    rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|<(/?)([A-Za-z_][\w.:-]*)([^<>]*)>",
+    rb"<!--.*?(?:-->|\Z)|<!\[CDATA\[.*?(?:\]\]>|\Z)|<\?.*?(?:\?>|\Z)|<(/?)([A-Za-z_][\w.:-]*)([^<>]*)>",
     re.S,
 )
 _TAIL_CLOSE_RE = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
@@ -279,13 +279,26 @@ def _trailing_root_span(body: bytes, root_hint: str) -> tuple[str, int]:
     return "", len(body)
 
 
-def _trailing_siblings(body: bytes, body_end: int, tokens: list, reader: Reader, root_tag: str = "") -> tuple[dict, int]:
+def _is_unterminated_markup(raw: bytes) -> bool:
+    """True when a comment, CDATA section, or processing instruction runs to EOF without closing."""
+    if raw.startswith(b"<!--"):
+        return not raw.endswith(b"-->")
+    if raw.startswith(b"<![CDATA["):
+        return not raw.endswith(b"]]>")
+    if raw.startswith(b"<?"):
+        return not raw.endswith(b"?>")
+    return False
+
+
+def _trailing_siblings(
+    body: bytes, body_end: int, tokens: list, reader: Reader, root_tag: str = "", start_offset: int = 0
+) -> tuple[dict, int]:
     """Recover complete top-level sibling elements immediately preceding ``</Root>``."""
     root_bytes = root_tag.encode("ascii", "replace") if root_tag else b""
     stack = []
     counts = Counter()
     trailing_start = None
-    prev_end = 0
+    prev_end = start_offset
     saw_root_open = False
 
     for tok in tokens:
@@ -297,6 +310,11 @@ def _trailing_siblings(body: bytes, body_end: int, tokens: list, reader: Reader,
         prev_end = tok.end()
         name = tok.group(2)
         if name is None:
+            if _is_unterminated_markup(tok.group(0)):
+                if stack:
+                    stack[-1][2] = True
+                else:
+                    trailing_start = None
             continue
         slash, rest = tok.group(1), tok.group(3)
         if rest.rstrip().endswith(b"/"):
@@ -335,20 +353,25 @@ def _trailing_siblings(body: bytes, body_end: int, tokens: list, reader: Reader,
     span = body[trailing_start:body_end]
     try:
         wrap = ET.fromstring(b"<_recover>" + span + b"</_recover>")
-    except ET.ParseError:
+        sections = reader.children(list(wrap))
+    except (ET.ParseError, ValueError):
         return {}, body_end
-    sections = reader.children(list(wrap))
-    return (sections if isinstance(sections, dict) else {"$items": sections}), trailing_start
+    if not isinstance(sections, dict):
+        # Direct unkeyed <Item>s belong in the prefix item list rather than sections={"$items": ...}.
+        return {}, body_end
+    return sections, trailing_start
 
 
-def _recover_prefix_items(body: bytes, prefix_end: int, tokens: list, reader: Reader, root_tag: str = "") -> list:
+def _recover_prefix_items(
+    body: bytes, prefix_end: int, tokens: list, reader: Reader, root_tag: str = "", start_offset: int = 0
+) -> list:
     """Recover outermost well-formed ``<Item>...</Item>`` subtrees within ``body[:prefix_end]`` in linear time."""
     root_bytes = root_tag.encode("ascii", "replace") if root_tag else b""
     stack = []
     counts = Counter()
     non_item_depth = 0
     candidates = []
-    prev_end = 0
+    prev_end = start_offset
     saw_root_open = False
 
     for tok in tokens:
@@ -359,6 +382,8 @@ def _recover_prefix_items(body: bytes, prefix_end: int, tokens: list, reader: Re
         prev_end = tok.end()
         name = tok.group(2)
         if name is None:
+            if _is_unterminated_markup(tok.group(0)) and stack:
+                stack[-1][2] = True
             continue
         slash, rest = tok.group(1), tok.group(3)
         if rest.rstrip().endswith(b"/"):
@@ -401,7 +426,7 @@ def _recover_prefix_items(body: bytes, prefix_end: int, tokens: list, reader: Re
     for start_pos, end_pos in candidates:
         try:
             items.append(reader.convert(ET.fromstring(body[start_pos:end_pos])))
-        except ET.ParseError:
+        except (ET.ParseError, ValueError):
             pass
     return items
 
@@ -411,11 +436,15 @@ def recover_fragments(data: bytes, reader: Reader | None = None, root_hint: str 
     reader = reader or Reader()
     body = data[len(BOM):] if data.startswith(BOM) else data
     root_tag, body_end = _trailing_root_span(body, root_hint)
-    tokens = list(_XML_TOKEN_RE.finditer(body, 0, body_end))
+    start_offset = 0
+    close_cmt = body.find(b"-->", 0, body_end)
+    if close_cmt != -1 and body.find(b"<!--", 0, close_cmt) == -1:
+        start_offset = close_cmt + 3
+    tokens = list(_XML_TOKEN_RE.finditer(body, start_offset, body_end))
     sections, prefix_end = ({}, body_end)
     if body_end < len(body):
-        sections, prefix_end = _trailing_siblings(body, body_end, tokens, reader, root_tag)
-    items = _recover_prefix_items(body, prefix_end, tokens, reader, root_tag)
+        sections, prefix_end = _trailing_siblings(body, body_end, tokens, reader, root_tag, start_offset)
+    items = _recover_prefix_items(body, prefix_end, tokens, reader, root_tag, start_offset)
     return root_tag, sections, items
 
 
@@ -453,7 +482,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None, recover=False):
         except (ET.ParseError, LookupError, ValueError) as e:
             # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
             failed[str(e).split(":")[0]] += 1
-            if recover:
+            if recover and isinstance(e, ET.ParseError):
                 rtag, sections, items = recover_fragments(doc["data"], reader=reader, root_hint=hint or "")
                 if sections or items:
                     recovered += 1
