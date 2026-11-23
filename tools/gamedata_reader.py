@@ -221,9 +221,10 @@ class Reader:
                 out[tag] = value
         return out
 
-    def read(self, data):
+    def read(self, data, *, qualified_root=None):
         """One document (bytes) -> ``(root tag, root type, value)``. Fields are converted as their end tag arrives
-        and then dropped from the tree. Raises ``ET.ParseError`` for a document that is not well-formed."""
+        and then dropped from the tree. With ``qualified_root``, return None for other root tags before conversion.
+        Raises ``ET.ParseError`` for a matching document that is not well-formed."""
         stream = io.BytesIO(data[len(BOM):] if data.startswith(BOM) else data)
         depth, root, parts, stream_kids = 0, None, [], False
         for event, el in ET.iterparse(stream, events=("start", "end")):
@@ -231,6 +232,8 @@ class Reader:
                 depth += 1
                 if root is None:
                     root = el
+                    if qualified_root is not None and root.tag != qualified_root:
+                        return None
                     stream_kids = self._streams_children(root)
                 continue
             depth -= 1
@@ -265,16 +268,21 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
     reader = reader or Reader()
     roots, failed, read = Counter(), Counter(), 0
     written_names = set()
+    # The lexical hint is still used for plain names. A qualified name requires the parser to resolve xmlns.
+    read_options = {"qualified_root": root_filter} if root_filter and root_filter.startswith("{") else {}
     for n, doc in enumerate(documents(targets)):
         hint = doc.get("root_hint")
-        if root_filter and hint != root_filter:
+        if root_filter and not read_options and hint != root_filter:
             continue
         try:
-            tag, _, value = reader.read(doc["data"])
+            converted = reader.read(doc["data"], **read_options)
         except (ET.ParseError, LookupError, ValueError) as e:
             # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
             failed[str(e).split(":")[0]] += 1
             continue
+        if converted is None:
+            continue
+        tag, _, value = converted
         read += 1
         roots[tag] += 1
         if out_dir:
@@ -300,7 +308,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("targets", nargs="+", help="rpf9_carve.py directories (with index.json) or .xml files")
-    ap.add_argument("--root", help="only documents with this root tag")
+    ap.add_argument("--root", help="only documents with this root tag (plain name or {namespace}tag)")
     ap.add_argument("--out", help="write one JSON file per document here (game data: keep it local)")
     a = ap.parse_args(argv)
     if a.out and os.path.exists(a.out) and not os.path.isdir(a.out):

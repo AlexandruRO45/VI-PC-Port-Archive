@@ -286,6 +286,33 @@ class Run(unittest.TestCase):
         s = R.run([self.dir], root_filter="COther", reader=R.Reader(root_handlers={}, type_handlers={}))
         self.assertEqual(s["documents"], 1)
 
+    def test_qualified_root_filter_matches_the_namespace_before_conversion(self):
+        fixtures = (
+            b'<alpha xmlns="urn:demo"><x value="1"/></alpha>',
+            b'<d:alpha xmlns:d="urn:demo"><x value="2"/></d:alpha>',
+            b'<alpha xmlns="urn:other" type="Other"><x value="3"/></alpha>',
+            b'<alpha type="Bare"><x value="4"/></alpha>',
+            b'<alpha xmlns="urn:other"><x value="5"/>',
+        )
+        targets = []
+        for index, data in enumerate(fixtures):
+            path = os.path.join(self.tmp.name, f"namespace-{index}.xml")
+            with open(path, "wb") as f:
+                f.write(data)
+            targets.append(path)
+
+        qualified = "{urn:demo}alpha"
+        summary = R.run(targets, root_filter=qualified, reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(summary["per_root_documents"], {qualified: 2})
+        self.assertEqual(summary["elements_by_convention"], {"scalar": 2, "struct": 2})
+        self.assertEqual(summary["type_classes"], 0)
+        self.assertEqual(summary["not_well_formed"], 0)
+
+        result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),
+                                 *targets, "--root", qualified], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 documents read, 1 roots, 0 not well-formed", result.stdout)
+
     def test_conversion_and_encoding_errors_do_not_abort_batch(self):
         bad = os.path.join(self.tmp.name, "bad.xml")
         good = os.path.join(self.dir, "c.xml")
