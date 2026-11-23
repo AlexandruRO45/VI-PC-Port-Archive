@@ -130,5 +130,69 @@ class MainUsesTheNativeFolder(unittest.TestCase):
         self.assertEqual(len(err.strip().splitlines()), 1)
 
 
-if __name__ == "__main__":
+
+
+class MissingSpirvTools(unittest.TestCase):
+    def test_find_spirv_tool_checks_env_and_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ext = ".exe" if os.name == "nt" else ""
+            stub = os.path.join(tmp, "spirv-as" + ext)
+            with open(stub, "wb") as f:
+                f.write(b"")
+            if hasattr(os, "chmod"):
+                os.chmod(stub, 0o755)
+            with patch.dict(os.environ, {"LEONIDA_SPIRV_TOOLS": tmp}):
+                self.assertEqual(rdna2spirv.find_spirv_tool("spirv-as"), stub)
+
+    def test_assemble_spirv_raises_clean_error_when_missing(self):
+        with patch.dict(os.environ, {"PATH": "", "LEONIDA_SPIRV_TOOLS": ""}):
+            with patch("shutil.which", return_value=None):
+                with self.assertRaises(rdna2spirv.SpirvToolNotFoundError) as ctx:
+                    rdna2spirv.assemble_spirv("nonexistent.sa", "nonexistent.sv")
+                self.assertEqual(ctx.exception.tool, "spirv-as")
+                self.assertEqual(ctx.exception.filename, "spirv-as")
+
+    def test_main_exits_2_with_single_error_line_when_tool_missing(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            in_dir = os.path.join(tmp, "in")
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(in_dir)
+            s_file = os.path.join(in_dir, "dummy.s")
+            with open(s_file, "w", encoding="utf-8") as f:
+                f.write("s_end\n")
+            with patch.dict(os.environ, {"PATH": "", "LEONIDA_SPIRV_TOOLS": ""}):
+                with patch("shutil.which", return_value=None):
+                    with patch("sys.stderr", err), patch("sys.argv", ["rdna2spirv.py", s_file, "--out", out_dir]):
+                        code = rdna2spirv.main()
+        self.assertEqual(code, 2)
+        lines_out = [line.strip() for line in err.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines_out), 1)
+        self.assertIn("spirv-as not found; install SPIRV-Tools", lines_out[0])
+
+    def test_main_handles_windows_filenotfound_with_none_filename(self):
+        # On Windows, subprocess.run raises FileNotFoundError with e.filename = None.
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            in_dir = os.path.join(tmp, "in")
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(in_dir)
+            s_file = os.path.join(in_dir, "test.s")
+            with open(s_file, "w", encoding="utf-8") as f:
+                f.write("s_end\n")
+            win_err = FileNotFoundError(2, "The system cannot find the file specified")
+            self.assertIsNone(win_err.filename)
+            with patch("rdna2spirv.find_spirv_tool", return_value="spirv-as"), \
+                    patch("rdna2spirv.translate", return_value="OpCapability Shader\nOpMemoryModel Logical GLSL450\n"), \
+                    patch("rdna2spirv.assemble_spirv", side_effect=win_err), \
+                    patch("sys.stderr", err), \
+                    patch("sys.argv", ["rdna2spirv.py", s_file, "--out", out_dir]):
+                code = rdna2spirv.main()
+        self.assertEqual(code, 2)
+        lines_out = [line.strip() for line in err.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines_out), 1)
+        self.assertIn("spirv-as not found; install SPIRV-Tools", lines_out[0])
+
+
+if __name__ == '__main__':
     unittest.main(verbosity=2)

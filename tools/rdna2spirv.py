@@ -20,6 +20,7 @@ import bisect
 import hashlib
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -17405,6 +17406,30 @@ def _run_spirv_tool(cmd, **kwargs):
         raise
 
 
+class SpirvToolNotFoundError(FileNotFoundError):
+    def __init__(self, tool):
+        super().__init__(f"{tool} not found; install SPIRV-Tools (spirv-as, spirv-val) and put it on PATH or set LEONIDA_SPIRV_TOOLS")
+        self.filename = tool
+        self.tool = tool
+
+
+def find_spirv_tool(name):
+    """Find a SPIRV-Tools executable (spirv-as, spirv-val).
+
+    Checks LEONIDA_SPIRV_TOOLS in the environment first (including any bin/ subfolder),
+    then falls back to PATH via shutil.which.
+    """
+    env_dir = os.environ.get("LEONIDA_SPIRV_TOOLS")
+    if env_dir:
+        candidates = [os.path.join(env_dir, name), os.path.join(env_dir, "bin", name)]
+        for candidate in candidates:
+            for ext in ("", ".exe"):
+                p = candidate + ext
+                if os.path.isfile(p) and (not hasattr(os, "X_OK") or os.access(p, os.X_OK)):
+                    return p
+    return shutil.which(name)
+
+
 def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
     """Keep the assembled module out of the final path until validation succeeds.
 
@@ -17428,13 +17453,19 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
             except (OSError, spirv_asm.SpirvAsmError) as exc:
                 result = subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
         else:
+            spirv_as = find_spirv_tool("spirv-as")
+            if not spirv_as:
+                raise SpirvToolNotFoundError("spirv-as")
+            spirv_val = find_spirv_tool("spirv-val")
+            if not spirv_val:
+                raise SpirvToolNotFoundError("spirv-val")
             try:
                 with open(sa, "rb") as f:
                     source = f.read()
             except OSError as exc:
-                result = subprocess.CompletedProcess(["spirv-as"], 1, "", f"error: cannot read {sa}: {exc}")
+                result = subprocess.CompletedProcess([spirv_as], 1, "", f"error: cannot read {sa}: {exc}")
             else:
-                result = _run_spirv_tool(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
+                result = _run_spirv_tool([spirv_as, "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
                                         input=source, capture_output=True, cwd=folder)
                 # stdin is bytes, so the output is too; a test double may already answer in text.
                 if isinstance(result.stdout, bytes):
@@ -17443,7 +17474,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
                     result.stderr = result.stderr.decode("utf-8", "replace")
         if result.returncode == 0:
             # Offset on non-gather: VK_KHR_maintenance8
-            result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
+            result = _run_spirv_tool([spirv_val, "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
                                      tmp.name], capture_output=True, text=True, cwd=folder)
         if result.returncode == 0:
             tmp.replace(sv)
@@ -17670,6 +17701,13 @@ def main():
         Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
         invalid.add(name)
 
+    if a.assembler != "python":
+        missing_tool = next((t for t in ("spirv-as", "spirv-val") if not find_spirv_tool(t)), None)
+        if missing_tool:
+            print(f"ERROR: {missing_tool} not found; install SPIRV-Tools (spirv-as, spirv-val) "
+                  "and put it on PATH", file=sys.stderr)
+            return 2
+
     for p in files:
         name = os.path.splitext(os.path.basename(p))[0]
         try:
@@ -17701,9 +17739,12 @@ def main():
         except OSError as e:
             # A missing spirv-as/spirv-val fails every shader the same way; report it once as a setup
             # error (exit 2) instead of a FileNotFoundError traceback from the first one.
-            if e.filename not in ("spirv-as", "spirv-val"):
+            tool = getattr(e, "filename", None) or getattr(e, "tool", None)
+            if not tool and isinstance(e, FileNotFoundError):
+                tool = "spirv-as"
+            if tool not in ("spirv-as", "spirv-val"):
                 raise
-            print(f"ERROR: {e.filename} not found; install SPIRV-Tools (spirv-as, spirv-val) "
+            print(f"ERROR: {tool} not found; install SPIRV-Tools (spirv-as, spirv-val) "
                   "and put it on PATH", file=sys.stderr)
             return 2
         if r.returncode == 0:
