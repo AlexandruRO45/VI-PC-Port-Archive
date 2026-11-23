@@ -584,5 +584,33 @@ class VLdexpF64TranslatorTests(unittest.TestCase):
         spv = translate_lines("ps_ldexp_f64_test", lines)
         self.assertIn("OpCapability", spv)
 
+# -----------------------------------------------------------------------------
+# Opcode 7: v_frexp_exp_i32_f64
+# -----------------------------------------------------------------------------
+def oracle_frexp_exp_i32_f64(x_bits: int) -> int:
+    """Reference mathematical oracle for v_frexp_exp_i32_f64: returns int32 exponent of frexp(x)."""
+    if is_nan_u64(x_bits) or (x_bits & 0x7FF0000000000000) == 0x7FF0000000000000:
+        return 0
+    fx = u64_to_f64(x_bits)
+    if fx == 0.0:
+        return 0
+    _, exp = math.frexp(fx)
+    return exp & MASK32
+
+
+class VFrexpExpI32F64OracleTests(unittest.TestCase):
+    def test_frexp_exp_basic(self):
+        # 1.0 = 0.5 * 2^1 -> exp is 1
+        self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_ONE), 1)
+
+    def test_frexp_exp_powers_of_two(self):
+        # 8.0 = 0.5 * 2^4 -> exp is 4
+        self.assertEqual(oracle_frexp_exp_i32_f64(f64_to_u64(8.0)), 4)
+        # 0.25 = 0.5 * 2^-1 -> exp is -1 (0xFFFFFFFF)
+        self.assertEqual(oracle_frexp_exp_i32_f64(f64_to_u64(0.25)), (-1) & MASK32)
+
+    def test_frexp_exp_zero(self):
+        self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_ZERO), 0)
+
 if __name__ == "__main__":
     unittest.main()
