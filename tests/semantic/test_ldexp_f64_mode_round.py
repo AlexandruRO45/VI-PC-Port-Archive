@@ -147,6 +147,17 @@ class LdexpF64ModeRound(unittest.TestCase):
         w = mrt0_words(translate_fixture("ps_ldexp_f64_directed"))
         self.assertEqual(w, [0xFFFFFFFF, 0xFFEFFFFF, 0x00000000, 0xFFF00000])
 
+    def test_directed_rounding_with_conditional_bit_selects(self):
+        for mode, low_word in ((RUP, 1), (RDN, 0)):
+            with self.subTest(mode=mode):
+                lines = [mode, "v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3ff80000", "v_mov_b32 v2, -1075",
+                         "v_ldexp_f64 v[8:9], v[0:1], v2",
+                         "s_mov_b32 vcc, -1", "v_cndmask_b32_e64 v10, 0, 0x3f800000, vcc",
+                         "s_mov_b32 vcc, 0", "v_cndmask_b32 v11, 0x80000000, v10",
+                         "exp mrt0 v8, v9, v10, v11 done vm", "s_endpgm"]
+                words = mrt0_words(translate_lines("ps_directed_bit_select", lines))
+                self.assertEqual(words, [low_word, 0, 0x3F800000, 0x80000000])
+
     def test_directed_write_with_an_unmodelled_f16_result_is_rejected(self):
         lines = [RUP, "v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3ff00000", "v_mov_b32 v2, 0",
                  "v_ldexp_f64 v[8:9], v[0:1], v2", "v_cvt_f16_f32 v10, v0",

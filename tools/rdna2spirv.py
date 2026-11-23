@@ -16080,7 +16080,8 @@ def translate(path):
         ops = {base_op(i["op"]) for i in insns}
         g.directed_round_mode = "v_ldexp_f64" in ops and all(
             op.startswith("s_") or op in NOOPS or op in U2 or op in F2 or
-            op in ("v_ldexp_f64", "v_mov_b32", "v_readfirstlane_b32", "v_readlane_b32", "v_writelane_b32", "exp")
+            op in ("v_ldexp_f64", "v_mov_b32", "v_cndmask_b32", "v_readfirstlane_b32",
+                   "v_readlane_b32", "v_writelane_b32", "exp")
             for op in ops)
     strict_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) for i in insns)
     code_w64 = strict_w64 or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
