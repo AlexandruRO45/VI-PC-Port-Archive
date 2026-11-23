@@ -1060,8 +1060,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             "translating again")
         drop(translated)
     # The translation also depends on the fallback flags (--no-float-controls, --bary-fallback,
-    # --texel-offset-fallback, --mesh-compute), so they are kept beside it like the wave64 mode. A folder from
-    # before the file existed was translated without them.
+    # --texel-offset-fallback, --f16-interp-fallback, --mesh-compute, --pc-tail-ubo), so they are kept beside it
+    # like the wave64 mode. A folder from before the file existed was translated without them.
     flags_file = os.path.join(spirv, "translator_flags.txt")
     want_flags = translator_flags_setting(fallbacks)
     had_flags = read_shader_setting(flags_file)
