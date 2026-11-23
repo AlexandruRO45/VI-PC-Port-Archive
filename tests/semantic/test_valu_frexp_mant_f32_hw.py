@@ -74,40 +74,110 @@ def run_ps_frexp_mant_f32(instructions: Sequence[str]) -> list[int]:
 
 class TestReferenceOracleAndTranslator(unittest.TestCase):
     def test_powers_of_two(self):
-        # 1.0 (0x3F800000) -> 0.5 (0x3F000000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(1.0)), f32_to_u32(0.5))
-        # 2.0 (0x40000000) -> 0.5 (0x3F000000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(2.0)), f32_to_u32(0.5))
-        # 4.0 (0x40800000) -> 0.5 (0x3F000000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(4.0)), f32_to_u32(0.5))
-        # 0.5 (0x3F000000) -> 0.5 (0x3F000000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(0.5)), f32_to_u32(0.5))
 
     def test_fractional_numbers(self):
-        # 3.0 (0x40400000) = 0.75 * 2^2 -> mantissa 0.75 (0x3F400000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(3.0)), f32_to_u32(0.75))
-        # 1.5 (0x3FC00000) = 0.75 * 2^1 -> mantissa 0.75 (0x3F400000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(1.5)), f32_to_u32(0.75))
 
     def test_negative_numbers(self):
-        # -1.0 (0xBF800000) -> -0.5 (0xBF000000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(-1.0)), f32_to_u32(-0.5))
-        # -3.0 (0xC0400000) -> -0.75 (0xBF400000)
         self.assertEqual(ref_frexp_mant_f32(f32_to_u32(-3.0)), f32_to_u32(-0.75))
 
     def test_translator_basic_execution(self):
         words = run_ps_frexp_mant_f32([
-            "v_mov_b32 v1, 0x40000000",  # 2.0
+            "v_mov_b32 v1, 0x40000000",
             "v_frexp_mant_f32 v0, v1",
         ])
         self.assertEqual(words[0], f32_to_u32(0.5))
 
     def test_translator_fractional_execution(self):
         words = run_ps_frexp_mant_f32([
-            "v_mov_b32 v1, 0x40400000",  # 3.0
+            "v_mov_b32 v1, 0x40400000",
             "v_frexp_mant_f32 v0, v1",
         ])
         self.assertEqual(words[0], f32_to_u32(0.75))
+
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    literal_val: int = 0
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of bounds [0, 255]")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of bounds [0, 105]")
+
+    @classmethod
+    def vgpr(cls, idx: int) -> Operand:
+        return cls(RegType.VGPR, index=idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> Operand:
+        return cls(RegType.SGPR, index=idx)
+
+    @classmethod
+    def literal(cls, val: int) -> Operand:
+        return cls(RegType.LITERAL, literal_val=val & MASK32)
+
+    def to_asm(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        else:
+            return f"{self.literal_val:#x}"
+
+
+@dataclass(frozen=True)
+class VFrexpMantF32Instruction:
+    dst: Operand
+    src0: Operand
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination must be a VGPR for VALU instruction v_frexp_mant_f32")
+
+    def to_asm(self) -> str:
+        return f"v_frexp_mant_f32 {self.dst.to_asm()}, {self.src0.to_asm()}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_ast_construction_and_formatting(self):
+        insn = VFrexpMantF32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+        )
+        self.assertEqual(insn.to_asm(), "v_frexp_mant_f32 v0, v1")
+
+    def test_ast_immutability(self):
+        insn = VFrexpMantF32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+        )
+        with self.assertRaises(Exception):
+            insn.dst = Operand.vgpr(2)  # type: ignore
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(TypeError):
+            VFrexpMantF32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+            )
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
 
 
 if __name__ == "__main__":
