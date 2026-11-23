@@ -277,7 +277,7 @@ class RunTestTest(unittest.TestCase):
 
     def test_invalid_ctest_skip_return_code_fails_without_launching(self):
         exe = self.exiting(0)
-        for bad in ("abc", "", [], True, 1.5):
+        for bad in ("abc", "", [], True, 1.5, -1, 256, "256"):
             with self.subTest(skip_code=bad):
                 entry = ctest_entry("bad_skip", self.command_for(exe), {"SKIP_RETURN_CODE": bad})
                 with mock.patch.object(rwt.subprocess, "run") as run:

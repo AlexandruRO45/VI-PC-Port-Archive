@@ -196,6 +196,8 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
                 return "fail", "invalid CTest SKIP_RETURN_CODE"
         else:
             return "fail", "invalid CTest SKIP_RETURN_CODE"
+        if not (0 <= skip_code <= 255):
+            return "fail", "invalid CTest SKIP_RETURN_CODE"
     start = time.monotonic()
     try:
         proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
