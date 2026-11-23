@@ -26,13 +26,25 @@ def judge(failed: list[str], status: int, expected: list[str]) -> tuple[int, lis
 
 
 def main(argv: list[str]) -> int:
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
     if len(argv) < 2:
         print(__doc__.strip(), file=sys.stderr)
         return 2
-    with open(argv[0], encoding="utf-8") as f:
-        failed = [line.strip() for line in f if line.strip()]
+    try:
+        status = int(argv[1])
+    except ValueError:
+        print(f"EXIT_STATUS must be an integer, not {argv[1]!r}", file=sys.stderr)
+        return 2
+    try:
+        with open(argv[0], encoding="utf-8-sig") as f:
+            failed = [line.strip() for line in f if line.strip()]
+    except OSError as e:
+        print(f"cannot read {argv[0]}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
     expected = [name for arg in argv[2:] for name in arg.split()]
-    code, lines = judge(failed, int(argv[1]), expected)
+    code, lines = judge(failed, status, expected)
     print("\n".join(lines))
     return code
 
