@@ -1093,10 +1093,10 @@ unsigned differential_jobs() {
 // Non-destructive argument-validation and proxy-wrapping cases run in-process for speed (<1 ms each).
 bool is_isolated_diff_case(int index) {
     if (index == 1 || index == 2) return true;         // residency (descriptor heap)
-    if (index >= 17 && index <= 20) return true;       // faults on PC runtime (queue null args)
-    if (index == 25) return true;                      // faults on PC runtime (null fence entry)
-    if (index >= 26 && index <= 29) return true;       // residency (MakeResident/Evict/Priority/Enqueue)
-    if (index == 30 || index == 31) return true;       // shared handle creation
+    if (index >= 16 && index <= 19) return true;       // faults on PC runtime (queue null args)
+    if (index == 24) return true;                      // faults on PC runtime (null fence entry)
+    if (index >= 25 && index <= 28) return true;       // residency (MakeResident/Evict/Priority/Enqueue)
+    if (index == 29 || index == 30) return true;       // shared handle creation
     return false;
 }
 
