@@ -6,18 +6,17 @@ Usage:
     python -I tools/validate.py code [--json]
     python -I tools/validate.py report [--game DIR] [--out FILE]
 
+Delegates stage/preflight/manifest rules directly to make_game.py so CLI and GUI never disagree.
 Standard library only. Never reads or exports game content; reports only sizes, hashes, and tool status.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import time
@@ -32,6 +31,7 @@ if ROOT_DIR not in sys.path:
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+import make_game  # noqa: E402
 import manifest as manifest_mod  # noqa: E402
 from mc_command import mc_command  # noqa: E402
 
@@ -42,9 +42,7 @@ BLOCKED_DATA_EXTENSIONS = {
 }
 
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-PROBES = ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf")
-MIN_FREE_GB = {"shaders": 30, "assets": 300}
-ALL_STAGES = ("check", "shaders", "assets", "runtime", "pipelines")
+ALL_STAGES = tuple(make_game.STAGES)
 
 
 @dataclass
@@ -86,86 +84,6 @@ def _platform_label() -> str:
     return f"{platform.system()} {platform.release()} ({platform.machine()})"
 
 
-def _tool_available(cmd: str) -> bool:
-    cmd = cmd.strip().strip('"')
-    if os.path.isfile(cmd):
-        return True
-    parts = cmd.split()
-    head = parts[0].strip('"') if parts else ""
-    return bool(head and (shutil.which(head) or os.path.isfile(head)))
-
-
-def _dotnet_sdk_version() -> str | None:
-    if not shutil.which("dotnet"):
-        return None
-    try:
-        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    versions = re.findall(r"^(\d+\.\d+\.\S+)", r.stdout, re.M)
-    supported = [v for v in versions if int(v.split(".")[0]) >= 8]
-    return supported[-1] if supported else None
-
-
-def _visual_cpp_ok() -> bool:
-    if os.name != "nt":
-        return False
-    vswhere = os.path.join(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        "Microsoft Visual Studio", "Installer", "vswhere.exe",
-    )
-    if not os.path.isfile(vswhere):
-        return False
-    try:
-        r = subprocess.run(
-            [
-                vswhere, "-latest", "-products", "*",
-                "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                "-property", "installationPath",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return r.returncode == 0 and bool(r.stdout.strip())
-
-
-def _llvm_mc_status() -> tuple[str, str]:
-    cmd = mc_command()
-    head = cmd[0]
-    if not _tool_available(head):
-        return "error", f"Not found ({head}). Set LLVM_MC or build with scripts/build_llvm_mc.ps1."
-    try:
-        r = subprocess.run([*cmd, "--version"], capture_output=True, text=True, errors="replace", timeout=15)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return "error", f"Failed to run {head}: {exc}"
-    out = r.stdout or ""
-    if r.returncode != 0:
-        return "error", f"{head} exited with {r.returncode}"
-    has_amdgpu = "amdgcn" in out.lower() or "amdgpu" in out.lower()
-    m = re.search(r"LLVM version (\d+\.\d+\.\d+)", out)
-    ver = m.group(1) if m else "unknown"
-    if not has_amdgpu:
-        return "error", f"LLVM {ver} found at {head}, but AMDGPU target is missing."
-    major = int(ver.split(".")[0]) if m else 0
-    if major and major < 21:
-        return "warn", f"LLVM {ver} with AMDGPU found (LLVM 21+ recommended)."
-    return "ok", f"LLVM {ver} with AMDGPU target ({head})"
-
-
-def _disk_free_gb(path: str) -> float | None:
-    target = os.path.abspath(path)
-    while target and not os.path.exists(target):
-        parent = os.path.dirname(target)
-        if parent == target:
-            break
-        target = parent
-    try:
-        return shutil.disk_usage(target).free / (2**30)
-    except OSError:
-        return None
-
-
 def _external_python_312() -> tuple[str | None, str | None]:
     """Find an external Python 3.12+ interpreter on PATH (needed when running from a frozen executable)."""
     candidates = ["py", "python", "python3"] if os.name == "nt" else ["python3", "python"]
@@ -192,13 +110,50 @@ def _external_python_312() -> tuple[str | None, str | None]:
     return None, None
 
 
+def _llvm_mc_status() -> tuple[str, str]:
+    cmd = mc_command()
+    head = cmd[0]
+    if not make_game.tool_available(head):
+        return "error", f"Not found ({head}). Set LLVM_MC or run scripts/install_llvm.ps1 / scripts/build_llvm_mc.ps1."
+    try:
+        r = subprocess.run([*cmd, "--version"], capture_output=True, text=True, errors="replace", timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "error", f"Failed to run {head}: {exc}"
+    out = r.stdout or ""
+    if r.returncode != 0:
+        return "error", f"{head} exited with {r.returncode}"
+    has_amdgpu = "amdgcn" in out.lower() or "amdgpu" in out.lower()
+    m = re.search(r"LLVM version (\d+\.\d+\.\d+)", out)
+    ver = m.group(1) if m else "unknown"
+    if not has_amdgpu:
+        return "error", f"LLVM {ver} found at {head}, but AMDGPU target is missing."
+    major = int(ver.split(".")[0]) if m else 0
+    if major and major < 21:
+        return "warn", f"LLVM {ver} with AMDGPU found (LLVM 21+ recommended)."
+    return "ok", f"LLVM {ver} with AMDGPU target ({' '.join(cmd)})"
+
+
+def _disk_free_gb(path: str) -> float | None:
+    target = os.path.abspath(path)
+    while target and not os.path.exists(target):
+        parent = os.path.dirname(target)
+        if parent == target:
+            break
+        target = parent
+    try:
+        return shutil.disk_usage(target).free / (2**30)
+    except OSError:
+        return None
+
+
 def check_environment(
     stages: list[str] | tuple[str, ...] = ALL_STAGES,
     work_dir: str | None = None,
     wav: bool = False,
+    runtime_build: str | None = None,
     root_dir: str = ROOT_DIR,
 ) -> ValidationReport:
-    """Inspect system prerequisites without starting a build."""
+    """Inspect system prerequisites using make_game.py's own rules and reuse discounts."""
     checks: list[CheckItem] = []
 
     if getattr(sys, "frozen", False):
@@ -244,14 +199,14 @@ def check_environment(
             required=req,
         ))
 
-    # .NET 8 SDK
+    # .NET 8 SDK (delegates to make_game.dotnet_sdk_ok)
     need_assets = "assets" in stages
-    dotnet_ver = _dotnet_sdk_version()
+    dotnet_ok = make_game.dotnet_sdk_ok()
     checks.append(CheckItem(
         id="dotnet",
         name=".NET 8+ SDK",
-        status="ok" if dotnet_ver else ("error" if need_assets else "warn"),
-        detail=f".NET SDK {dotnet_ver}" if dotnet_ver else "Not found (.NET 8 SDK required for rpf9dump)",
+        status="ok" if dotnet_ok else ("error" if need_assets else "warn"),
+        detail=".NET 8+ SDK available" if dotnet_ok else "Not found (.NET 8 SDK required for rpf9dump)",
         required=need_assets,
     ))
 
@@ -266,10 +221,10 @@ def check_environment(
         required=False,
     ))
 
-    # C++ toolchain
-    need_runtime = "runtime" in stages
+    # C++ toolchain (delegates to make_game.visual_cpp_tools_ok / cross_build_missing)
+    need_runtime = "runtime" in stages and not runtime_build
     if os.name == "nt":
-        vs_ok = _visual_cpp_ok()
+        vs_ok = make_game.visual_cpp_tools_ok()
         checks.append(CheckItem(
             id="msvc",
             name="Visual Studio C++ (x64)",
@@ -278,14 +233,37 @@ def check_environment(
             required=need_runtime,
         ))
     else:
-        cmake = shutil.which("cmake")
-        clang_cl = shutil.which("clang-cl")
+        missing_cross = make_game.cross_build_missing() if need_runtime else []
         checks.append(CheckItem(
             id="cmake",
-            name="CMake & Cross-build tools",
-            status="ok" if (cmake and clang_cl) else ("warn" if need_runtime else "skip"),
-            detail=f"cmake={cmake or 'missing'}, clang-cl={clang_cl or 'missing'}",
+            name="Cross-build toolchain (clang-cl + xwin)",
+            status="ok" if not missing_cross else "warn",
+            detail="Ready" if not missing_cross else "; ".join(missing_cross),
             required=False,
+        ))
+
+    # Pipelines prerequisite (delegates to make_game.pipeline_check_exe / pipeline_check_prerequisite)
+    if "pipelines" in stages:
+        pcheck = make_game.pipeline_check_exe()
+        if pcheck:
+            p_status, p_detail = "ok", pcheck
+        elif os.name != "nt":
+            has_cmake = bool(shutil.which("cmake"))
+            p_status = "ok" if has_cmake else "error"
+            p_detail = "vk_pipeline_check will be built with CMake" if has_cmake else "CMake 3.24+ required to build vk_pipeline_check"
+        else:
+            rt_building = "runtime" in stages and not runtime_build
+            has_vk_sdk = bool(os.environ.get("VULKAN_SDK"))
+            if rt_building and has_vk_sdk:
+                p_status, p_detail = "ok", "vk_pipeline_check will be built during runtime stage (VULKAN_SDK set)"
+            else:
+                p_status, p_detail = "error", make_game.pipeline_check_prerequisite(rt_building)
+        checks.append(CheckItem(
+            id="pipelines",
+            name="Vulkan Pipeline Checker (vk_pipeline_check)",
+            status=p_status,
+            detail=p_detail,
+            required=True,
         ))
 
     # ffmpeg (optional unless --wav)
@@ -298,15 +276,29 @@ def check_environment(
         required=bool(wav and need_assets),
     ))
 
-    # Disk space
-    check_path = work_dir or os.path.expanduser("~")
+    # Disk space (uses make_game.MIN_FREE_GB + assets_exported / shader_outputs_reusable discounts)
+    check_path = work_dir or os.path.join(make_game.default_out(), "work")
     free_gb = _disk_free_gb(check_path)
-    need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
+    need_map = {s: make_game.MIN_FREE_GB.get(s, 0) for s in stages}
+    if need_map.get("assets") and not wav and os.path.isdir(check_path) and make_game.assets_exported(check_path):
+        need_map["assets"] = 0
+    need_gb = sum(need_map.values())
+    if (
+        free_gb is not None
+        and free_gb < need_gb
+        and need_map.get("shaders")
+        and os.path.isdir(check_path)
+    ):
+        try:
+            if make_game.shader_outputs_reusable(check_path, False, True, ()):
+                need_gb -= need_map["shaders"]
+        except SystemExit:
+            pass
     if free_gb is None:
         disk_status, disk_detail = "warn", f"Could not measure free space at {check_path}"
     elif need_gb > 0 and free_gb < need_gb:
         disk_status = "warn"
-        disk_detail = f"{free_gb:.1f} GB free at {check_path} (~{need_gb} GB recommended for selected stages)"
+        disk_detail = f"{free_gb:.1f} GB free at {check_path} (~{need_gb} GB needed for selected stages)"
     else:
         disk_status = "ok"
         disk_detail = f"{free_gb:.1f} GB free at {check_path}" + (f" (need ~{need_gb} GB)" if need_gb else "")
@@ -358,7 +350,7 @@ def validate_game_folder(
     root_dir: str = ROOT_DIR,
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> ValidationReport:
-    """Validate a game package folder against game/<version>.json (sizes + optional SHA-256)."""
+    """Validate a game package folder against game/<version>.json using make_game.probe_mismatches."""
     game_dir = os.path.abspath(game_dir)
     if not os.path.isdir(game_dir):
         return ValidationReport(
@@ -383,19 +375,7 @@ def validate_game_folder(
     matched_manifest = None
     probe_notes = []
     for _path, doc in manifests:
-        files = doc.get("files", {})
-        probes = [p for p in PROBES if p in files]
-        bad = []
-        for probe in probes:
-            target = os.path.join(game_dir, probe)
-            try:
-                st = os.stat(target)
-                if not stat.S_ISREG(st.st_mode):
-                    bad.append(f"{probe}: not a file")
-                elif st.st_size != files[probe]["size"]:
-                    bad.append(f"{probe}: size {st.st_size} != {files[probe]['size']}")
-            except OSError:
-                bad.append(f"{probe}: missing")
+        bad = make_game.probe_mismatches(game_dir, doc)
         if not bad:
             matched_manifest = doc
             break
@@ -536,10 +516,9 @@ def validate_manifest_schema(path: str) -> list[str]:
 
 
 def validate_codebase(root_dir: str = ROOT_DIR) -> ValidationReport:
-    """Self-validate the Leonida codebase: manifests, Python compilation, key files, and no-game-data safety."""
+    """Self-validate the Leonida codebase: manifests, Python syntax, key files, and no-game-data safety."""
     checks: list[CheckItem] = []
 
-    # 1. Key files
     required_files = [
         "make_game.py",
         "tools/manifest.py",
@@ -555,7 +534,6 @@ def validate_codebase(root_dir: str = ROOT_DIR) -> ValidationReport:
         detail="All core files present." if not missing_files else f"Missing: {', '.join(missing_files)}",
     ))
 
-    # 2. Manifest schema validation
     manifest_dir = os.path.join(root_dir, "game")
     schema_errors: list[str] = []
     manifest_count = 0
@@ -575,7 +553,6 @@ def validate_codebase(root_dir: str = ROOT_DIR) -> ValidationReport:
         ),
     ))
 
-    # 3. Python syntax check (in-memory compile so it works in read-only bundles too)
     compile_targets = [
         os.path.join(root_dir, "make_game.py"),
         os.path.join(root_dir, "tools"),
@@ -612,7 +589,6 @@ def validate_codebase(root_dir: str = ROOT_DIR) -> ValidationReport:
         ),
     ))
 
-    # 4. No-game-data check (via git ls-files when inside a git checkout)
     blocked_found: list[str] = []
     if shutil.which("git") and os.path.exists(os.path.join(root_dir, ".git")):
         try:
@@ -631,7 +607,6 @@ def validate_codebase(root_dir: str = ROOT_DIR) -> ValidationReport:
         detail="Clean repository (0 restricted files tracked)." if not blocked_found else f"Found: {', '.join(blocked_found[:5])}",
     ))
 
-    # 5. Bundled Outfit fonts
     font_dir = os.path.join(root_dir, "assets", "fonts")
     fonts_present = [
         f for f in ("Outfit-Regular.ttf", "Outfit-Medium.ttf", "Outfit-SemiBold.ttf", "Outfit-Bold.ttf")
@@ -677,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     p_env.add_argument("--stages", default=",".join(ALL_STAGES))
     p_env.add_argument("--work", default=None)
     p_env.add_argument("--wav", action="store_true")
+    p_env.add_argument("--runtime-build", default=None)
     p_env.add_argument("--json", action="store_true")
 
     p_game = sub.add_parser("game", help="Validate a game package folder")
@@ -696,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "env":
         stages = [s.strip() for s in args.stages.split(",") if s.strip()]
-        rep = check_environment(stages=stages, work_dir=args.work, wav=args.wav)
+        rep = check_environment(stages=stages, work_dir=args.work, wav=args.wav, runtime_build=args.runtime_build)
         _print_report(rep, args.json)
         return 0 if rep.ok else 1
 

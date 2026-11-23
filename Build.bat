@@ -27,10 +27,7 @@ if not defined PY (
   exit /b 1
 )
 if "%~1"=="" (
-  %PY% -c "import PySide6" >nul 2>nul && (
-    %PY% -I "%~dp0leonida_gui.py"
-    exit /b %ERRORLEVEL%
-  )
+  %PY% -c "import PySide6" >nul 2>nul && goto :run_gui
 )
 %PY% -I "%~dp0make_game.py" %*
 set "RC=%ERRORLEVEL%"
@@ -38,3 +35,7 @@ echo.
 if "%RC%"=="0" (echo Done.) else (echo The build stopped. Read the message above.)
 pause
 exit /b %RC%
+
+:run_gui
+%PY% -I "%~dp0leonida_gui.py"
+exit /b %ERRORLEVEL%

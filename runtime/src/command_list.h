@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <memory>
 #include <string>
 #include <utility>
 #include <variant>
@@ -150,8 +152,11 @@ inline constexpr std::uint32_t clear_depth = 0x1;
 inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
-// Portable color-view interpretation. Other views inherit their resource format as before.
-enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint, rgba8_sint, rgba8_snorm };
+// The format a color view names, as a VkFormat number (0, `resource`, is the resource's own). The named values are
+// the RGBA8 family's; a typeless resource of any other family stores its view's VkFormat the same way (D3D-275).
+enum class ColorViewFormat : std::uint32_t {
+    resource = 0, rgba8_unorm = 37, rgba8_snorm = 38, rgba8_uint = 41, rgba8_sint = 42, rgba8_srgb = 43
+};
 
 // D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
 namespace d3d12_query_heap {
@@ -175,6 +180,11 @@ inline constexpr std::uint32_t video_decode_statistics = 8;
 inline constexpr std::uint32_t pipeline_statistics1 = 10;
 } // namespace d3d12_query
 
+// A stream-output statistics query (SO_STATISTICS_STREAM0..3).
+constexpr bool is_so_statistics(std::uint32_t query_type) {
+    return query_type >= d3d12_query::so_statistics_stream0 && query_type <= d3d12_query::so_statistics_stream3;
+}
+
 // Whether a heap of `heap_type` holds queries of `query_type` (the D3D12 pairing rules).
 constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type) {
     namespace h = d3d12_query_heap;
@@ -192,7 +202,8 @@ constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type
 }
 
 // Bytes one resolved query takes: a UINT64 for occlusion and timestamps, D3D12_QUERY_DATA_PIPELINE_STATISTICS
-// (11 UINT64s) for pipeline statistics. 0 for the types this layer does not resolve.
+// (11 UINT64s) for pipeline statistics, D3D12_QUERY_DATA_SO_STATISTICS (2 UINT64s) for stream output. 0 for the
+// types this layer does not resolve.
 constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     namespace q = d3d12_query;
     switch (query_type) {
@@ -200,6 +211,11 @@ constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     case q::binary_occlusion:
     case q::timestamp: return 8;
     case q::pipeline_statistics: return 11 * 8;
+    // D3D12_QUERY_DATA_SO_STATISTICS: NumPrimitivesWritten, PrimitivesStorageNeeded.
+    case q::so_statistics_stream0:
+    case q::so_statistics_stream0 + 1:
+    case q::so_statistics_stream0 + 2:
+    case q::so_statistics_stream3: return 2 * 8;
     default: return 0;
     }
 }
@@ -288,6 +304,7 @@ struct CopyBuffer {
     ResourceId src;
     std::uint64_t src_offset;
     std::uint64_t size;
+    ResourceId tiled_resource = 0;  // CopyTiles uses the padded size of the sparse side
 };
 
 // D3D12_TEXTURE_COPY_LOCATION: a texture subresource, or a placed footprint in a buffer. The footprint's format is
@@ -387,28 +404,38 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
+// The views a draw captured, at the D3D12 maxima. Kept by value because the CPU descriptor slots and the bound
+// views can change after the draw is recorded, and out of line because the command variant is sized by its largest
+// member: inline they made every recorded command, barriers included, 976 bytes.
+struct DrawViews {
+    std::array<TargetView, 8> render_targets{};
+    std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
+    std::uint32_t render_target_count = 8;
+};
+
 // DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
 // render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
 // the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+// Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
+// during command list recording (D3D-289).
 struct Draw {
-    std::uintptr_t pipeline;
-    std::array<std::uint32_t, 32> user_data;
-    std::vector<TargetView> render_targets;
-    TargetView depth;
-    std::vector<VertexBufferView> vertex_buffers;  // by input slot
-    IndexBufferView index;
-    std::uint32_t topology;  // D3D_PRIMITIVE_TOPOLOGY
-    Viewport viewport;       // the first; more viewports are not modelled yet
-    Rect scissor;            // the first; D3D12 always scissors
-    std::array<float, 4> blend_factor;
-    std::uint32_t stencil_front;
-    std::uint32_t stencil_back;
-    bool indexed;
-    std::uint32_t count;  // vertices or indices per instance
-    std::uint32_t instances;
-    std::uint32_t first;  // first vertex or first index
-    std::int32_t base_vertex;
-    std::uint32_t first_instance;
+    std::uintptr_t pipeline = 0;
+    std::array<std::uint32_t, 32> user_data{};
+    std::shared_ptr<const DrawViews> views;  // null: no render targets or vertex buffers captured
+    TargetView depth{};
+    IndexBufferView index{};
+    std::uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
+    Viewport viewport{};       // the first; more viewports are not modelled yet
+    Rect scissor{};            // the first; D3D12 always scissors
+    std::array<float, 4> blend_factor{1, 1, 1, 1};
+    std::uint32_t stencil_front = 0;
+    std::uint32_t stencil_back = 0;
+    bool indexed = false;
+    std::uint32_t count = 0;  // vertices or indices per instance
+    std::uint32_t instances = 0;
+    std::uint32_t first = 0;  // first vertex or first index
+    std::int32_t base_vertex = 0;
+    std::uint32_t first_instance = 0;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -710,6 +737,11 @@ public:
         if (!draw.count || !draw.instances) return !closed_;
         return append(draw);
     }
+    bool draw(Draw&& draw) {
+        if (!draw.pipeline) return false;
+        if (!draw.count || !draw.instances) return !closed_;
+        return append(std::move(draw));
+    }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
     bool clear_render_target(const TargetView& target, const ClearColor& color, std::span<const Rect> rects = {}) {
@@ -767,11 +799,15 @@ public:
         return append(ClearUnorderedAccess{view, is_float, values, {rects.begin(), rects.end()}});
     }
 
-    // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list
-    // types and bundle-only restrictions before calling this method.
-    bool execute_bundle(const CommandList& bundle) {
+    // ExecuteBundle copies the closed bundle's commands [first, last) at the call site. The COM layer validates D3D12
+    // list types and bundle-only restrictions before calling this method, and calls it once per stretch between the
+    // bundle's deferred state calls and draws (d3d12_com.cpp, GraphicsCommandList::ExecuteBundle).
+    bool execute_bundle(const CommandList& bundle, std::size_t first = 0, std::size_t last = std::size_t(-1)) {
         if (this == &bundle || closed_ || !bundle.closed_) return false;
-        commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        last = std::min(last, bundle.commands_.size());
+        if (first < last)
+            commands_.insert(commands_.end(), bundle.commands_.begin() + std::ptrdiff_t(first),
+                             bundle.commands_.begin() + std::ptrdiff_t(last));
         return true;
     }
 
@@ -880,6 +916,12 @@ private:
     bool append(const Command& command) {
         if (closed_) return false;
         commands_.push_back(command);
+        return true;
+    }
+    // The recording calls pass a temporary: moved, so a command's rectangles are not copied a second time.
+    bool append(Command&& command) {
+        if (closed_) return false;
+        commands_.push_back(std::move(command));
         return true;
     }
 

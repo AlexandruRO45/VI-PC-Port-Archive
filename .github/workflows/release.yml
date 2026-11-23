@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v1.0.0)"
+        description: "Release tag (e.g. v1.2.1)"
         required: true
-        default: "v1.0.0"
+        default: "v1.2.1"
         type: string
 
 permissions:
@@ -40,6 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: recursive
           persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -65,12 +66,13 @@ jobs:
           python -I tools/validate.py code
           python -I tests/test_validate.py
           python -I tests/test_gui_core.py
+          python -I tests/test_text_write_line_endings.py
 
       - name: Build Windows executable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --uac-admin `
+          pyinstaller --noconfirm --clean --onefile --windowed `
             --name Leonida-windows-x64 `
             --add-data "assets/fonts;assets/fonts" `
             --add-data "assets/logo.png;assets" `
@@ -79,6 +81,8 @@ jobs:
             --add-data "tools;tools" `
             --add-data "gui;gui" `
             --add-data "scripts;scripts" `
+            --add-data "runtime;runtime" `
+            --add-data "third_party;third_party" `
             --add-data "viewer;viewer" `
             leonida_gui.py
           New-Item -ItemType Directory -Force -Path release-out | Out-Null
@@ -101,6 +105,8 @@ jobs:
             --add-data "tools:tools" \
             --add-data "gui:gui" \
             --add-data "scripts:scripts" \
+            --add-data "runtime:runtime" \
+            --add-data "third_party:third_party" \
             --add-data "viewer:viewer" \
             leonida_gui.py
           ./dist/Leonida/Leonida --version
@@ -121,6 +127,8 @@ jobs:
             --add-data "tools:tools" \
             --add-data "gui:gui" \
             --add-data "scripts:scripts" \
+            --add-data "runtime:runtime" \
+            --add-data "third_party:third_party" \
             --add-data "viewer:viewer" \
             leonida_gui.py
           ./dist/Leonida.app/Contents/MacOS/Leonida --version

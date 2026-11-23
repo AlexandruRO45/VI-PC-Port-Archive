@@ -83,5 +83,17 @@ class ValidateCodebaseTest(unittest.TestCase):
         self.assertTrue(rep.ok, rep.summary)
 
 
+class InstallLlvmSecurityTest(unittest.TestCase):
+    def test_prebuilt_fails_closed_without_valid_sha256(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import install_llvm  # noqa: E402
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError):
+                install_llvm.install_prebuilt("https://example.invalid/llvm.zip", "", tmp)
+            with self.assertRaises(RuntimeError):
+                install_llvm.install_prebuilt("https://example.invalid/llvm.zip", "not-a-sha256", tmp)
+
+
 if __name__ == "__main__":
     unittest.main()

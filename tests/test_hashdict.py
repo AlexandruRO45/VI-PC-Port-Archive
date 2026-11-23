@@ -385,6 +385,44 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(index, "rb") as f:
             self.assertEqual(f.read(), before)
 
+    def assert_carved_blob_preserved(self, output, blob):
+        with open(blob, "rb") as f:
+            original = f.read()
+        p = self.run_tool(self.carve_dir, "--out", output)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is one of the inputs", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(blob, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_out_cannot_replace_a_harvested_blob(self):
+        # The existing --out check protects index.json and --extra, but the
+        # <offset>.bin files read during harvesting are inputs as well.
+        for archive, offset in (("common", 0), ("custom_pack", 32)):
+            with self.subTest(archive=archive):
+                blob = os.path.join(self.carve_dir, archive, f"{offset:012x}.bin")
+                self.assert_carved_blob_preserved(blob, blob)
+
+    def test_out_cannot_replace_a_hard_link_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_alias.json")
+        try:
+            os.link(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.samefile(blob, alias))
+
+    def test_out_cannot_replace_a_symlink_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_link.json")
+        try:
+            os.symlink(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.islink(alias))
+
     def test_build_requires_an_explicit_carve_directory(self):
         empty = os.path.join(self.dir, "empty")
         os.mkdir(empty)
@@ -410,6 +448,30 @@ class CarveAndExtraCLITest(unittest.TestCase):
                 self.assertNotIn("Traceback", p.stderr)
                 with open(self.out_json, encoding="utf-8") as f:
                     self.assertEqual(json.load(f), {"12345678": "keep"})
+
+    def test_non_bink_row_head_and_offset_are_validated_before_writing(self):
+        # Missing/nonstring head and invalid (missing, negative, float, bool) offsets must be one ERROR
+        # line naming the file and row, exit 2, and never overwrite --out.
+        cases = [
+            {"off": 0, "type": "bin"},                       # missing head
+            {"off": 0, "head": 123, "type": "bin"},          # non-string head
+            {"head": "00000000", "type": "bin"},             # missing offset
+            {"off": -1, "head": "00000000", "type": "bin"},  # negative offset
+            {"off": 1.5, "head": "00000000", "type": "bin"}, # non-integer offset
+            {"off": True, "head": "00000000", "type": "bin"},# bool offset (True == 1)
+        ]
+        for row in cases:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as carve:
+                os.makedirs(os.path.join(carve, "arch"))
+                with open(os.path.join(carve, "arch", "index.json"), "w", encoding="utf-8") as f:
+                    json.dump({"files": [row]}, f)
+                out = os.path.join(carve, "out.json")
+                p = self.run_tool(carve, "--out", out)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("index.json", p.stderr)
+                self.assertIn("row 0", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse(os.path.exists(out), "no report may be written on bad input")
 
     def test_listed_blob_missing_from_disk_is_skipped_and_reported(self):
         # The PSIN blob is listed in custom_pack/index.json but gone: the run keeps every other string.

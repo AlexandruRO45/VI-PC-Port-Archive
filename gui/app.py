@@ -923,10 +923,15 @@ class LeonidaWindow(QMainWindow):
         if not py or not os.path.isfile(serve):
             webbrowser.open(SITE_URL)
             return
+        cmd = [py, "-I", serve]
+        work = self.work_edit.text().strip() or os.path.join(self.out_edit.text().strip(), "work")
+        world_dir = os.path.join(work, "world")
+        if os.path.isfile(os.path.join(world_dir, "world.json")):
+            cmd.extend(["--world", world_dir])
         if self.viewer_proc is None or self.viewer_proc.poll() is not None:
-            self.viewer_proc = subprocess.Popen([py, "-I", serve], cwd=self.repo_root)
+            self.viewer_proc = subprocess.Popen(cmd, cwd=self.repo_root)
             time.sleep(0.6)
-        webbrowser.open("http://127.0.0.1:8000/")
+        webbrowser.open("http://127.0.0.1:8765/")
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.build_worker and self.build_worker.isRunning():

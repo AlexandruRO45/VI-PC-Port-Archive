@@ -189,7 +189,7 @@ PREREQ_SPECS: dict[str, dict] = {
     "llvm_mc": {
         "package_key": "llvm_mc",
         "name": "LLVM 21+ llvm-mc (AMDGPU)",
-        "download_url": "https://github.com/FelipeMzero/Leonida/releases/tag/llvm-21.1.8",
+        "download_url": "https://github.com/llvm/llvm-project/releases",
         "win32": ["powershell", "-ExecutionPolicy", "Bypass", "-File", "{ROOT}/scripts/install_llvm.ps1"],
         "darwin": ["python3", "-I", "{ROOT}/scripts/install_llvm.py"],
         "linux": ["python3", "-I", "{ROOT}/scripts/install_llvm.py"],

@@ -44,23 +44,28 @@ jobs:
 
       - name: Determine LLVM version
         id: ver
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VER: ${{ inputs.llvm_version }}
+          REF_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VER="${{ inputs.llvm_version }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VER="$INPUT_VER"
           else
-            VER="${GITHUB_REF_NAME#llvm-}"
+            VER="${REF_NAME#llvm-}"
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "tag=llvm-$VER" >> "$GITHUB_OUTPUT"
 
       - name: Build llvm-mc on Windows (AMDGPU, static CRT)
         if: runner.os == 'Windows'
+        env:
+          LLVM_VER: ${{ steps.ver.outputs.version }}
         shell: pwsh
         run: |
-          $ver = "${{ steps.ver.outputs.version }}"
           $dest = Join-Path $env:RUNNER_TEMP "llvm-out"
-          & scripts/build_llvm_mc.ps1 -Version $ver -Dest $dest -NoEnv
+          & scripts/build_llvm_mc.ps1 -Version $env:LLVM_VER -Dest $dest -NoEnv
           New-Item -ItemType Directory -Force -Path release-out | Out-Null
           Compress-Archive -Path (Join-Path $dest "llvm-mc.exe") -DestinationPath release-out/llvm-mc-windows-x64.zip -Force
 
@@ -79,14 +84,16 @@ jobs:
 
       - name: Build llvm-mc on Linux / macOS (AMDGPU)
         if: runner.os != 'Windows'
+        env:
+          LLVM_VER: ${{ steps.ver.outputs.version }}
+          RUNNER_OS_NAME: ${{ runner.os }}
         shell: bash
         run: |
           set -euo pipefail
-          VER="${{ steps.ver.outputs.version }}"
           DEST="$RUNNER_TEMP/llvm-out"
-          python3 -I scripts/install_llvm.py --version "$VER" --dest "$DEST" --from-source --no-env
+          python3 -I scripts/install_llvm.py --version "$LLVM_VER" --dest "$DEST" --from-source --no-env
           mkdir -p release-out
-          if [ "${{ runner.os }}" = "macOS" ]; then
+          if [ "$RUNNER_OS_NAME" = "macOS" ]; then
             tar -czf release-out/llvm-mc-macos-arm64.tar.gz -C "$DEST" llvm-mc
           else
             tar -czf release-out/llvm-mc-linux-x64.tar.gz -C "$DEST" llvm-mc
@@ -146,16 +153,6 @@ jobs:
           ## LLVM $VER \`llvm-mc\` (AMDGPU / gfx1013) + Automatic Installer
 
           Built cleanly from [llvm/llvm-project](https://github.com/llvm/llvm-project) (\`llvmorg-$VER\`) with \`-DLLVM_TARGETS_TO_BUILD=AMDGPU\` and verified with the \`gfx1013\` \`s_endpgm\` probe.
-
-          ### Automatic Installation
-          - **Windows (PowerShell):**
-            \`\`\`powershell
-            powershell -ExecutionPolicy Bypass -File install_llvm.ps1
-            \`\`\`
-          - **Cross-platform (Python 3):**
-            \`\`\`bash
-            python3 -I install_llvm.py
-            \`\`\`
 
           ### Files
           - \`llvm-mc-windows-x64.zip\` (static CRT, no VC++ redistributable required)

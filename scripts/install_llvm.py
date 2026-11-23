@@ -1,13 +1,16 @@
 """Automatic installer for LLVM llvm-mc (AMDGPU target, from llvm/llvm-project).
 
 Usage:
-    python -I scripts/install_llvm.py [--version 21.1.8] [--dest DIR] [--from-source] [--no-env] [--check]
+    python -I scripts/install_llvm.py [--version 21.1.8] [--dest DIR] [--no-env] [--check]
+    python -I scripts/install_llvm.py --prebuilt-url URL --expected-sha256 HEX [--dest DIR]
 
-1. Checks if a working llvm-mc with AMDGPU (gfx1013) is already available.
-2. Otherwise downloads the prebuilt llvm-mc built from https://github.com/llvm/llvm-project
-   (verified with SHA-256) from GitHub Releases.
-3. Falls back to building from https://github.com/llvm/llvm-project source (--from-source).
-4. Installs to ~/.leonida/llvm-mc and sets LLVM_MC on Windows.
+1. Respects any working LLVM_MC already configured (including command lines such as
+   `wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc`), or a working llvm-mc on PATH / in --dest.
+2. By default, builds llvm-mc (AMDGPU target only) directly from official
+   https://github.com/llvm/llvm-project sources (scripts/build_llvm_mc.ps1 on Windows,
+   CMake + Ninja on Linux/macOS).
+3. Optional prebuilt archive download requires BOTH --prebuilt-url and --expected-sha256
+   and fails closed if the SHA-256 does not match.
 
 Standard library only.
 """
@@ -17,19 +20,27 @@ import argparse
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
-import urllib.error
 import urllib.request
 import zipfile
 
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPTS_DIR)
+TOOLS_DIR = os.path.join(ROOT_DIR, "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from mc_command import split_command  # noqa: E402
+
 DEFAULT_VERSION = "21.1.8"
-RELEASE_REPO = "FelipeMzero/Leonida"
 LLVM_REPO = "https://github.com/llvm/llvm-project"
 PROBE_BYTES = "0x00 0x00 0x81 0xbf\n"
+HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def default_dest() -> str:
@@ -41,8 +52,10 @@ def exe_name() -> str:
 
 
 def probe_llvm_mc(cmd: list[str]) -> bool:
-    """Verify llvm-mc can disassemble a gfx1013 s_endpgm instruction."""
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    """Verify an llvm-mc command line can disassemble a gfx1013 s_endpgm instruction."""
+    if not cmd:
+        return False
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8", newline="\n") as f:
         f.write(PROBE_BYTES)
         probe_path = f.name
     try:
@@ -60,27 +73,26 @@ def probe_llvm_mc(cmd: list[str]) -> bool:
             pass
 
 
-def find_existing_llvm_mc(dest: str) -> str | None:
-    candidates = []
-    env_mc = os.environ.get("LLVM_MC", "").strip().strip('"')
-    if env_mc:
-        candidates.append(env_mc)
-    candidates.append(os.path.join(dest, exe_name()))
+def find_existing_llvm_mc(dest: str) -> tuple[str, bool] | None:
+    """Return (command_or_path, from_env) for an existing working llvm-mc, checking LLVM_MC first."""
+    env_raw = os.environ.get("LLVM_MC", "").strip()
+    if env_raw:
+        try:
+            cmd = split_command(env_raw)
+        except SystemExit:
+            cmd = []
+        if cmd and probe_llvm_mc(cmd):
+            return env_raw, True
+
+    local_bin = os.path.join(dest, exe_name())
+    if os.path.isfile(local_bin) and probe_llvm_mc([local_bin]):
+        return local_bin, False
+
     which_mc = shutil.which("llvm-mc")
-    if which_mc:
-        candidates.append(which_mc)
-    for c in candidates:
-        if os.path.isfile(c) and probe_llvm_mc([c]):
-            return c
+    if which_mc and probe_llvm_mc([which_mc]):
+        return which_mc, False
+
     return None
-
-
-def platform_asset_name() -> str:
-    if os.name == "nt":
-        return "llvm-mc-windows-x64.zip"
-    if sys.platform == "darwin":
-        return "llvm-mc-macos-arm64.tar.gz"
-    return "llvm-mc-linux-x64.tar.gz"
 
 
 def _download(url: str, dest_path: str) -> None:
@@ -97,50 +109,42 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _parse_checksums(path: str) -> dict[str, str]:
-    table: dict[str, str] = {}
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                table[os.path.basename(parts[1].lstrip("*"))] = parts[0].lower()
-    return table
+def _safe_extract_zip(archive: str, dest: str) -> None:
+    real_dest = os.path.realpath(dest)
+    with zipfile.ZipFile(archive) as zf:
+        for info in zf.infolist():
+            target = os.path.realpath(os.path.join(real_dest, info.filename))
+            if os.path.commonpath([real_dest, target]) != real_dest:
+                raise RuntimeError(f"Unsafe zip member path: {info.filename}")
+        zf.extractall(real_dest)
 
 
-def install_prebuilt(version: str, dest: str) -> str | None:
-    asset = platform_asset_name()
-    base = f"https://github.com/{RELEASE_REPO}/releases/download/llvm-{version}"
-    asset_url = f"{base}/{asset}"
-    sums_url = f"{base}/SHA256SUMS.txt"
+def install_prebuilt(url: str, expected_sha256: str, dest: str) -> str:
+    """Download and verify a prebuilt llvm-mc archive; fails closed if SHA-256 is missing or mismatches."""
+    if not expected_sha256 or not HEX64_RE.match(expected_sha256.strip()):
+        raise RuntimeError("--expected-sha256 must be a valid 64-character hex SHA-256 digest.")
+    expected = expected_sha256.strip().lower()
 
     with tempfile.TemporaryDirectory(prefix="leonida-llvm-") as tmp:
-        archive = os.path.join(tmp, asset)
-        sums_path = os.path.join(tmp, "SHA256SUMS.txt")
-        print(f"Downloading {asset_url} ...", flush=True)
-        try:
-            _download(asset_url, archive)
-            _download(sums_url, sums_path)
-        except (urllib.error.URLError, OSError) as exc:
-            print(f"Prebuilt download unavailable ({exc}).", flush=True)
-            return None
+        name = os.path.basename(url.split("?", 1)[0]) or "llvm-mc-archive"
+        archive = os.path.join(tmp, name)
+        print(f"Downloading {url} ...", flush=True)
+        _download(url, archive)
 
-        sums = _parse_checksums(sums_path)
-        expected = sums.get(asset)
         actual = _sha256(archive)
-        if expected and actual != expected:
-            raise RuntimeError(f"SHA-256 mismatch for {asset}: got {actual}, expected {expected}")
+        if actual != expected:
+            raise RuntimeError(f"SHA-256 mismatch for {name}: got {actual}, expected {expected}")
 
         os.makedirs(dest, exist_ok=True)
-        if asset.endswith(".zip"):
-            with zipfile.ZipFile(archive) as zf:
-                zf.extractall(dest)
+        if name.lower().endswith(".zip"):
+            _safe_extract_zip(archive, dest)
         else:
             with tarfile.open(archive, "r:*") as tf:
-                tf.extractall(dest)
+                tf.extractall(dest, filter="data")
 
     binary = os.path.join(dest, exe_name())
     if not os.path.isfile(binary):
-        return None
+        raise RuntimeError(f"Expected {exe_name()} was not found after extracting {url}.")
     if os.name != "nt":
         os.chmod(binary, os.stat(binary).st_mode | 0o111)
     if not probe_llvm_mc([binary]):
@@ -149,9 +153,8 @@ def install_prebuilt(version: str, dest: str) -> str | None:
 
 
 def build_from_source(version: str, dest: str) -> str:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     if os.name == "nt":
-        ps1 = os.path.join(script_dir, "build_llvm_mc.ps1")
+        ps1 = os.path.join(SCRIPTS_DIR, "build_llvm_mc.ps1")
         if not os.path.isfile(ps1):
             raise RuntimeError(f"Missing {ps1}")
         r = subprocess.run(
@@ -220,25 +223,28 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Automatic LLVM llvm-mc (AMDGPU) installer from llvm/llvm-project.")
     ap.add_argument("--version", default=DEFAULT_VERSION, help=f"LLVM version (default {DEFAULT_VERSION})")
     ap.add_argument("--dest", default=default_dest(), help="Destination directory (default ~/.leonida/llvm-mc)")
-    ap.add_argument("--from-source", action="store_true", help="Compile directly from llvm/llvm-project instead of downloading prebuilt")
+    ap.add_argument("--prebuilt-url", default="", help="Optional prebuilt archive URL (requires --expected-sha256)")
+    ap.add_argument("--expected-sha256", default="", help="Pinned 64-char hex SHA-256 for --prebuilt-url")
+    ap.add_argument("--from-source", action="store_true", help="Build directly from llvm/llvm-project (default)")
     ap.add_argument("--no-env", action="store_true", help="Do not update the LLVM_MC user environment variable")
     ap.add_argument("--check", action="store_true", help="Only verify whether a working llvm-mc (AMDGPU) is already installed")
     args = ap.parse_args(argv)
 
     existing = find_existing_llvm_mc(args.dest)
     if existing:
-        print(f"[OK] llvm-mc (AMDGPU) already installed: {existing}", flush=True)
-        if not args.no_env and not args.check and os.environ.get("LLVM_MC") != existing:
-            set_user_env(existing)
+        found, from_env = existing
+        print(f"[OK] llvm-mc (AMDGPU) already configured: {found}", flush=True)
+        if not from_env and not args.no_env and not args.check and not os.environ.get("LLVM_MC", "").strip():
+            set_user_env(found)
         return 0
     if args.check:
         print("[MISSING] llvm-mc (AMDGPU) not found.", flush=True)
         return 1
 
     print(f"Platform: {platform.system()} ({platform.machine()})", flush=True)
-    binary = None if args.from_source else install_prebuilt(args.version, args.dest)
-    if not binary:
-        print("Falling back to building llvm-mc from llvm/llvm-project source...", flush=True)
+    if args.prebuilt_url and not args.from_source:
+        binary = install_prebuilt(args.prebuilt_url, args.expected_sha256, args.dest)
+    else:
         binary = build_from_source(args.version, args.dest)
 
     if not args.no_env:
