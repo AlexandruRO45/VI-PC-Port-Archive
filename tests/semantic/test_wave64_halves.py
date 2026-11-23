@@ -899,14 +899,68 @@ class UniformVote(unittest.TestCase):
 
     def test_c_compare_under_a_narrowed_exec(self):
         # EXEC narrowed to lanes 0..31: the second half has no active lane, votes no and sets s20 = 2, which the lanes
-        # of that half read once EXEC is restored; the wave voted yes (s20 = 1)
+        # of that half read once EXEC is restored; the wave voted yes (s20 = 1). The sides themselves are inert for a
+        # half with no active lane (SHADER-10 narrowed uniform vote), so what makes it tier C is the read of s20.
         whole, halves = self.differs("vs_uv_narrowed", [
             "v_mov_b32_e32 v1, s4", "v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc",
             "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1",
             "s_branch 2", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_mov_b64 exec, s[12:13]",
-            "v_add_nc_u32_e32 v7, s20, v0"], "unsafe-vote-branch")
+            "v_add_nc_u32_e32 v7, s20, v0"], "stale-scalar")
         self.assertEqual([w[1] for w in whole[32:]], [1 + k for k in range(32, 64)])
         self.assertEqual([w[1] for w in halves[32:]], [2 + k for k in range(32, 64)])
+
+    # -- a uniform compare under a narrowed EXEC (SHADER-10): only a half with no active lane can vote apart from the
+    # wave, and it runs the other side with every lane off; exact when neither side has an effect EXEC does not mask
+    # or lets EXEC grow, and no scalar a side defines is read past the join
+    NARROW = ["v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc"]
+
+    @staticmethod
+    def narrowed_want(s4, k):
+        return (7 if s4 > 5 else 5) if k < 32 else 0, 1 + k
+
+    def test_a_narrowed_uniform_vote_vccz_if_else(self):
+        # v1 is written from s4 after the narrowing: the same in every active lane, which is all the vote needs
+        self.invariant("vs_uvn_vccz", self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 2", "v_mov_b32_e32 v6, 7",
+            "s_branch 1", "v_mov_b32_e32 v6, 5", "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"],
+            "A", [], self.narrowed_want)
+
+    def test_a_narrowed_uniform_vote_llvm_and_exec_with_a_nested_if(self):
+        # the LLVM form (s_and_b64 vcc, exec, mask; vccnz) and a nested saveexec / restore inside the yes side: EXEC
+        # is restored to a mask saved inside the side, never past what it was at the branch
+        self.invariant("vs_uvn_and_exec", self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_vccnz 2", "v_mov_b32_e32 v6, 5", "s_branch 4", "v_mov_b32_e32 v6, 7",
+            "v_cmp_gt_u32_e32 vcc, 64, v0", "s_and_saveexec_b64 s[16:17], vcc", "s_or_b64 exec, exec, s[16:17]",
+            "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"], "A", [], self.narrowed_want)
+
+    def test_c_narrowed_uniform_vote_side_restores_exec(self):
+        # the no side restores the EXEC saved before the narrowing: the second half (no active lane, votes no) turns
+        # its lanes on and writes v6 = 5 there, which the wave (yes side) never does
+        whole, halves = self.differs("vs_uvn_widen", self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7",
+            "s_mov_b64 exec, s[12:13]", "s_branch 2", "s_mov_b64 exec, s[12:13]", "v_mov_b32_e32 v6, 5",
+            "v_add_nc_u32_e32 v7, 1, v0"], "unsafe-vote-branch")
+        self.assertEqual([w[0] for w in whole[32:]], [0] * 32)
+        self.assertEqual([w[0] for w in halves[32:]], [5] * 32)
+
+    def test_c_narrowed_uniform_vote_side_writes_a_lane(self):
+        # v_writelane ignores EXEC: the second half runs it on its no side, the wave does not
+        self.differs("vs_uvn_writelane", self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 2", "v_mov_b32_e32 v6, 7",
+            "s_branch 2", "v_writelane_b32 v6, s4, 8", "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"],
+            "unsafe-vote-branch")
+
+    def test_c_narrowed_compare_of_a_varying_value(self):
+        # EXEC keeps lanes 0..47 and v0 differs between them: lanes 0..2 vote yes, so the wave runs the yes side for
+        # all 48, while the second half (lanes 32..47 active, all voting no) runs the no side with them
+        whole, halves = self.differs("vs_uvn_varying", [
+            "v_cmp_gt_u32_e32 vcc, 48, v0", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_cmp_gt_u32_e32 vcc, 3, v0", "s_cbranch_vccz 2", "v_mov_b32_e32 v6, 7", "s_branch 1",
+            "v_mov_b32_e32 v6, 5", "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"],
+            "unsafe-vote-branch")
+        self.assertEqual([w[0] for w in whole[32:48]], [7] * 16)
+        self.assertEqual([w[0] for w in halves[32:48]], [5] * 16)
 
     def test_c_half_of_a_uniform_mask_rewritten(self):
         # s15 (the high half of the uniform mask) is rewritten before the mask becomes VCC: the wave still sees the low

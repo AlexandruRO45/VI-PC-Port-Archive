@@ -99,6 +99,13 @@ MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
 UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none in the wave and in each half (see vote)
+UVOTEN = "uvoten"        # (UVOTEN, exec token): a compare made under a narrowed EXEC whose active lanes all agree (vote)
+# Ops a half with no active lane must not run where the wave would not (a side of a narrowed uniform vote): what EXEC
+# does not mask or what acts once per wave. Scalar defs are allowed (the stale-scalar check covers their reads).
+NOT_INERT = ("exp", "s_endpgm", "s_sendmsg", "s_store", "s_buffer_store", "s_scratch_store", "s_atomic",
+             "s_buffer_atomic", "s_barrier", "s_trap", "s_sethalt", "s_setkill", "s_setreg", "s_round_mode",
+             "s_denorm_mode", "s_dcache_wb", "s_setpc", "s_swappc", "s_movreld", "s_ttracedata", "v_writelane",
+             "ds_append", "ds_consume", "ds_gws", "ds_ordered_count")
 
 
 _TYPE16 = re.compile(r"^[biuf]16$")
@@ -851,6 +858,8 @@ class Analysis:
             tag, tj = self.cmp_tag(st, ins, op, srcs, t_src, idiom)
             if tag is None and self.uniform_cmp(st, ins, srcs, uses, tj):
                 tag = UVOTE
+            elif tag is None and self.uniform_cmp(st, ins, srcs, uses, tj, active=True):
+                tag = (UVOTEN, st["x"])
             put(d, tj, tag)
             if len(dests) > 1:
                 put(dests[1], t_src)
@@ -900,6 +909,12 @@ class Analysis:
                     for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
                 # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
                 tag = UVOTE
+            elif op == "s_and_b64" and not t_src and not st["f"] and len(srcs) == 2 \
+                    and sum(_regs(x) == ["exec"] for x in srcs) == 1 and all(
+                        _regs(x) == ["exec"] or (_regs(x) and all(self.agrees(st, st["g"].get(r)) for r in _regs(x)))
+                        for x in srcs):
+                # the same AND under a narrowed EXEC: every active lane or none
+                tag = (UVOTEN, st["x"])
             put(dests[0], t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
                 T["scc"] = X
@@ -1123,23 +1138,34 @@ class Analysis:
             return g[2]
         return None
 
-    def uniform_cmp(self, st, ins, srcs, uses, tj):
+    def uniform_cmp(self, st, ins, srcs, uses, tj, active=False):
         """Whether a v_cmp writes a wave-uniform lane mask: EXEC is the launch mask and every source is the same in
         every lane (an immediate, a scalar that is no lane mask, a VGPR written from those with EXEC the launch mask)
         and carries no taint, so the mask is every launch lane or none, in the wave and in each half alike. A value
-        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one."""
-        if tj or uses or not st["f"] or not srcs:
+        read with v_readfirstlane from a varying VGPR is tainted (waterfall-scalar), so it is not one.
+
+        With `active`, the same under a narrowed EXEC, where a VGPR source need only be the same in the active lanes:
+        the mask is every active lane or none (UVOTEN, see vote)."""
+        if tj or uses or not srcs or (not active and not st["f"]):
             return False
+        if active and (st["f"] or (st["xg"] and st["xg"][0] == "elect")):
+            return False
+        uni = st["ua"] if active else st["u"]
         for x in srcs:
             k = x.get("k")
             if k in ("imm", "fimm"):
                 continue
             if self.rd(st, ins, x) or self.is_mask(ins, x):
                 return False
-            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["u"] for r in _regs(x))):
+            if k == "sgpr" or (k == "vgpr" and all(r[1] in uni for r in _regs(x))):
                 continue
             return False
         return True
+
+    def agrees(self, st, g):
+        """Whether lane-mask tag `g` is set in every lane active now or in none of them: a launch-uniform compare, or
+        a narrowed one made under this EXEC or under a wider one this EXEC was narrowed from."""
+        return g == UVOTE or (bool(g) and g[0] == UVOTEN and self.ancestor(g[1], st["x"]))
 
     def cmp_tag(self, st, ins, op, srcs, t_src, idiom):
         """(tag, taint) of the lane mask a v_cmp / v_cmpx writes. The two recognised comparisons: a waterfall
@@ -1301,6 +1327,16 @@ class Analysis:
                 and (id(ins), "vcc") not in self.stale:
             return
         self.voted[n] = reg
+        # A uniform compare under a narrowed EXEC (UVOTEN): a half with an active lane votes as the wave does; only a
+        # half with none can vote no while the wave votes yes. That half runs the other side with every lane off, so
+        # the branch is exact when neither side does anything EXEC does not mask nor lets EXEC grow past what it was
+        # at the branch (the lanes of that half then stay off up to the join, in the wave as in the half). Its scalar
+        # defs are the vote's (voted above), so a read of one past the join is stale-scalar.
+        if reg == "vcc" and st is not None and not st["t"].get("vcc", 0) and (id(ins), "vcc") not in self.stale \
+                and (st["g"].get("vcc") or ("",))[0] == UVOTEN and self.agrees(st, st["g"]["vcc"]):
+            if not self.inert_sides(n) and ev is not None:
+                ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
+            return
         if n + 1 > self.n:
             return
         targets = self.succ[n]
@@ -1483,6 +1519,61 @@ class Analysis:
         elif dests and _mask64(dests[0]) and combine(op, srcs):
             new_sub.add(tuple(_regs(dests[0])))
         return inside, frozenset(new_sub)
+
+    def inert_sides(self, n):
+        """Whether every block between the branch ending block `n` and its join (immediate post-dominator) only does
+        what a half with no active lane may do unseen: no op of NOT_INERT (nor GDS), and EXEC never set to more than
+        it was at the branch (a must-dataflow with confine_step: narrowings, and restores of masks saved inside)."""
+        join = self.ipdoms().get(n)
+        entry, work = {}, []
+        for s in self.succ[n]:
+            if s != join:
+                entry[s] = frozenset()
+                work.append(s)
+        while work:
+            b = work.pop()
+            inside, sub = True, entry[b]
+            for ins in self.blocks[b]:
+                if base_op(ins["op"]).startswith(NOT_INERT) or "gds" in (ins.get("mods") or []):
+                    return False
+                inside, sub = self.confine_step(ins, inside, sub)
+                if not inside:
+                    return False
+            for s in self.succ[b]:
+                if s == join:
+                    continue
+                new = sub if s not in entry else entry[s] & sub
+                if new != entry.get(s):
+                    entry[s] = new
+                    work.append(s)
+        return True
+
+    def ipdoms(self):
+        """Block -> its immediate post-dominator (None when that is the program's exit), cached."""
+        if getattr(self, "_ipdoms", None) is not None:
+            return self._ipdoms
+        n = self.n
+        exit_ = n
+        succ = [list(s) or [exit_] for s in self.succ] + [[]]
+        full = (1 << (n + 1)) - 1
+        pdom = [full] * (n + 1)
+        pdom[exit_] = 1 << exit_
+        changed = True
+        while changed:
+            changed = False
+            for b in range(n - 1, -1, -1):
+                new = full
+                for s in succ[b]:
+                    new &= pdom[s]
+                new |= 1 << b
+                if new != pdom[b]:
+                    pdom[b], changed = new, True
+        ip = {}
+        for b in range(n):
+            strict = pdom[b] & ~(1 << b)
+            ip[b] = next((c for c in range(n) if strict >> c & 1 and pdom[c] == strict), None)
+        self._ipdoms = ip
+        return ip
 
     def past_jumps(self, blk):
         """`blk`, or where it leads when it holds nothing but jumps and waits (the layout of a vccnz skip)."""
