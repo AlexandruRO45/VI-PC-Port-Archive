@@ -110,15 +110,31 @@ class ReportPathTest(unittest.TestCase):
 
 
 class PrefilterTest(unittest.TestCase):
+    def test_cli_uses_shared_report_path_rules_before_scanning(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, cpu_path, _ = make_carve(td)
+            report = cpu_path.with_name(cpu_path.name.upper())
+            before = cpu_path.read_bytes()
+            with mock.patch.object(sys, "platform", "darwin"), \
+                    mock.patch("os.path.realpath", side_effect=os.path.abspath), \
+                    mock.patch("os.path.normcase", side_effect=lambda path: path), \
+                    mock.patch("os.path.samefile", return_value=False), \
+                    mock.patch.object(os, "pathconf", return_value=0, create=True), \
+                    mock.patch.object(tex_headers, "scan_archive", return_value=[]) as scan:
+                _, code = self.run_main(carve, "--out", report)
+            self.assertEqual(code, 2)
+            scan.assert_not_called()
+            self.assertEqual(cpu_path.read_bytes(), before)
+
     def run_main(self, *args):
         calls = []
-        real = tex_headers.same_output_path
+        real = tex_headers.same_report_path
 
         def counting(first, second):
             calls.append((first, second))
             return real(first, second)
 
-        with mock.patch.object(tex_headers, "same_output_path", counting), \
+        with mock.patch.object(tex_headers, "same_report_path", counting), \
                 mock.patch.object(sys, "argv", ["tex_headers.py", *map(str, args)]), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
