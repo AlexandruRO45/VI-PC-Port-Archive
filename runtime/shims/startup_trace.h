@@ -31,6 +31,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <vector>
+#include <cwchar>
 
 #include "shims.h"
 
@@ -211,8 +213,103 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// LEONIDA_PROBE=<rva>[,<rva>...] (diagnostic, with --trace): a breakpoint at each RVA of the main image (hex, as
+// `where` prints them). Each hit logs a "probe" event with the general registers and the qword at rsp (the return
+// address at a function's first instruction), then the original byte is put back, the instruction runs under the trap
+// flag, and the breakpoint is re-armed after it. The first 16 hits of each probe are logged (LEONIDA_PROBE_MAX=N for N). Answers "which call
+// returned what" on the player's machine without a debugger; nothing of the image is written to the trace.
+struct Probe {
+    unsigned char* at;
+    unsigned char original;
+    unsigned hits;
+};
+inline std::vector<Probe>& probes() {
+    static std::vector<Probe> list;
+    return list;
+}
+inline std::mutex& probe_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline thread_local unsigned char* probe_rearm = nullptr;
+
+inline void write_code_byte(unsigned char* at, unsigned char value) {
+    DWORD old = 0;
+    if (!VirtualProtect(at, 1, PAGE_EXECUTE_READWRITE, &old)) return;
+    *at = value;
+    VirtualProtect(at, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, 1);
+}
+
+inline bool probe(EXCEPTION_POINTERS* info) {
+    if (probes().empty() || !info->ContextRecord) return false;
+    CONTEXT& c = *info->ContextRecord;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_SINGLE_STEP && probe_rearm) {
+        write_code_byte(probe_rearm, 0xCC);
+        probe_rearm = nullptr;
+        return true;
+    }
+    if (code != EXCEPTION_BREAKPOINT) return false;
+    auto* at = static_cast<unsigned char*>(info->ExceptionRecord->ExceptionAddress);
+    Probe* hit = nullptr;
+    unsigned count = 0;
+    {
+        const std::lock_guard lock(probe_mutex());
+        for (auto& p : probes())
+            if (p.at == at) {
+                hit = &p;
+                count = ++p.hits;
+                break;
+            }
+    }
+    if (!hit || c.Rip != reinterpret_cast<DWORD64>(at)) return false;
+    static const unsigned max_hits = [] {
+        wchar_t v[16] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_PROBE_MAX", v, 16);
+        const unsigned long parsed = (n && n < 16) ? std::wcstoul(v, nullptr, 10) : 0;
+        return parsed ? static_cast<unsigned>(parsed) : 16u;
+    }();
+    if (count <= max_hits) {
+        char regs[640];
+        const auto ret = c.Rsp ? *reinterpret_cast<const uint64_t*>(c.Rsp) : 0;
+        std::snprintf(regs, sizeof regs,
+                      "\"hit\":%u,\"rax\":\"%llx\",\"rbx\":\"%llx\",\"rcx\":\"%llx\",\"rdx\":\"%llx\",\"rsi\":\"%llx\","
+                      "\"rdi\":\"%llx\",\"r8\":\"%llx\",\"r9\":\"%llx\",\"r12\":\"%llx\",\"r13\":\"%llx\",\"r14\":\"%llx\","
+                      "\"r15\":\"%llx\",\"rsp\":\"%llx\",\"at_rsp\":",
+                      count, c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.R8, c.R9, c.R12, c.R13, c.R14, c.R15, c.Rsp);
+        const std::string where_at = quote(where(reinterpret_cast<uint64_t>(at)));
+        event("probe", "\"at\":" + where_at + "," + regs + quote(where(ret)));
+        std::fprintf(stderr, "[probe] %s hit %u: rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx ret=%s\n",
+                     where(reinterpret_cast<uint64_t>(at)).c_str(), count, c.Rax, c.Rcx, c.Rdx, c.R8, c.R9,
+                     where(ret).c_str());
+        // LEONIDA_PROBE_MEM=1: also the first 8 qwords at rdi and rsi (read with ReadProcessMemory, so a bad pointer
+        // prints "-"). Local diagnostics only: these bytes can be game data, so never paste them anywhere public.
+        static const bool mem = GetEnvironmentVariableW(L"LEONIDA_PROBE_MEM", nullptr, 0) != 0;
+        if (mem) {
+            for (const auto& [name, address] : {std::pair<const char*, DWORD64>{"rdi", c.Rdi}, {"rsi", c.Rsi}}) {
+                uint64_t q[8] = {};
+                SIZE_T got = 0;
+                const bool ok = address && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+                                                             q, sizeof q, &got) && got == sizeof q;
+                if (!ok) {
+                    std::fprintf(stderr, "[probe]   [%s] -\n", name);
+                    continue;
+                }
+                std::fprintf(stderr, "[probe]   [%s] %llx %llx %llx %llx %llx %llx %llx %llx\n", name, q[0], q[1], q[2],
+                             q[3], q[4], q[5], q[6], q[7]);
+            }
+        }
+    }
+    write_code_byte(at, hit->original);
+    c.EFlags |= 0x100;  // trap after the original instruction, then re-arm
+    probe_rearm = at;
+    return true;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (probe(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
     in_handler = true;
 #ifdef _MSC_VER
@@ -234,6 +331,30 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
 }  // namespace detail
 
 inline void close();
+
+// Arms LEONIDA_PROBE in the mapped main image (see detail::probe). Call before any image code runs. RVAs outside the
+// image are ignored with a line on stderr.
+inline void install_probes(uint8_t* base, uint32_t size) {
+    wchar_t value[1024] = {};
+    const DWORD length = GetEnvironmentVariableW(L"LEONIDA_PROBE", value, 1024);
+    if (!length || length >= 1024 || !base) return;
+    const std::lock_guard lock(detail::probe_mutex());
+    for (wchar_t* cursor = value; *cursor;) {
+        wchar_t* end = nullptr;
+        const unsigned long long rva = std::wcstoull(cursor, &end, 16);
+        if (end == cursor) break;
+        if (rva && rva < size) {
+            unsigned char* at = base + rva;
+            detail::probes().push_back({at, *at, 0});
+            detail::write_code_byte(at, 0xCC);
+            std::fprintf(stderr, "[probe] armed at +0x%llx\n", rva);
+        } else {
+            std::fprintf(stderr, "[probe] +0x%llx is outside the image; ignored\n", rva);
+        }
+        cursor = end;
+        while (*cursor == L',' || *cursor == L' ') ++cursor;
+    }
+}
 
 // Creates the trace file and installs the exception handler. The file must not exist yet ("x" mode): the trace is
 // opened before the loader reads anything, so overwriting would let `--trace` destroy an input, such as the image

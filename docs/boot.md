@@ -76,6 +76,13 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+* `LEONIDA_PROBE=<rva>[,<rva>...]` (with `--trace`) puts a breakpoint at each RVA of the executable (hex, as the
+  trace's `module+RVA` prints them). Each hit is logged as a `probe` event and an `[probe]` line on stderr with the
+  general registers and the qword at `rsp` (the return address at a function's first instruction); the instruction
+  then runs and the breakpoint is re-armed. `LEONIDA_PROBE_MAX=N` logs N hits per address (16 by default), and
+  `LEONIDA_PROBE_MEM=1` adds the first 8 qwords at `rdi` and `rsi`. Put a probe on the instruction after a call to
+  read its return value in `rax`: that names which call of a long init function failed, without a debugger. The
+  registers and memory can hold game data: keep the output on your machine and report only what it shows.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their

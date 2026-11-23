@@ -246,6 +246,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
 
+  # LEONIDA_PROBE (shims/startup_trace.h) on a synthetic function: its own executable, the variables are read once.
+  add_executable(probe_test
+    test/probe_test.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(probe_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(probe_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(probe_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(probe_test PRIVATE /OPT:NOREF)
+
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
@@ -1006,6 +1016,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
+  endif()
+  if(WIN32 AND TARGET probe_test)
+    add_test(NAME probe COMMAND probe_test)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
