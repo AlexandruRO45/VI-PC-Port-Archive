@@ -314,6 +314,8 @@ applies scale; the scale rule of [Map placement records](#map-placement-records)
 python -I tools\world_archetypes.py <game>\levels.rpf --start 8589934592 --limit 1073741824 --check-extents --out <work>\world\archetypes_8-9.json
 ```
 
+`--out` writes the full report; without it the tool prints the summary and writes no file.
+
 ### Measured placement summary
 
 | Scope | Map files | Entities |
