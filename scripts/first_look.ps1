@@ -39,16 +39,43 @@ if (Test-Path $calls) { $checklistArgs += @("--gdk-calls", $calls) }
 python -I (Join-Path $root "tools\exe_checklist.py") @checklistArgs
 if ($LASTEXITCODE -ne 0) { Write-Warning "exe_checklist could not write the checklist" }
 
-$rt = Join-Path $root "runtime\build\gta6rt.exe"
+function Find-RuntimeLoader($build, $folders) {
+    foreach ($folder in $folders) {
+        $candidate = [IO.Path]::Combine($build, $folder, "gta6rt.exe")
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+}
+
+$build = Join-Path $root "runtime\build"
+$configs = @("RelWithDebInfo", "Release", "MinSizeRel", "Debug")
+$folders = @("") + $configs
+$rt = Find-RuntimeLoader $build $folders
 # A gta6rt.exe older than the runtime sources (a pull since the last build) would report the old shim table, so it
 # is rebuilt then too, not only when missing.
 $sources = @("runtime\src", "runtime\shims", "runtime\CMakeLists.txt") | ForEach-Object { Join-Path $root $_ } |
     Where-Object { Test-Path $_ }
 $newest = $sources | Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
-$stale = (Test-Path $rt) -and $newest -and ($newest.LastWriteTime -gt (Get-Item $rt).LastWriteTime)
-if ($stale) { Write-Host "runtime\build\gta6rt.exe is older than $($newest.Name): rebuilding it first" }
-if (-not (Test-Path $rt) -or $stale) { & (Join-Path $PSScriptRoot "build_runtime.ps1") }
+$stale = $rt -and $newest -and ($newest.LastWriteTime -gt (Get-Item -LiteralPath $rt).LastWriteTime)
+if ($stale) { Write-Host "$rt is older than $($newest.Name): rebuilding it first" }
+if (-not $rt -or $stale) {
+    $cache = Join-Path $build "CMakeCache.txt"
+    if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
+        (Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=Visual Studio ' -Quiet)) {
+        # The wrapper configures Ninja and cannot reuse a Visual Studio build tree.
+        $cmake = (Select-String -LiteralPath $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.+)$').Matches.Groups[1].Value
+        $folders = $configs
+        $existing = Find-RuntimeLoader $build $configs
+        $configArgs = @()
+        if ($existing) { $configArgs = @("--config", (Split-Path (Split-Path $existing) -Leaf)) }
+        & $cmake --build $build --target gta6rt @configArgs
+        if ($LASTEXITCODE -ne 0) { throw "Building gta6rt in $build failed ($LASTEXITCODE)" }
+    } else {
+        & (Join-Path $PSScriptRoot "build_runtime.ps1")
+    }
+    $rt = Find-RuntimeLoader $build $folders
+    if (-not $rt) { throw "Build finished but gta6rt.exe was not found in $build" }
+}
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & {
     # Keep native stderr in the report without letting Windows PowerShell stop the dry run on it.

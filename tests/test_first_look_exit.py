@@ -36,25 +36,56 @@ class FirstLookExitTest(unittest.TestCase):
                 "Add-Type -OutputAssembly gta6rt.exe -OutputType ConsoleApplication -TypeDefinition @'\n"
                 "public class Loader { public static int Main() {\n"
                 "    int code = int.Parse(System.Environment.GetEnvironmentVariable(\"LEONIDA_TEST_LOADER_EXIT\"));\n"
-                "    (code == 0 ? System.Console.Out : System.Console.Error).WriteLine(\"synthetic dry run\");\n"
+                "    var dir = new System.IO.DirectoryInfo(System.AppDomain.CurrentDomain.BaseDirectory);\n"
+                "    (code == 0 ? System.Console.Out : System.Console.Error).WriteLine(\"synthetic dry run from \" + dir.Name);\n"
                 "    return code;\n"
                 "} }\n'@"
             )
             env = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
             # Keep Core's modules out of Windows PowerShell's search path when Python was started from pwsh.
             env["PSModulePath"] = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/Modules")
-            subprocess.run([*POWERSHELL, "-Command", compile_loader], cwd=build, env=env, check=True, timeout=30)
-            for code in (0, 17):
-                with self.subTest(loader_exit_code=code):
-                    image = root / f"fixture-{code}.exe"
+            subprocess.run([*POWERSHELL, "-Command", compile_loader], cwd=scripts, env=env, check=True, timeout=30)
+            fixture = scripts / "gta6rt.exe"
+            (scripts / "build_runtime.ps1").write_text(
+                'Copy-Item "$PSScriptRoot/gta6rt.exe" "$PSScriptRoot/../runtime/build/gta6rt.exe"\n'
+                'Set-Content "$PSScriptRoot/built.txt" built\n', encoding="utf-8", newline="\n",
+            )
+            source = root / "runtime" / "src" / "loader.cpp"
+            source.parent.mkdir()
+            source.touch()
+            marker = scripts / "built.txt"
+            cases = (
+                ("Debug", ["Debug"], "Debug", False, 0),
+                ("MinSizeRel", ["MinSizeRel", "Debug"], "MinSizeRel", False, 0),
+                ("Release", ["Release", "MinSizeRel"], "Release", False, 0),
+                ("RelWithDebInfo", ["RelWithDebInfo", "Release"], "RelWithDebInfo", False, 0),
+                ("flat", ["", "RelWithDebInfo"], "build", False, 17),
+                ("stale-Release", ["Release"], "build", True, 0),
+                ("missing", [], "build", True, 0),
+            )
+            for layout, folders, expected_dir, should_build, code in cases:
+                with self.subTest(layout=layout):
+                    shutil.rmtree(build)
+                    build.mkdir()
+                    marker.unlink(missing_ok=True)
+                    for folder in folders:
+                        loader = build / folder / "gta6rt.exe"
+                        loader.parent.mkdir(exist_ok=True)
+                        shutil.copyfile(fixture, loader)
+                        if layout == "stale-Release":
+                            older = source.stat().st_mtime - 3600
+                            os.utime(loader, (older, older))
+                    image = root / f"fixture-{layout}.exe"
                     image.write_bytes(b"MZ")
                     result = subprocess.run(
                         [*POWERSHELL, "-File", str(wrapper), "-Exe", str(image)],
                         env={**env, "LEONIDA_TEST_LOADER_EXIT": str(code)}, capture_output=True, text=True, timeout=30,
                     )
                     report = root / "reports" / "exe" / image.stem
+                    self.assertEqual(marker.exists(), should_build, result.stdout + result.stderr)
                     self.assertTrue((report / "shim-todo.txt").is_file(), result.stdout + result.stderr)
-                    self.assertIn("synthetic dry run", (report / "dryrun.txt").read_text(encoding="utf-16"))
+                    self.assertIn("synthetic dry run from " + expected_dir,
+                                  (report / "dryrun.txt").read_text(encoding="utf-16"))
                     self.assertEqual(result.returncode, code, result.stdout + result.stderr)
 
 
