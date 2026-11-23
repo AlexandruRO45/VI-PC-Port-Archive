@@ -43,6 +43,48 @@ std::uint32_t as_bits(float f) {
     return bits;
 }
 
+struct StatisticsObservation {
+    unsigned query_begins = 0;
+    unsigned query_ends = 0;
+    unsigned dispatches = 0;
+    unsigned dispatches_in_query = 0;
+};
+
+thread_local StatisticsObservation* statistics_observation = nullptr;
+PFN_vkGetDeviceProcAddr real_device_proc = nullptr;
+PFN_vkCmdBeginQuery real_begin_query = nullptr;
+PFN_vkCmdEndQuery real_end_query = nullptr;
+PFN_vkCmdDispatch real_dispatch = nullptr;
+
+VKAPI_ATTR void VKAPI_CALL observe_begin_query(VkCommandBuffer cb, VkQueryPool pool, std::uint32_t index,
+                                               VkQueryControlFlags flags) {
+    if (statistics_observation) ++statistics_observation->query_begins;
+    real_begin_query(cb, pool, index, flags);
+}
+
+VKAPI_ATTR void VKAPI_CALL observe_end_query(VkCommandBuffer cb, VkQueryPool pool, std::uint32_t index) {
+    if (statistics_observation) ++statistics_observation->query_ends;
+    real_end_query(cb, pool, index);
+}
+
+VKAPI_ATTR void VKAPI_CALL observe_dispatch(VkCommandBuffer cb, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    if (auto* observation = statistics_observation) {
+        ++observation->dispatches;
+        if (observation->query_begins > observation->query_ends) ++observation->dispatches_in_query;
+    }
+    real_dispatch(cb, x, y, z);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL observe_statistics_proc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkCmdBeginQuery") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(observe_begin_query);
+    if (std::strcmp(name, "vkCmdEndQuery") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(observe_end_query);
+    if (std::strcmp(name, "vkCmdDispatch") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(observe_dispatch);
+    return real_device_proc(device, name);
+}
+
 PFN_vkCmdPipelineBarrier2 real_barrier2 = nullptr;
 std::uint32_t host_barriers = 0;
 VkPipelineStageFlags2 host_src_stages = 0;
@@ -250,9 +292,14 @@ int main() {
             return VK_NULL_HANDLE;
         };
 
-        VulkanContext context(gpu.device_proc, gpu.device, true);
+        real_device_proc = gpu.device_proc;
+        real_begin_query = gpu.fn<PFN_vkCmdBeginQuery>("vkCmdBeginQuery");
+        real_end_query = gpu.fn<PFN_vkCmdEndQuery>("vkCmdEndQuery");
+        real_dispatch = gpu.fn<PFN_vkCmdDispatch>("vkCmdDispatch");
+        EXPECT(real_begin_query && real_end_query && real_dispatch);
+        VulkanContext context(observe_statistics_proc, gpu.device, true);
         EXPECT(context.loaded());
-        context.enable_depth24(gpu.device_proc, alloc_device_local);
+        context.enable_depth24(observe_statistics_proc, alloc_device_local);
         context.set_occlusion_resolve_memory(mem_props);
 
         constexpr int kIters = 16;
@@ -476,7 +523,7 @@ int main() {
             rgb96_b.rgb96 = true;
             context.add_resource(id_rgb96_img, rgb96_b, VK_IMAGE_LAYOUT_UNDEFINED);
 
-            // D3D-162: both conversion directions and formats must leave all 11 application counters zero.
+            // D3D-162: D24 and RGB96 uploads and readbacks must dispatch outside the application's query.
             VkQueryPool statistics = VK_NULL_HANDLE;
             void* statistics_data = nullptr;
             if (gpu.pipeline_statistics_query) {
@@ -488,7 +535,7 @@ int main() {
                 ResourceBinding counters{}; counters.size = 88; counters.host_readable = true;
                 counters.buffer = gpu.buffer(88, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &statistics_data);
                 EXPECT(counters.buffer && statistics_data);
-                std::memset(statistics_data, 0xcd, 88);
+                std::memset(statistics_data, 0xff, 88);
                 context.add_resource(100, counters);
             }
             CommandList slice_list;
@@ -515,7 +562,11 @@ int main() {
             EXPECT(slice_list.close());
 
             const CommandList* ptr = &slice_list;
-            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
+            StatisticsObservation observation;
+            if (statistics) statistics_observation = &observation;
+            const auto result = queue_a.execute({&ptr, 1});
+            statistics_observation = nullptr;
+            EXPECT(result == ReplayResult::success);
             EXPECT(queue_a.idle());
 
             for (std::uint32_t i = 0; i < slice_words; ++i) {
@@ -553,12 +604,19 @@ int main() {
                 if (!in_written(i)) EXPECT(arena_ptr[i] == guard_word);
 
             if (statistics) {
+                gpu.fn<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(gpu.device, statistics, nullptr);
+                EXPECT(observation.query_begins > 0 && observation.query_begins == observation.query_ends);
+                EXPECT(observation.dispatches >= 4);  // D24 and RGB96, one upload and one readback each
+                EXPECT(observation.dispatches_in_query == 0);
+                // GPU-assisted validation can inject compute dispatches into vkCmdCopyBufferToImage. The command
+                // observation checks replay's own dispatches before Vulkan sees them.
+                constexpr unsigned cs_invocations_word = 10;
                 for (unsigned word = 0; word < 11; ++word) {
                     std::uint64_t value = UINT64_MAX;
                     std::memcpy(&value, static_cast<const char*>(statistics_data) + 8 * word, 8);
-                    EXPECT(value == 0);
+                    EXPECT(value != UINT64_MAX);
+                    if (word != cs_invocations_word) EXPECT(value == 0);
                 }
-                gpu.fn<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(gpu.device, statistics, nullptr);
             }
             std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8, depth24 and rgb96 CopyTexture) ok\n");
 
