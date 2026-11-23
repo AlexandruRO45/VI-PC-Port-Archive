@@ -125,6 +125,16 @@ struct ScopeExit {
     }
 };
 
+std::atomic<unsigned> g_queue_label_calls{0};
+VKAPI_ATTR void VKAPI_CALL noop_cmd_label(VkCommandBuffer, const VkDebugUtilsLabelEXT*) {}
+VKAPI_ATTR void VKAPI_CALL noop_cmd_end(VkCommandBuffer) {}
+VKAPI_ATTR void VKAPI_CALL count_queue_label(VkQueue, const VkDebugUtilsLabelEXT*) {
+    g_queue_label_calls.fetch_add(1, std::memory_order_relaxed);
+}
+VKAPI_ATTR void VKAPI_CALL count_queue_end(VkQueue) {
+    g_queue_label_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
 }  // namespace
 
 int main() {
@@ -388,12 +398,34 @@ int main() {
         EXPECT(F1.semaphore() && F2.semaphore() && F3.semaphore());
 
         // 4a & 4b: signal() under must_hold() && is_device_lost() returns false and does not call pin() or hold;
-        //          marker() under is_device_lost() does not push into held_.
+        //          marker() under is_device_lost() neither invokes queue debug-label callbacks nor pushes into held_.
         {
+            g_queue_label_calls.store(0, std::memory_order_relaxed);
+            DebugLabelFunctions labels{};
+            labels.cmd_insert = noop_cmd_label;
+            labels.cmd_begin = noop_cmd_label;
+            labels.cmd_end = noop_cmd_end;
+            labels.queue_insert = count_queue_label;
+            labels.queue_begin = count_queue_label;
+            labels.queue_end = count_queue_end;
+            context.enable_debug_labels(labels);
+            EXPECT(context.debug_labels());
+
             VulkanQueue queue(context, qB, famB, kindB);
             EXPECT(queue.ok());
+            // Establish an already-held batch BEFORE marking the device lost so held_ is non-empty.
             queue.wait(F1.semaphore(), 1);
+            EXPECT(queue.execute({&p_copy, 1}) == ReplayResult::success);
+            EXPECT(context.holds().any_held());
+
             context.mark_device_lost();
+            const std::uint64_t seq_before = context.holds().current_seq();
+            // 4b (held_ non-empty): marker() must not push a new held entry or call debug labels.
+            queue.marker(DebugMarker::Kind::set, "lost-while-held");
+            EXPECT(context.holds().current_seq() == seq_before);
+            EXPECT(g_queue_label_calls.load(std::memory_order_relaxed) == 0);
+
+            // 4a (must_hold via !held_.empty()): signal() returns false without calling pin() or hold().
             bool pin_called = false;
             const bool sig_ok = queue.signal(F2.semaphore(), 1, [&]() -> std::shared_ptr<void> {
                 pin_called = true;
@@ -401,8 +433,22 @@ int main() {
             });
             EXPECT(!sig_ok);
             EXPECT(!pin_called);
+            EXPECT(context.holds().current_seq() == seq_before);
+            EXPECT(!context.holds().any_held());  // signal()'s pump_ready() dropped the prior held batch
+
+            // 4a (must_hold via pending wait alone): signal() still returns false without calling pin() or hold().
+            queue.wait(F3.semaphore(), 1);
+            const bool sig_ok2 = queue.signal(F2.semaphore(), 2, [&]() -> std::shared_ptr<void> {
+                pin_called = true;
+                return std::make_shared<int>(2);
+            });
+            EXPECT(!sig_ok2);
+            EXPECT(!pin_called);
             EXPECT(!context.holds().any_held());
-            queue.marker(DebugMarker::Kind::set, "lost");
+
+            // 4b (held_ empty): marker() must still not invoke queue debug-label callbacks on a lost device.
+            queue.marker(DebugMarker::Kind::set, "lost-after-drain");
+            EXPECT(g_queue_label_calls.load(std::memory_order_relaxed) == 0);
             EXPECT(!context.holds().any_held());
         }
 
