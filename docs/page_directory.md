@@ -97,6 +97,10 @@ What the samples did not show:
   `q28_continuations` (`q28_continuation_pages` in the summary); it is not added to `continuations` or to the
   resource, so every `q38` and resource count above is unchanged. `q28_tables_unread` is 0 in all three archives.
   Whether the runtime treats that stream as part of the resource is not measured.
+- **A `q28` pointer can reach past the streams read.** That is on other pages, not the 1,581 above: 681 pointers on
+  86 `navmeshes.rpf` pages and 283,818 on 6,810 `anim.rpf` pages are at or past the end of the directory, `q38`
+  and `q28` streams (47 and 2,123 exactly at the end); `data.rpf` has none. The tool reads no further streams for
+  `q28` targets, so where those pointers land was not followed up.
 - **The navmesh type hashes are not on every page.** `0xde5f1345` is in 8,412 of the 9,603 pages (every page of the
   first 64 MiB has it); the most common hash, `0x0bcb00e4`, is in 9,585 records.
 
