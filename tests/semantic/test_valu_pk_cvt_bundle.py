@@ -303,5 +303,32 @@ class VCvtPknormI16F16EdgeCasesTests(unittest.TestCase):
         self.assertEqual(ref_norm16_i16(0x7E00), 0x0000)
         self.assertEqual(ref_norm16_i16(0xFE00), 0x0000)
 
+class VCvtPknormI16F16TranslatorTests(unittest.TestCase):
+    def test_translation_basic(self):
+        lines = [
+            "v_mov_b32 v1, 0x3C00",
+            "v_mov_b32 v2, 0xBC00",
+            "v_cvt_pknorm_i16_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pknorm_i16_basic", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word & 0xFFFF, 0x7FFF)
+        self.assertEqual((word >> 16) & 0xFFFF, 0x8001)
+
+    def test_translation_opsel(self):
+        lines = [
+            "v_mov_b32 v1, 0x3C000000",
+            "v_mov_b32 v2, 0xBC000000",
+            "v_cvt_pknorm_i16_f16 v0, v1, v2 op_sel:[1,1,0]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pknorm_i16_opsel", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word & 0xFFFF, 0x7FFF)
+        self.assertEqual((word >> 16) & 0xFFFF, 0x8001)
+
 if __name__ == '__main__':
     unittest.main()
