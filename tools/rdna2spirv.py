@@ -226,6 +226,9 @@ DPP_MODS = ("quad_perm", "row_", "wave_", "dpp8", "bank_mask", "bound_ctrl", "fi
 # A single lane-local instruction keeps its select: on an RX 5700 XT wrapping it bought nothing measurable
 # (64 divergent if/else of 1-4 ops: within 1%), and it adds labels. Long runs are where the time goes.
 MIN_ACTIVE_RUN = 2
+# gfx103x-only spellings of VOP2 0x06 / VOP3 0x106 / 0x140 (fused legacy multiply-add). The console's gfx1013 decodes
+# these slots as v_mac_legacy_f32 / v_mad_legacy_f32; Gen refuses these names with a message that says so.
+GFX103_ONLY_LEGACY_FMA = ("v_fmac_legacy_f32", "v_fma_legacy_f32")
 
 
 def base_op(op):
@@ -9182,6 +9185,14 @@ class Gen:
             self.emit(f"{sel} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
             self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
+        elif op in GFX103_ONLY_LEGACY_FMA:
+            # Refused on purpose (docs/design.md, "GFX10.1 (console gfx1013) / GFX10.3 ... opcode differences"): these
+            # are the gfx103x spellings of VOP2 0x06 / VOP3 0x106 / 0x140, which the console's gfx1013 runs as the
+            # unfused v_mac_legacy_f32 / v_mad_legacy_f32 above. A listing that prints them was disassembled for the
+            # wrong target; translating them as a fused multiply-add would hide that.
+            raise Unsupported(f"{op}: gfx103x-only spelling of VOP2 0x06 / VOP3 0x106 / 0x140, which the console "
+                              f"(gfx1013) runs as v_mac_legacy_f32 / v_mad_legacy_f32; disassemble with --mcpu gfx1013 "
+                              f"(docs/design.md, GFX10.1 / GFX10.3 opcode differences)")
         elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32"):
             x, y, z = (self.src_u(t) for t in a[1:4])
             f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")
