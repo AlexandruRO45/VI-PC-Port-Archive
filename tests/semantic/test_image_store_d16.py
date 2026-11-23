@@ -89,8 +89,8 @@ def _eval_image_store_texels(setup_lines: list[str], store_line: str) -> dict[st
                 coord_id, coord_ty = res, ty
             elif ty == "%v4float":
                 v4f = res
-            elif ty == "%v4uint_st":
-                v4u = res
+            elif ty in ("%v4uint_st", "%v4uint_bal"):    # one uvec4 type; named _bal when a ballot uses it
+                v4u, v4u_ty = res, ty
             elif ty == "%v4int_st":
                 v4s = res
                 cut_idx = idx + 1
@@ -110,7 +110,7 @@ def _eval_image_store_texels(setup_lines: list[str], store_line: str) -> dict[st
     # Extract header up to %main = OpFunction, add four Output vars, and emit stores at cut_idx.
     out_decls = [
         "%_ptr_Out_f = OpTypePointer Output %v4float",
-        "%_ptr_Out_u = OpTypePointer Output %v4uint_st",
+        f"%_ptr_Out_u = OpTypePointer Output {v4u_ty}",
         "%_ptr_Out_s = OpTypePointer Output %v4int_st",
         f"%_ptr_Out_c = OpTypePointer Output {coord_ty}",
         "%cap_f = OpVariable %_ptr_Out_f Output",

@@ -4739,6 +4739,17 @@ class Gen:
         self.emit(f"{word} = OpSelect %uint {upper} {hi} {lo}")
         return word
 
+    def wave32_first_running_lane(self):
+        """The lowest running lane of this wave32 fragment's 32-lane half (0-31): the lane a uniform value is read
+        from. A fixed lane (0 of the half) need not be running: a quad with no covered sample, or helpers a driver
+        leaves out of subgroup operations, read as undefined (SHADER-1016). The half always holds the caller."""
+        ballot, lsb = self.tmp(), self.tmp()
+        self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        word = self.wave32_ballot_word(ballot)
+        self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
+        self.uses_subgroup = self.uses_ballot = True
+        return lsb
+
     def ballot_lsb_by_words(self, bal):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
         OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
@@ -11397,8 +11408,10 @@ class Gen:
         if self.emulate:
             return r
         if self.wave32_fragment:
+            # Each 32-lane half of a wider subgroup is its own wave with its own SGPRs: broadcast from the half's
+            # first running lane, as OpGroupNonUniformBroadcastFirst does for the whole subgroup below.
             b = self.tmp()
-            self.g_shuffle(b, r, self.cu(0))
+            self.g_shuffle(b, r, self.wave32_first_running_lane())
             return b
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
         # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV

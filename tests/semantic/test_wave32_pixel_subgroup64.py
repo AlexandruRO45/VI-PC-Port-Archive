@@ -20,14 +20,15 @@ def fbits(value):
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
-def run_ps(spv, subgroup_size, inputs):
+def run_ps(spv, subgroup_size, inputs, lanes=None, **kwargs):
+    lanes = list(range(64)) if lanes is None else lanes
     _, outputs = si.run_workgroup(
-        spv, 64, subgroup_size,
+        spv, len(lanes), subgroup_size,
         inputs_for=lambda i: {
-            "%sg_lane": i % subgroup_size,
+            "%sg_lane": lanes[i] % subgroup_size,
             "%in_attr0": (inputs[i], 0.0, 0.0, 0.0),
         },
-        return_outputs=True,
+        return_outputs=True, lanes=lanes, **kwargs,
     )
     return [out["%out_mrt0"] for out in outputs]
 
@@ -91,6 +92,44 @@ class Wave32PixelSubgroupTests(unittest.TestCase):
         for subgroup_size in (32, 64):
             with self.subTest(subgroup_size=subgroup_size):
                 self.assertEqual(run_ps(spv, subgroup_size, inputs), expected)
+
+    def test_descriptor_index_comes_from_a_running_lane_of_each_half(self):
+        # SHADER-1016: the image a wave32 pixel shader reads must not depend on which lanes of its half are
+        # running. Lanes 0-3 and 32-35 (the first quad of each half) are not running, as when that quad has no
+        # covered pixel or holds only helpers the driver leaves out. Each half reads its own T# (an SGPR offset
+        # from its first lane), so a broadcast across the whole 64-lane subgroup is wrong too.
+        spv = support.translate_lines("ps_wave32_halves_descriptor", [
+            "v_interp_mov_f32_e32 v1, p0, attr0.x",
+            "v_cvt_u32_f32_e32 v1, v1",
+            "v_readfirstlane_b32 s4, v1",
+            "s_lshl_b32 s4, s4, 5",
+            "s_load_dwordx8 s[8:15], s[0:1], s4",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+            "image_load v[4:7], v[2:3], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
+            "s_waitcnt vmcnt(0)",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ])
+        # Word 1 (data format) is 0, a float format, so both halves read the float image binding.
+        tsharp = {half: [0 if w == 1 else tag + w for w in range(8)]
+                  for half, tag in ((0, 0x11110000), (1, 0x22220000))}
+        base = 0x1000
+        memory = {base + 32 * half + 4 * w: word for half, words in tsharp.items() for w, word in enumerate(words)}
+        # The runtime's descriptor hash table: word 0 the slot mask, then 10-word slots (T# words at 1-8, the
+        # bindless index at 9). Two slots and mask 1: every T# is found within two probes whatever its hash.
+        desc_map = [1, *tsharp[0], 1, 0, *tsharp[1], 2]
+        texels = {1: (0.25, 0.5, 0.75, 1.0), 2: (1.0, 0.75, 0.5, 0.25)}
+        images = [None] + [(lambda coord, lod, t=texels[k]: t) for k in (1, 2)]
+        lanes = [lane for lane in range(64) if lane % 32 >= 4]
+        inputs = [float(lane // 32) for lane in lanes]
+        expected = [tuple(fbits(c) for c in texels[1 + lane // 32]) for lane in lanes]
+        for subgroup_size in (32, 64):
+            with self.subTest(subgroup_size=subgroup_size):
+                self.assertEqual(run_ps(spv, subgroup_size, inputs, lanes, push_constants=[base, 0],
+                                        memory=memory,
+                                        resources={"%desc_map": desc_map, "%images": images}), expected)
 
 
 if __name__ == "__main__":
