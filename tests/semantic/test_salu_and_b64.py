@@ -126,5 +126,109 @@ class SaluAndB64OracleTests(unittest.TestCase):
                     scc = ref_scc(res)
                     self.assertEqual(scc, 1 if res != 0 else 0)
 
+class OperandKind(Enum):
+    SGPR_PAIR = auto()
+    SPECIAL = auto()
+    IMM64 = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class OperandAST:
+    kind: OperandKind
+    name: str
+    sgpr_index: Optional[int] = None
+    value: Optional[int] = None
+
+    @classmethod
+    def sgpr_pair(cls, base_index: int) -> OperandAST:
+        if not (0 <= base_index <= 104):
+            raise ValueError(f"SGPR pair base index out of bounds: {base_index}")
+        return cls(
+            kind=OperandKind.SGPR_PAIR,
+            name=f"s[{base_index}:{base_index+1}]",
+            sgpr_index=base_index,
+        )
+
+    @classmethod
+    def special(cls, name: str) -> OperandAST:
+        valid_specials = {"exec", "vcc", "null"}
+        if name not in valid_specials:
+            raise ValueError(f"Unknown special 64-bit register: {name}")
+        return cls(kind=OperandKind.SPECIAL, name=name)
+
+    @classmethod
+    def imm(cls, val: int) -> OperandAST:
+        return cls(kind=OperandKind.IMM64, name=hex(val & MASK64), value=val & MASK64)
+
+
+@dataclass(frozen=True)
+class InstructionAST:
+    opcode: str
+    dst: OperandAST
+    src0: OperandAST
+    src1: OperandAST
+
+    def __post_init__(self) -> None:
+        if self.opcode != "s_and_b64":
+            raise ValueError(f"Unexpected opcode: {self.opcode}")
+        if self.dst.kind not in (OperandKind.SGPR_PAIR, OperandKind.SPECIAL):
+            raise ValueError(f"Invalid destination operand: {self.dst}")
+
+    def render(self) -> str:
+        return f"{self.opcode} {self.dst.name}, {self.src0.name}, {self.src1.name}"
+
+
+class SaluAndB64AstTests(unittest.TestCase):
+    """AST syntax validation and formatting tests for s_and_b64."""
+
+    def test_ast_construction_sgpr_pairs(self) -> None:
+        inst = InstructionAST(
+            opcode="s_and_b64",
+            dst=OperandAST.sgpr_pair(4),
+            src0=OperandAST.sgpr_pair(0),
+            src1=OperandAST.sgpr_pair(2),
+        )
+        self.assertEqual(inst.render(), "s_and_b64 s[4:5], s[0:1], s[2:3]")
+
+    def test_ast_construction_special_registers(self) -> None:
+        inst_exec = InstructionAST(
+            opcode="s_and_b64",
+            dst=OperandAST.special("exec"),
+            src0=OperandAST.special("exec"),
+            src1=OperandAST.special("vcc"),
+        )
+        self.assertEqual(inst_exec.render(), "s_and_b64 exec, exec, vcc")
+
+        inst_null = InstructionAST(
+            opcode="s_and_b64",
+            dst=OperandAST.special("null"),
+            src0=OperandAST.sgpr_pair(0),
+            src1=OperandAST.sgpr_pair(2),
+        )
+        self.assertEqual(inst_null.render(), "s_and_b64 null, s[0:1], s[2:3]")
+
+    def test_ast_construction_literals(self) -> None:
+        inst_imm = InstructionAST(
+            opcode="s_and_b64",
+            dst=OperandAST.sgpr_pair(0),
+            src0=OperandAST.sgpr_pair(0),
+            src1=OperandAST.imm(0xFFFFFFFF_00000000),
+        )
+        self.assertEqual(inst_imm.render(), "s_and_b64 s[0:1], s[0:1], 0xffffffff00000000")
+
+    def test_ast_invalid_operands_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            OperandAST.sgpr_pair(105)
+        with self.assertRaises(ValueError):
+            OperandAST.special("m0")
+        with self.assertRaises(ValueError):
+            InstructionAST(
+                opcode="s_and_b64",
+                dst=OperandAST.imm(0),
+                src0=OperandAST.sgpr_pair(0),
+                src1=OperandAST.sgpr_pair(2),
+            )
+
 if __name__ == "__main__":
     unittest.main()
