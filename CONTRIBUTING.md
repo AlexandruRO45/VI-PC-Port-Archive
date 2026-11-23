@@ -46,6 +46,10 @@ methods are still open.
   browser, network or game data). These execute the viewer streaming code with a synthetic loader and clock.
 - `loader_test` writes small PE images to a `leonida_loader_test` folder in `%TEMP%`. Antivirus that blocks newly
   written executables makes it stop with that reason; exclude the folder or set `LEONIDA_TEST_DIR` to one it skips.
+- The no-game-data job that runs on every pull request is `python -I scripts/check_no_game_data.py` (no argument
+  checks every file `git ls-files` lists; pass paths to check only those). It reads the first bytes of each file, so
+  it catches game data saved under another name; the extension list in `.github/workflows/no-game-data.yml` only
+  covers the file names.
 - Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
   `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
   pipeline) for every translated shader and reports failures plus the saved cache path.
