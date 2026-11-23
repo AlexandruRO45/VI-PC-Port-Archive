@@ -296,8 +296,10 @@ int test_prepare_emit_chunks_and_teardown() {
         };
         EXPECT(mock.ops == expected_ops);
         EXPECT(mock.pushes.size() == 3);
-        EXPECT(mock.pushes[0].first_record == 0 && mock.pushes[0].records == 64);
+        EXPECT(mock.pushes[0].first_record == 0 && mock.pushes[0].records == 64 &&
+               mock.pushes[0].stride_words == 6 && mock.pushes[0].count == job.count);
         EXPECT(mock.pushes[1].first_record == 64 && mock.pushes[1].records == 64 &&
+               mock.pushes[1].stride_words == 6 && mock.pushes[1].count == job.count &&
                mock.pushes[1].arguments == job.arguments + 64 * 24 &&
                mock.pushes[1].output == job.output + 64 * 12);
         EXPECT(mock.pushes[2].first_record == 128 && mock.pushes[2].records == 2);
@@ -314,10 +316,22 @@ int test_prepare_emit_chunks_and_teardown() {
         EXPECT(mock.last_alloc_type == 0); // Fallback when no device-local memory exists
         wide.emit(make_handle<VkCommandBuffer>(0x401), wide_job);
         EXPECT(mock.pushes.size() == 2);
-        EXPECT(mock.pushes[0].records == 8 && mock.pushes[1].first_record == 8 && mock.pushes[1].records == 2);
+        EXPECT(mock.pushes[0].records == 8 && mock.pushes[0].stride_words == 0x20000000u &&
+               mock.pushes[0].count == wide_job.count);
+        EXPECT(mock.pushes[1].first_record == 8 && mock.pushes[1].records == 2 &&
+               mock.pushes[1].arguments == wide_job.arguments + 8ull * 0x80000000u);
+
+        // Multi-workgroup dispatches: max_wg_x == 4 (256 records/chunk), 321 records -> 256 (x=4) + 65 (x=2).
+        mock.dispatches.clear();
+        IndirectDispatchCounter multi(mock_get_proc, make_handle<VkDevice>(0x1), make_mem(true), make_limits(4));
+        auto bm = multi.batch();
+        CountedDispatch multi_job{};
+        EXPECT(bm->prepare(args, 0, cnt, 0, 12, 321, multi_job));
+        multi.emit(make_handle<VkCommandBuffer>(0x401), multi_job);
+        EXPECT((mock.dispatches == std::vector<std::uint32_t>{4, 2}));
     }
-    EXPECT(mock.destroy_buffer == 2 && mock.free_memory == 2);
-    EXPECT(mock.destroy_pipeline == 2 && mock.destroy_layout == 2);
+    EXPECT(mock.destroy_buffer == 3 && mock.free_memory == 3);
+    EXPECT(mock.destroy_pipeline == 3 && mock.destroy_layout == 3);
     return 0;
 }
 
