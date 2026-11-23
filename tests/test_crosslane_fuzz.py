@@ -595,6 +595,60 @@ class HarnessErrors(unittest.TestCase):
                 X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
         self.assertIn("no dump (exit 3): device lost", str(ctx.exception))
 
+    def test_exit_77_is_a_skip_with_the_harness_reason(self):
+        """vk_compute_test's exit 77 (a 128-byte push-constant device given a 144-byte module, say) is a skipped
+        program, not a harness error: Unsupported is an Unpinned, so main() counts it as skipped."""
+        prog = X.make_program(1, 32, 4)
+        done = subprocess.CompletedProcess(
+            ["x"], 77, stdout="", stderr="device: AMD\nunsupported: need 144 push constant bytes, device has 128\n")
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", return_value=done), \
+                mock.patch.object(X, "PC_TAIL", [False]):
+            with self.assertRaises(X.Unpinned) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertIsInstance(ctx.exception, X.Unsupported)
+        self.assertIn("unsupported: need 144 push constant bytes, device has 128", str(ctx.exception))
+        self.assertIn("--pc-tail-ubo", str(ctx.exception))
+
+
+class PcTailUbo(unittest.TestCase):
+    """--pc-tail-ubo / LEONIDA_PC_TAIL_UBO (128-byte push constants), as in lds_fuzz.py and valu_fuzz.py: the
+    translator gets --pc-tail-ubo and vk_compute_test LEONIDA_PC_TAIL_UBO=1, together or not at all."""
+
+    def test_translator_gets_the_flag_only_with_pc_tail(self):
+        cmds = []
+
+        def fake_run(cmd, **kw):
+            cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(X, "PC_TAIL", [False]):
+                X.translate(work, False)
+            with mock.patch.object(X, "PC_TAIL", [True]):
+                X.translate(work, True)
+        self.assertNotIn("--pc-tail-ubo", cmds[0])
+        self.assertIn("--pc-tail-ubo", cmds[1])
+        self.assertIn("--wave64-emulate", cmds[1])
+
+    def test_harness_environment_follows_pc_tail(self):
+        prog = X.make_program(1, 32, 4)
+        base = {"LEONIDA_PC_TAIL_UBO": "1", "PATH": "x"}
+        with mock.patch.object(X, "PC_TAIL", [True]):
+            self.assertEqual(X.gpu_env(prog, False, "d.bin", base={"PATH": "x"})["LEONIDA_PC_TAIL_UBO"], "1")
+        with mock.patch.object(X, "PC_TAIL", [False]):
+            # a stray LEONIDA_PC_TAIL_UBO must not make the harness declare 128 bytes for a 144-byte module
+            self.assertNotIn("LEONIDA_PC_TAIL_UBO", X.gpu_env(prog, False, "d.bin", base=base))
+
+    def test_flag_or_environment_turns_it_on(self):
+        for extra, env_val, want in (([], "", False), (["--pc-tail-ubo"], "", True), ([], "1", True),
+                                     ([], "on", True), ([], "0", False)):
+            with mock.patch.object(X, "PC_TAIL", [None]), \
+                    mock.patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": env_val}), \
+                    mock.patch.object(X, "self_test", lambda: 0), \
+                    mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--self-test", *extra]):
+                X.main()
+                self.assertIs(X.PC_TAIL[0], want, (extra, env_val))
+
     def _main(self, run_gpu, argv):
         """main() with the assembler, translator and GPU replaced: every program 'translates'."""
         def translate(work, emulate):

@@ -29,7 +29,10 @@ available", e.g. Mesa llvmpipe at 8 lanes), and a run where every program was sk
 translated with --wave64-emulate use no subgroup operations, so they are compared at any subgroup size.
 
 Needs LLVM_MC (llvm-mc with AMDGPU, as for the shaders stage), the Vulkan SDK and a built vk_compute_test
-(cmake --build runtime/build --target vk_compute_test). No game files.
+(cmake --build runtime/build --target vk_compute_test). No game files. On a device with 128 bytes of push constants
+(AMD RDNA2 iGPUs on Windows, docs/testing.md), pass --pc-tail-ubo or set LEONIDA_PC_TAIL_UBO=1, as for lds_fuzz.py,
+valu_fuzz.py and image_fuzz.py: the programs are then translated with --pc-tail-ubo and vk_compute_test binds the
+tail block. Without it vk_compute_test refuses the 144-byte layout there (exit 77), and each program is skipped.
 
 Reference semantics (AMD "RDNA 2" ISA reference guide; Mesa ACO and LLVM where the guide is terse):
   * v_readlane_b32 sD, vS, lane: sD = vS of lane (lane & 63 in wave64, & 31 in wave32), EXEC ignored.
@@ -94,6 +97,13 @@ LOOP_S = (32, 34)                      # --ext: a loop's break mask and "done th
 DS_WAIT = "\n\ts_waitcnt lgkmcnt(0)"   # after ds_bpermute / ds_permute / ds_swizzle: the result comes back late
 PERMLANE_FETCH_INACTIVE = False
 TRANSLATOR = [os.path.join(HERE, "rdna2spirv.py")]   # --translator        # --permlane-fetch-inactive: model FI = 1 (read inactive sources)
+PC_TAIL = [False]   # --pc-tail-ubo or LEONIDA_PC_TAIL_UBO: translate with --pc-tail-ubo, run vk_compute_test to match
+
+
+def pc_tail_env():
+    """True when LEONIDA_PC_TAIL_UBO asks for rdna2spirv.py --pc-tail-ubo (128-byte push constants), as in
+    lds_fuzz.py, valu_fuzz.py, image_fuzz.py and runtime/test/shaders/build.py."""
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class Wave:
@@ -1310,6 +1320,8 @@ def translate(work, emulate):
     cmd = [sys.executable, "-I", TRANSLATOR[0], os.path.join(work, "disasm"), "--out", out]
     if emulate:
         cmd.append("--wave64-emulate")
+    if PC_TAIL[0]:
+        cmd.append("--pc-tail-ubo")
     r = subprocess.run(cmd, capture_output=True, text=True)
     return out, r.stdout + r.stderr
 
@@ -1319,11 +1331,17 @@ def gpu_env(prog, emulate, dump, base=None):
     raw bytes. A wave32 program, or a wave64 one translated with --wave64-emulate, is written for 32-wide subgroups,
     so it asks for them with VKC_SUBGROUP_SIZE=32, as lds_fuzz.py and valu_fuzz.py do (FUZZ-13): on AMD, whose
     compute default is 64, a group over 32 would otherwise run as one 64-wide subgroup and mismatch in wave 1.
-    A native wave64 program keeps the device default (--w64-native runs it on whatever the GPU has)."""
+    A native wave64 program keeps the device default (--w64-native runs it on whatever the GPU has).
+    LEONIDA_PC_TAIL_UBO follows PC_TAIL, so vk_compute_test declares the push constants the module was translated
+    for: 128 bytes and the set-1 tail block with --pc-tail-ubo, 144 bytes without it."""
     env = dict(os.environ if base is None else base, VKC_OUT_WORDS=str(max(prog.group * len(OUT_REGS), 64)),
                VKC_DUMP=dump)
     if prog.wave == 32 or emulate:
         env["VKC_SUBGROUP_SIZE"] = "32"
+    if PC_TAIL[0]:
+        env["LEONIDA_PC_TAIL_UBO"] = "1"
+    else:
+        env.pop("LEONIDA_PC_TAIL_UBO", None)
     return env
 
 
@@ -1335,6 +1353,12 @@ class Unpinned(RuntimeError):
     """vk_compute_test ran a wave32 program but couldn't pin the 32-lane subgroups it needs, so its words came from
     another wave size (Mesa llvmpipe: 8 lanes) and are no evidence either way: the program is skipped. Programs
     translated with --wave64-emulate use no subgroup operations, so they are judged at any size."""
+
+
+class Unsupported(Unpinned):
+    """vk_compute_test exited 77: the device can't run the program as declared, and its "unsupported:" line says why
+    (144 push-constant bytes on a 128-byte device without --pc-tail-ubo, say). Skipped like Unpinned: no words, no
+    evidence either way, and not a harness error."""
 
 
 GPU_TIMEOUT = 60    # seconds for one program; a translated program that never ends shows up as this
@@ -1354,6 +1378,11 @@ def run_gpu(exe, spv, prog, work, emulate):
     if lanes:
         raise Unpinned(f"the device can't run it at {lanes} lanes (vk_compute_test: compute subgroup size: {lanes} "
                        "not available)")
+    if r.returncode == 77:
+        why = next((ln.strip() for ln in (r.stdout + r.stderr).splitlines() if "unsupported" in ln), "exit 77")
+        hint = (" (run with --pc-tail-ubo or LEONIDA_PC_TAIL_UBO=1)"
+                if "push constant" in why and not PC_TAIL[0] else "")
+        raise Unsupported(f"vk_compute_test: {why}{hint}")
     if not os.path.exists(dump):
         detail = " ".join(f"{r.stdout}{r.stderr}".split())
         raise HarnessError(f"vk_compute_test gave no dump (exit {r.returncode}){': ' + detail if detail else ''}")
@@ -1480,6 +1509,9 @@ def main():
     ap.add_argument("--no-hw-guard", action="store_true",
                     help="no s_nop 7 after each instruction in the native kernels (hazards then show up as mismatches)")
     ap.add_argument("--translator", help="rdna2spirv.py to test (default: the one next to this file)")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1, for a "
+                         "device with 128 bytes of push constants (also on when LEONIDA_PC_TAIL_UBO is set)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if not os.path.isfile(args.exe):   # a Visual Studio build puts it in a configuration subfolder
@@ -1497,6 +1529,7 @@ def main():
     PERMLANE_FETCH_INACTIVE = args.permlane_fetch_inactive
     if args.translator:
         TRANSLATOR[0] = os.path.abspath(args.translator)
+    PC_TAIL[0] = args.pc_tail_ubo or pc_tail_env()
     if args.self_test:
         return self_test()
     backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
