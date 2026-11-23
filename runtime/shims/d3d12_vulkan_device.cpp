@@ -559,6 +559,25 @@ struct TextureCreateInfo {
     TextureCreateInfo& operator=(const TextureCreateInfo&) = delete;
 };
 
+// A texture with a castable-format list is a mutable image whose format list holds the list's formats (`formats`, as
+// castable_view_formats maps them), the texture's own (D3D12 always allows a view in it; Vulkan wants every view
+// format listed) and, for the R9G9B9E5 emulation, its E5B9G9R9 pair (whose list TextureCreateInfo already chained).
+// `formats` must outlive `create`. Creation and allocation() both build the image this way, so the requirements
+// GetResourceAllocationInfo and the placed-resource checks use are those of the image created.
+void list_view_formats(TextureCreateInfo& create, const Format& format, std::vector<VkFormat>& formats) {
+    if (std::find(formats.begin(), formats.end(), format.format) == formats.end()) formats.push_back(format.format);
+    if (format.r9g9b9e5_as_r32_uint)
+        for (VkFormat pair : {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32})
+            if (std::find(formats.begin(), formats.end(), pair) == formats.end()) formats.push_back(pair);
+    create.info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    create.format_list.viewFormatCount = std::uint32_t(formats.size());
+    create.format_list.pViewFormats = formats.data();
+    if (create.info.pNext != &create.format_list) {
+        create.format_list.pNext = create.info.pNext;
+        create.info.pNext = &create.format_list;
+    }
+}
+
 std::filesystem::path configured_shader_directory() {
     constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
     if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
@@ -2054,22 +2073,8 @@ public:
                                  castable_uav && !castable.empty());
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
-            // D3D12 always allows a view in the resource's own format, whether or not the castable list names
-            // it. Vulkan requires every view format to be in the image's format list, so add it when missing.
             view_formats_ = castable;
-            if (std::find(view_formats_.begin(), view_formats_.end(), format.format) == view_formats_.end())
-                view_formats_.push_back(format.format);
-            if (format.r9g9b9e5_as_r32_uint) {
-                // The R9G9B9E5 emulation needs its E5B9G9R9 views whatever the list names (TextureCreateInfo).
-                for (VkFormat pair : {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32})
-                    if (std::find(view_formats_.begin(), view_formats_.end(), pair) == view_formats_.end())
-                        view_formats_.push_back(pair);
-            }
-            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-            create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
-            create.format_list.pViewFormats = view_formats_.data();
-            create.format_list.pNext = info.pNext;
-            info.pNext = &create.format_list;
+            list_view_formats(create, format, view_formats_);
         }
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
@@ -5290,6 +5295,11 @@ public:
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
+    // castable_allocation_info's answer (d3d12_com.h): allocation() for a texture with a castable-format list.
+    D3D12_RESOURCE_ALLOCATION_INFO castable_allocation(const D3D12_RESOURCE_DESC& desc, UINT32 count,
+                                                       const DXGI_FORMAT* formats, VkMemoryRequirements* vulkan) const {
+        return allocation(desc, count, formats, vulkan);
+    }
     IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
@@ -6917,7 +6927,7 @@ public:
             D3D12_RESOURCE_DESC checked = *desc;
             checked.SampleDesc.Quality = 0;
             const bool castable_uav = state_.lists_typed_uav_format(castable_count, castable);
-            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(checked, castable_uav);
+            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(checked, castable_count, castable);
             if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
                 heap_offset % alloc.Alignment) {
                 log_once("placed texture refused (size, alignment or room in the heap), dimension",
@@ -7828,8 +7838,11 @@ private:
     }
 
     // One resource's size and alignment, or kInvalidAllocation for a description D3D12 (or this device) rejects.
-    // castable_uav: a placed texture's castable list names a format with a typed UAV (create_placed).
-    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc, bool castable_uav = false) const {
+    // castable_count/castable: a committed or placed texture's castable-format list. The image sized is then the one
+    // creation makes (create_texture): same usages and the same view-format list. `vulkan` gets its requirements.
+    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc, UINT32 castable_count = 0,
+                                              const DXGI_FORMAT* castable = nullptr,
+                                              VkMemoryRequirements* vulkan = nullptr) const {
         constexpr UINT64 align_4k = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT,
                          align_64k = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
                          align_msaa_64k = D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
@@ -7895,16 +7908,21 @@ private:
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
         }
 
+        const bool castable_uav = state_.lists_typed_uav_format(castable_count, castable);
         const Format format = state_.texture_format(desc, castable_uav);
         if (!format.format) {
             log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
             return kInvalidAllocation;
         }
+        // A list creation refuses gets its own HRESULT there (castable_view_formats); here the image is sized without.
+        std::vector<VkFormat> view_formats;
+        if (FAILED(castable_view_formats(format, castable_count, castable, view_formats))) view_formats.clear();
         VkMemoryRequirements need{};
-        // castable_uav only changes a B8G8R8X8 texture's usages here; the other castable rules stay as before.
-        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format), false,
-                                       castable_uav);
+        TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format), !view_formats.empty(),
+                                 castable_uav && !view_formats.empty());
+        if (!view_formats.empty()) list_view_formats(create, format, view_formats);
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
+        if (vulkan) *vulkan = need;
         if (tiled) {
             leonida::ResourceTiling tiling;
             if (!resource_tiling(resolved, tiling)) return kInvalidAllocation;
@@ -8019,7 +8037,7 @@ private:
         D3D12_RESOURCE_DESC checked = *desc;
         if (checked.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) checked.SampleDesc.Quality = 0;
         if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-            allocation(checked, state_.lists_typed_uav_format(castable_count, castable)).SizeInBytes == UINT64_MAX) {
+            allocation(checked, castable_count, castable).SizeInBytes == UINT64_MAX) {
             log_once((std::string(method ? method : "CreateCommittedResource") +
                       " refused (texture size, mips, samples or alignment), dimension")
                          .c_str(),
@@ -8412,6 +8430,16 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
     return nullptr;
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO castable_allocation_info(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
+                                                        UINT32 count, const DXGI_FORMAT* formats,
+                                                        VkMemoryRequirements* vulkan) {
+    if (vulkan) *vulkan = {};
+    ID3D12Device* real = device ? rt::d3d12_xs::device_proxy_real_device(device) : nullptr;
+    if (auto* d = device ? Device::from<Device>(real ? real : device) : nullptr)
+        return d->castable_allocation(desc, count, formats, vulkan);
+    return {UINT64_MAX, 0};
 }
 
 bool device_supports_ray_tracing(ID3D12Device* device) {

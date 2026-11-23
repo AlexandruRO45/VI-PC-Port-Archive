@@ -223,6 +223,12 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
+// What such a device's committed and placed creation check a texture with a castable-format list against (there is
+// no GetResourceAllocationInfo3 here, which takes the list): the size and alignment, UINT64_MAX for a refusal, and in
+// `vulkan` the requirements of the image it sizes, which is the image creation makes. For tests.
+D3D12_RESOURCE_ALLOCATION_INFO castable_allocation_info(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
+                                                        UINT32 count, const DXGI_FORMAT* formats,
+                                                        VkMemoryRequirements* vulkan = nullptr);
 
 // Whether the requested colour format has an integer numeric class.
 bool color_resolve_format_is_integer(DXGI_FORMAT format);

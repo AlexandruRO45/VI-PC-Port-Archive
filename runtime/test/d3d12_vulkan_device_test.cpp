@@ -8424,6 +8424,91 @@ int main() {
                         "given or refused, and B8G8R8A8 UAV clears matched %s\n", x8_uav_cases.size(), creation_source,
                         clear_source);
         }
+
+        // A texture with a castable-format list is sized as the image creation makes: the allocation committed and
+        // placed creation check it against is refused exactly when creation is, and otherwise has the created image's
+        // Vulkan requirements. B8G8R8X8 and R8G8B8A8_UNORM_SRGB with unordered access, the other channel order and a
+        // typeless family, with one mip and with a full chain.
+        const rt::d3d12::VulkanDeviceInfo* vk_info = rt::d3d12::vulkan_device_info(layer_device.p);
+        EXPECT(vk_info != nullptr);
+        const auto device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            vk_info->get_instance_proc(vk_info->instance, "vkGetDeviceProcAddr"));
+        const auto image_requirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
+            device_proc(vk_info->device, "vkGetImageMemoryRequirements"));
+        struct SizedCase {
+            DXGI_FORMAT resource;
+            std::vector<DXGI_FORMAT> list;
+        };
+        const std::vector<SizedCase> sized_cases = {
+            {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_B8G8R8A8_UNORM}},
+            {DXGI_FORMAT_B8G8R8X8_UNORM, {DXGI_FORMAT_R32_UINT}},
+            {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, {DXGI_FORMAT_B8G8R8A8_UNORM}},
+            {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, {DXGI_FORMAT_R8G8B8A8_UNORM}},
+            {DXGI_FORMAT_R8G8B8A8_UNORM, {DXGI_FORMAT_B8G8R8A8_UNORM}},
+            {DXGI_FORMAT_R8G8B8A8_TYPELESS, {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UINT}},
+        };
+        D3D12_HEAP_DESC sized_heap_desc{};
+        sized_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        sized_heap_desc.SizeInBytes = 4u << 20;
+        sized_heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        sized_heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        Ref<ID3D12Heap> sized_heap;
+        EXPECT(SUCCEEDED(layer10->CreateHeap(&sized_heap_desc, IID_PPV_ARGS(&sized_heap.p))));
+        const D3D12_HEAP_PROPERTIES sized_default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        unsigned sized = 0, sized_created = 0, sized_differences = 0;
+        for (const SizedCase& c : sized_cases)
+            for (const UINT side : {64u, 256u}) {
+                D3D12_RESOURCE_DESC1 texture = x8_uav_desc(c.resource);
+                texture.Width = texture.Height = side;
+                texture.MipLevels = side == 64 ? 1 : 0;
+                const D3D12_RESOURCE_DESC plain{texture.Dimension, texture.Alignment, texture.Width, texture.Height,
+                                                texture.DepthOrArraySize, texture.MipLevels, texture.Format,
+                                                texture.SampleDesc, texture.Layout, texture.Flags};
+                const UINT32 count = UINT32(c.list.size());
+                VkMemoryRequirements need{};
+                const D3D12_RESOURCE_ALLOCATION_INFO info =
+                    rt::d3d12::castable_allocation_info(layer_device.p, plain, count, c.list.data(), &need);
+                const bool valid = info.SizeInBytes != UINT64_MAX;
+                Ref<ID3D12Resource> committed, placed;
+                const HRESULT results[2] = {
+                    layer10->CreateCommittedResource3(&sized_default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                      D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, count,
+                                                      c.list.data(), IID_PPV_ARGS(&committed.p)),
+                    layer10->CreatePlacedResource2(sized_heap.p, 0, &texture, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
+                                                   count, c.list.data(), IID_PPV_ARGS(&placed.p))};
+                ID3D12Resource* const made[2] = {committed.p, placed.p};
+                ++sized;
+                for (int k = 0; k < 2; ++k) {
+                    const char* kind = k ? "placed" : "committed";
+                    if (SUCCEEDED(results[k]) != valid) {
+                        std::fprintf(stderr, "castable list: format %d (%zu listed) %ux%u %s: allocation %s, creation "
+                                     "%08lx\n", int(c.resource), c.list.size(), side, side, kind,
+                                     valid ? "given" : "refused", static_cast<unsigned long>(results[k]));
+                        ++sized_differences;
+                        continue;
+                    }
+                    if (!valid) continue;
+                    ++sized_created;
+                    VkMemoryRequirements real{};
+                    image_requirements(vk_info->device, rt::d3d12::vulkan_image(made[k]), &real);
+                    const UINT64 aligned = info.Alignment ? (real.size + info.Alignment - 1) / info.Alignment *
+                                                                info.Alignment : 0;
+                    if (real.size != need.size || real.alignment != need.alignment ||
+                        real.memoryTypeBits != need.memoryTypeBits || info.SizeInBytes != aligned) {
+                        std::fprintf(stderr, "castable list: format %d (%zu listed) %ux%u %s: sized %llu/%llu/%x "
+                                     "(D3D12 %llu), created %llu/%llu/%x\n", int(c.resource), c.list.size(), side,
+                                     side, kind, static_cast<unsigned long long>(need.size),
+                                     static_cast<unsigned long long>(need.alignment), need.memoryTypeBits,
+                                     static_cast<unsigned long long>(info.SizeInBytes),
+                                     static_cast<unsigned long long>(real.size),
+                                     static_cast<unsigned long long>(real.alignment), real.memoryTypeBits);
+                        ++sized_differences;
+                    }
+                }
+            }
+        EXPECT(sized_differences == 0);
+        std::printf("castable-format lists: %u textures sized as creation makes them (refused alike, or %u created "
+                    "with the sized image's size, alignment and memory types)\n", sized, sized_created);
     }
 #undef CAST_CHECK
 
