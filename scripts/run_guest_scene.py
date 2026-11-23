@@ -2,13 +2,14 @@
 """Run the 600-frame synthetic Win32 guest scene headless in full, save and resume mode and check the results.
 
   python -I scripts/run_guest_scene.py --loader L --guest G --shaders ROOT [--out DIR] [--wine WINE]
-                                       [--play-audio] [--negative-controls]
+                                       [--play-audio] [--negative-controls] [--startup-trace]
 
 Each run renders offscreen in a fresh process and write overlay. Without --out the runs go to a temporary folder that is removed
 afterwards. The summary is printed first, and on failure the last run's log tails are printed too. Audio stays offline
 unless --play-audio sets LEONIDA_SCENE_AUDIO=winmm. The guest then plays the pulse synchronously with PlaySoundW.
 Run records distinguish a child exit, a deadline expiry and a launch failure.
 --negative-controls also runs a corrupted scene.bin and a corrupted checkpoint.bin, and each one must exit with 1.
+--startup-trace asks the loader to write a separate startup JSONL trace for each run under <out>/logs.
 Exit code 0 means every check passed, 1 means a check failed and 2 means bad arguments.
 """
 from __future__ import annotations
@@ -188,8 +189,12 @@ class Session:
     def run(self, name: str, mode: str, package: Path, overlay: Path) -> tuple[int, list[bytes], bytes]:
         a, wine = self.args, bool(self.args.wine)
         cmd = ([a.wine] if wine else []) + [str(a.loader), "--run", guest_path(a.guest, wine), "--game-dir",
-                                            guest_path(package, wine), "--overlay", guest_path(overlay, wine),
-                                            "--", guest_path(a.shaders, wine)]
+                                           guest_path(package, wine), "--overlay", guest_path(overlay, wine)]
+        trace_path = None
+        if getattr(a, "startup_trace", False):
+            trace_path = self.logs / f"{name}.startup.jsonl"
+            cmd.extend(["--trace", guest_path(trace_path, wine)])
+        cmd.extend(["--", guest_path(a.shaders, wine)])
         env_set = {"LEONIDA_SCENE_MODE": mode,
                    "LEONIDA_SCENE_AUDIO": "winmm" if a.play_audio else "offline",
                    "LEONIDA_KEYBOARD_PAD": "always", "LEONIDA_GAMEINPUT_THREAD": "0", "LEONIDA_D3D12": "vulkan",
@@ -215,6 +220,8 @@ class Session:
                "stderr_sha256": sha256(stderr)}
         if launch_error is not None:
             rec["launch_error"] = launch_error
+        if trace_path is not None and trace_path.is_file():
+            rec["startup_trace"] = str(trace_path)
         write_new(self.logs / f"{name}.json", json.dumps(rec, indent=2).encode())
         self.runs[name] = rec
         if launch_error is not None:
@@ -323,6 +330,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--wine", help="run the loader through this Wine binary")
     ap.add_argument("--play-audio", action="store_true", help="LEONIDA_SCENE_AUDIO=winmm instead of offline")
     ap.add_argument("--negative-controls", action="store_true", help="also run a bad scene.bin and checkpoint")
+    ap.add_argument("--startup-trace", action="store_true", help="write a loader startup JSONL trace for each run")
     args = ap.parse_args()
     for name in ("loader", "guest"):
         if not getattr(args, name).is_file():

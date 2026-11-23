@@ -90,4 +90,15 @@ The output directory also holds any logs, frame records and PPM images
 the runner produced. If the runner rejects an occupied directory, any
 report already there belongs to an earlier run.
 
+Add `--startup-trace` to the `guest-scene` command above to request a loader
+startup trace for each run. The loader writes `logs/<run>.startup.jsonl`
+under `--out`, with separate files for `full`, `save`, `resume` and any
+negative controls that run. When a file exists, its path is recorded as
+`startup_trace` in that run's details. A trace can also be available for
+a failed run. To analyze the full run's trace:
+
+```powershell
+python -I scripts/dev.py boot-trace "scene run/logs/full.startup.jsonl" --json
+```
+
 You can also invoke `python -I scripts/run_guest_scene.py` directly.
