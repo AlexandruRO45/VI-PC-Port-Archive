@@ -338,8 +338,9 @@ class Catalog:
             document = json.loads((self.out / STATE_NAME).read_text(encoding="utf-8"))
             for name, record in document["archives"].items():
                 done = sorted({n for n in record["completed"] if type(n) is int and n >= 0})
-                if type(record["size"]) is int and type(record["window"]) is int and record["window"] > 0:
-                    self.windows[name] = {"size": record["size"], "window": record["window"], "completed": done}
+                if all(type(record[f]) is int for f in ("size", "mtime_ns", "window")) and record["window"] > 0:
+                    self.windows[name] = {"size": record["size"], "mtime_ns": record["mtime_ns"],
+                                          "window": record["window"], "completed": done}
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             self.windows = {}
 
@@ -586,10 +587,32 @@ class Catalog:
         self.attempts += 1
 
 
+def check_window_manifest(manifest: Path, source: Path, start: int, length: int) -> None:
+    """Refuse a manifest that is not for exactly this source and window, before any row is used."""
+    reader = ManifestReader(manifest.open(encoding="utf-8-sig"))
+    try:
+        next(reader.rows(), None)
+    except (ValueError, RecursionError) as exc:
+        raise OSError(f"unreadable window manifest {manifest}: {exc}") from exc
+    finally:
+        reader.file.close()
+    scan = reader.metadata.get("Scan")
+    found = (scan.get("Start"), scan.get("Length")) if isinstance(scan, dict) else None
+    named = reader.metadata.get("src")
+    if (not isinstance(named, str) or os.path.normcase(os.path.abspath(named)) != os.path.normcase(str(source))
+            or found is None or type(found[0]) is not int or type(found[1]) is not int
+            or found != (start, length)):
+        raise OSError(f"exporter did not honour window {start}+{length} of {source.name}: "
+                      f"manifest says {found} for {named!r}")
+
+
 def release(folder: Path, root: Path) -> None:
-    """Delete an owned window staging folder, refusing anything that is not a plain directory under its root."""
+    """Delete one owned window staging folder: exactly <root>/<start>-<length>, root = <exports>/windows/<stem>."""
     if not folder.exists():
         return
+    if (folder.parent != root or not re.fullmatch(r"\d+-\d+", folder.name) or root.parent.name != "windows"
+            or folder.resolve() != folder or root.resolve() != root or linked(root) or linked(root.parent)):
+        raise OSError(f"refusing to delete {folder}: not an owned window staging folder")
     safe_destination(folder, root)
     for directory, subdirs, files in os.walk(folder):
         if any(linked(Path(directory) / name) for name in subdirs + files):
@@ -604,11 +627,17 @@ def export_windows(catalog: Catalog, args, relative: str, source: Path, work: Pa
     checkpoint were written; only then is its OBJ staging deleted. Anything else leaves the window partial, and
     the next run exports it again (converted GLBs are reused, since their paths depend only on the window)."""
     size, window = source.stat().st_size, args.window_mib * MIB
+    identity = {"size": size, "mtime_ns": source.stat().st_mtime_ns, "window": window}
     record = catalog.windows.get(relative)
-    if not record or record["size"] != size or record["window"] != window:
-        record = catalog.windows[relative] = {"size": size, "window": window, "completed": []}
+    if record and any(record.get(name) != value for name, value in identity.items()):
+        catalog.issue("stale window checkpoint refused",
+                      f"{relative} changed since {STATE_NAME} was written; remove that file to start over")
+        return True
+    if not record:
+        record = catalog.windows[relative] = {**identity, "completed": []}
     stem, reserve = Path(relative).stem, args.reserve_gib * GIB
     root = exports / "windows" / stem
+    exports.mkdir(parents=True, exist_ok=True)
     command = None
     for start in range(0, size, window):
         length = min(window, size - start)
@@ -630,6 +659,7 @@ def export_windows(catalog: Catalog, args, relative: str, source: Path, work: Pa
             manifest = folder / stem / "models" / "manifest.json"
             if not manifest.is_file():
                 raise OSError(f"rpf9dump did not publish a manifest for {source.name} window {start}")
+            check_window_manifest(manifest, source, start, length)
             catalog.manifest(manifest, folder, windowed=True)
         except SpaceError as exc:
             catalog.issue("archives deferred for free space", f"{relative} window {start}: {exc}")

@@ -2,6 +2,7 @@
 from pathlib import Path
 from io import StringIO
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ class CatalogTests(unittest.TestCase):
         self.exports.mkdir()
         self.work = self.root / "work"
 
-    def write_export(self, archive, rows, rejected=0, root=None):
+    def write_export(self, archive, rows, rejected=0, root=None, scan=None, src=None):
         folder = (root or self.exports) / archive / "models"
         folder.mkdir(parents=True, exist_ok=True)
         for row in rows:
@@ -33,7 +34,9 @@ class CatalogTests(unittest.TestCase):
             if Path(filename).name == filename and not row.get("Missing"):
                 (folder / filename).write_text(OBJ, encoding="utf-8", newline="\n")
         (folder / "manifest.json").write_text(
-            json.dumps({"Count": len(rows), "Scan": {"NotRecovered": rejected}, "Items": rows}),
+            json.dumps({"src": str(src), "Count": len(rows), "Scan": {"NotRecovered": rejected, **(scan or {})},
+                        "Items": rows} if src else
+                       {"Count": len(rows), "Scan": {"NotRecovered": rejected}, "Items": rows}),
             encoding="utf-8", newline="\n",
         )
         return folder
@@ -154,7 +157,7 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("levels", result["status"]["message"])
         self.assertEqual([asset["name"] for asset in result["assets"]], ["ready"])
 
-    def window_setup(self, windows=3):
+    def window_setup(self, windows=3, ignore=False):
         game = self.root / "synthetic-package"
         source = game / "levels.rpf"
         source.parent.mkdir(parents=True)
@@ -166,7 +169,9 @@ class CatalogTests(unittest.TestCase):
             calls.append(window)
             start = window[0] // viewer_catalog.MIB
             rows = [{"File": f"{name}.obj", "Name": name} for name in (f"w{start}_a", f"w{start}_same")]
-            folder = self.write_export("levels", rows, root=exports)
+            asked = {"Start": window[0], "Length": window[1]}
+            folder = self.write_export("levels", rows, root=exports, src=src,
+                                       scan=asked if not ignore else {})
             # Same filename in every window: the window must keep the converted paths apart.
             (folder / "w_same.obj").write_text(OBJ, encoding="utf-8")
             self.assertEqual(window[1], min(viewer_catalog.MIB, src.stat().st_size - window[0]))
@@ -230,6 +235,41 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(self.windowed(game), 0)
         self.assertTrue(self.catalog()["status"]["complete"])
         self.assertEqual(len(self.catalog()["assets"]), 4)
+
+    def test_exporter_ignoring_window_is_rejected_before_models_or_checkpoint(self):
+        game, calls, patcher = self.window_setup(2, ignore=True)
+        with patcher:
+            self.assertEqual(self.windowed(game), 1)
+        result = self.catalog()
+        self.assertEqual(result["assets"], [])
+        self.assertFalse(result["status"]["complete"])
+        self.assertFalse((self.out / ".window-state.json").exists())
+        self.assertTrue(list((self.work / "rpf9dump-models").rglob("manifest.json")))
+        self.assertEqual(list(self.out.rglob("*.glb")), [])
+
+    def test_same_size_mutated_source_refuses_checkpoint_and_keeps_assets(self):
+        game, calls, patcher = self.window_setup()
+        with patcher:
+            self.assertEqual(self.windowed(game), 0)
+            glbs = sorted(self.out.rglob("*.glb"))
+            os.utime(game / "levels.rpf", ns=(1, 1))
+            self.assertEqual(self.windowed(game), 1)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sorted(self.out.rglob("*.glb")), glbs)
+        self.assertEqual(len(self.catalog()["assets"]), 6)
+        self.assertIn("stale window checkpoint refused", self.catalog()["status"]["message"])
+
+    def test_release_only_removes_exact_owned_window_folder(self):
+        root = self.root / "x" / "windows" / "levels"
+        (root / "0-5").mkdir(parents=True)
+        other = self.root / "x" / "windows" / "other"
+        other.mkdir()
+        for bad in (other, root, root / "0-5" / "..", self.root / "x"):
+            with self.assertRaises(OSError):
+                viewer_catalog.release(bad, root)
+        self.assertTrue(other.is_dir() and root.is_dir())
+        viewer_catalog.release(root / "0-5", root)
+        self.assertFalse((root / "0-5").exists())
 
     def test_window_options_need_game_and_default_stays_whole_file(self):
         with self.assertRaises(SystemExit), patch("sys.stderr", new=StringIO()):
