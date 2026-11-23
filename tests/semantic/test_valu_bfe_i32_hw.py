@@ -439,5 +439,50 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertFalse(s_pos.negative)
 
 
+class TestBoundaryExtremes(unittest.TestCase):
+    def test_float_bit_patterns_treated_as_raw_bits(self):
+        # IEEE 754 -1.0 is 0xBF800000. Extract sign bit (offset=31, width=1):
+        # Bit 31 is 1 -> sign extended -> 0xFFFFFFFF (-1)
+        r = ref_bfe_i32(0xBF800000, 31, 1)
+        self.assertEqual(r, 0xFFFFFFFF)
+
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xBF800000",
+            "v_mov_b32 v1, 31",
+            "v_mov_b32 v2, 1",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], 0xFFFFFFFF)
+
+        # Extract exponent of -1.0 (bits 23..30, width=8):
+        # 0xBF800000 >> 23 = 0x17F; 0x17F & 0xFF = 0x7F (127). MSB of 8-bit field is 0 -> positive 127
+        r_exp = ref_bfe_i32(0xBF800000, 23, 8)
+        self.assertEqual(r_exp, 127)
+
+        words_exp = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xBF800000",
+            "v_mov_b32 v1, 23",
+            "v_mov_b32 v2, 8",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words_exp[0], 127)
+
+    def test_nan_and_inf_bit_patterns(self):
+        # +inf (0x7F800000): sign bit is 0
+        self.assertEqual(ref_bfe_i32(0x7F800000, 31, 1), 0)
+        # -inf (0xFF800000): sign bit is 1 -> 0xFFFFFFFF
+        self.assertEqual(ref_bfe_i32(0xFF800000, 31, 1), 0xFFFFFFFF)
+        # qNaN (0x7FC00000): sign bit is 0
+        self.assertEqual(ref_bfe_i32(0x7FC00000, 31, 1), 0)
+
+    def test_integer_overflow_extremes(self):
+        # 0x7FFFFFFF (INT_MAX): bits 0..30 all 1s, bit 31 is 0
+        self.assertEqual(ref_bfe_i32(0x7FFFFFFF, 0, 31), 0x7FFFFFFF)
+        # 0x80000000 (INT_MIN): bit 31 is 1, lower 31 bits are 0
+        self.assertEqual(ref_bfe_i32(0x80000000, 0, 31), 0)
+        # Extract full 32 bits from INT_MIN
+        self.assertEqual(ref_bfe_i32(0x80000000, 0, 32), 0x80000000)
+
+
 if __name__ == "__main__":
     unittest.main()
