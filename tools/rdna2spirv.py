@@ -928,9 +928,9 @@ class Gen:
     def rescale_f32_fma_inputs(self, x_bits, y_bits):
         """Keep a subnormal multiplicand alive on drivers that flush f32 inputs.
 
-        Multiply the smaller operand by 2^23 and divide the larger by 2^23, but only when the smaller is a
-        nonzero subnormal and the larger is finite and stays normal. The product is unchanged, so the FMA can
-        still round the sum with the original addend. Build the scaled operands from their integer bits.
+        Multiply a nonzero subnormal by 2^23. Divide its finite partner by 2^23 if it stays normal, or keep an
+        infinite partner as it is. The product is unchanged, so the FMA still rounds the sum with the original
+        addend. Build the scaled operands from their integer bits.
         """
         x_mag, y_mag, x_smaller = (self.tmp() for _ in range(3))
         self.emit(f"{x_mag} = OpBitwiseAnd %uint {x_bits} {self.cu(0x7FFFFFFF)}")
@@ -942,21 +942,24 @@ class Gen:
         self.emit(f"{small_mag} = OpSelect %uint {x_smaller} {x_mag} {y_mag}")
         self.emit(f"{large_mag} = OpSelect %uint {x_smaller} {y_mag} {x_mag}")
 
-        nonzero, below_normal, subnormal, can_shift, finite, normal_after_shift, rescale = (self.tmp() for _ in range(7))
+        nonzero, below_normal, subnormal, can_shift, non_nan, usable_partner, rescale = (self.tmp() for _ in range(7))
         self.emit(f"{nonzero} = OpINotEqual %bool {small_mag} {self.cu(0)}")
         self.emit(f"{below_normal} = OpULessThan %bool {small_mag} {self.cu(0x00800000)}")
         self.emit(f"{subnormal} = OpLogicalAnd %bool {nonzero} {below_normal}")
         self.emit(f"{can_shift} = OpUGreaterThanEqual %bool {large_mag} {self.cu(24 << 23)}")  # exponent >= -103
-        self.emit(f"{finite} = OpULessThan %bool {large_mag} {self.cu(0x7F800000)}")
-        self.emit(f"{normal_after_shift} = OpLogicalAnd %bool {can_shift} {finite}")
-        self.emit(f"{rescale} = OpLogicalAnd %bool {subnormal} {normal_after_shift}")
+        self.emit(f"{non_nan} = OpULessThanEqual %bool {large_mag} {self.cu(0x7F800000)}")
+        self.emit(f"{usable_partner} = OpLogicalAnd %bool {can_shift} {non_nan}")
+        self.emit(f"{rescale} = OpLogicalAnd %bool {subnormal} {usable_partner}")
 
-        mantissa, up, sign, up_bits, down_bits = (self.tmp() for _ in range(5))
+        mantissa, up, sign, up_bits = (self.tmp() for _ in range(4))
         self.emit(f"{mantissa} = OpConvertUToF %float {small_mag}")
         self.emit(f"{up} = OpFMul %float {mantissa} {self.fconst(2.0 ** -126)}")
         self.emit(f"{sign} = OpBitwiseAnd %uint {small} {self.cu(0x80000000)}")
         self.emit(f"{up_bits} = OpBitwiseOr %uint {self.tou(up)} {sign}")
-        self.emit(f"{down_bits} = OpISub %uint {large} {self.cu(23 << 23)}")
+        infinite, shifted, down_bits = (self.tmp() for _ in range(3))
+        self.emit(f"{infinite} = OpIEqual %bool {large_mag} {self.cu(0x7F800000)}")
+        self.emit(f"{shifted} = OpISub %uint {large} {self.cu(23 << 23)}")
+        self.emit(f"{down_bits} = OpSelect %uint {infinite} {large} {shifted}")
         scaled_x, scaled_y, out_x, out_y = (self.tmp() for _ in range(4))
         self.emit(f"{scaled_x} = OpSelect %uint {x_smaller} {up_bits} {down_bits}")
         self.emit(f"{scaled_y} = OpSelect %uint {x_smaller} {down_bits} {up_bits}")

@@ -130,6 +130,14 @@ def run_f32(x: float, y: float, z: float, vcc: bool, insn: str = "v_div_fmas_f32
     return run_f32_u(f2u(x), f2u(y), f2u(z), vcc, insn)
 
 
+def fma_flushing_inputs(fma):
+    def call(x, y, z):
+        operands = (math.copysign(0.0, value) if 0 < abs(value) < 2.0 ** -126 else value for value in (x, y, z))
+        return fma(*operands)
+
+    return call
+
+
 def _eval_spv_f64_mrt0(spv_text: str):
     """Straight-line SSA evaluator for translated %double/%uint/%bool fragment shaders."""
     def u64_to_d(lo, hi):
@@ -396,16 +404,8 @@ class DivFmasF32Tests(unittest.TestCase):
         self.assertEqual(run_f32_u(0x00800000, f2u(1.0), 0, False, "v_div_fmas_f32 v0, v1, v2, v3 div:2"), 0)
 
     def test_subnormal_multiplicands_survive_fma_input_flush(self):
-        fma = si.fma_f32
-
-        def flush(value):
-            return math.copysign(0.0, value) if abs(value) < 2.0 ** -126 else value
-
-        def flush_fma(x, y, z):
-            return fma(flush(x), flush(y), flush(z))
-
         # A native RTX 5070 on driver 610.88 flushes the reported subnormal operand before Fma.
-        with mock.patch.object(si, "fma_f32", side_effect=flush_fma):
+        with mock.patch.object(si, "fma_f32", side_effect=fma_flushing_inputs(si.fma_f32)):
             for operands, plain, scaled in (
                 ((0x00080000, f2u(2.0 ** 80), 0), 0x26800000, 0x06800000),
                 ((0x80080000, f2u(2.0 ** 80), 0), 0xA6800000, 0x86800000),
@@ -418,11 +418,26 @@ class DivFmasF32Tests(unittest.TestCase):
                         self.assertEqual(run_f32_u(a, b, z, False), plain)
                         self.assertEqual(run_f32_u(a, b, z, True), scaled)
 
+    def test_subnormal_times_infinity_survives_fma_input_flush(self):
+        with mock.patch.object(si, "fma_f32", side_effect=fma_flushing_inputs(si.fma_f32)):
+            for x, y, expected in (
+                (0x00080000, 0x7F800000, 0x7F800000),
+                (0x80080000, 0x7F800000, 0xFF800000),
+                (0x00080000, 0xFF800000, 0xFF800000),
+                (0x80080000, 0xFF800000, 0x7F800000),
+            ):
+                for a, b in ((x, y), (y, x)):
+                    for vcc in (False, True):
+                        with self.subTest(x=hex(a), y=hex(b), vcc=vcc):
+                            self.assertEqual(run_f32_u(a, b, 0, vcc), expected)
+            for vcc in (False, True):
+                self.assertTrue(math.isnan(u2f(run_f32_u(0, 0x7F800000, 0, vcc))))
+                self.assertTrue(math.isnan(u2f(run_f32_u(0x00080000, 0x7FC00000, 0, vcc))))
+
     def test_fma_rescale_stays_in_the_normal_finite_range(self):
         for large, expected in (
             (0x0BFFFFFF, (0x00080000, 0x0BFFFFFF)),  # one word below the minimum larger operand
             (0x0C000000, (0x0A000000, 0x00800000)),  # the scaled larger operand is the smallest normal
-            (0x7F800000, (0x00080000, 0x7F800000)),  # infinity remains an infinity
         ):
             with self.subTest(large=hex(large)), mock.patch.object(si, "fma_f32", wraps=si.fma_f32) as fma:
                 run_f32_u(0x00080000, large, 0, False)
