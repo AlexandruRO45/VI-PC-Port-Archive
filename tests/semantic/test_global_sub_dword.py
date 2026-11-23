@@ -410,7 +410,7 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
         self.assertEqual(mem[BASE], (SEED[0] & ~0xFF00) | 0x71 << 8)
 
     def test_rejected_forms(self):
-        for line in ("global_load_dword_addtid v0, s[0:1]", "global_store_byte v1, v[2:3], s[0:1]",
+        for line in ("global_load_dword_addtid v0, s[0:1] lds", "global_store_byte v1, v[2:3], s[0:1]",
                      "global_store_short v1, v2, s[0:1] slc"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):

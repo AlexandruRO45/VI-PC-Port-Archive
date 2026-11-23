@@ -614,7 +614,9 @@ class Analysis:
             # ds_write/ds_store: operand 0 is vaddr, the rest is vdata;
             # exp target, v, v, v, v: the first operand is the target (no taint), the rest is data
             addr, data = [], list(srcs)
-            if op.startswith(("global_store", "flat_store", "scratch_store")) and len(srcs) >= 2:
+            if op == "global_store_dword_addtid" and len(srcs) >= 2:
+                data, addr = [srcs[0]], list(srcs[1:])
+            elif op.startswith(("global_store", "flat_store", "scratch_store")) and len(srcs) >= 2:
                 addr, data = [srcs[0]] + list(srcs[2:]), [srcs[1]]
             elif op.startswith(("ds_write", "ds_store")) and len(srcs) >= 2:
                 addr, data = [srcs[0]], list(srcs[1:])
@@ -632,6 +634,8 @@ class Analysis:
                 at |= self.rd(st, ins, x)
             if op.startswith(("buffer_store", "tbuffer_store")):
                 at |= self.add_tid_lane(n, i, a, mods)
+            elif op == "global_store_dword_addtid":
+                at |= LANE
             bits_violation(dt)
             bits_violation(at, BASE | RNK)
             if at & RNK and at & BASE:
@@ -709,6 +713,8 @@ class Analysis:
         t_src |= md
         if op.startswith(("buffer_load", "tbuffer_load")):
             t_src |= self.add_tid_lane(n, i, a, mods)
+        elif op == "global_load_dword_addtid":
+            t_src |= LANE
 
         # --- lane masks and counts
         if op in ("s_bcnt1_i32_b64", "s_ff1_i32_b64") and len(a) == 2 and self.is_mask(ins, a[1]):

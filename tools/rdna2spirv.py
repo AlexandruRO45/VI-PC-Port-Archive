@@ -3369,6 +3369,43 @@ class Gen:
         self.uses_long = True
         return full
 
+    def global_addtid_address(self, op, saddr, mods):
+        """The 64-bit Xbox GPU VA a global_load/store_dword_addtid accesses (ulong id):
+        (saddr: 64-bit SGPR pair | off: 0) + (lane_id * 4) + sext12(offset) (does not add M0)."""
+        inst = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
+        if len(inst) > 1:
+            raise Unsupported(f"{op} offset form")
+        try:
+            inst = int(inst[0], 0) if inst else 0
+        except ValueError:
+            raise Unsupported(f"{op} offset:{inst[0]}") from None
+        if not -0x800 <= inst <= 0x7FF:
+            raise Unsupported(f"{op} offset:{inst}")
+        lane_bytes, lane64 = self.tmp(), self.tmp()
+        self.emit(f"{lane_bytes} = OpShiftLeftLogical %uint {self.wave_lane()} {self.cu(2)}")
+        self.emit(f"{lane64} = OpUConvert %ulong {lane_bytes}")
+        if (saddr["k"] == "sgpr" and saddr.get("n") == 2) or (saddr["k"] == "slist" and len(saddr["r"]) == 2):
+            lo, hi = self.sgpr_words(saddr, 2)
+            l64, h64, sh, base, va = (self.tmp() for _ in range(5))
+            self.emit(f"{l64} = OpUConvert %ulong {lo}")
+            self.emit(f"{h64} = OpUConvert %ulong {hi}")
+            self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
+            self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
+            self.emit(f"{va} = OpIAdd %ulong {base} {lane64}")
+        elif saddr["k"] == "special" and saddr["t"] == "off":
+            va = lane64
+        else:
+            raise Unsupported(op + " addressing")
+        self.uses_psb = True
+        if inst == 0:
+            return va
+        off64, o2, full = (self.tmp() for _ in range(3))
+        self.emit(f"{off64} = OpSConvert %long {self.as_int(self.cu(inst & 0xFFFFFFFF))}")
+        self.emit(f"{o2} = OpBitcast %ulong {off64}")
+        self.emit(f"{full} = OpIAdd %ulong {va} {o2}")
+        self.uses_long = True
+        return full
+
     GLOBAL_SUB = {  # op: (bytes, store?, signed, VGPR half the data comes from / lands in, or None = whole register)
         "global_store_byte": (1, True, False, None), "global_store_byte_d16_hi": (1, True, False, 1),
         "global_store_short": (2, True, False, None), "global_store_short_d16_hi": (2, True, False, 1),
@@ -3451,21 +3488,29 @@ class Gen:
             self.store_reg("vgpr", data["r"], ph)
 
     def global_mem(self, op, a, mods):
-        """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off.
+        """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off,
+        and global_load/store_dword_addtid vD, saddr|off offset:N.
         Address = (saddr: 64-bit SGPR pair + zero-extended 32-bit vaddr | off: 64-bit VGPR pair) + offset,
+        or for _addtid: (saddr: 64-bit SGPR pair | off: 0) + (lane_id * 4) + sext12(offset) (no M0),
         an Xbox GPU VA translated through the heap base. Stores and loads only take effect in active lanes."""
         load = op.startswith("global_load")
-        if op.endswith("_addtid"):
-            # global_load/store_dword_addtid address by the lane id and M0, not vaddr; until 2026-11-22 it crashed
-            # here with IndexError (no vaddr operand)
-            raise Unsupported(op)
         if any(m in mods for m in ("lds", "tfe", "d16")):
             raise Unsupported(op + " form")
+        addtid = op in ("global_load_dword_addtid", "global_store_dword_addtid")
+        if not addtid and op.endswith("_addtid"):
+            raise Unsupported(op)
         sub = {"global_load_ushort": (16, False), "global_load_sshort": (16, True),
                "global_load_ubyte": (8, False), "global_load_sbyte": (8, True)}.get(op)
-        n = 1 if (op.endswith("dword") or sub) else int(op.rsplit("x", 1)[1])
-        data, vaddr, saddr = (a[0], a[1], a[2]) if load else (a[1], a[0], a[2])
-        full = self.global_address(op, vaddr, saddr, mods)
+        if addtid:
+            if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " operand")
+            n = 1
+            data, saddr = a[0], a[1]
+            full = self.global_addtid_address(op, saddr, mods)
+        else:
+            n = 1 if (op.endswith("dword") or sub) else int(op.rsplit("x", 1)[1])
+            data, vaddr, saddr = (a[0], a[1], a[2]) if load else (a[1], a[0], a[2])
+            full = self.global_address(op, vaddr, saddr, mods)
         act = self.active_b()
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
         if load:

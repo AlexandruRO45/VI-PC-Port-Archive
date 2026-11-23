@@ -255,6 +255,10 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 if op in ("s_buffer_load_dwordx4", "s_buffer_load_dwordx8", "s_buffer_load_dwordx16"):
                     if len(a) >= 3 and a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1:
                         events["strides"].update(scale.get(a[2]["r"], ()))
+        elif op in ("global_load_dword_addtid", "global_store_dword_addtid") and len(a) >= 2:
+            slots = _sgpr_slots(a[1], 2)
+            if slots is not None:
+                _record_ptr_pair(events, sym, slots, is_desc_width=False)
         elif op.startswith(("global_load", "global_store")) and len(a) >= 3:
             slots = _sgpr_slots(a[2], 2)
             if slots is not None:

@@ -86,6 +86,19 @@ def asm_mattr(path):
     return None
 
 
+def asm_mcpu(path):
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith(";"):
+            break
+        m = re.match(r";\s*mcpu:\s*(\S+)", s)
+        if m:
+            return m.group(1)
+    return "gfx1013"
+
+
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
@@ -158,7 +171,8 @@ def translate_tests(work, names):
         if shift and n.startswith("cs_"):
             raw = shift_user_data(raw, shift)
         mattr = asm_mattr(asm_path)
-        cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        mcpu = asm_mcpu(asm_path)
+        cmd = MC + ["-triple=amdgcn--amdpal", f"-mcpu={mcpu}"]
         if n in CLIP_CASES:
             cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[n]}")
         if mattr:
