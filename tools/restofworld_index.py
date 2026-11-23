@@ -372,7 +372,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
 def _carve_index(path):
     """rpf9_carve.py's index.json in `path`: ({file name: stored bytes}, summary), or ({}, {}) without one."""
     try:
-        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(path, "index.json"), encoding="utf-8-sig") as f:
             index = json.load(f)
         stored = {f"{int(e['off']):012x}.bin": int(e["stored"]) for e in index.get("files", [])}
         summary = index.get("summary", {})
