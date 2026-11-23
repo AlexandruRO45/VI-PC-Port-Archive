@@ -242,7 +242,10 @@ What is implemented (all of it testable without the game):
   even, which is what WARP and AMD's D3D12 driver do; NaN and negatives are 0, 1 and above the maximum). Every
   24-bit word makes the round trip unchanged (checked on all 16777216 by `depth24_convert_test`). Texture to
   texture copies move the floats as they are. `ClearDepthStencilView` of any D24 texture, native or stored as D32, clears with the float of the quantised value (an exact 24-bit value, so no driver tie rounding is left),
-  so the texture reads back as D3D's quantisation of the clear value. The scratch buffers and descriptors live
+  so the texture reads back as D3D's quantisation of the clear value. The stored float is constructed with integer
+  bits as in the copy shader, independently of the host rounding mode, so a selected D24 code survives readback
+  unchanged. The clear quantizer still follows the active thread's rounding mode; the CPU
+  `depth24_rounding_test` checks these two contracts separately. The scratch buffers and descriptors live
   until the submission that used them completes. A copy larger than the device's `maxStorageBufferRange` (128 MiB at
   least) is split into several dispatches, by slices or by rows of one slice. The dispatch runs even under a
   `SetPredication` that would skip copies: the layer runs copies unpredicated (section 4.7) and the conversion

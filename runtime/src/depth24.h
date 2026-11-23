@@ -9,6 +9,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 
@@ -39,8 +40,16 @@ inline std::uint32_t depth24_quantize(float value) {
 }
 
 // The float stored for a 24-bit UNORM: the nearest float to d / 16777215 (quantising it gives d back).
+// Use the integer mantissa derivation in depth24_convert.comp: with e = floor(log2(d)) and
+// m = d << (23 - e), the nearest value is (m + 1) * 2^(e - 47). Construct its bits so a
+// caller's rounding mode cannot lose another code after depth24_quantize selected it.
 inline float depth24_to_float(std::uint32_t d) {
-    return static_cast<float>(double(d & depth24_max) / double(depth24_max));
+    d &= depth24_max;
+    if (d == 0) return 0.0f;
+    const std::uint32_t e = 31u - std::countl_zero(d);
+    const std::uint32_t m = d << (23u - e);
+    // The implicit leading bit is omitted; m + 1 carries into the exponent at d == 0xffffff.
+    return std::bit_cast<float>(((e + 103u) << 23) + (m + 1u - (1u << 23)));
 }
 
 // A depth value as the layer's D32 must hold it for a D24 texture: what a clear writes, so that reading the texture
