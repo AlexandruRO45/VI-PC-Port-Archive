@@ -246,5 +246,110 @@ class TestVMax3F16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res, 0xDEAD0000)  # +0.0 won
 
 
+class SIMDState:
+    def __init__(self, num_lanes: int = 32, exec_mask: int = 0xFFFFFFFF):
+        if num_lanes not in (32, 64):
+            raise ValueError(f"Unsupported lane count {num_lanes}, must be 32 or 64")
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask
+        self.vgprs = [[0] * num_lanes for _ in range(256)]
+        self.sgprs = [0] * 106
+
+    def read_lane16(self, op: Operand, lane: int) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index][lane] & MASK16
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK16
+        elif op.reg_type == RegType.IMM:
+            return op.value & MASK16
+        raise ValueError(f"Unknown reg_type: {op.reg_type}")
+
+
+class SIMDInterpreter:
+    @staticmethod
+    def execute(state: SIMDState, inst: VMax3F16Instruction) -> list[int]:
+        results = []
+        for lane in range(state.num_lanes):
+            lane_active = (state.exec_mask >> lane) & 1
+            if lane_active:
+                s0 = state.read_lane16(inst.src0, lane)
+                s1 = state.read_lane16(inst.src1, lane)
+                s2 = state.read_lane16(inst.src2, lane)
+                res16 = ref_max3_f16(s0, s1, s2)
+                old_hi = state.vgprs[inst.dst.index][lane] & 0xFFFF0000
+                new_word = old_hi | (res16 & MASK16)
+                state.vgprs[inst.dst.index][lane] = new_word
+                results.append(new_word)
+            else:
+                results.append(state.vgprs[inst.dst.index][lane])
+        return results
+
+
+class TestVMax3F16SIMDDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_wave32_full_exec(self):
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        for i in range(32):
+            state.vgprs[0][i] = 0xCAFE0000
+            state.vgprs[1][i] = 0x3C00  # 1.0
+            state.vgprs[2][i] = 0x3800  # 0.5
+            state.vgprs[3][i] = 0x4000 if (i % 2) else 0x3400  # 2.0 or 0.25
+        inst = VMax3F16Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        for i in range(32):
+            expected_lo = 0x4000 if (i % 2) else 0x3C00
+            expected = 0xCAFE0000 | expected_lo
+            self.assertEqual(res[i], expected)
+            self.assertEqual(state.vgprs[0][i], expected)
+
+    def test_simd_wave32_divergent_mask(self):
+        mask = 0x55555555
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        for i in range(32):
+            state.vgprs[0][i] = 0xDEADBEEF
+            state.vgprs[1][i] = 0x3C00
+            state.vgprs[2][i] = 0x4000
+            state.vgprs[3][i] = 0x3800
+        inst = VMax3F16Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(res[i], 0xDEAD4000)
+            else:
+                self.assertEqual(res[i], 0xDEADBEEF)
+
+    def test_simd_wave64_partial_exec(self):
+        mask = 0x00000000FFFFFFFF
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        for i in range(64):
+            state.vgprs[0][i] = 0xBABE0000
+            state.vgprs[1][i] = 0xBC00
+            state.vgprs[2][i] = 0x0000
+            state.vgprs[3][i] = 0x8000
+        inst = VMax3F16Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        for i in range(64):
+            if i < 32:
+                self.assertEqual(res[i], 0xBABE0000)  # +0.0
+            else:
+                self.assertEqual(res[i], 0xBABE0000)
+
+
 if __name__ == "__main__":
     unittest.main()
