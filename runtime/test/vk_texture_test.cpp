@@ -325,10 +325,19 @@ int main(int argc, char** argv) {
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
     leonida::DescriptorTable desc_table(16);
-    // The heap already holds the original key. Change only the registered key for the miss control.
-    if (fetch_miss) tsharp[7] ^= 1;
-    desc_table.insert(tsharp, 1);
-    desc_table.insert(ssharp, 1);
+    if (fetch_uint || fetch_miss) {
+        // Changing bits above the low nibble leaves the FNV-1a home slot unchanged in this 16-slot table.
+        // The UINT hit must reach the eighth slot. For the miss, every decoy points at the integer image
+        // so accepting any partial key will be visible instead of returning the magenta fallback.
+        const unsigned decoys = fetch_miss ? leonida::kDescriptorProbes : leonida::kDescriptorProbes - 1;
+        for (unsigned i = 1; i <= decoys; ++i) {
+            auto key = leonida::make_tsharp_key(tsharp);
+            key[7] ^= i << 4;
+            desc_table.insert(key, fetch_miss ? 1 : 0);
+        }
+    }
+    if (!fetch_miss) desc_table.insert(tsharp, 1);
+    if (!fetch) desc_table.insert(ssharp, 1);  // image_load has no sampler
     const auto table = desc_table.build_gpu_buffer(true);
     VkBuffer tb; VkDeviceMemory tbm; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbm, &tbp));
