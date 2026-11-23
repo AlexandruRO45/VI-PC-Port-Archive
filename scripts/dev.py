@@ -67,12 +67,18 @@ def run_producer(relative_path: str, args: list[str]) -> int:
 
 
 def guest_scene(args: list[str]) -> int:
+    # Let the runner decide whether help or an argument error comes first.
+    for arg in args:
+        if arg == "--":
+            break
+        if arg in ("-h", "--help"):
+            return run_producer(GUEST_SCENE, args)
+
     # Only enforce the persistent output option here. The runner parses the original argv.
     parser = argparse.ArgumentParser(prog="dev.py guest-scene", add_help=False, allow_abbrev=False)
-    parser.add_argument("-h", "--help", action="store_true")
     parser.add_argument("--out", metavar="PATH")
     options, _ = parser.parse_known_args(args)
-    if not options.help and not options.out:
+    if not options.out:
         parser.error("--out PATH is required to keep the scene results")
 
     return run_producer(GUEST_SCENE, args)
