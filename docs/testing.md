@@ -93,7 +93,8 @@ Runtime, download and unzip `runtime-windows`, and pass the unzipped folder to `
 python -I scripts/run_gpu_tests.py --build <unzipped runtime-windows>
 ```
 
-`build.py` and `check.py` take the same folder as their second argument:
+`check.py` takes the same folder as its second argument (`build.py` reads anything after the output folder as
+test shader names):
 
 ```sh
 python -I runtime/test/shaders/build.py <out dir>

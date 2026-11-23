@@ -119,6 +119,14 @@ class BuildUnderFallbackTest(unittest.TestCase):
             self.fake_translate = keep
         self.assertIn("did not produce validated SPIR-V for: cs_store", str(status))
 
+    def test_a_runtime_folder_as_second_argument_is_refused_as_a_shader_name(self):
+        # docs/testing.md: only check.py takes the runtime folder second; build.py reads test shader names there.
+        runtime = self.out.parent / "runtime-windows"
+        runtime.mkdir()
+        status, _ = self.run_build([str(runtime)], {})
+        self.assertEqual(status, "Unknown test shaders: " + str(runtime))
+        self.assertEqual(self.asked, [])
+
 
 if __name__ == "__main__":
     unittest.main()
