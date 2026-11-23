@@ -70,12 +70,19 @@ class F64OutputModifiersTest(unittest.TestCase):
         else:
             self.assertNotIn("FClamp", spv)
         pair = result(rf"OpBitcast %v2uint_d {value}")
-        for index, register in ((0, "%c4"), (1, "%c5")):
+        # Each half of the pair is written once, to its own register, and nothing else is written to them. A
+        # straight-line block writes the word directly; a block whose EXEC can be partial loads the old word and
+        # selects (#4473), so both shapes are accepted here and neither may touch the other register.
+        for index, register in ((0, 4), (1, 5)):
             word = result(rf"OpCompositeExtract %uint {pair} {index}")
-            dest = result(rf"OpAccessChain %_ptr_Function_uint %vgpr {register}")
-            old_word = result(rf"OpLoad %uint {dest}")
-            masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+            other = 5 if index == 0 else 4
+            # A block whose EXEC can be partial predicates the write on a select of the old word (#4473).
+            predicated = re.search(rf"(?m)^ *(%\w+) = OpSelect %uint %\w+ {word} (%\w+)$", spv)
+            stored = word if predicated is None else predicated.group(1)
+            written = re.findall(rf"(?m)^ *OpStore %reg_v{register} (\S+)$", spv)
+            self.assertIn(stored, written, f"nothing stores the new word of v{register}")
+            self.assertEqual([w for w in written if w != stored], [], f"v{register} is also written from another value")
+            self.assertNotIn(f"OpStore %reg_v{other} {stored}", spv)
         # The add keeps its own rounding (no_contraction decorates all float arithmetic).
         for op in re.findall(r"(?m)^ *(%\w+) = OpFAdd %double ", spv):
             self.assertRegex(spv, rf"(?m)^ *OpDecorate {op} NoContraction$")
