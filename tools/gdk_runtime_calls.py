@@ -1045,6 +1045,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{path}: report {collision} would overwrite input file", file=sys.stderr)
             rc = 1
             continue
+        if same_report_path(json_path, txt_path):
+            print(f"{path}: JSON and text reports name the same file ({json_path}, {txt_path})", file=sys.stderr)
+            rc = 1
+            continue
         try:
             with open(json_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"table": table.source, **r}, f, indent=1)

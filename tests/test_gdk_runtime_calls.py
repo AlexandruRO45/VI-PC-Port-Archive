@@ -361,6 +361,28 @@ class ImageTest(unittest.TestCase):
                           for s in i["slots"]})
         self.assertIsNone(r["referenced_thunks"])
 
+    def test_main_refuses_aliased_json_and_text_reports(self):
+        out = os.path.join(self.tmp, "alias-reports")
+        os.mkdir(out)
+        json_path = os.path.join(out, "thunks.dll.gdk_calls.json")
+        txt_path = os.path.join(out, "thunks.dll.gdk_calls.txt")
+        original = b"previous report\n"
+        with open(json_path, "wb") as f:
+            f.write(original)
+        try:
+            os.link(json_path, txt_path)
+        except OSError as e:
+            self.skipTest(f"hard links unavailable: {e}")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = grc.main([self.path, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("JSON and text reports name the same file", stderr.getvalue())
+        for path in (json_path, txt_path):
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), original)
+
     def test_main_writes_text_and_json_with_lf(self):
         out = os.path.join(self.tmp, "out")
         source = self.write("xgameruntime.cpp", SERVED_SOURCE.encode())
