@@ -39,6 +39,8 @@ As a CLI:
 """
 import argparse
 import sys
+from collections import Counter
+from itertools import chain, compress
 
 _PURE_OPS = frozenset((
     "OpAccessChain",
@@ -72,6 +74,38 @@ _COMMUTATIVE_OPS = frozenset((
     "OpIEqual", "OpINotEqual", "OpLogicalAnd", "OpLogicalOr",
     "OpLogicalEqual", "OpLogicalNotEqual",
 ))
+
+_TERMINATOR_OPS = frozenset(("OpBranch", "OpBranchConditional", "OpSwitch"))
+
+# The only opcodes _fold_int_op can fold; every other opcode returns None there.
+_FOLD_OPS = frozenset((
+    "OpNot", "OpUConvert", "OpBitFieldUExtract",
+    "OpIAdd", "OpISub", "OpIMul", "OpUDiv", "OpUMod",
+    "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor",
+    "OpShiftLeftLogical", "OpShiftRightLogical", "OpShiftRightArithmetic",
+    "OpIEqual", "OpINotEqual",
+    "OpULessThan", "OpULessThanEqual", "OpUGreaterThan", "OpUGreaterThanEqual",
+    "OpSLessThan", "OpSLessThanEqual", "OpSGreaterThan", "OpSGreaterThanEqual",
+))
+
+# Opcodes the copy / select / logical block of process_block can act on.
+_SIMPLIFY_OPS = frozenset((
+    "OpCopyObject", "OpBitcast", "OpCompositeConstruct", "OpCompositeExtract", "OpSelect",
+    "OpLogicalNot", "OpLogicalAnd", "OpLogicalOr", "OpIEqual", "OpINotEqual",
+))
+
+# Opcodes process_block can act on; every other instruction only has its operands alias-resolved.
+_BLOCK_OPS = _PURE_OPS | _SIMPLIFY_OPS | _FOLD_OPS | frozenset(("OpPhi", "OpLoad", "OpStore", "OpExtInst", "OpAccessChain"))
+
+# Instructions the optimizer writes back exactly as read.
+_RAW_OPS = frozenset(("OpFunction", "OpFunctionEnd", "OpLabel", "OpVariable"))
+
+_DISCOVER_OPS = frozenset(("OpVariable", "OpAccessChain"))
+_MEMORY_OPS = frozenset(("OpLoad", "OpStore", "OpAccessChain"))
+_NOT_GENERIC_OPS = frozenset(("OpLoad", "OpStore", "OpAccessChain", "OpVariable"))
+
+# Opcodes is_pure_dce_candidate can ever accept.
+_DCE_OPS = _PURE_OPS | frozenset(("OpPhi", "OpExtInst", "OpLoad", "OpVariable"))
 
 _PURE_GLSL_EXT = frozenset((
     "FAbs", "SAbs", "FSign", "SSign", "Floor", "Trunc", "Round", "RoundEven",
@@ -109,6 +143,14 @@ def _format_inst(res: str | None, op: str, args: list[str]) -> str:
     return f"         {op} {' '.join(args)}" if args else f"         {op}"
 
 
+def _drop_indices(insts: list, dead: set[int]) -> list:
+    """insts without the entries at the indices in dead (order kept)."""
+    keep = [True] * len(insts)
+    for i in dead:
+        keep[i] = False
+    return list(compress(insts, keep))
+
+
 def _to_signed(uval: int, width: int) -> int:
     sign_bit = 1 << (width - 1)
     return uval - (1 << width) if uval >= sign_bit else uval
@@ -118,8 +160,9 @@ def _build_cfg_and_dom(insts: list[list]):
     """Split function instructions into basic blocks and compute CFG + dominator tree."""
     blocks: list[list[int]] = []         # block_idx -> list of inst indices (starting with OpLabel)
     label_to_block: dict[str, int] = {}
+    terminators: list[tuple[int, str, list[str]]] = []   # (block_idx, op, args) in block order
     cur: list[int] | None = None
-    for idx, (res, op, _args, _raw) in enumerate(insts):
+    for idx, (res, op, args, _raw) in enumerate(insts):
         if op == "OpLabel" and res is not None:
             b = len(blocks)
             label_to_block[res] = b
@@ -130,6 +173,8 @@ def _build_cfg_and_dom(insts: list[list]):
                 cur = None
             else:
                 cur.append(idx)
+                if op in _TERMINATOR_OPS:
+                    terminators.append((len(blocks) - 1, op, args))
 
     n_blocks = len(blocks)
     if n_blocks == 0:
@@ -138,24 +183,26 @@ def _build_cfg_and_dom(insts: list[list]):
     succs: list[list[int]] = [[] for _ in range(n_blocks)]
     all_preds: list[set[int]] = [set() for _ in range(n_blocks)]
 
-    for b, b_insts in enumerate(blocks):
-        seen_s: set[int] = set()
-        for idx in b_insts:
-            _, op, args, _ = insts[idx]
-            targets = ()
-            if op == "OpBranch" and args:
-                targets = (args[0],)
-            elif op == "OpBranchConditional" and len(args) >= 3:
-                targets = (args[1], args[2])
-            elif op == "OpSwitch" and len(args) >= 2:
-                targets = tuple([args[1]] + [args[k] for k in range(3, len(args), 2)])
-            for t in targets:
-                tb = label_to_block.get(t)
-                if tb is not None:
-                    all_preds[tb].add(b)
-                    if tb not in seen_s:
-                        seen_s.add(tb)
-                        succs[b].append(tb)
+    seen_s: set[int] = set()
+    seen_b = -1
+    for b, op, args in terminators:
+        if b != seen_b:
+            seen_b = b
+            seen_s = set()
+        targets = ()
+        if op == "OpBranch" and args:
+            targets = (args[0],)
+        elif op == "OpBranchConditional" and len(args) >= 3:
+            targets = (args[1], args[2])
+        elif op == "OpSwitch" and len(args) >= 2:
+            targets = tuple([args[1]] + [args[k] for k in range(3, len(args), 2)])
+        for t in targets:
+            tb = label_to_block.get(t)
+            if tb is not None:
+                all_preds[tb].add(b)
+                if tb not in seen_s:
+                    seen_s.add(tb)
+                    succs[b].append(tb)
 
     # Iterative DFS from block 0 to compute reverse postorder (RPO) of reachable blocks.
     visited = [False] * n_blocks
@@ -216,6 +263,8 @@ def _fold_int_op(op: str, res_ty: str, args: list[str],
                  const_true_id: str | None, const_false_id: str | None) -> str | None:
     """Fold constant/algebraic integer/bit operations into an existing SSA ID, or return None."""
     n = len(args)
+    if n == 3 and args[1] != args[2] and args[1] not in const_int_val and args[2] not in const_int_val:
+        return None      # every 3-operand rule needs a constant operand or two identical operands
     if op == "OpNot" and n == 2:
         c1 = const_int_val.get(args[1])
         if c1 is not None:
@@ -410,13 +459,10 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         ptr_slot: dict[str, tuple | None] = {}      # ptr_id -> (var_id, *canonical_const_indices) or None
         escaped: set[str] = set()
         dyn_indexed: set[str] = set()
-        id_type: dict[str, str] = dict(const_type)
 
-        for res, op, args, _ in insts:
-            if op is None:
-                continue
-            if res is not None and args and op != "OpLabel":
-                id_type[res] = args[0]
+        id_type: dict[str, str] = dict(const_type)
+        id_type.update({e[0]: e[2][0] for e in insts if e[0] is not None and e[2] and e[1] != "OpLabel"})
+        for res, op, args, _ in [e for e in insts if e[1] in _DISCOVER_OPS]:
             if op == "OpVariable" and len(args) >= 2 and args[1] == "Function" and res:
                 init = args[2] if len(args) >= 3 else None
                 func_vars[res] = init
@@ -441,13 +487,12 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     ptr_root[res] = base
 
         slot_depths: dict[str, set[int]] = {}
-        for res, op, args, _ in insts:
-            if op is None:
-                continue
+        store_ptrs: list[str] = []
+        for res, op, args, _ in [e for e in insts if e[1] in _MEMORY_OPS]:
             if op == "OpLoad":
                 if len(args) >= 2 and args[1] in ptr_root and ptr_root[args[1]] in func_vars:
                     root = ptr_root[args[1]]
-                    if any("Volatile" in m for m in args[2:]):
+                    if (len(args) > 2 and any("Volatile" in m for m in args[2:])):
                         escaped.add(root)
                     sl = ptr_slot.get(args[1])
                     if sl is not None:
@@ -456,9 +501,11 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     if tok in ptr_root and ptr_root[tok] in func_vars:
                         escaped.add(ptr_root[tok])
             elif op == "OpStore":
+                if len(args) >= 2:
+                    store_ptrs.append(args[0])
                 if len(args) >= 2 and args[0] in ptr_root and ptr_root[args[0]] in func_vars:
                     root = ptr_root[args[0]]
-                    if any("Volatile" in m for m in args[2:]):
+                    if (len(args) > 2 and any("Volatile" in m for m in args[2:])):
                         escaped.add(root)
                     sl = ptr_slot.get(args[0])
                     if sl is not None:
@@ -470,10 +517,11 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 for tok in args[2:]:
                     if tok in ptr_root and ptr_root[tok] in func_vars:
                         escaped.add(ptr_root[tok])
-            elif op != "OpVariable":
-                for tok in args:
-                    if tok in ptr_root and ptr_root[tok] in func_vars:
-                        escaped.add(ptr_root[tok])
+
+        # Any other instruction naming a tracked pointer lets its variable escape.
+        for tok in ptr_root.keys() & chain.from_iterable([e[2] for e in insts if e[2] and e[1] not in _NOT_GENERIC_OPS]):
+            if ptr_root[tok] in func_vars:
+                escaped.add(ptr_root[tok])
 
         # Exclude variables accessed at mixed aggregate/subobject depths (e.g. whole array + element pointer).
         for root, depths in slot_depths.items():
@@ -486,15 +534,13 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         # Identify which trackable vars and static slots ever receive an OpStore in the function.
         stored_vars: set[str] = set()
         stored_slots: set[tuple] = set()
-        for _res, op, args, _ in insts:
-            if op == "OpStore" and len(args) >= 2:
-                ptr = args[0]
-                root = ptr_root.get(ptr)
-                if root in trackable:
-                    stored_vars.add(root)
-                    slot = ptr_slot.get(ptr)
-                    if slot is not None:
-                        stored_slots.add(slot)
+        for ptr in store_ptrs:
+            root = ptr_root.get(ptr)
+            if root in trackable:
+                stored_vars.add(root)
+                slot = ptr_slot.get(ptr)
+                if slot is not None:
+                    stored_slots.add(slot)
 
         # Function-wide immutable facts for never-stored trackable variables (e.g. %active in non-divergent shaders).
         readonly_slot_val: dict[tuple, str] = {}
@@ -529,6 +575,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 alias[tok] = cur
             return cur
 
+        alias_untouched = alias.keys().isdisjoint
         dead_idx: set[int] = set()
 
         # Scoped dominator-tree tables (maintained via undo logs during iterative DFS).
@@ -558,12 +605,16 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 if op is None or op == "OpLabel":
                     continue
 
-                if alias and args:
+                if alias and args and not alias_untouched(args):
                     new_args = [resolve(t) if t.startswith("%") else t for t in args]
                     if new_args != args:
                         entry[2] = new_args
                         args = new_args
                         changed = True
+                # Only their operands needed resolving unless a rule below can act on the opcode.
+                if op not in _BLOCK_OPS:
+                    continue
+                plain = res is not None and res not in decorated_ids
 
                 # Trivial OpPhi simplification (only in reachable blocks so dominance is guaranteed).
                 if op == "OpPhi" and reachable and res is not None and res not in decorated_ids and len(args) >= 3:
@@ -577,7 +628,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         continue
 
                 # Algebraic / copy / constant-fold / round-trip bitcast simplifications
-                if res is not None and res not in decorated_ids:
+                if plain and op in _SIMPLIFY_OPS:
                     if op == "OpCopyObject" and len(args) == 2:
                         alias[res] = args[1]
                         dead_idx.add(idx)
@@ -730,7 +781,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         if idx in dead_idx:
                             continue
 
-                    # Integer/bit constant folding & algebraic identities
+                # Integer/bit constant folding & algebraic identities
+                if plain and op in _FOLD_OPS:
                     folded = _fold_int_op(
                         op, args[0], args, const_int_val, int_const_by_val,
                         int_type_info, const_true_id, const_false_id,
@@ -743,7 +795,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         continue
 
                 # Dominator-scoped OpAccessChain CSE
-                if op == "OpAccessChain" and res is not None and res not in decorated_ids:
+                if op == "OpAccessChain" and plain:
                     key = tuple(args)
                     prev = ac_cse.get(key)
                     if prev is not None:
@@ -757,7 +809,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     continue
 
                 # Dominator-scoped pure-value CSE (with commutative operand canonicalization)
-                if res is not None and res not in decorated_ids and (
+                if plain and (
                     op in _PURE_OPS or (op == "OpExtInst" and len(args) >= 3 and args[1] in glsl_sets and args[2] in _PURE_GLSL_EXT)
                 ):
                     if op in _COMMUTATIVE_OPS and len(args) == 3 and args[1] > args[2]:
@@ -778,7 +830,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 # OpLoad forwarding & CSE (Function-scope slots + immutable Input/PushConstant globals)
                 if op == "OpLoad" and res is not None and len(args) >= 2:
                     ptr = args[1]
-                    volatile = any("Volatile" in m for m in args[2:])
+                    volatile = (len(args) > 2 and any("Volatile" in m for m in args[2:]))
                     root = ptr_root.get(ptr)
                     if not volatile and root in trackable:
                         slot = ptr_slot.get(ptr)
@@ -817,7 +869,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 # Function-scope OpStore tracking & redundant/overwritten store elimination
                 if op == "OpStore" and len(args) >= 2:
                     ptr, val = args[0], args[1]
-                    volatile = any("Volatile" in m for m in args[2:])
+                    volatile = (len(args) > 2 and any("Volatile" in m for m in args[2:]))
                     root = ptr_root.get(ptr)
                     if not volatile and root in trackable:
                         slot = ptr_slot.get(ptr)
@@ -911,13 +963,13 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         del logical_not_of[k]
 
         if dead_idx:
-            insts = [e for i, e in enumerate(insts) if i not in dead_idx]
+            insts = _drop_indices(insts, dead_idx)
 
         # Post-walk alias resolution sweep (updates backedge operands of OpPhi, etc.).
         if alias:
             for entry in insts:
                 _, op, args, _ = entry
-                if op is None or not args:
+                if op is None or not args or alias_untouched(args):
                     continue
                 new_args = [resolve(t) if t.startswith("%") else t for t in args]
                 if new_args != args:
@@ -928,38 +980,32 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         #    if a slot (var, ...) has zero remaining OpLoads anywhere in the function, every OpStore to it is dead.
         if static_trackable:
             loaded_slots: set[tuple] = set()
-            for _res, op, args, _ in insts:
-                if op == "OpLoad" and len(args) >= 2:
+            for _res, _op, args, _ in [e for e in insts if e[1] == "OpLoad"]:
+                if len(args) >= 2:
                     slot = ptr_slot.get(args[1])
                     if slot is not None and slot[0] in static_trackable:
                         loaded_slots.add(slot)
             dead_stores: set[int] = set()
-            for idx, (_res, op, args, _) in enumerate(insts):
-                if op == "OpStore" and len(args) >= 2:
-                    if any("Volatile" in m for m in args[2:]):
+            for idx, (_res, op, args, _) in [(i, e) for i, e in enumerate(insts) if e[1] == "OpStore"]:
+                if len(args) >= 2:
+                    if (len(args) > 2 and any("Volatile" in m for m in args[2:])):
                         continue
                     slot = ptr_slot.get(args[0])
                     if slot is not None and slot[0] in static_trackable and slot not in loaded_slots:
                         dead_stores.add(idx)
             if dead_stores:
-                insts = [e for i, e in enumerate(insts) if i not in dead_stores]
+                insts = _drop_indices(insts, dead_stores)
                 changed = True
 
         # 4. Backward pure Dead-Code Elimination (DCE) + dead Function-scope OpVariable removal.
-        use_count: dict[str, int] = {}
-        for _res, op, args, _ in insts:
-            if op is None or not args:
-                continue
-            for tok in args:
-                if tok.startswith("%"):
-                    use_count[tok] = use_count.get(tok, 0) + 1
+        use_count: Counter = Counter(chain.from_iterable([e[2] for e in insts if e[2]]))
 
         def is_pure_dce_candidate(res: str, op: str, args: list[str]) -> bool:
             if op in _PURE_OPS or op == "OpPhi":
                 return True
             if op == "OpExtInst" and len(args) >= 3 and args[1] in glsl_sets and args[2] in _PURE_GLSL_EXT:
                 return True
-            if op == "OpLoad" and len(args) >= 2 and not any("Volatile" in m for m in args[2:]):
+            if op == "OpLoad" and len(args) >= 2 and not (len(args) > 2 and any("Volatile" in m for m in args[2:])):
                 ptr = args[1]
                 root = ptr_root.get(ptr)
                 return root in trackable or root in readonly_global_vars or ptr in readonly_global_vars
@@ -968,30 +1014,32 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
             return False
 
         dce_dead: set[int] = set()
-        for idx in range(len(insts) - 1, -1, -1):
+        for idx in [i for i, e in enumerate(insts) if e[1] in _DCE_OPS][::-1]:
             res, op, args, _ = insts[idx]
-            if res is None or op is None:
+            if res is None:
                 continue
-            if use_count.get(res, 0) == 0 and is_pure_dce_candidate(res, op, args):
+            if (res[0] != "%" or use_count[res] == 0) and is_pure_dce_candidate(res, op, args):
                 dce_dead.add(idx)
                 deleted_ids.add(res)
                 for tok in args:
-                    if tok.startswith("%"):
-                        use_count[tok] = use_count.get(tok, 0) - 1
+                    use_count[tok] -= 1
 
         if dce_dead:
-            insts = [e for i, e in enumerate(insts) if i not in dce_dead]
+            insts = _drop_indices(insts, dce_dead)
             changed = True
 
         if not changed:
             break
 
     out_lines = []
+    emit = out_lines.append
     for res, op, args, raw in insts:
-        if op is None or op in ("OpFunction", "OpFunctionEnd", "OpLabel", "OpVariable"):
-            out_lines.append(raw)
+        if op is None or op in _RAW_OPS:
+            emit(raw)
+        elif res is not None:
+            emit(f"         {res} = {op} {' '.join(args)}" if args else f"         {res} = {op}")
         else:
-            out_lines.append(_format_inst(res, op, args))
+            emit(f"         {op} {' '.join(args)}" if args else f"         {op}")
     return out_lines, deleted_ids
 
 
@@ -1074,7 +1122,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 array_elem_type[res] = args[0]
             elif op == "OpVariable" and res and len(args) >= 2 and args[1] in ("PushConstant", "Input"):
                 readonly_global_vars.add(res)
-        else:
+        elif "OpFunctionEnd" in raw:
             parsed = _parse_line(raw)
             if parsed is not None and parsed[1] == "OpFunctionEnd":
                 func_ranges.append((fn_start, i + 1))
