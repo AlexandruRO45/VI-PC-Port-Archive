@@ -10508,11 +10508,17 @@ class Gen:
             f = self.attribute(attr["a"], attr["c"], half=1 if "high" in mods else 0, ij=self.interp_weights(ins))
             if op == "v_interp_p2_f16":
                 # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
-                # Until 2026-11-22 it was dropped. A partial write like the other f16 results: the high half of vdst is
-                # kept (SHADER-430, measured on gfx1036 with tools/hw_oracle: a preset 0xdead high half survived every
-                # case). It used to be zeroed.
-                self.write_lo16(a[0], self.f16_res(self.clamp_f16(f, mods)))
+                # Until 2026-11-22 it was dropped. A partial write like the other f16 results: VOP3 op_sel[3] (word 0
+                # bit 14, 0x4000) selects the destination half — 0 writes vdst[15:0] keeping vdst[31:16], 1 writes
+                # vdst[31:16] keeping vdst[15:0] (measured on native gfx1036 in wave32 and wave64 across plain, high
+                # and clamp forms).
+                sel, dhi = self.opsel_bits(mods, 3)
+                if any(sel):
+                    raise Unsupported("v_interp_p2_f16 op_sel source")
+                self.write_half16(a[0], self.f16_res(self.clamp_f16(f, mods)), dhi)
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
+                if any(m.startswith("op_sel:") for m in mods):
+                    raise Unsupported(op + " op_sel")
                 self.dst(a[0], self.tou(f))
         elif op.startswith("s_cmp_"):
             self.compare(op, a, scalar=True)
@@ -16218,6 +16224,29 @@ def restore_mix_literal(ins, raw, literal):
             ins["args"][1 + i] = {**ins["args"][1 + i], "v": literal}
 
 
+def interp_p2_f16_opsel_dst(raw, printed, op):
+    """True when ``raw`` and ``printed`` are an 8-byte VOP3 ``v_interp_p2_f16`` differing only in VOP3 word 0 bit 14
+    (``op_sel[3]``, 0x4000) being 1 in ``raw`` and 0 in ``printed``.
+
+    On RDNA2, VOP3 word 0 bit 14 routes the f16 result to ``vdst[31:16]`` while preserving ``vdst[15:0]`` (measured on
+    native gfx1036 in wave32 and wave64 across plain, ``high`` and ``clamp`` forms). ``llvm-mc`` drops bit 14 when
+    disassembling ``v_interp_p2_f16`` and re-encodes it as 0; only that single bit may differ, so any other dropped
+    field (``op_sel[0:2]``, ``clamp`` or an operand) is still refused."""
+    if op != "v_interp_p2_f16" or len(raw) != 8 or len(printed) != 8:
+        return False
+    r = int.from_bytes(raw, "little")
+    p = int.from_bytes(printed, "little")
+    if ((r >> 16) & 0xFFFF) != 0xD75A:
+        return False
+    return (r & 0x4000) != 0 and (r ^ p) == 0x4000
+
+
+def restore_interp_p2_f16_opsel_dst(ins):
+    """Record the dropped VOP3 ``op_sel[3]`` destination high-half bit on ``ins``."""
+    if not any(m.startswith("op_sel:") for m in ins["mods"]):
+        ins["mods"].append("op_sel:[0,0,0,1]")
+
+
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     d = shader_container(path, name)
@@ -16398,6 +16427,9 @@ def check_printed_encodings(path, info):
             if literal is not None:
                 restore_mix_literal(ins, raw, literal)
                 continue
+            if interp_p2_f16_opsel_dst(raw, enc, base_op(ins["op"])):
+                restore_interp_p2_f16_opsel_dst(ins)
+                continue
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
 
@@ -16453,6 +16485,9 @@ def translate(path):
                 literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
                 if literal is not None:
                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                    break
+                if interp_p2_f16_opsel_dst(blob[at:at + len(enc)], enc, base_op(op)):
+                    restore_interp_p2_f16_opsel_dst(ins)
                     break
                 at += 4
                 skipped += 4
