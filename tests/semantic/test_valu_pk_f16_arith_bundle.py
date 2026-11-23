@@ -145,5 +145,25 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
         val = ast.eval_scalar(w1, w2)
         self.assertEqual(val, pack_f16x2(0x3c00, 0x4000))
 
+    def test_v_pk_min_f16_simd_divergence_and_boundaries(self):
+        state = MachineState(num_lanes=64)
+        state.exec_mask = 0x00000000FFFFFFFF # first 32 active
+        for l in range(64):
+            state.vgpr[0][l] = 0xDEADBEEF
+            state.vgpr[1][l] = pack_f16x2(0x3c00, 0x4200) # 1.0, 3.0
+            state.vgpr[2][l] = pack_f16x2(0x4000, 0x4000) # 2.0, 2.0
+        ast = InstructionAST("v_pk_min_f16", dst=0, srcs=[1, 2])
+        ast.execute_simd(state)
+        for l in range(32):
+            self.assertEqual(state.vgpr[0][l], pack_f16x2(0x3c00, 0x4000))
+        for l in range(32, 64):
+            self.assertEqual(state.vgpr[0][l], 0xDEADBEEF)
+
+        # Boundary checks: NaN, Inf, -0.0
+        res_nan = ref_pk_min_f16(pack_f16x2(QNAN, POS_INF), pack_f16x2(0x3c00, 0x4000))
+        lo, hi = unpack_f16x2(res_nan)
+        self.assertEqual(lo, 0x3c00) # NMin returns non-NaN
+        self.assertEqual(hi, 0x4000) # min(Inf, 2.0) = 2.0
+
 if __name__ == '__main__':
     unittest.main()
