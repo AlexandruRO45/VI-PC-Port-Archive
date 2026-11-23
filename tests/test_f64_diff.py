@@ -141,8 +141,16 @@ class F64DiffTests(unittest.TestCase):
                 self.assertEqual(status, "mismatch")
                 self.assertNotEqual(expected, actual)
                 reduced = fd.shrink(lines, expected)
-                self.assertEqual(len(reduced), 1)
-                self.assertTrue(reduced[0].startswith("v_trunc_f64 "))
+                self.assertTrue(reduced)
+                self.assertLess(len(reduced), len(lines))
+                self.assertEqual(fd.output_kind(reduced), fd.output_kind(lines))
+                self.assertTrue(any(line.startswith("v_trunc_f64 ") for line in reduced))
+                reduced_status, _, reduced_expected, reduced_actual = fd.run_one(
+                    reduced, "ps_f64_negative_control_shrunk", tmp)
+                self.assertEqual(reduced_status, "mismatch")
+                self.assertEqual(reduced_expected, expected)
+                self.assertIsNotNone(reduced_actual)
+                self.assertNotEqual(reduced_expected, reduced_actual)
         finally:
             fd.translate = original
 
