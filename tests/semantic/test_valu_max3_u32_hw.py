@@ -184,5 +184,70 @@ class TestValuMax3U32ASTDefinitions(unittest.TestCase):
         self.assertEqual(str(inst.src1), "v5")
         self.assertEqual(inst.src2, 42)
 
+# ---------------------------------------------------------------------------
+# Stage 3: Deterministic instruction interpreter
+# ---------------------------------------------------------------------------
+
+class ValuMax3Interpreter:
+    """Scalar architectural interpreter for v_max3_u32."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+
+    def resolve(self, operand: Register | int) -> int:
+        if isinstance(operand, int):
+            return operand & MASK32
+        if operand.kind == RegKind.VGPR:
+            return self.vgprs[operand.index]
+        if operand.kind == RegKind.SGPR:
+            return self.sgprs[operand.index]
+        return 0
+
+    def step(self, inst: VOP3Instruction) -> int:
+        s0 = self.resolve(inst.src0)
+        s1 = self.resolve(inst.src1)
+        s2 = self.resolve(inst.src2)
+        res = oracle_max3_u32(s0, s1, s2)
+        self.vgprs[inst.vdst.index] = res
+        return res
+
+
+class TestValuMax3U32ScalarInterpreter(unittest.TestCase):
+    """Stage 3: Deterministic scalar instruction interpreter for v_max3_u32."""
+
+    def test_interpreter_vgpr_execution(self) -> None:
+        interp = ValuMax3Interpreter()
+        interp.vgprs[1] = 20
+        interp.vgprs[2] = 80
+        interp.vgprs[3] = 45
+
+        inst = VOP3Instruction(
+            Opcode.V_MAX3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 80)
+        self.assertEqual(interp.vgprs[0], 80)
+
+    def test_interpreter_mixed_operands(self) -> None:
+        interp = ValuMax3Interpreter()
+        interp.sgprs[4] = 100
+        interp.vgprs[2] = 25
+
+        inst = VOP3Instruction(
+            Opcode.V_MAX3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.SGPR, 4),
+            Register(RegKind.VGPR, 2),
+            200,
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 200)
+        self.assertEqual(interp.vgprs[0], 200)
+
 if __name__ == "__main__":
     unittest.main()
