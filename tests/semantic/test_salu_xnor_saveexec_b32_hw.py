@@ -248,5 +248,70 @@ class TestSaluXnorSaveexecB32AST(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_salu_instruction("s_xnor_saveexec_b32 s106, s0")
 
+# --- Section 3: Deterministic Scalar Instruction Interpreter ---
+
+class ScalarRegisterFile:
+    def __init__(self) -> None:
+        self.sgprs: List[int] = [0] * 106
+        self.exec_lo: int = 0xFFFFFFFF
+        self.exec_hi: int = 0xFFFFFFFF
+        self.scc: int = 0
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: OperandAST) -> int:
+        if op.kind == OperandKind.SGPR:
+            assert op.reg_idx is not None
+            return self.read_sgpr(op.reg_idx)
+        return op.value & MASK32
+
+
+class SaluInterpreter:
+    def __init__(self, reg_file: Optional[ScalarRegisterFile] = None) -> None:
+        self.rf = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def execute(self, inst: InstructionAST) -> Tuple[int, int, int]:
+        if inst.mnemonic != "s_xnor_saveexec_b32":
+            raise ValueError(f"Unsupported mnemonic: {inst.mnemonic}")
+        s0_val = self.rf.read_operand(inst.src0)
+        new_exec_lo, saved_d, scc = ref_s_xnor_saveexec_b32(s0_val, self.rf.exec_lo)
+        assert inst.dst.reg_idx is not None
+        self.rf.write_sgpr(inst.dst.reg_idx, saved_d)
+        self.rf.exec_lo = new_exec_lo
+        self.rf.scc = scc
+        return new_exec_lo, saved_d, scc
+
+
+class TestSaluXnorSaveexecB32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = SaluInterpreter(self.rf)
+
+    def test_interpreter_execution(self) -> None:
+        self.rf.exec_lo = 0x0000000F
+        self.rf.write_sgpr(2, 0x55555555)
+        inst = parse_salu_instruction("s_xnor_saveexec_b32 s8, s2")
+        new_lo, saved_d, scc = self.interp.execute(inst)
+        self.assertEqual(saved_d, 0x0000000F)
+        self.assertEqual(self.rf.read_sgpr(8), 0x0000000F)
+        self.assertEqual(new_lo, 0xAAAAAAA5)
+        self.assertEqual(self.rf.exec_lo, 0xAAAAAAA5)
+        self.assertEqual(scc, 1)
+
+    def test_zero_result_clears_scc(self) -> None:
+        self.rf.exec_lo = 0xAAAAAAAA
+        self.rf.write_sgpr(0, 0x55555555)
+        inst = parse_salu_instruction("s_xnor_saveexec_b32 s1, s0")
+        new_lo, saved_d, scc = self.interp.execute(inst)
+        self.assertEqual(new_lo, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.rf.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
