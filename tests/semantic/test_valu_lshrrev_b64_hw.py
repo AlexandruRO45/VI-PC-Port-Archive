@@ -95,5 +95,80 @@ class TestVLshrrevB64Reference(unittest.TestCase):
                 self.assertEqual(hw_res, ref_res)
 
 
+class RegType(enum.Enum):
+    VGPR = 1
+    SGPR = 2
+    IMM = 3
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    value: int = 0
+    size: int = 1
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+        if self.size not in (1, 2):
+            raise ValueError(f"Invalid operand size {self.size}, must be 1 or 2")
+
+
+@dataclasses.dataclass(frozen=True)
+class VLshrrevB64Instruction:
+    dst: Operand
+    shift: Operand
+    src: Operand
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR or self.dst.size != 2:
+            raise TypeError("Destination must be a 64-bit VGPR pair (size=2)")
+        if self.src.size != 2:
+            raise TypeError("Source operand must be a 64-bit register pair or constant (size=2)")
+
+
+class TestVLshrrevB64AST(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation_valid(self):
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 0, size=2),
+            shift=Operand(RegType.VGPR, 4, size=1),
+            src=Operand(RegType.VGPR, 2, size=2),
+        )
+        self.assertEqual(inst.dst.index, 0)
+        self.assertEqual(inst.dst.size, 2)
+        self.assertEqual(inst.shift.index, 4)
+        self.assertEqual(inst.src.index, 2)
+        self.assertEqual(inst.src.size, 2)
+
+    def test_ast_validation_rejects_single_word_dst(self):
+        with self.assertRaises(TypeError):
+            VLshrrevB64Instruction(
+                dst=Operand(RegType.VGPR, 0, size=1),
+                shift=Operand(RegType.VGPR, 4, size=1),
+                src=Operand(RegType.VGPR, 2, size=2),
+            )
+
+    def test_ast_validation_rejects_sgpr_dst(self):
+        with self.assertRaises(TypeError):
+            VLshrrevB64Instruction(
+                dst=Operand(RegType.SGPR, 0, size=2),
+                shift=Operand(RegType.VGPR, 4, size=1),
+                src=Operand(RegType.VGPR, 2, size=2),
+            )
+
+    def test_ast_validation_rejects_out_of_range_index(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, 256, size=2)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 106, size=2)
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, -1, size=2)
+
+
 if __name__ == "__main__":
     unittest.main()
