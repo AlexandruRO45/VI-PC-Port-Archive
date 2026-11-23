@@ -238,17 +238,19 @@ def render_targets(forms, name, harness, vs, out, runs, timeout, observed, decla
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser()
-    ap.add_argument("repo")
-    ap.add_argument("shaders")
-    ap.add_argument("out")
-    ap.add_argument("--count", type=positive_int, default=150)
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("repo", help="repository root; --harness defaults to its runtime/build/vk_texture_test")
+    ap.add_argument("shaders", help="finished shaders stage: <work>/shaders, holding dxbc/disasm and spirv/index.json")
+    ap.add_argument("out", help="folder for the rendered images and outcomes.tsv")
+    ap.add_argument("--count", type=positive_int, default=150,
+                    help="branchy pixel shaders to pick from the corpus (default: %(default)s)")
     ap.add_argument("--all-attachments", action="store_true", help="compare each colour export using vk_ps_sweep")
     ap.add_argument("--harness", help="override the executable for the selected harness")
     ap.add_argument("--loops", choices=("none", "only"), default="none",
                     help="'only': shaders with backward branches. Use a software driver for those: one that never "
                          "terminates is killed after --timeout seconds, where a real GPU would reset its driver")
-    ap.add_argument("--timeout", type=positive_int, default=60)
+    ap.add_argument("--timeout", type=positive_int, default=60,
+                    help="seconds before a shader with loops is killed on a software driver (default: %(default)s)")
     ap.add_argument("--names", help="run exactly the shaders listed in this file (one per line), no selection")
     ap.add_argument("--runs", type=positive_int, default=1,
                     help="render each form this many times; all must agree")
