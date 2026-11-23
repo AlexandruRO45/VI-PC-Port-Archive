@@ -49,7 +49,7 @@ from check import NAN_PAYLOAD_TEST, nan_payload_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
-from check import bary_persp_problem   # ps_persp_bary's perspective-correct reference
+from check import PERSP_BARY_TESTS, bary_persp_problem   # ps_persp_bary's perspective-correct reference
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -603,7 +603,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
-DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_bary": "vs_persp.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
+DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", **dict.fromkeys(PERSP_BARY_TESTS, "vs_persp.asm"), "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
@@ -1359,8 +1359,8 @@ def run_suite(a, work: str) -> int:
                 ok, detail = not problem, problem or "4096/4096 pixels match the driver-aware NaN payload check"
             elif name == "ps_bary":
                 ok, detail = check_bary(raw)
-            elif name == "ps_persp_bary":
-                problem = bary_persp_problem(read_raw_rgba32f(raw))
+            elif name in PERSP_BARY_TESTS:
+                problem = bary_persp_problem(read_raw_rgba32f(raw), raw_weights_only=name != "ps_persp_bary")
                 ok, detail = not problem, problem or "perspective-correct on every covered pixel"
             elif name == "ps_bitmask_perm":
                 m = re.search(r"subgroup \d+\.\.(\d+)", msg)
