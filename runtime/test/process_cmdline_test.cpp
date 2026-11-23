@@ -18,6 +18,10 @@
 namespace {
 int failures = 0;
 
+using TerminateFn = BOOL(WINAPI*)(HANDLE, UINT);
+TerminateFn g_terminate = nullptr;
+HANDLE g_terminate_target = nullptr;
+
 wchar_t** wargv() {
     using Fn = wchar_t*** (__cdecl*)();
     return *reinterpret_cast<Fn>(rt::shims::find("ucrtbase.dll", "__p___wargv"))();
@@ -59,8 +63,9 @@ void check_non_ascii(const std::wstring& want, const char* what) {
     }
 }
 
-// An executable can import GetCommandLineA/W and ExitProcess from kernel32.dll, kernelbase.dll or the API set its
-// umbrella library names, and the loader matches the DLL name exactly: every name must hand out the same shim.
+// An executable can import GetCommandLineA/W, ExitProcess and TerminateProcess from kernel32.dll, kernelbase.dll or
+// the API set its umbrella library names, and the loader matches the DLL name exactly: every name must hand out the
+// same shim.
 void check_import_names() {
     for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processenvironment-l1-1-0.dll"})
         for (const char* name : {"GetCommandLineA", "GetCommandLineW"}) {
@@ -70,13 +75,14 @@ void check_import_names() {
                 ++failures;
             }
         }
-    for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processthreads-l1-1-0.dll"}) {
-        void* fn = rt::shims::find(dll, "ExitProcess");
-        if (!fn || fn != rt::shims::find("kernel32.dll", "ExitProcess")) {
-            std::fprintf(stderr, "FAIL %s!ExitProcess is not the kernel32.dll shim\n", dll);
-            ++failures;
+    for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processthreads-l1-1-0.dll"})
+        for (const char* name : {"ExitProcess", "TerminateProcess"}) {
+            void* fn = rt::shims::find(dll, name);
+            if (!fn || fn != rt::shims::find("kernel32.dll", name)) {
+                std::fprintf(stderr, "FAIL %s!%s is not the kernel32.dll shim\n", dll, name);
+                ++failures;
+            }
         }
-    }
     for (const char* dll : {"api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll", "ucrtbased.dll"})
         for (const char* name : {"_get_narrow_winmain_command_line", "_get_wide_winmain_command_line"})
             if (!rt::shims::find(dll, name)) {
@@ -202,6 +208,66 @@ int main() {
             std::fprintf(stderr, "FAIL run_entry with ExitThread(42) returned %d, want 42\n", code);
             ++failures;
         }
+    }
+
+    {
+        g_terminate = reinterpret_cast<TerminateFn>(rt::shims::find("kernel32.dll", "TerminateProcess"));
+        const HANDLE self =
+            OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentProcessId());
+        if (!g_terminate || !self) {
+            std::fprintf(stderr, "FAIL kernel32.dll!TerminateProcess is not shimmed (or this process can't be opened)\n");
+            ++failures;
+        } else {
+            auto terminate_entry = +[](void*) -> DWORD {
+                g_terminate(g_terminate_target, 0x2a5);
+                return 1;
+            };
+            for (const HANDLE target : {GetCurrentProcess(), self}) {
+                g_terminate_target = target;
+                const int code = rt::process::run_entry(reinterpret_cast<void*>(terminate_entry), 0);
+                if (code != 0x2a5) {
+                    std::fprintf(stderr, "FAIL run_entry with TerminateProcess(%s, 0x2a5) returned %d, want 677\n",
+                                 target == self ? "a real handle to this process" : "GetCurrentProcess()", code);
+                    ++failures;
+                }
+            }
+
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, path, MAX_PATH);
+            STARTUPINFOW startup{};
+            startup.cb = sizeof(startup);
+            PROCESS_INFORMATION child{};
+            if (CreateProcessW(path, nullptr, nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startup,
+                               &child)) {
+                const BOOL ok = g_terminate(child.hProcess, 7);
+                DWORD child_code = 0;
+                WaitForSingleObject(child.hProcess, 10000);
+                GetExitCodeProcess(child.hProcess, &child_code);
+                if (!ok || child_code != 7) {
+                    std::fprintf(stderr, "FAIL TerminateProcess(child, 7) returned %d and left exit code %lu\n", ok,
+                                 child_code);
+                    ++failures;
+                }
+                CloseHandle(child.hThread);
+                CloseHandle(child.hProcess);
+            } else {
+                std::fprintf(stderr, "FAIL could not start a suspended child (error %lu)\n", GetLastError());
+                ++failures;
+            }
+
+            SetLastError(ERROR_SUCCESS);
+            const BOOL host_ok = TerminateProcess(nullptr, 1);
+            const DWORD host_error = GetLastError();
+            SetLastError(ERROR_SUCCESS);
+            const BOOL shim_ok = g_terminate(nullptr, 1);
+            const DWORD shim_error = GetLastError();
+            if (shim_ok != host_ok || shim_error != host_error) {
+                std::fprintf(stderr, "FAIL TerminateProcess(NULL) returned %d error %lu, the host %d error %lu\n",
+                             shim_ok, shim_error, host_ok, host_error);
+                ++failures;
+            }
+        }
+        if (self) CloseHandle(self);
     }
 
     // The game thread that ends a run must park, not ExitProcess, even when run_entry has already returned and

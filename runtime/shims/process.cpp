@@ -3,9 +3,9 @@
 // `gta6rt --run` calls a mapped EXE's entry point inside the gta6rt process. The EXE's CRT startup asks for its
 // arguments and finally calls exit(); both go through the EXE's own import table, so they can be answered here:
 //   - argv/argc and the command line are the game's (set by run_entry), not gta6rt's;
-//   - exit(), _exit(), quick_exit(), ExitProcess() and abort() from the game end the game's run, not the host:
-//     the exit code is recorded, the run is signalled as finished and the calling thread waits for the host to
-//     exit;
+//   - exit(), _exit(), quick_exit(), ExitProcess(), TerminateProcess() of its own process and abort() from the game
+//     end the game's run, not the host: the exit code is recorded, the run is signalled as finished and the calling
+//     thread waits for the host to exit;
 //   - the game's atexit registrations (_crt_atexit, which MSVC's atexit and static destructors reach; msvcrt's
 //     atexit and _onexit) go to a table of the run's own instead of the CRT's process-wide one, which the game
 //     shares with gta6rt. exit() runs it newest first, as the CRT does, before the run ends; _exit(), _Exit(),
@@ -15,10 +15,10 @@
 //     destructor callback (_register_thread_local_exe_atexit_callback); both still reach the host CRT.
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
-// The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
-// title can import them by: kernel32.dll (the classic import libraries), kernelbase.dll, and the API sets that the
-// umbrella libraries a GDK title links (OneCore_apiset.lib, mincore.lib) bind them to. The retail package's own DLLs
-// import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll.
+// The loader matches imports by exact DLL name, so GetCommandLineA/W, ExitProcess and TerminateProcess are served under
+// every name a title can import them by: kernel32.dll (the classic import libraries), kernelbase.dll, and the API sets
+// that the umbrella libraries a GDK title links (OneCore_apiset.lib, mincore.lib) bind them to. The retail package's
+// own DLLs import ExitProcess, and XboxBvhBuilder.dll TerminateProcess, from api-ms-win-core-processthreads-l1-1-0.dll.
 #include <windows.h>
 
 #include <atomic>
@@ -168,6 +168,10 @@ void __cdecl game_cexit() {
 }
 void __cdecl game_c_exit() {}
 void __stdcall game_exit_process(UINT code) { end_run(static_cast<int>(code)); }
+BOOL __stdcall game_terminate_process(HANDLE process, UINT code) {
+    if (GetProcessId(process) == GetCurrentProcessId()) end_run(static_cast<int>(code));
+    return TerminateProcess(process, code);
+}
 void __cdecl game_abort() {
     std::fprintf(stderr, "[rt] process: the game called abort()\n");
     // The game's signal() import is not shimmed: its handler goes into the host CRT's process-wide table, which
@@ -351,7 +355,9 @@ using namespace rt::process;
     {dll, "__p__wcmdln", reinterpret_cast<void*>(&game_p_wcmdln_storage)}, \
     {dll, "_get_narrow_winmain_command_line", reinterpret_cast<void*>(&game_get_narrow_winmain_command_line)}, \
     {dll, "_get_wide_winmain_command_line", reinterpret_cast<void*>(&game_get_wide_winmain_command_line)}
-#define EXIT_PROCESS(dll) {dll, "ExitProcess", reinterpret_cast<void*>(&game_exit_process)}
+#define EXIT_PROCESS(dll) \
+    {dll, "ExitProcess", reinterpret_cast<void*>(&game_exit_process)}, \
+    {dll, "TerminateProcess", reinterpret_cast<void*>(&game_terminate_process)}
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
