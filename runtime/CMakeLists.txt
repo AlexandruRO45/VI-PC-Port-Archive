@@ -2516,6 +2516,19 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_pso_validation COMMAND d3d12_pso_validation_test)
       set_tests_properties(d3d12_pso_validation PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
+      # RSSetScissorRects / closed-list RSSetViewports host-parity and Vulkan validation test.
+      add_executable(d3d12_scissor_validation_test test/d3d12_scissor_validation_test.cpp
+                     ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_scissor_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_scissor_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_scissor_validation_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_scissor_validation COMMAND d3d12_scissor_validation_test)
+      set_tests_properties(d3d12_scissor_validation PROPERTIES
+        SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # Conservative raster Tier 1, with geometric coverage bounds and host D3D12 references.
       set(LEONIDA_CONSERVATIVE_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_conservative.spv)
       set(LEONIDA_CONSERVATIVE_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative.spv)

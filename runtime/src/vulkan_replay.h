@@ -4085,9 +4085,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
             vk.set_viewport(command_buffer, 0, 1, &viewport);
             const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+            const std::int64_t scissor_x = std::max<std::int64_t>(0, s.left);
+            const std::int64_t scissor_y = std::max<std::int64_t>(0, s.top);
+            const std::int64_t scissor_w = std::max<std::int64_t>(0, std::int64_t(s.right) - scissor_x);
+            const std::int64_t scissor_h = std::max<std::int64_t>(0, std::int64_t(s.bottom) - scissor_y);
+            const VkRect2D scissor{{std::int32_t(scissor_x), std::int32_t(scissor_y)},
+                                   {std::uint32_t(scissor_w), std::uint32_t(scissor_h)}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
