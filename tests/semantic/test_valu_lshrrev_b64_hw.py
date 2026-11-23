@@ -469,5 +469,34 @@ class TestVLshrrevB64ConditionCodes(unittest.TestCase):
         self.assertEqual(flags.shift_count, 8)
 
 
+class TestVLshrrevB64IEEE754(unittest.TestCase):
+    """IEEE 754 raw bit pattern preservation and subnormal/NaN behavior."""
+
+    def test_ieee754_double_precision_patterns(self):
+        # 64-bit float bit patterns
+        patterns = [
+            0x0000000000000000,  # +0.0
+            0x8000000000000000,  # -0.0
+            0x0000000000000001,  # smallest positive subnormal
+            0x000FFFFFFFFFFFFF,  # largest positive subnormal
+            0x7FF0000000000000,  # +infinity
+            0xFFF0000000000000,  # -infinity
+            0x7FF8000000000000,  # quiet NaN
+            0x7FF0000000000001,  # signaling NaN
+            0xFFF8000000000000,  # negative quiet NaN
+        ]
+        for p in patterns:
+            for sh in (0, 1, 12, 32, 52, 63):
+                with self.subTest(p=hex(p), sh=sh):
+                    res = ref_lshrrev_b64(sh, p)
+                    self.assertEqual(res, (p >> sh) & MASK64)
+
+    def test_ieee754_hw_translator_nan_shift(self):
+        # Shift a quiet NaN pattern by 1 bit: high bit becomes 0, bits shift cleanly
+        qnan64 = 0x7FF8000000000000
+        hw_res = run_hw_lshrrev_b64(1, qnan64)
+        self.assertEqual(hw_res, qnan64 >> 1)
+
+
 if __name__ == "__main__":
     unittest.main()
