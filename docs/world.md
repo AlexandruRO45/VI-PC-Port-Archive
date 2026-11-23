@@ -582,6 +582,9 @@ MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout":
 `stats.placements` block: `rows`, `malformed`, `other_lod_level`, `outside_region`, `selected`, `placed`,
 `placed_unverified` (no key in the row), `key_mismatch`, `unresolved_archetype` (no exported model has that name),
 `model_not_loadable`, `degenerate_scale`, `mirrored` and `distinct_models`.
+A row without a finite position, rotation or archetype, or whose `lod_level` is present but not a JSON
+integer (`0.0`, `true`, `"0"`), is `malformed` and skipped. A row with an integer level outside `--lod-levels`, or
+with no level (missing or `null`), is `other_lod_level`.
 
 `--max-tex-size` limits the longest edge of embedded DDS previews to 512 pixels by default.
 When shrinking a DDS tagged sRGB, the converter averages RGB in linear light, weights each texel by its
