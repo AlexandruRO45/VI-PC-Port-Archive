@@ -103,8 +103,20 @@ struct XMemAllocationHooks {
     void(__stdcall* free_fn)(void* p, uint64_t attributes);
 };
 
+inline std::atomic<const XMemAllocationHooks*>& guest_xmem_hooks_override() {
+    static std::atomic<const XMemAllocationHooks*> override_hooks{nullptr};
+    return override_hooks;
+}
+
+inline void set_guest_xmem_hooks_for_testing(const XMemAllocationHooks* hooks) {
+    guest_xmem_hooks_override().store(hooks, std::memory_order_release);
+}
+
 // Resolves __XMemAllocationHooks__ from the mapped guest image at 0x140000000 when present, or nullptr.
 inline const XMemAllocationHooks* find_guest_xmem_hooks() {
+    if (const auto* override_hooks = guest_xmem_hooks_override().load(std::memory_order_acquire)) {
+        return override_hooks;
+    }
 #ifdef _WIN32
     static std::atomic<const XMemAllocationHooks*> cached{nullptr};
     if (const auto* found = cached.load(std::memory_order_acquire)) return found;

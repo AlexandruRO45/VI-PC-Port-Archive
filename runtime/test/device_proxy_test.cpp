@@ -17,7 +17,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include <wrl/client.h>
 
@@ -600,6 +602,80 @@ int main(int argc, char** argv) {
             reinterpret_cast<void**>(committed_x.GetAddressOf()));
         check(SUCCEEDED(hr_x) && committed_x != nullptr,
               "slot 127 sanitizes console heap flags, layout, clear value, and InitialLayout");
+
+        // Regression test: slot 127 __XMemAllocationHooks__ blocks must be freed when the resource refcount hits 0.
+        struct HookAllocCounters {
+            struct Block {
+                void* ptr;
+                std::size_t size;
+                std::uint64_t attr;
+            };
+            std::vector<Block> live;
+            std::size_t alloc_calls = 0;
+            std::size_t free_calls = 0;
+            bool attr_ok = true;
+            bool size_ok = true;
+        };
+        static HookAllocCounters* g_hook_counters = nullptr;
+        HookAllocCounters counters;
+        g_hook_counters = &counters;
+
+        constexpr std::uint64_t kExpectedD3d12CommittedAttr = 0x00808000ULL;
+        const rt::shims::XMemAllocationHooks counting_hooks{
+            [](std::size_t size, std::uint64_t attributes) -> void* {
+                auto* c = g_hook_counters;
+                ++c->alloc_calls;
+                if (attributes != kExpectedD3d12CommittedAttr) c->attr_ok = false;
+                if (size == 0) c->size_ok = false;
+                void* p = std::malloc(size ? size : 1);
+                if (p) c->live.push_back({p, size, attributes});
+                return p;
+            },
+            [](void* p, std::uint64_t attributes) {
+                auto* c = g_hook_counters;
+                ++c->free_calls;
+                if (attributes != kExpectedD3d12CommittedAttr) c->attr_ok = false;
+                for (auto it = c->live.begin(); it != c->live.end(); ++it) {
+                    if (it->ptr == p) {
+                        c->live.erase(it);
+                        break;
+                    }
+                }
+                std::free(p);
+            },
+        };
+        rt::shims::set_guest_xmem_hooks_for_testing(&counting_hooks);
+
+        constexpr std::size_t kResourceCount = 32;
+        std::vector<ComPtr<ID3D12Resource>> resources(kResourceCount);
+        bool all_created = true;
+        for (std::size_t i = 0; i < kResourceCount; ++i) {
+            const HRESULT hr_loop = reinterpret_cast<Slot127XboxFn>(vtable[127])(
+                device.Get(), &heap_props, static_cast<D3D12_HEAP_FLAGS>(0x8), &xbox_desc,
+                static_cast<D3D12_RESOURCE_STATES>(0x3), &clear_val, 0, 0, nullptr, &iid_res,
+                reinterpret_cast<void**>(resources[i].GetAddressOf()));
+            if (FAILED(hr_loop) || !resources[i]) all_created = false;
+        }
+        check(all_created && counters.alloc_calls == kResourceCount && counters.live.size() == kResourceCount &&
+                  counters.free_calls == 0 && counters.attr_ok && counters.size_ok,
+              "slot 127 tracks one guest hook allocation per live resource");
+
+        // Extra ref keeps the guest hook block alive until the final Release drops the refcount to 0.
+        ComPtr<ID3D12Resource> extra_ref = resources[0];
+        resources[0].Reset();
+        check(counters.live.size() == kResourceCount && counters.free_calls == 0,
+              "slot 127 guest hook block stays live while resource refcount > 0");
+        extra_ref.Reset();
+        check(counters.live.size() == kResourceCount - 1 && counters.free_calls == 1,
+              "slot 127 frees guest hook block when resource refcount hits 0");
+
+        for (std::size_t i = 1; i < kResourceCount; ++i) resources[i].Reset();
+        check(counters.live.empty() && counters.alloc_calls == kResourceCount &&
+                  counters.free_calls == kResourceCount && counters.attr_ok,
+              "slot 127 releases all N guest hook allocations with zero live blocks remaining");
+
+        rt::shims::set_guest_xmem_hooks_for_testing(nullptr);
+        g_hook_counters = nullptr;
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.

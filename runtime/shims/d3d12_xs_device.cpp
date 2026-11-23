@@ -1999,11 +1999,62 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                out);
 }
 
-void notify_xbox_d3d12_committed_alloc(ID3D12Device* real, const D3D12_RESOURCE_DESC& pc_desc) {
+// {9a7c3d10-4f2b-4a8e-b3c1-6e9f2a1d8b40}: attaches a guest __XMemAllocationHooks__ block to a slot 127
+// ID3D12Resource via SetPrivateDataInterface so hooks->free_fn releases it when the resource's refcount hits 0.
+constexpr GUID kXboxCommittedAllocDataGuid{
+    0x9a7c3d10, 0x4f2b, 0x4a8e, {0xb3, 0xc1, 0x6e, 0x9f, 0x2a, 0x1d, 0x8b, 0x40}};
+
+class XboxCommittedAllocHolder final : public IUnknown {
+public:
+    XboxCommittedAllocHolder(const rt::shims::XMemAllocationHooks* hooks, void* mem, std::uint64_t attributes)
+        : hooks_(hooks), mem_(mem), attributes_(attributes) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (IsEqualIID(riid, __uuidof(IUnknown))) {
+            *out = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1, std::memory_order_relaxed) + 1; }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (left == 0) {
+            if (hooks_ && hooks_->free_fn && mem_) {
+                hooks_->free_fn(mem_, attributes_);
+            }
+            delete this;
+        }
+        return left;
+    }
+
+private:
+    const rt::shims::XMemAllocationHooks* hooks_;
+    void* mem_;
+    std::uint64_t attributes_;
+    std::atomic<ULONG> refs_{1};
+};
+
+void notify_xbox_d3d12_committed_alloc(ID3D12Device* real, const D3D12_RESOURCE_DESC& pc_desc, void* created_obj) {
+    if (!real || !created_obj) return;
     const auto* hooks = rt::shims::find_guest_xmem_hooks();
-    if (!hooks || !hooks->alloc_fn || !real) return;
+    if (!hooks || !hooks->alloc_fn) return;
+    ID3D12Object* d3d_obj = nullptr;
+    if (FAILED(static_cast<IUnknown*>(created_obj)
+                   ->QueryInterface(__uuidof(ID3D12Object), reinterpret_cast<void**>(&d3d_obj))) ||
+        !d3d_obj) {
+        return;
+    }
     const D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(0, 1, &pc_desc);
-    if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX) return;
+    if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX) {
+        d3d_obj->Release();
+        return;
+    }
     // Bits 23:16 = 0x80 (eXMemAllocatorId_D3D12), bit 15 = 0x8000 (D3D12 allocation attribute).
     constexpr std::uint64_t kD3d12CommittedAttr = 0x00808000ULL;
     void* mem = hooks->alloc_fn(static_cast<std::size_t>(info.SizeInBytes), kD3d12CommittedAttr);
@@ -2013,6 +2064,19 @@ void notify_xbox_d3d12_committed_alloc(ID3D12Device* real, const D3D12_RESOURCE_
                      static_cast<unsigned long long>(info.SizeInBytes),
                      static_cast<unsigned long long>(kD3d12CommittedAttr), mem);
     }
+    if (mem) {
+        auto* holder = new (std::nothrow) XboxCommittedAllocHolder(hooks, mem, kD3d12CommittedAttr);
+        if (!holder || FAILED(d3d_obj->SetPrivateDataInterface(kXboxCommittedAllocDataGuid, holder))) {
+            if (holder) {
+                holder->Release();
+            } else if (hooks->free_fn) {
+                hooks->free_fn(mem, kD3d12CommittedAttr);
+            }
+        } else {
+            holder->Release();
+        }
+    }
+    d3d_obj->Release();
 }
 
 // Xbox device slot 127: CreateCommittedResourceX(heap_props, heap_flags, desc, initial_layout, clear,
@@ -2049,7 +2113,7 @@ HRESULT proxy_create_committed_resource_x(DeviceProxy* self, const D3D12_HEAP_PR
     }
     const HRESULT hr = self->real->CreateCommittedResource(&pc_heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
                                                            D3D12_RESOURCE_STATE_COMMON, pc_clear_ptr, *riid, out);
-    if (SUCCEEDED(hr)) notify_xbox_d3d12_committed_alloc(self->real, pc_desc);
+    if (SUCCEEDED(hr)) notify_xbox_d3d12_committed_alloc(self->real, pc_desc, *out);
     return hr;
 }
 
