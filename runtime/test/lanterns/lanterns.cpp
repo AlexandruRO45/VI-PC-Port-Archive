@@ -17,11 +17,13 @@
 //
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
+#include "lanterns_edges_gpu.h"
 #include "lanterns_gpu.h"
 #include "lanterns_reference.h"
 #include "lanterns_scene.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -84,15 +86,67 @@ Change changes(const std::vector<Color>& a, const lanterns::Reference& ra, const
 int stage1(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
     const lanterns::Scene scene = lanterns::stage1();
     lanterns::Shaders shaders;
-    if (!lanterns::load_shaders(shader_dir, shaders)) return 1;
-    std::vector<Color> with_depth, without_depth;
+    lanterns::EdgeShaders edge_shaders;
+    if (!lanterns::load_shaders(shader_dir, shaders) || !lanterns::load_edge_shaders(shader_dir, edge_shaders)) return 1;
+    std::vector<Color> with_depth, without_depth, edges;
     {
         lanterns::Gpu gpu;
         if (!gpu.create(scene, shaders)) return 1;
         if (!gpu.submit_frame(scene, true) || !gpu.finish_frame(with_depth)) return 1;
         if (!gpu.submit_frame(scene, false) || !gpu.finish_frame(without_depth)) return 1;
+        lanterns::EdgeDraw edge_draw;
+        if (!edge_draw.create(gpu, edge_shaders) || !edge_draw.run(edges)) return 1;
         if (!gpu.idle()) return 1;
     }
+    // The shared edges: every pixel exact (red = which triangles drew it, green and alpha = how many times).
+    const lanterns::EdgeReference edge_ref = lanterns::edge_reference();
+    unsigned edge_exact = 0, edge_on_ok = 0, edge_twice = 0, edge_gap = 0;
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+        const bool ok = lanterns::detail::same(edges[i], edge_ref.color[i]);
+        edge_exact += ok;
+        edge_twice += edges[i][1] > 1.0f;
+        edge_gap += edge_ref.color[i][1] == 1.0f && edges[i][1] == 0.0f;
+        if (!ok && edges.size() - edge_exact <= 3)
+            std::printf("lanterns: shared edges, pixel (%zu, %zu): gpu (%g %g %g %g) want (%g %g %g %g)\n",
+                        i % lanterns::kWidth, i / lanterns::kWidth, edges[i][0], edges[i][1], edges[i][2], edges[i][3],
+                        edge_ref.color[i][0], edge_ref.color[i][1], edge_ref.color[i][2], edge_ref.color[i][3]);
+    }
+    for (unsigned y = 0; y < lanterns::kHeight; ++y)
+        for (unsigned x = 0; x < lanterns::kWidth; ++x) {
+            const long long px = 2 * x + 1, py = 2 * y + 1;
+            bool on = false;
+            for (unsigned k = 0; k < lanterns::kEdgeTriangles && !on; ++k) {
+                const long long dx = lanterns::kEdgeRing[k][0] - lanterns::kEdgeCentre[0],
+                                dy = lanterns::kEdgeRing[k][1] - lanterns::kEdgeCentre[1];
+                const long long qx = px - lanterns::kEdgeCentre[0], qy = py - lanterns::kEdgeCentre[1];
+                const long long t = qx * dx + qy * dy;
+                on = qx * dy - qy * dx == 0 && t >= 0 && t < dx * dx + dy * dy;
+            }
+            const std::size_t i = std::size_t(y) * lanterns::kWidth + x;
+            edge_on_ok += on && lanterns::detail::same(edges[i], edge_ref.color[i]);
+        }
+    {   // The picture: each triangle's own colour from the bits the GPU (and the CPU) summed; white twice, black none.
+        const auto shown_of = [](const Color& c) {
+            static constexpr float palette[8][3] = {{0.9f, 0.3f, 0.2f}, {0.9f, 0.7f, 0.2f}, {0.5f, 0.8f, 0.3f},
+                                                    {0.2f, 0.7f, 0.6f}, {0.2f, 0.5f, 0.9f}, {0.5f, 0.3f, 0.9f},
+                                                    {0.8f, 0.3f, 0.7f}, {0.6f, 0.6f, 0.6f}};
+            if (c[1] == 0.0f) return Color{0, 0, 0, 1};
+            if (c[1] != 1.0f) return Color{1, 1, 1, 1};
+            const unsigned k = unsigned(std::log2(std::max(1.0f, c[0]))) & 7u;
+            return Color{palette[k][0], palette[k][1], palette[k][2], 1};
+        };
+        std::vector<Color> shown_gpu(edges.size());
+        lanterns::Reference shown_ref;
+        shown_ref.color.resize(edges.size());
+        shown_ref.candidates.resize(edges.size());
+        for (std::size_t i = 0; i < edges.size(); ++i)
+            shown_gpu[i] = shown_of(edges[i]), shown_ref.color[i] = shown_of(edge_ref.color[i]);
+        if (!dump(out_dir, "stage1-edges", shown_gpu, shown_ref)) return 1;
+    }
+    std::printf("lanterns: shared edges (wave64 VS and PS, root table at s8): %u of %u pixels exact; %u of %u pixel "
+                "centres exactly on an inner edge drawn once by the triangle the top-left rule names; %u pixels drawn "
+                "twice, %u gaps\n", edge_exact, unsigned(edges.size()), edge_on_ok, edge_ref.on_shared, edge_twice,
+                edge_gap);
     const lanterns::Reference ref_on = lanterns::reference_frame(scene, true);
     const lanterns::Reference ref_off = lanterns::reference_frame(scene, false);
     const auto on = lanterns::compare(with_depth, ref_on), off = lanterns::compare(without_depth, ref_off);
@@ -105,13 +159,17 @@ int stage1(const std::filesystem::path& shader_dir, const std::filesystem::path&
                 "what is behind them\n", ref_on.shared_edge_pixels);
     if (!dump(out_dir, "stage1-depth", with_depth, ref_on) || !dump(out_dir, "stage1-nodepth", without_depth, ref_off))
         return 1;
-    if (!on.pass() || !off.pass() || control.expected < 1000 || control.changed != control.expected) {
+    if (!on.pass() || !off.pass() || control.expected < 1000 || control.changed != control.expected ||
+        edge_exact != edges.size() || edge_on_ok != edge_ref.on_shared || edge_ref.on_shared < 500 ||
+        edge_ref.covered < 50000) {
         std::fprintf(stderr, "lanterns: stage 1 FAILED\n");
         return 1;
     }
     // Printed only here, after every check: run_lanterns.py wants this line once and exit code 0.
     std::printf("Lanterns stage 1: PASS, %u of %u pixels exact, %u edge pixels plausible, depth-off control changed "
-                "%u pixels\n", on.certain_exact, kWidth * kHeight, on.uncertain_plausible, control.changed);
+                "%u pixels; shared edges through a wave64 VS/PS with the title's s8 table: %u of %u pixels exact, %u "
+                "centres on shared edges each drawn once\n", on.certain_exact, kWidth * kHeight, on.uncertain_plausible,
+                control.changed, edge_exact, unsigned(edges.size()), edge_on_ok);
     return 0;
 }
 

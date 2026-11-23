@@ -54,9 +54,13 @@ What it covers:
 - Pipelines from DXBC/XDAT/XBCH containers, with each shader found by its FSSM hash. The VS container has two 0x0D
   payloads, as 195 of the title's do, and the layer must take the last one, as the tools do.
 - Wave32 and wave64 shaders. The octahedra are drawn with a wave64 VS and PS pair; every VS in the title's census is
-  wave64. All shaders read their tables from `s0`, where the layer packs root arguments. The title's VS read their
-  first pointer at `s8` ([d3d12_vulkan.md](d3d12_vulkan.md) 3.5), but that census does not say which root parameter
-  feeds which register, and the layer does not map it, so Lanterns does not test it.
+  wave64.
+- The title's register layout. The title's VS and PS read their first table pointer at `s8`
+  ([d3d12_vulkan.md](d3d12_vulkan.md) 3.5). The layer packs root arguments from `s0` in root-signature order, so a
+  root signature that starts with eight 32-bit constants puts them in `s0`..`s7` and the first table at `s8`. A
+  second, small draw does exactly that: a wave64 VS and PS (`vs_lanterns_edges`, `ps_lanterns_edges`) read their
+  constants from `s0`..`s3` and their table from `s[8:9]`, the VS its vertices through slot 0 and the PS one value
+  through slot 1.
 - Vertex, index and instance buffers in DEFAULT heaps, filled from an upload buffer by `CopyBufferRegion`.
 - The vertex shader fetches the vertex and the instance through two V#s in two descriptor tables. It reads the descriptor
   heap start handles through heap slots 9 and 10.
@@ -75,6 +79,11 @@ How the check works:
   Each of these must be one of the colours the reference lists for it. The background is on that list only where no
   surface certainly covers the pixel. Near an edge that two faces of one solid share, one of the two must cover it,
   because both get the same vertex positions, so a crack there fails.
+- **Shared edges.** The second draw is a fan of eight triangles around one vertex, every vertex on a pixel centre, with
+  inner edges horizontal, vertical and at slopes 1:1, 1:2, 3:2 and 1:4. 673 pixel centres lie exactly on an edge two
+  triangles share. Each triangle has its own flat colour, and additive blending counts how often each pixel is drawn.
+  The CPU applies D3D's top-left rule in exact integers (`lanterns_edges.h`). Every one of the 98,304 pixels must
+  match: each shared-edge centre drawn once, by the triangle the rule names, no pixel drawn twice, no gap.
 - **Lookup control.** Before drawing, the guest writes two containers of the vertex shader's FSSM program with the
   same writer (`runtime/test/d3d12_test_shaders.h`). The first holds the program as it is, and the layer must give a
   pipeline for it. The second has one byte of the program's name changed (`vs_lanterns` to `vs_lanternS`), so its
@@ -88,7 +97,7 @@ How the check works:
 On success the guest prints one line and exits 0:
 
 ```
-Lanterns stage 1: PASS, 97926 of 98304 pixels exact, 378 edge pixels plausible, depth-off control changed 11610 pixels
+Lanterns stage 1: PASS, 97926 of 98304 pixels exact, 378 edge pixels plausible, depth-off control changed 11610 pixels; shared edges through a wave64 VS/PS with the title's s8 table: 98304 of 98304 pixels exact, 673 centres on shared edges each drawn once
 ```
 
 `run_lanterns.py` passes the run only when all of these hold: exit code 0, this line exactly once, whole and with
@@ -101,8 +110,9 @@ winevulkan's device creation, because that explorer keeps the old, closed displa
 with exit code 3 instead of hanging it. On Linux it also catches a process that left the launcher's session; if
 anything survives the kill, or taskkill fails on Windows, the run fails with exit code 4 and names what is left.
 Each run writes into a new folder under `--out`: the guest's dumps, the launcher's output, `lanterns-stage1.png`
-and `lanterns-stage1-sheet.png`. The sheet shows the GPU frame, the reference, the control frame, and a mask (grey:
-exact, red: wrong, yellow: uncertain).
+and `lanterns-stage1-sheet.png`. The sheet shows the GPU frame, the reference, the control frame, a mask (grey:
+exact, red: wrong, yellow: uncertain), and the edge fan from the GPU and from the CPU (each triangle in its own
+colour, white where drawn twice, black where not drawn).
 
 Each check was made to fail on purpose, and each fix in it was shown to matter:
 
@@ -115,6 +125,9 @@ Each check was made to fail on purpose, and each fix in it was shown to matter:
   The guest fails at the unmodified container's pipeline. With only the renamed container, as before, it passed.
 - A fence nobody signals: frame 2 of stage 3 made to wait for one value more. The guest fails after 30 s with the
   fence line. Before, the run hung until the runner's timeout.
+- The register layout and the fill rule: the edge PS reading table slot 0 instead of slot 1 leaves 31,884 of
+  98,304 pixels exact. A reference with a bottom-right rule instead of top-left leaves 0 of 673 shared-edge centres
+  right (319 gaps). Both fail.
 - A stale `wineserver`: seen on another Linux setup, where 20 of 20 launches hung without the stop and 20 of 20 passed
   with it. On the test machine two back-to-back runs passed either way, so here it rests on the runner's test with a
   fake `wineserver` on `PATH`.

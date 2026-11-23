@@ -54,7 +54,10 @@ FACTORY = re.compile(r"^\[rt\] d3d12_xs: D3D12XboxCreateDevice -> proxy (0[xX])?
 N = r"(\d+)"
 PASS_LINES = {
     1: (rf"Lanterns stage 1: PASS, {N} of 98304 pixels exact, {N} edge pixels plausible, depth-off control changed "
-        rf"{N} pixels", lambda exact, edge, moved: exact + edge == 98304 and moved >= 1000),
+        rf"{N} pixels; shared edges through a wave64 VS/PS with the title's s8 table: {N} of 98304 pixels exact, {N} "
+        rf"centres on shared edges each drawn once",
+        lambda exact, edge, moved, fan, centres: exact + edge == 98304 and moved >= 1000 and fan == 98304
+        and centres >= 500),
 }
 
 
@@ -256,7 +259,8 @@ def mask_rows(gpu, ref, uncertain):
 # The panels of each stage's PNGs: "<dump>.gpu" or "<dump>.ref" is a frame, "<dump>:mask" the uncertainty map of a dump.
 PANELS = {
     1: {"main": [["stage1-depth.gpu"]],
-        "sheet": [["stage1-depth.gpu", "stage1-depth.ref"], ["stage1-nodepth.gpu", "stage1-depth:mask"]]},
+        "sheet": [["stage1-depth.gpu", "stage1-depth.ref"], ["stage1-nodepth.gpu", "stage1-depth:mask"],
+                  ["stage1-edges.gpu", "stage1-edges.ref"]]},
 }
 
 

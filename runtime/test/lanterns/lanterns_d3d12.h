@@ -65,4 +65,14 @@ inline std::array<std::uint32_t, 4> make_vsharp(std::uint64_t base, std::uint32_
     return leonida::gfx10::encode(buffer);
 }
 
+// A raw V# (stride 0: offen addressing checked against a byte count).
+inline std::array<std::uint32_t, 4> make_raw(std::uint64_t base, std::uint32_t bytes) {
+    leonida::gfx10::Buffer buffer;
+    buffer.address = base;
+    buffer.num_records = bytes;
+    buffer.format = 77;
+    buffer.oob_select = leonida::gfx10::OobSelect::raw;
+    return leonida::gfx10::encode(buffer);
+}
+
 }  // namespace lanterns

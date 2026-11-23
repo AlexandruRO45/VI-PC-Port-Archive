@@ -43,6 +43,9 @@ public:
     bool finish_frame(std::vector<Color>& pixels);
     // Waits until the queue is idle (before the objects are released).
     bool idle();
+    // For the passes that record on the same device and direct queue (lanterns_edges_gpu.cpp).
+    ID3D12Device* device() const { return device_.p; }
+    ID3D12CommandQueue* queue() const { return queue_.p; }
 
 private:
     bool create_pipelines(const Shaders& shaders);

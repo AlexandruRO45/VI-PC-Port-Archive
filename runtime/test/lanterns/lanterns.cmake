@@ -20,7 +20,8 @@ if(LEONIDA_TEST_LANTERNS AND NOT TARGET d3d12_xs_stub)
   message(STATUS "LEONIDA_TEST_LANTERNS: lanterns.exe needs gta6rt and the d3d12_xs_stub target; not built")
 elseif(LEONIDA_TEST_LANTERNS)
   set(_lanterns_src ${CMAKE_CURRENT_SOURCE_DIR}/test/lanterns)
-  add_executable(lanterns ${_lanterns_src}/lanterns.cpp ${_lanterns_src}/lanterns_gpu.cpp)
+  add_executable(lanterns ${_lanterns_src}/lanterns.cpp ${_lanterns_src}/lanterns_gpu.cpp
+                          ${_lanterns_src}/lanterns_edges_gpu.cpp)
   target_link_libraries(lanterns PRIVATE d3d12_xs_stub Vulkan::Headers)
   target_compile_definitions(lanterns PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
   target_compile_options(lanterns PRIVATE /W4 /permissive- /utf-8)
@@ -43,7 +44,8 @@ elseif(LEONIDA_TEST_LANTERNS)
     file(GLOB _lanterns_tool_py CONFIGURE_DEPENDS ${_lanterns_tools}/*.py)
     set(_lanterns_asm ${_lanterns_src}/shaders/vs_lanterns.asm ${_lanterns_src}/shaders/ps_lanterns_lit.asm
                       ${_lanterns_src}/shaders/ps_lanterns_floor.asm ${_lanterns_src}/shaders/vs_lanterns_w64.asm
-                      ${_lanterns_src}/shaders/ps_lanterns_lit_w64.asm)
+                      ${_lanterns_src}/shaders/ps_lanterns_lit_w64.asm ${_lanterns_src}/shaders/vs_lanterns_edges.asm
+                      ${_lanterns_src}/shaders/ps_lanterns_edges.asm)
     get_filename_component(_lanterns_spirv_tools ${LEONIDA_SPIRV_AS} DIRECTORY)
     file(TO_NATIVE_PATH "${_lanterns_spirv_tools}" _lanterns_spirv_tools)
     add_custom_command(

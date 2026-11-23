@@ -18,7 +18,9 @@ sys.path.insert(0, os.path.dirname(RUNNER))
 import run_lanterns  # noqa: E402
 
 FACTORY = "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy 0x1f2e3d4c (Vulkan device 0x5a6b7c8d)"
-PASS = "Lanterns stage 1: PASS, 90000 of 98304 pixels exact, 8304 edge pixels plausible, depth-off control changed 20000 pixels"
+PASS = ("Lanterns stage 1: PASS, 90000 of 98304 pixels exact, 8304 edge pixels plausible, depth-off control changed 20000 "
+        "pixels; shared edges through a wave64 VS/PS with the title's s8 table: 98304 of 98304 pixels exact, 673 centres "
+        "on shared edges each drawn once")
 
 
 def alive(pid):
@@ -123,6 +125,9 @@ class Transcript(unittest.TestCase):
             "PASS and then words": (0, "Lanterns stage 1: PASS, nonsense\n", FACTORY + "\n"),
             "PASS with counts that do not add up": (0, PASS.replace("8304 edge", "8303 edge") + "\n", FACTORY + "\n"),
             "PASS with no depth-off change": (0, PASS.replace("changed 20000", "changed 0") + "\n", FACTORY + "\n"),
+            "PASS with a wrong shared-edge pixel": (0, PASS.replace("98304 of 98304", "98303 of 98304") + "\n",
+                                                    FACTORY + "\n"),
+            "PASS without the shared-edge part": (0, PASS.split(";")[0] + "\n", FACTORY + "\n"),
         }
         for name, (code, out, err) in cases.items():
             with self.subTest(name):
