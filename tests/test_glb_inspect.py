@@ -171,8 +171,8 @@ class GlbInspectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "invalid-duration.glb")
             out = os.path.join(folder, "report.json")
-            for declared_max in (10**400, 1e100):
-                with self.subTest(number_kind=type(declared_max).__name__):
+            for declared_max in (10**400, 1e100, -1e100):
+                with self.subTest(number=declared_max):
                     gltf = animated_gltf()
                     gltf["accessors"][2]["max"] = [declared_max]
                     data = glb(gltf, triangle_bin())
