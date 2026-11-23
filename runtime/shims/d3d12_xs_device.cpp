@@ -27,9 +27,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <intrin.h>
 #include <iterator>
 #include <new>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace rt::d3d12_xs {
@@ -877,6 +881,177 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// ---- Console command-list probe (measurement only) -------------------------------------------------------------
+//
+// Device slot 73 with IID {c3827890-4024-474c-98cf-645b51dc4874} creates the console's command list (retail
+// executable, RVA 0x2478b71: RDX = a 16-byte description, R8 = the slot 9 allocator, R9 = 0, then riid and the output
+// on the stack). Its vtable is wider than any PC list (the first call after creation is slot 132) and its order past
+// slot 26 is not the PC one (docs/d3d12_command_objects.md section 3.5a), so no slot is forwarded on a guess. Until
+// the slots are mapped, slot 73 hands out this probe: every slot is a thunk that records the slot, the argument words
+// and the caller, and returns 0 (S_OK for an HRESULT, nothing for void). That makes the title's recording run on with
+// nothing drawn, which is what the measurement needs; a slot whose result the title uses (a pointer, a count) will
+// still stop it, at a place the log names.
+//
+//   LEONIDA_LIST_PROBE=stop   end the process (exit code 0x4C495354, "LIST") at the first call of a slot not seen
+//                             before past IUnknown, after logging it: one new slot per run.
+//   LEONIDA_LIST_PROBE=off    slot 73 goes to the PC method as before.
+// Logged per slot: the first 4 calls, then the 10th, 100th, 1000th, ... A summary of every slot's count is printed
+// at process exit and every 4096 probe calls. Queue slot 10 (ExecuteCommandLists) drops probes from its array and
+// logs them; with only probes in it, nothing reaches the real queue.
+namespace list_probe {
+
+// {c3827890-4024-474c-98cf-645b51dc4874}
+constexpr GUID kConsoleListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+constexpr unsigned kSlots = 512;
+constexpr DWORD kStopExitCode = 0x4C495354;
+
+struct Probe {
+    void** vtable;
+    std::atomic<unsigned long> refs;
+    unsigned id;
+    std::uint32_t desc[4];
+    IID iid;  // the interface slot 73 was asked for; QueryInterface answers it too
+};
+
+enum class Mode { log, stop, off };
+
+Mode mode() {
+    static const Mode m = [] {
+        char value[16] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_LIST_PROBE", value, sizeof(value));
+        if (n == 0 || n >= sizeof(value)) return Mode::log;
+        if (_stricmp(value, "stop") == 0) return Mode::stop;
+        if (_stricmp(value, "off") == 0) return Mode::off;
+        return Mode::log;
+    }();
+    return m;
+}
+
+std::atomic<std::uint64_t> g_hits[kSlots];
+std::atomic<std::uint64_t> g_total{0};
+std::atomic<unsigned> g_next_id{0};
+
+void** get_vtable();
+
+bool is_probe(const void* object) {
+    return object && *reinterpret_cast<void* const*>(object) == reinterpret_cast<void*>(get_vtable());
+}
+
+// "base+0xRVA" for an address inside a mapped image (the loader maps each image as one allocation), else the address.
+void format_caller(const void* address, char* out, std::size_t size) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (address && VirtualQuery(address, &info, sizeof(info)) == sizeof(info) && info.AllocationBase) {
+        std::snprintf(out, size, "%p+0x%llx", info.AllocationBase,
+                      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(address) -
+                                                      reinterpret_cast<std::uintptr_t>(info.AllocationBase)));
+    } else {
+        std::snprintf(out, size, "%p", address);
+    }
+}
+
+void print_summary(const char* when) {
+    std::string line;
+    char item[40];
+    for (unsigned s = 0; s < kSlots; ++s) {
+        const std::uint64_t n = g_hits[s].load(std::memory_order_relaxed);
+        if (!n) continue;
+        std::snprintf(item, sizeof(item), " %u:%llu", s, static_cast<unsigned long long>(n));
+        line += item;
+    }
+    std::fprintf(stderr, "[rt] list-probe summary (%s, %llu calls, %u lists): slot:count%s\n", when,
+                 static_cast<unsigned long long>(g_total.load(std::memory_order_relaxed)),
+                 g_next_id.load(std::memory_order_relaxed), line.c_str());
+    std::fflush(stderr);
+}
+
+bool should_log(std::uint64_t n) {
+    if (n <= 4) return true;
+    while (n % 10 == 0) n /= 10;
+    return n == 1;
+}
+
+void record(unsigned slot, const Probe* self, const std::uint64_t (&a)[8], const void* caller) {
+    const std::uint64_t n = g_hits[slot].fetch_add(1, std::memory_order_relaxed) + 1;
+    const std::uint64_t total = g_total.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (should_log(n)) {
+        char where[48];
+        format_caller(caller, where, sizeof(where));
+        std::fprintf(stderr,
+                     "[rt] list-probe: list %u slot %u (+0x%x) call %llu from %s args 0x%llx 0x%llx 0x%llx "
+                     "| stack 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n",
+                     is_probe(self) ? self->id : ~0u, slot, slot * 8u, static_cast<unsigned long long>(n), where,
+                     static_cast<unsigned long long>(a[0]), static_cast<unsigned long long>(a[1]),
+                     static_cast<unsigned long long>(a[2]), static_cast<unsigned long long>(a[3]),
+                     static_cast<unsigned long long>(a[4]), static_cast<unsigned long long>(a[5]),
+                     static_cast<unsigned long long>(a[6]), static_cast<unsigned long long>(a[7]));
+    }
+    if (total % 4096 == 0) print_summary("periodic");
+    if (n == 1 && slot > 2 && mode() == Mode::stop) {
+        print_summary("stop at a new slot");
+        TerminateProcess(GetCurrentProcess(), kStopExitCode);
+    }
+}
+
+template <unsigned Slot>
+std::uint64_t WINAPI probe_slot(Probe* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+                                std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
+                                std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    // a4.. are the caller's stack words; they are read only (never written), whatever the method's real arity.
+    record(Slot, self, {a1, a2, a3, a4, a5, a6, a7, a8}, _ReturnAddress());
+    (void)a9, (void)a10, (void)a11, (void)a12, (void)a13, (void)a14;
+    if constexpr (Slot == 0) {
+        const auto* riid = reinterpret_cast<const IID*>(a1);
+        auto** out = reinterpret_cast<void**>(a2);
+        if (!out) return hr_to_u64(E_POINTER);
+        if (riid && (*riid == kConsoleListIid || *riid == self->iid || *riid == __uuidof(IUnknown))) {
+            self->refs.fetch_add(1, std::memory_order_relaxed);
+            *out = self;
+            return hr_to_u64(S_OK);
+        }
+        *out = nullptr;
+        return hr_to_u64(E_NOINTERFACE);
+    } else if constexpr (Slot == 1) {
+        return self->refs.fetch_add(1, std::memory_order_relaxed) + 1;
+    } else if constexpr (Slot == 2) {
+        const unsigned long left = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        return left;  // probes are never freed: a stale pointer must still find the vtable
+    } else {
+        return 0;
+    }
+}
+
+template <std::size_t... I>
+void fill(void** vtable, std::index_sequence<I...>) {
+    ((vtable[I] = reinterpret_cast<void*>(&probe_slot<static_cast<unsigned>(I)>)), ...);
+}
+
+void** get_vtable() {
+    static void** vtable = [] {
+        static void* storage[kSlots];
+        fill(storage, std::make_index_sequence<kSlots>{});
+        return storage;
+    }();
+    return vtable;
+}
+
+HRESULT create(const std::uint32_t* desc, REFIID iid, void** out) {
+    if (!out) return E_POINTER;
+    auto* probe = new (std::nothrow) Probe{get_vtable(), {1}, 0, {}, iid};
+    if (!probe) return E_OUTOFMEMORY;
+    probe->id = g_next_id.fetch_add(1, std::memory_order_relaxed);
+    if (desc) std::memcpy(probe->desc, desc, sizeof(probe->desc));
+    static std::atomic<bool> registered{false};
+    if (!registered.exchange(true)) std::atexit([] { print_summary("exit"); });
+    std::fprintf(stderr, "[rt] list-probe: device slot 73 -> probe list %u (%s, desc %08x %08x %08x %08x)\n",
+                 probe->id, iid == kConsoleListIid ? "console list IID" : "IID_ID3D12GraphicsCommandList",
+                 probe->desc[0], probe->desc[1], probe->desc[2], probe->desc[3]);
+    *out = probe;
+    return S_OK;
+}
+
+}  // namespace list_probe
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -912,6 +1087,33 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
+        // ExecuteCommandLists(count, lists): command-list probes never reach the real queue.
+        std::uint64_t kept[64];
+        if constexpr (K == ChildKind::queue && Slot == 10) {
+            const auto count = static_cast<std::uint32_t>(a1);
+            const auto* lists = reinterpret_cast<void* const*>(a2);
+            if (lists && count) {
+                std::uint32_t probes = 0, n = 0;
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    if (list_probe::is_probe(lists[i])) {
+                        ++probes;
+                    } else if (n < std::size(kept)) {
+                        kept[n++] = reinterpret_cast<std::uint64_t>(lists[i]);
+                    }
+                }
+                if (probes) {
+                    static std::atomic<std::uint64_t> executes{0};
+                    const std::uint64_t e = executes.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (e <= 4 || e % 1000 == 0) {
+                        std::fprintf(stderr, "[rt] list-probe: queue ExecuteCommandLists #%llu with %u probe list(s) "
+                                     "of %u: not submitted\n", static_cast<unsigned long long>(e), probes, count);
+                    }
+                    if (n == 0) return 0;
+                    a1 = n;
+                    a2 = reinterpret_cast<std::uint64_t>(kept);
+                }
+            }
+        }
 
         // The PC vtable entry with the real object as `this`; integer/pointer arguments, the hidden struct-return
         // pointer and stack arguments keep their positions, as in the device proxy.
@@ -1420,6 +1622,36 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t);
         return reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5);
+    } else if constexpr (Slot == 73) {
+        // The console command list (see list_probe): RDX desc, R8 allocator, R9 0, then riid and out on the stack.
+        const auto* const riid = reinterpret_cast<const IID*>(a4);
+        // The executable asks for two interfaces here: the console list IID and IID_ID3D12GraphicsCommandList
+        // (RVA 0x17f6d3b). On the console both are the console-ordered list, so both get a probe.
+        if (list_probe::mode() != list_probe::Mode::off && riid &&
+            (*riid == list_probe::kConsoleListIid || *riid == __uuidof(ID3D12GraphicsCommandList))) {
+            note_slot(73);
+            return hr_to_u64(list_probe::create(reinterpret_cast<const std::uint32_t*>(a1), *riid,
+                                                reinterpret_cast<void**>(a5)));
+        }
+        {
+            char where[48];
+            list_probe::format_caller(_ReturnAddress(), where, sizeof(where));
+            std::fprintf(stderr, "[rt] list-probe: device slot 73 not a console list, from %s, args 0x%llx 0x%llx "
+                         "0x%llx 0x%llx 0x%llx 0x%llx: forwarded\n", where,
+                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
+            if (riid && !IsBadReadPtr(riid, sizeof(IID))) {
+                std::fprintf(stderr, "[rt] list-probe:   a4 as IID {%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
+                             riid->Data1, riid->Data2, riid->Data3, riid->Data4[0], riid->Data4[1], riid->Data4[2],
+                             riid->Data4[3], riid->Data4[4], riid->Data4[5], riid->Data4[6], riid->Data4[7]);
+            }
+        }
+        note_slot(Slot);
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t);
+        return reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5, a6);
     } else if constexpr (Slot == 9) {
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
