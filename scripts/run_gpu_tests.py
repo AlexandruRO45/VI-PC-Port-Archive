@@ -1447,7 +1447,8 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                # the harness may die with just its device line; the exit code is the only other signal
+                results.append((name, False, f"exit {rc}: {msg}"))
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
