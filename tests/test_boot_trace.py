@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -449,6 +450,90 @@ class BootTraceTests(unittest.TestCase):
                 text = bt.format_text(summary, 10)
                 self.assertIn("tls callbacks: 2", text)
                 self.assertIn(f"last observed TLS callback: fixture.exe+0x2200 ({phase})", text)
+
+
+class InterruptedRead(io.RawIOBase):
+    def __init__(self, first_line):
+        self.first_line = first_line
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if not self.first_line:
+            raise OSError("simulated read failure")
+        length = len(self.first_line)
+        buffer[:length] = self.first_line
+        self.first_line = b""
+        return length
+
+
+class BootTraceInputTests(unittest.TestCase):
+    def test_invalid_event_kinds_are_counted_as_bad_lines(self):
+        events = [{"kind": kind} for kind in (None, False, 5, [], {}, "", " ")]
+        events.append({"kind": "future_event"})
+        source = io.StringIO("".join(json.dumps(event) + "\n" for event in events))
+        with patch.object(bt, "_open_text", return_value=source):
+            result = bt.parse_startup("boot.jsonl", limit=2)
+        self.assertEqual(result["events"], 1)
+        self.assertEqual(result["kinds"], {"future_event": 1})
+        self.assertEqual(result["bad_lines"], 7)
+        self.assertEqual(result["bad_line_numbers"], [1, 2])
+
+    def test_encoding_probe_and_decode_use_one_open(self):
+        line = '{"kind": "future_event"}\r\n'
+        for encoding in ("utf-8", "utf-8-sig", "utf-16"):
+            with self.subTest(encoding=encoding):
+                raw = io.BufferedReader(io.BytesIO(line.encode(encoding)))
+                with patch.object(bt, "open", return_value=raw, create=True) as opened:
+                    result = bt.parse_startup("boot.jsonl")
+                opened.assert_called_once_with("boot.jsonl", "rb")
+                self.assertEqual(result["kinds"], {"future_event": 1})
+                self.assertTrue(raw.closed)
+
+    def test_mid_read_errors_name_the_input_and_close_the_stream(self):
+        for parser, path, line in (
+            (bt.parse_startup, "boot.jsonl", b'{"kind":"trace_open"}\n'),
+            (bt.parse_d3d12, "d3d12.log", b"[d3d12-trace] #1 Foo ok\n"),
+        ):
+            with self.subTest(path=path):
+                raw = io.BufferedReader(InterruptedRead(line))
+                with patch.object(bt, "open", return_value=raw, create=True):
+                    with self.assertRaisesRegex(bt.TraceError, f"cannot read {path}: simulated read failure"):
+                        parser(path)
+                self.assertTrue(raw.closed)
+
+    def test_cli_keeps_the_other_report_when_either_input_stops_mid_read(self):
+        fixtures = {
+            "boot.jsonl": b'{"kind":"trace_open","pid":123}\n',
+            "d3d12.log": b"[d3d12-trace] #1 Foo ok\n",
+        }
+        for bad, good, missing_key, good_key, text in (
+            ("boot.jsonl", "d3d12.log", "startup", "d3d12", "d3d12 trace: d3d12.log"),
+            ("d3d12.log", "boot.jsonl", "d3d12", "startup", "startup trace: boot.jsonl"),
+        ):
+            for as_json in (False, True):
+                with self.subTest(bad=bad, as_json=as_json):
+                    streams = {
+                        bad: io.BufferedReader(InterruptedRead(fixtures[bad])),
+                        good: io.BufferedReader(io.BytesIO(fixtures[good])),
+                    }
+                    args = ["boot.jsonl", "--d3d12", "d3d12.log"]
+                    if as_json:
+                        args.append("--json")
+                    out, err = io.StringIO(), io.StringIO()
+                    with patch.object(bt, "open", side_effect=lambda path, mode: streams[path], create=True), \
+                            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        self.assertEqual(bt.main(args), 2)
+                    self.assertEqual(err.getvalue(), f"error: cannot read {bad}: simulated read failure\n")
+                    if as_json:
+                        report = json.loads(out.getvalue())
+                        self.assertIsNone(report[missing_key])
+                        self.assertEqual(report[good_key]["path"], good)
+                    else:
+                        self.assertIn(text, out.getvalue())
+                        self.assertNotIn(bad, out.getvalue())
+                    self.assertTrue(all(stream.closed for stream in streams.values()))
 
 
 if __name__ == "__main__":

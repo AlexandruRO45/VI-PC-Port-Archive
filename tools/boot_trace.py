@@ -26,9 +26,11 @@ parse, the report still includes the other trace.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import sys
+from contextlib import contextmanager
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
 
@@ -37,13 +39,15 @@ class TraceError(ValueError):
     """The file is unreadable or holds no valid trace event."""
 
 
+@contextmanager
 def _open_text(path: str):
     """Read UTF-8 or use the byte-order mark to decode a UTF-16 trace."""
     try:
         with open(path, "rb") as raw:
-            head = raw.read(2)
-        encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
-        return open(path, encoding=encoding, errors="replace")
+            head = raw.peek(2)[:2]
+            encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+            with io.TextIOWrapper(raw, encoding=encoding, errors="replace") as text:
+                yield text
     except OSError as e:
         raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
 
@@ -79,20 +83,22 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 continue
             try:
                 event = json.loads(line)
-                if isinstance(event, dict) and event.get("kind") == "exit" and type(event.get("code")) is not int:
+                kind = event.get("kind") if isinstance(event, dict) else None
+                if not isinstance(kind, str) or not kind.strip():
+                    event = None
+                elif kind == "exit" and type(event.get("code")) is not int:
                     event = None
             except json.JSONDecodeError:
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)
                 continue
-            if not isinstance(event, dict) or "kind" not in event:
+            if event is None:
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)
                 continue
             trace["events"] += 1
-            kind = str(event.get("kind"))
             trace["kinds"][kind] = trace["kinds"].get(kind, 0) + 1
             if kind == "trace_open":
                 trace["pid"] = event.get("pid")
