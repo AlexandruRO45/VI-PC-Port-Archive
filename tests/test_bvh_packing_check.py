@@ -289,16 +289,23 @@ class TestArchive(unittest.TestCase):
         self.assertEqual(w_before_bad.checked, 0)
         w_bad = C.scan_window((path, next_boundary, next_boundary + window))
         self.assertEqual((w_bad.checked, w_bad.passed), (1, 0))
+    def write_raw_rpf(self, data):
+        fd, path = tempfile.mkstemp(suffix=".rpf")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"RPF9" + struct.pack("<I", 16) + bytes(8) + data)
+        self.addCleanup(os.unlink, path)
+        return path
+
     def test_workers_above_the_pool_limit_are_capped(self):
         # 62 workers never return from multiprocessing.Pool on Windows (tools/pool_workers.py:4-7).
-        path = self.write_rpf([payload(build())])
+        # 64 KiB of zeros at a 1 KiB window is 64 windows, so the cap, not the window count, picks the pool.
+        path = self.write_raw_rpf(bytes(64 << 10))
         RecordingPool.sizes = []
         self.addCleanup(setattr, RecordingPool, "sizes", [])
         with unittest.mock.patch.object(C.pool_workers, "MAX_PROCESS_WORKERS", 61), \
                 unittest.mock.patch.object(C.multiprocessing, "Pool", RecordingPool):
-            tally, _ = C.scan_archive(path, 62, 64, progress=False)
+            C.scan_archive(path, 62, 1024, progress=False)
         self.assertEqual(RecordingPool.sizes, [61])
-        self.assertEqual(tally.checked, 1)
 
     def test_cli_json_and_exit_status(self):
         with tempfile.TemporaryDirectory() as d:

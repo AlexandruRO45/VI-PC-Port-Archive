@@ -461,7 +461,8 @@ def scan_archive(path, workers, window, start=None, limit=None, progress=True):
         results = map(scan_window, jobs)
         pool = None
     else:
-        pool = multiprocessing.Pool(workers, initializer=I.below_normal)
+        # One process per window is enough: a two-window scan starts two, not one per --workers.
+        pool = multiprocessing.Pool(min(workers, len(jobs)), initializer=I.below_normal)
         results = pool.imap_unordered(scan_window, jobs)
     try:
         for done, t in enumerate(results, 1):
