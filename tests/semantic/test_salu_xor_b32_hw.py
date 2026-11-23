@@ -336,5 +336,35 @@ class SXorB32ConditionCodesTests(unittest.TestCase):
         self.assertEqual(res, 1)
         self.assertEqual(scc, 1)
 
+class SXorB32Ieee754BoundariesTests(unittest.TestCase):
+    def test_float_sign_bit_toggle(self):
+        # +1.0f in IEEE 754 is 0x3F800000; flipping bit 31 produces -1.0f (0xBF800000)
+        pos_one_bits = struct.unpack(">I", struct.pack(">f", 1.0))[0]
+        neg_one_bits = struct.unpack(">I", struct.pack(">f", -1.0))[0]
+        res, scc = oracle_xor_b32(pos_one_bits, 0x80000000)
+        self.assertEqual(res, neg_one_bits)
+        self.assertEqual(scc, 1)
+
+    def test_float_nan_payload_preservation(self):
+        # XOR with zero preserves NaN bit pattern exactly without canonicalization
+        qnan_bits = 0x7FC00001
+        res, scc = oracle_xor_b32(qnan_bits, 0)
+        self.assertEqual(res, qnan_bits)
+        self.assertEqual(scc, 1)
+
+    def test_subnormal_float_preservation(self):
+        # Subnormal float pattern 0x00000001 XOR 0 is preserved (no flush to zero)
+        subnorm_bits = 0x00000001
+        res, scc = oracle_xor_b32(subnorm_bits, 0)
+        self.assertEqual(res, subnorm_bits)
+        self.assertEqual(scc, 1)
+
+    def test_infinity_sign_toggle(self):
+        pos_inf_bits = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
+        neg_inf_bits = struct.unpack(">I", struct.pack(">f", float("-inf")))[0]
+        res, scc = oracle_xor_b32(pos_inf_bits, 0x80000000)
+        self.assertEqual(res, neg_inf_bits)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
