@@ -116,6 +116,7 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             ("gfx1013", 25, "HW_REG_POPS_PACKER"), ("gfx1013", 26, "26"), ("gfx1013", 22, "HW_REG_XNACK_MASK"),
             ("gfx1013", 29, "29"), ("gfx1030", 22, "22"), ("gfx1030", 29, "HW_REG_SHADER_CYCLES"),
             ("gfx1030", 1, "HW_REG_MODE"), ("gfx1030", 23, "HW_REG_HW_ID1"),
+            ("gfx10-1-generic", 22, "HW_REG_XNACK_MASK"), ("gfx10-3-generic", 22, "22"),
         ):
             with self.subTest(mcpu=mcpu, reg_id=reg_id):
                 text, invalid = rdna2_decode.disasm_bytes(words(0xB9010000 | reg_id | 31 << 11), mcpu=mcpu)
@@ -125,6 +126,11 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         for mcpu, name in (("gfx1030", "HW_REG_SHADER_CYCLES"), ("gfx1013", "29")):
             text, invalid = rdna2_decode.disasm_bytes(words(0xBA80F81D, 5), mcpu=mcpu)
             self.assertEqual((text.split(";")[0].strip(), invalid), (f"s_setreg_imm32_b32 hwreg({name}), 5", 0))
+        # The generic targets follow their family (llvm-mc 23.1.6): VOP3 0x140 is the unfused v_mad_legacy_f32 on
+        # gfx10-1-generic and the fused v_fma_legacy_f32 on gfx10-3-generic.
+        for mcpu, name in (("gfx10-1-generic", "v_mad_legacy_f32"), ("gfx10-3-generic", "v_fma_legacy_f32")):
+            text, invalid = rdna2_decode.disasm_bytes(bytes.fromhex("000040d501050e04"), mcpu=mcpu)
+            self.assertEqual((text.split(";")[0].strip(), invalid), (f"{name} v0, v1, v2, v3", 0))
 
     def test_s_ttracedata_imm_keeps_simm16(self):
         for word, value in ((0xBFA80000, 0x0), (0xBFA80001, 0x1),
