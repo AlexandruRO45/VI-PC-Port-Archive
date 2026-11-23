@@ -41,7 +41,7 @@ def rel32(from_end, target):
     return struct.pack("<i", target - from_end)
 
 
-def build_image(callers):
+def build_image(callers, iat_calls=()):
     """A PE32+ with one import descriptor (xmem.dll: XMemFoo, XMemBar, #7) and the given `.text` callers."""
     buf = bytearray(0x3000)
     buf[0:2] = b"MZ"
@@ -83,6 +83,9 @@ def build_image(callers):
     for at, opcode, target in callers:
         buf[at] = opcode
         buf[at + 1:at + 5] = rel32(at + 5, target)
+    for at, slot in iat_calls:
+        buf[at:at + 2] = b"\xff\x15"
+        buf[at + 2:at + 6] = rel32(at + 6, slot)
     return bytes(buf)
 
 
@@ -160,6 +163,38 @@ class ImportCallSitesTest(unittest.TestCase):
             self.assertTrue(err.getvalue().strip())
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(import_call_sites.main([os.path.join(tmp, "missing.exe")]), 2)
+
+    def test_counts_direct_iat_calls_without_a_thunk(self):
+        data = build_image(
+            self.callers,
+            iat_calls=[
+                (TEXT_RVA + 0x160, IAT_BAR),
+                (TEXT_RVA + 0x170, IAT_FOO),
+                (TEXT_RVA + 0x180, OTHER_IAT_RVA),  # call through a slot outside the IAT must be ignored
+            ],
+        )
+        out = import_call_sites.call_sites(data)["imports"]
+        self.assertEqual(out["xmem.dll!XMemBar"]["call"], [])
+        self.assertEqual(out["xmem.dll!XMemBar"]["iat_call"], [TEXT_RVA + 0x160])
+        self.assertEqual(out["xmem.dll!XMemFoo"]["iat_call"], [TEXT_RVA + 0x170])
+        self.assertEqual(out["xmem.dll!#7"]["iat_call"], [])
+
+    def test_cli_table_and_json_include_direct_iat_calls(self):
+        data = build_image(self.callers, iat_calls=[(TEXT_RVA + 0x160, IAT_BAR)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(data)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(import_call_sites.main([path, "--import", "xmem.dll!XMemBar"]), 0)
+            self.assertIn("iat", out.getvalue())
+            self.assertIn("1 import(s), 1 call site(s)", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(import_call_sites.main([path, "--import", "xmem.dll!XMemBar", "--json"]), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["imports"]["xmem.dll!XMemBar"]["iat_call"], [hex(TEXT_RVA + 0x160)])
 
 
 if __name__ == "__main__":
