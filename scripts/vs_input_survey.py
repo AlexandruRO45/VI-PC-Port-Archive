@@ -75,10 +75,22 @@ def read_before_write(insns):
     return read_s, read_v
 
 
+def vertex_shader_names(dxbc_dir):
+    """The shader names of the vertex-stage entries in <dxbc>/index.json; ValueError when it cannot be read."""
+    path = os.path.join(dxbc_dir, "index.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            index = json.load(f)
+        if not isinstance(index, list):
+            raise ValueError("expected a list of shaders")
+        return [os.path.splitext(e["file"])[0] for e in index if e.get("stage") == "vs"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError(f"cannot read {path}: {e!r}" if isinstance(e, (KeyError, TypeError, AttributeError))
+                         else f"cannot read {path}: {e}") from None
+
+
 def survey(dxbc_dir):
-    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
-        index = json.load(f)
-    names = [os.path.splitext(e["file"])[0] for e in index if e.get("stage") == "vs"]
+    names = vertex_shader_names(dxbc_dir)
     markers, vgprs, families = Counter(), Counter(), Counter()
     missing = 0
     for n in names:
@@ -115,7 +127,11 @@ def main():
     ap.add_argument("dxbc", help="<work>/shaders/dxbc from make_game.py")
     ap.add_argument("--json", help="also write the counts as JSON")
     a = ap.parse_args()
-    r = survey(a.dxbc)
+    try:
+        r = survey(a.dxbc)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     m = r["markers"]
     print(f"{r['vertex_shaders']} vertex shaders ({r['missing_listings']} without a listing)")
     print(f"NGG markers: exp prim {m.get('exp prim', 0)}, s_sendmsg {m.get('s_sendmsg', 0)}, v_mbcnt {m.get('v_mbcnt', 0)}")
