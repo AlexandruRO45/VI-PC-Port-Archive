@@ -613,6 +613,27 @@ class Execution(unittest.TestCase):
                 self.assertEqual((tier, r), ("C", reasons))
                 self.assertEqual(sum(w != h for w, h in zip(whole, halves)), lanes)
 
+    def test_c_constant_lane_mask_through_vcc(self):
+        # a 64-bit constant other than 0 / -1 kept in VCC is still one bit per lane: as EXEC or as a v_cndmask / carry
+        # mask it selects lane L in the wave and lane L - 32 of the second half (lane_masks tracks it as a mask)
+        add = ["v_add_nc_u32_e32 v6, 1, v6", "s_mov_b64 exec, s[10:11]"]
+        for name, body, reasons, lanes in (
+                ("vs_c_vcc_imm_exec", ["s_mov_b64 vcc, 1", "s_mov_b64 exec, vcc"] + add, ["tainted-exec"], 1),
+                ("vs_c_vcc_or_exec", ["s_or_b64 vcc, 0, 1", "s_mov_b64 exec, vcc"] + add, ["tainted-exec"], 1),
+                ("vs_c_vcc_cselect_exec", ["s_cmp_eq_u32 s4, 0", "s_cselect_b64 vcc, 1, 0",
+                                           "s_and_saveexec_b64 s[12:13], vcc"] + add, ["tainted-exec"], 1),
+                ("vs_c_cmp_and_lo32_exec", ["v_cmp_lt_u32_e32 vcc, 4, v0", "s_and_b64 vcc, vcc, 0xffffffff",
+                                            "s_and_b64 exec, exec, vcc"] + add, ["tainted-exec"], 32),
+                ("vs_c_vcc_imm_cndmask", ["s_mov_b64 vcc, 1", "v_cndmask_b32_e32 v6, 7, v0, vcc"], ["lane-id"], 1)):
+            with self.subTest(name):
+                (tier, r, _), asm = meta_of(name, vs(body))
+                whole, halves = out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32))
+                self.assertEqual((tier, r), ("C", reasons))
+                self.assertEqual(sum(w != h for w, h in zip(whole, halves)), lanes)
+        # a 64-bit constant that is no lane mask (here a descriptor-style pair read as data) is not tainted
+        (tier, r, _), _ = meta_of("vs_a_const_pair_data", vs(["s_mov_b64 s[16:17], 0x1234", "v_mov_b32_e32 v6, s16"]))
+        self.assertEqual((tier, r), ("A", []))
+
     def test_a_exec_from_a_mask_0_or_minus_1_invariant(self):
         narrow = ["v_cmp_gt_u32_e32 vcc, 40, v0", "s_and_saveexec_b64 s[12:13], vcc", "v_add_nc_u32_e32 v6, 1, v6"]
         for name, body, want in (

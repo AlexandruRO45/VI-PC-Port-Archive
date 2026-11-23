@@ -890,7 +890,7 @@ class Analysis:
                 put(dests[0], t_src | X)
                 return
             if any(not self.is_mask(ins, x) and not (x.get("k") == "imm" and x["v"] in (
-                    0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)) for x in srcs):
+                    0, -1, 0xFFFFFFFFFFFFFFFF)) for x in srcs):
                 # a lane mask combined with a register that is not one (a user value, a loaded mask): the result is
                 # no mask the translator tracks, and its bits are the lanes of the half
                 put(dests[0], t_src | X | MASKD)
@@ -914,6 +914,12 @@ class Analysis:
                 T["scc"] = X
                 st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
             return
+        if op.startswith(MASK_BITWISE + ("s_cselect_b", "s_bfm_b")) and op.endswith("b64") and dests and srcs \
+                and all(x.get("k") == "imm" for x in srcs) \
+                and any(x["v"] not in (0, -1, 0xFFFFFFFFFFFFFFFF) for x in srcs) and self.defines_mask(n, i, dests[0]):
+            # a 64-bit constant other than 0 / -1 kept as a lane mask: its bit L is lane L in the wave but lane L - 32
+            # of the second half, so it selects other lanes there
+            t_src |= LANE
 
         # --- register swap and dynamic indexing
         if op == "v_swap_b32" and len(a) == 2:
@@ -1271,6 +1277,12 @@ class Analysis:
                     _regs(b[1]) == [("s", 3)] and b[2].get("k") == "imm" and b[2]["v"] == 0x80008 and \
                     not any(("s", 3) in w for w in writes[:j])
         return False
+
+    def defines_mask(self, n, i, d):
+        """Whether `d`, written by instruction i of block n, is a lane mask right after it (lane_masks' state there)."""
+        blk = self.blocks[n]
+        nxt = [blk[i + 1]] if i + 1 < len(blk) else [self.blocks[b][0] for b in self.succ[n] if self.blocks[b]]
+        return any(lane_masks.kind(self.masks.get(id(x), {}), d) in lane_masks.MASK_KINDS for x in nxt)
 
     def ancestor(self, anc, tok):
         seen = set()
