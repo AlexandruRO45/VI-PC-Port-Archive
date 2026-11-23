@@ -31,12 +31,18 @@ def primary_fingerprints(colons):
     for line in colons.splitlines():
         fields = line.split(":")
         if fields[0] == "pub":
+            if expect_primary_fpr:
+                out.append("")
             expect_primary_fpr = True
         elif fields[0] == "fpr" and expect_primary_fpr:
             out.append(fields[9].upper() if len(fields) > 9 else "")
             expect_primary_fpr = False
         elif fields[0] in ("sub", "ssb", "sec"):
+            if expect_primary_fpr:
+                out.append("")
             expect_primary_fpr = False
+    if expect_primary_fpr:
+        out.append("")
     return out
 
 

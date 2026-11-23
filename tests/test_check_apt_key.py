@@ -56,6 +56,18 @@ class PrimaryFingerprints(unittest.TestCase):
     def test_nothing(self):
         self.assertEqual(check_apt_key.primary_fingerprints(""), [])
 
+    def test_pub_without_fpr_is_not_dropped(self):
+        bare_pub = "pub:-:3072:1:0000000000000001:1544460984:::-:::scESC::::::23::0:\n"
+        self.assertEqual(check_apt_key.primary_fingerprints(listing((WINEHQ, [])) + bare_pub), [WINEHQ, ""])
+        self.assertEqual(check_apt_key.primary_fingerprints(bare_pub + listing((WINEHQ, []))), ["", WINEHQ])
+        self.assertEqual(
+            check_apt_key.primary_fingerprints(
+                bare_pub + "sub:-:3072:1:0000000000000002:1544460984::::::e::::::23:\n"
+                + f"fpr:::::::::{LLVM}:\n"
+            ),
+            [""],
+        )
+
     def test_normalize(self):
         self.assertEqual(check_apt_key.normalize("d43f 6401 4536 9c51 d786  ddea 76f1 a20f f987 672f"), WINEHQ)
         for bad in ("", "D43F", WINEHQ + "00", "G" * 40):
@@ -87,6 +99,12 @@ class CheckWithStandInGpg(unittest.TestCase):
 
     def test_a_second_primary_key_fails(self):
         problem = check_apt_key.check(self.key(listing((WINEHQ, []), (LLVM, []))), WINEHQ, self.gpg)
+        self.assertIn("holds 2 primary keys", problem)
+
+    def test_a_second_primary_key_without_fpr_fails(self):
+        bare_pub = "pub:-:3072:1:0000000000000001:1544460984:::-:::scESC::::::23::0:\n"
+        problem = check_apt_key.check(self.key(listing((WINEHQ, [])) + bare_pub), WINEHQ, self.gpg)
+        self.assertIsNotNone(problem)
         self.assertIn("holds 2 primary keys", problem)
 
     def test_no_key_fails(self):
