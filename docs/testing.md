@@ -197,11 +197,14 @@ x86_64 headers for Win11SDK_10.0.26100".
 On a machine without a display (a server, a container, WSL without WSLg), Wine has no graphics driver to create a
 Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (VkResult -3)` and, with
 `WINEDEBUG=+vulkan`, "Failed to load Wine graphics driver supporting Vulkan". Run the tests under a virtual X server,
-as CI does: `WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a ctest --test-dir runtime/build/windows`
-(packages `xvfb` and `xauth`, which `xvfb-run` needs). With Mesa installed, the tests then run on llvmpipe.
+as CI does, through `scripts/run_wine_session.sh`, which initializes the prefix on that display:
+`WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a bash scripts/run_wine_session.sh ctest --test-dir
+runtime/build/windows` (packages `xvfb` and `xauth`, which `xvfb-run` needs). With Mesa installed, the tests then run
+on llvmpipe. CI passes the same script `python3 -I scripts/run_wine_tests.py ...`, so the per-test summary and the
+drive mapping come with it.
 
 A virtual X server has no presentable surface, so presentation cannot be judged under it. With a real display (here
-Wine 11.22 on a Wayland session, through XWayland) the same 123-test list gives 92 passed, 6 failed and 25 skipped,
+Wine 11.22 on a Wayland session, through XWayland) the then-current test list gives 92 passed, 6 failed and 25 skipped,
 and `vk_presenter_sync`, `xbox_present` and `dxgi_swapchain` pass, while they fail under `xvfb-run`. Use a real
 compositor for those three. Six still failed with a real display: `device_proxy`, `d3d12_xs_root_signature`,
 `xdxr_build`, `d3d12_xdxr_rt`, `d3d12_present` and `d3d12_compute`.
@@ -236,7 +239,8 @@ the prefix the emulator made: a prefix from another wine version fails every tes
 mismatch". The tests need a real display here as well.
 
 Measured on 2026-11-23 with Proton 11.0 (wine-11.0, vkd3d-proton 3.0) on an RX 7600 XT (radv): 155 tests
-registered, 154 run, 127 passed, 20 skipped, one disabled and seven failed. The skips are the usual ones (game data,
+registered, 154 run, 127 passed, 20 skipped, one disabled and seven failed. This build predates `b136ee468`; the
+note below says what that changes on current `main`. The skips are the usual ones (game data,
 `LEONIDA_FIRST_LIGHT_DIR`, no independent Vulkan queue for `d3d12_queue_wait`, and so on). All seven failures are in
 the comparisons with the host D3D12, which is vkd3d-proton here:
 
@@ -251,13 +255,22 @@ the comparisons with the host D3D12, which is vkd3d-proton here:
   crashes on the queue one too). `d3d12_compute` passes with only `WINEDLLOVERRIDES="dxgi=n"`, where the host is
   Wine's own d3d12 and the comparison skips.
 
+**This measurement predates `b136ee468`** ("Tests: check Microsoft's recorded answers where Wine and Proton have no
+reference"). On current `main` these seven host comparisons skip under Wine and Proton and check Microsoft's
+recorded answers instead, so the list above is historical; re-run a current artifact before treating it as live.
+A repeat on the 12:28 main artifact `d0835dd9` (148 tests; also before `b136ee468`) on Proton 11.0 and an RX 9070
+(RADV) gave 107 passed, 10 failed and 31 skipped. The same seven failed, `d3d12_xs_root_signature` and
+`d3d12_present` failed too, and `xbox_present` failed (the frame extent kept the old size after a resize;
+`present failed (VkResult -11)`), where Wine 11.22 passes it. `xdxr_build` and `d3d12_xdxr_rt` failed only because
+the artifact zip omits their empty case folders; creating those folders makes both pass.
+
 The host's D3D12 here is Wine's vkd3d or vkd3d-proton, not Microsoft's runtime, and Proton's `EnumWarpAdapter`
 returns the hardware adapter, so "WARP" is vkd3d-proton on the GPU. Most tests that compare with the host or WARP
 skip that comparison under Wine and Proton (`runtime/test/host_wine.h`), and most of them still check the layer
 against Microsoft's answers recorded in the test (`d3d12_subresource_copy` and `d3d12_private_data` keep theirs in
 `d3d12_subresource_copy_answers.h` and `d3d12_private_data_answers.h`).
-A few still compare with the host (`root_sig`, `device_proxy`, and some of `d3d12_vulkan_device`'s cases), so some
-of those fail for that reason.
+A few still compare with the host (`root_sig`, `device_proxy`, and a handful of others named in the open Wine-skip
+PRs; `d3d12_vulkan_device` now skips all host creation), so some of those fail for that reason.
 
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
@@ -566,7 +579,7 @@ game's device ignores it`, so leaving them set cannot slow a game down (`run_tin
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `ctest` lists `fsr_dispatch` and `bvh_builder` as failed (`Not Run`) after clang-cl hits an internal compiler error in `fsr_dispatch_test.cpp` and `bvh_builder_test.cpp` | clang-cl 22.1.8 on Fedora (Linux cross-build) and Windows, plus 22.1.7 on Windows | Use clang-cl 23.1.6 (both files compile on Windows) |
 | `d3d12_compute`, `d3d12_draw` or another test that writes a shader library under the temp directory fails now and then (a PSO creation `line N: SUCCEEDED(...)`, or exit 3 with no message) but passes when run alone | Two copies running at once (`ctest -j`, or two suites sharing one Wine prefix or `TMPDIR`) used the same `leonida_<test>` folder under the temp directory, and one copy deleted the shader modules the other was loading: 6 of 40 runs failed with four copies of `d3d12_compute` at once on a Mac under Wine | Current `main` gives each process its own folder (`<temp>/leonida_<test>_<pid>`) |
-| A Windows CI artifact run under Wine by hand: `d3d12_compute` and the other tests that read `LEONIDA_TEST_*_SPV` end with exit 3 and no message | The `.spv` paths are compiled in as `D:/a/Leonida/Leonida/runtime/build/generated/...`; the prefix has no `D:` drive and the test isn't run from the artifact folder | Run it from the artifact folder (the tests then find `generated/<name>.spv` there) or through `scripts/run_wine_tests.py`, which maps that drive for the run; current `main` names the file it couldn't copy (`cannot copy ...: File not found`) |
+| A Windows CI artifact run under Wine by hand: `d3d12_compute` and the other tests that read `LEONIDA_TEST_*_SPV` end with exit 3 and no message | The `.spv` paths are compiled in as `D:/a/Leonida/Leonida/runtime/build/generated/...`; the prefix has no `D:` drive and the test isn't run from the artifact folder | Run it from the artifact folder (the tests then find `generated/<name>.spv` there) or through `scripts/run_wine_tests.py`, which maps that drive for the run; tests that use `testfiles::copy_file` now name the file (`cannot copy ...: File not found`), while a few older tests still call `std::filesystem::copy_file` directly and exit 3 with no message |
 | Linux cross-build: CMake can't find `clang-cl-19` (or another versioned `clang-cl-<N>`) although `clang-19` and `lld-19` are installed | On Debian and Ubuntu, the versioned `clang-cl-<N>` link is in the `clang-tools-<N>` package, not in `clang-<N>` (`/usr/lib/llvm-<N>/bin/clang-cl` comes from it too); `lld-link-<N>`, `llvm-lib`, `llvm-rc` and `llvm-mt` come from `lld-<N>` and `llvm-<N>` | `sudo apt-get install clang-tools-19 lld-19 llvm-19` (Ubuntu 24.04 has 19 and 20), then pass the versioned names as in [the cross-build](#the-windows-runtime-on-linux-under-wine-or-proton) |
 | Under Ubuntu's Wine 9.0, `wineboot --init` (and every Wine program after it) stops at once with `free(): invalid pointer` or a segmentation fault, before printing anything else; the prefix holds only a `wineserver` file | That Wine opens `/run/user/<uid>` for its server directory, whether `XDG_RUNTIME_DIR` is set or not, and aborts when the folder doesn't exist. The login manager makes it for a desktop session; a container or a shell started without a login session (a root shell in Docker, a CI runner image) has none | Create it before starting Wine: `mkdir -p /run/user/$(id -u) && chmod 700 /run/user/$(id -u)` (setting `XDG_RUNTIME_DIR` alone doesn't help), delete the half-made prefix, and run `wineboot --init` again |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |

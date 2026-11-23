@@ -12,8 +12,10 @@ Some tests open files through absolute paths compiled into them (the GLSL test s
 runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
 ($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
 
-Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
-others show what does and doesn't work under Wine yet without failing the job.
+Every test is reported. The exit code is 1 if a test named by --require is missing or does not pass (a skip
+counts as not passing), 2 if --tests or its fixtures cannot be used or the setup graph has a cycle, and 1 if
+--summary cannot be written. Otherwise 0: the other tests show what does and doesn't work under Wine yet without
+failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 """
 import argparse
