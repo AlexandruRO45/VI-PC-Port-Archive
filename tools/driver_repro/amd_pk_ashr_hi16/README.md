@@ -60,7 +60,9 @@ gcc -O1 vk_repro.c -o vk_repro -lvulkan
 ```
 
 Write the modules (`modules.py` also assembles them when `spirv-as` from the Vulkan SDK is on `PATH`), then run
-them on a GPU whose name contains the second argument:
+them on a GPU whose name contains the second argument, ignoring case. AMD's Windows driver names the device
+`AMD Radeon(TM) Graphics`; RADV names it after the chip (for example `AMD Ryzen ... (RADV RAPHAEL_MENDOCINO)`), so use
+`radv` there. With no second argument the first device is used.
 
 ```powershell
 python -I modules.py .
@@ -76,10 +78,13 @@ Exit 0 when all 64 threads wrote the expected word (`0x40004000`, or a third arg
 | GPU | Driver | `pk_ashr_hi16` | `pk_ashr_hi16_in_place` |
 |---|---|---|---|
 | AMD Radeon iGPU of a Ryzen 5 7600X (gfx1036, `1002:164e`), Windows 11 | 32.0.21045.29003 (Vulkan driver 2.0.353) | `0xb88d4000` in 64 of 64 threads | `0x40004000` |
+| AMD Radeon iGPU (gfx1036, `1002:13c0`), Windows 11 ([@Halfect](https://github.com/ItsNotRexed/Leonida/pull/5725#issuecomment-7100360775)) | 32.0.21030.2001 (Vulkan driver 2.0.353) | `0xb88d4000` in 64 of 64 threads | `0x40004000` |
+| AMD iGPU of a Ryzen 9 9950X3D, RADV `RAPHAEL_MENDOCINO`, Linux ([@gertify](https://github.com/ItsNotRexed/Leonida/pull/5725#issuecomment-7100514254)) | Mesa RADV, Vulkan 1.4.354; runner built with gcc | `0x40004000` | `0x40004000` |
 | NVIDIA GeForce RTX 4070 SUPER, Windows 11 | 621.24 | `0x40004000` | `0x40004000` |
 
 The same with `VK_LAYER_KHRONOS_validation` on: no validation messages, same words. `XFlawless1` saw the original
-program fail on the gfx1036 iGPU of a Ryzen 7 9800X3D with the same driver (#5533). Not yet run: other RDNA2 GPUs,
-other AMD Windows drivers, and RADV.
+program fail on the gfx1036 iGPU of a Ryzen 7 9800X3D with driver 32.0.21045.29003 (#5533). So far it fails on AMD's
+Windows driver and passes on RADV, on the same kind of GPU. Not yet run: discrete RDNA2 GPUs and other AMD Windows
+drivers.
 
 Add a row to this table, or a comment on #5533, with your GPU and driver.
