@@ -207,6 +207,7 @@ class Cli(unittest.TestCase):
                 raw = f.read()
             self.assertNotIn(b"\r\n", raw)
             self.assertEqual(json.loads(raw.decode("utf-8")), payload)
+            self.assertEqual([p.name for p in Path(out_path).parent.glob(".image_d16_probe-*")], [])
 
     def test_write_json_oserror_returns_2_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,6 +216,7 @@ class Cli(unittest.TestCase):
                 err = pr.write_json_report(out_path, {"ok": True})
             self.assertIsNotNone(err)
             self.assertIn("cannot write --json", err)
+            self.assertEqual([p.name for p in Path(tmp).glob(".image_d16_probe-*")], [])
 
             stderr = io.StringIO()
             with mock.patch("builtins.open", side_effect=OSError("disk full")), \
@@ -223,6 +225,54 @@ class Cli(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("error:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertEqual([p.name for p in Path(tmp).glob(".image_d16_probe-*")], [])
+
+    def test_json_write_failure_preserves_previous_report_and_cleans_temp(self):
+        previous = '{"previous": true}'
+        real_open = open
+
+        def failing_open(*args, **kwargs):
+            handle = real_open(*args, **kwargs)
+            orig_write = handle.write
+
+            def fail_write(data):
+                orig_write(data[:8])
+                raise OSError(28, "No space left on device")
+
+            handle.write = fail_write
+            return handle
+
+        for label, patch in (
+            ("write", mock.patch("builtins.open", side_effect=failing_open)),
+            ("replace", mock.patch.object(pr, "replace_retry", side_effect=PermissionError(13, "Permission denied"))),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                out_path = Path(tmp) / "keep.json"
+                out_path.write_text(previous, encoding="utf-8", newline="\n")
+                stderr = io.StringIO()
+                with patch, mock.patch.object(sys, "stderr", stderr):
+                    rc, _ = run_main(FakeOracle(), "--dims", "1d", "--formats", "r32_uint", "--json", str(out_path))
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot write --json", stderr.getvalue())
+                self.assertEqual(out_path.read_text(encoding="utf-8"), previous)
+                self.assertEqual([p.name for p in Path(tmp).glob(".image_d16_probe-*")], [])
+
+    def test_readonly_existing_report_is_preserved_without_temp_files(self):
+        if os.name != "nt" and os.geteuid() == 0:
+            self.skipTest("root bypasses read-only file mode")
+        previous = '{"readonly": true}'
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "readonly.json"
+            out_path.write_text(previous, encoding="utf-8", newline="\n")
+            os.chmod(out_path, 0o444)
+            try:
+                err = pr.write_json_report(str(out_path), {"ok": True})
+                self.assertIsNotNone(err)
+                self.assertIn("cannot write --json", err)
+                self.assertEqual(out_path.read_text(encoding="utf-8"), previous)
+                self.assertEqual([p.name for p in Path(tmp).glob(".image_d16_probe-*")], [])
+            finally:
+                os.chmod(out_path, 0o600)
 
 
 class OnHardware(unittest.TestCase):
