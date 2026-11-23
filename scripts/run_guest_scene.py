@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -177,6 +178,23 @@ def check_audio(mode_dir: Path, has_event: bool, play_audio: bool) -> dict:
             "wav_sha256": sha256(wav_path.read_bytes()), "playback": PLAYBACK[playback], "mmresult": mmresult}
 
 
+def run_loader(cmd: list[str], *, wine: bool, cwd: Path, env: dict[str, str], stdout, stderr) -> int:
+    options = dict(cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+    if os.name != "posix" or not wine:
+        return subprocess.run(cmd, **options, timeout=TIMEOUT).returncode
+
+    # Wine launchers can start children that keep writing to the run's logs.
+    with subprocess.Popen(cmd, **options, start_new_session=True) as proc:
+        try:
+            return proc.wait(timeout=TIMEOUT)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+
+
 class Session:
     """Starts the loader once per run and keeps each run's streams and record under <out>/logs."""
 
@@ -200,8 +218,7 @@ class Session:
         rc, launch_error = None, None
         with self.last[0].open("xb") as so, self.last[1].open("xb") as se:
             try:
-                rc = subprocess.run(cmd, cwd=overlay, env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se,
-                                    timeout=TIMEOUT).returncode
+                rc = run_loader(cmd, wine=wine, cwd=overlay, env=env, stdout=so, stderr=se)
             except subprocess.TimeoutExpired:
                 outcome = "timed_out"
             except OSError as e:

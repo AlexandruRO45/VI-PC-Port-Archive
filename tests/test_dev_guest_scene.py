@@ -1,11 +1,13 @@
 """Exercise guest-scene forwarding and persisted results without a native GPU run."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -98,6 +100,44 @@ class GuestSceneTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
         self.assertTrue(result.stderr)
         self.assertFalse((self.cwd / output / "report.json").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups and flock")
+    def test_wine_timeout_stops_children(self):
+        import fcntl
+
+        args = self.scene_args()
+        (self.cwd / "loader.txt").write_text(
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import fcntl, time; lock = open(\"child.lock\", \"w\"); "
+            "fcntl.flock(lock, fcntl.LOCK_EX); print(\"child ready\", flush=True); time.sleep(5)'], "
+            "stdout=subprocess.PIPE)\n"
+            "print(child.stdout.readline().decode().strip(), flush=True)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8", newline="\n",
+        )
+        runner = (
+            "import runpy, sys; script = sys.argv.pop(1); "
+            "main = runpy.run_path(script)['main']; main.__globals__['TIMEOUT'] = 2; sys.exit(main())"
+        )
+        result = self.invoke("-c", runner, self.producer, *args, "--out", "out")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"timed out after 2s", result.stdout)
+        out = self.cwd / "out"
+        record = json.loads((out / "logs" / "full.json").read_bytes())
+        self.assertEqual(record["outcome"], "timed_out")
+        self.assertEqual((out / "logs" / "full.stdout.log").read_bytes().strip(), b"child ready")
+        # The lock is released when the child exits, even if its PID is still a zombie.
+        with (out / "full" / "child.lock").open("r+") as lock:
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self.fail("Wine launcher child survived timeout")
+                    time.sleep(0.02)
 
 
 if __name__ == "__main__":
