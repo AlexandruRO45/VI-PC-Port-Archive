@@ -401,5 +401,120 @@ class TestSAddI32ScalarInterpreter(unittest.TestCase):
                 continue
             self.assertEqual(self.state.sgprs[i], (i * 0x01010101) & MASK32)
 
+@dataclasses.dataclass
+class WaveState:
+    wave_size: int = 64
+    exec_mask: int = 0xFFFFFFFFFFFFFFFF
+    sgprs: list[int] = dataclasses.field(default_factory=lambda: [0] * 106)
+    vgprs: list[list[int]] = dataclasses.field(default_factory=list)
+    scc: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.wave_size)]
+
+
+class SIMDInterpreter:
+    def __init__(self, wave: WaveState) -> None:
+        self.wave = wave
+
+    def execute_salu(self, inst: SOP2Inst) -> tuple[int, int]:
+        s = ScalarState(sgprs=self.wave.sgprs, scc=self.wave.scc)
+        interp = ScalarInterpreter(s)
+        dst, scc = interp.step(inst)
+        self.wave.sgprs = s.sgprs
+        self.wave.scc = scc
+        return dst, scc
+
+    def broadcast_to_vgpr(self, src_sgpr: int, dst_vgpr: int) -> None:
+        val = self.wave.sgprs[src_sgpr]
+        for lane in range(self.wave.wave_size):
+            if (self.wave.exec_mask >> lane) & 1:
+                self.wave.vgprs[lane][dst_vgpr] = val
+
+
+class TestSAddI32SIMDDivergence(unittest.TestCase):
+    """Unit tests for wavefront SIMD execution and EXEC divergence."""
+
+    def test_wave32_uniform_scalar_addition(self) -> None:
+        wave = WaveState(wave_size=32, exec_mask=0xFFFFFFFF)
+        wave.sgprs[1] = 1000
+        wave.sgprs[2] = 2000
+        simd = SIMDInterpreter(wave)
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Reg(OperandKind.SGPR, 2),
+        )
+        dst, scc = simd.execute_salu(inst)
+        self.assertEqual(dst, 3000)
+        self.assertEqual(scc, 0)
+        simd.broadcast_to_vgpr(0, 5)
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][5], 3000)
+
+    def test_wave64_divergent_exec_mask(self) -> None:
+        # Alternating active lanes (even lanes active, odd lanes inactive)
+        mask = 0x5555555555555555
+        wave = WaveState(wave_size=64, exec_mask=mask)
+        wave.sgprs[1] = INT32_MAX
+        wave.sgprs[2] = 1
+        for lane in range(64):
+            wave.vgprs[lane][0] = 0xDEADBEEF
+
+        simd = SIMDInterpreter(wave)
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 3),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Reg(OperandKind.SGPR, 2),
+        )
+        dst, scc = simd.execute_salu(inst)
+        self.assertEqual(dst, UINT32_INT_MIN)
+        self.assertEqual(scc, 1)
+        simd.broadcast_to_vgpr(3, 0)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][0], UINT32_INT_MIN)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 0xDEADBEEF)
+
+    def test_wave64_zero_exec_mask(self) -> None:
+        wave = WaveState(wave_size=64, exec_mask=0)
+        wave.sgprs[1] = 50
+        wave.sgprs[2] = 50
+        for lane in range(64):
+            wave.vgprs[lane][1] = 999
+
+        simd = SIMDInterpreter(wave)
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Reg(OperandKind.SGPR, 2),
+        )
+        dst, scc = simd.execute_salu(inst)
+        self.assertEqual(dst, 100)
+        self.assertEqual(wave.sgprs[0], 100)
+        simd.broadcast_to_vgpr(0, 1)
+
+        # Inactive lanes untouched
+        for lane in range(64):
+            self.assertEqual(wave.vgprs[lane][1], 999)
+
+    def test_wave32_prefix_exec_mask(self) -> None:
+        wave = WaveState(wave_size=32, exec_mask=0x000000FF)  # First 8 lanes active
+        wave.sgprs[0] = 42
+        for lane in range(32):
+            wave.vgprs[lane][2] = 0
+
+        simd = SIMDInterpreter(wave)
+        simd.broadcast_to_vgpr(0, 2)
+        for lane in range(32):
+            expected = 42 if lane < 8 else 0
+            self.assertEqual(wave.vgprs[lane][2], expected)
+
 if __name__ == "__main__":
     unittest.main()
