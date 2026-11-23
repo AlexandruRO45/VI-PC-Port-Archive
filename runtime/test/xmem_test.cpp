@@ -262,6 +262,14 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
                                              PAGE_READWRITE);
     check(reset_region != nullptr, "allocate committed 64 KiB region for reset");
     if (reset_region) {
+        auto* const bytes = static_cast<uint8_t*>(reset_region);
+        std::memset(bytes, 0x5a, kPage64k);
+        check(virtual_alloc(bytes + 0x1234, 0x2000, MEM_RESET | kXmem64kPages, 0, PAGE_READWRITE) != nullptr,
+              "unaligned 64 KiB-mode reset uses the host reset range");
+        check(bytes[0] == 0x5a && bytes[0x4000] == 0x5a && bytes[kPage64k - 1] == 0x5a,
+              "unaligned reset preserves neighbouring committed data");
+        check(virtual_alloc(bytes + 0xe123, 0x1edd, MEM_RESET | kXmem64kPages, 0, PAGE_READWRITE) != nullptr,
+              "unaligned reset near the end of a committed region succeeds");
         check(virtual_alloc(reset_region, kPage64k, MEM_RESET | kXmem64kPages, 0, PAGE_READWRITE) == reset_region,
               "MEM_RESET with 64 KiB pages succeeds on committed memory");
         SetLastError(ERROR_SUCCESS);

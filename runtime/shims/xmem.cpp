@@ -374,7 +374,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    if (address != nullptr) {
+    const bool reset = (host_type & (MEM_RESET | MEM_RESET_UNDO)) != 0;
+    if (reset) {
+        // VirtualAlloc applies its own reset range rounding; guest page alignment would widen the discard.
+    } else if (address != nullptr) {
         const uintptr_t requested = reinterpret_cast<uintptr_t>(address);
         const uintptr_t max = (std::numeric_limits<uintptr_t>::max)();
         if (size > max - requested) {
