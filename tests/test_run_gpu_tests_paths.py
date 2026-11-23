@@ -45,7 +45,8 @@ class DrawShaders(unittest.TestCase):
             # the clip cases (#193) are variants of vs_clip.asm with different signatures, not files of their own
             source = "vs_clip" if name in run_gpu_tests.CLIP_CASES else name
             self.assertTrue((shaders / f"{source}.asm").is_file(), name)
-            self.assertTrue((shaders / extra).is_file(), extra)
+            for partner in (extra if isinstance(extra, (list, tuple)) else (extra,)):
+                self.assertTrue((shaders / partner).is_file(), partner)
 
 
 class FilterSelection(unittest.TestCase):

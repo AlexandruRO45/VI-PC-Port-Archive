@@ -1482,7 +1482,8 @@ def run_suite(a, work: str) -> int:
 
     if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
         names = [os.path.splitext(f)[0] for f in asm_files]
-        partners = {os.path.splitext(f)[0] for f in DRAWN_WITH.values()} | set(TEXTURE_MIP_DEPENDENCIES)
+        partners = {os.path.splitext(f)[0] for v in DRAWN_WITH.values()
+                    for f in (v if isinstance(v, (list, tuple)) else (v,))} | set(TEXTURE_MIP_DEPENDENCIES)
         shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
         role = "partners built for other tests" if partners.issuperset(names) else "inputs without a GPU test row"
         hint = ("; cs_bench_* shaders are benchmark inputs, run them with the benchmark tool"
