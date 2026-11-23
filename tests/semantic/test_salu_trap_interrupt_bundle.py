@@ -465,5 +465,28 @@ class TestSTrapRefusal(unittest.TestCase):
         self.assertEqual(str(cm.exception), "s_trap")
 
 
+class TestSTrapRange(unittest.TestCase):
+    def test_trap_small_immediates_refused(self):
+        for trap_id in (2, 3, 4, 16):
+            bad_lines = [
+                f"s_trap {trap_id}",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            with self.assertRaises(rdna2spirv.Unsupported) as cm:
+                support.translate_lines(f"ps_trap_id_{trap_id}", bad_lines)
+            self.assertEqual(str(cm.exception), "s_trap")
+
+    def test_trap_max_simm7_refused(self):
+        bad_lines = [
+            "s_trap 127",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_trap_max", bad_lines)
+        self.assertEqual(str(cm.exception), "s_trap")
+
+
 if __name__ == "__main__":
     unittest.main()
