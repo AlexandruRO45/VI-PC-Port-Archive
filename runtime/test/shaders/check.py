@@ -288,6 +288,7 @@ CVT_F32_SAT_CASES = (
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
+PACK_F16_NEG_WORDS = [0x7C00BC00, 0xFC003C00, 0x7C00C400, 0x3C003C00, 0x3C00C400, 0xFC00BC00, 0x7C003C00, 0xBC00C400]
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
@@ -1555,6 +1556,8 @@ def main():
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
+    results.append(("cs_pack_f16_neg", compute_test(tools, spirv, "cs_pack_f16_neg", "1", "dump",
+                                                     expected_words=PACK_F16_NEG_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
