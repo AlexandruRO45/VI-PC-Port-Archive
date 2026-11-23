@@ -1387,19 +1387,23 @@ class Analysis:
         Only mask arithmetic is allowed: scalar results have no reader outside this terminating path."""
         seen = set()
         inside, sub = False, frozenset({m})
+        direct = True
         while blk not in seen:
-            if run is not None and self.reaches(run, blk, -1):
-                return False
             seen.add(blk)
             for ins in self.blocks[blk]:
-                op = base_op(ins["op"])
+                op, args = base_op(ins["op"]), ins["args"]
                 if op in ("s_nop", "s_waitcnt", "s_branch"):
                     continue
                 if op == "s_endpgm":
-                    return inside
+                    # A direct MOV/AND exit has no temporary mask state to keep private.
+                    # For the extended proof, overlap anywhere implies the run reaches this end block.
+                    return inside and (direct or run is None or not self.reaches(run, blk, -1))
                 if op == "exp" and inside:
                     continue
                 if op in OFF_OK + ("s_or_b64", "s_xor_b64", "s_andn2_b64"):
+                    direct = direct and (op, len(args)) in (("s_mov_b64", 2), ("s_and_b64", 3)) \
+                        and _regs(args[0]) == ["exec"] and not _half(args[0]) \
+                        and any(tuple(_regs(x)) == m or _zero(x) for x in args[1:])
                     inside, sub = self.confine_step(ins, inside, sub)
                     continue
                 return False

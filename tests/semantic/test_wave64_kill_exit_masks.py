@@ -1,7 +1,7 @@
 """SHADER-1155: synthetic kill exits through mask arithmetic, and exits that really change outputs."""
 import unittest
 
-from test_wave64_halves import (KILL, RUN_WQM, EXIT_PS, kill, meta_of, run_cut, out_param)
+from test_wave64_halves import (KILL, RUN_WQM, EXIT_PS, PRO, size, kill, meta_of, run_cut, out_param)
 
 
 ACCEPTED = {
@@ -28,6 +28,29 @@ HEAD = ["v_mov_b32_e32 v7, 77"] + KILL
 
 
 class KillExitMasks(unittest.TestCase):
+    def test_direct_exit_with_shared_export(self):
+        prefix = PRO + HEAD
+        run = RUN_WQM + ["v_add_nc_u32_e32 v6, 3, v0", "s_branch 1"]
+        vote = f"s_cbranch_scc0 {sum(map(size, run)) // 4}"
+        split = [vote] + run + ["s_mov_b64 exec, s[20:21]"]
+        for stage, export in (("vs", "exp param0 v6, v6, v6, v6"), ("ps", "exp mrt0 v6, v6, v6, v6 done vm")):
+            with self.subTest(stage=stage):
+                meta, asm = meta_of(stage + "_shared_kill_exit", prefix + split + [export, "s_endpgm"])
+                self.assertEqual(meta, ("A", [], []))
+                if stage == "vs":
+                    whole = run_cut(asm, 64)
+                    self.assertEqual(whole, run_cut(asm, 32))
+                    self.assertEqual([w[0] for w in out_param(whole)], [0] * 40 + list(range(43, 67)))
+
+        extended = [vote] + run + ["s_wqm_b64 exec, s[20:21]"]
+        meta, _ = meta_of("ps_shared_wqm_exit", prefix + extended + EXIT_PS[1:])
+        self.assertEqual(meta, ("C", ["unsafe-vote-branch"], []))
+
+        # An independent reason keeps the shader in C, as in the reported census.
+        counted = PRO + ["s_bcnt1_i32_b64 s6, exec", "v_mov_b32_e32 v7, s6"] + KILL + split
+        meta, _ = meta_of("ps_counted_shared_exit", counted + ["exp mrt0 v7, v7, v7, v7 done vm", "s_endpgm"])
+        self.assertEqual(meta, ("C", ["lane-count"], []))
+
     def test_accepted(self):
         for name, exit_head in ACCEPTED.items():
             with self.subTest(name=name):
