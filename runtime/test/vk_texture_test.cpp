@@ -154,10 +154,9 @@ int main(int argc, char** argv) {
     // LEONIDA_VK_DEVICE picks one GPU on a machine with several, as in the other test programs.
     std::vector<VkPhysicalDeviceProperties> candidates(n);
     for (uint32_t i = 0; i < n; ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
-    const size_t chosen = leonida::vk_test::pick_device(candidates);
+    const size_t chosen = leonida::vk_test::pick_device(candidates, leonida::vk_test::tool_min_api_version);
     if (chosen >= n) {
-        leonida::vk_test::report_no_device();
-        return 1;
+        return leonida::vk_test::report_no_device(candidates, leonida::vk_test::tool_min_api_version);
     }
     VkPhysicalDevice pd = pds[chosen];
     VkPhysicalDeviceProperties properties = candidates[chosen];

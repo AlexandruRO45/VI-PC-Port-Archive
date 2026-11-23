@@ -11,8 +11,10 @@ namespace {
 
 int failures = 0;
 
-VkPhysicalDeviceProperties device(VkPhysicalDeviceType type, std::uint32_t vendor, const char* name) {
+VkPhysicalDeviceProperties device(VkPhysicalDeviceType type, std::uint32_t vendor, const char* name,
+                                     std::uint32_t api_version = 0) {
     VkPhysicalDeviceProperties properties{};
+    properties.apiVersion = api_version;
     properties.deviceType = type;
     properties.vendorID = vendor;
     std::snprintf(properties.deviceName, sizeof properties.deviceName, "%s", name);
@@ -22,6 +24,12 @@ VkPhysicalDeviceProperties device(VkPhysicalDeviceType type, std::uint32_t vendo
 void expect_index(const char* what, std::size_t got, std::size_t want) {
     if (got == want) return;
     std::fprintf(stderr, "FAIL %s: picked %zu, expected %zu\n", what, got, want);
+    ++failures;
+}
+
+void expect_code(const char* what, int got, int want) {
+    if (got == want) return;
+    std::fprintf(stderr, "FAIL %s: exit code %d, expected %d\n", what, got, want);
     ++failures;
 }
 
@@ -108,6 +116,30 @@ int main() {
     expect_index("filter picks the Dozen wrapper despite its rank", pick_device(devices), 0);
     set_filter("no-such-gpu");
     expect_index("filter matches nothing", pick_device(devices), devices.size());
+    set_filter("");
+
+    // The tools chain Vulkan 1.1/1.2 feature structures, so a device below 1.2 is no candidate (a 1.0 or 1.1 device
+    // knows neither, and a 1.0 instance has no vkGetPhysicalDeviceFeatures2). A newer device wins whatever its rank.
+    using leonida::vk_test::report_no_device;
+    using leonida::vk_test::tool_min_api_version;
+    devices = {
+        device(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, nvidia, "old discrete", VK_API_VERSION_1_0),
+        device(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, amd, "1.1 integrated", VK_API_VERSION_1_1),
+        device(VK_PHYSICAL_DEVICE_TYPE_CPU, amd, "1.2 cpu", VK_API_VERSION_1_2),
+    };
+    expect_index("device below 1.2 is skipped", pick_device(devices, tool_min_api_version), 2);
+    expect_index("no minimum keeps every device", pick_device(devices), 0);
+    devices[2].apiVersion = VK_API_VERSION_1_3;
+    expect_index("1.3 meets a 1.2 minimum", pick_device(devices, tool_min_api_version), 2);
+    devices.pop_back();
+    expect_index("only devices below 1.2", pick_device(devices, tool_min_api_version), devices.size());
+    // Nothing at 1.2 is a skip (77) the runners report as SKIP, not a failure.
+    expect_code("old devices only: skip", report_no_device(devices, tool_min_api_version), 77);
+    expect_code("no device at all: failure", report_no_device({}, tool_min_api_version), 1);
+    set_filter("1.1 integrated");
+    expect_code("filter keeps an old device: skip", report_no_device(devices, tool_min_api_version), 77);
+    set_filter("no-such-gpu");
+    expect_code("filter matches nothing: failure", report_no_device(devices, tool_min_api_version), 1);
     set_filter("");
 
     if (failures) {

@@ -1102,6 +1102,15 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
   endif()
+  # A stand-in libvulkan.so.1 that makes the real loader look like Vulkan 1.0 / 1.1 (TEST-1110): run a test tool with
+  #   LD_LIBRARY_PATH=<build>/vk_api_cap LEONIDA_VK_API_CAP=1.0 <tool> ...
+  # to see it skip (exit 77) on an older instance instead of crashing. See the comment in the source.
+  if(UNIX AND NOT APPLE)
+    add_library(vk_api_cap_loader SHARED test/vk_api_cap_loader.cpp)
+    target_link_libraries(vk_api_cap_loader PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    set_target_properties(vk_api_cap_loader PROPERTIES PREFIX "lib" OUTPUT_NAME "vulkan" SUFFIX ".so.1"
+                          LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vk_api_cap")
+  endif()
   # Committed BC* texture zero-initialization via vk.zero_buffer or vk.copy_scratch (D3D-220).
   add_executable(vk_bc_zero_init_test test/vk_bc_zero_init_test.cpp)
   target_link_libraries(vk_bc_zero_init_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})

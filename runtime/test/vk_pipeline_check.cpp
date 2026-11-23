@@ -912,6 +912,7 @@ int main(int argc, char** argv) {
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2);
     LOADI(vkGetDeviceProcAddr); LOADI(vkEnumerateDeviceExtensionProperties); LOADI(vkGetPhysicalDeviceFeatures2);
+    if (!vkGetPhysicalDeviceProperties2 || !vkGetPhysicalDeviceFeatures2) return leonida::vk_test::report_no_core11_entry_points();
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     if (n == 0) { std::fprintf(stderr, "no Vulkan physical devices found\n"); return 1; }
@@ -919,11 +920,10 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
     std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
     for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
-    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates, leonida::vk_test::tool_min_api_version);
     VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
     if (!pd) {
-        leonida::vk_test::report_no_device();
-        return 1;
+        return leonida::vk_test::report_no_device(candidates, leonida::vk_test::tool_min_api_version);
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
@@ -963,7 +963,8 @@ int main(int argc, char** argv) {
     };
     link(&f11, reinterpret_cast<VkBaseOutStructure*>(&f11), nullptr, true);   // shaderDrawParameters (VS v0/v3)
     link(&f12, reinterpret_cast<VkBaseOutStructure*>(&f12), nullptr, true);
-    link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, true);
+    // Unknown to a 1.2 device: its features stay false there.
+    link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, props.apiVersion >= VK_API_VERSION_1_3);
     const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh), VK_EXT_MESH_SHADER_EXTENSION_NAME, want_mesh);
     const bool ext_bary = link(&bary, reinterpret_cast<VkBaseOutStructure*>(&bary), VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, want_bary);
     const bool ext_lock = link(&lock, reinterpret_cast<VkBaseOutStructure*>(&lock), VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, want_lock);

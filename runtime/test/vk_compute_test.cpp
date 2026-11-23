@@ -165,17 +165,17 @@ int main(int argc, char** argv) {
     LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
     LOADI(vkGetPhysicalDeviceMemoryProperties);
+    if (!vkGetPhysicalDeviceProperties2 || !vkGetPhysicalDeviceFeatures2) return leonida::vk_test::report_no_core11_entry_points();
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
     std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
     for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
-    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates, leonida::vk_test::tool_min_api_version);
     VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
     if (!pd) {
-        leonida::vk_test::report_no_device();
-        return 1;
+        return leonida::vk_test::report_no_device(candidates, leonida::vk_test::tool_min_api_version);
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
@@ -196,7 +196,8 @@ int main(int argc, char** argv) {
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2q.pNext = &f13q;
+    // The Vulkan 1.3 structure is unknown to a 1.2 device: its features stay false there.
+    if (props.apiVersion >= VK_API_VERSION_1_3) f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
     const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
     const uint32_t req_sg = require_wave64 ? 64u : (sg_env ? uint32_t(std::atoi(sg_env)) : 0u);
