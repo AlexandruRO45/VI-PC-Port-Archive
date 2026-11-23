@@ -308,5 +308,131 @@ class TestSymbolicAST(unittest.TestCase):
             RegisterOperand(106, RegType.SGPR)
 
 
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files, m0, and GWS memory."""
+
+    def __init__(self, num_gws_resources: int = GWS_NUM_RESOURCES) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_m0(self) -> int:
+        return self.m0
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.val
+        return self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_gws_barrier_v."""
+
+    def execute(
+        self,
+        instr: DSGWSBarrierVInstruction,
+        state: ScalarState,
+    ) -> Tuple[int, int, list[int]]:
+        """Execute a ds_gws_barrier_v instruction on scalar state.
+
+        Returns:
+            Tuple[int, int, list[int]]: (resource_id, total_releases, woken_waves)
+        """
+        m0 = state.get_m0()
+        rid, releases, woken = state.gws.barrier_v(
+            offset=instr.offset,
+            m0=m0,
+        )
+        return rid, releases, woken
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_barrier_v_execution(self) -> None:
+        self.state.gws.barriers[3].arrive_and_wait(1)
+        self.state.gws.barriers[3].arrive_and_wait(2)
+
+        instr = DSGWSBarrierVInstruction(offset=3)
+        rid, rels, woken = self.interp.execute(instr, self.state)
+
+        self.assertEqual(rid, 3)
+        self.assertEqual(rels, 1)
+        self.assertEqual(woken, [1, 2])
+        self.assertEqual(self.state.gws.read_arrived(3), 0)
+        self.assertEqual(self.state.gws.read_releases(3), 1)
+
+    def test_scalar_with_offset_and_m0(self) -> None:
+        self.state.set_m0(12)
+        instr = DSGWSBarrierVInstruction(offset=4)
+        rid, rels, woken = self.interp.execute(instr, self.state)
+        self.assertEqual(rid, 16)
+        self.assertEqual(rels, 1)
+        self.assertEqual(self.state.get_m0(), 12)
+
+    def test_scalar_registers_unmodified(self) -> None:
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.state.set_vgpr(i, 0x7700 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.state.set_sgpr(i, 0x8800 + i)
+        self.state.set_m0(7)
+
+        instr = DSGWSBarrierVInstruction(offset=2)
+        self.interp.execute(instr, self.state)
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.assertEqual(self.state.get_vgpr(i), 0x7700 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(self.state.get_sgpr(i), 0x8800 + i)
+        self.assertEqual(self.state.get_m0(), 7)
+
+    def test_scalar_multiple_releases(self) -> None:
+        instr = DSGWSBarrierVInstruction(offset=0)
+        for i in range(1, 4):
+            rid, rels, _ = self.interp.execute(instr, self.state)
+            self.assertEqual(rid, 0)
+            self.assertEqual(rels, i)
+        self.assertEqual(self.state.gws.read_releases(0), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
