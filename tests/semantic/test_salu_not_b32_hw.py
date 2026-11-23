@@ -562,5 +562,61 @@ class TestSaluNotB32IEEE754BitPatterns(unittest.TestCase):
                 self.assertEqual(res, ref_s_not_b32(nan))
                 self.assertEqual(scc, ref_s_not_b32_scc(nan))
 
+# --- Section 8: Negative Controls, Syntax Rejection, and Mutation Detection ---
+
+class TestSaluNotB32NegativeAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection tests."""
+
+    def test_rejection_out_of_bounds_registers(self) -> None:
+        invalid_lines = [
+            "s_not_b32 s106, s0",
+            "s_not_b32 s200, s1",
+            "s_not_b32 s0, s106",
+            "s_not_b32 v0, s0",
+            "s_not_b32 s0, v0",
+        ]
+        for line in invalid_lines:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_salu_instruction(line)
+
+    def test_rejection_malformed_syntax(self) -> None:
+        malformed = [
+            "s_not_b32",
+            "s_not_b32 s0",
+            "s_not_b32 s0, s1, s2",
+            "s_not_b32 s0, 0xGHIJ",
+            "s_not_b32 s0, , s1",
+        ]
+        for line in malformed:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_salu_instruction(line)
+
+    def test_mutation_identity_detection(self) -> None:
+        """Mutant 1: Pass-through identity without inverting bits."""
+        def mutant_identity(val: int) -> int:
+            return val & MASK32
+
+        val = 0x80000000
+        self.assertNotEqual(mutant_identity(val), ref_s_not_b32(val))
+
+    def test_mutation_scc_inversion(self) -> None:
+        """Mutant 2: Inverted SCC logic (SCC = 1 when result is zero)."""
+        def mutant_scc(val: int) -> int:
+            res = ref_s_not_b32(val)
+            return 1 if res == 0 else 0
+
+        # For val = 0 (res = 0xFFFFFFFF), normal SCC = 1, mutant = 0
+        self.assertNotEqual(mutant_scc(0), ref_s_not_b32_scc(0))
+
+    def test_mutation_16bit_not(self) -> None:
+        """Mutant 3: Truncating NOT to low 16 bits."""
+        def mutant_16bit_not(val: int) -> int:
+            return (~val) & 0xFFFF
+
+        val = 0x12345678
+        self.assertNotEqual(mutant_16bit_not(val), ref_s_not_b32(val))
+
 if __name__ == "__main__":
     unittest.main()
