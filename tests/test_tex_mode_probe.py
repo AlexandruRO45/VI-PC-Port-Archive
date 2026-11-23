@@ -920,6 +920,7 @@ if pytest is not None:
         assert exc.value.code == 2
         assert "--n" in capsys.readouterr().err
 
+    @pytest.mark.skipif(not HAVE_NUMPY, reason="numpy required for tex_mode_probe end-to-end probing")
     @pytest.mark.parametrize(
         "data_size, candidate_count, parts, mips",
         [(32760, 0, 1, 2), (32768, 1, 1, 2), (40960, 2, 1, 2), (32768, 1, 2, 2),
