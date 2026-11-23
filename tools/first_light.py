@@ -474,6 +474,26 @@ def sample_rgba_bilinear(
     return out
 
 
+def _manifest_int(value, field: str) -> int:
+    """A manifest register/address field as an int, or one clean SystemExit line.
+
+    A rechecked manifest.json is the user's file, so a bool, a list, a missing value or a
+    non-finite float (1e400 parses to inf, and int(inf) overflows) must fail like the tool's
+    other broken-manifest paths, not as a TypeError/KeyError/OverflowError traceback.
+    """
+    if isinstance(value, bool):
+        raise SystemExit(f"first-light manifest: {field} must be an integer, not a bool")
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(
+            f"first-light manifest: {field} must be an integer, not {type(value).__name__}"
+        ) from None
+    if isinstance(value, float) and value != result:
+        raise SystemExit(f"first-light manifest: {field} must be a whole number")
+    return result
+
+
 def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> dict:
     """The environment vk_harness draws a first_light manifest with: the mesh and its layout, plus the constants of a
     --camera draw (VKH_SGPRS and VKH_HEAP) or of a --dds draw (the texture, T#, S# and its pointer SGPR).
@@ -493,18 +513,18 @@ def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> d
     tex = manifest.get("texture")
     if tex:
         tex_file = manifest["files"]["texture"]
-        ptr_sgpr = int(tex["ptr_sgpr"])
-        tsharp_va = int(tex["tsharp_va"])
+        ptr_sgpr = _manifest_int(tex.get("ptr_sgpr"), "texture.ptr_sgpr")
+        tsharp_va = _manifest_int(tex.get("tsharp_va"), "texture.tsharp_va")
         ssharp = tex["ssharp"]
         sgprs = ["0"] * (ptr_sgpr + 1)
         sgprs[ptr_sgpr] = hex(tsharp_va)
         env["VKH_TEX_RGBA"] = os.path.join(out_dir, tex_file)
         env["VKH_TSHARP_VA"] = hex(tsharp_va)
-        env["VKH_SSHARP"] = ",".join(hex(int(w)) for w in ssharp)
+        env["VKH_SSHARP"] = ",".join(hex(_manifest_int(w, "texture.ssharp")) for w in ssharp)
         env["VKH_SGPRS"] = ",".join(sgprs)
         ps_sg = manifest.get("ps", {}).get("subgroup_size")
         if ps_sg:
-            env["VKH_SUBGROUP_SIZE"] = str(int(ps_sg))
+            env["VKH_SUBGROUP_SIZE"] = str(_manifest_int(ps_sg, "ps.subgroup_size"))
     return env
 
 

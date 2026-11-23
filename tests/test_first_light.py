@@ -51,6 +51,60 @@ def harness() -> str | None:
     return None
 
 
+class HarnessEnvManifestTests(unittest.TestCase):
+    """harness_env reads a rechecked manifest.json; a bad texture field is one error line, not a traceback.
+
+    Pure CPU: no vk_harness and no package, just the manifest dict the --check path loads.
+    """
+
+    def _manifest(self, ptr_sgpr=4):
+        return {
+            "width": 4, "height": 4,
+            "files": {"mesh": "mesh.bin", "texture": "texture.rgba"},
+            "texture": {"ptr_sgpr": ptr_sgpr, "tsharp_va": 0, "ssharp": [0, 0, 0, 0]},
+        }
+
+    def test_valid_texture_fields_build_the_env(self):
+        env = fl.harness_env(self._manifest(), "/tmp/out", base_env={})
+        self.assertEqual(env["VKH_TSHARP_VA"], "0x0")
+        self.assertEqual(env["VKH_SGPRS"], "0,0,0,0,0x0")
+
+    def test_bad_texture_field_is_one_systemexit_line(self):
+        cases = (
+            ("ptr_sgpr", 1e400), ("ptr_sgpr", -1e400), ("ptr_sgpr", [1]),
+            ("ptr_sgpr", None), ("ptr_sgpr", True), ("ptr_sgpr", 1.5),
+            ("tsharp_va", 1e400), ("tsharp_va", [1]), ("tsharp_va", None),
+        )
+        for field, bad in cases:
+            with self.subTest(field=field, bad=bad):
+                man = self._manifest()
+                man["texture"][field] = bad
+                with self.assertRaises(SystemExit) as ctx:
+                    fl.harness_env(man, "/tmp/out", base_env={})
+                self.assertIn(field, str(ctx.exception))
+
+    def test_bad_ssharp_word_is_one_systemexit_line(self):
+        man = self._manifest()
+        man["texture"]["ssharp"] = [0, 1e400, 0, 0]
+        with self.assertRaises(SystemExit) as ctx:
+            fl.harness_env(man, "/tmp/out", base_env={})
+        self.assertIn("ssharp", str(ctx.exception))
+
+    def test_missing_texture_field_is_one_systemexit_line(self):
+        man = self._manifest()
+        del man["texture"]["ptr_sgpr"]
+        with self.assertRaises(SystemExit) as ctx:
+            fl.harness_env(man, "/tmp/out", base_env={})
+        self.assertIn("ptr_sgpr", str(ctx.exception))
+
+    def test_bad_subgroup_size_is_one_systemexit_line(self):
+        man = self._manifest()
+        man["ps"] = {"subgroup_size": 1e400}
+        with self.assertRaises(SystemExit) as ctx:
+            fl.harness_env(man, "/tmp/out", base_env={})
+        self.assertIn("subgroup_size", str(ctx.exception))
+
+
 class MeshOutputTests(unittest.TestCase):
     def test_fit_keeps_relative_depth_for_an_offset_mesh(self) -> None:
         import tempfile
