@@ -232,6 +232,16 @@ def _accessor_type(gltf: dict, index: object) -> str | None:
     return _text(accessor.get("type")) if accessor is not None else None
 
 
+def _morph_target_count(gltf: dict, node: dict | None) -> int | None:
+    mesh = _entry(gltf, "meshes", _object(node).get("mesh"))
+    counts = {len(_array(_object(primitive).get("targets")))
+              for primitive in _array(_object(mesh).get("primitives"))}
+    # A valid glTF mesh has the same number of morph targets on every primitive.
+    if len(counts) == 1:
+        return counts.pop() or None
+    return None
+
+
 def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
     """Summarize an animation and flag references that cannot be resolved."""
     issues: list[str] = []
@@ -298,6 +308,7 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
     channels: list[dict] = []
     paths: dict[str, int] = {}
     target_nodes: set[int] = set()
+    values_per_key: dict[int, set[int]] = {}
     for channel_index, channel in enumerate(raw_channels):
         if not isinstance(channel, dict):
             issues.append(f"channel[{channel_index}] is not an object")
@@ -311,6 +322,11 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
         node = _entry(gltf, "nodes", node_index)
         if sampler_index is None or sampler_index >= len(raw_samplers):
             issues.append(f"channel[{channel_index}] has no valid sampler")
+        else:
+            widths = values_per_key.setdefault(sampler_index, set())
+            width = _morph_target_count(gltf, node) if path == "weights" else 1
+            if width is not None:
+                widths.add(width)
         if node_index is None:
             issues.append(f"channel[{channel_index}] has no target node")
         elif node is None:
@@ -339,6 +355,21 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             "node_name": _text(node.get("name")) if node is not None else None,
             "path": path,
         })
+
+    for sampler in samplers:
+        input_count, output_count = sampler["input_count"], sampler["output_count"]
+        if input_count is None or output_count is None:
+            continue
+        sampler_index = sampler["index"]
+        interpolation = sampler["interpolation"]
+        frames = input_count * (3 if interpolation == "CUBICSPLINE" else 1)
+        for width in sorted(values_per_key.get(sampler_index, {1})):
+            expected = frames * width
+            if output_count != expected:
+                issues.append(
+                    f"sampler[{sampler_index}] has {output_count} output values for {input_count} "
+                    f"keys with {interpolation} interpolation (expected {expected})"
+                )
 
     known_durations = [sampler["duration"] for sampler in samplers if sampler["duration"] is not None]
     return {
