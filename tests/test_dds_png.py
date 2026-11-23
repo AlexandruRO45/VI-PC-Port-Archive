@@ -5,6 +5,7 @@
 import contextlib
 import importlib.util
 import io
+import itertools
 import os
 import struct
 import tempfile
@@ -924,19 +925,50 @@ class DownscaleTests(unittest.TestCase):
         self.assertEqual(dds.downscale_rgba(2, 2, red * 4, 1), (1, 1, bytes((0, 0, 0, 0))))
         self.assertEqual(dds.downscale_rgba(2, 1, red + blue, 1), (1, 1, bytes((0, 0, 255, 128))))
 
+    @staticmethod
+    def transparent_rgba(width, height, pattern, seed):
+        """Random RGB with one of six alpha patterns, each with at least one pixel below 255."""
+        def rand():
+            nonlocal seed
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+            return seed >> 16 & 0xFF
+        n = width * height
+        buf = bytearray(rand() for _ in range(n * 4))
+        buf[3::4] = {
+            "all zero": bytes(n),
+            "near the ends": bytes((0, 1, 2, 254, 255)[rand() % 5] for _ in range(n)),
+            "one hole": b"\xff" * (n - 1) + b"\x00",
+            "all one": b"\x01" * n,
+            "zero or 255": bytes(255 if rand() & 1 else 0 for _ in range(n)),
+            "random": bytes(a if a % 3 else 0 for a in buf[3::4]),
+        }[pattern]
+        if buf[3::4].count(255) == n:
+            buf[3] = 0
+        return bytes(buf)
+
+    PATTERNS = ("all zero", "near the ends", "one hole", "all one", "zero or 255", "random")
+
     def test_even_transparent_halving_matches_the_area_resampler(self):
-        # _halve_rgba takes a 2x2 fast path for even extents with transparency; it must give _resample_box's bytes.
-        seed = 1
-        for width, height in ((2, 2), (2, 1), (1, 2), (6, 4), (8, 2), (16, 16)):
-            buf = bytearray()
-            for _ in range(width * height * 4):
-                seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-                buf.append(seed >> 16 & 0xFF)
-            buf[3::4] = bytes(a if a % 3 else 0 for a in buf[3::4])  # include fully transparent pixels
+        # _halve_rgba takes a 2x2 fast path for even extents with transparency; it must give _resample_box's bytes,
+        # including 1-wide and 1-high images, where the one column or row is counted twice.
+        shapes = ((2, 2), (2, 1), (1, 2), (8, 1), (1, 8), (6, 4), (4, 6), (8, 2), (16, 16), (30, 12), (64, 2))
+        for (width, height), pattern in itertools.product(shapes, self.PATTERNS):
+            buf = self.transparent_rgba(width, height, pattern, width * 131 + height)
             nw, nh = max(1, width // 2), max(1, height // 2)
-            with self.subTest(width=width, height=height):
-                self.assertEqual(dds._halve_rgba(width, height, bytes(buf)),
-                                 (nw, nh, dds._resample_box(width, height, bytes(buf), nw, nh)))
+            with self.subTest(width=width, height=height, alpha=pattern):
+                self.assertEqual(dds._halve_rgba(width, height, buf),
+                                 (nw, nh, dds._resample_box(width, height, buf, nw, nh)))
+
+    def test_repeated_transparent_halving_matches_the_area_resampler(self):
+        # downscale_rgba halves until the limit is met; each even step must equal one area resample of the step before.
+        for (width, height, limit), pattern in itertools.product(((32, 32, 4), (64, 16, 8), (16, 2, 1)), self.PATTERNS):
+            buf = self.transparent_rgba(width, height, pattern, width + height * 7)
+            w, h, want = width, height, buf
+            while max(w, h) > limit:
+                nw, nh = max(1, w // 2), max(1, h // 2)
+                w, h, want = nw, nh, dds._resample_box(w, h, want, nw, nh)
+            with self.subTest(width=width, height=height, limit=limit, alpha=pattern):
+                self.assertEqual(dds.downscale_rgba(width, height, buf, limit), (w, h, want))
 
     def test_no_change_needed(self):
         buf = self.rgba_grid(4, 4)
