@@ -1686,9 +1686,11 @@ if(TARGET Vulkan::Headers)
       # through the same build; the test creates the heaps, the SRV, the sampler and the root signature through the
       # D3D12 API only.
       set(LEONIDA_M2_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m2_shaders)
-      set(LEONIDA_M2_FILES ${LEONIDA_M2_DIR}/spirv/index.json ${LEONIDA_M2_DIR}/fssm/vs_m2.fssm
-                           ${LEONIDA_M2_DIR}/fssm/ps_m2.fssm ${LEONIDA_M2_DIR}/fssm/ps_m2_uoff.fssm
-                           ${LEONIDA_M2_DIR}/fssm/ps_m2_literal.fssm)
+      set(LEONIDA_M2_FILES ${LEONIDA_M2_DIR}/spirv/index.json
+                           ${LEONIDA_M2_DIR}/fssm/vs_m2.fssm ${LEONIDA_M2_DIR}/spirv/vs_m2.spv
+                           ${LEONIDA_M2_DIR}/fssm/ps_m2.fssm ${LEONIDA_M2_DIR}/spirv/ps_m2.spv
+                           ${LEONIDA_M2_DIR}/fssm/ps_m2_uoff.fssm ${LEONIDA_M2_DIR}/spirv/ps_m2_uoff.spv
+                           ${LEONIDA_M2_DIR}/fssm/ps_m2_literal.fssm ${LEONIDA_M2_DIR}/spirv/ps_m2_literal.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_M2_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M2_DIR}
@@ -1716,8 +1718,10 @@ if(TARGET Vulkan::Headers)
       # M2, formats: BC1 and BC7 textures with mip chains and an R8G8B8A8 2D array through the same descriptor path.
       # vs_m2.asm with ps_m2.asm (2D) and ps_m2_array.asm (2D array, slice 1.0 of the view).
       set(LEONIDA_M2F_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m2f_shaders)
-      set(LEONIDA_M2F_FILES ${LEONIDA_M2F_DIR}/spirv/index.json ${LEONIDA_M2F_DIR}/fssm/vs_m2.fssm
-                            ${LEONIDA_M2F_DIR}/fssm/ps_m2.fssm ${LEONIDA_M2F_DIR}/fssm/ps_m2_array.fssm)
+      set(LEONIDA_M2F_FILES ${LEONIDA_M2F_DIR}/spirv/index.json
+                            ${LEONIDA_M2F_DIR}/fssm/vs_m2.fssm ${LEONIDA_M2F_DIR}/spirv/vs_m2.spv
+                            ${LEONIDA_M2F_DIR}/fssm/ps_m2.fssm ${LEONIDA_M2F_DIR}/spirv/ps_m2.spv
+                            ${LEONIDA_M2F_DIR}/fssm/ps_m2_array.fssm ${LEONIDA_M2F_DIR}/spirv/ps_m2_array.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_M2F_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M2F_DIR}
