@@ -115,6 +115,22 @@ class TestCli(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
 
+    def test_json_names_with_mixed_case_extension(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = os.path.join(d, "one.bin")
+            with open(source, "wb") as f:
+                f.write(sample())
+            for suffix in (".json", ".JSON", ".JsOn"):
+                with self.subTest(suffix=suffix):
+                    names = os.path.join(d, "names" + suffix)
+                    with open(names, "w", encoding="utf-8") as f:
+                        json.dump({"files": [{"names": ["prop_crate_01.#dr"]}]}, f)
+                    result = self.run_tool(source, "--names", names, "--json")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    summary = json.loads(result.stdout)["summary"]
+                    self.assertEqual(summary.get("u32 resolved", 0), 1)
+                    self.assertEqual(summary.get("u64 resolved", 0), 1)
+
     def test_text_json_and_refs(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "c")

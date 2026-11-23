@@ -92,7 +92,7 @@ def load_names(paths):
     JSON, or not the shape rpf9_names.py writes, raises ValueError naming the file (--names is repeatable)."""
     names = set()
     for path in paths:
-        if path.endswith(".json"):
+        if path.lower().endswith(".json"):
             try:
                 with open(path, encoding="utf-8") as f:
                     doc = json.load(f)
