@@ -39,6 +39,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from awc_opus import ogg_page, write_file  # noqa: E402
+from bank_stage import prune_stage_dirs  # noqa: E402
 
 VENDOR = b"leonida "
 MARKUP = re.compile(r"~[^~]*~")
@@ -171,6 +172,7 @@ def tag_folder(root, names, dialogue=None, langs=(), dry_run=False, ambiguous=No
     dialogue = dialogue or {}
     ambiguous = ambiguous or {}
     for folder, _dirs, files in os.walk(root, onerror=scan_failed):
+        prune_stage_dirs(_dirs)     # a killed awc_opus.py run can leave a half-written bank here
         rel = os.path.relpath(folder, root).replace(os.sep, "/")
         streams, label = None, None
         for fname in sorted(files):

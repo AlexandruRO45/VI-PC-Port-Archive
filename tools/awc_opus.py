@@ -32,7 +32,6 @@ import functools
 import os
 import struct
 import sys
-import secrets
 import shutil
 import tempfile
 import time
@@ -40,27 +39,12 @@ import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bank_stage import STAGE_PREFIX, is_stage_name  # noqa: E402
 from file_mode import new_file_mode, published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 from report_paths import path_key  # noqa: E402
 
 # ---- Ogg ----
-_CRC = []
-for _i in range(256):
-    _r = _i << 24
-    for _ in range(8):
-        _r = ((_r << 1) ^ 0x04C11DB7) if _r & 0x80000000 else (_r << 1)
-    _CRC.append(_r & 0xFFFFFFFF)
-
-
-def _ogg_crc_bytewise(data: bytes) -> int:
-    """The reference: one table step per byte (slow). Kept for the tests that check ogg_crc against it."""
-    c = 0
-    for b in data:
-        c = ((c << 8) & 0xFFFFFFFF) ^ _CRC[((c >> 24) ^ b) & 0xFF]
-    return c
-
-
 _REVERSE_BITS = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
 
 
@@ -168,12 +152,38 @@ def write_new_file(path: str, data: bytes) -> None:
         f.write(data)
 
 
-STAGE_PREFIX = ".awc-bank-"
-STALE_STAGE_SECONDS = 24 * 3600
+STALE_STAGE_SECONDS = 3600
+RENAME_ATTEMPTS = 5
+RENAME_WAIT = 0.2
 
 
-def _remove_stale_stages(parent: str) -> None:
-    """Delete staging folders an interrupted run left in `parent` (older than a day, so a live run keeps its own)."""
+def stage_dir(od: str) -> str:
+    """The staging folder of the bank that publishes as `od`: one fixed name per bank, so a rerun finds and removes
+    what a killed run left. Two runs exporting the same bank at once are not supported (main() rejects it within a
+    run)."""
+    parent, name = os.path.split(os.path.abspath(od))
+    return os.path.join(parent, STAGE_PREFIX + name)
+
+
+def _publish(stage: str, od: str) -> bool:
+    """Rename the finished stage to `od`. A transient failure (a virus scanner holding the new folder on Windows)
+    is retried; False means it still failed and the finished stage should be kept for the rerun."""
+    for attempt in range(RENAME_ATTEMPTS):
+        try:
+            os.rename(stage, od)
+            return True
+        except OSError:
+            if os.path.isdir(od):
+                raise
+            if attempt == RENAME_ATTEMPTS - 1:
+                return False
+            time.sleep(RENAME_WAIT * (attempt + 1))
+    return False
+
+
+def remove_stale_stages(parent: str) -> None:
+    """Delete staging folders an interrupted run left in `parent` (idle over an hour: a live run adds a file to its
+    own folder every few milliseconds)."""
     now = time.time()
     try:
         names = os.listdir(parent)
@@ -181,7 +191,7 @@ def _remove_stale_stages(parent: str) -> None:
         return
     for name in names:
         full = os.path.join(parent, name)
-        if name.startswith(STAGE_PREFIX) and os.path.isdir(full):
+        if is_stage_name(name) and os.path.isdir(full):
             try:
                 if now - os.stat(full).st_mtime > STALE_STAGE_SECONDS:
                     shutil.rmtree(full, ignore_errors=True)
@@ -394,31 +404,32 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
         d = f.read()
     streams, music = parse_awc(d)
     od = bank_output_dir(path, out_dir)
+    shutil.rmtree(stage_dir(od), ignore_errors=True)    # what a killed run left for this bank
     if os.path.lexists(od):
         # Repair of an existing or partial bank: replace file by file, as before.
         return _export_streams(d, streams, music, od, pre_skip, None)
     # A fresh bank is built under a private sibling name and published with one rename, so an interrupted run
     # leaves no bank at all (the rerun starts over) instead of a part-written one.
     os.makedirs(out_dir, exist_ok=True)
-    _remove_stale_stages(out_dir)
-    stage = os.path.join(out_dir, f"{STAGE_PREFIX}{secrets.token_hex(8)}")
+    stage = stage_dir(od)
     os.mkdir(stage)
+    keep = False
     try:
         counts = _export_streams(d, streams, music, stage, pre_skip, write_new_file)
         try:
-            os.rename(stage, od)
+            published = _publish(stage, od)
         except OSError:
-            if not os.path.isdir(od):
-                raise
             # Another run published the same bank first: merge into it file by file.
-            os.makedirs(od, exist_ok=True)
             for name in os.listdir(stage):
                 write_file(os.path.join(od, name), _read_bytes(os.path.join(stage, name)))
-            shutil.rmtree(stage)
-        stage = None
+            published = True
+        if not published:
+            keep = True     # a finished bank is not thrown away; the rerun removes it and redoes the bank
+            raise OSError(f"could not rename {stage} to {od}")
+        shutil.rmtree(stage, ignore_errors=True)    # only exists after a merge
         return counts
     finally:
-        if stage is not None:
+        if not keep:
             shutil.rmtree(stage, ignore_errors=True)
 
 
@@ -550,6 +561,8 @@ def main(argv=None) -> int:
                     skipped(b, e)
                 if i % 200 == 0:
                     print(f"  {i}/{len(banks)} banks: {tot}", flush=True)
+    for parent in sorted({p for _, p in banks}):
+        remove_stale_stages(parent)
     print(f"{len(banks)} banks: {tot['opus']} Ogg Opus, {tot['music']} music channels (Ogg Opus), {tot['pcm']} WAV, "
           f"{tot['other']} not handled (XMA/other)")
     if failed:

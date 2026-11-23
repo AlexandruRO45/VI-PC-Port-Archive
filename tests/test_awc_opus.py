@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -1147,14 +1148,72 @@ class FreshBankPublishTest(unittest.TestCase):
         awc.export_bank(self.path, self.out)
         self.assertEqual(sorted(os.listdir(self.bank)), ["00000009.wav", "00000009~2.wav"])
 
-    def test_old_staging_folder_from_a_killed_run_is_removed(self):
+    def killed_run_stage(self, bank_exists):
+        """What a killed run leaves: the bank's staging folder holding a truncated .ogg."""
+        stage = awc.stage_dir(self.bank)
+        os.makedirs(stage)
+        ogg = os.path.join(stage, "00000001.ogg")
+        awc.write_ogg_opus(ogg, [bytes([0x78]) + bytes(40)] * 3, 1, 1, writer=awc.write_new_file)
+        with open(ogg, "r+b") as f:
+            f.truncate(os.path.getsize(ogg) - 20)
+        if bank_exists:
+            os.makedirs(self.bank)
+        return stage
+
+    def test_rerun_removes_its_own_staging_folder_whether_or_not_the_bank_folder_exists(self):
+        for bank_exists in (False, True):
+            with self.subTest(bank_exists=bank_exists):
+                if os.path.isdir(self.out):
+                    shutil.rmtree(self.out)
+                self.killed_run_stage(bank_exists)
+                awc.export_bank(self.path, self.out)
+                self.assertEqual(os.listdir(self.out), ["bank"])
+
+    def test_wav_step_ignores_a_staging_folder_a_killed_run_left(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import audio_wav
+        self.killed_run_stage(True)
+        awc.write_ogg_opus(os.path.join(self.bank, "00000002.ogg"), [bytes([0x78]) + bytes(40)], 1, 2)
+        files, not_opus = audio_wav.collect(self.out)
+        self.assertEqual([rel for _, rel in files], [os.path.join("bank", "00000002")])
+        self.assertEqual(not_opus, 0)
+
+    def test_main_removes_idle_staging_folders_of_other_banks_at_the_end(self):
         os.makedirs(self.out)
-        stale = os.path.join(self.out, awc.STAGE_PREFIX + "dead")
+        stale = os.path.join(self.out, awc.STAGE_PREFIX + "other")
         os.mkdir(stale)
-        old = os.stat(stale).st_mtime - 2 * 24 * 3600
+        old = os.stat(stale).st_mtime - 2 * 3600
         os.utime(stale, (old, old))
+        fresh = os.path.join(self.out, awc.STAGE_PREFIX + "running")
+        os.mkdir(fresh)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(awc.main([self.path, self.out, "--jobs", "1"]), 0)
+        self.assertEqual(sorted(os.listdir(self.out)), [awc.STAGE_PREFIX + "running", "bank"])
+
+    def test_transient_rename_failure_is_retried(self):
+        real, calls = os.rename, []
+
+        def flaky(src, dst):
+            calls.append(src)
+            if len(calls) < 3:
+                raise PermissionError(13, "sharing violation", src)
+            return real(src, dst)
+        with mock.patch.object(awc.os, "rename", flaky), mock.patch.object(awc.time, "sleep"):
+            awc.export_bank(self.path, self.out)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sorted(os.listdir(self.out)), ["bank"])
+        self.assertEqual(len(os.listdir(self.bank)), 5)
+
+    def test_rename_that_keeps_failing_keeps_the_finished_bank_for_the_rerun(self):
+        with mock.patch.object(awc.os, "rename", side_effect=PermissionError(13, "sharing violation")), \
+                mock.patch.object(awc.time, "sleep"):
+            with self.assertRaises(OSError):
+                awc.export_bank(self.path, self.out)
+        stage = awc.stage_dir(self.bank)
+        self.assertEqual(len(os.listdir(stage)), 5)
         awc.export_bank(self.path, self.out)
         self.assertEqual(os.listdir(self.out), ["bank"])
+        self.assertEqual(len(os.listdir(self.bank)), 5)
 
 
 class WriteFileReadOnlyTest(unittest.TestCase):

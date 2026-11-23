@@ -34,6 +34,9 @@ import time
 from typing import BinaryIO
 import unicodedata
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bank_stage import prune_stage_dirs  # noqa: E402
+
 EXTS = (".ogg", ".opus")
 
 
@@ -134,6 +137,7 @@ def collect(src: str):
     files, not_opus = [], 0
     for root, dirs, names in os.walk(src, onerror=scan_failed):
         dirs.sort()
+        prune_stage_dirs(dirs)      # a killed awc_opus.py run can leave a half-written bank here
         for name in sorted(names):
             if not name.lower().endswith(EXTS):
                 continue
