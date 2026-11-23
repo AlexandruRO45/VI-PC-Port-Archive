@@ -942,6 +942,16 @@ private:
             copy.imageExtent = {extent_.width, extent_.height, 1};
             fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buffer_, 1,
                                     &copy);
+            VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_host.buffer = capture_buffer_;
+            to_host.offset = 0;
+            to_host.size = VK_WHOLE_SIZE;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                                nullptr, 1, &to_host, 0, nullptr);
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
