@@ -8,6 +8,9 @@
 // The 4x depth array is also cleared through views that count their slices (slice 0 alone, slice 1 alone, slices
 // 1-3): its readback resolves each slice on its own, which is where D3D-417 showed (the layer's depth resolve of a
 // slice above 0 read slice 0 on the AMD driver, whatever the view had cleared).
+// Every range is cleared a second time with a rectangle: inside it the slices the view names read one, outside it
+// zero. The layer clears those through an attachment in a rendering scope (vkCmdClearAttachments) rather than the
+// image (vkCmdClear*Image), so the two runs also tell a wrong clear apart from a wrong resolve or readback.
 // A range the host's debug layer refuses stays refused by the layer: a first slice past the array (with -1 too), no
 // slices, more slices than are left, and UINT_MAX - 1. Those are not run on the host.
 // No game data or shaders. Needs a Vulkan GPU; LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
@@ -18,6 +21,9 @@ namespace {
 using copycmp::Ptr;
 
 constexpr UINT kSlices = 4, kSize = 8;
+// The clears with a rectangle clear this part of mip 0, scaled down for the others; on the layer they clear an
+// attachment in a rendering scope (vkCmdClearAttachments) instead of the image (vkCmdClear*Image).
+constexpr D3D12_RECT kRect{2, 1, 6, 7};
 
 struct Case {
     const char* name;
@@ -27,8 +33,11 @@ struct Case {
 };
 
 // Seeds, clears through {mip, first, count} and reads back. `reached` gets one bit per subresource (mip + slice *
-// mips) the clear wrote. Returns an error text when the list was refused or the readback is not all zeros or ones.
-std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first, UINT count, std::uint32_t& reached) {
+// mips) the clear wrote; with `rect`, the clear is that rectangle of mip 0 scaled to the view's mip, and a reached
+// subresource is one inside it and zero outside. Returns an error text when the list was refused or a subresource is
+// neither reached nor all zeros.
+std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first, UINT count, std::uint32_t& reached,
+                          const D3D12_RECT* rect = nullptr) {
     ID3D12Device* device = run.device;
     const bool msaa = c.samples > 1;
     D3D12_RESOURCE_DESC desc{};
@@ -65,7 +74,7 @@ std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first
         return "resource creation failed";
     const auto slot = heap->GetCPUDescriptorHandleForHeapStart();
     // A clear takes the descriptor as it is when the clear is recorded, so one slot serves every view.
-    const auto clear = [&](UINT view_mip, UINT view_first, UINT view_count, FLOAT value) {
+    const auto clear = [&](UINT view_mip, UINT view_first, UINT view_count, FLOAT value, const D3D12_RECT* r) {
         if (c.depth) {
             D3D12_DEPTH_STENCIL_VIEW_DESC view{};
             view.Format = c.view;
@@ -73,7 +82,7 @@ std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first
             if (msaa) view.Texture2DMSArray = {view_first, view_count};
             else view.Texture2DArray = {view_mip, view_first, view_count};
             device->CreateDepthStencilView(texture.p, &view, slot);
-            run.list->ClearDepthStencilView(slot, D3D12_CLEAR_FLAG_DEPTH, value, 0, 0, nullptr);
+            run.list->ClearDepthStencilView(slot, D3D12_CLEAR_FLAG_DEPTH, value, 0, r ? 1 : 0, r);
         } else {
             D3D12_RENDER_TARGET_VIEW_DESC view{};
             view.Format = c.view;
@@ -82,12 +91,15 @@ std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first
             else view.Texture2DArray = {view_mip, view_first, view_count, 0};
             device->CreateRenderTargetView(texture.p, &view, slot);
             const FLOAT colour[4] = {value, value, value, value};
-            run.list->ClearRenderTargetView(slot, colour, 0, nullptr);
+            run.list->ClearRenderTargetView(slot, colour, r ? 1 : 0, r);
         }
     };
     for (UINT slice = 0; slice < kSlices; ++slice)
-        for (UINT level = 0; level < desc.MipLevels; ++level) clear(level, slice, 1, 0.0f);
-    clear(mip, first, count, 1.0f);
+        for (UINT level = 0; level < desc.MipLevels; ++level) clear(level, slice, 1, 0.0f, nullptr);
+    // A rectangle is in the view's mip's texels: the one used is kRect scaled down to it.
+    D3D12_RECT scaled{};
+    if (rect) scaled = {rect->left >> mip, rect->top >> mip, rect->right >> mip, rect->bottom >> mip};
+    clear(mip, first, count, 1.0f, rect ? &scaled : nullptr);
 
     if (msaa) {
         run.barrier(texture.p, written, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
@@ -117,15 +129,22 @@ std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first
     for (UINT i = 0; i < n && error.empty(); ++i) {
         // One, in every format here, has a byte that is not zero in each texel; zero has none.
         const size_t texel = size_t(row_bytes[i]) / placed[i].Footprint.Width;
-        size_t ones = 0, texels = 0;
+        size_t ones = 0, zeros = 0, texels = 0;
         for (UINT row = 0; row < rows[i]; ++row)
             for (UINT x = 0; x < placed[i].Footprint.Width; ++x, ++texels) {
                 const std::uint8_t* at =
                     bytes + placed[i].Offset + size_t(row) * placed[i].Footprint.RowPitch + x * texel;
-                ones += std::any_of(at, at + texel, [](std::uint8_t b) { return b != 0; });
+                const bool one = std::any_of(at, at + texel, [](std::uint8_t b) { return b != 0; });
+                // Inside the rectangle a clear writes one; outside it the seed's zero stays.
+                const UINT level = i % desc.MipLevels;
+                const bool inside = !rect || (x >= UINT(rect->left) >> level && x < UINT(rect->right) >> level &&
+                                              row >= UINT(rect->top) >> level && row < UINT(rect->bottom) >> level);
+                ones += one == inside;
+                zeros += !one;
             }
         if (ones == texels) reached |= 1u << i;
-        else if (ones) error = "subresource " + std::to_string(i) + " is partly cleared";
+        else if (zeros == texels) continue;
+        else error = "subresource " + std::to_string(i) + " is partly cleared";
     }
     readback->Unmap(0, nullptr);
     return error;
@@ -203,27 +222,29 @@ int main() {
             const UINT end = range.count == UINT_MAX ? kSlices : first + range.count;
             std::uint32_t expected = 0;
             for (UINT slice = first; slice < end; ++slice) expected |= 1u << (mip + slice * mips);
-            const auto check = [&](ID3D12Device* device, bool is_ours, const char* who) {
+            const auto check = [&](ID3D12Device* device, bool is_ours, const char* who, const D3D12_RECT* rect) {
                 copycmp::Run run;
                 std::uint32_t reached = 0;
                 std::string error = run.init(device, is_ours) ? "" : "no queue or list";
                 if (error.empty()) {
                     run.begin();
-                    error = clear_through(run, c, mip, first, range.count, reached);
+                    error = clear_through(run, c, mip, first, range.count, reached, rect);
                 }
                 if (error.empty() && reached == expected) return;
                 ++failures;
-                std::fprintf(stderr, "%s, mip %u, first slice %u, ArraySize %d, on %s: %s%s; expected slice.mip%s\n",
-                             c.name, mip, first, int(range.count), who,
+                std::fprintf(stderr, "%s, mip %u, first slice %u, ArraySize %d%s, on %s: %s%s; expected slice.mip%s\n",
+                             c.name, mip, first, int(range.count), rect ? ", rectangle" : "", who,
                              error.empty() ? "cleared slice.mip" : error.c_str(),
                              error.empty() ? slices_of(reached, mips).c_str() : "", slices_of(expected, mips).c_str());
             };
-            check(ours.p, true, "the layer");
-            ++cleared;
-            for (const Host& host : hosts) {
-                if (!host.device.p || (host.warp && c.depth && c.samples > 1)) continue;
-                check(host.device.p, false, host.name.c_str());
-                ++compared;
+            for (const D3D12_RECT* rect : {static_cast<const D3D12_RECT*>(nullptr), &kRect}) {
+                check(ours.p, true, "the layer", rect);
+                ++cleared;
+                for (const Host& host : hosts) {
+                    if (!host.device.p || (host.warp && c.depth && c.samples > 1)) continue;
+                    check(host.device.p, false, host.name.c_str(), rect);
+                    ++compared;
+                }
             }
         }
         // What the host's debug layer refuses, the layer refuses: the list fails at Close or when it runs.
