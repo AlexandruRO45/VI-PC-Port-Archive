@@ -31,7 +31,6 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
-from file_mode import published_mode  # noqa: E402
 
 SPIRV_MAGIC = 0x07230203
 
@@ -550,6 +549,8 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
 
 def _write_output(path: str, data: bytes) -> None:
+    from file_mode import published_mode
+
     destination = os.path.realpath(path)
     try:
         mode = os.stat(destination).st_mode
