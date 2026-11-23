@@ -356,5 +356,11 @@ class VCubeTcSimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(i, 5), -555.0)
 
+class VCubeTcEdgeCasesTests(unittest.TestCase):
+    def test_cubetc_zero_y_axis(self):
+        # +Z major with y = 0.0 -> tc = -0.0
+        tc = oracle_cubetc_f32(0.0, 0.0, 1.0)
+        self.assertEqual(tc, 0.0)
+
 if __name__ == "__main__":
     unittest.main()
