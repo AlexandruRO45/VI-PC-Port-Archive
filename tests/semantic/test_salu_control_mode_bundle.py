@@ -98,6 +98,25 @@ class TestRoundModeAST(unittest.TestCase):
         self.assertIn("OpStore", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestRoundModeConfig(unittest.TestCase):
+    def test_fp16_rounding_modes(self):
+        for fp16_val in (0, 1, 2, 3):
+            imm = fp16_val << 2
+            modes = model_round_mode(imm)
+            self.assertEqual(modes["fp16"], fp16_val)
+            self.assertEqual(modes["fp32"], 0)
+
+    def test_translator_round_mode_fp16_modes(self):
+        for imm in (0, 12):
+            prog = [f"s_round_mode {imm}", "s_endpgm"]
+            spv = support.translate_lines(f"cs_rm_fp16_{imm}", prog, fssm=saveexec_run.fssm())
+            self.assertIn("OpCapability Shader", spv)
+            si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+        for imm in (4, 8):
+            prog = [f"s_round_mode {imm}", "s_endpgm"]
+            with self.assertRaises(rdna2spirv.Unsupported):
+                support.translate_lines(f"cs_rm_fp16_rej_{imm}", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
