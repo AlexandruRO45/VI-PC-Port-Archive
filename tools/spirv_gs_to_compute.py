@@ -6,18 +6,19 @@ writes the vertices it emits into a buffer, followed by an ordinary draw of that
 by tools/rdna2spirv.py (stage `Geometry`) into a GLCompute module with one invocation per input primitive:
 
 - the per-vertex inputs (`BuiltIn Position`, `Location N`: Input arrays of vec4) are read from the input buffer
-  (set 1, binding 0), `{ uint primitive_count; uint pad[3]; vec4 data[]; }`: vertex v of primitive p has its
+  (set 2, binding 0), `{ uint primitive_count; uint pad[3]; vec4 data[]; }`: vertex v of primitive p has its
   inputs at `data[(p * VERTS_IN + v) * NUM_INPUTS + slot]`;
 - the vec4 outputs become private variables, and every `OpEmitVertex` copies them to the record buffer
-  (set 1, binding 1), `{ vec4 rec[]; }`: vertex n of primitive p at `rec[(p * MAX_VERTS + n) * NUM_OUTPUTS + slot]`;
-- the meta buffer (set 1, binding 2), `{ uint meta[]; }`, gets `meta[p * (MAX_VERTS + 1)]` = the vertices
+  (set 2, binding 1), `{ vec4 rec[]; }`: vertex n of primitive p at `rec[(p * MAX_VERTS + n) * NUM_OUTPUTS + slot]`;
+- the meta buffer (set 2, binding 2), `{ uint meta[]; }`, gets `meta[p * (MAX_VERTS + 1)]` = the vertices
   primitive p emitted and `meta[p * (MAX_VERTS + 1) + 1 + n]` = 1 when `OpEndPrimitive` ends a strip after vertex n
   (0 otherwise).
 
 Slots are ordered Position first, then by location; `--layout` writes them with the sizes. `PrimitiveId` reads give
 p, `InvocationId` reads 0 (only `Invocations 1` is supported). The workgroup is 64x1x1; invocations past
-`primitive_count` return at once. Push constants and set 0 are untouched. The draw afterwards turns each strip into
-triangles (or lines, points) in emission order.
+`primitive_count` return at once. Push constants, set 0 and set 1 (the `--pc-tail-ubo` block) are untouched; the
+capture set is `CAPTURE_SET` and the --layout output names it as "capture_set". The draw afterwards turns each strip
+into triangles (or lines, points) in emission order.
 
 Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
@@ -31,6 +32,10 @@ from itertools import combinations
 from pathlib import Path
 
 LOCAL_SIZE = 64
+# The capture buffers' descriptor set. Not set 1: `rdna2spirv.py --pc-tail-ubo` puts its Uniform block at set 1,
+# binding 0, and one slot can't be both a Uniform and a StorageBuffer in one pipeline layout (VUID-07990,
+# SHADER-825). The set is in the --layout output as "capture_set", so the host reads it from there.
+CAPTURE_SET = 2
 IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triangles": 3,
             "InputTrianglesAdjacency": 6}
 OUT_TOPOLOGY = {"OutputPoints": "points", "OutputLineStrip": "line_strip", "OutputTriangleStrip": "triangle_strip"}
@@ -139,9 +144,10 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
              "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
              f"OpDecorate %gsc_rec_t {buffer_block}", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
              f"OpDecorate %gsc_meta_t {buffer_block}", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
-             "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0", "OpDecorate %gsc_in NonWritable",
-             "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
-             "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
+             f"OpDecorate %gsc_in DescriptorSet {CAPTURE_SET}", "OpDecorate %gsc_in Binding 0",
+             "OpDecorate %gsc_in NonWritable",
+             f"OpDecorate %gsc_rec DescriptorSet {CAPTURE_SET}", "OpDecorate %gsc_rec Binding 1",
+             f"OpDecorate %gsc_meta DescriptorSet {CAPTURE_SET}", "OpDecorate %gsc_meta Binding 2"]
     types = ([f"{v3u} = OpTypeVector {uint} 3"] if v3u == "%gsc_v3u" else []) + \
             ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else [])
     types += [f"{k(v)} = OpConstant {uint} {v}" for v in sorted({0, 1, 2, 3, vin, nin, nout, mv, mv + 1}
@@ -328,6 +334,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         out.append(s)
     public = {key: lay[key] for key in ("verts_in", "max_verts", "topology", "inputs", "outputs")}
     public["local_size"] = LOCAL_SIZE
+    public["capture_set"] = CAPTURE_SET   # bindings 0 (input), 1 (records), 2 (meta) of this set
     return "\n".join(out) + "\n", public
 
 

@@ -34,7 +34,45 @@ def test_layout(gs_tri):
     _, spvasm = gs_tri
     _, lay = gsc.rewrite(spvasm)
     assert lay == {"verts_in": 3, "max_verts": 3, "topology": "triangle_strip",
-                   "inputs": ["position", "location 1"], "outputs": ["position", "location 1"], "local_size": 64}
+                   "inputs": ["position", "location 1"], "outputs": ["position", "location 1"], "local_size": 64,
+                   "capture_set": gsc.CAPTURE_SET}
+
+
+def with_pc_tail_block(spvasm):
+    """The GS with the Uniform block `rdna2spirv.py --pc-tail-ubo` declares at set 1, binding 0 (SHADER-825)."""
+    uint = re.search(r"^\s*(%\w+) = OpTypeInt 32 0\s*$", spvasm, re.M).group(1)
+    lines = spvasm.splitlines()
+    last_deco = max(i for i, ln in enumerate(lines) if ln.lstrip().startswith(("OpDecorate", "OpMemberDecorate")))
+    lines[last_deco + 1:last_deco + 1] = ["OpDecorate %pct_t Block", "OpMemberDecorate %pct_t 0 Offset 0",
+                                          "OpDecorate %pct DescriptorSet 1", "OpDecorate %pct Binding 0"]
+    at = next(i for i, ln in enumerate(lines) if re.match(rf"\s*{uint} = OpTypeInt 32 0\s*$", ln))
+    lines[at + 1:at + 1] = [f"%pct_t = OpTypeStruct {uint}", "%pct_p = OpTypePointer Uniform %pct_t",
+                            "%pct = OpVariable %pct_p Uniform"]
+    return "\n".join(lines) + "\n"
+
+
+def slots(module):
+    """(set, binding) -> the variables decorated with it."""
+    sets = dict(re.findall(r"OpDecorate (%\w+) DescriptorSet (\d+)", module))
+    binds = dict(re.findall(r"OpDecorate (%\w+) Binding (\d+)", module))
+    out = {}
+    for var, s in sets.items():
+        out.setdefault((int(s), int(binds[var])), []).append(var)
+    return out
+
+
+@requires_tools
+def test_capture_buffers_leave_the_pc_tail_slot_alone(gs_tri):
+    # SHADER-825: the capture input buffer took set 1, binding 0, the --pc-tail-ubo Uniform block's slot, so the
+    # lowered module used one slot as both a Uniform and a StorageBuffer (VUID-VkComputePipelineCreateInfo-07990).
+    shader, spvasm = gs_tri
+    out, lay = gsc.rewrite(with_pc_tail_block(spvasm))
+    used = slots(out)
+    assert used[(1, 0)] == ["%pct"]
+    assert {used[(lay["capture_set"], b)][0] for b in (0, 1, 2)} == {"%gsc_in", "%gsc_rec", "%gsc_meta"}
+    assert all(len(v) == 1 for v in used.values()), used
+    assert lay["capture_set"] not in (0, 1)
+    shader.validate(out)
 
 
 @requires_tools
