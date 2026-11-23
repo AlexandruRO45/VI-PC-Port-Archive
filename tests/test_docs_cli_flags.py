@@ -24,6 +24,10 @@ SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", "
                    ".bat", ".sh", ".yml", ".yaml", ".csproj")
 # Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself.
 FOREIGN = {"--search", "--state", "--index-url", "--help"}
+# spirv-opt's own flags, quoted in docs/embedded_shaders.md when a measurement compares optimizer runs; they belong to
+# LLVM's tool, not to one of ours, so no source file of this repo defines them.
+FOREIGN |= {"--ssa-rewrite", "--cfg-cleanup", "--merge-blocks", "--merge-return", "--scalar-replacement",
+            "--eliminate-dead-branches", "--eliminate-dead-code-aggressive"}
 # Pages that quote another project's tree (SCARAB, americas-recomp).
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
