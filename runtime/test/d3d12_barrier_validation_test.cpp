@@ -488,6 +488,26 @@ std::vector<ParityCase> build_parity_cases() {
                          g.pTextureBarriers = &tb;
                          l7->Barrier(1, &g);
                      }});
+    cases.push_back({"EB TEXTURE UNDEFINED->RENDER_TARGET AccessBefore=COMMON", false, true,
+                     [](ID3D12GraphicsCommandList*, ID3D12GraphicsCommandList7* l7, ID3D12Resource*, ID3D12Resource* tex) {
+                         D3D12_TEXTURE_BARRIER tb{D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_RENDER_TARGET,
+                                                  D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_RENDER_TARGET,
+                                                  D3D12_BARRIER_LAYOUT_UNDEFINED, D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                                                  tex, {0xffffffffu, 0, 0, 0, 0, 0}, D3D12_TEXTURE_BARRIER_FLAG_DISCARD};
+                         D3D12_BARRIER_GROUP g{D3D12_BARRIER_TYPE_TEXTURE, 1};
+                         g.pTextureBarriers = &tb;
+                         l7->Barrier(1, &g);
+                     }});
+    cases.push_back({"EB TEXTURE UNDEFINED->UNDEFINED AccessAfter=COMMON (no layout change)", true, true,
+                     [](ID3D12GraphicsCommandList*, ID3D12GraphicsCommandList7* l7, ID3D12Resource*, ID3D12Resource* tex) {
+                         D3D12_TEXTURE_BARRIER tb{D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_SYNC_ALL,
+                                                  D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_ACCESS_COMMON,
+                                                  D3D12_BARRIER_LAYOUT_UNDEFINED, D3D12_BARRIER_LAYOUT_UNDEFINED,
+                                                  tex, {0xffffffffu, 0, 0, 0, 0, 0}, D3D12_TEXTURE_BARRIER_FLAG_NONE};
+                         D3D12_BARRIER_GROUP g{D3D12_BARRIER_TYPE_TEXTURE, 1};
+                         g.pTextureBarriers = &tb;
+                         l7->Barrier(1, &g);
+                     }});
 
     return cases;
 }

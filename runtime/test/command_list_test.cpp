@@ -110,11 +110,15 @@ int main() {
     CHECK(!list.barrier(GlobalBarrier{y::all, y::all, 0x04000000u, a::common}));
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, 999u, l::common, 9, all, 0}));
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, 999u, 9, all, 0}));
+    CHECK(!list.barrier(TextureBarrier{y::all, y::render_target, a::common, a::render_target, l::undefined,
+                                       l::render_target, 9, all, texture_barrier_discard}));
+    CHECK(list.barrier(TextureBarrier{y::all, y::all, a::shader_resource, a::shader_resource, 31u, 31u, 9, all, 0}));
     CHECK(list.close());
-    CHECK(list.commands().size() == 4);
+    CHECK(list.commands().size() == 5);
     CHECK(std::get<GlobalBarrier>(list.commands()[1]).sync_before == y::split);
     CHECK(std::get<BufferBarrier>(list.commands()[2]).resource == 7);
     CHECK(std::get<TextureBarrier>(list.commands()[3]).flags == texture_barrier_discard);
+    CHECK(std::get<TextureBarrier>(list.commands()[4]).layout_before == 31u);
 
     // Copies: D3D12's own call rules (aligned footprints; degenerate boxes and DEFAULT-heap
     // CopyResource self-copies are accepted as no-ops and must not record Vulkan commands).

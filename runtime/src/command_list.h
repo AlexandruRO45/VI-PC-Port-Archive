@@ -141,6 +141,7 @@ inline constexpr std::uint32_t compute_queue_shader_resource = 27;
 inline constexpr std::uint32_t compute_queue_copy_source = 28;
 inline constexpr std::uint32_t compute_queue_copy_dest = 29;
 inline constexpr std::uint32_t video_queue_common = 30;
+inline constexpr std::uint32_t direct_queue_generic_read_compute_queue_accessible = 31;
 } // namespace d3d12_layout
 
 // D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAGS, D3D12_CLEAR_FLAGS and
@@ -700,6 +701,9 @@ public:
         if (!valid_layout(barrier.layout_before) || !valid_layout(barrier.layout_after)) return false;
         if (barrier.layout_after == d3d12_layout::undefined && barrier.layout_before != d3d12_layout::undefined)
             return false;
+        if (barrier.layout_before == d3d12_layout::undefined && barrier.layout_after != d3d12_layout::undefined &&
+            barrier.access_before != d3d12_access::no_access)
+            return false;
         if (barrier.flags & ~texture_barrier_discard) return false;
         if (barrier.range.mip_count && (!barrier.range.layer_count || !barrier.range.plane_count)) return false;
         if (barrier.sync_after == d3d12_sync::split) return !closed_;
@@ -1020,7 +1024,8 @@ private:
     }
 
     static bool valid_layout(std::uint32_t layout) {
-        return layout == d3d12_layout::undefined || layout <= d3d12_layout::video_queue_common;
+        return layout == d3d12_layout::undefined ||
+               layout <= d3d12_layout::direct_queue_generic_read_compute_queue_accessible;
     }
 
     bool append(const Command& command) {
