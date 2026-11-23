@@ -1988,6 +1988,38 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # First-frame dry run (docs/boot.md sections 3 and 5): the whole contiguous order on the device
+      # D3D12XboxCreateDevice hands out, from the measured 24-word params block through queue/fence, allocator/list,
+      # a committed vertex buffer, a 32-constant root signature (s0..s31 plus the layer's heap-base tail), the PSO,
+      # a draw and an offscreen readback. The other D3D12 tests call create_vulkan_device + create_device_proxy
+      # directly, and run_tiny_frame stops before the root signature; this is the one path that spans both.
+      set(LEONIDA_FIRST_FRAME_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_first_frame.spv)
+      set(LEONIDA_FIRST_FRAME_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_first_frame.spv)
+      foreach(pair "vs_first_frame.vert;${LEONIDA_FIRST_FRAME_VS}" "ps_first_frame.frag;${LEONIDA_FIRST_FRAME_PS}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the first-frame dry-run shader ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_first_frame_dry_run_test
+        test/d3d12_first_frame_dry_run_test.cpp
+        shims/d3d12_xs.cpp
+        shims/registry.cpp
+        ${LEONIDA_FIRST_FRAME_VS} ${LEONIDA_FIRST_FRAME_PS})
+      target_link_libraries(d3d12_first_frame_dry_run_test PRIVATE gta6rt_d3d12_com gta6rt_d3d12_xs_rootsig)
+      target_compile_definitions(d3d12_first_frame_dry_run_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        _CRT_SECURE_NO_WARNINGS
+        LEONIDA_VULKAN_DEVICE
+        LEONIDA_TEST_VS_SPV="${LEONIDA_FIRST_FRAME_VS}"
+        LEONIDA_TEST_PS_SPV="${LEONIDA_FIRST_FRAME_PS}")
+      target_compile_options(d3d12_first_frame_dry_run_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_first_frame_dry_run COMMAND d3d12_first_frame_dry_run_test)
+      set_tests_properties(d3d12_first_frame_dry_run PROPERTIES SKIP_RETURN_CODE 77)
       # Conservative raster Tier 1, with geometric coverage bounds and host D3D12 references.
       set(LEONIDA_CONSERVATIVE_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_conservative.spv)
       set(LEONIDA_CONSERVATIVE_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative.spv)
