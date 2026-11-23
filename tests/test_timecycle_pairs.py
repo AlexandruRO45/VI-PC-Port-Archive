@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from codecs import BOM_UTF16_BE, BOM_UTF16_LE
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -147,6 +148,29 @@ class DirectoryReportTests(unittest.TestCase):
             except SystemExit as exc:
                 status = exc.code
         return status, out.getvalue(), err.getvalue()
+
+    def test_plain_utf16_files_and_folder_match_utf8_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(tmp, carved=False)
+            status, expected, err = self.run_cli(*paths)
+            self.assertEqual(status, 0, err)
+            self.assertEqual(json.loads(expected)["second_number"]["count"], 7)
+            paths.append(os.path.join(tmp, "other.xml"))
+            for encoding, bom, declaration in (
+                ("utf-16-le", BOM_UTF16_LE, "UTF-16"),
+                ("utf-16-be", BOM_UTF16_BE, "UTF-16"),
+                ("utf-16-le", b"", "UTF-16LE"),
+                ("utf-16-be", b"", "UTF-16BE"),
+            ):
+                for path, doc in zip(paths, (SYNTH_MOD, SYNTH_KF, b"<other/>")):
+                    text = doc.decode("ascii").replace("UTF-8", declaration)
+                    with open(path, "wb") as f:
+                        f.write(bom + text.encode(encoding))
+                for args in (paths, [tmp]):
+                    with self.subTest(encoding=encoding, bom=bool(bom), args=args):
+                        status, actual, err = self.run_cli(*args)
+                        self.assertEqual(status, 0, err)
+                        self.assertEqual(actual, expected)
 
     def test_reports_cannot_replace_directory_sources(self):
         for carved in (False, True):

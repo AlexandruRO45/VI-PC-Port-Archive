@@ -16,6 +16,7 @@ names, attribute values, or raw XML. Standard library only.
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import statistics
@@ -70,7 +71,7 @@ def load_documents(paths: list[str]) -> list[tuple[str, bytes]]:
                     if os.path.isfile(full) and name.lower().endswith(".xml"):
                         with open(full, "rb") as f:
                             blob = f.read()
-                        root = gi.xml_root(blob)
+                        root = _plain_xml_root(blob)
                         if root in TARGET_ROOTS:
                             docs.append((root, blob))
         elif path.lower().endswith(".rpf"):
@@ -82,10 +83,24 @@ def load_documents(paths: list[str]) -> list[tuple[str, bytes]]:
         else:
             with open(path, "rb") as f:
                 blob = f.read()
-            root = gi.xml_root(blob)
+            root = _plain_xml_root(blob)
             if root in TARGET_ROOTS:
                 docs.append((root, blob))
     return docs
+
+
+def _plain_xml_root(blob: bytes) -> str:
+    # XML starts with ASCII markup or whitespace, even in BOM-less UTF-16LE/BE.
+    if blob.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    elif blob[1:2] == b"\x00":
+        encoding = "utf-16-le"
+    elif blob.startswith(b"\x00"):
+        encoding = "utf-16-be"
+    else:
+        return gi.xml_root(blob)
+    # Only sniff the root here. ElementTree validates the original bytes of matching documents.
+    return gi.xml_root(blob.decode(encoding, errors="replace").encode("utf-8"))
 
 
 def summarize_documents(docs: list[tuple[str, bytes]]) -> dict:
