@@ -2,7 +2,7 @@
 
 Usage:
     python -I tools/gdk_runtime_calls.py <image> [<image> ...] [--json] [--out DIR]
-                                       [--table FILE] [--runtime-source FILE]
+                                       [--table FILE] [--runtime-source FILE|DIR]
 
 A title linked with xgameruntime.lib imports no GDK function. Each function of the library is a thunk that calls a
 helper with a class id and an interface id (the helper initializes the runtime once and calls QueryApiImpl), then
