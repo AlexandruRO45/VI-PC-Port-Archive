@@ -1136,12 +1136,29 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     note_slot(8);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
+    // The console desc may carry flag bits the PC runtime does not define. Measured on the retail title
+    // (static disassembly of its CreateCommandQueueX call sites at exe+0x2478813 and exe+0x2478853): the
+    // first queue passes Flags=D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT and is accepted; the second
+    // passes Flags=0x2, a console-only bit, the PC runtime fails the call, and the title checks the
+    // HRESULT and hits its own int3 at exe+0x2478866. PC CreateCommandQueue defines Flags NONE (0) and
+    // DISABLE_GPU_TIMEOUT (0x1) only, so drop the other bits before the forward and log the drop once.
+    static std::atomic<bool> masked_flags_logged{false};
+    D3D12_COMMAND_QUEUE_DESC pc_desc = *desc;
+    constexpr UINT kPcQueueFlags = D3D12_COMMAND_QUEUE_FLAG_NONE | D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+    if (pc_desc.Flags & ~kPcQueueFlags) {
+        const UINT original = pc_desc.Flags;
+        pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(pc_desc.Flags & kPcQueueFlags);
+        if (!masked_flags_logged.exchange(true)) {
+            std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueue desc flags 0x%x masked to 0x%x (console-only bits)\n",
+                         original, pc_desc.Flags);
+        }
+    }
     // The caller's null output goes to the real device on purpose: its answer (S_FALSE, E_UNEXPECTED, ...) is the
     // one to give, although the SDK annotates the parameter as required.
 #pragma warning(suppress : 6387)
-    if (!out) return self->real->CreateCommandQueue(desc, *riid, nullptr);
+    if (!out) return self->real->CreateCommandQueue(&pc_desc, *riid, nullptr);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
+    const HRESULT hr = self->real->CreateCommandQueue(&pc_desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }

@@ -91,6 +91,8 @@ struct Mock {
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
+    D3D12_COMMAND_QUEUE_DESC last_queue_desc{};  // device: the desc its last slot 8/48/75 creation received
+    bool has_last_queue_desc;
 };
 
 Mock g_pool[256];
@@ -186,7 +188,12 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
         switch (slot) {
-            case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
+            case 8:  // CreateCommandQueue: snapshot the desc, the shim passes its own masked copy
+                if (a1) {
+                    std::memcpy(&m->last_queue_desc, reinterpret_cast<const void*>(a1), sizeof(D3D12_COMMAND_QUEUE_DESC));
+                    m->has_last_queue_desc = true;
+                }
+                return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
@@ -718,7 +725,28 @@ int check_xbox_slots() {
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
-    EXPECT(mock->args[8][0] == word(&kQueueDesc));
+    // The shim forwards its own desc copy (it may mask console-only flag bits), so the mock checks the value.
+    EXPECT(mock->has_last_queue_desc &&
+           std::memcmp(&mock->last_queue_desc, &kQueueDesc, sizeof(D3D12_COMMAND_QUEUE_DESC)) == 0);
+
+    // Console-only CreateCommandQueue flag bits are masked before the PC forward. Measured on the retail title:
+    // its second queue passes Flags=0x2, a bit the PC runtime does not define, the PC call fails, and the title
+    // asserts on the HRESULT. The shim's masked copy reaches the real device; the caller's desc is untouched.
+    D3D12_COMMAND_QUEUE_DESC xbox_flags_desc{};
+    xbox_flags_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    xbox_flags_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x2);  // a console-only bit
+    void* flagged_queue = nullptr;
+    EXPECT(hr_of(raw(device, 48, word(&xbox_flags_desc), word(&kQueueIid), word(&flagged_queue))) == S_OK);
+    EXPECT(xs::is_queue_proxy(flagged_queue) && mock->has_last_queue_desc);
+    EXPECT(mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE);
+    EXPECT(mock->last_queue_desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+    EXPECT(xbox_flags_desc.Flags == static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x2));
+    EXPECT(release(flagged_queue) == 0);
+    // The PC-valid DISABLE_GPU_TIMEOUT bit survives the mask.
+    xbox_flags_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+    EXPECT(hr_of(raw(device, 48, word(&xbox_flags_desc), word(&kQueueIid), word(&flagged_queue))) == S_OK);
+    EXPECT(mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
+    EXPECT(release(flagged_queue) == 0);
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
