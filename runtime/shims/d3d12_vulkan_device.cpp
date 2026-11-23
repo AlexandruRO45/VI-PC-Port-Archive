@@ -6936,8 +6936,16 @@ public:
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            log_once("a title-placed texture (device slot 133) is not supported yet; dimension", int(desc.Dimension));
-            return d3d12_trace::result(method, E_NOTIMPL);
+            // A texture cannot take the title's pages as its memory: the title writes them in its own layout (through
+            // xg_xs, linear here) and an image's memory is in the driver's. It is an ordinary DEFAULT texture of the
+            // same description; the title's writes at `address` do not reach it yet (an upload from that layout is
+            // still to do).
+            log_once("a title-placed texture (device slot 133) is an ordinary texture the title's writes do not "
+                     "reach yet; dimension",
+                     int(desc.Dimension));
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            return d3d12_trace::result(method, create_committed(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
         }
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_CUSTOM;

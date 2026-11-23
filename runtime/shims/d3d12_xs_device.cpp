@@ -2235,7 +2235,50 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         *info = device->real->GetResourceAllocationInfo(static_cast<UINT>(args[0]), count, pc_descs.get());
         return reinterpret_cast<std::uint64_t>(ret);
-    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
+    } else if constexpr (Slot == 108) {
+        // GetResourceAllocationInfo1(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1), a struct
+        // return in the Xbox order (measured at the retail executable's RVA 0xabfda9/0xabfe07: RCX = a 16-byte return,
+        // RDX = the device, R8 = 1, R9 = 1, then the description and a D3D12_RESOURCE_ALLOCATION_INFO1 out). The title
+        // first asks with Alignment 0x1000 and asks again with 0 when the answer is not 4 KiB aligned. The
+        // descriptions are the console's 0x38-byte ones, converted as slot 25 does.
+        note_slot(108);
+        void* ret = nullptr;
+        std::uint64_t args[3] = {};
+        bool xbox_order = false;
+        DeviceProxy* const device = struct_return_call(self, a1, {a2, a3, a4, a5}, &ret, args, xbox_order);
+        if (!device || !ret) return 0;
+        auto* const each = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
+        const auto count = static_cast<UINT>(args[1]);
+        const auto* const xbox_descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[2]);
+        auto* const info = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(ret);
+        if (count == 0 || !xbox_descs || count > 4096) {
+            *info = {0, 0};
+            return reinterpret_cast<std::uint64_t>(ret);
+        }
+        std::vector<D3D12_RESOURCE_DESC> pc_descs(xbox_descs, xbox_descs + count);
+        for (auto& d : pc_descs) {
+            d.Layout = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                      : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(d.Flags) & 0x7ffu);
+        }
+        ID3D12Device4* device4 = nullptr;
+        if (FAILED(device->real->QueryInterface(IID_PPV_ARGS(&device4))) || !device4) {
+            *info = device->real->GetResourceAllocationInfo(static_cast<UINT>(args[0]), count, pc_descs.data());
+        } else {
+            *info = device4->GetResourceAllocationInfo1(static_cast<UINT>(args[0]), count, pc_descs.data(), each);
+            device4->Release();
+        }
+        static std::atomic<unsigned> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 108 GetResourceAllocationInfo1 (%s order): %u desc(s), first "
+                                 "dimension %d width %llu alignment 0x%llx -> %llu bytes, alignment 0x%llx\n",
+                         xbox_order ? "Xbox" : "PC", count, static_cast<int>(xbox_descs[0].Dimension),
+                         static_cast<unsigned long long>(xbox_descs[0].Width),
+                         static_cast<unsigned long long>(xbox_descs[0].Alignment),
+                         static_cast<unsigned long long>(info->SizeInBytes),
+                         static_cast<unsigned long long>(info->Alignment));
+        return reinterpret_cast<std::uint64_t>(ret);
+    } else if constexpr (Slot == 31 ||Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),

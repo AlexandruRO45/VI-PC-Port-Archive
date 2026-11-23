@@ -19,6 +19,8 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
+#include <intrin.h>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -97,6 +99,33 @@ void* place_descriptor_heap(std::size_t bytes) {
 }
 }  // namespace
 #endif
+
+// CLZERO (0F 01 FC) is an AMD instruction (the console's Zen 2 has it); the retail executable zeroes memory with it in
+// eleven places (1.0.2.1: RVA 0x4c81c97 and ten in the memset at 0x4e8aa70..0x4e8abb4). On a CPU without it (CPUID
+// 0x80000008 EBX bit 0) each one raises STATUS_ILLEGAL_INSTRUCTION; this handler does what the instruction does --
+// zero the 64-byte line RAX points into -- and steps over it.
+LONG CALLBACK emulate_clzero(EXCEPTION_POINTERS* info) {
+    if (!info || !info->ExceptionRecord || !info->ContextRecord ||
+        info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT& c = *info->ContextRecord;
+    const auto* ip = reinterpret_cast<const unsigned char*>(c.Rip);
+    if (ip[0] != 0x0f || ip[1] != 0x01 || ip[2] != 0xfc) return EXCEPTION_CONTINUE_SEARCH;
+    std::memset(reinterpret_cast<void*>(c.Rax & ~std::uint64_t{63}), 0, 64);
+    c.Rip += 3;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void install_clzero_emulation() {
+    int regs[4] = {};
+    __cpuid(regs, static_cast<int>(0x80000000));
+    if (static_cast<unsigned>(regs[0]) >= 0x80000008u) {
+        __cpuid(regs, static_cast<int>(0x80000008));
+        if (regs[1] & 1) return;  // the CPU has CLZERO
+    }
+    AddVectoredExceptionHandler(1, &emulate_clzero);
+    std::fprintf(stderr, "[rt] this CPU has no CLZERO; the title's CLZERO instructions are emulated\n");
+}
 
 void install_title_heap_placement(const rt::Module& module) {
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -216,6 +245,7 @@ int wmain(int argc, wchar_t** argv) {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         install_title_heap_placement(main_module);
+        install_clzero_emulation();
         // An executable with TLS that did not get index 0: its /GA code would read and write the TLS in slot 0, which
         // is gta6rt's own (or another executable's), so no code of it may run.
         const auto* main_nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
