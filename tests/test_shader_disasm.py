@@ -492,13 +492,19 @@ for ln, line in enumerate(sys.stdin.read().split("\n"), 1):
             pos.append((ln, col + 1, int(tok, 16)))
         col += len(tok) + 1
 data = bytes(b for _, _, b in pos)
-for i in range(0, len(data), 4):
+i = 0
+while i < len(data):
     w = data[i:i + 4]
+    if w.hex() == "000020cc":   # v_fma_mix_f32 with a literal: 12 bytes read, printed without the literal
+        print(f"\tv_fma_mix_f32 v0, 0x4000, v1, v2 ; encoding: [{','.join(f'0x{b:02x}' for b in data[i:i + 8])}]")
+        i += 12
+        continue
     name = names.get(w[:2].hex() + " " + w[2:].hex())
     if name is None:
         print(f"<stdin>:{pos[i][0]}:{pos[i][1]}: warning: invalid instruction encoding", file=sys.stderr)
     else:
         print(f"\t{name} ; encoding: [{','.join(f'0x{b:02x}' for b in w)}]")
+    i += 4
 '''
 
 
@@ -534,6 +540,20 @@ class VccTupleFallbackTest(unittest.TestCase):
         """The warnings' offsets come from their line and column, so input split into lines (#4210) still splices."""
         self.check(*self.fake_run(lambda code: "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + 8])
                                                            for i in range(0, len(code), 8))))
+
+    def test_an_instruction_printed_shorter_than_read(self):
+        """llvm-mc prints a v_fma_mix_f32 literal cut from its encoding: the splice still finds the later tuple."""
+        mix = bytes.fromhex("000020ccff020a0400400040")
+        old = globals()["VCC_CODE"]
+        globals()["VCC_CODE"] = mix + old
+        try:
+            asm, bad = self.fake_run()
+        finally:
+            globals()["VCC_CODE"] = old
+        self.assertEqual(bad, 0)
+        ops = [shader_ir.parse_line(l)["op"] for l in asm.splitlines() if "; encoding:" in l]
+        self.assertEqual(ops[:3], ["v_fma_mix_f32", "s_load_dwordx8", "s_load_dwordx4"])
+        self.assertIn(X8, asm.splitlines()[1])
 
     def test_with_real_llvm_mc(self):
         mc = os.environ.get("LLVM_MC")

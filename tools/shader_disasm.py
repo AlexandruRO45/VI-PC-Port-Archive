@@ -119,8 +119,8 @@ def _vcc_tuple_fallback(code: bytes, mcpu: str, wave32: bool):
     or an image's resource) and then decodes the next words misaligned. rdna2_decode prints them as the
     [s100,...,vcc_lo,vcc_hi] list the translator reads, so give llvm-mc s_nop words in their place and splice
     the Python lines back in. None when there is no such instruction or the splice does not line up."""
-    lists = {ins["pc"]: ins for ins in rdna2_decode.decode_bytes(code, mcpu=mcpu, wave32=wave32)["insns"]
-             if "vcc_lo,vcc_hi]" in rdna2_decode.format_insn(ins)}
+    decoded = {ins["pc"]: ins for ins in rdna2_decode.decode_bytes(code, mcpu=mcpu, wave32=wave32)["insns"]}
+    lists = {pc: ins for pc, ins in decoded.items() if "vcc_lo,vcc_hi]" in rdna2_decode.format_insn(ins)}
     if not lists:
         return None
     patched = bytearray(code)
@@ -138,6 +138,10 @@ def _vcc_tuple_fallback(code: bytes, mcpu: str, wave32: bool):
         while at in invalid:
             at += 4
         size = enc.count("0x")
+        # llvm-mc prints some instructions shorter than it read them (a v_fma_mix* literal is left out of the
+        # encoding): where both decoders name the same instruction here, its length is the Python decoder's.
+        if at in decoded and line.split()[0] == decoded[at]["op"]:
+            size = len(decoded[at]["enc"]) // 2
         if at in lists:
             out.append(rdna2_decode.format_insn(lists[at]) + "\n")
             skip_to, placed = at + len(lists[at]["enc"]) // 2, placed + 1
