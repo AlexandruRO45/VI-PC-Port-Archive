@@ -161,6 +161,19 @@ class ScanTests(unittest.TestCase):
                 pending.replace(root / "index.json")
                 self.assertEqual(scan.scan_directory(disasm)["per_stage"][stage]["with_selected_op"], 1)
 
+    def test_stage_index_saved_with_utf8_bom(self):
+        name, listing = PS_W64_SENSITIVE
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            disasm = root / "disasm"
+            disasm.mkdir()
+            (disasm / name).write_text(listing, encoding="utf-8", newline="\n")
+            index = [{"file": Path(name).with_suffix(".dxbc").name, "stage": "gs"}]
+            (root / "index.json").write_text(json.dumps(index), encoding="utf-8-sig", newline="\n")
+            stages = scan.scan_directory(disasm)["per_stage"]
+            self.assertEqual(stages["gs"]["with_selected_op"], 1)
+            self.assertEqual(stages["ps"]["shaders"], 0)
+
     def test_main_json_has_no_shader_names(self):
         # privacy rule: nothing from the game leaves the work folder, not even file names
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outdir:

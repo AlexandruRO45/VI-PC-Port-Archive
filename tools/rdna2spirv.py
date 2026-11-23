@@ -15013,7 +15013,7 @@ def no_contraction(text):
 @lru_cache(maxsize=1)
 def _indexed_stages(index_path, _version):
     """Keep one carve's stage table in memory while its index is unchanged."""
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:
         return {e["file"][:-5]: e["stage"] for e in _json.load(f)}
 
 
