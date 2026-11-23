@@ -34,11 +34,11 @@ function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$
     return ""
 }
 
-function Get-BatchCommand([string]$Tool) {
-    # cmd's CALL doubles ^ in the remaining command (#3554). Use it only for .cmd/.bat so
-    # those wrappers return; cmake.exe is invoked quoted, with no CALL.
-    if ($Tool -match '\.(cmd|bat)$') { return "call `"$Tool`"" }
-    return "`"$Tool`""
+function Get-BatchCommand([string]$Tool, [string]$CommandArgs) {
+    # cmd's CALL doubles ^ in the remaining command and cannot find a .cmd/.bat whose own
+    # path contains ^ (#3554). Nested cmd /c returns without CALL; cmake.exe stays quoted.
+    if ($Tool -match '\.(cmd|bat)$') { return "cmd /d /s /c `"`"$Tool`" $CommandArgs`"" }
+    return "`"$Tool`" $CommandArgs"
 }
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -68,10 +68,11 @@ $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
 $vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
 
 if ($cmake -and $ninja) {
-    $runCmake = Get-BatchCommand $cmake
+    $runConfigure = Get-BatchCommand $cmake "-S `"$src`" -B `"$out`" -G Ninja `"-DCMAKE_MAKE_PROGRAM=$ninja`" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk"
+    $runBuild = Get-BatchCommand $cmake "--build `"$out`" -j $jobs"
     $body = @"
-$runCmake -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk || exit /b 1
-$runCmake --build "$out" -j $jobs || exit /b 1
+$runConfigure || exit /b 1
+$runBuild || exit /b 1
 "@
 } else {
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
