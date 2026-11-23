@@ -386,5 +386,59 @@ class SaluAndB64DivergenceTests(unittest.TestCase):
         self.assertEqual(state.exec, 0)
         self.assertEqual(state.scc, 0)
 
+class SaluAndB64AliasingTests(unittest.TestCase):
+    """Register aliasing: in-place destination, source-target overlaps, partial dwords."""
+
+    def test_dst_aliases_src0(self) -> None:
+        state = ScalarState()
+        a = 0x12345678_9ABCDEF0
+        b = 0x0F0F0F0F_F0F0F0F0
+        state.write_sgpr64(0, a)
+        state.write_sgpr64(2, b)
+
+        state.step_s_and_b64("s[0:1]", "s[0:1]", "s[2:3]")
+        expected = a & b
+        self.assertEqual(state.read_sgpr64(0), expected)
+        self.assertEqual(state.read_sgpr64(2), b)
+
+    def test_dst_aliases_src1(self) -> None:
+        state = ScalarState()
+        a = 0x12345678_9ABCDEF0
+        b = 0x0F0F0F0F_F0F0F0F0
+        state.write_sgpr64(0, a)
+        state.write_sgpr64(2, b)
+
+        state.step_s_and_b64("s[2:3]", "s[0:1]", "s[2:3]")
+        expected = a & b
+        self.assertEqual(state.read_sgpr64(0), a)
+        self.assertEqual(state.read_sgpr64(2), expected)
+
+    def test_all_operands_same_register(self) -> None:
+        state = ScalarState()
+        a = 0xDEADBEEF_CAFEBABE
+        state.write_sgpr64(0, a)
+
+        state.step_s_and_b64("s[0:1]", "s[0:1]", "s[0:1]")
+        self.assertEqual(state.read_sgpr64(0), a)
+        self.assertEqual(state.scc, 1)
+
+    def test_overlapping_partial_sgprs(self) -> None:
+        """Destination s[1:2] partially overlaps src0 s[0:1] and src1 s[2:3]."""
+        state = ScalarState()
+        state.sgprs[0] = 0xAAAAAAAA
+        state.sgprs[1] = 0xBBBBBBBB
+        state.sgprs[2] = 0xCCCCCCCC
+        state.sgprs[3] = 0xDDDDDDDD
+
+        s0 = state.read_sgpr64(0)
+        s1 = state.read_sgpr64(2)
+        expected = s0 & s1
+
+        state.step_s_and_b64("s[1:2]", "s[0:1]", "s[2:3]")
+
+        self.assertEqual(state.sgprs[0], 0xAAAAAAAA)
+        self.assertEqual(state.read_sgpr64(1), expected)
+        self.assertEqual(state.sgprs[3], 0xDDDDDDDD)
+
 if __name__ == "__main__":
     unittest.main()
