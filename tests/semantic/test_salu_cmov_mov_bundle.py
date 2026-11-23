@@ -493,6 +493,29 @@ class TestSMovkI32Oracle(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], MASK32)
 
+class SMovkI32Expr(ASTNode):
+    def __init__(self, simm16: int) -> None:
+        self.simm16 = simm16
+
+    def eval(self) -> int:
+        return ref_s_movk_i32(self.simm16)
+
+
+class TestSMovkI32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SMovkI32Expr(-100)
+        self.assertEqual(expr.eval(), 0xFFFFFF9C)
+
+    def test_ast_translator_execution(self) -> None:
+        body = [
+            "s_movk_i32 s4, -100",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_movk_ast")
+        for l in range(32):
+            self.assertEqual(results[l], 0xFFFFFF9C)
+
 
 if __name__ == "__main__":
     unittest.main()
