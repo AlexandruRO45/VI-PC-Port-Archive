@@ -466,5 +466,25 @@ class TestInterpMovF32SIMDAndFlat(unittest.TestCase):
             self.assertEqual(wave.vgprs[5][lane], f32_to_bits(123.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_mov_f32 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+class TestInterpMovF32HardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            VInterpMovF32Instruction(dst=RegisterOperand(OperandType.VGPR, 0), vsel="p30", attr=AttrOperand(0, "x"))
+
+    def test_hardware_translator_execution(self):
+        prog = [
+            "v_interp_mov_f32 v3, p0, attr0.y",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_interp_mov_hw", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
+
 if __name__ == '__main__':
     unittest.main()
