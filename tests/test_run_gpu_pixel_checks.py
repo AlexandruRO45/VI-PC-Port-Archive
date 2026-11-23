@@ -26,6 +26,37 @@ class PixelChecks(unittest.TestCase):
         grad = b"".join(struct.pack("<4f", (i % 64 + 0.5) / 64, (i // 64 + 0.5) / 64, 0.5, 1.0) for i in range(4096))
         self.assertTrue(rgt.check_grad(self.raw(grad), 0.5, 1.0)[0])
 
+    def test_base_ids_uses_full_flat_id_and_uv_readback(self):
+        frame = b"".join(struct.pack("<2I2f", 0x101, 0x102, (x + 0.5) / 64, (y + 0.5) / 64)
+                         for y in range(64) for x in range(64))
+        last_pixel = frame[-16:]
+        controls = (
+            ("complete", frame, True),
+            ("empty", b"", False),
+            ("one pixel", frame[:16], False),
+            ("partial pixel", frame[:-1], False),
+            ("extra pixel", frame + last_pixel, False),
+            ("wrong last ID", frame[:-16] + struct.pack("<I", 0x7111) + last_pixel[4:], False),
+            ("wrong last UV", frame[:-8] + struct.pack("<2f", 0.0, 0.0), False),
+            ("NaN last UV", frame[:-8] + struct.pack("<2f", NAN, 1.0), False),
+            ("infinite last UV", frame[:-8] + struct.pack("<2f", 1.0, float("inf")), False),
+        )
+        with tempfile.TemporaryDirectory() as work:
+            for name in ("vs_base_ids.spv", "ps_flat.spv"):
+                (Path(work) / name).touch()
+            for label, data, expected in controls:
+                with self.subTest(frame=label):
+                    def harness(_tool, vertex, pixel, raw, *, env):
+                        self.assertEqual((Path(vertex).name, Path(pixel).name), ("vs_base_ids.spv", "ps_flat.spv"))
+                        self.assertEqual(env["VKH_DRAW"], "16,7")
+                        raw.write_bytes(data)
+                        return 0, "ok 64x64"
+
+                    self.assertEqual(rgt.check_flat(self.raw(data))[0], expected)
+                    with patch.object(check, "run", side_effect=harness):
+                        standalone = check.base_ids_test(work, work)
+                    self.assertEqual(standalone == "", expected, standalone)
+
     def test_bary_checks_both_interpolation_paths(self) -> None:
         triangle = []
         for y in range(64):

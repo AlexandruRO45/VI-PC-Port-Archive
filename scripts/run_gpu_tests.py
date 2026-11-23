@@ -43,7 +43,7 @@ from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shader
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
-from check import barycentric_problem
+from check import barycentric_problem, flat_readback_result
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
@@ -429,18 +429,7 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
 def check_flat(raw_path: str) -> tuple[bool, str]:
     """ps_flat with vs_ids: the integer IDs come from the first (provoking) vertex, the UVs still interpolate."""
     with open(raw_path, "rb") as source:
-        data = source.read()
-    if len(data) != 64 * 64 * 16:
-        return False, f"expected a 64x64 frame, got {len(data)} bytes"
-    px = list(struct.iter_unpack("<2I2f", data))
-    if problem := frame_problem(px):
-        return False, problem
-    w = int(len(px) ** 0.5)
-    wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
-    err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
-    ok = wrong == 0 and err < 1e-6
-    return ok, (f"{len(px)} pixels: flat IDs exact, uv within {err:.1g}" if ok else
-                f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}")
+        return flat_readback_result(source.read())
 
 
 def check_wqm(raw_path: str) -> tuple[bool, str]:

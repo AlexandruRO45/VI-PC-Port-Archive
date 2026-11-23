@@ -1334,6 +1334,26 @@ def interp_f16_high_problem(px):
     return "" if err < 2e-3 else f"f16 halves off by {err:.3g}"
 
 
+def flat_pixel_result(px):
+    """ps_flat's two exact provoking-vertex IDs and interpolated UVs over the full default frame."""
+    if len(px) != 64 * 64:
+        return False, f"expected 4096 pixels, got {len(px)}"
+    if any(not math.isfinite(v) for p in px for v in p[2:]):
+        return False, "UVs contain non-finite values"
+    wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
+    err = max(max(abs(u - (i % 64 + 0.5) / 64), abs(v - (i // 64 + 0.5) / 64))
+              for i, (_, _, u, v) in enumerate(px))
+    ok = wrong == 0 and err < 1e-6
+    return ok, (f"{len(px)} pixels: flat IDs exact, uv within {err:.1g}" if ok else
+                f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}")
+
+
+def flat_readback_result(data):
+    if len(data) != 64 * 64 * 16:
+        return False, f"expected a 64x64 frame, got {len(data)} bytes"
+    return flat_pixel_result(list(struct.iter_unpack("<2I2f", data)))
+
+
 def base_ids_test(tools, spirv):
     """vs_base_ids with ps_flat, drawn with firstVertex 16 and firstInstance 7: the VS input VGPRs are zero-based on
     the hardware, so every pixel must still see vertex 0 of instance 0 (0x101, 0x102), not 0x7111."""
@@ -1350,9 +1370,8 @@ def base_ids_test(tools, spirv):
             return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
         if code or not raw.is_file():
             return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
-        px = list(struct.iter_unpack("<2I2f", raw.read_bytes()))
-    wrong = [p for p in px if (p[0], p[1]) != (0x101, 0x102)]
-    return "" if px and not wrong else f"{len(wrong)} of {len(px)} pixels differ, e.g. {hex(wrong[0][0]) if wrong else '-'}"
+        ok, detail = flat_readback_result(raw.read_bytes())
+    return "" if ok else detail
 
 
 def wide_pixel_skip(name, out):
@@ -1462,12 +1481,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_bary":
         return barycentric_problem(px, 1e-6)
     if name == "ps_flat":
-        if any(not math.isfinite(v) for p in px for v in p[2:]):
-            return "UVs contain non-finite values"
-        w = int(n ** 0.5)
-        wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
-        err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
-        return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}"
+        ok, detail = flat_pixel_result(px)
+        return "" if ok else detail
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
     if name == "ps_ij_computed":
