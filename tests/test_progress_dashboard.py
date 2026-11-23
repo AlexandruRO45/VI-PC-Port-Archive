@@ -94,6 +94,42 @@ class Tests(unittest.TestCase):
                     self.assertEqual(result["cases"], 2)
                     self.assertEqual(result["all_skipped"], skipped == 2)
 
+    def test_junit_matches_cases_and_verdicts_in_the_report_namespace(self):
+        cases = """
+            <testcase name="broken" classname="sample" time="1.25">
+                <failure message="assertion failed"/><error message="secondary error"/>
+            </testcase>
+            <testsuite>
+                <testcase name="errored"><error message="setup failed"/></testcase>
+                <testcase name="skipped"><skipped/></testcase>
+            </testsuite>
+            <testcase name="passed"><ext:failure/><ext:error/><ext:skipped/></testcase>
+            <ext:testcase name="foreign case"/>
+        """
+        expected = [
+            ("sample::broken", "fail", 1.25, "assertion failed"),
+            ("errored", "fail", None, "setup failed"),
+            ("skipped", "skip", None, ""),
+            ("passed", "pass", None, ""),
+        ]
+        for namespace in ("", ' xmlns="urn:example:junit"', ' xmlns="*"'):
+            ns = namespace + ' xmlns:ext="urn:example:extension"'
+            reports = {
+                "testsuite": f"<testsuite{ns}>{cases}</testsuite>",
+                "testsuites": f"<testsuites{ns}><testsuite>{cases}</testsuite>"
+                              '<ext:testsuite><testcase name="foreign suite case"/></ext:testsuite></testsuites>',
+            }
+            for root, report in reports.items():
+                with self.subTest(namespace=namespace, root=root):
+                    self.assertEqual(pd.parse_junit(report), expected)
+
+    def test_junit_preserves_the_fallback_for_other_root_names(self):
+        report = ('<report xmlns="urn:example:extension">'
+                  '<testsuite><testcase name="extension case"/></testsuite>'
+                  '<testsuite xmlns=""><testcase name="plain case"/></testsuite>'
+                  '</report>')
+        self.assertEqual(pd.parse_junit(report), [("plain case", "pass", None, "")])
+
     def test_junit_ctest_and_pytest_flavours(self):
         ctest = '<testsuite><testcase name="loader" classname="loader" status="run" time="0.9"/>' \
                 '<testcase name="xmem" classname="xmem" status="fail"><failure message="C:\\Users\\me\\x\\out.txt bad"/></testcase></testsuite>'
@@ -216,6 +252,8 @@ class Freshness(unittest.TestCase):
             "before.xml": (100, ctest_suite.format(
                 '<testcase name="older" status="run"/><testcase name="failed" status="fail"/>'
                 '<testcase name="skipped" status="notrun"/>')),
+            "before-namespaced.xml": (100, '<testsuite xmlns="urn:example:junit" disabled="0" hostname="">'
+                                           '<testcase name="older namespaced" status="run"/></testsuite>'),
             "after.xml": (300, ctest_suite.format('<testcase name="newer" status="run"/>')),
             "pytest.xml": (100, '<testsuites><testsuite name="pytest" hostname="host">'
                            '<testcase name="unrelated"/></testsuite></testsuites>'),
@@ -238,13 +276,14 @@ class Freshness(unittest.TestCase):
         self.assertEqual(outcomes, {
             "local": ("partial", "revalidation_required"),
             "older": ("partial", "revalidation_required"),
+            "older namespaced": ("partial", "revalidation_required"),
             "failed": ("failed", "failed"),
             "skipped": ("unknown", "unknown"),
             "newer": ("verified", "current"),
             "unrelated": ("verified", "current"),
         })
         metric = next(m for m in col.metrics if m["id"] == "runtime.current")
-        self.assertEqual((metric["numerator"], metric["denominator"]), (2, 6))
+        self.assertEqual((metric["numerator"], metric["denominator"]), (2, 7))
 
 
 class GpuLog(unittest.TestCase):
@@ -439,6 +478,33 @@ class Scrub(unittest.TestCase):
 
 
 class Outputs(unittest.TestCase):
+    def test_namespaced_junit_cli_records_cases_in_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "junit.xml"
+            out = Path(tmp) / "out"
+            report.write_text(
+                '<j:testsuites xmlns:j="urn:example:junit"><j:testsuite>'
+                '<j:testcase classname="namespace_case" name="broken"><j:failure message="assertion failed"/></j:testcase>'
+                '<j:testcase classname="namespace_case" name="passed"/>'
+                '<j:testcase classname="namespace_case" name="skipped"><j:skipped/></j:testcase>'
+                '</j:testsuite></j:testsuites>',
+                encoding="utf-8", newline="\n",
+            )
+            result = subprocess.run([sys.executable, "-I", "-B", TOOL, "--out", str(out), "--junit", str(report)],
+                                    capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+            snapshot_path, = (out / "snapshots").glob("progress_*.json")
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+
+        cases = {c["name"]: (c["status"], c.get("detail"))
+                 for c in snapshot["components"] if c["name"].startswith("namespace_case::")}
+        self.assertEqual(cases, {
+            "namespace_case::broken": ("failed", "assertion failed"),
+            "namespace_case::passed": ("verified", None),
+            "namespace_case::skipped": ("unknown", None),
+        })
+        self.assertEqual([(s["status"], s["records"]) for s in snapshot["sources"] if s["id"] == "junit"], [("ok", 3)])
+
     def test_nonpositive_test_options_are_argument_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")

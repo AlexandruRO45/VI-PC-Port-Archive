@@ -373,16 +373,26 @@ def group_of_test(name):
 def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
     root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
-    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    # ElementTree expands namespaced tags to {uri}name.
+    namespace, brace, root_name = str(root.tag).rpartition("}")
+    prefix = namespace + brace if root_name in ("testsuite", "testsuites") else ""
+
+    def matching_children(element, name):
+        tag = prefix + name
+        return (child for child in element if child.tag == tag)
+
+    suites = [root] if root_name == "testsuite" else matching_children(root, "testsuite")
     out = []
     for suite in suites:
-        for tc in suite.iter("testcase"):
+        for tc in suite.iter(prefix + "testcase"):
             status = tc.get("status")
             st = (status or "").lower()
-            fail = tc.find("failure") if tc.find("failure") is not None else tc.find("error")
+            fail = next(matching_children(tc, "failure"), None)
+            if fail is None:
+                fail = next(matching_children(tc, "error"), None)
             if fail is not None or st == "fail":
                 res = "fail"
-            elif tc.find("skipped") is not None or st in ("notrun", "disabled"):
+            elif next(matching_children(tc, "skipped"), None) is not None or st in ("notrun", "disabled"):
                 res = "skip"
             else:
                 res = "pass"
@@ -464,7 +474,8 @@ def collect_ctest(col, args):
             col.source("junit", path, "invalid", note=str(e))
             continue
         # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.
-        is_ctest = root.tag == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
+        root_name = root.tag.rsplit("}", 1)[-1]
+        is_ctest = root_name == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
         rows = parse_junit(root)
         sets.append(("junit:" + os.path.basename(path), path, rows, is_ctest))
         col.source("junit", path, "ok", len(rows))
