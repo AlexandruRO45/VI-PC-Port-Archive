@@ -117,9 +117,9 @@ class TimecyclePairsTests(unittest.TestCase):
 
 
 class DirectoryReportTests(unittest.TestCase):
-    def fixture(self, folder, carved):
+    def fixture(self, folder, carved, modifier=SYNTH_MOD, split_at=256):
         if carved:
-            chunks = (SYNTH_MOD[:256], SYNTH_MOD[256:])
+            chunks = (modifier[:split_at], modifier[split_at:])
             rows, paths = [], []
             for i, chunk in enumerate(chunks):
                 offset = 0x1000 + i * 256
@@ -186,6 +186,33 @@ class DirectoryReportTests(unittest.TestCase):
                     self.assertEqual(f.read(), before)
                 with open(report, "rb") as f:
                     self.assertEqual(f.read(), before)
+
+    def test_modifier_count_requires_the_full_root_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = tp.TARGET_ROOTS[0]
+            for index, suffix in enumerate(("", "\u00e9", "\u0301")):
+                path = os.path.join(tmp, f"document-{index}.xml")
+                with open(path, "wb") as f:
+                    f.write(f"<{root}{suffix}/>".encode())
+            report = os.path.join(tmp, "report.json")
+            status, _, err = self.run_cli(tmp, "--out", report)
+            self.assertEqual(status, 0, err)
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["modifier_docs"], 1)
+
+    def test_carved_report_classifies_the_name_after_reassembly(self):
+        declaration = b'<?xml version="1.0"?>'
+        name = ("<" + tp.TARGET_ROOTS[0]).encode()
+        first = declaration + b" " * (65536 - len(declaration) - len(name)) + name
+        for suffix, expected in (("", 1), ("\u00e9", 0)):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                data = first + suffix.encode() + b" " * 128 + b"/>"
+                self.fixture(tmp, carved=True, modifier=data, split_at=65536)
+                report = os.path.join(tmp, "report.json")
+                status, _, err = self.run_cli(tmp, "--out", report)
+                self.assertEqual(status, 0, err)
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["modifier_docs"], expected)
 
     def test_distinct_report_in_directory_can_be_created_and_replaced(self):
         for carved in (False, True):

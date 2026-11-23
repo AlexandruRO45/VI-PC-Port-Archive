@@ -88,6 +88,21 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual([(r["type"], r["chunks"]) for r in data["rows"]],
                          [("other", 2), ("binary", 1), ("binary", 1)])
 
+    def test_root_name_can_end_at_a_stream_boundary(self):
+        for declaration in (b'<?xml version="1.0"?>', b""):
+            first = declaration + b" " * (65536 - len(declaration) - len(b"<Catalog")) + b"<Catalog"
+            second = b">" + b" " * (65536 - len(b"></Catalog>")) + b"</Catalog>"
+            self.add(first, chunks=[first, second])
+            self.add(b"next payload")
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual([(r["root"], r["chunks"], r["complete"]) for r in rows],
+                         [("Catalog", 2, True), ("", 1, True)] * 2)
+
     def test_rejects_a_shared_csv_and_json_destination(self):
         self.finish()
         out = os.path.join(self.root, "index.json")
@@ -308,6 +323,14 @@ class XmlClassificationTest(unittest.TestCase):
             with self.subTest(data=data):
                 self.assertTrue(self.tool.xml_complete("Foo", data))
         self.assertFalse(self.tool.xml_complete("", b"<Foo></Foo>"))
+
+    def test_root_requires_a_complete_ascii_name(self):
+        for data in (b"<Catalog>", b"<Catalog/>", b"<Catalog\tkey='value'/>"):
+            with self.subTest(data=data):
+                self.assertEqual(self.tool.xml_root(data), "Catalog")
+        for data in (b"<Catalog", "<Catalog\u00e9/>".encode(), "<Catalog\u0301/>".encode()):
+            with self.subTest(data=data):
+                self.assertEqual(self.tool.xml_root(data), "")
 
     def test_quoted_greater_than_in_attributes_does_not_end_a_tag(self):
         for data in (b'<Foo><Foo attr="x>y"/></Foo>', b"<Foo><Foo attr='x>y'/></Foo>",

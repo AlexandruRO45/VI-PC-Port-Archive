@@ -41,7 +41,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 CARVER = os.path.join(ROOT, "rpf9_carve.py")
 BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
-XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
+# A tag-name delimiter confirms that the ASCII matcher saw the whole name.
+XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)(?=[ \t\r\n/>])")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
@@ -274,6 +275,7 @@ def build_rows(rows: list, source) -> list:
                 if nk in ("decl", "bink2", "rbf0", "psin", "other", "binary"):
                     break
                 blob += nxt
+                root = root or xml_root(blob)
                 group.append(j)
                 j += 1
             out.append(row_for("xml", rows, group, root=root, header=True,
@@ -319,8 +321,11 @@ def build_rows(rows: list, source) -> list:
                         chunks.append(nxt)
                     group.append(j)
                     j += 1
-                    if chunks is not None and start_root and tail_root(nxt) == start_root and xml_complete(start_root, b"".join(chunks)):
-                        break
+                    if chunks is not None and (end_root := tail_root(nxt)) and start_root in ("", end_root):
+                        blob = b"".join(chunks)
+                        start_root = start_root or xml_root(blob)
+                        if end_root == start_root and xml_complete(start_root, blob):
+                            break
             if chunks is not None:
                 blob = b"".join(chunks)
                 root = tail_root(blob) or (xml_root(blob) if standalone_xml(blob) else "")
