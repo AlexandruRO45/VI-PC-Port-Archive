@@ -79,7 +79,8 @@ def vertices(b):
 def vehicle_documents(carve):
     """(cell-size Counter, set of ModelName values) of the CVehiclePoints documents in a carve of common.rpf."""
     cells, names = Counter(), set()
-    for p in sorted(glob.glob(os.path.join(carve, "*.bin"))):
+    # --common names a directory, not a pattern: brackets must not select a different sibling carve.
+    for p in sorted(glob.glob(os.path.join(glob.escape(os.fspath(carve)), "*.bin"))):
         with open(p, "rb") as f:
             t = f.read()
         m = re.search(rb"<(CVehiclePoints\w*)[\s>]", t)
