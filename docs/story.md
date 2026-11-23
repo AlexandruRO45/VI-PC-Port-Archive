@@ -8,8 +8,9 @@ Everything below is aggregate. No game payload, path or name is stored in this r
 ## Archives and index
 
 Sizes are exact bytes from the package; `data offset` is the little-endian u32 at file offset 4.
-A full index of `story000.rpf` was not completed (see the layout section); its headline row is the
-first 1 GiB of the data area, and the full-file non-inflating signature scan is reported separately.
+The full index of `story000.rpf` (141,385 streams, see the layout section) is below; its row in this
+table is the first 1 GiB window of the data area, and the full-file non-inflating signature scan is
+reported separately.
 
 | Archive | File size | Data offset | Scope | Streams | Stored | Inflated | Zero padding | Unread | Readable | Elapsed |
 |---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|
