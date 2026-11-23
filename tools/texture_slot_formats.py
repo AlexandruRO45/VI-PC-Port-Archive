@@ -8,7 +8,8 @@ carries ``Param`` (the stored 32-bit parameter name hash as eight hex digits), `
 * exact: the 64-bit key is a texture pool ``AssetKey`` (``ttpf``/``ttpf_pack`` manifests, ``DxgiFormat``) and/or an
   embedded texture ``Key`` (``Format``) of any model. The formats from both sources are pooled: a key with one format
   is tallied, a key with more than one (two pools, or a pool and an embedded copy, disagreeing) is counted as
-  conflicting and left out of the tally. Exact keys found in both sources, and pool matches whose row has no
+  conflicting and left out of the tally; a key whose rows give no format at all is still exact and counted as
+  without format. Exact keys found in both sources, and pool matches whose row has no
   exported file (``File`` null or missing on disk), are counted too: an exact match is a metadata match, not proof
   that a texture file is available;
 * candidate: otherwise the stored name hash is on exactly one embedded or dictionary entry (``Hash``); not proof of
@@ -79,8 +80,11 @@ def usable_hash(row, **kw):
 
 
 def add(index, key, fmt):
-    if key is not None and fmt is not None:
-        index.setdefault(key, set()).add(fmt)
+    """Record that ``key`` exists, and its format when there is one: a row without a format is still a key match."""
+    if key is not None:
+        formats = index.setdefault(key, set())
+        if fmt is not None:
+            formats.add(fmt)
 
 
 def models_archives(export):
@@ -179,8 +183,10 @@ def census(export, only=None):
                 found = pool.get(k, set()) | emb.get(k, set())
                 if len(found) == 1:
                     fmts[next(iter(found))] += 1
-                else:
+                elif found:
                     part["conflicting"] += 1
+                else:
+                    part["no format"] += 1
                 continue
             entries = [f for h in hashes if h is not None for f in by_hash.get(h, [])]
             if len(entries) == 1:
@@ -193,7 +199,7 @@ def census(export, only=None):
         params[p] = {
             "bindings": bindings[p], "distinct_textures": len(keys),
             "exact": part["exact"], "exact_conflicting": part["conflicting"], "exact_pool_and_embedded": part["both"],
-            "exact_pool_without_file": part["no file"],
+            "exact_pool_without_file": part["no file"], "exact_without_format": part["no format"],
             "candidate": part["candidate"], "ambiguous": part["ambiguous"], "unresolved": part["unresolved"],
             "formats": {str(f): n for f, n in sorted(fmts.items(), key=lambda kv: (-kv[1], str(kv[0])))},
             "candidate_formats": {str(f): n for f, n in sorted(cand_fmts.items(),
@@ -201,7 +207,8 @@ def census(export, only=None):
         }
     for p in bindings:                  # parameters seen only without a usable key
         params.setdefault(p, {"bindings": bindings[p], "distinct_textures": 0, "exact": 0, "exact_conflicting": 0,
-                              "exact_pool_and_embedded": 0, "exact_pool_without_file": 0, "candidate": 0,
+                              "exact_pool_and_embedded": 0, "exact_pool_without_file": 0,
+                              "exact_without_format": 0, "candidate": 0,
                               "ambiguous": 0, "unresolved": 0, "formats": {}, "candidate_formats": {}})
     order = sorted(params, key=lambda p: (-params[p]["bindings"], p))
     return {"archives": sorted(only) if only is not None else "all", "models": models,
@@ -250,7 +257,8 @@ def main(argv=None) -> int:
     for p, d in (shown[:a.top] if a.top else shown):
         notes = [f"{d[k]:,} {label}" for k, label in (("exact_conflicting", "conflicting"),
                                                       ("exact_pool_and_embedded", "pool and embedded"),
-                                                      ("exact_pool_without_file", "pool row without file"))
+                                                      ("exact_pool_without_file", "pool row without file"),
+                                                      ("exact_without_format", "without format"))
                  if d[k]]
         note = f" ({', '.join(notes)})" if notes else ""
         print(f"0x{p} | {d['bindings']:,} | {d['distinct_textures']:,} | {d['exact']:,}{note} | "

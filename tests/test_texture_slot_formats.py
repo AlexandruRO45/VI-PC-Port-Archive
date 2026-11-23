@@ -261,5 +261,18 @@ class ReviewCases(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("models 1,", out)
 
+    def test_key_match_without_a_format_stays_exact(self):
+        # Flyander on #5067: a pool row with DxgiFormat null and File null still matches the 64-bit key
+        emb = {"Textures": [{"Hash": "66666666", "Key": "00000000000000E2"}]}     # embedded copy without Format
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([("12345678", "00000000000000A1", "77777777"),
+                                       ("12345678", "00000000000000E2", "66666666")], embedded=emb)])
+            dump(os.path.join(exp, "ttpf", "nofmt", "manifest.json"), {"Count": 1, "Textures": [
+                {"AssetKey": "00000000000000A1", "DxgiFormat": None, "File": None}]})
+            d = tsf.census(exp)["parameters"]["12345678"]
+        self.assertEqual((d["exact"], d["unresolved"], d["exact_without_format"], d["exact_conflicting"]),
+                         (2, 0, 2, 0))
+        self.assertEqual((d["formats"], d["exact_pool_without_file"]), ({}, 1))
+
 if __name__ == "__main__":
     unittest.main()
