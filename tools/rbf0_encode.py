@@ -204,20 +204,11 @@ def encode(doc):
     return bytes(w.out)
 
 
-def resources(source, limit=None):
-    """Yield (doc, original bytes) for every RBF0 resource in a carve directory or a single file. The bytes are
-    the resource's chunks joined as rbf0_tree.decode_source joined them; check() compares their length with the
-    size the document records."""
-    docs, _summary = rbf0_tree.decode_source(source, limit=limit)
-    rows, read = rbf0_tree._rows(source)
-    by_name = {}
-    for i, row in enumerate(rows):
-        if row["name"] in by_name:      # a document names its first chunk; two rows of one name cannot be told apart
-            raise rbf0_tree.SelectionError(f"two carved streams are named {row['name']!r}")
-        by_name[row["name"]] = i
-    for doc in docs:
-        i = by_name[doc["source"]]
-        yield doc, b"".join(read(rows[j]) for j in range(i, i + doc["chunks"]))
+def resources(source, limit=None, stats=None):
+    """Yield (doc, original bytes) for every RBF0 resource in a carve directory or a single file. Each resource
+    is read once: the bytes are the chunks rbf0_tree joined while decoding, not a second read of them. `stats`
+    receives how many resources the source holds, as rbf0_tree.iter_resources reports it."""
+    yield from rbf0_tree.iter_resources(source, limit=limit, stats=stats)
 
 
 def check(source, limit=None):
@@ -226,7 +217,8 @@ def check(source, limit=None):
     counts = {"resources": 0, "exact": 0, "different": 0, "refused": 0}
     reasons = dict.fromkeys(REASONS, 0)
     layouts = {}
-    for doc, blob in resources(source, limit):
+    stats = {}                                  # the walk reports the source's total before the first resource
+    for doc, blob in resources(source, limit, stats):
         counts["resources"] += 1
         layout = layouts.setdefault(doc["layout"], {"resources": 0, "exact": 0})
         layout["resources"] += 1
@@ -241,12 +233,7 @@ def check(source, limit=None):
             layout["exact"] += 1
         else:
             counts["different"] += 1
-    # Only a limited run can stop short of the source; counting it is a second walk, so do it only then.
-    if limit is None:
-        counts["total"] = counts["resources"]
-    else:
-        rows, _read = rbf0_tree._rows(source)
-        counts["total"] = sum(1 for row in rows if rbf0_tree.starts_resource(row))
+    counts["total"] = stats["total"]
     return {**counts, "refused_by_reason": {k: v for k, v in reasons.items() if v}, "by_layout": layouts}
 
 

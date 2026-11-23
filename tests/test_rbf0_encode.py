@@ -325,11 +325,17 @@ class Cli(unittest.TestCase):
         blob = every_record(True)
         doc = rbf0_tree.parse_resource(blob)
         self.assertEqual(doc["size"], len(blob))
+        def fake(resource):
+            def walk(source, limit=None, stats=None):
+                stats["total"] = 1      # the walk reports the source's total before its first resource
+                yield resource, blob
+            return walk
+
         real = rbf0_encode.resources
         self.addCleanup(setattr, rbf0_encode, "resources", real)
-        rbf0_encode.resources = lambda source, limit=None: iter([(doc, blob)])
+        rbf0_encode.resources = fake(doc)
         self.assertEqual(rbf0_encode.check("unused")["exact"], 1)
-        rbf0_encode.resources = lambda source, limit=None: iter([({**doc, "size": len(blob) - 1}, blob)])
+        rbf0_encode.resources = fake({**doc, "size": len(blob) - 1})
         counts = rbf0_encode.check("unused")
         self.assertEqual((counts["exact"], counts["different"]), (0, 1))
 
@@ -341,6 +347,35 @@ class Cli(unittest.TestCase):
         rbf0_tree._rows = lambda source: ([dict(row), dict(row, offset=1)], lambda r: blob)
         with self.assertRaises(rbf0_tree.SelectionError):
             list(rbf0_encode.resources("unused"))
+        with self.assertRaises(rbf0_tree.SelectionError):   # refused before a --limit slice can be compared
+            list(rbf0_encode.resources("unused", limit=1))
+
+    def test_check_walks_the_carve_once_and_reads_each_stream_once(self):
+        self.put("00001000.bin", every_record(True))
+        self.put("00002000.bin", every_record(False))
+        walks, reads = [], []
+        real = rbf0_tree._rows
+        self.addCleanup(setattr, rbf0_tree, "_rows", real)
+
+        def rows(source):
+            walks.append(source)
+            rws, read = real(source)
+
+            def counted(row):
+                reads.append(row["name"])
+                return read(row)
+            return rws, counted
+
+        rbf0_tree._rows = rows
+        counts = rbf0_encode.check(self.carve)
+        self.assertEqual((counts["resources"], counts["total"]), (2, 2))
+        self.assertEqual(walks, [self.carve])                          # one listing, not one per pass
+        self.assertEqual(sorted(reads), ["00001000.bin", "00002000.bin"])
+        walks.clear(), reads.clear()
+        counts = rbf0_encode.check(self.carve, limit=1)
+        self.assertEqual((counts["resources"], counts["total"]), (1, 2))   # the total comes from that same walk
+        self.assertEqual(walks, [self.carve])
+        self.assertEqual(reads, ["00001000.bin"])
 
     def test_check_limit_is_not_a_verdict_on_the_rest_of_the_carve(self):
         self.put("00001000.bin", every_record(True))

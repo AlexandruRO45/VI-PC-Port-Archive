@@ -409,16 +409,24 @@ def starts_resource(row):
     return row["head"][:4] == MAGIC
 
 
-def decode_source(source, roots=None, offset=None, limit=None, progress=None):
-    """Decode RBF0 resources, joining 64 KiB continuations, and return (docs, summary).
+def iter_resources(source, roots=None, offset=None, limit=None, progress=None, stats=None):
+    """Yield (doc, blob) for each decoded RBF0 resource, joining 64 KiB continuations as it parses.
 
-    An explicit offset must be nonnegative and an explicit limit must be positive.
+    `blob` is that resource's chunks already joined, so a caller that compares them with the document does not
+    read the carve a second time. `stats`, when given, receives `"total"`, how many resources the source holds
+    after `--offset`, before the first resource is yielded. An explicit offset must be nonnegative and an explicit
+    limit must be positive.
     """
     if limit is not None and limit < 1:
         raise SelectionError("--limit must be at least 1")
     if offset is not None and offset < 0:
         raise SelectionError("--offset must be non-negative")
     rows, read = _rows(source)
+    names = set()
+    for row in rows:
+        if row["name"] in names:    # a document names its first chunk; two rows of one name cannot be told apart
+            raise SelectionError(f"two carved streams are named {row['name']!r}")
+        names.add(row["name"])
     starts = [i for i, row in enumerate(rows) if starts_resource(row)]
     if not starts:
         raise SystemExit(f"no RBF0 resource in {source}")
@@ -426,8 +434,10 @@ def decode_source(source, roots=None, offset=None, limit=None, progress=None):
         starts = [i for i in starts if rows[i]["offset"] == offset]
         if not starts:
             raise SystemExit(f"no RBF0 resource at offset 0x{offset:x}")
+    if stats is not None:
+        stats["total"] = len(starts)
     wanted = set(roots or ())
-    docs = []
+    found = 0
     for i in starts:
         blob = read(rows[i])
         chunks = 1
@@ -444,11 +454,17 @@ def decode_source(source, roots=None, offset=None, limit=None, progress=None):
                 break
         if wanted and doc["root_name"] not in wanted:
             continue
-        docs.append(doc)
-        if limit is not None and len(docs) >= limit:
+        yield doc, blob
+        found += 1
+        if limit is not None and found >= limit:
             break
         if progress:
-            progress(len(docs), len(starts))
+            progress(found, len(starts))
+
+
+def decode_source(source, roots=None, offset=None, limit=None, progress=None):
+    """Decode every RBF0 resource of a source and return (docs, summary)."""
+    docs = [doc for doc, _blob in iter_resources(source, roots, offset, limit, progress)]
     summary = _summary(docs)
     summary["source"] = os.path.abspath(source)
     return docs, summary

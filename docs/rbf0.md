@@ -455,7 +455,9 @@ the last byte. The corpus has 0 bad, 0 truncated and 0 trailing resources.
 `tools/rbf0_encode.py` writes a tree document back to bytes with the grammar of section 3. It emits each descriptor
 name at its first use, then the element header words `0, 0, attribute count`, the attributes, and the content in tree
 order. Text and strings keep their recorded bytes and terminating NUL. `--check` decodes every resource of a carve,
-joining continuations as `rbf0_tree.py` does, encodes it, and compares the result with the original bytes. It exits 0
+joining continuations as `rbf0_tree.py` does, encodes it, and compares the result with the original bytes. It lists
+the carve once and holds one resource at a time: each decoded resource is encoded, compared and dropped before the
+next stream is read. It exits 0
 only when every resource is byte-identical: a resource that encodes to different bytes or is refused makes it exit 1,
 as `rbf0_tree.py` does for a resource that is not `ok`.
 
