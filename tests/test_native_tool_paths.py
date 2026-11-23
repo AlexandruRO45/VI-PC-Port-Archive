@@ -4,7 +4,8 @@
 
 On Windows, spirv-as, spirv-val and the GPU test programs read their command line in the ANSI code page, so a folder
 name with a character outside it (a Cyrillic or CJK user name, as under %TEMP%) reached them as '?'. Every shader then
-failed with "file does not exist". The folders here use a private-use character, which no ANSI code page maps.
+failed with "file does not exist". The folders here use a private-use character. The short-name test explicitly
+uses ASCII so it exercises the fallback even when Windows uses UTF-8.
 tools/rdna2spirv.py's assemble_spirv now runs the tools in the output folder with relative names; run_gpu_tests.py
 uses the work folder's 8.3 short name, or stops with one error line when there is none. Standard library only; no
 game files.
@@ -77,7 +78,7 @@ class AssembleSpirv(unittest.TestCase):
 
 class NativeFolder(unittest.TestCase):
     def test_a_path_the_code_page_holds_is_kept(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(suffix=MARK) as tmp:
             self.assertEqual(run_gpu_tests.native_folder(tmp, ansi="utf-8"), tmp)
 
     def test_other_systems_keep_the_path(self):
@@ -89,10 +90,10 @@ class NativeFolder(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "leonida_gpu_work_" + MARK)
             os.makedirs(work)
-            native = run_gpu_tests.native_folder(work)
+            native = run_gpu_tests.native_folder(work, ansi="ascii")
             if native is None:
                 self.skipTest("this volume keeps no 8.3 short names (the error path is tested below)")
-            native.encode("mbcs")  # raises if the short name still has a character the code page lacks
+            native.encode("ascii")  # raises if the short name still has a character the code page lacks
             self.assertNotIn(MARK, native)
             self.assertTrue(os.path.samefile(native, work))
 
