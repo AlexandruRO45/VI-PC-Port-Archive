@@ -49,8 +49,8 @@ MAX_STRUCTURED_DEPTH = 64
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
-# report (RADV, NVIDIA). It is not the device limit: the AMD Windows (RDNA4) and Intel drivers report 32768, the
-# Vulkan minimum is 16384. The translator runs offline, so it records the exact total as lds_bytes in index.json and
+# report (RADV). It is not the device limit: NVIDIA reports 49152 (PROC-298), the AMD Windows (RDNA4) and Intel
+# drivers 32768, the Vulkan minimum is 16384. The translator runs offline, so it records the exact total as lds_bytes in index.json and
 # the runtime compares that with the device's limit before it creates the pipeline. spirv-val checks neither.
 MAX_SHARED_BYTES = 65536
 WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
