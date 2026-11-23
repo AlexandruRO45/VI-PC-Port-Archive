@@ -30,6 +30,11 @@ import time, unittest
 class T(unittest.TestCase):
     def test_stuck(self): time.sleep(60)
 '''
+UNICODE = '''
+import unittest
+class T(unittest.TestCase):
+    def test_pixel(self): self.fail("unexpected pixel \\U0001F642")
+'''
 EMPTY = '''
 import unittest
 '''
@@ -67,6 +72,16 @@ class RunSemanticTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("TIMED OUT: test_stuck.py", r.stdout)
         self.assertIn("1 files not ok", r.stdout)
+
+    def test_a_failure_report_survives_a_stdout_that_cannot_encode_it(self):
+        # cp1251 on Windows, here ASCII: the runner must still print the assertion (escaped) and the summary
+        env = dict(os.environ, PYTHONIOENCODING="ascii")
+        r = subprocess.run([sys.executable, SCRIPT, "--start", self.folder(test_unicode=UNICODE), "--jobs", "1"],
+                           capture_output=True, text=True, encoding="ascii", errors="replace", env=env, timeout=120)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("unexpected pixel \\U0001f642", r.stdout)
+        self.assertIn("FAILED: test_unicode.py", r.stdout)
+        self.assertNotIn("UnicodeEncodeError", r.stderr)
 
     def test_a_file_that_runs_no_test_fails(self):
         r = run(self.folder(test_empty=EMPTY))

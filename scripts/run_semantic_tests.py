@@ -57,6 +57,11 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=300.0, help="seconds per file before it is stopped (0: none)")
     ap.add_argument("--verbose", action="store_true", help="print every file's output, not only the failing ones")
     args = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):   # a test's output may not fit a redirected stdout's code page (cp1251)
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     if args.jobs < 1:
         ap.error("--jobs must be at least 1")
     names = test_files(args.start, args.pattern)
