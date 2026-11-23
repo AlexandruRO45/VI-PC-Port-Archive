@@ -1186,6 +1186,64 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
 
 }  // namespace
 
+BOOL WINAPI create_hard_link_w(LPCWSTR link, LPCWSTR existing, LPSECURITY_ATTRIBUTES security) {
+    if (!link || !existing) return fail_bool(ERROR_INVALID_PARAMETER);
+    std::vector<std::wstring> link_parts, source_parts;
+    const Parsed link_kind = parse_console(link, link_parts);
+    const Parsed source_kind = parse_console(existing, source_parts);
+    if (link_kind == Parsed::Host && source_kind == Parsed::Host)
+        return ::CreateHardLinkW(link, existing, security);
+    if (link_kind == Parsed::Refused || source_kind == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    // A hard link makes both names writable aliases. Do not let a guest alias escape its overlay.
+    if (link_kind != Parsed::Console || source_kind != Parsed::Console) return fail_bool(ERROR_ACCESS_DENIED);
+    const Target source = read_target(existing);
+    if (source.error) return fail_bool(source.error);
+    std::filesystem::path destination;
+    DWORD error = 0;
+    if (!copy_destination(link, true, destination, error)) return fail_bool(error);
+    const Target writable_source = write_target(existing, true);
+    if (writable_source.error) return fail_bool(writable_source.error);
+    return ::CreateHardLinkW(destination.c_str(), writable_source.path.c_str(), security);
+}
+
+BOOL WINAPI create_hard_link_a(LPCSTR link, LPCSTR existing, LPSECURITY_ATTRIBUTES security) {
+    if (!link || !existing) return ::CreateHardLinkA(link, existing, security);
+    std::vector<std::wstring> parts;
+    const std::wstring wide_link = widen_ansi(link), wide_existing = widen_ansi(existing);
+    if (parse_console(wide_link, parts) == Parsed::Host && parse_console(wide_existing, parts) == Parsed::Host)
+        return ::CreateHardLinkA(link, existing, security);
+    return create_hard_link_w(wide_link.c_str(), wide_existing.c_str(), security);
+}
+
+BOOL WINAPI get_volume_name_w(LPCWSTR mount, LPWSTR name, DWORD size) {
+    if (!mount) return ::GetVolumeNameForVolumeMountPointW(mount, name, size);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(mount, parts);
+    if (parsed == Parsed::Host) return ::GetVolumeNameForVolumeMountPointW(mount, name, size);
+    if (parsed == Parsed::Refused || !drive_root(mount, parts)) return fail_bool(ERROR_INVALID_NAME);
+    const auto overlay = roots().overlay;
+    if (overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
+    std::error_code ec;
+    std::filesystem::create_directories(overlay, ec);
+    if (ec) return fail_bool(static_cast<DWORD>(ec.value()));
+    wchar_t volume_path[MAX_PATH]{};
+    if (!::GetVolumePathNameW(overlay.c_str(), volume_path, MAX_PATH)) return FALSE;
+    return ::GetVolumeNameForVolumeMountPointW(volume_path, name, size);
+}
+
+BOOL WINAPI get_volume_name_a(LPCSTR mount, LPSTR name, DWORD size) {
+    if (!mount) return ::GetVolumeNameForVolumeMountPointA(mount, name, size);
+    const std::wstring wide_mount = widen_ansi(mount);
+    std::vector<std::wstring> parts;
+    if (parse_console(wide_mount, parts) == Parsed::Host) return ::GetVolumeNameForVolumeMountPointA(mount, name, size);
+    wchar_t wide_name[MAX_PATH]{};
+    if (!get_volume_name_w(wide_mount.c_str(), wide_name, MAX_PATH)) return FALSE;
+    const int needed = ::WideCharToMultiByte(CP_ACP, 0, wide_name, -1, nullptr, 0, nullptr, nullptr);
+    if (!needed) return FALSE;
+    if (size < static_cast<DWORD>(needed)) return fail_bool(ERROR_MORE_DATA);
+    return ::WideCharToMultiByte(CP_ACP, 0, wide_name, -1, name, size, nullptr, nullptr) != 0;
+}
+
 BOOL WINAPI copy_file_w(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
     std::filesystem::path source, destination;
     DWORD error = 0;
@@ -1371,6 +1429,10 @@ using namespace rt::fs;
         {dll, "MoveFileW", reinterpret_cast<void*>(&move_file_w)},                                       \
         {dll, "MoveFileExA", reinterpret_cast<void*>(&move_file_ex_a)},                                  \
         {dll, "MoveFileExW", reinterpret_cast<void*>(&move_file_ex_w)},                                  \
+        {dll, "CreateHardLinkA", reinterpret_cast<void*>(&create_hard_link_a)},                               \
+        {dll, "CreateHardLinkW", reinterpret_cast<void*>(&create_hard_link_w)},                               \
+        {dll, "GetVolumeNameForVolumeMountPointA", reinterpret_cast<void*>(&get_volume_name_a)},                \
+        {dll, "GetVolumeNameForVolumeMountPointW", reinterpret_cast<void*>(&get_volume_name_w)},                \
         {dll, "CopyFileA", reinterpret_cast<void*>(&copy_file_a)},                                       \
         {dll, "CopyFileW", reinterpret_cast<void*>(&copy_file_w)},                                       \
         {dll, "CopyFileExA", reinterpret_cast<void*>(&copy_file_ex_a)},                                  \

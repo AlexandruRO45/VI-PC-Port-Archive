@@ -238,6 +238,41 @@ void run_checks(const std::filesystem::path& root) {
               attributes_ex_w && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
 
+    // Synthetic package-only hard links must copy up before linking, and never link into the package.
+    {
+        using Link = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPSECURITY_ATTRIBUTES);
+        using Volume = BOOL(WINAPI*)(LPCWSTR, LPWSTR, DWORD);
+        const auto link = resolve<Link>("kernel32.dll", "CreateHardLinkW");
+        const auto volume = resolve<Volume>("kernel32.dll", "GetVolumeNameForVolumeMountPointW");
+        write_path(package / "data" / "link-source.txt", "link bytes");
+        check(link != nullptr, "CreateHardLinkW resolves");
+        if (link) {
+            check(link(L"GAME:\\data\\link-dest.txt", L"GAME:\\data\\link-source.txt", nullptr), "hard link copies package source up");
+            check(read_path(overlay / "data" / "link-dest.txt") == "link bytes", "link reads package bytes");
+            write_path(overlay / "data" / "link-dest.txt", "changed");
+            check(read_path(package / "data" / "link-source.txt") == "link bytes", "package source stays unchanged");
+            check(!link((root / "outside.txt").c_str(), L"GAME:\\data\\link-source.txt", nullptr), "guest source cannot link outside overlay");
+        }
+        using LinkA = BOOL(WINAPI*)(LPCSTR, LPCSTR, LPSECURITY_ATTRIBUTES);
+        using VolumeA = BOOL(WINAPI*)(LPCSTR, LPSTR, DWORD);
+        const auto link_a = resolve<LinkA>("kernelbase.dll", "CreateHardLinkA");
+        const auto volume_a = resolve<VolumeA>("kernelbase.dll", "GetVolumeNameForVolumeMountPointA");
+        check(link_a && link_a("G:\\data\\link-a.txt", "G:\\data\\link-source.txt", nullptr), "CreateHardLinkA resolves G drive");
+        check(volume_a != nullptr, "GetVolumeNameForVolumeMountPointA resolves");
+        if (volume_a) {
+            char name[MAX_PATH]{};
+            check(volume_a("T:\\", name, MAX_PATH) && std::string(name).rfind("\\\\?\\Volume{", 0) == 0,
+                  "T volume has GUID path");
+        }
+        check(volume != nullptr, "GetVolumeNameForVolumeMountPointW resolves");
+        if (volume) {
+            wchar_t name[MAX_PATH]{};
+            const bool ok = volume(L"GAME:\\", name, MAX_PATH) != FALSE;
+            const std::wstring result(name);
+            check(ok && result.rfind(L"\\\\?\\Volume{", 0) == 0 && result.back() == L'\\', "GAME volume has GUID path");
+        }
+    }
+
     // A read of a package file, through the mixed-case prefix and through forward slashes.
     {
         HANDLE h = create_w(L"GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
