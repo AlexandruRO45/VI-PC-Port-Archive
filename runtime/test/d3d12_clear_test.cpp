@@ -375,8 +375,6 @@ bool check_unlisted_rtvs(ID3D12Device* device) {
                 "lists don't name\n", std::size(textures), refused);
     return true;
 }
-} // namespace
-
 // The two RTVs share a resource format and castable list. Check the exact stored bits for each view. Needs no host
 // reference, so it runs where WARP is unavailable.
 bool check_castable_r32_rtvs(ID3D12Device* ours) {
@@ -408,6 +406,8 @@ bool check_castable_r32_rtvs(ID3D12Device* ours) {
     }
     return ok;
 }
+
+} // namespace
 
 int main(int argc, char** argv) {
     const bool volume_only = argc == 2 && std::strcmp(argv[1], "--volume") == 0;
@@ -449,7 +449,7 @@ int main(int argc, char** argv) {
             }
             return check_shared_exponent_target(ours.p) ? 0 : 1;
         }
-        if (!check_castable_r32_rtvs(ours.p)) return 1;
+        const bool castable_r32_ok = check_castable_r32_rtvs(ours.p);  // counted with the other format failures
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
             {DXGI_FORMAT_R32G32_SINT, "R32G32_SINT", 8, int_values, ni},
             {DXGI_FORMAT_R32G32B32A32_SINT, "R32G32B32A32_SINT", 16, int_values, ni},
         };
-        unsigned format_failures = 0;
+        unsigned format_failures = castable_r32_ok ? 0 : 1;
         for (const auto& cf : color_formats) {
             for (unsigned i = 0; i < cf.count; ++i) {
                 // Different colours outside and inside the rectangle exercise both Vulkan clear paths.
