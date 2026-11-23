@@ -7,7 +7,7 @@ import posixpath
 
 def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:  # an index re-saved with a BOM is still valid UTF-8
             rows = json.load(f)
     except UnicodeDecodeError as exc:
         raise ValueError(f"{path}: invalid UTF-8: {exc}") from exc
