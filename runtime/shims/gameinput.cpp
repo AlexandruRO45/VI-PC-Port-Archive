@@ -2037,13 +2037,15 @@ void update_keyboard_mouse(uint64_t now) {
     Snapshot mouse{};
     mouse.kbm_kind = GameInputKindMouse;
     if (focus) {
+        // Use the foreground window thread's layout, including when the polling thread has a different layout.
+        const HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
         // The reportable keys that are down, in virtual-key order, up to kMaxKeys.
         for (int vk = 1; vk < 255 && keys.key_count < kMaxKeys; ++vk) {
             if (!reportable_key(vk) || !key_down(vk)) continue;
             GameInputKeyState& k = keys.keys[keys.key_count++];
             k.virtualKey = static_cast<uint8_t>(vk);
-            k.scanCode = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC_EX);
-            const UINT ch = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_CHAR);
+            k.scanCode = MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC_EX, layout);
+            const UINT ch = MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_CHAR, layout);
             k.isDeadKey = (ch & 0x80000000u) != 0;
             k.codePoint = ch & 0xFFFFu;
         }
@@ -2112,7 +2114,10 @@ bool init_sdl() {
 void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
-    if (!init_sdl()) return;
+    if (!init_sdl()) {
+        update_keyboard_mouse(now_us());
+        return;
+    }
     apply_prompt_config();
     update_keyboard_pad();
     SDL_UpdateGamepads();

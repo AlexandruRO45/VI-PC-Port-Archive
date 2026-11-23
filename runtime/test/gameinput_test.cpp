@@ -1775,7 +1775,9 @@ void test_keyboard_mouse(IGameInput* input) {
     rt::gameinput::poll();
     g_focus = true;
     rt::gameinput::poll();  // the first poll back in focus takes the cursor as it is
-    if (input->GetCurrentReading(GameInputKindMouse, mse, &r) == S_OK && r) {
+    HRESULT focus_hr = input->GetCurrentReading(GameInputKindMouse, mse, &r);
+    check(focus_hr == S_OK && r, "keyboard/mouse: mouse reading after focus returns");
+    if (focus_hr == S_OK && r) {
         GameInputMouseState m{};
         r->GetMouseState(&m);
         check(m.positionX == 8, "keyboard/mouse: cursor movement out of focus is not counted");
@@ -1783,7 +1785,9 @@ void test_keyboard_mouse(IGameInput* input) {
     }
     g_focus = false;
     rt::gameinput::poll();
-    if (input->GetCurrentReading(GameInputKindKeyboard, kbd, &r) == S_OK && r) {
+    focus_hr = input->GetCurrentReading(GameInputKindKeyboard, kbd, &r);
+    check(focus_hr == S_OK && r, "keyboard/mouse: keyboard reading out of focus");
+    if (focus_hr == S_OK && r) {
         check(r->GetKeyCount() == 0, "keyboard/mouse: no keys while another window has focus");
         r->Release();
     }
