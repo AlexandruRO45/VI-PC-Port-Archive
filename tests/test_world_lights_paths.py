@@ -510,10 +510,38 @@ class ScanTest(unittest.TestCase):
         with open(lights, encoding="utf-8") as f:
             self.assertEqual(f.read(), '{"old": true}\n')
         self.assertFalse(os.path.exists(lights + ".partial"), "a failed run left its staged report behind")
+        tmps = [f for f in os.listdir(self.tmp.name) if f.startswith(".world_lights-") and f.endswith(".tmp")]
+        self.assertEqual(tmps, [], "a failed run left temporary staging files behind")
         lines = err.getvalue().strip().splitlines()
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("bad.jsonl", lines[0])
         self.assertNotIn("Traceback", err.getvalue())
+
+    def test_unreadable_entities_exits_2_without_traceback(self):
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        entities = os.path.join(self.tmp.name, "unreadable_entities.jsonl")
+        with open(entities, "w", encoding="utf-8") as f:
+            f.write('{"id": 1}\n')
+        err = io.StringIO()
+        with self._exclusive_lock(entities):
+            with contextlib.redirect_stderr(err):
+                rc = T.main([self.rpf, "--entities", entities, "--lights-out", lights])
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        tmps = [f for f in os.listdir(self.tmp.name) if f.startswith(".world_lights-") and f.endswith(".tmp")]
+        self.assertEqual(tmps, [], "an unreadable entities run left temporary staging files behind")
+
+    def test_aliased_out_and_lights_out_rejected(self):
+        fresh_dir = os.path.join(self.tmp.name, "fresh")
+        out1 = os.path.join(fresh_dir, "report.json")
+        for alias in [out1 + ".", out1 + " ", os.path.join(fresh_dir + ".", "report.json")]:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    T.main([self.rpf, "--entities", self.entities, "--out", out1, "--lights-out", alias])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must use different paths", err.getvalue())
 
     def test_lights_report_that_is_a_directory_leaves_no_partial(self):
         lights = os.path.join(self.tmp.name, "lights.jsonl")

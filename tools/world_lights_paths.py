@@ -55,6 +55,7 @@ if _TOOLS_DIR not in sys.path:
 
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -837,33 +838,6 @@ def summarize(total, entities=None, lights_out=None):
     return summary
 
 
-def same_report_path(first, second):
-    first, second = os.path.realpath(first), os.path.realpath(second)
-    if os.path.normcase(first) == os.path.normcase(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return False
-
-    first_dir, first_name = os.path.split(first)
-    second_dir, second_name = os.path.split(second)
-    if first_name.casefold() != second_name.casefold():
-        return False
-    try:
-        if not os.path.samefile(first_dir, second_dir):
-            return False
-        # normcase on POSIX does not tell us whether this volume folds case.
-        # Try the two names in a scratch directory on the destination volume before scanning.
-        with tempfile.TemporaryDirectory(prefix=".world-lights-", dir=first_dir) as probe:
-            with open(os.path.join(probe, first_name), "xb"):
-                return os.path.exists(os.path.join(probe, second_name))
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive")
@@ -906,6 +880,7 @@ def main(argv=None):
             return 2
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
     lights_tmp = None
+    summary_tmp = None
     try:
         if a.lights_out:
             dest = os.path.abspath(a.lights_out)
@@ -915,42 +890,33 @@ def main(argv=None):
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
                                              prefix=".world_lights-", suffix=".tmp", delete=False) as lights_f:
                 lights_tmp = lights_f.name
-                try:
-                    summary = summarize(total, a.entities, lights_f)
-                except ValueError as e:
-                    print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
-                    return 2
+                summary = summarize(total, a.entities, lights_f)
         else:
-            try:
-                summary = summarize(total, a.entities, None)
-            except ValueError as e:
-                print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
-                return 2
+            summary = summarize(total, a.entities, None)
 
         text = json.dumps(summary, indent=1, sort_keys=True) + "\n"
+        if a.out:
+            dest = os.path.abspath(a.out)
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                             prefix=".world_lights-", suffix=".tmp", delete=False) as f:
+                summary_tmp = f.name
+                f.write(text)
+        _publish_reports(text, a.out, summary_tmp, a.lights_out, lights_tmp)
+        lights_tmp = None
         summary_tmp = None
-        try:
-            if a.out:
-                dest = os.path.abspath(a.out)
-                parent = os.path.dirname(dest)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
-                                                 prefix=".world_lights-", suffix=".tmp", delete=False) as f:
-                    summary_tmp = f.name
-                    f.write(text)
-            try:
-                _publish_reports(text, a.out, summary_tmp, a.lights_out, lights_tmp)
-            except OSError as e:
-                print(f"error: {e}", file=sys.stderr)
-                return 2
-            lights_tmp = None
-            summary_tmp = None
-        finally:
-            if summary_tmp is not None:
-                with suppress(OSError):
-                    os.unlink(summary_tmp)
+    except ValueError as e:
+        print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     finally:
+        if summary_tmp is not None:
+            with suppress(OSError):
+                os.unlink(summary_tmp)
         if lights_tmp is not None:
             with suppress(OSError):
                 os.unlink(lights_tmp)
