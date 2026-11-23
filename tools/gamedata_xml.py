@@ -130,8 +130,8 @@ def scan_refs(text: str, report: dict) -> None:
             report["platform_total"] += 1
 
 
-def scan_xml(data: bytes) -> dict:
-    """Parse one document and return aggregate facts. Never keeps element text or values."""
+def scan_xml_events(data: bytes) -> dict:
+    """Reference scan on the iterparse event stream: the exact result for malformed documents."""
     report = {
         "root": "",
         "well_formed": False,
@@ -206,6 +206,174 @@ def scan_xml(data: bytes) -> dict:
     if ended is not None:
         scan_refs(ended.tail, report)
     report["attributes"] = sorted(report["attrs"])
+    return report
+
+
+FEED_CHUNK = 16 * 1024          # what iterparse feeds: the parser then buffers a token, not the document
+
+# Encodings a document can declare while "$(" and "platform:/" stay those very ASCII bytes in the file.
+ASCII_COMPATIBLE_ENCODINGS = frozenset((
+    "utf-8", "utf8", "us-ascii", "ascii", "iso-8859-1", "latin-1", "latin1", "windows-1252", "cp1252"))
+XML_DECL_ENCODING = re.compile(rb"""encoding\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+
+
+def refs_possible(data: bytes) -> bool:
+    """False only when no text or attribute value of the document can hold ``$(`` or ``platform:/``.
+
+    The bytes are searched for both tokens and for ``&``, since a character reference spells any of their
+    characters. A comment, a CDATA section or a processing instruction inside a text does not end it, so a
+    token split by one is still a token and these answer True too, as do bytes that are not ASCII-compatible
+    (UTF-16/32, EBCDIC) and a declared encoding this does not know to be ASCII-compatible.
+    """
+    if b"$(" in data or b"platform:/" in data or b"&" in data or b"<!--" in data or b"<![CDATA[" in data:
+        return True
+    start = 3 if data.startswith(BOM) else 0
+    if data[start:start + 1] != b"<" or data[start + 1:start + 2] == bytes(1):
+        return True                      # no ASCII "<" first, or UTF-16/32 without a byte-order mark
+    declared = data.startswith(b"<?xml", start)
+    if data.count(b"<?") > int(declared):
+        return True
+    if declared:
+        end = data.find(b"?>", start, start + 512)
+        if end < 0:
+            return True
+        declaration = data[start:end]
+        if b"encoding" in declaration:
+            match = XML_DECL_ENCODING.search(declaration)
+            if not match:
+                return True
+            name = (match.group(1) if match.group(1) is not None else match.group(2)).decode("latin-1")
+            if name.lower() not in ASCII_COMPATIBLE_ENCODINGS:
+                return True
+    return False
+
+
+def scan_xml(data: bytes) -> dict:
+    """Parse one document and return aggregate facts. Never keeps element text or values.
+
+    A well-formed document is counted in a single pass of parser callbacks: no element tree and no event
+    queue are built. The result is the one ``scan_xml_events`` gives. A malformed document is rescanned
+    there, because the facts it reports before the error depend on the chunks that parser had been fed; the
+    callback pass has returned by then, so the rescan does not run beside what it counted.
+    """
+    report = scan_xml_callbacks(data)
+    return report if report is not None else scan_xml_events(data)
+
+
+def scan_xml_callbacks(data: bytes):
+    """The callback pass of ``scan_xml``: the facts of a well-formed document, None for any other."""
+    elements = Counter()
+    attrs = Counter()
+    refs = Counter()
+    platform = Counter()
+    type_values = set()
+    content_values = set()
+    comments = 0
+    platform_total = 0
+    depth = max_depth = 0
+    text = []                   # data pieces of the run between two tags; comments do not split a run
+
+    def count_text(run: str) -> None:
+        nonlocal platform_total
+        if "$(" in run:
+            for match in MACRO_REF.finditer(run):
+                refs["$(" + match.group(1) + ")"] += 1
+        if "platform:/" in run:
+            for match in PLATFORM_REF.finditer(run):
+                platform["levels" if (match.group(1) or "").lower() == "levels" else "other"] += 1
+                platform_total += 1
+
+    def start(tag, attrib):
+        nonlocal depth, max_depth
+        if text:
+            run = "".join(text)
+            text.clear()
+            if "$(" in run or "platform:/" in run:
+                count_text(run)
+        depth += 1
+        if depth > max_depth:
+            max_depth = depth
+        elements[tag] += 1
+        if attrib:
+            for name, value in attrib.items():
+                attrs[name] += 1
+                if "$(" in value or "platform:/" in value:
+                    count_text(value)
+            if "type" in attrib:
+                type_values.add(attrib["type"])
+            if "content" in attrib:
+                content_values.add(attrib["content"])
+
+    def end(tag):
+        nonlocal depth
+        if text:
+            run = "".join(text)
+            text.clear()
+            if "$(" in run or "platform:/" in run:
+                count_text(run)
+        depth -= 1
+
+    def start_plain(tag, attrib):
+        nonlocal depth, max_depth
+        depth += 1
+        if depth > max_depth:
+            max_depth = depth
+        elements[tag] += 1
+        if attrib:
+            for name in attrib:
+                attrs[name] += 1
+            if "type" in attrib:
+                type_values.add(attrib["type"])
+            if "content" in attrib:
+                content_values.add(attrib["content"])
+
+    def end_plain(tag):
+        nonlocal depth
+        depth -= 1
+
+    def comment(_):
+        nonlocal comments
+        comments += 1
+
+    class Target:
+        pass
+
+    target = Target()
+    target.comment = comment
+    if refs_possible(data):
+        target.start, target.end, target.data = start, end, text.append
+    else:                       # no value can hold a reference: skip the text and the per-value checks
+        target.start, target.end = start_plain, end_plain
+    try:
+        parser = ET.XMLParser(target=target)
+        view = memoryview(data)
+        for offset in range(0, len(view), FEED_CHUNK):
+            parser.feed(view[offset:offset + FEED_CHUNK])
+        parser.close()
+    except (ET.ParseError, LookupError, ValueError):
+        return None
+    report = {
+        "root": next(iter(elements), ""),
+        "well_formed": True,
+        "mismatched_tag": False,
+        "error": "",
+        "element_count": sum(elements.values()),
+        "max_depth": max_depth,
+        "attributes": sorted(attrs),
+        "comments": comments,
+        "elements": elements,
+        "attrs": attrs,
+        "refs": refs,
+        "platform": platform,
+        "platform_total": platform_total,
+        "filename": elements.get("filename", 0),
+        "parent_path": attrs.get("parentPath", 0),
+        "parent_file": attrs.get("parentFile", 0),
+        "xi_include": elements.get(XI_INCLUDE, 0) + elements.get("xi:include", 0),
+        "type_attrs": attrs.get("type", 0),
+        "type_values": type_values,
+        "content_values": content_values,
+    }
     return report
 
 
