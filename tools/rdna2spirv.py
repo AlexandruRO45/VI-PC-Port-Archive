@@ -8447,9 +8447,22 @@ class Gen:
             # Three-operand 16-bit integer min/max/median on the low halves (op_sel bits 0..2 pick the high half of
             # S0..S2, bit 3 writes the high half of D); VOP3-only, so the other half of D is kept (RDNA2 ISA; Mesa
             # ACO can_use_opsel). clamp is accepted on hardware and is a no-op on the 16-bit bounded integer word.
+            if ins["op"].endswith(("_dpp", "_sdwa")):
+                raise Unsupported(ins["op"])
+            if len(a) != 4:
+                raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " destination")
+            if any(s.get("n", 1) != 1 for s in a[1:4]):
+                raise Unsupported(op + " operand width")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in a):
+                raise Unsupported(op + " operand modifier")
+            opsel_mods = [m for m in mods if m.startswith("op_sel:")]
+            clamp_count = sum(1 for m in mods if m == "clamp")
+            if (len(opsel_mods) > 1 or clamp_count > 1 or
+                    any(m != "clamp" and not m.startswith("op_sel:") for m in mods)):
+                raise Unsupported(op + " modifier")
             sb, dhi = self.opsel_bits(mods, 3)
-            if dhi and a[0]["k"] != "vgpr":
-                raise Unsupported("op_sel destination")
             signed = op.endswith("_i16")
             vals = []
             for k, s_ in enumerate(a[1:4]):
