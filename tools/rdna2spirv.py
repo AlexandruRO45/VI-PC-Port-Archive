@@ -17126,17 +17126,17 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
         Path(sv).unlink(missing_ok=True)
         return result
     # The module is published whole or not at all: stage it beside `sv`, then rename.
-    with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
-        tmp = Path(f.name)
-        try:
-            f.write(binary)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
+    tmp = None
     try:
+        # Close the handle before any unlink: Windows refuses to delete an open file, which would hide the
+        # original error (ENOSPC, Ctrl-C) and leave the temporary file behind.
+        with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
+            tmp = Path(f.name)
+            f.write(binary)
         tmp.replace(sv)
     finally:
-        tmp.unlink(missing_ok=True)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     return result
 
 
