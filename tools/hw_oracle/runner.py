@@ -1,8 +1,8 @@
 """Find the tools, build the launcher, assemble kernels and run them on the GPU. Standard library only.
 
-Two launchers: on Windows the HIP runtime that ships in the AMD driver (hw_oracle.c, this file), on Linux raw
-dispatches through the kernel driver (hw_oracle_drm.c, drm.py, which also lists its own variables). open_oracle()
-picks the one for the platform.
+On Windows the HIP runtime that ships in the AMD driver runs the kernels: hw_oracle.c with the external toolchain,
+or windows_driver.py with the driver's assembler and HIP libraries. Linux uses raw dispatches (hw_oracle_drm.c,
+drm.py, which also lists its own variables). open_oracle() picks the path for the platform.
 
 Tools are located through environment variables first, then by looking in the usual places:
     LEONIDA_AMD_CLANG   AMD clang (its folder must also hold ld.lld); default: amdclang / clang on PATH that lists
@@ -12,7 +12,8 @@ Tools are located through environment variables first, then by looking in the us
     LEONIDA_HOST_CC     a C compiler for hw_oracle.c (MinGW gcc, or cl.exe from a Developer shell); default: gcc on
                         PATH, C:\\msys64\\ucrt64\\bin, then on Windows a cl on PATH or Visual Studio's (vswhere)
     LEONIDA_HW_ARCH     the GPU architecture to assemble for; default: what amdgpu-arch reports, else gfx1150
-Anything missing raises Unavailable, which callers turn into exit 77 ("skipped").
+On Windows, a missing external toolchain can fall back to COMGR and HIP from the installed driver.
+An unavailable oracle raises Unavailable, which callers turn into exit 77 ("skipped").
 """
 import hashlib
 import os
@@ -210,10 +211,15 @@ class Oracle:
             raise Unavailable(f"{e} (set LEONIDA_HW_ARCH)") from None
         self.chunk = chunk
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
-        self.exe = self._build_launcher()
-        self.device = self._probe()
-        self.true16 = self._needs_true16()
-        self._probe_waves()
+        try:
+            self.exe = self._build_launcher()
+            self.device = self._probe()
+            self.true16 = self._needs_true16()
+            self._probe_waves()
+        except BaseException:
+            if workdir is None:
+                self.close()
+            raise
 
     def _build_launcher(self):
         src = os.path.join(HERE, "hw_oracle.c")
@@ -369,6 +375,59 @@ class Oracle:
         shutil.rmtree(self.workdir, ignore_errors=True)
 
 
+def _windows_driver(*args, input=None):
+    worker = os.path.join(HERE, "windows_driver.py")
+    return subprocess.run([sys.executable, "-I", worker, *args], input=input, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
+
+
+class WindowsDriverOracle(Oracle):
+    """Reuse kernel batching with the AMD driver in place of the SDK and host compiler."""
+
+    clang = None
+
+    def __init__(self, arch=None, workdir=None, chunk=500):
+        self.dll = find_hip_dll()
+        report = _windows_driver("device", self.dll)
+        if report.returncode:
+            raise Unavailable(report.stderr.strip() or f"HIP probe exited {report.returncode}")
+        reported = report.stdout.strip().rpartition(" arch=")[2]
+        self.arch = arch or os.environ.get("LEONIDA_HW_ARCH") or reported
+        if reported != self.arch:
+            raise Unavailable(f"HIP device 0 reports {reported}, requested {self.arch}")
+        try:
+            asm.family(self.arch)
+        except ValueError as error:
+            raise Unavailable(str(error)) from None
+        self.chunk = chunk
+        self._scratch = tempfile.TemporaryDirectory(prefix="leonida-driver-oracle-", dir=workdir)
+        self.workdir = self._scratch.name
+        try:
+            self.device = self._probe()
+            self.true16 = self._needs_true16()
+            self._probe_waves()
+        except BaseException:
+            self.close()
+            raise
+
+    def _assemble(self, text, wave=32):
+        source = os.path.join(self.workdir, "k.s")
+        output = os.path.join(self.workdir, "k.co")
+        with open(source, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        result = _windows_driver("assemble", source, output, self.arch, str(wave), str(self.code_object or 0))
+        if result.returncode:
+            return None, result.stderr.strip() or f"COMGR worker exited {result.returncode}"
+        return output, ""
+
+    def _launch(self, co, names, words=4):
+        result = _windows_driver("launch", co, str(words), self.dll, input="\n".join(names) + "\n")
+        return result.returncode, result.stdout, result.stderr
+
+    def close(self):
+        self._scratch.cleanup()
+
+
 def open_oracle(**kw):
     """An Oracle for this platform, or raise Unavailable."""
     if sys.platform.startswith("linux"):
@@ -377,7 +436,15 @@ def open_oracle(**kw):
         except ImportError:   # run as a script
             import drm
         return drm.DrmOracle(**kw)
-    return Oracle(**kw)
+    try:
+        return Oracle(**kw)
+    except Unavailable as external:
+        if os.name != "nt" or any(os.environ.get(var) for var in ("LEONIDA_AMD_CLANG", "LEONIDA_HOST_CC")):
+            raise
+        try:
+            return WindowsDriverOracle(**kw)
+        except Unavailable as driver:
+            raise Unavailable(f"{external}; installed AMD driver: {driver}") from None
 
 
 def main():
@@ -386,7 +453,8 @@ def main():
     except Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    print(f"hardware oracle ready: {o.device}; clang {o.clang}")
+    assembler = f"clang {o.clang}" if o.clang else "AMD driver COMGR"
+    print(f"hardware oracle ready: {o.device}; {assembler}")
     o.close()
     return 0
 

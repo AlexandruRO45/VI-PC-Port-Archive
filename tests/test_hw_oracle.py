@@ -331,6 +331,36 @@ class ToolchainFallbacks(unittest.TestCase):
         self.assertTrue(all(isinstance(g, str) and "unsupported on gfx1170+" in g for g in got))
 
 
+class WindowsDriverFallback(unittest.TestCase):
+    def test_prefers_the_external_oracle_and_falls_back_when_it_is_unavailable(self):
+        with mock.patch.object(sys, "platform", "win32"), mock.patch.object(os, "name", "nt"), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(runner, "Oracle", return_value=mock.sentinel.external) as external, \
+                mock.patch.object(runner, "WindowsDriverOracle", return_value=mock.sentinel.driver) as driver:
+            self.assertIs(runner.open_oracle(arch="gfx1032"), mock.sentinel.external)
+            driver.assert_not_called()
+            external.side_effect = runner.Unavailable("no AMD clang")
+            self.assertIs(runner.open_oracle(arch="gfx1032"), mock.sentinel.driver)
+            driver.assert_called_once_with(arch="gfx1032")
+
+    def test_an_explicit_toolchain_never_gets_replaced(self):
+        with mock.patch.object(sys, "platform", "win32"), mock.patch.object(os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"LEONIDA_AMD_CLANG": "custom-clang"}, clear=True), \
+                mock.patch.object(runner, "Oracle", side_effect=runner.Unavailable("custom-clang is missing")), \
+                mock.patch.object(runner, "WindowsDriverOracle") as driver:
+            with self.assertRaisesRegex(runner.Unavailable, "custom-clang is missing"):
+                runner.open_oracle()
+            driver.assert_not_called()
+
+    def test_unavailability_reports_both_attempts(self):
+        with mock.patch.object(sys, "platform", "win32"), mock.patch.object(os, "name", "nt"), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(runner, "Oracle", side_effect=runner.Unavailable("no AMD clang")), \
+                mock.patch.object(runner, "WindowsDriverOracle", side_effect=runner.Unavailable("no COMGR")):
+            with self.assertRaisesRegex(runner.Unavailable, "no AMD clang.*no COMGR"):
+                runner.open_oracle()
+
+
 class Filters(unittest.TestCase):
     def test_literals(self):
         self.assertEqual(asm.literals("s_add_u32 s4, 0x100, s5"), {0x100})
@@ -777,7 +807,7 @@ class OnHardware(unittest.TestCase):
         # image_fuzz's 64x64 cases (16,384) and this one need.
         lines = ["v_lshlrev_b32 v2, 5, v0", "v_mov_b32 v1, 0xabcd0001"]
         lines += [f"global_store_b32 v2, v1, s[2:3] offset:{4 * j}" for j in range(8)]
-        lines += ["s_waitcnt vmcnt(0)"]
+        lines += ["s_waitcnt vmcnt(0)", "s_endpgm"]
         kernel = asm.Kernel(lines, wave=32, threads=1024, words=8192, raw=True)
         self.assertEqual(self.oracle.run([kernel]), [[0xABCD0001] * 8192])
 

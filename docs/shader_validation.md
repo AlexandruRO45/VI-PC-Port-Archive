@@ -173,7 +173,12 @@ python -I tools/salu_diff.py --oracle hw --programs 5000 --seed 1
 python -I tools/hw_oracle/runner.py        # checks the setup: prints the device, or what is missing (exit 77)
 ```
 
-Setup on Windows, about 800 MB and no admin rights:
+On Windows, try `python -I tools/hw_oracle/runner.py` first. When the external toolchain is unavailable, the oracle
+can assemble, link and dispatch its kernels with the installed AMD COMGR and HIP DLLs in System32. The driver
+reports the GFX target. The existing probe checks lane IDs in wave32 and wave64 before accepting the backend.
+Verified on Radeon RX 6600 XT (`gfx1032`, Windows 11, Adrenalin 26.11.2, COMGR 2.9, `amdhip64_6.dll`).
+
+The external toolchain is preferred when available. Setup takes about 800 MB and needs no admin rights:
 
 - **Driver.** The AMD Windows driver ships the HIP runtime as `amdhip64_7.dll` in System32; nothing else is
   loaded from the SDK. `LEONIDA_HIP_DLL` overrides the path. Drivers from 2024 ship `amdhip64_6.dll` instead and
