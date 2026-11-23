@@ -207,5 +207,6 @@ class WindowsPowerShell(unittest.TestCase):
         self.assertEqual([cmd[0] for cmd in calls], [self.exe])
         self.assertEqual(gpus, [("AMD Radeon RX 6700 XT", 12)])
 
+
 if __name__ == "__main__":
     unittest.main()
