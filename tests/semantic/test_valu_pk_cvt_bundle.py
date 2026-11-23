@@ -472,5 +472,20 @@ class VPackB32F16OracleTests(unittest.TestCase):
         self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(0, 1)), 0x33332222)
         self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(1, 1)), 0x33331111)
 
+class VPackB32F16AstTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = PackedInstructionAST(
+            mnemonic="v_pack_b32_f16",
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.VGPR, index=2),
+            op_sel=(0, 1, 0),
+            abs_mods=(True, False),
+            neg_mods=(False, True),
+        )
+        self.assertEqual(ast.mnemonic, "v_pack_b32_f16")
+        self.assertEqual(ast.abs_mods, (True, False))
+        self.assertEqual(ast.neg_mods, (False, True))
+
 if __name__ == '__main__':
     unittest.main()
