@@ -155,16 +155,20 @@ def one(path, out, mcpu, backend="llvm-mc"):
     if end is None:
         return "no s_endpgm"
     if start is None:
-        # Walk back in 4-byte steps from the end and keep the longest clean decode.
-        start, best = end - 4, None
+        # Keep the result as well as the offset, so the listing is the one the scan actually checked.
+        result = None
         for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
-            _, bad, _ = disasm(b[s:end], mcpu, backend=backend)
+            candidate = disasm(b[s:end], mcpu, backend=backend)
+            _, bad, _ = candidate
             if bad == 0:
-                best = s
-        if best is None:
+                # Empty output leaves the range unconfirmed. Keep it in scan order so that a longer
+                # unknown range fails below instead of silently publishing a shorter listing.
+                start, result = s, candidate
+        if result is None:
             return "scan failed"
-        start = best
-    asm, bad, err = disasm(b[start:end], mcpu, backend=backend)
+    else:
+        result = disasm(b[start:end], mcpu, backend=backend)
+    asm, bad, err = result
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
         reason = (err.strip().splitlines() or ["no output"])[0]
         FAILED.append((path, reason))
