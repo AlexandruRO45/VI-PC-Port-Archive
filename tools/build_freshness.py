@@ -9,6 +9,10 @@ import os
 SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".in", ".cmake", ".txt")
 
 
+def executable_name(name: str) -> str:
+    return name + (".exe" if os.name == "nt" else "")
+
+
 def newest_source_mtime(root: str) -> float:
     """The newest modification time of a C/C++ or CMake file under root/runtime, build folders left out."""
     newest = 0.0

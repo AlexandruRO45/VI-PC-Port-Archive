@@ -48,9 +48,10 @@ import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
+sys.path.insert(0, TOOLS)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 from compute_fixture import find_test_program  # noqa: E402
-from build_freshness import binary_is_stale  # noqa: E402
+from build_freshness import binary_is_stale, executable_name  # noqa: E402
 
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
@@ -597,7 +598,7 @@ def rebuild_if_stale(harness: str) -> None:
 
 
 def find_harness(explicit: str | None) -> str:
-    executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
+    executable = executable_name("vk_harness")
     build = os.path.join(ROOT, "runtime", "build")
     build_dirs = (os.path.join(build, "linux"), os.path.join(build, "windows"), build)
     for candidate in (

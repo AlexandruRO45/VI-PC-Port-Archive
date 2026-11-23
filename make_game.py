@@ -72,7 +72,7 @@ from mc_command import mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
-from build_freshness import binary_is_stale  # noqa: E402
+from build_freshness import binary_is_stale, executable_name  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -2112,10 +2112,13 @@ def cross_build_runtime(jobs: int) -> str:
 def build_pipeline_check(jobs: int) -> None:
     build = os.path.join(ROOT, "runtime", "build", "linux")
     log("pipelines: building vk_pipeline_check")
-    cmake_configure(build)
-    cmake_build(build, ["vk_pipeline_check"], jobs,
-                "It needs a C++20 compiler and the Vulkan headers (your distribution's Vulkan headers package, "
-                "or VULKAN_SDK); the CMake output above says which is missing.")
+    try:
+        cmake_configure(build)
+        cmake_build(build, ["vk_pipeline_check"], jobs,
+                    "It needs a C++20 compiler and the Vulkan headers (your distribution's Vulkan headers package, "
+                    "or VULKAN_SDK); the CMake output above says which is missing.")
+    except FileNotFoundError:
+        fail("cmake not found, cannot rebuild vk_pipeline_check")
 
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
@@ -2202,11 +2205,12 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     """Find the checker for this host, using a supplied Windows build before the local Windows build."""
     build = os.path.join(ROOT, "runtime", "build")
     windows = os.name == "nt"
+    executable = executable_name("vk_pipeline_check")
     if windows:
-        windows_builds = (runtime_build, build) if runtime_build else (build,)
-        found = [os.path.join(d, "vk_pipeline_check.exe") for d in windows_builds]
+        build_dirs = (runtime_build, build) if runtime_build else (build,)
     else:
-        found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
+        build_dirs = (os.path.join(build, "linux"), build)
+    found = (os.path.join(folder, executable) for folder in build_dirs)
     return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
