@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -249,6 +250,18 @@ class HeapIndexCensus(unittest.TestCase):
         self.assertIn("--json would overwrite an input the census reads", p.stderr)
         with open(container, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}\n'
+        js = os.path.join(self.work.root, "out", "census.json")
+        os.makedirs(os.path.dirname(js), exist_ok=True)
+        with open(js, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(hic, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                hic.write_json_report(js, {"shaders_read": 1})
+        with open(js, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

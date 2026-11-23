@@ -30,17 +30,22 @@ Usage:
     python -I tools/heap_index_census.py <work>/shaders/dxbc/disasm [--json OUT] [--limit N]
 
 A missing folder, an unreadable carve index and an unwritable --json each give one ERROR line and exit 2.
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 import argparse
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 USER_SGPRS = 32          # graphics stages: user data s0..s31 (tools/rdna2spirv.py USER_SGPRS)
@@ -447,15 +452,46 @@ def main(argv=None):
     print_report(out)
     if args.json:
         try:
-            d = os.path.dirname(os.path.abspath(args.json))
-            os.makedirs(d, exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1, sort_keys=True)
-                f.write("\n")
+            write_json_report(args.json, out)
         except OSError as e:
             print(f"ERROR: cannot write {args.json}: {e}", file=sys.stderr)
             return 2
     return 0
+
+
+def write_json_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1, sort_keys=True)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination), prefix=".heap_index_census-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, sort_keys=True)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
