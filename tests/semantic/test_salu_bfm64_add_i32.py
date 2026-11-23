@@ -176,12 +176,17 @@ class BfmB64Tests(unittest.TestCase):
 
     def test_vcc_and_null_destinations_wave64(self):
         # D = vcc (read back as a lane mask by v_cndmask_b32_e32); D = null discards the mask and keeps SCC.
+        # null is s125 and m0 is s124, so a 64-bit null write must not reach m0 either (the null mask
+        # (63, 1) = lanes 1..63 differs from every vcc mask here and from the m0 seed); exec stays whole, so all
+        # 64 lanes still export.
+        m0_seed = 0x5A5A1234
         for size, offset in ((8, 28), (20, 48), (32, 0)):
             for scc_in in (0, 1):
                 with self.subTest(size=size, offset=offset, scc_in=scc_in):
                     spv = support.translate_lines("ps_salu_bfm64_vcc", [
                         "s_mov_b64 exec, -1",
                         "s_mov_b64 vcc, 0",
+                        f"s_mov_b32 m0, {m0_seed:#x}",
                         f"s_bfm_b64 vcc, {size}, {offset}",
                         f"s_mov_b32 s4, {scc_in}",
                         "s_cmp_eq_u32 s4, 1",
@@ -189,15 +194,17 @@ class BfmB64Tests(unittest.TestCase):
                         "s_cselect_b32 s5, 1, 0",
                         "v_cndmask_b32_e32 v0, 0, 1, vcc",
                         "v_mov_b32 v1, s5",
-                        "v_mov_b32 v2, 0",
+                        "v_mov_b32 v2, m0",
                         "v_mov_b32 v3, 0",
                         "exp mrt0 v0, v1, v2, v3 done vm",
                         "s_endpgm",
                     ])
                     outs = wi.run_wave(spv, wave=64)["outputs"]
+                    self.assertTrue(all(out is not None for out in outs), "a lane was dropped: exec changed")
                     mask = sum(out["%out_mrt0"][0] << lane for lane, out in enumerate(outs))
                     self.assertEqual(mask, ref_bfm_b64(size, offset))
                     self.assertEqual({out["%out_mrt0"][1] for out in outs}, {scc_in})
+                    self.assertEqual({out["%out_mrt0"][2] for out in outs}, {m0_seed})
 
     def test_seeded_wave64(self):
         rng = random.Random(0xBF64)
