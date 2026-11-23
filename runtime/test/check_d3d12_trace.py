@@ -14,6 +14,8 @@ def run_fixture(exe, *args):
                              errors="replace", timeout=120 if RUNNER else 30)
     if process.returncode:
         raise SystemExit(f"{exe} exited with {process.returncode}\n{process.stdout}{process.stderr}")
+    if any(line.startswith("[d3d12-trace]") for line in process.stdout.splitlines()):
+        raise SystemExit("D3D12 trace appeared on stdout")
     return [line for line in process.stderr.splitlines() if line.startswith("[d3d12-trace]")]
 
 
