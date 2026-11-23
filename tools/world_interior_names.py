@@ -396,6 +396,12 @@ def main(argv=None):
     if os.path.isdir(a.out):
         print("world_interior_names.py: --out is a directory: %s" % a.out, file=sys.stderr)
         return 2
+    parent = os.path.dirname(out_abs)
+    while not os.path.exists(parent) and os.path.dirname(parent) != parent:
+        parent = os.path.dirname(parent)  # the nearest existing ancestor; makedirs needs it to be a folder
+    if not os.path.isdir(parent):
+        print("world_interior_names.py: --out is under a file, not a folder: %s" % parent, file=sys.stderr)
+        return 2
     try:
         names, duplicate_keys, malformed = load_names(a.names)
     except (OSError, ValueError) as exc:  # json.JSONDecodeError is a ValueError

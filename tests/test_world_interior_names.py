@@ -376,6 +376,27 @@ class CliTest(unittest.TestCase):
         self.assertEqual(so.getvalue(), "")
         self.assertFalse(os.path.exists(out))
 
+    def test_out_under_a_file_fails_before_the_scan(self):
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(interiors())
+        saved = T.scan
+        T.scan = lambda *args: self.fail("scan started")
+        try:
+            for out in (os.path.join(self.names, "r.json"), os.path.join(self.names, "sub", "r.json")):
+                err = io.StringIO()
+                sys.stderr, saved_err = err, sys.stderr
+                try:
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(T.main([folder, "--names", self.names, "--out", out]), 2, out)
+                finally:
+                    sys.stderr = saved_err
+                self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        finally:
+            T.scan = saved
+        self.assertTrue(os.path.isfile(self.names))
+
     def test_pool_size_goes_through_process_workers(self):
         # Windows refuses a ProcessPoolExecutor above 61 workers; tools/pool_workers.py caps it there.
         path = os.path.join(self.tmp.name, "levels.rpf")
