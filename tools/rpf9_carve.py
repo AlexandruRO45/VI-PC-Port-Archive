@@ -108,7 +108,7 @@ def first_adat_bank(m, start, end):
         at = m.find(b"ADAT", pos, end)
         if at < 0:
             return None
-        if parse_adat_header_bytes(m[at:min(size, at + ADAT_HEADER_READ)], at, size) is not None:
+        if parse_adat_header_bytes(m[at:min(end, at + ADAT_HEADER_READ)], at, size) is not None:
             return at
         pos = at + 1
     return None

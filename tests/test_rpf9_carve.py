@@ -385,3 +385,16 @@ class CarveUntilAdatTest(unittest.TestCase):
         doc, _ = carve_args(self, data, "--until-adat", "--limit", str(0x20))
         self.assertIsNone(doc["summary"]["first_adat_bank"])
         self.assertEqual(doc["summary"]["span"], 0x20)
+
+    def test_a_limit_inside_the_bank_header(self):
+        data, bank = adat_archive()
+        for header_bytes in (4, 15):
+            with self.subTest(header_bytes=header_bytes):
+                limit = bank + header_bytes - 0x40
+                doc, _ = carve_args(self, data, "--until-adat", "--limit", str(limit))
+                self.assertIsNone(doc["summary"]["first_adat_bank"])
+                self.assertEqual(doc["summary"]["span"], limit)
+
+        doc, _ = carve_args(self, data, "--until-adat", "--limit", str(bank + 16 - 0x40))
+        self.assertEqual(doc["summary"]["first_adat_bank"], bank)
+        self.assertEqual(doc["summary"]["span"], bank - 0x40)
