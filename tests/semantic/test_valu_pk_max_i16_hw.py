@@ -274,3 +274,48 @@ class TestValuPkMaxI16SimdDivergence(unittest.TestCase):
                 self.assertEqual(dest_vgpr[lane], ref_pk_max_i16(lane, lane + 1))
             else:
                 self.assertEqual(dest_vgpr[lane], 0xDEADBEEF)
+
+
+class TestValuPkMaxI16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        state = RegisterState()
+        state.vgpr[0] = 0x0005FFFB
+        state.vgpr[1] = 0xFFFB0005
+        inst = ASTInstruction(
+            opcode=Opcode.V_PK_MAX_I16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, 0x00050005)
+        self.assertEqual(state.vgpr[0], 0x00050005)
+
+    def test_dst_aliases_src1(self):
+        state = RegisterState()
+        state.vgpr[0] = 0x0005FFFB
+        state.vgpr[1] = 0xFFFB0005
+        inst = ASTInstruction(
+            opcode=Opcode.V_PK_MAX_I16,
+            dst=ASTOperand.vgpr(1),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, 0x00050005)
+        self.assertEqual(state.vgpr[1], 0x00050005)
+
+    def test_self_aliasing(self):
+        state = RegisterState()
+        state.vgpr[0] = 0x12345678
+        inst = ASTInstruction(
+            opcode=Opcode.V_PK_MAX_I16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, 0x12345678)
+        self.assertEqual(state.vgpr[0], 0x12345678)
