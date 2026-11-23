@@ -39,7 +39,7 @@ void check_quick_exit() {
                 ++failures;
                 continue;
             }
-            for (const char* exit_name : {"quick_exit", "_exit", "exit"}) {
+            for (const char* exit_name : {"quick_exit", "_exit", "_Exit", "exit"}) {
                 quick_terminate = reinterpret_cast<QuickExit>(rt::shims::find(dll, exit_name));
                 if (!quick_terminate) {
                     std::fprintf(stderr, "FAIL missing %s!%s\n", dll, exit_name);
