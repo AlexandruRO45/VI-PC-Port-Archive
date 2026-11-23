@@ -851,8 +851,11 @@ Save the lookup JSON and run
 to verify single-offset predictions. Supply completed normal model manifests from the
 same source archive. The verifier reads cached JSON only. It uses the world builder's
 name hashes and counts each identity and its placements once. A matching offset and both
-hashes confirm an observation, including dictionary children sharing an offset. The local
-report counts repeat exact observations and lists other offsets for the same identity.
+hashes confirm an observation, including dictionary children sharing an offset. Each row's
+`exact_observations` counts all matching entries and `distinct_drawable_children` counts unique
+non-null `Drawable` offsets among them. `duplicate_observations` counts entries beyond the
+first for each `Drawable` at that archive offset, grouping null and missing `Drawable` values
+together. The report also lists other offsets for the same identity.
 Without an exact match, a different name at the offset takes precedence over a matching
 identity elsewhere. The coverage flag independently records whether the predicted offset
 falls in a supplied scan (start inclusive, end exclusive). A full scan covers all offsets.

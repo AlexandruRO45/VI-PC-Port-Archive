@@ -35,16 +35,41 @@ class VerifyTest(unittest.TestCase):
                   "Items": [{"Name": "one.#dr", "Offset": 10}, {"Name": "one", "Offset": 12},
                             {"Name": "three", "Offset": 18}, {"Name": "", "Offset": 14}]}
         first = self.write("first", export)
-        second = self.write("second", dict(export, Items=export["Items"][:1]))
+        second = self.write("second", dict(export, Items=[dict(export["Items"][0], Drawable=None)]))
         result = verifier.verify(predictions, [first, second, first])
         self.assertEqual([r["status"] for r in result["rows"]],
                          ["confirmed", "conflicting_name", "conflicting_offset", "missing_evidence",
                           "outside_windows"])
         self.assertEqual(result["placements"], {s: 3 for s in result["identities"]})
+        self.assertEqual(result["rows"][0]["exact_observations"], 2)
         self.assertEqual(result["rows"][0]["duplicate_observations"], 1)
+        self.assertEqual(result["rows"][0]["distinct_drawable_children"], 0)
         self.assertEqual(result["rows"][0]["other_identity_offsets"], [12])
         full = self.write("full", dict(export, Scan={}))
         self.assertEqual(verifier.verify(predictions, [full])["identities"]["missing_evidence"], 2)
+
+    def test_distinguish_drawable_children_from_repeats(self):
+        candidate = {"archetype": format(world_names.joaat("twin"), "x"),
+                     "key": format(world_names.hash64("twin"), "x"), "offsets": [0x3010],
+                     "status": "candidate", "placements": 3}
+        predictions = self.write("lookup", {"archive": "source.rpf", "candidates": [candidate]})
+        children = [{"Name": "twin.#dr", "Offset": 0x3010, "Drawable": drawable}
+                    for drawable in (0x200, 0x700)]
+        first = self.write("first", {"src": "source.rpf", "Scan": {"Start": 0, "Length": 0x5000},
+                                     "Items": children})
+        second = self.write("second", {"src": "source.rpf", "Scan": {"Start": 0x2010, "Length": 0x2000},
+                                       "Items": children[:1]})
+
+        for manifests, exact, repeats in [([first], 2, 0), ([first, second], 3, 1)]:
+            with self.subTest(manifests=manifests):
+                result = verifier.verify(predictions, manifests)
+                self.assertEqual(result["identities"], {"confirmed": 1})
+                self.assertEqual(result["placements"], {"confirmed": 3})
+                row, = result["rows"]
+                self.assertEqual(row["exact_observations"], exact)
+                self.assertEqual(row["duplicate_observations"], repeats)
+                self.assertEqual(row["distinct_drawable_children"], 2)
+                self.assertEqual(result, verifier.verify(predictions, [*manifests, first]))
 
     def test_reject_unrelated_archive_and_bad_bounds(self):
         predictions = self.write("lookup", {"archive": "source.rpf", "candidates": []})

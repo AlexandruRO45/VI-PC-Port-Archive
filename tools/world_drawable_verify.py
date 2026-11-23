@@ -22,7 +22,7 @@ def verify(predictions, manifests):
     archive = archive_path(report.get("archive"))
     windows = []
     full_scan = False
-    observations = Counter()
+    observations = defaultdict(Counter)
     named_offsets = set()
     by_identity = defaultdict(set)
     paths = dict.fromkeys(os.path.normcase(os.path.realpath(path)) for path in manifests)
@@ -49,7 +49,7 @@ def verify(predictions, manifests):
         for h, entries in index.items():
             for _, item, key in entries:
                 offset = item["Offset"]
-                observations[h, key, offset] += 1
+                observations[h, key, offset][item.get("Drawable")] += 1
                 named_offsets.add(offset)
                 by_identity[h, key].add(offset)
 
@@ -72,7 +72,9 @@ def verify(predictions, manifests):
         if type(n) is not int or n < 1:
             raise ValueError("expected positive placement count")
         covered = full_scan or any(start <= offset < end for start, end in windows)
-        exact = observations[h, key, offset]
+        drawables = observations.get((h, key, offset), {})
+        exact = sum(drawables.values())
+        distinct_children = len(drawables) - (None in drawables)
         elsewhere = sorted(by_identity[h, key] - {offset})
         if exact:
             status = "confirmed"
@@ -88,7 +90,8 @@ def verify(predictions, manifests):
         placements[status] += n
         rows.append({"archetype": row["archetype"], "key": row["key"], "offset": offset,
                      "placements": n, "status": status, "covered": covered,
-                     "exact_observations": exact, "duplicate_observations": max(0, exact - 1),
+                     "exact_observations": exact, "duplicate_observations": exact - len(drawables),
+                     "distinct_drawable_children": distinct_children,
                      "other_identity_offsets": elsewhere})
     return {"identities": identities, "placements": placements, "rows": rows}
 
