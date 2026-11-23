@@ -111,7 +111,12 @@ class Skip(Exception):
 
 def load_program(path):
     """The reachable instructions of a listing, as rdna2spirv.translate() takes them (no SPIR-V is built)."""
-    info = parse_file(path)
+    try:
+        info = parse_file(path)
+    except ValueError:
+        # a cut or mangled listing line (an encoding comment holding a non-hex token is the usual one) aborts
+        # the parse; like every other listing the census cannot follow, it is counted, not fatal
+        raise Skip("undecodable listing line") from None
     insns = info["insns"]
     if not insns:
         raise Skip("no instructions")

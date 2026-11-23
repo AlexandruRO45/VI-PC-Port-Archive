@@ -274,6 +274,23 @@ class SummaryTests(unittest.TestCase):
             census.main([os.path.join(tempfile.gettempdir(), "no_such_shaders_dir_xyz")])
         self.assertNotEqual(cm.exception.code, 0)
 
+    def test_cut_encoding_comment_is_counted_not_fatal(self):
+        # one listing cut or mangled inside its encoding comment (here: a token left as "0x" by a
+        # truncated write) must not lose the whole scan: the census counts it in not_analysed,
+        # the way it counts a branch out of the code, and still reports the good listings
+        listings = {
+            "cs_tri": listing(*DESC_LITERALS, CALL32, *TRIANGLE, "s_endpgm"),
+            "ps_cut": "; ps_cut  code 0x0..0x4 (header), gfx1013, 0 invalid words\n"
+                      "\timage_bvh_intersect_ray v[4:7], v[0:10], s[8:11] ; encoding: [0x00,0x00,0x00,0x]\n",
+        }
+        with tempfile.TemporaryDirectory() as src:
+            self.directory(src, listings)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(census.main([src]), 0)
+        first = printed.getvalue().splitlines()[0]
+        self.assertIn("1 image_bvh sites", first)                    # the good listing was still counted
+        self.assertIn("undecodable listing line", first)             # and the cut one became a reason
+
     def test_output_must_not_overwrite_a_listing(self):
         with tempfile.TemporaryDirectory() as src:
             self.directory(src, {"cs_tri": listing(CALL32, "s_endpgm")})
