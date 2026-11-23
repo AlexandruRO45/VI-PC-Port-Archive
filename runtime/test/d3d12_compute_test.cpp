@@ -268,9 +268,14 @@ int main() {
     for (std::uint32_t i = 0; i < 14; ++i) put32(fssm, 0xbf810000u + i);  // filler, s_endpgm-like words
     const auto container = shader_container(fssm);
     EXPECT(leonida::fssm_program(container) == fssm);
+    auto requires_unknown_control = fssm;
+    requires_unknown_control[8] ^= 2;
+    const auto unknown_control_container = shader_container(requires_unknown_control);
     const auto library = std::filesystem::temp_directory_path() / "leonida_compute_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(library / "cs_user_data.spv", library / "cs_unknown_control.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -280,7 +285,10 @@ int main() {
               << "\", \"bindings\": [{\"binding\": 0}], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1]},\n"
                  " \"cs_user_data\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
-                 "\"uses_code_base\": true, \"wave64\": false}}";
+                 "\"uses_code_base\": true, \"wave64\": false},\n"
+                 " \"cs_unknown_control\": {\"stage\": \"cs\", \"fssm_sha256\": \""
+              << leonida::sha256_hex(requires_unknown_control)
+              << "\", \"float_controls\": [\"shaderTestUnknownFloatControl\"]}}";
     }
 
     constexpr UINT elements = 64, bytes = elements * 4;
@@ -339,6 +347,11 @@ int main() {
         const auto other_container = shader_container(other);
         pso_desc.CS = {other_container.data(), other_container.size()};
         EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
+        // A valid module with an unknown requirement is refused on every adapter.
+        pso_desc.CS = {unknown_control_container.data(), unknown_control_container.size()};
+        Ref<ID3D12PipelineState> unknown_control;
+        EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown_control.p)) == E_NOTIMPL &&
+               !unknown_control.p);
         pso_desc.CS = {container.data(), container.size()};
 
         // The PSO through slot 67, compute pipeline from native code; maps to CreateComputePipelineState.

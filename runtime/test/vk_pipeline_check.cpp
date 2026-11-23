@@ -50,6 +50,7 @@
 #include "pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
 #include "../src/spirv_words.h"
+#include "../src/vulkan_float_controls.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1021,13 +1022,9 @@ int main(int argc, char** argv) {
         // Execution modes the translator declares (SignedZeroInfNanPreserve 32, DenormPreserve 16) need a device
         // property, not a feature.
         for (const auto& fc : meta.float_controls) {
-            if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
-                if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
-            } else if (fc == "shaderDenormPreserveFloat16") {
-                if (!fcProps.shaderDenormPreserveFloat16) return "no " + fc;
-            } else {
-                return "unknown float control " + fc;
-            }
+            const auto* enabled = leonida::float_control_property(fcProps, fc);
+            if (!enabled) return "unknown float control " + fc;
+            if (!*enabled) return "no " + fc;
         }
         for (const auto& feat : meta.features) {
             if (feat == "meshShader" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";

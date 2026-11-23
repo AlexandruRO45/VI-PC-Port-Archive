@@ -162,7 +162,8 @@ Current limits, by design:
   (`shims/d3d12_vulkan_device.cpp`) when `LEONIDA_D3D12=vulkan` is set and the runtime was built with the
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
   depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
-  section 3.2 for what is missing.
+  section 3.2 for what is missing. If a translated shader needs a Vulkan float-control property the device lacks,
+  graphics or compute pipeline creation logs the shader and property and returns `E_NOTIMPL`.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback

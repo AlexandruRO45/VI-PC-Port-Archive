@@ -624,6 +624,7 @@ struct ShaderEntry {
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
     std::size_t binding_count = 0;  // set-0 bindings the module declares
     std::uint32_t push_constant_bytes = 0;
+    std::vector<std::string> float_controls;  // Vulkan device properties required by the module's execution modes
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     // Workgroup memory the module declares: its LDS array plus what --wave64-emulate adds (SHADER-309). A compute
     // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
@@ -779,6 +780,9 @@ private:
                 e.fspx_state_sha256 = s->string;
             if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
+            if (const Json* controls = meta.find("float_controls"); controls && controls->kind == Json::Kind::array)
+                for (const Json& property : controls->array)
+                    if (property.kind == Json::Kind::string) e.float_controls.push_back(property.string);
             e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);

@@ -26,6 +26,7 @@
 #include "../src/spirv_f16_halves.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/vulkan_float_controls.h"
 #include "../src/vulkan13_features.h"
 
 #include <vulkan/vulkan_win32.h>
@@ -393,7 +394,25 @@ struct TextureCreateInfo {
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
     VulkanDeviceInfo info;
+    VkPhysicalDeviceFloatControlsProperties float_controls{};
     std::vector<std::uint32_t> families;
+
+    bool supports_float_controls(const leonida::ShaderEntry& entry) const {
+        for (const std::string& required : entry.float_controls) {
+            const auto* enabled = leonida::float_control_property(float_controls, required);
+            if (!enabled) {
+                std::fprintf(stderr, "[rt] d3d12: %s has an unknown Vulkan float-control requirement: %s\n",
+                             entry.name.c_str(), required.c_str());
+                return false;
+            }
+            if (!*enabled) {
+                std::fprintf(stderr, "[rt] d3d12: %s requires %s, which the Vulkan device does not support\n",
+                             entry.name.c_str(), required.c_str());
+                return false;
+            }
+        }
+        return true;
+    }
 
     template<typename CreateInfo>
     void share(CreateInfo& create) const {
@@ -2630,6 +2649,7 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
+            if (!device_.supports_float_controls(*stage.entry)) return E_NOTIMPL;
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
@@ -3022,6 +3042,7 @@ public:
                              leonida::sha256_hex(program.bytes).c_str());
             return E_INVALIDARG;
         }
+        if (!device_.supports_float_controls(*entry)) return E_NOTIMPL;
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
         if (entry->binding_count && !device_.bindless) {
@@ -4067,10 +4088,11 @@ public:
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
+                state_.float_controls.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES;
                 VkPhysicalDeviceDepthStencilResolveProperties resolve{
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES, &state_.float_controls};
                 VkPhysicalDeviceConservativeRasterizationPropertiesEXT conservative{
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT, &state_.float_controls};
                 if (info.conservative_rasterization) resolve.pNext = &conservative;
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
