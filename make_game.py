@@ -2166,7 +2166,8 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
         dst = src[:-8] + ".wav"
         tmp = dst + ".part"
         # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
-        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
+        # Without -xerror, ffmpeg can report a decoder error but exit 0 after writing partial audio.
+        r = subprocess.run([ff, "-v", "error", "-xerror", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
                            stdin=subprocess.DEVNULL)
         progress.tick()
         if r.returncode == 0 and os.path.isfile(tmp):

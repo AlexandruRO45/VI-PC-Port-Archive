@@ -146,8 +146,9 @@ class AudioStageResumeTest(unittest.TestCase):
         if self.ffmpeg_ok:
             open(cmd[-1], "w").close()
             return subprocess.CompletedProcess(cmd, 0)
-        open(cmd[-1], "w").close()        # a failed ffmpeg can still leave part of its output
-        return subprocess.CompletedProcess(cmd, 1)
+        # ffmpeg can leave a partial file and exit successfully after a decoder error unless -xerror is set.
+        open(cmd[-1], "w").close()
+        return subprocess.CompletedProcess(cmd, 1 if "-xerror" in cmd else 0)
 
     def run_stage(self, ffmpeg="ffmpeg"):
         self.ran = []
