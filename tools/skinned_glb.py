@@ -590,7 +590,8 @@ def own_parent_name(record, own_skeleton) -> str | None:
     if parent_name is None:
         parent = record.get("parent")
         if isinstance(parent, int) and 0 <= parent < len(own_skeleton):
-            parent_name = own_skeleton[parent].get("name")
+            bone = own_skeleton[parent]
+            parent_name = bone.get("name") if isinstance(bone, dict) else None
     return parent_name if isinstance(parent_name, str) and parent_name else None
 
 

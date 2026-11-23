@@ -250,6 +250,9 @@ class SkinnedGlbTest(unittest.TestCase):
         with self.assertRaisesRegex(skinned_glb.SkinError, "skeleton bone has no fields: list"):
             skinned_glb.build_skinned_glb(skeleton, [component])
 
+    def test_own_parent_name_ignores_a_non_object_parent_entry(self):
+        self.assertIsNone(skinned_glb.own_parent_name({"parent": 0}, [[1, 2]]))
+
     def test_joint_count_and_palette_resolution(self):
         _gltf, _binary, stats = self._build()
         self.assertEqual(stats["ped_joints"], 3)
