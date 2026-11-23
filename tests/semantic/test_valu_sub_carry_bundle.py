@@ -645,5 +645,37 @@ class VSubrevCoCiU32AstInterpreterTests(unittest.TestCase):
         self.assertEqual(out[1], 0)
 
 
+class VSubrevCoCiU32SimdBoundaryTests(unittest.TestCase):
+    """64-bit reverse ripple borrow chains and clamp saturation for v_subrev_co_ci_u32."""
+
+    def test_64bit_reverse_borrow_chain_translator(self):
+        # [v3:v2] - [v5:v4] = (0x00000001_00000000) - (0x00000000_00000001) = 0x00000000_FFFFFFFF
+        out = run_prog([
+            "v_mov_b32 v2, 0",  # low minuend
+            "v_mov_b32 v3, 1",  # high minuend
+            "v_mov_b32 v4, 1",  # low subtrahend
+            "v_mov_b32 v5, 0",  # high subtrahend
+            "v_subrev_co_u32 v0, vcc, v4, v2",
+            "v_subrev_co_ci_u32 v1, vcc, v5, v3, vcc",
+            "v_cndmask_b32 v2, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 0xFFFFFFFF)
+        self.assertEqual(out[1], 0x0)
+        self.assertEqual(out[2], 0)
+
+    def test_clamp_saturation_translator(self):
+        # 5 - 20 - 1 clamp -> 0 (borrow=1)
+        out = run_prog([
+            "v_mov_b32 v0, 20",
+            "v_mov_b32 v1, 5",
+            "v_sub_co_u32 v2, vcc, 0, 1",  # vcc = 1
+            "v_subrev_co_ci_u32 v3, vcc, v0, v1, vcc clamp",
+            "v_mov_b32 v0, v3",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 0)
+        self.assertEqual(out[1], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
