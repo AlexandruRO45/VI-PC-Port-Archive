@@ -300,6 +300,17 @@ class TestVSubU16Interpreter(unittest.TestCase):
         self.assertEqual(res, 0)
         self.assertEqual(state.vgpr[1], 0)
 
+class TestVSubU16EdgeCases(unittest.TestCase):
+    def test_extremum_bounds(self):
+        self.assertEqual(ref_v_sub_u16(0, 0xFFFF), 1)  # (0 - 65535) & 0xFFFF = 1
+        self.assertEqual(ref_v_sub_u16(0, 0xFFFF, clamp=True), 0)
+
+    def test_simd_divergent_lanes(self):
+        lanes_a = [1000 + i * 10 for i in range(64)]
+        lanes_b = [i * 10 for i in range(64)]
+        res = [ref_v_sub_u16(a, b) for a, b in zip(lanes_a, lanes_b)]
+        self.assertTrue(all(r == 1000 for r in res))
+
 
 if __name__ == "__main__":
     unittest.main()
