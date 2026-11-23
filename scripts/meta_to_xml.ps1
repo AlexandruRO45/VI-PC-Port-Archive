@@ -1,12 +1,15 @@
 # Converts carved PSO ('PSIN') and RBF ('RBF0') metadata blobs to XML with CodeWalker.Core's parsers.
 # Run in Windows PowerShell 5.1.
 #   .\meta_to_xml.ps1 -Carve <work>\carve -Out <work>\meta [-Limit N]
+# -Limit N converts the first N blobs; 0 or no -Limit converts every blob.
 # Each blob becomes <Out>\<archive>\<offset>.xml. Failures go to <Out>\failures.txt (UTF-8 with BOM) with the error message.
 param(
     [string]$Carve = "<work>\carve",
     [string]$Out = "<work>\meta",
     [string]$CodeWalker = "<ref>\codewalker-gen9",
-    [int]$Limit = 0
+    # A negative limit used to stop before the first blob: `$Limit` is true for any non-zero value, so the loop
+    # broke at once and the run ended with 'pso ok 0 failed 0' and an empty failures.txt.
+    [ValidateRange(0, 2147483647)][int]$Limit = 0
 )
 $ErrorActionPreference = "Stop"
 try { (Get-Process -Id $PID).PriorityClass = "BelowNormal" } catch {}
