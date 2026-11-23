@@ -411,5 +411,19 @@ class VCubeMaScalarInterpreterTests(unittest.TestCase):
         res = oracle_cubema_f32(0.5, 1.0, 2.5)  # Z major -> 2 * 2.5 = 5.0
         self.assertEqual(res, 5.0)
 
+class VCubeMaSimdDivergenceTests(unittest.TestCase):
+    def test_cubema_simd_exec_masking(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0xAAAAAAAA
+        for i in range(32):
+            wave.set_vgpr(i, 6, -1.0)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_vgpr(i, 6, oracle_cubema_f32(0.0, 0.0, float(i)))
+        for i in range(32):
+            if (0xAAAAAAAA >> i) & 1:
+                self.assertEqual(wave.get_vgpr(i, 6), 2.0 * float(i))
+            else:
+                self.assertEqual(wave.get_vgpr(i, 6), -1.0)
+
 if __name__ == "__main__":
     unittest.main()
