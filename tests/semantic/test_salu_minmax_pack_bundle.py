@@ -307,5 +307,22 @@ class SMaxI32SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(res, 0x7FFFFFFF)
         self.assertEqual(scc, 1)
 
+class SMaxI32TranslatorTests(unittest.TestCase):
+    def test_max_i32_translation_and_execution(self):
+        lines = [
+            "s_mov_b32 s0, 50",
+            "s_mov_b32 s1, -50",
+            "s_max_i32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, s3",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_max_i32_exec", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 50)
+        self.assertEqual(words[1], 1)
+
 if __name__ == "__main__":
     unittest.main()
