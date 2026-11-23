@@ -89,7 +89,7 @@ def query(a: Asm, out_disp: int, class_id: str, iface_id: str | None, done: str)
     a.rel("78", done, 1)                                         # js done
 
 
-def build_code(a: Asm) -> list[tuple[int, int]]:
+def build_code(a: Asm, inline_return_block: bool = False) -> list[tuple[int, int]]:
     """The functions; returns their (begin, end) for .pdata."""
     funcs = []
 
@@ -134,7 +134,20 @@ def build_code(a: Asm) -> list[tuple[int, int]]:
     # thunk2, call [rax+disp8]: XNetworkingImpl as IXNetworkingImpl2, slot 15 = XNetworkingGetConnectivityHint(&hint)
     s = begin("thunk2")
     a.raw("53" "4883EC30" "488BD9")                              # push rbx; sub rsp,30h; mov rbx,rcx
-    query(a, 0x28, NETWORKING, NETWORKING2, "done2")
+    if inline_return_block:
+        # The `if (helper(...) < 0) return -1;` block cl 14.44 /O2 writes inline: the jns lands on the body, the
+        # block ends the first .pdata entry on its jmp to the epilogue, and the body is the next entry.
+        a.raw("4C8D442428")                                      # lea r8,[rsp+28h]
+        a.rel("488D15", GUIDS[NETWORKING2])                      # lea rdx,[iid]
+        a.rel("488D0D", GUIDS[NETWORKING])                       # lea rcx,[clsid]
+        a.rel("E8", "helper")
+        a.raw("85C0")                                            # test eax,eax
+        a.rel("79", "t2_body", 1)                                # jns t2_body
+        a.raw("B8FFFFFFFF")                                      # mov eax,-1
+        a.rel("E9", "done2")                                     # jmp done2
+        a.label("t2_body")                                       # thunk2's second .pdata entry starts here
+    else:
+        query(a, 0x28, NETWORKING, NETWORKING2, "done2")
     a.raw("488B4C2428" "488B01" "488BD3")                        # mov rcx,[rsp+28h]; mov rax,[rcx]; mov rdx,rbx
     a.raw("FF5078")                                              # call [rax+78h]
     a.raw("488B4C2428" "488B01" "FF5010")                        # Release
@@ -224,7 +237,8 @@ def build_code(a: Asm) -> list[tuple[int, int]]:
     return funcs
 
 
-def build_image(with_pdata: bool = True, split_thunk1: bool = False) -> bytes:
+def build_image(with_pdata: bool = True, split_thunk1: bool = False, split_thunk2: bool = False,
+                inline_return_block: bool = False) -> bytes:
     opt_size = 240
     buf = bytearray(RDATA_RAW + RDATA_SIZE)
     buf[0:2] = b"MZ"
@@ -241,7 +255,7 @@ def build_image(with_pdata: bool = True, split_thunk1: bool = False) -> bytes:
     struct.pack_into("<I", buf, opt + 108, 16)
 
     a = Asm(TEXT_RVA)
-    funcs = build_code(a)
+    funcs = build_code(a, inline_return_block)
     code = a.finish()
     LABELS.update(a.labels)
     assert len(code) <= TEXT_SIZE
@@ -257,6 +271,11 @@ def build_image(with_pdata: bool = True, split_thunk1: bool = False) -> bytes:
             i = next(k for k, (b, _) in enumerate(entries) if b == LABELS["thunk1"])
             entries[i:i + 1] = [(LABELS["thunk1"], LABELS["t1_body"]), (LABELS["t1_body"], LABELS["done1"]),
                                 (LABELS["done1"], entries[i][1])]
+        if split_thunk2:
+            # The inline return block ends thunk2's first entry on its jmp; the body the jns lands on is the next
+            # entry, as cl 14.44 /O2 writes it.
+            i = next(k for k, (b, _) in enumerate(entries) if b == LABELS["thunk2"])
+            entries[i:i + 1] = [(LABELS["thunk2"], LABELS["t2_body"]), (LABELS["t2_body"], entries[i][1])]
         at = RDATA_RAW + PDATA_RVA - RDATA_RVA
         for i, (b, e) in enumerate(entries):
             struct.pack_into("<III", buf, at + i * 12, b, e, 0x3F00)
@@ -379,6 +398,17 @@ class ImageTest(unittest.TestCase):
         self.assertEqual(r["thunks"], 6)
         threading = slots_of(by_class(r)["XThreadingImpl"])
         self.assertEqual(threading[("XThreadingImpl/IXThreadingImpl", 12)]["method"], "XTaskQueueCreate")
+
+    def test_an_inline_return_block_does_not_end_the_function(self):
+        # cl 14.44 /O2 writes `if (helper(...) < 0) return -1;` inline: the jns lands on the body, the block ends
+        # its .pdata entry on the jmp past it, and the body is the next entry. Treating that jmp as the function's
+        # end loses the slot call after it, so a thunk with an early return is reported as having no slot at all.
+        path = self.write("return_block.dll", build_image(inline_return_block=True, split_thunk2=True))
+        r = grc.report(path, self.table, self.served)
+        self.assertEqual(r["pdata_functions"], 11)
+        self.assertEqual(r["thunks"], 6)
+        net = slots_of(by_class(r)["XNetworkingImpl"])
+        self.assertEqual(net[("IXNetworkingImpl2", 15)]["method"], "XNetworkingGetConnectivityHint")
 
     def test_main_writes_text_and_json_with_lf(self):
         out = os.path.join(self.tmp, "out")

@@ -147,6 +147,11 @@ class Insn:
         return self.mod is not None and self.mod != 3 and self.base == base and self.index is None
 
 
+def is_conditional_branch(i: Insn) -> bool:
+    """A `jcc` (short `7x`, near `0F 8x`) or a loop instruction (`E0`-`E3`)."""
+    return 0x70 <= i.op <= 0x7F or 0x180 <= i.op <= 0x18F or 0xE0 <= i.op <= 0xE3
+
+
 def decode(buf, off: int, base_rva: int) -> Insn | None:
     """Decode the instruction at buf[off] (buf starts at base_rva). None for an invalid or cut-off instruction."""
     n = len(buf)
@@ -480,17 +485,23 @@ class Code:
 
     def continued_end(self, begin: int, end: int) -> int:
         """`end` of the last .pdata entry that continues this one: an entry starting exactly where this one ends,
-        when the code at the hand-over does not end the flow. MSVC 14.44 splits one function into several adjacent
-        entries (a prologue prefix, the body with the vtable calls, the epilogue), so one entry's end is not
-        necessarily the function's end."""
+        when the next entry is still part of the same function. MSVC 14.44 splits one function into several
+        adjacent entries (a prologue prefix, the body with the vtable calls, the epilogue), so one entry's end is
+        not necessarily the function's end. A hand-over continues the function when the code before it falls
+        through, or when a conditional branch inside the entry targets exactly the hand-over: an `if (helper() <
+        0) return ...;` block written inline ends its entry on the jmp to the epilogue, and the rest of the body
+        starts where that branch lands."""
         while True:
             nxt = self.function(end)
             if nxt is None or nxt[0] != end:
                 return end
             run = self.run(begin, end)
+            if run is None:
+                return end
             # shortcut: a function whose last entry ends on a call could chain into its neighbour; a function's
-            # last instruction is a ret or a jmp, so stop there.
-            if run is None or run[-1].ends_flow():
+            # last instruction is a ret or a jmp, so stop there unless a conditional branch comes back to the
+            # hand-over.
+            if run[-1].ends_flow() and not any(is_conditional_branch(i) and i.target == end for i in run):
                 return end
             begin, end = end, nxt[1]
 
