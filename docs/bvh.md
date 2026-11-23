@@ -182,9 +182,37 @@ The same file defines the packed records: `XboxBvh4NodePacked` at L2326, `XboxBv
 
 The layouts above are source definitions. The dehydrated stream is not a contiguous array of runtime `Node16`
 records. Its element and box packing is measured in §4a: a CPU model that reads it reproduces the library's
-rehydrated output byte for byte, and its structure holds on all 272,874 streams of the two packs. The
-`BVVDHeader` table is not used by the samples there and stays **Open**. A decoder must not feed the dehydrated root
-to the runtime traversal path; it has to rehydrate first.
+rehydrated output byte for byte, and its structure holds on all 272,874 streams of the two packs. A decoder must not
+feed the dehydrated root to the runtime traversal path; it has to rehydrate first.
+
+**No `BVVDHeader` table in the packs (ASSET-319, measured).** `tools/bvh_packing_check.py` also requires every byte
+of a structure outside the header, the five leaf arrays of each chunk, the used bytes of each box group and the level
+table to be zero (`nonzero_outside_packing` otherwise). Over both packs:
+
+| | holds on |
+|---|---|
+| nothing outside the §4a packing, structure at `0x100` of each stream | 272,874 / 272,874 (core 271,637, shared 1,237) |
+| the same, structures after the first in an N > 1 buffer (§3.2a) | 4,174 / 4,174 (core 4,170, shared 4) |
+| a stream's bytes outside its structures are zero, apart from each structure's wrapper words at `0x20` and `0x28` | 272,874 / 272,874 |
+
+So the 277,048 structures leave no non-zero byte for a table of 8-byte records, and no header word locates one:
+`offsetToPrimRemap` is 0 everywhere (above), and the kDOP field of `flags` (bits 20-23,
+`XboxBvh4Header_Flags_kDOP_Mask` at L2568) is 0 in `0x81020006`, so no bytes follow the 64-byte header
+(`kept_header_bytes` in `tools/bvh_rehydrate.py`). The library's rehydration programs take no table either: the
+parameter block of `Box16Rehydration` and `Box32Rehydration` is `offsetToHierarchy`, `offsetToParentData`,
+`offsetToLeaves` and `IsUpdatableBVH`; `LeafRehydration`'s holds the leaf frame, `offsetToLeaves` and `numElements`.
+No resource or field name of the 52 builder programs ([embedded_shaders.md](embedded_shaders.md), both bitcode
+modules of each through `llvm-dis`), and no string of `XboxBvhBuilder.dll`, contains `variant` or `BVVD`.
+
+**Hypothesis:** what a `BVVDHeader` describes is stored inline. Its two-bit `variantChildNode` and six-bit
+`variantBitMask` match one slot's six bits of a group word's 24-bit override mask (bit `6 * slot + c`, §4a), and the
+word's place in its group stands for `variantNodeIndex`. In the structures at `0x100`, 3,193,382 slots store at least
+one component in core (17,082,560 components, 5.3 per slot) and 16,476 in shared (86,499). **Open:** whether the
+library writes `BVVDHeader` records anywhere else, for example when it dehydrates a structure at run time.
+
+The first row and the slot counts (`override_slots` in the report's stats) are a `bvh_packing_check.py` run (§7). The
+other two rows came from a scratch driver around the same `check_stream` that walks the structures of a buffer by the
+§3.2a rule; that walk is not in the tool.
 
 ### 3.2 Instance descriptor (208 bytes)
 
@@ -462,7 +490,8 @@ bytes form exactly one tree:
 * a TRI0 pointer names a leaf slot `offsetToElements + 64 * k` with `k < numElements`;
 * nothing points to the root, and every other node and every leaf has exactly one parent;
 * every vertex-order byte is a permutation;
-* every stored override lies inside `sceneBounds` in the leaf frame.
+* every stored override lies inside `sceneBounds` in the leaf frame;
+* every other byte of the structure is zero (§3.1, the `BVVDHeader` table).
 
 Result: **272,874 of 272,874** streams pass. That is 271,627 complete streams and 10 split ones (joined) in
 `core_bvh4.rpf`, plus 1,237 in `shared_minigame000_bvh4.rpf`.
@@ -774,6 +803,9 @@ Measured on Windows with 14 workers:
 |---|---:|---:|
 | `core_bvh4.rpf` | 235 s | 271,637 / 271,637 |
 | `shared_minigame000_bvh4.rpf` | 3 s | 1,237 / 1,237 |
+
+With the zero-byte check added (ASSET-319) the same streams pass, run with `--workers 1` on a Ryzen 5 2600X: 4,959 s
+for core and 37 s for the shared pack.
 
 The exit status is 1 when a stream fails.
 
