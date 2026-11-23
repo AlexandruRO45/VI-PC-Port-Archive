@@ -5515,26 +5515,33 @@ class Gen:
         or zero per lane) also sets the lanes of that half from its bit (identical to testing non-zero, but safe
         for non-mask scalars). Lanes of the other half are unchanged."""
         lane = self.wave_lane()
-        rel, inh, bit, on, cur, new = (self.tmp() for _ in range(6))
-        if half == 0:
+        word = self.cu(const & 0xFFFFFFFF) if const is not None else val
+        rel = self.tmp()
+        if not self.wave64:
+            self.emit(f"{rel} = OpCopyObject %uint {lane}")
+        elif half == 0:
+            inh = self.tmp()
             self.emit(f"{inh} = OpULessThan %bool {lane} {self.cu(32)}")
             self.emit(f"{rel} = OpCopyObject %uint {lane}")
         else:
+            inh = self.tmp()
             self.emit(f"{inh} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
             self.emit(f"{rel} = OpISub %uint {lane} {self.cu(32)}")
-        word = self.cu(const & 0xFFFFFFFF) if const is not None else val
-        r31 = self.tmp()
+        r31, shr, bit, on = (self.tmp() for _ in range(4))
         self.emit(f"{r31} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
         # Shift and mask, not OpBitFieldUExtract: Intel's Windows driver (UHD 770 / Xe-LP, 32.0.101.6129;
         # also seen on Xe-LPG) extracts from a constant that fits in 16 bits with the offset taken mod 16, so
         # exec_lo = 0xffff turned on all 32 lanes. GPU-checked with cs_exec_const.asm.
-        shr = self.tmp()
         self.emit(f"{shr} = OpShiftRightLogical %uint {word} {r31}")
         self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
         self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
-        self.emit(f"{cur} = OpLoad %bool %active")
-        self.emit(f"{new} = OpSelect %bool {inh} {on} {cur}")
-        self.emit(f"OpStore %active {new}")
+        if self.wave64:
+            cur = self.active_b()
+            new = self.tmp()
+            self.emit(f"{new} = OpSelect %bool {inh} {on} {cur}")
+            self.emit(f"OpStore %active {new}")
+        else:
+            self.emit(f"OpStore %active {on}")
         self.uses_active = True
 
     def set_scc(self, b):
