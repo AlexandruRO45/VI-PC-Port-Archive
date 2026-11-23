@@ -7225,6 +7225,8 @@ class Gen:
                 raise Unsupported(op + " modifiers")
             sh_src, val_src = self.src_u(a[1]), self.src_u(a[2])
             signed = op.endswith("i16")
+            k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical",
+                 "v_pk_ashrrev_i16": "OpShiftRightArithmetic"}[op]
             halves = []
             for h, sl in ((0, sel), (1, selhi)):
                 amt, val, am, r16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
@@ -7234,6 +7236,23 @@ class Gen:
                     self.emit(f"{amt} = OpBitwiseAnd %uint {half} {self.cu(15)}")
                 else:
                     self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(0)} {self.cu(4)}")
+                if h == 1:
+                    # The high result half is computed in place, in bits 31:16, and never moved down and back up
+                    # (#5533, SHADER-1002). AMD's Windows driver 32.0.21045.29003 (gfx1036) miscompiles the
+                    # down-shift-up spelling when the shift amount is 0 and the values come through the EXEC
+                    # OpSelect: `v_pk_ashrrev_i16 v29, v30, v24 op_sel:[1,1] op_sel_hi:[1,1]` with v24 =
+                    # 0x4000b88d gave 0xb88d4000 for 0x40004000 (tools/driver_repro/amd_pk_ashr_hi16). With the
+                    # source half in bits 31:16 and zeros below, a shift by 0..15 leaves only zeros or shifted-out
+                    # bits under bit 16, so masking with 0xFFFF0000 gives the same word: arithmetic right shifts see
+                    # the half's sign in bit 31, logical ones shift in zeros, left shifts drop bits past bit 31.
+                    if sl[1]:
+                        self.emit(f"{val} = OpBitwiseAnd %uint {val_src} {self.cu(0xFFFF0000)}")
+                    else:
+                        self.emit(f"{val} = OpShiftLeftLogical %uint {val_src} {self.cu(16)}")
+                    self.emit(f"{am} = {k} %uint {val} {amt}")
+                    self.emit(f"{r16} = OpBitwiseAnd %uint {am} {self.cu(0xFFFF0000)}")
+                    halves.append(r16)
+                    continue
                 if sl[1]:
                     # The high half: x >> 16 already extends it the right way for the shift that follows.
                     right = "OpShiftRightArithmetic" if signed else "OpShiftRightLogical"
@@ -7241,14 +7260,11 @@ class Gen:
                 else:
                     ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
                     self.emit(f"{val} = {ext} %uint {val_src} {self.cu(0)} {self.cu(16)}")
-                k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical",
-                     "v_pk_ashrrev_i16": "OpShiftRightArithmetic"}[op]
                 self.emit(f"{am} = {k} %uint {val} {amt}")
                 self.emit(f"{r16} = OpBitwiseAnd %uint {am} {self.cu(0xFFFF)}")
                 halves.append(r16)
-            hi, r = self.tmp(), self.tmp()
-            self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
-            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
+            r = self.tmp()
+            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {halves[1]}")
             self.dst(a[0], r)
         elif op in ("v_sin_f32", "v_cos_f32"):
             # RDNA takes the angle in turns: reduce in turns, then sin/cos(x * 2*pi).

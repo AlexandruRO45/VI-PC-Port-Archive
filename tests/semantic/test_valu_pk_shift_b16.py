@@ -236,6 +236,53 @@ class PkShiftB16Tests(unittest.TestCase):
                         "s_endpgm",
                     ])
 
+    def test_high_half_in_place_all_selects(self):
+        # SHADER-1002 (#5533): the high result half is computed in bits 31:16. Every op_sel / op_sel_hi combination,
+        # with shift amounts that include 0 in each half (the amount AMD's driver got wrong) and 15.
+        vals = (0x4000B88D, 0x80017FFF, 0xFFFF0000, 0x0000FFFF, 0x7FFF8000, 0x12345678)
+        shs = (0xBE204B94, 0x00000000, 0x000F0000, 0x0000000F, 0x00070003, 0xFFFFFFFF)
+        for op in OPS:
+            for bits in range(16):
+                sel, selhi = [bits & 1, bits >> 1 & 1], [bits >> 2 & 1, bits >> 3 & 1]
+                spv = translate_shift([
+                    "v_mov_b32 v1, s0",
+                    "v_mov_b32 v2, s1",
+                    f"{op} v0, v1, v2" + mod_str("op_sel", sel) + mod_str("op_sel_hi", selhi),
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v3, v3, v3 done vm",
+                    "s_endpgm",
+                ])
+                for sh in shs:
+                    for val in vals:
+                        with self.subTest(op=op, sel=sel, selhi=selhi, sh=hex(sh), val=hex(val)):
+                            got = support.mrt0_words(spv, push_constants=[sh, val])[0]
+                            self.assertEqual(got, ref_pk_shift(op, sh, val, sel, selhi))
+        # The #5533 pair's packed shift: both halves are hi(v24) >> (hi(v30) & 15) = 0x4000 >> 0.
+        self.assertEqual(run_shift("v_pk_ashrrev_i16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[1,1]",
+                                   push=[0xBE204B94, 0x4000B88D]), 0x40004000)
+
+    def test_high_half_not_moved_down_and_up(self):
+        # The spelling AMD's Windows driver 32.0.21045.29003 (gfx1036) miscompiled for a zero shift amount: the
+        # high source half moved to bits 15:0, shifted, masked with 0xFFFF and moved back with `<< 16`. Now the
+        # source half is masked in place with 0xFFFF0000 (or moved up from the low half), shifted, and masked again.
+        for op in OPS:
+            spv = translate_shift([
+                "v_mov_b32 v1, s0",
+                "v_mov_b32 v2, s1",
+                f"{op} v0, v1, v2 op_sel:[1,1] op_sel_hi:[1,1]",
+                "v_mov_b32 v3, 0",
+                "exp mrt0 v0, v3, v3, v3 done vm",
+                "s_endpgm",
+            ])
+            consts = dict(re.findall(r"^(%\S+) = OpConstant %uint (\d+)$", spv, re.M))
+            hi_mask = [k for k, v in consts.items() if v == str(0xFFFF0000)]
+            with self.subTest(op=op):
+                self.assertEqual(len(hi_mask), 1)
+                self.assertEqual(len(re.findall(r"= OpBitwiseAnd %uint %\S+ " + re.escape(hi_mask[0]) + r"\b", spv)), 2)
+                sixteen = [k for k, v in consts.items() if v == "16"]
+                for k in sixteen:
+                    self.assertNotRegex(spv, r"= OpShiftLeftLogical %uint %\S+ " + re.escape(k) + r"\b")
+
     def test_negative_controls(self):
         # 1. Sabotaging signed 16-bit extraction to unsigned must lose sign-extension on negative halves.
         spv_ashr = translate_shift([
