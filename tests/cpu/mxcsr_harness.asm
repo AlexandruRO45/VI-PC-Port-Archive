@@ -16,4 +16,14 @@ set_mxcsr PROC FRAME
     ret
 set_mxcsr ENDP
 
+get_mxcsr_mask PROC FRAME
+    sub rsp, 520
+    .allocstack 520
+    .endprolog
+    fxsave [rsp]
+    mov eax, dword ptr [rsp+28]
+    add rsp, 520
+    ret
+get_mxcsr_mask ENDP
+
 END

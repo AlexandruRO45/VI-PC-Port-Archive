@@ -2323,12 +2323,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_trap COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
         check "$<TARGET_FILE:cpu_trap_harness>" "$<TARGET_FILE:cpu_trap>" "$<TARGET_FILE:cpu_trap_lifted>"
         ${trap_controls} "${trap_o2}")
-    # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
-    # an /O2 build of the translation.
+    # The opt-in host-MXCSR profile, including independent FTZ and capability-gated DAZ checks.
     cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)
     cpu_asm_fixture(cpu_mxcsr mxcsr)
-    set(mxcsr_controls)
-    foreach(variant IN ITEMS lifted noload fixed)
+    set(mxcsr_ftz_controls)
+    set(mxcsr_daz_controls)
+    foreach(variant IN ITEMS lifted noload fixed noftz nodaz mask0 nomask)
         set(mxcsr_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_${variant}.cpp")
         add_custom_command(OUTPUT "${mxcsr_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
@@ -2337,7 +2337,11 @@ if(EXISTS "${INTAKE_PYTHON}")
                 tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
         add_library(cpu_mxcsr_${variant} SHARED "${mxcsr_fixture}")
         if(NOT variant STREQUAL "lifted")
-            list(APPEND mxcsr_controls "$<TARGET_FILE:cpu_mxcsr_${variant}>")
+            if(variant STREQUAL "noload" OR variant STREQUAL "fixed" OR variant STREQUAL "noftz")
+                list(APPEND mxcsr_ftz_controls "$<TARGET_FILE:cpu_mxcsr_${variant}>")
+            else()
+                list(APPEND mxcsr_daz_controls "$<TARGET_FILE:cpu_mxcsr_${variant}>")
+            endif()
         endif()
     endforeach()
     set(mxcsr_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_lifted_o2.dll")
@@ -2348,7 +2352,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_custom_target(cpu_mxcsr_lifted_o2 ALL DEPENDS "${mxcsr_o2}")
     add_test(NAME cpu_aot_mxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
         check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
-        ${mxcsr_controls} "${mxcsr_o2}")
+        ${mxcsr_ftz_controls} "${mxcsr_o2}")
+    add_test(NAME cpu_aot_mxcsr_daz COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
+        check-daz "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
+        ${mxcsr_daz_controls} "${mxcsr_o2}")
+    set_tests_properties(cpu_aot_mxcsr_daz PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)

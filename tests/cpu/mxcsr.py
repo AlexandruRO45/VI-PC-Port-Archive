@@ -2,8 +2,8 @@
 
 The translation runs through mxcsr_entry, which saves the caller's MXCSR and restores it on return, after a
 refusal and when a guest memory fault leaves the lowered body. Every rounding mode is round-tripped and changes
-an ADDPS halfway case and CVTSS2SI conversions whose operands the test writes at run time. Words with a
-reserved bit, an unmasked exception, FTZ or DAZ are refused before the host register changes.
+an ADDPS halfway case and CVTSS2SI conversions whose operands the test writes at run time. The denormal tests
+exercise FTZ and capability-gated DAZ independently; the default profile and unsupported words remain refused.
 """
 import ctypes
 from pathlib import Path
@@ -21,15 +21,21 @@ from cpu_ranges import function_ranges
 from ffx_version_query import INTEGER_HEADER, MXCSR_HEADER, MXCSR_STATUS, Mxcsr, lower, mxcsr_entry, region
 
 U64 = ctypes.c_uint64
-EXPORTS = ("mxcsr_round", "mxcsr_leak", "mxcsr_after", "mxcsr_badload", "mxcsr_fault")
+EXPORTS = ("mxcsr_round", "mxcsr_leak", "mxcsr_after", "mxcsr_badload", "mxcsr_fault", "mxcsr_denormals")
 # LDMXCSR and STMXCSR in each export of mxcsr.asm.
-SOURCE_READS = {"mxcsr_round": 4, "mxcsr_leak": 1, "mxcsr_after": 1, "mxcsr_badload": 1, "mxcsr_fault": 1}
+SOURCE_READS = {"mxcsr_round": 4, "mxcsr_leak": 1, "mxcsr_after": 1, "mxcsr_badload": 1,
+                "mxcsr_fault": 1, "mxcsr_denormals": 4}
 REJECT = "{{ *mxcsr_status = {status}; return 0; }}"
 DEFAULT = 0x1F80  # all six exceptions masked, round to nearest-even, FTZ and DAZ clear
 CALLER = 0x7FA0   # a non-default caller word: round toward zero and the sticky precision flag
+FTZ = 0x8000
+DAZ = 0x0040
 FILL = 0xA5
 STATE = 0x100
 GUARDS = [(0x04, 4), (0x0C, 4), (0x64, 4), (0x6C, 4), (0x74, 4), (0x80, 0x80)]
+MIN_NORMAL = 2.0 ** -126
+SUBNORMAL_INPUT = 2.0 ** -140
+ROUNDING_MODES = (0, 3)
 
 
 def f32(value):
@@ -52,12 +58,24 @@ EXPECT = {
 }
 if len(set(EXPECT.values())) != 4:
     raise AssertionError("the probes do not tell the four rounding modes apart")
-REFUSED = {0x11F80: "reserved", 0x1D80: "unmasked", 0x9F80: "unsupported", 0x1FC0: "unsupported"}
+REFUSED = {0x11F80: "reserved", 0x1D80: "unmasked"}
+DAZ_MASK_CHECK = f"if (!(mxcsr_mask & 0x40u)) {REJECT.format(status=3)}"
 CONTROLS = {
     # LDMXCSR checks the word but never loads it.
     "noload": ("_mm_setcsr(want);", "(void)want;"),
     # STMXCSR stores the default word instead of the host's.
     "fixed": (", _mm_getcsr());", ", 0x1f80u);"),
+    # Refuse FTZ despite the denormals opt-in.
+    "noftz": ("_mm_setcsr(want);", f"if (want & 0x8000u) {REJECT.format(status=3)} _mm_setcsr(want);"),
+    # Refuse DAZ despite the host supporting it.
+    "nodaz": (DAZ_MASK_CHECK, f"if (want & 0x40u) {REJECT.format(status=3)}"),
+    # Simulate an FXSAVE mask that does not advertise DAZ.
+    "mask0": ("_fxsave(mxcsr_fxsave);", "memset(mxcsr_fxsave, 0, sizeof mxcsr_fxsave);"),
+    # Simulate the same host while omitting the DAZ capability check.
+    "nomask": (
+        "_fxsave(mxcsr_fxsave);",
+        "memset(mxcsr_fxsave, 0, sizeof mxcsr_fxsave);",
+    ),
 }
 
 
@@ -67,17 +85,22 @@ def emit(image, output, variant="lifted"):
         for name in EXPORTS:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
             code = lower(region(pe, *bounds), ["rcx = a; rdx = b; r8 = c; r9 = state;"], {}, {}, {},
-                         host_mxcsr=Mxcsr(REJECT))
+                         host_mxcsr=Mxcsr(REJECT, denormals=True))
             parts.append(f"static __declspec(noinline) word {name}_body(word a, word b, word c, word state, "
                          f"int* mxcsr_status) {{\n{code}\n}}\n")
             parts.append(mxcsr_entry(name, f"{name}_body"))
     text = "".join(parts)
     if variant != "lifted":
-        literal, replacement = CONTROLS[variant]
-        count = text.count(literal)
-        if not count:
-            raise AssertionError(f"variant {variant} changed nothing")
-        text = text.replace(literal, replacement)
+        replacements = [CONTROLS[variant]]
+        if variant == "nomask":
+            replacements.append((DAZ_MASK_CHECK, ""))
+        count = 0
+        for literal, replacement in replacements:
+            changed = text.count(literal)
+            if not changed:
+                raise AssertionError(f"variant {variant} changed nothing for {literal!r}")
+            text = text.replace(literal, replacement)
+            count += changed
         print(f"variant {variant}: {count} replacements")
     output.write_text(text, encoding="ascii")
 
@@ -104,6 +127,28 @@ def rejected_by_default(image):
     return refused
 
 
+def rejected_vex():
+    legacy = list(Decoder(64, b"\x0f\xae\x10\xc3", ip=0x1000))
+    default_code = lower(legacy, ["rax = a;"], {}, {}, {}, host_mxcsr=Mxcsr(REJECT))
+    if "want & 0x8040u" not in default_code or "_fxsave" in default_code:
+        raise AssertionError("Mxcsr(reject) must keep refusing FTZ and DAZ without probing the host")
+    opt_in_code = lower(legacy, ["rax = a;"], {}, {}, {},
+                        host_mxcsr=Mxcsr(REJECT, denormals=True))
+    if "if (want & 0x40u)" not in opt_in_code or "want & 0x8040u" in opt_in_code:
+        raise AssertionError("the denormals opt-in must allow FTZ and capability-check DAZ")
+    for data, expected in ((b"\xc5\xf8\xae\x10", M.VLDMXCSR), (b"\xc5\xf8\xae\x18", M.VSTMXCSR)):
+        instructions = list(Decoder(64, data, ip=0x1000))
+        if len(instructions) != 1 or instructions[0].mnemonic != expected:
+            raise AssertionError(f"expected {expected}, decoded {instructions}")
+        try:
+            lower(instructions, ["rcx = a;"], {}, {}, {}, host_mxcsr=Mxcsr(REJECT, denormals=True))
+        except ValueError as exc:
+            if "unsupported query operation" not in str(exc):
+                raise AssertionError(f"unexpected VEX MXCSR refusal: {exc}") from exc
+        else:
+            raise AssertionError(f"the opt-in profile lowered VEX {expected}")
+
+
 def load(path, lifted):
     lib = ctypes.CDLL(str(Path(path).resolve()))
     for name in EXPORTS:
@@ -118,10 +163,10 @@ def status(lib, name):
     return getter()
 
 
-def fresh_state():
+def fresh_state(add_a=ADD_A, add_b=ADD_B):
     state = (ctypes.c_ubyte * STATE)(*([FILL] * STATE))
-    struct.pack_into("<4f", state, 0x10, *ADD_A)
-    struct.pack_into("<4f", state, 0x20, *ADD_B)
+    struct.pack_into("<4f", state, 0x10, *add_a)
+    struct.pack_into("<4f", state, 0x20, *add_b)
     struct.pack_into("<4f", state, 0x30, CVT_C, 0, 0, 0)
     struct.pack_into("<4f", state, 0x40, CVT_D, 0, 0, 0)
     return state
@@ -136,6 +181,7 @@ class Host:
         self.lib = ctypes.CDLL(str(Path(harness).resolve()))
         self.lib.get_mxcsr.argtypes, self.lib.get_mxcsr.restype = [], ctypes.c_uint32
         self.lib.set_mxcsr.argtypes, self.lib.set_mxcsr.restype = [ctypes.c_uint32], None
+        self.lib.get_mxcsr_mask.argtypes, self.lib.get_mxcsr_mask.restype = [], ctypes.c_uint32
 
     def get(self):
         return self.lib.get_mxcsr()
@@ -143,6 +189,8 @@ class Host:
     def set(self, word):
         self.lib.set_mxcsr(word)
 
+    def stored_mask(self):
+        return self.lib.get_mxcsr_mask()
 
 def round_case(host, lib, rc, sticky):
     """(outputs, problem) of mxcsr_round with rounding control rc and the requested sticky flags."""
@@ -169,6 +217,80 @@ def round_case(host, lib, rc, sticky):
     if after != CALLER:
         return outputs, f"caller MXCSR {after:#x} after the call, expected {CALLER:#x}"
     return outputs, None
+
+
+def denormal_case(host, lib, ftz, daz, rc, add_a, add_b, expected):
+    word = DEFAULT | rc << 13 | (FTZ if ftz else 0) | (DAZ if daz else 0)
+    state = fresh_state(add_a, add_b)
+    host.set(CALLER)
+    result = lib.mxcsr_denormals(0, word, 0, ctypes.addressof(state))
+    after = host.get()
+    outputs = struct.unpack_from("<4I", state, 0x50)
+    readback = struct.unpack_from("<I", state, 0x70)[0]
+    if result != 7:
+        refused_status = status(lib, "mxcsr_denormals") if hasattr(lib, "mxcsr_denormals_status") else None
+        return outputs, f"returned {result:#x}, status {refused_status}"
+    if outputs != expected:
+        return outputs, f"outputs {outputs}, expected {expected}"
+    if readback & (0x6000 | FTZ | DAZ) != word & (0x6000 | FTZ | DAZ):
+        return outputs, f"STMXCSR read back {readback:#x}, expected control bits from {word:#x}"
+    if struct.unpack_from("<I", state, 0)[0] != CALLER:
+        return outputs, f"entry STMXCSR stored {struct.unpack_from('<I', state, 0)[0]:#x}, caller {CALLER:#x}"
+    if not guards_intact(state):
+        return outputs, "a guard byte next to a stored word changed"
+    if after != CALLER:
+        return outputs, f"caller MXCSR {after:#x} after the call, expected {CALLER:#x}"
+    return outputs, None
+
+
+FTZ_INPUTS = (MIN_NORMAL, -MIN_NORMAL, 1.0, -1.0)
+FTZ_ADDENDS = (-1.5 * MIN_NORMAL, 1.5 * MIN_NORMAL, 1.0, -1.0)
+FTZ_EXPECT = {
+    False: (0x80400000, 0x00400000, f32(2.0), f32(-2.0)),
+    True: (0x80000000, 0x00000000, f32(2.0), f32(-2.0)),
+}
+DAZ_INPUTS = (MIN_NORMAL, -MIN_NORMAL, 1.0, -1.0)
+DAZ_ADDENDS = (-SUBNORMAL_INPUT, SUBNORMAL_INPUT, 0.5, 0.5)
+DAZ_EXPECT = {
+    (False, False): (0x007FFE00, 0x807FFE00, f32(1.5), f32(-0.5)),
+    (True, False): (0x80000000, 0x00000000, f32(1.5), f32(-0.5)),
+    (False, True): (f32(MIN_NORMAL), f32(-MIN_NORMAL), f32(1.5), f32(-0.5)),
+    (True, True): (f32(MIN_NORMAL), f32(-MIN_NORMAL), f32(1.5), f32(-0.5)),
+}
+
+
+def ftz_violation(host, native, lib, label):
+    for ftz in (False, True):
+        for rc in ROUNDING_MODES:
+            expected = FTZ_EXPECT[ftz]
+            got, problem = denormal_case(host, lib, ftz, False, rc, FTZ_INPUTS, FTZ_ADDENDS, expected)
+            if problem:
+                return f"{label} FTZ={ftz} rc={rc}: {problem}"
+            reference, problem = denormal_case(
+                host, native, ftz, False, rc, FTZ_INPUTS, FTZ_ADDENDS, expected)
+            if problem:
+                raise AssertionError(f"native FTZ={ftz} rc={rc}: {problem}")
+            if got != reference:
+                return f"{label} FTZ={ftz} rc={rc}: {got} != native {reference}"
+    return None
+
+
+def daz_violation(host, native, lib, label):
+    for ftz in (False, True):
+        for daz in (False, True):
+            for rc in ROUNDING_MODES:
+                expected = DAZ_EXPECT[ftz, daz]
+                got, problem = denormal_case(
+                    host, lib, ftz, daz, rc, DAZ_INPUTS, DAZ_ADDENDS, expected)
+                if problem:
+                    return f"{label} FTZ={ftz} DAZ={daz} rc={rc}: {problem}"
+                reference, problem = denormal_case(
+                    host, native, ftz, daz, rc, DAZ_INPUTS, DAZ_ADDENDS, expected)
+                if problem:
+                    raise AssertionError(f"native FTZ={ftz} DAZ={daz} rc={rc}: {problem}")
+                if got != reference:
+                    return f"{label} FTZ={ftz} DAZ={daz} rc={rc}: {got} != native {reference}"
+    return None
 
 
 def lifted_violation(host, native, lib, label):
@@ -240,7 +362,82 @@ def lifted_violation(host, native, lib, label):
     finally:
         kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
         kernel32.VirtualFree(ctypes.c_void_p(page), 0, 0x8000)
+    problem = ftz_violation(host, native, lib, label)
+    if problem:
+        return problem
     return None
+
+
+def fake_mask_case(host, lib, label, accepted):
+    state = fresh_state()
+    host.set(CALLER)
+    result = lib.mxcsr_after(0, DEFAULT | DAZ, 0, ctypes.addressof(state))
+    marker = struct.unpack_from("<Q", state, 0x78)[0]
+    got = (result, status(lib, "mxcsr_after"), marker, host.get())
+    if accepted:
+        expected = (7, 0, 1, CALLER)
+    else:
+        expected = (0, MXCSR_STATUS["unsupported"], int.from_bytes([FILL] * 8, "little"), CALLER)
+    if got != expected:
+        return f"{label} with fake MXCSR_MASK=0: got {got}, expected {expected}"
+    return None
+
+
+def check_daz(harness_path, native_path, lifted_path, *extra_paths):
+    host = Host(harness_path)
+    original = host.get()
+    try:
+        stored_mask = host.stored_mask()
+        mask = stored_mask if stored_mask else 0xFFBF
+        print(f"native MXCSR_MASK: stored={stored_mask:#06x}, effective={mask:#06x}")
+        native, lifted = load(native_path, False), load(lifted_path, True)
+        if not mask & DAZ:
+            state = fresh_state()
+            host.set(CALLER)
+            result = lifted.mxcsr_after(0, DEFAULT | DAZ, 0, ctypes.addressof(state))
+            marker = struct.unpack_from("<Q", state, 0x78)[0]
+            got = (result, status(lifted, "mxcsr_after"), marker, host.get())
+            expected = (0, MXCSR_STATUS["unsupported"], int.from_bytes([FILL] * 8, "little"), CALLER)
+            if got != expected:
+                raise AssertionError(f"DAZ unsupported by MXCSR_MASK: got {got}, expected {expected}")
+            print("DAZ capability skip: MXCSR_MASK bit 6 is clear; translated LDMXCSR refused it safely")
+            return 77
+        problem = daz_violation(host, native, lifted, "lifted")
+        if problem:
+            raise AssertionError(problem)
+        print("lifted: all four FTZ/DAZ combinations matched native results and fixed expectations for both "
+              "rounding modes; DAZ inputs of both signs, read-back, and caller restoration verified")
+        for path in extra_paths:
+            stem = Path(path).stem
+            variant = stem.rsplit("_", 1)[-1]
+            if stem.endswith("_o2"):
+                reads = reads_in(path)
+                short = {n: c for n, c in reads.items() if c < SOURCE_READS[n]}
+                if short:
+                    raise AssertionError(f"{stem}: fewer LDMXCSR/STMXCSR than the source in {short}")
+                problem = daz_violation(host, native, load(path, True), stem)
+                if problem:
+                    raise AssertionError(problem)
+                print(f"{stem}: all DAZ rules held and source MXCSR instructions remain reachable: {reads}")
+            elif variant == "nodaz":
+                problem = daz_violation(host, native, load(path, True), f"control {variant}")
+                print(f"control {variant}: {problem}")
+                if problem is None:
+                    raise AssertionError(f"control {variant} kept every rule")
+            elif variant == "mask0":
+                problem = fake_mask_case(host, load(path, True), f"control {variant}", accepted=False)
+                if problem:
+                    raise AssertionError(problem)
+                print("control mask0: the synthetic mask without DAZ refused the load before guest work")
+            elif variant == "nomask":
+                problem = fake_mask_case(host, load(path, True), f"control {variant}", accepted=True)
+                if problem:
+                    raise AssertionError(problem)
+                print("control nomask: ignoring the synthetic mask accepted DAZ on a host that lacks it")
+            else:
+                raise AssertionError(f"unexpected DAZ control {variant}")
+    finally:
+        host.set(original)
 
 
 CHILD = """
@@ -302,15 +499,17 @@ def check(harness_path, native_path, lifted_path, *extra_paths):
     original = host.get()
     try:
         refused = rejected_by_default(native_path)
+        rejected_vex()
         print(f"the default profile refuses each of the {len(refused)} MXCSR instructions on its own: "
-              f"{refused.count('LDMXCSR')} LDMXCSR, {refused.count('STMXCSR')} STMXCSR")
+              f"{refused.count('LDMXCSR')} LDMXCSR, {refused.count('STMXCSR')} STMXCSR; "
+              "the denormals opt-in still rejects VEX forms")
         native, lifted = load(native_path, False), load(lifted_path, True)
         problem = lifted_violation(host, native, lifted, "lifted")
         if problem:
             raise AssertionError(problem)
         print("lifted: all four rounding modes round-trip and change ADDPS and CVTSS2SI as natively, with and "
               "without sticky flags; adjacent bytes unchanged; the caller's word "
-              f"{CALLER:#x} restored after return, refusal and a guest memory fault; refused words "
+              f"{CALLER:#x} restored after return, refusal and a guest memory fault; reserved and unmasked words "
               f"{', '.join(f'{w:#x}={r}' for w, r in REFUSED.items())} stopped the guest before its next store")
         code, out, err = native_reserved(native_path)
         print(f"native reference, LDMXCSR of {0x11F80:#x} in a child process: exit {code:#x} {out} {err}")
@@ -328,6 +527,8 @@ def check(harness_path, native_path, lifted_path, *extra_paths):
                       f"source's LDMXCSR and STMXCSR: {reads}")
                 continue
             variant = stem.rsplit("_", 1)[-1]
+            if variant not in ("noload", "fixed", "noftz"):
+                raise AssertionError(f"unexpected FTZ control {variant}")
             problem = lifted_violation(host, native, load(path, True), f"control {variant}")
             print(f"control {variant}: {problem}")
             if problem is None:
@@ -343,5 +544,7 @@ if __name__ == "__main__":
         emit(Path(image), Path(output), *variant)
     elif mode == "check":
         check(*args)
+    elif mode == "check-daz":
+        sys.exit(check_daz(*args) or 0)
     else:
         raise ValueError(mode)

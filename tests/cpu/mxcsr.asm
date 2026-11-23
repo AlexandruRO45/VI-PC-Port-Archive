@@ -9,6 +9,8 @@
 ;   78 the marker that mxcsr_after writes after its LDMXCSR, 80-FF guards
 ; mxcsr_round restores the caller's word itself. mxcsr_leak, mxcsr_after, mxcsr_badload and mxcsr_fault do not:
 ; there only the translated entry's boundary restores it, and the test calls them translated only.
+; mxcsr_denormals saves the incoming word at 00, loads b, adds the runtime-fed vectors at 10 and 20, writes the
+; result at 50 and its MXCSR read-back at 70, then restores the word saved at 00.
 .code
 
 mxcsr_round PROC FRAME
@@ -67,5 +69,20 @@ mxcsr_fault PROC FRAME
     mov eax, dword ptr [rcx]
     ret
 mxcsr_fault ENDP
+
+mxcsr_denormals PROC FRAME
+    .endprolog
+    stmxcsr dword ptr [r9]
+    mov dword ptr [r9+8], edx
+    ldmxcsr dword ptr [r9+8]
+    movups xmm0, xmmword ptr [r9+10h]
+    movups xmm1, xmmword ptr [r9+20h]
+    addps xmm0, xmm1
+    movups xmmword ptr [r9+50h], xmm0
+    stmxcsr dword ptr [r9+70h]
+    ldmxcsr dword ptr [r9]
+    mov eax, 7
+    ret
+mxcsr_denormals ENDP
 
 END

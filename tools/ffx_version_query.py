@@ -347,7 +347,7 @@ def string_op(i):
 
 
 # The host-MXCSR profile's refusal statuses: a requested word with a reserved bit (16-31), with one of the six
-# exception masks (bits 7-12) clear, or with FTZ (bit 15) or DAZ (bit 6), which the first profile leaves out.
+# exception masks (bits 7-12) clear, or with an unsupported denormal mode.
 MXCSR_STATUS = {"reserved": 1, "unmasked": 2, "unsupported": 3}
 # A file that lowers with the host-MXCSR profile observes the floating-point environment.
 MXCSR_HEADER = "#pragma fenv_access(on)\n"
@@ -355,10 +355,12 @@ MXCSR_HEADER = "#pragma fenv_access(on)\n"
 
 class Mxcsr:
     """The host-MXCSR profile's error channel. reject is a format string with a {status} field: C++ that leaves
-    the lowered function and hands the status to the caller, as for x87_lower.Checked."""
+    the lowered function and hands the status to the caller, as for x87_lower.Checked. denormals opts into FTZ
+    and capability-checked DAZ support; the default keeps both refused."""
 
-    def __init__(self, reject):
+    def __init__(self, reject, *, denormals=False):
         self.reject = reject
+        self.denormals = denormals
 
     def leave(self, name):
         return self.reject.format(status=MXCSR_STATUS[name])
@@ -882,11 +884,17 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif op == M.LDMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
             # so a refused word changes nothing and no later guest instruction runs.
+            checks = (f"if (want & 0x8040u) {host_mxcsr.leave('unsupported')} "
+                      if not host_mxcsr.denormals else
+                      f"if (want & 0x40u) {{ __declspec(align(16)) unsigned char mxcsr_fxsave[512]; "
+                      "_fxsave(mxcsr_fxsave); "
+                      "uint32_t mxcsr_mask = *reinterpret_cast<const uint32_t*>(mxcsr_fxsave + 28); "
+                      "if (!mxcsr_mask) mxcsr_mask = 0xffbfu; "
+                      f"if (!(mxcsr_mask & 0x40u)) {host_mxcsr.leave('unsupported')} }} ")
             stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
                     f"if (want & 0xffff0000u) {host_mxcsr.leave('reserved')} "
                     f"if ((want & 0x1f80u) != 0x1f80u) {host_mxcsr.leave('unmasked')} "
-                    f"if (want & 0x8040u) {host_mxcsr.leave('unsupported')} "
-                    f"_mm_setcsr(want); }}")
+                    f"{checks}_mm_setcsr(want); }}")
         elif op == M.STMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             stmt = f"store<uint32_t>({address()}, _mm_getcsr());"
         elif op == M.XGETBV and host_cpu:
