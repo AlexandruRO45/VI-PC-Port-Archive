@@ -22,6 +22,7 @@ inverseBindMatrices count differs from its joint count exits nonzero. Structural
 problems also exit nonzero with a one-line ``ERROR:`` message.
 
 Each joint's inverse bind matrix must have the affine fourth row (0, 0, 0, 1).
+POSITION bounds use finite components; an axis with none is reported as null.
 
 Only the standard library is used, and the input is read, never modified.
 """
@@ -396,8 +397,9 @@ def _skin_label(skin_index, skin_name):
 
 
 def _bbox(values):
-    minimum = [math.inf, math.inf, math.inf]
-    maximum = [-math.inf, -math.inf, -math.inf]
+    """Keep finite axis bounds, leaving an axis with no finite samples unknown."""
+    minimum = [None, None, None]
+    maximum = [None, None, None]
     non_finite = 0
     finite = 0
     for row in values:
@@ -407,9 +409,9 @@ def _bbox(values):
                 non_finite += 1
                 continue
             finite += 1
-            if value < minimum[axis]:
+            if minimum[axis] is None or value < minimum[axis]:
                 minimum[axis] = value
-            if value > maximum[axis]:
+            if maximum[axis] is None or value > maximum[axis]:
                 maximum[axis] = value
     if not finite:
         return None, None, non_finite

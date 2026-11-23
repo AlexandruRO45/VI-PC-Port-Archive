@@ -105,10 +105,11 @@ class Builder:
 
 def make_glb(weights=None, joints=None, *, ibm_count=2, add_static=False,
              include_skin=True, bind_skin=True, weight_component="float",
-             skin_name="Rig", two_sets=False):
+             skin_name="Rig", two_sets=False, positions=None):
     """A three-vertex, two-joint skinned triangle, optionally plus a static mesh."""
     builder = Builder()
-    positions = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    if positions is None:
+        positions = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
     position_payload = b"".join(struct.pack("<3f", *point) for point in positions)
     position_accessor = builder.add_accessor(
         position_payload, 5126, "VEC3", len(positions),
@@ -488,6 +489,44 @@ class GlbSkinningTests(unittest.TestCase):
         proc = self.run_tool(path)
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("non-finite", proc.stderr)
+
+    def test_non_finite_position_bounds_are_reported_and_serializable(self):
+        non_finite = (float("nan"), float("inf"), float("-inf"))
+        cases = []
+        for axis in range(3):
+            positions = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            for vertex, value in zip(positions, non_finite):
+                vertex[axis] = value
+            lower, upper = [0.0, 0.0, 0.0], [1.0, 1.0, 0.0]
+            lower[axis] = upper[axis] = None
+            cases.append((f"axis-{axis}", positions, lower, upper, 3))
+        cases.extend([
+            ("all", [non_finite] * 3, None, None, 9),
+            ("mixed", [(non_finite[0], 2.0, 3.0), (4.0, non_finite[1], 5.0),
+                       (6.0, 7.0, non_finite[2])], [4.0, 2.0, 3.0], [6.0, 7.0, 5.0], 3),
+        ])
+        for label, positions, lower, upper, bad_count in cases:
+            with self.subTest(case=label):
+                data = make_glb(positions=positions)
+                report = glb_skinning.analyze_glb(data)
+                self.assertFalse(report["ok"])
+                position = report["meshes"][0]["primitives"][0]["position"]
+                self.assertEqual(lower, position["bbox_min"])
+                self.assertEqual(upper, position["bbox_max"])
+                self.assertEqual(bad_count, position["non_finite_count"])
+                self.assertEqual(bad_count, report["summary"]["non_finite_value_count"])
+                json.dumps(report, allow_nan=False)
+
+                source = self.write(f"{label}.glb", data)
+                out = self.dir / f"{label}.json"
+                proc = self.run_tool(source, "--json", out)
+                self.assertEqual(1, proc.returncode, proc.stderr)
+                self.assertEqual(
+                    [f'ERROR: mesh[0] "Body" primitive[0].POSITION has '
+                     f'{bad_count} non-finite component(s)'], proc.stderr.splitlines(),
+                )
+                self.assertEqual(report, json.loads(out.read_text(encoding="utf-8")))
+                self.assertIn("POSITION bbox:", proc.stdout)
 
     def test_json_round_trip_is_lf_only(self):
         data = make_glb(add_static=True)
