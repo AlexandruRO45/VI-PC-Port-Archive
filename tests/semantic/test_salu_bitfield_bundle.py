@@ -267,5 +267,26 @@ class TestSBfeI32Bounds(unittest.TestCase):
         self.assertEqual(scc, 0)
 
 
+def run_hw_bfe_i32(src0: int, ctl: int) -> int:
+    lines = [
+        f"s_mov_b32 s0, {src0 & MASK32:#x}",
+        f"s_mov_b32 s1, {ctl & MASK32:#x}",
+        "s_bfe_i32 s2, s0, s1",
+        "v_mov_b32 v0, s2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_bfe_i32_hw", lines)
+    return support.mrt0_words(spv)[0]
+
+
+class TestSBfeI32HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for s_bfe_i32."""
+
+    def test_translator_extract_cases(self):
+        self.assertEqual(run_hw_bfe_i32(0x00000070, 4 | (4 << 16)), 7)
+        self.assertEqual(run_hw_bfe_i32(0x000000F0, 4 | (4 << 16)), MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
