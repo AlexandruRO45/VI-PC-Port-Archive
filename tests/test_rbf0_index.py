@@ -6,6 +6,7 @@ Every byte here is built by the test. No game file, game asset path or game name
 """
 import contextlib
 import csv
+import io
 import json
 import os
 import subprocess
@@ -21,6 +22,7 @@ TOOL = os.path.join(ROOT, "tools", "rbf0_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import rbf0_index  # noqa: E402
+import report_paths  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -323,6 +325,23 @@ class ArgumentTest(unittest.TestCase):
         self.assertIn("nope.rpf", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         self.assertFalse(os.path.exists(out))
+
+    def test_report_refuses_an_equivalent_unicode_source_name(self):
+        source = os.path.join(self.root, "caf\u00e9.rpf")
+        report = os.path.join(self.root, "cafe\u0301.rpf")
+        os.replace(self.rpf, source)
+        stderr = io.StringIO()
+        with (mock.patch.object(report_paths, "case_insensitive_volume", return_value=True),
+              mock.patch.object(sys, "argv", [TOOL, source, report, "--quiet"]),
+              mock.patch.object(rbf0_index, "scan_rpf", return_value=([], [], {})) as scan,
+              mock.patch.object(rbf0_index, "write_output") as write,
+              contextlib.redirect_stderr(stderr)):
+            with self.assertRaises(SystemExit) as error:
+                rbf0_index.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("output must not overwrite the source", stderr.getvalue())
+        scan.assert_not_called()
+        write.assert_not_called()
 
     def test_directory_report_cannot_replace_a_carve_input(self):
         manifest = os.path.join(self.root, "index.json")
