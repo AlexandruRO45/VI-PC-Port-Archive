@@ -52,5 +52,10 @@ class CliHelpTests(unittest.TestCase):
     def test_every_cli_tool_answers_dash_dash_help(self):
         self.loop("--help")
 
+    def test_every_cli_tool_answers_dash_h(self):
+        self.loop("-h")
+
+
+
 if __name__ == "__main__":
     unittest.main()
