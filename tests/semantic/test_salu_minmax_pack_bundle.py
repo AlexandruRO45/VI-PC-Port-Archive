@@ -84,5 +84,57 @@ class SMinI32OracleTests(unittest.TestCase):
         self.assertEqual(res, 42)
         self.assertEqual(scc, 0)
 
+class RegKind(enum.Enum):
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class SaluInstructionAST:
+    mnemonic: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+
+
+class ScalarRegisterState:
+    def __init__(self):
+        self.sgprs: dict[int, int] = {}
+        self.scc: int = 0
+
+    def set_sgpr(self, idx: int, val: int):
+        self.sgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0) & MASK32
+
+    def get_operand_val(self, op: Operand) -> int:
+        if op.kind == RegKind.SGPR:
+            return self.get_sgpr(op.index)
+        return op.raw_val & MASK32
+
+class SMinI32AstInterpreterTests(unittest.TestCase):
+    def test_min_i32_ast_construction(self):
+        ast = SaluInstructionAST("s_min_i32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        self.assertEqual(ast.mnemonic, "s_min_i32")
+        self.assertEqual(ast.dst.index, 2)
+
+    def test_min_i32_scalar_execution(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, u32(-50))
+        state.set_sgpr(1, 100)
+        res, scc = oracle_min_i32(state.get_sgpr(0), state.get_sgpr(1))
+        state.set_sgpr(2, res)
+        state.scc = scc
+        self.assertEqual(state.get_sgpr(2), u32(-50))
+        self.assertEqual(state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
