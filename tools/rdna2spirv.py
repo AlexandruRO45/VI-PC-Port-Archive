@@ -2019,6 +2019,8 @@ class Gen:
 
     def swizzle(self, a, mods, ins):
         """ds_swizzle_b32 vD, vS [offset:swizzle(...) | offset:N]: a subgroup shuffle (one invocation per lane)."""
+        if "gds" in mods:
+            raise Unsupported("ds_swizzle_b32 gds")
         line = " ".join(m for m in mods) + " " + " ".join(x.get("t", "") for x in a if x["k"] in ("special", "raw"))
         import re as _re
         text = line + " " + str(ins.get("raw", ""))
@@ -4583,6 +4585,8 @@ class Gen:
         """LDS (GFX10 DS encoding). Addresses are bytes. offset:N is bytes; read2/write2 offset0/offset1 count
         data-size units (x64 for st64). Writes and atomics run only in active lanes; results land in VGPRs through
         dst (inactive lanes unchanged). Sub-dword writes use atomic and/or so neighbouring lanes don't race."""
+        if "gds" in mods:
+            raise Unsupported(op + " gds")
         if self.stage not in ("cs", "ms"):
             raise Unsupported(op + " outside compute")
         self.uses_lds = True
@@ -4597,7 +4601,7 @@ class Gen:
         sc, sem = self.cu(2), self.cu(0)
         sizes = {"b32": 1, "b64": 2, "b96": 3, "b128": 4}
         if op in ("ds_read_addtid_b32", "ds_write_addtid_b32"):
-            if "gds" in mods or not 0 <= off <= 0xFFFF:
+            if not 0 <= off <= 0xFFFF:
                 raise Unsupported(op + " addressing")
             if len(a) != 1 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
                 raise Unsupported(op + " operand")
@@ -5436,6 +5440,8 @@ class Gen:
         destination lane scans the 32 source lanes of its half in order and keeps the last one that targets it.
         Each source lane publishes its target plus one (0 = off in EXEC, so a lane that doesn't exist in a partial
         wave reads as "no target" as well)."""
+        if "gds" in mods:
+            raise Unsupported("ds_permute_b32 gds")
         d, ad, dat = a[0], self.src_u(a[1]), self.src_u(a[2])
         off = self.mod_int(mods, "offset", 0)
         s1, sh, dl, dp, tp = (self.tmp() for _ in range(5))
@@ -6721,6 +6727,8 @@ class Gen:
 
     def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
+        if op.startswith("ds_") and "gds" in mods:
+            raise Unsupported(op + " gds")
         if op in NOOPS or op.startswith("s_waitcnt"):
             return
         if op == "s_sendmsg" and a and self.stage == "gs":
@@ -7842,6 +7850,8 @@ class Gen:
             if val is not None and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
                 self.sgpr_imm[a[0]["r"]] = val
         elif op == "ds_bpermute_b32":
+            if "gds" in mods:
+                raise Unsupported(op + " gds")
             # vD = vData from lane ((vAddr + offset) / 4) mod 32: a subgroup shuffle (no LDS memory involved).
             d, ad, dat = a[0], self.src_u(a[1]), self.src_u(a[2])
             off = self.mod_int(mods, "offset", 0)
@@ -13764,6 +13774,8 @@ class Gen:
         self.emit(f"{end} = OpLabel")
 
     def gs_ds(self, op, a, mods):
+        if "gds" in mods:
+            raise Unsupported(op + " gds")
         nreg = self.gs["nreg"]
         if op in ("ds_read_b32", "ds_read_b64", "ds_read2_b32", "ds_read_b128", "ds_read_b96"):
             if op == "ds_read2_b32":
