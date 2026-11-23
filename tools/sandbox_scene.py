@@ -161,6 +161,14 @@ def build(args):
     return stats
 
 
+def check_placement(ap, args):
+    """--radius and --max-props, for this tool and for tools/sandbox.py, which calls build() directly."""
+    if not math.isfinite(args.radius) or args.radius < 0:
+        ap.error("--radius must be finite and non-negative")
+    if args.max_props < 0:
+        ap.error("--max-props must be non-negative")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--entities", required=True, help="world_index.py --entities-out file (JSON lines)")
@@ -173,10 +181,7 @@ def main(argv=None):
     ap.add_argument("--tex-size", type=int, default=256)
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
-    if not math.isfinite(args.radius) or args.radius < 0:
-        ap.error("--radius must be finite and non-negative")
-    if args.max_props < 0:
-        ap.error("--max-props must be non-negative")
+    check_placement(ap, args)
     if os.path.isdir(args.out):
         print(f"ERROR: --out is a folder, not a scene file: {args.out}", file=sys.stderr)
         return 2

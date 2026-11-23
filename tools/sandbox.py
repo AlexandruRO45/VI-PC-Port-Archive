@@ -121,6 +121,8 @@ def main(argv=None):
     mode.add_argument("--window", action="store_true")
     mode.add_argument("--check", action="store_true")
     a = ap.parse_args(argv)
+    # Before the tool lookup: a bad value is a usage error (exit 2), not "unsupported" (77), which reads as a skip.
+    sandbox_scene.check_placement(ap, a)
 
     tool = find_tool(a.build)
     pair = pick_pair(os.path.join(a.work, "shaders"))

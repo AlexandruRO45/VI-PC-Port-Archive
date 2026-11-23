@@ -1,12 +1,15 @@
 """tools/sandbox.py: the shader pair is chosen by signature and descriptor layout, never by name."""
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import sandbox  # noqa: E402
+import sandbox_scene  # noqa: E402
 
 VS_TEXT = """\ts_load_dwordx4 s[0:3], s[8:9], null
 \ts_load_dwordx4 s[20:23], s[8:9], 0x40
@@ -103,6 +106,48 @@ class CheckFrame(unittest.TestCase):
         self.assertFalse(sandbox.check_frame(self.frame(px, 10, 10), True)[0])   # textured needs colour variety
         varied = [(140, 173, 217)] * 300 + [(i % 256, i // 256, 7) for i in range(300)]
         self.assertTrue(sandbox.check_frame(self.frame(varied, 30, 20), True)[0])
+
+
+class ScenePlacementOptions(unittest.TestCase):
+    """--radius and --max-props are refused by sandbox.py as by sandbox_scene.py, before vk_sandbox is looked up."""
+    BAD = (["--radius", "nan"], ["--radius", "inf"], ["--radius", "-5"], ["--max-props", "-1"])
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.entities = os.path.join(self.tmp.name, "entities.jsonl")
+        open(self.entities, "w").close()
+
+    def refused(self, main, argv):
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+            main(argv)
+        self.assertEqual(stop.exception.code, 2)
+        return err.getvalue()
+
+    def test_sandbox_refuses_bad_values_before_looking_for_vk_sandbox(self):
+        # No vk_sandbox and no shaders here: before the check this was exit 77, "unsupported", which reads as a skip.
+        base = ["--work", self.tmp.name, "--entities", self.entities, "--models", self.tmp.name,
+                "--build", os.path.join(self.tmp.name, "no-build"), "--check"]
+        for extra in self.BAD:
+            with self.subTest(extra=extra):
+                self.assertIn(f"{extra[0]} must be", self.refused(sandbox.main, base + extra))
+
+    def test_sandbox_scene_refuses_the_same_values(self):
+        base = ["--entities", self.entities, "--models", self.tmp.name, "--out", os.path.join(self.tmp.name, "s.bin")]
+        for extra in self.BAD:
+            with self.subTest(extra=extra):
+                self.assertIn(f"{extra[0]} must be", self.refused(sandbox_scene.main, base + extra))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "s.bin")))
+
+    def test_zero_is_still_accepted(self):
+        # 0 is a valid radius (only props at the centre) and a valid cap (an empty scene), so it reaches the tool lookup.
+        base = ["--work", self.tmp.name, "--entities", self.entities, "--models", self.tmp.name,
+                "--build", os.path.join(self.tmp.name, "no-build"), "--check", "--radius", "0", "--max-props", "0"]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(sandbox.main(base), 77)
+        self.assertIn("vk_sandbox is not built", out.getvalue())
 
 
 if __name__ == "__main__":
