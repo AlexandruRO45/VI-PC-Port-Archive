@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -252,7 +253,7 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     free_mem(nullptr, 0x77);  // a free-only word is recorded too
     rt::startup_trace::close();
 
-    std::ifstream in(path);
+    std::ifstream in{std::filesystem::path(path)};
     std::stringstream text;
     text << in.rdbuf();
     const std::string log = text.str();
@@ -335,7 +336,7 @@ void test_transfer_trace(XMemTransferMemoryFn transfer) {
     transfer(1, 2097152);
     rt::startup_trace::close();
 
-    std::ifstream in(path);
+    std::ifstream in{std::filesystem::path(path)};
     std::stringstream text;
     text << in.rdbuf();
     const std::string log = text.str();
