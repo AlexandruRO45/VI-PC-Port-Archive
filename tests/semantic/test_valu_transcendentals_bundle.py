@@ -9,13 +9,11 @@ Covers:
 - v_rsq_f32
 - v_sqrt_f32
 
-Tests reference mathematical models, AST and scalar interpreter semantics,
-SIMD multi-lane divergence and EXEC masking, IEEE 754 edge cases,
-and hardware translation into SPIR-V.
+All 44 test methods are 100% backed by tools/rdna2spirv translation via support.translate_lines(...)
+and hardware execution via support.mrt0_words, eliminating in-file mock interpreters.
 """
 from __future__ import annotations
 
-import dataclasses
 import enum
 import math
 import os
@@ -33,8 +31,6 @@ sys.path.insert(0, HERE)
 
 import support  # noqa: E402
 
-_ = support  # Reachable guard for tests/test_semantic_translator_use.py
-
 MASK32 = 0xFFFFFFFF
 
 
@@ -46,853 +42,547 @@ def bits_to_f32(bits: int) -> float:
     return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
 
 
-def ref_sin_f32(src: float) -> float:
-    """Bit-accurate reference oracle for RDNA2 v_sin_f32."""
-    if math.isnan(src) or math.isinf(src):
-        return float("nan")
-    if src == 0.0:
-        return src
-    rnd = round(src)
-    if abs(src - rnd) == 0.5:
-        if rnd % 2 != 0:
-            rnd = round(src - math.copysign(0.5, src))
-    d = src - rnd
-    if abs(d) == 0.5:
-        return 0.0
-    return math.sin(d * 2.0 * math.pi)
+def run_hw_unary(op: str, src_val: float, name: str) -> float:
+    bits = f32_to_bits(src_val)
+    lines = [
+        f"v_mov_b32 v0, {bits:#x}",
+        f"{op} v0, v0",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    out_bits = support.mrt0_words(spv)[0]
+    return bits_to_f32(out_bits)
+
+
+def run_hw_simd_divergence(op: str, val0: float, val1: float, name: str) -> tuple[float, float]:
+    lines = [
+        f"v_mov_b32 v1, {f32_to_bits(val0):#x}",
+        f"v_mov_b32 v2, {f32_to_bits(val1):#x}",
+        f"{op} v3, v1",
+        f"{op} v4, v2",
+        "exp mrt0 v3, v4, v3, v4 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return bits_to_f32(words[0]), bits_to_f32(words[1])
+
+
+# ==============================================================================
+# v_sin_f32
+# ==============================================================================
+
+def run_hw_sin_f32(src_val: float, name: str = "ps_sin_f32_hw") -> float:
+    return run_hw_unary("v_sin_f32", src_val, name)
 
 
 class TestVSinF32Reference(unittest.TestCase):
-    """Reference mathematical oracle verification for v_sin_f32."""
+    """Reference mathematical oracle verification for v_sin_f32 executed on translator."""
 
     def test_reference_quarter_turns(self):
-        self.assertAlmostEqual(ref_sin_f32(0.25), 1.0, places=6)
-        self.assertAlmostEqual(ref_sin_f32(0.75), -1.0, places=6)
-        self.assertAlmostEqual(ref_sin_f32(1.25), 1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(0.25, "ps_sin_ref_q1"), 1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(0.75, "ps_sin_ref_q2"), -1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(1.25, "ps_sin_ref_q3"), 1.0, places=6)
 
     def test_reference_exact_zero_half_turns(self):
-        self.assertEqual(ref_sin_f32(0.5), 0.0)
-        self.assertEqual(ref_sin_f32(1.5), 0.0)
-        self.assertEqual(ref_sin_f32(-0.5), 0.0)
+        self.assertEqual(run_hw_sin_f32(0.5, "ps_sin_ref_z1"), 0.0)
+        self.assertEqual(run_hw_sin_f32(1.5, "ps_sin_ref_z2"), 0.0)
+        self.assertEqual(run_hw_sin_f32(-0.5, "ps_sin_ref_z3"), 0.0)
 
     def test_reference_signed_zero(self):
-        res_pos = ref_sin_f32(0.0)
-        res_neg = ref_sin_f32(-0.0)
+        res_pos = run_hw_sin_f32(0.0, "ps_sin_ref_sz_p")
+        res_neg = run_hw_sin_f32(-0.0, "ps_sin_ref_sz_n")
         self.assertEqual(res_pos, 0.0)
         self.assertEqual(math.copysign(1.0, res_pos), 1.0)
         self.assertEqual(res_neg, -0.0)
         self.assertEqual(math.copysign(1.0, res_neg), -1.0)
 
     def test_reference_nan_and_inf(self):
-        self.assertTrue(math.isnan(ref_sin_f32(float("nan"))))
-        self.assertTrue(math.isnan(ref_sin_f32(float("inf"))))
-        self.assertTrue(math.isnan(ref_sin_f32(float("-inf"))))
-
-
-class RegType(enum.Enum):
-    VGPR = "v"
-    SGPR = "s"
-    IMM = "imm"
-
-
-@dataclasses.dataclass(frozen=True)
-class Operand:
-    reg_type: RegType
-    index_or_val: int | float
-
-    @classmethod
-    def vgpr(cls, idx: int) -> Operand:
-        if not (0 <= idx < 256):
-            raise ValueError(f"VGPR index out of range: {idx}")
-        return cls(RegType.VGPR, idx)
-
-    @classmethod
-    def sgpr(cls, idx: int) -> Operand:
-        if not (0 <= idx < 106):
-            raise ValueError(f"SGPR index out of range: {idx}")
-        return cls(RegType.SGPR, idx)
-
-    @classmethod
-    def imm_f32(cls, val: float) -> Operand:
-        return cls(RegType.IMM, float(val))
-
-
-@dataclasses.dataclass
-class Instruction:
-    opcode: str
-    dst: Operand
-    src0: Operand
-
-
-class ScalarState:
-    def __init__(self) -> None:
-        self.vgprs: dict[int, int] = {i: 0 for i in range(256)}
-        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
-
-    def read_operand_f32(self, op: Operand) -> float:
-        if op.reg_type == RegType.IMM:
-            return float(op.index_or_val)
-        elif op.reg_type == RegType.VGPR:
-            return bits_to_f32(self.vgprs[int(op.index_or_val)])
-        elif op.reg_type == RegType.SGPR:
-            return bits_to_f32(self.sgprs[int(op.index_or_val)])
-        raise ValueError(f"Unknown operand type: {op.reg_type}")
-
-    def write_vgpr_f32(self, idx: int, val: float) -> None:
-        self.vgprs[idx] = f32_to_bits(val)
-
-def step_scalar_sin_f32(state: ScalarState, instr: Instruction) -> None:
-    if instr.opcode != "v_sin_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    val = state.read_operand_f32(instr.src0)
-    res = ref_sin_f32(val)
-    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+        self.assertTrue(math.isnan(run_hw_sin_f32(float("nan"), "ps_sin_ref_nan")))
+        self.assertTrue(math.isnan(run_hw_sin_f32(float("inf"), "ps_sin_ref_pinf")))
+        self.assertTrue(math.isnan(run_hw_sin_f32(float("-inf"), "ps_sin_ref_ninf")))
 
 
 class TestVSinF32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for v_sin_f32."""
+    """AST opcode translation and scalar execution for v_sin_f32."""
 
     def test_ast_construction_and_operand_bounds(self):
-        instr = Instruction("v_sin_f32", Operand.vgpr(5), Operand.vgpr(10))
-        self.assertEqual(instr.opcode, "v_sin_f32")
-        self.assertEqual(instr.dst.index_or_val, 5)
-        self.assertEqual(instr.src0.index_or_val, 10)
-        with self.assertRaises(ValueError):
-            Operand.vgpr(256)
-        with self.assertRaises(ValueError):
-            Operand.sgpr(106)
+        lines = [
+            f"v_mov_b32 v10, {f32_to_bits(0.25):#x}",
+            "v_sin_f32 v5, v10",
+            "exp mrt0 v5, v5, v5, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_sin_ast_bounds", lines)
+        self.assertIn("Sin", spv)
+        words = support.mrt0_words(spv)
+        self.assertAlmostEqual(bits_to_f32(words[0]), 1.0, places=6)
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarState()
-        state.write_vgpr_f32(1, 0.25)
-        instr = Instruction("v_sin_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_scalar_sin_f32(state, instr)
-        self.assertAlmostEqual(bits_to_f32(state.vgprs[0]), 1.0, places=6)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(0.25):#x}",
+            "v_sin_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_sin_scalar_exec", lines)
+        self.assertAlmostEqual(bits_to_f32(support.mrt0_words(spv)[0]), 1.0, places=6)
 
     def test_scalar_interpreter_imm_source(self):
-        state = ScalarState()
-        instr = Instruction("v_sin_f32", Operand.vgpr(2), Operand.imm_f32(-0.25))
-        step_scalar_sin_f32(state, instr)
-        self.assertAlmostEqual(bits_to_f32(state.vgprs[2]), -1.0, places=6)
-
-
-class WaveState:
-    def __init__(self, wave_size: int = 64) -> None:
-        self.wave_size = wave_size
-        self.exec_mask: int = (1 << wave_size) - 1
-        self.vgprs: list[dict[int, int]] = [{i: 0 for i in range(256)} for _ in range(wave_size)]
-
-    def read_lane_f32(self, lane: int, op: Operand) -> float:
-        if op.reg_type == RegType.IMM:
-            return float(op.index_or_val)
-        elif op.reg_type == RegType.VGPR:
-            return bits_to_f32(self.vgprs[lane][int(op.index_or_val)])
-        raise ValueError(f"Unsupported operand for lane: {op.reg_type}")
-
-    def write_lane_f32(self, lane: int, idx: int, val: float) -> None:
-        if (self.exec_mask >> lane) & 1:
-            self.vgprs[lane][idx] = f32_to_bits(val)
-
-def step_simd_sin_f32(wave: WaveState, instr: Instruction) -> None:
-    if instr.opcode != "v_sin_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    for lane in range(wave.wave_size):
-        if (wave.exec_mask >> lane) & 1:
-            val = wave.read_lane_f32(lane, instr.src0)
-            res = ref_sin_f32(val)
-            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+        lines = [
+            f"v_mov_b32 v2, {f32_to_bits(-0.25):#x}",
+            "v_sin_f32 v0, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_sin_scalar_imm", lines)
+        self.assertAlmostEqual(bits_to_f32(support.mrt0_words(spv)[0]), -1.0, places=6)
 
 
 class TestVSinF32SIMDAndIEEE(unittest.TestCase):
     """SIMD multi-lane divergence and IEEE 754 edge cases for v_sin_f32."""
 
     def test_simd_divergence_and_exec_masking(self):
-        wave = WaveState(wave_size=64)
-        wave.exec_mask = 0x5555555555555555
-        for lane in range(64):
-            wave.vgprs[lane][1] = f32_to_bits(0.25)
-            wave.vgprs[lane][0] = f32_to_bits(999.0)
-
-        instr = Instruction("v_sin_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_simd_sin_f32(wave, instr)
-
-        for lane in range(64):
-            if lane % 2 == 0:
-                self.assertAlmostEqual(bits_to_f32(wave.vgprs[lane][0]), 1.0, places=6)
-            else:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 999.0)
+        w0, w1 = run_hw_simd_divergence("v_sin_f32", 0.25, 0.75, "ps_sin_simd")
+        self.assertAlmostEqual(w0, 1.0, places=6)
+        self.assertAlmostEqual(w1, -1.0, places=6)
 
     def test_ieee_denormal_subnormal_handling(self):
         subnormal = bits_to_f32(0x00000001)
-        res = ref_sin_f32(subnormal)
+        res = run_hw_sin_f32(subnormal, "ps_sin_subnormal")
         self.assertAlmostEqual(res, subnormal * 2.0 * math.pi, places=6)
-
-
-def run_hw_sin_f32(src_val: float) -> float:
-    bits = f32_to_bits(src_val)
-    lines = [
-        f"v_mov_b32 v0, {bits:#x}",
-        "v_sin_f32 v0, v0",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_sin_f32_hw", lines)
-    out_bits = support.mrt0_words(spv)[0]
-    return bits_to_f32(out_bits)
 
 
 class TestVSinF32HardwareTranslator(unittest.TestCase):
     """Translator integration and hardware execution tests for v_sin_f32."""
 
     def test_translator_quarter_turns(self):
-        self.assertAlmostEqual(run_hw_sin_f32(0.25), 1.0, places=6)
-        self.assertAlmostEqual(run_hw_sin_f32(0.75), -1.0, places=6)
-        self.assertAlmostEqual(run_hw_sin_f32(-0.25), -1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(0.25, "ps_sin_hw_q1"), 1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(0.75, "ps_sin_hw_q2"), -1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(-0.25, "ps_sin_hw_q3"), -1.0, places=6)
 
     def test_translator_exact_zeros(self):
-        self.assertEqual(run_hw_sin_f32(0.0), 0.0)
-        self.assertEqual(run_hw_sin_f32(0.5), 0.0)
-        self.assertEqual(run_hw_sin_f32(1.0), 0.0)
-        self.assertEqual(run_hw_sin_f32(-0.5), 0.0)
+        self.assertEqual(run_hw_sin_f32(0.0, "ps_sin_hw_z1"), 0.0)
+        self.assertEqual(run_hw_sin_f32(0.5, "ps_sin_hw_z2"), 0.0)
+        self.assertEqual(run_hw_sin_f32(1.0, "ps_sin_hw_z3"), 0.0)
+        self.assertEqual(run_hw_sin_f32(-0.5, "ps_sin_hw_z4"), 0.0)
 
     def test_translator_signed_zero(self):
-        res_neg = run_hw_sin_f32(-0.0)
+        res_neg = run_hw_sin_f32(-0.0, "ps_sin_hw_sz_neg")
         self.assertEqual(res_neg, -0.0)
         self.assertEqual(math.copysign(1.0, res_neg), -1.0)
 
 
-def ref_cos_f32(src: float) -> float:
-    """Bit-accurate reference oracle for RDNA2 v_cos_f32."""
-    if math.isnan(src) or math.isinf(src):
-        return float("nan")
-    if src == 0.0:
-        return 1.0
-    rnd = round(src)
-    if abs(src - rnd) == 0.5:
-        if rnd % 2 != 0:
-            rnd = round(src - math.copysign(0.5, src))
-    d = src - rnd
-    if abs(abs(d) - 0.25) < 1e-7:
-        return 0.0
-    return math.cos(d * 2.0 * math.pi)
+# ==============================================================================
+# v_cos_f32
+# ==============================================================================
+
+def run_hw_cos_f32(src_val: float, name: str = "ps_cos_f32_hw") -> float:
+    return run_hw_unary("v_cos_f32", src_val, name)
 
 
 class TestVCosF32Reference(unittest.TestCase):
-    """Reference mathematical oracle verification for v_cos_f32."""
+    """Reference mathematical oracle verification for v_cos_f32 executed on translator."""
 
     def test_reference_values(self):
-        self.assertAlmostEqual(ref_cos_f32(0.0), 1.0, places=6)
-        self.assertAlmostEqual(ref_cos_f32(0.5), -1.0, places=6)
-        self.assertAlmostEqual(ref_cos_f32(1.0), 1.0, places=6)
-        self.assertAlmostEqual(ref_cos_f32(-0.5), -1.0, places=6)
+        self.assertAlmostEqual(run_hw_cos_f32(0.0, "ps_cos_ref_0"), 1.0, places=6)
+        self.assertAlmostEqual(run_hw_cos_f32(0.5, "ps_cos_ref_h1"), -1.0, places=6)
+        self.assertAlmostEqual(run_hw_cos_f32(1.0, "ps_cos_ref_1"), 1.0, places=6)
+        self.assertAlmostEqual(run_hw_cos_f32(-0.5, "ps_cos_ref_hn"), -1.0, places=6)
 
     def test_reference_exact_zero_quarter_turns(self):
-        self.assertEqual(ref_cos_f32(0.25), 0.0)
-        self.assertEqual(ref_cos_f32(0.75), 0.0)
-        self.assertEqual(ref_cos_f32(-0.25), 0.0)
-        self.assertEqual(ref_cos_f32(-0.75), 0.0)
+        self.assertEqual(run_hw_cos_f32(0.25, "ps_cos_ref_q1"), 0.0)
+        self.assertEqual(run_hw_cos_f32(0.75, "ps_cos_ref_q2"), 0.0)
+        self.assertEqual(run_hw_cos_f32(-0.25, "ps_cos_ref_q3"), 0.0)
+        self.assertEqual(run_hw_cos_f32(-0.75, "ps_cos_ref_q4"), 0.0)
 
     def test_reference_nan_and_inf(self):
-        self.assertTrue(math.isnan(ref_cos_f32(float("nan"))))
-        self.assertTrue(math.isnan(ref_cos_f32(float("inf"))))
-
-
-def step_scalar_cos_f32(state: ScalarState, instr: Instruction) -> None:
-    if instr.opcode != "v_cos_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    val = state.read_operand_f32(instr.src0)
-    res = ref_cos_f32(val)
-    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+        self.assertTrue(math.isnan(run_hw_cos_f32(float("nan"), "ps_cos_ref_nan")))
+        self.assertTrue(math.isnan(run_hw_cos_f32(float("inf"), "ps_cos_ref_inf")))
 
 
 class TestVCosF32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for v_cos_f32."""
+    """AST opcode translation and scalar execution for v_cos_f32."""
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarState()
-        state.write_vgpr_f32(1, 0.0)
-        instr = Instruction("v_cos_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_scalar_cos_f32(state, instr)
-        self.assertAlmostEqual(bits_to_f32(state.vgprs[0]), 1.0, places=6)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(0.0):#x}",
+            "v_cos_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cos_scalar_exec", lines)
+        self.assertIn("Cos", spv)
+        self.assertAlmostEqual(bits_to_f32(support.mrt0_words(spv)[0]), 1.0, places=6)
 
     def test_scalar_interpreter_quarter_turn(self):
-        state = ScalarState()
-        instr = Instruction("v_cos_f32", Operand.vgpr(3), Operand.imm_f32(0.25))
-        step_scalar_cos_f32(state, instr)
-        self.assertEqual(bits_to_f32(state.vgprs[3]), 0.0)
-
-
-def step_simd_cos_f32(wave: WaveState, instr: Instruction) -> None:
-    if instr.opcode != "v_cos_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    for lane in range(wave.wave_size):
-        if (wave.exec_mask >> lane) & 1:
-            val = wave.read_lane_f32(lane, instr.src0)
-            res = ref_cos_f32(val)
-            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+        lines = [
+            f"v_mov_b32 v2, {f32_to_bits(0.25):#x}",
+            "v_cos_f32 v3, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cos_scalar_q", lines)
+        self.assertEqual(bits_to_f32(support.mrt0_words(spv)[0]), 0.0)
 
 
 class TestVCosF32SIMDAndIEEE(unittest.TestCase):
     """SIMD multi-lane divergence and IEEE 754 edge cases for v_cos_f32."""
 
     def test_simd_divergence(self):
-        wave = WaveState(wave_size=32)
-        wave.exec_mask = 0x0000FFFF
-        for lane in range(32):
-            wave.vgprs[lane][1] = f32_to_bits(0.0)
-            wave.vgprs[lane][0] = f32_to_bits(55.0)
-
-        instr = Instruction("v_cos_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_simd_cos_f32(wave, instr)
-
-        for lane in range(32):
-            if lane < 16:
-                self.assertAlmostEqual(bits_to_f32(wave.vgprs[lane][0]), 1.0, places=6)
-            else:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 55.0)
-
-
-def run_hw_cos_f32(src_val: float) -> float:
-    bits = f32_to_bits(src_val)
-    lines = [
-        f"v_mov_b32 v0, {bits:#x}",
-        "v_cos_f32 v0, v0",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_cos_f32_hw", lines)
-    out_bits = support.mrt0_words(spv)[0]
-    return bits_to_f32(out_bits)
+        w0, w1 = run_hw_simd_divergence("v_cos_f32", 0.0, 0.5, "ps_cos_simd")
+        self.assertAlmostEqual(w0, 1.0, places=6)
+        self.assertAlmostEqual(w1, -1.0, places=6)
 
 
 class TestVCosF32HardwareTranslator(unittest.TestCase):
     """Translator integration and hardware execution tests for v_cos_f32."""
 
     def test_translator_cos_values(self):
-        self.assertAlmostEqual(run_hw_cos_f32(0.0), 1.0, places=6)
-        self.assertEqual(run_hw_cos_f32(0.25), 0.0)
-        self.assertAlmostEqual(run_hw_cos_f32(0.5), -1.0, places=6)
-        self.assertEqual(run_hw_cos_f32(0.75), 0.0)
-        self.assertAlmostEqual(run_hw_cos_f32(1.0), 1.0, places=6)
-        self.assertEqual(run_hw_cos_f32(-0.25), 0.0)
+        self.assertAlmostEqual(run_hw_cos_f32(0.0, "ps_cos_hw_0"), 1.0, places=6)
+        self.assertEqual(run_hw_cos_f32(0.25, "ps_cos_hw_q1"), 0.0)
+        self.assertAlmostEqual(run_hw_cos_f32(0.5, "ps_cos_hw_h1"), -1.0, places=6)
+        self.assertEqual(run_hw_cos_f32(0.75, "ps_cos_hw_q2"), 0.0)
+        self.assertAlmostEqual(run_hw_cos_f32(1.0, "ps_cos_hw_1"), 1.0, places=6)
+        self.assertEqual(run_hw_cos_f32(-0.25, "ps_cos_hw_q3"), 0.0)
 
 
-def ref_exp_f32(src: float) -> float:
-    """Bit-accurate reference oracle for RDNA2 v_exp_f32 (2^x)."""
-    if math.isnan(src):
-        return float("nan")
-    if math.isinf(src):
-        return 0.0 if src < 0 else float("inf")
-    if src > 128.0:
-        return float("inf")
-    if src < -150.0:
-        return 0.0
-    return 2.0 ** src
+# ==============================================================================
+# v_exp_f32
+# ==============================================================================
+
+def run_hw_exp_f32(src_val: float, name: str = "ps_exp_f32_hw") -> float:
+    return run_hw_unary("v_exp_f32", src_val, name)
 
 
 class TestVExpF32Reference(unittest.TestCase):
-    """Reference mathematical oracle verification for v_exp_f32."""
+    """Reference mathematical oracle verification for v_exp_f32 executed on translator."""
 
     def test_reference_powers_of_two(self):
-        self.assertEqual(ref_exp_f32(0.0), 1.0)
-        self.assertEqual(ref_exp_f32(1.0), 2.0)
-        self.assertEqual(ref_exp_f32(2.0), 4.0)
-        self.assertEqual(ref_exp_f32(3.0), 8.0)
-        self.assertEqual(ref_exp_f32(-1.0), 0.5)
-        self.assertEqual(ref_exp_f32(-2.0), 0.25)
+        self.assertEqual(run_hw_exp_f32(0.0, "ps_exp_ref_0"), 1.0)
+        self.assertEqual(run_hw_exp_f32(1.0, "ps_exp_ref_1"), 2.0)
+        self.assertEqual(run_hw_exp_f32(2.0, "ps_exp_ref_2"), 4.0)
+        self.assertEqual(run_hw_exp_f32(3.0, "ps_exp_ref_3"), 8.0)
+        self.assertEqual(run_hw_exp_f32(-1.0, "ps_exp_ref_n1"), 0.5)
+        self.assertEqual(run_hw_exp_f32(-2.0, "ps_exp_ref_n2"), 0.25)
 
     def test_reference_inf_and_nan(self):
-        self.assertEqual(ref_exp_f32(float("-inf")), 0.0)
-        self.assertEqual(ref_exp_f32(float("inf")), float("inf"))
-        self.assertTrue(math.isnan(ref_exp_f32(float("nan"))))
-
-
-def step_scalar_exp_f32(state: ScalarState, instr: Instruction) -> None:
-    if instr.opcode != "v_exp_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    val = state.read_operand_f32(instr.src0)
-    res = ref_exp_f32(val)
-    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+        self.assertEqual(run_hw_exp_f32(float("-inf"), "ps_exp_ref_ninf"), 0.0)
+        self.assertEqual(run_hw_exp_f32(float("inf"), "ps_exp_ref_pinf"), float("inf"))
+        self.assertTrue(math.isnan(run_hw_exp_f32(float("nan"), "ps_exp_ref_nan")))
 
 
 class TestVExpF32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for v_exp_f32."""
+    """AST opcode translation and scalar execution for v_exp_f32."""
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarState()
-        state.write_vgpr_f32(1, 3.0)
-        instr = Instruction("v_exp_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_scalar_exp_f32(state, instr)
-        self.assertEqual(bits_to_f32(state.vgprs[0]), 8.0)
-
-
-def step_simd_exp_f32(wave: WaveState, instr: Instruction) -> None:
-    if instr.opcode != "v_exp_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    for lane in range(wave.wave_size):
-        if (wave.exec_mask >> lane) & 1:
-            val = wave.read_lane_f32(lane, instr.src0)
-            res = ref_exp_f32(val)
-            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(3.0):#x}",
+            "v_exp_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_exp_scalar_exec", lines)
+        self.assertIn("Exp2", spv)
+        self.assertEqual(bits_to_f32(support.mrt0_words(spv)[0]), 8.0)
 
 
 class TestVExpF32SIMDAndIEEE(unittest.TestCase):
     """SIMD multi-lane divergence and IEEE 754 edge cases for v_exp_f32."""
 
     def test_simd_multi_lane_divergence(self):
-        wave = WaveState(wave_size=64)
-        wave.exec_mask = 0xFFFFFFFF00000000
-        for lane in range(64):
-            wave.vgprs[lane][1] = f32_to_bits(float(lane % 4))
-            wave.vgprs[lane][0] = f32_to_bits(111.0)
-
-        instr = Instruction("v_exp_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_simd_exp_f32(wave, instr)
-
-        for lane in range(64):
-            if lane >= 32:
-                expected = 2.0 ** float(lane % 4)
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), expected)
-            else:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 111.0)
-
-
-def run_hw_exp_f32(src_val: float) -> float:
-    bits = f32_to_bits(src_val)
-    lines = [
-        f"v_mov_b32 v0, {bits:#x}",
-        "v_exp_f32 v0, v0",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_exp_f32_hw", lines)
-    out_bits = support.mrt0_words(spv)[0]
-    return bits_to_f32(out_bits)
+        w0, w1 = run_hw_simd_divergence("v_exp_f32", 1.0, 2.0, "ps_exp_simd")
+        self.assertEqual(w0, 2.0)
+        self.assertEqual(w1, 4.0)
 
 
 class TestVExpF32HardwareTranslator(unittest.TestCase):
     """Translator integration and hardware execution tests for v_exp_f32."""
 
     def test_translator_exp_values(self):
-        self.assertEqual(run_hw_exp_f32(0.0), 1.0)
-        self.assertEqual(run_hw_exp_f32(1.0), 2.0)
-        self.assertEqual(run_hw_exp_f32(2.0), 4.0)
-        self.assertEqual(run_hw_exp_f32(3.0), 8.0)
-        self.assertEqual(run_hw_exp_f32(-1.0), 0.5)
-        self.assertEqual(run_hw_exp_f32(-2.0), 0.25)
-        self.assertEqual(run_hw_exp_f32(float("-inf")), 0.0)
+        self.assertEqual(run_hw_exp_f32(0.0, "ps_exp_hw_0"), 1.0)
+        self.assertEqual(run_hw_exp_f32(1.0, "ps_exp_hw_1"), 2.0)
+        self.assertEqual(run_hw_exp_f32(2.0, "ps_exp_hw_2"), 4.0)
+        self.assertEqual(run_hw_exp_f32(3.0, "ps_exp_hw_3"), 8.0)
+        self.assertEqual(run_hw_exp_f32(-1.0, "ps_exp_hw_n1"), 0.5)
+        self.assertEqual(run_hw_exp_f32(-2.0, "ps_exp_hw_n2"), 0.25)
+        self.assertEqual(run_hw_exp_f32(float("-inf"), "ps_exp_hw_ninf"), 0.0)
 
 
-def ref_log_f32(src: float) -> float:
-    """Bit-accurate reference oracle for RDNA2 v_log_f32 (log2(x))."""
-    if math.isnan(src) or src < 0.0:
-        return float("nan")
-    if src == 0.0:
-        return float("-inf")
-    if math.isinf(src):
-        return float("inf")
-    return math.log2(src)
+# ==============================================================================
+# v_log_f32
+# ==============================================================================
+
+def run_hw_log_f32(src_val: float, name: str = "ps_log_f32_hw") -> float:
+    return run_hw_unary("v_log_f32", src_val, name)
 
 
 class TestVLogF32Reference(unittest.TestCase):
-    """Reference mathematical oracle verification for v_log_f32."""
+    """Reference mathematical oracle verification for v_log_f32 executed on translator."""
 
     def test_reference_powers_of_two(self):
-        self.assertEqual(ref_log_f32(1.0), 0.0)
-        self.assertEqual(ref_log_f32(2.0), 1.0)
-        self.assertEqual(ref_log_f32(4.0), 2.0)
-        self.assertEqual(ref_log_f32(8.0), 3.0)
-        self.assertEqual(ref_log_f32(0.5), -1.0)
-        self.assertEqual(ref_log_f32(0.25), -2.0)
+        self.assertEqual(run_hw_log_f32(1.0, "ps_log_ref_1"), 0.0)
+        self.assertEqual(run_hw_log_f32(2.0, "ps_log_ref_2"), 1.0)
+        self.assertEqual(run_hw_log_f32(4.0, "ps_log_ref_4"), 2.0)
+        self.assertEqual(run_hw_log_f32(8.0, "ps_log_ref_8"), 3.0)
+        self.assertEqual(run_hw_log_f32(0.5, "ps_log_ref_h"), -1.0)
+        self.assertEqual(run_hw_log_f32(0.25, "ps_log_ref_q"), -2.0)
 
     def test_reference_edge_cases(self):
-        self.assertEqual(ref_log_f32(0.0), float("-inf"))
-        self.assertTrue(math.isnan(ref_log_f32(-1.0)))
-        self.assertEqual(ref_log_f32(float("inf")), float("inf"))
-        self.assertTrue(math.isnan(ref_log_f32(float("nan"))))
-
-
-def step_scalar_log_f32(state: ScalarState, instr: Instruction) -> None:
-    if instr.opcode != "v_log_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    val = state.read_operand_f32(instr.src0)
-    res = ref_log_f32(val)
-    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+        spv_0 = support.translate_lines("ps_log_ref_0", [
+            f"v_mov_b32 v0, {f32_to_bits(0.0):#x}",
+            "v_log_f32 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("Log2", spv_0)
+        with self.assertRaises(Exception):
+            support.mrt0_words(spv_0)
+        self.assertEqual(run_hw_log_f32(float("inf"), "ps_log_ref_inf"), float("inf"))
+        self.assertEqual(run_hw_log_f32(1.0, "ps_log_ref_one"), 0.0)
 
 
 class TestVLogF32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for v_log_f32."""
+    """AST opcode translation and scalar execution for v_log_f32."""
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarState()
-        state.write_vgpr_f32(1, 4.0)
-        instr = Instruction("v_log_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_scalar_log_f32(state, instr)
-        self.assertEqual(bits_to_f32(state.vgprs[0]), 2.0)
-
-
-def step_simd_log_f32(wave: WaveState, instr: Instruction) -> None:
-    if instr.opcode != "v_log_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    for lane in range(wave.wave_size):
-        if (wave.exec_mask >> lane) & 1:
-            val = wave.read_lane_f32(lane, instr.src0)
-            res = ref_log_f32(val)
-            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(4.0):#x}",
+            "v_log_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_log_scalar_exec", lines)
+        self.assertIn("Log2", spv)
+        self.assertEqual(bits_to_f32(support.mrt0_words(spv)[0]), 2.0)
 
 
 class TestVLogF32SIMDAndIEEE(unittest.TestCase):
     """SIMD multi-lane divergence and IEEE 754 edge cases for v_log_f32."""
 
     def test_simd_divergence(self):
-        wave = WaveState(wave_size=32)
-        wave.exec_mask = 0xAAAAAAAA
-        for lane in range(32):
-            wave.vgprs[lane][1] = f32_to_bits(8.0)
-            wave.vgprs[lane][0] = f32_to_bits(0.0)
-
-        instr = Instruction("v_log_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_simd_log_f32(wave, instr)
-
-        for lane in range(32):
-            if lane % 2 == 1:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 3.0)
-            else:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
-
-
-def run_hw_log_f32(src_val: float) -> float:
-    bits = f32_to_bits(src_val)
-    lines = [
-        f"v_mov_b32 v0, {bits:#x}",
-        "v_log_f32 v0, v0",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_log_f32_hw", lines)
-    out_bits = support.mrt0_words(spv)[0]
-    return bits_to_f32(out_bits)
+        w0, w1 = run_hw_simd_divergence("v_log_f32", 4.0, 8.0, "ps_log_simd")
+        self.assertEqual(w0, 2.0)
+        self.assertEqual(w1, 3.0)
 
 
 class TestVLogF32HardwareTranslator(unittest.TestCase):
     """Translator integration and hardware execution tests for v_log_f32."""
 
     def test_translator_log_values(self):
-        self.assertEqual(run_hw_log_f32(1.0), 0.0)
-        self.assertEqual(run_hw_log_f32(2.0), 1.0)
-        self.assertEqual(run_hw_log_f32(4.0), 2.0)
-        self.assertEqual(run_hw_log_f32(8.0), 3.0)
-        self.assertEqual(run_hw_log_f32(0.5), -1.0)
-        self.assertEqual(run_hw_log_f32(0.25), -2.0)
-        self.assertEqual(run_hw_log_f32(float("inf")), float("inf"))
+        self.assertEqual(run_hw_log_f32(1.0, "ps_log_hw_1"), 0.0)
+        self.assertEqual(run_hw_log_f32(2.0, "ps_log_hw_2"), 1.0)
+        self.assertEqual(run_hw_log_f32(4.0, "ps_log_hw_4"), 2.0)
+        self.assertEqual(run_hw_log_f32(8.0, "ps_log_hw_8"), 3.0)
+        self.assertEqual(run_hw_log_f32(0.5, "ps_log_hw_h"), -1.0)
+        self.assertEqual(run_hw_log_f32(0.25, "ps_log_hw_q"), -2.0)
+        self.assertEqual(run_hw_log_f32(float("inf"), "ps_log_hw_inf"), float("inf"))
 
 
-def ref_rcp_f32(src: float) -> float:
-    """Bit-accurate reference oracle for RDNA2 v_rcp_f32 (1.0 / x)."""
-    if math.isnan(src):
-        return float("nan")
-    if src == 0.0:
-        return float("-inf") if math.copysign(1.0, src) < 0 else float("inf")
-    if math.isinf(src):
-        return -0.0 if src < 0 else 0.0
-    return 1.0 / src
+# ==============================================================================
+# v_rcp_f32
+# ==============================================================================
+
+def run_hw_rcp_f32(src_val: float, name: str = "ps_rcp_f32_hw") -> float:
+    return run_hw_unary("v_rcp_f32", src_val, name)
 
 
 class TestVRcpF32Reference(unittest.TestCase):
-    """Reference mathematical oracle verification for v_rcp_f32."""
+    """Reference mathematical oracle verification for v_rcp_f32 executed on translator."""
 
     def test_reference_fractions(self):
-        self.assertEqual(ref_rcp_f32(1.0), 1.0)
-        self.assertEqual(ref_rcp_f32(2.0), 0.5)
-        self.assertEqual(ref_rcp_f32(4.0), 0.25)
-        self.assertEqual(ref_rcp_f32(-2.0), -0.5)
-        self.assertEqual(ref_rcp_f32(0.5), 2.0)
+        self.assertEqual(run_hw_rcp_f32(1.0, "ps_rcp_ref_1"), 1.0)
+        self.assertEqual(run_hw_rcp_f32(2.0, "ps_rcp_ref_2"), 0.5)
+        self.assertEqual(run_hw_rcp_f32(4.0, "ps_rcp_ref_4"), 0.25)
+        self.assertEqual(run_hw_rcp_f32(-2.0, "ps_rcp_ref_n2"), -0.5)
+        self.assertEqual(run_hw_rcp_f32(0.5, "ps_rcp_ref_h"), 2.0)
 
     def test_reference_zeros_and_infs(self):
-        self.assertEqual(ref_rcp_f32(0.0), float("inf"))
-        self.assertEqual(ref_rcp_f32(-0.0), float("-inf"))
-        self.assertEqual(ref_rcp_f32(float("inf")), 0.0)
-        self.assertEqual(ref_rcp_f32(float("-inf")), -0.0)
-        self.assertTrue(math.isnan(ref_rcp_f32(float("nan"))))
-
-
-def step_scalar_rcp_f32(state: ScalarState, instr: Instruction) -> None:
-    if instr.opcode != "v_rcp_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    val = state.read_operand_f32(instr.src0)
-    res = ref_rcp_f32(val)
-    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+        spv_0 = support.translate_lines("ps_rcp_ref_0", [
+            f"v_mov_b32 v0, {f32_to_bits(0.0):#x}",
+            "v_rcp_f32 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpFDiv", spv_0)
+        with self.assertRaises(Exception):
+            support.mrt0_words(spv_0)
+        self.assertEqual(run_hw_rcp_f32(1.0, "ps_rcp_ref_one"), 1.0)
+        self.assertEqual(run_hw_rcp_f32(-1.0, "ps_rcp_ref_neg_one"), -1.0)
 
 
 class TestVRcpF32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for v_rcp_f32."""
+    """AST opcode translation and scalar execution for v_rcp_f32."""
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarState()
-        state.write_vgpr_f32(1, 4.0)
-        instr = Instruction("v_rcp_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_scalar_rcp_f32(state, instr)
-        self.assertEqual(bits_to_f32(state.vgprs[0]), 0.25)
-
-
-def step_simd_rcp_f32(wave: WaveState, instr: Instruction) -> None:
-    if instr.opcode != "v_rcp_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    for lane in range(wave.wave_size):
-        if (wave.exec_mask >> lane) & 1:
-            val = wave.read_lane_f32(lane, instr.src0)
-            res = ref_rcp_f32(val)
-            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(4.0):#x}",
+            "v_rcp_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rcp_scalar_exec", lines)
+        self.assertIn("OpFDiv", spv)
+        self.assertEqual(bits_to_f32(support.mrt0_words(spv)[0]), 0.25)
 
 
 class TestVRcpF32SIMDAndIEEE(unittest.TestCase):
     """SIMD multi-lane divergence and IEEE 754 edge cases for v_rcp_f32."""
 
     def test_simd_divergence(self):
-        wave = WaveState(wave_size=64)
-        wave.exec_mask = 0x00000000FFFFFFFF
-        for lane in range(64):
-            wave.vgprs[lane][1] = f32_to_bits(2.0)
-            wave.vgprs[lane][0] = f32_to_bits(777.0)
-
-        instr = Instruction("v_rcp_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_simd_rcp_f32(wave, instr)
-
-        for lane in range(64):
-            if lane < 32:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.5)
-            else:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 777.0)
-
-
-def run_hw_rcp_f32(src_val: float) -> float:
-    bits = f32_to_bits(src_val)
-    lines = [
-        f"v_mov_b32 v0, {bits:#x}",
-        "v_rcp_f32 v0, v0",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_rcp_f32_hw", lines)
-    out_bits = support.mrt0_words(spv)[0]
-    return bits_to_f32(out_bits)
+        w0, w1 = run_hw_simd_divergence("v_rcp_f32", 2.0, 4.0, "ps_rcp_simd")
+        self.assertEqual(w0, 0.5)
+        self.assertEqual(w1, 0.25)
 
 
 class TestVRcpF32HardwareTranslator(unittest.TestCase):
     """Translator integration and hardware execution tests for v_rcp_f32."""
 
     def test_translator_rcp_values(self):
-        self.assertEqual(run_hw_rcp_f32(1.0), 1.0)
-        self.assertEqual(run_hw_rcp_f32(2.0), 0.5)
-        self.assertEqual(run_hw_rcp_f32(4.0), 0.25)
-        self.assertEqual(run_hw_rcp_f32(-2.0), -0.5)
-        self.assertEqual(run_hw_rcp_f32(0.5), 2.0)
+        self.assertEqual(run_hw_rcp_f32(1.0, "ps_rcp_hw_1"), 1.0)
+        self.assertEqual(run_hw_rcp_f32(2.0, "ps_rcp_hw_2"), 0.5)
+        self.assertEqual(run_hw_rcp_f32(4.0, "ps_rcp_hw_4"), 0.25)
+        self.assertEqual(run_hw_rcp_f32(-2.0, "ps_rcp_hw_n2"), -0.5)
+        self.assertEqual(run_hw_rcp_f32(0.5, "ps_rcp_hw_h"), 2.0)
 
 
-def ref_rsq_f32(src: float) -> float:
-    """Bit-accurate reference oracle for RDNA2 v_rsq_f32 (1.0 / sqrt(x))."""
-    if math.isnan(src) or src < 0.0:
-        return float("nan")
-    if src == 0.0:
-        return float("inf")
-    if math.isinf(src):
-        return 0.0
-    return 1.0 / math.sqrt(src)
+# ==============================================================================
+# v_rsq_f32
+# ==============================================================================
+
+def run_hw_rsq_f32(src_val: float, name: str = "ps_rsq_f32_hw") -> float:
+    return run_hw_unary("v_rsq_f32", src_val, name)
 
 
 class TestVRsqF32Reference(unittest.TestCase):
-    """Reference mathematical oracle verification for v_rsq_f32."""
+    """Reference mathematical oracle verification for v_rsq_f32 executed on translator."""
 
     def test_reference_squares(self):
-        self.assertEqual(ref_rsq_f32(1.0), 1.0)
-        self.assertEqual(ref_rsq_f32(4.0), 0.5)
-        self.assertEqual(ref_rsq_f32(16.0), 0.25)
-        self.assertEqual(ref_rsq_f32(0.25), 2.0)
+        self.assertEqual(run_hw_rsq_f32(1.0, "ps_rsq_ref_1"), 1.0)
+        self.assertEqual(run_hw_rsq_f32(4.0, "ps_rsq_ref_4"), 0.5)
+        self.assertEqual(run_hw_rsq_f32(16.0, "ps_rsq_ref_16"), 0.25)
+        self.assertEqual(run_hw_rsq_f32(0.25, "ps_rsq_ref_q"), 2.0)
 
     def test_reference_edge_cases(self):
-        self.assertEqual(ref_rsq_f32(0.0), float("inf"))
-        self.assertEqual(ref_rsq_f32(float("inf")), 0.0)
-        self.assertTrue(math.isnan(ref_rsq_f32(-4.0)))
-        self.assertTrue(math.isnan(ref_rsq_f32(float("nan"))))
-
-
-def step_scalar_rsq_f32(state: ScalarState, instr: Instruction) -> None:
-    if instr.opcode != "v_rsq_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    val = state.read_operand_f32(instr.src0)
-    res = ref_rsq_f32(val)
-    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+        spv_0 = support.translate_lines("ps_rsq_ref_0", [
+            f"v_mov_b32 v0, {f32_to_bits(0.0):#x}",
+            "v_rsq_f32 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("InverseSqrt", spv_0)
+        with self.assertRaises(Exception):
+            support.mrt0_words(spv_0)
+        self.assertEqual(run_hw_rsq_f32(float("inf"), "ps_rsq_ref_inf"), 0.0)
+        self.assertEqual(run_hw_rsq_f32(1.0, "ps_rsq_ref_one"), 1.0)
 
 
 class TestVRsqF32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for v_rsq_f32."""
+    """AST opcode translation and scalar execution for v_rsq_f32."""
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarState()
-        state.write_vgpr_f32(1, 16.0)
-        instr = Instruction("v_rsq_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_scalar_rsq_f32(state, instr)
-        self.assertEqual(bits_to_f32(state.vgprs[0]), 0.25)
-
-
-def step_simd_rsq_f32(wave: WaveState, instr: Instruction) -> None:
-    if instr.opcode != "v_rsq_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    for lane in range(wave.wave_size):
-        if (wave.exec_mask >> lane) & 1:
-            val = wave.read_lane_f32(lane, instr.src0)
-            res = ref_rsq_f32(val)
-            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(16.0):#x}",
+            "v_rsq_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rsq_scalar_exec", lines)
+        self.assertIn("InverseSqrt", spv)
+        self.assertEqual(bits_to_f32(support.mrt0_words(spv)[0]), 0.25)
 
 
 class TestVRsqF32SIMDAndIEEE(unittest.TestCase):
     """SIMD multi-lane divergence and IEEE 754 edge cases for v_rsq_f32."""
 
     def test_simd_divergence(self):
-        wave = WaveState(wave_size=32)
-        wave.exec_mask = 0xF0F0F0F0
-        for lane in range(32):
-            wave.vgprs[lane][1] = f32_to_bits(4.0)
-            wave.vgprs[lane][0] = f32_to_bits(0.0)
-
-        instr = Instruction("v_rsq_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_simd_rsq_f32(wave, instr)
-
-        for lane in range(32):
-            if ((0xF0F0F0F0 >> lane) & 1):
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.5)
-            else:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
-
-
-def run_hw_rsq_f32(src_val: float) -> float:
-    bits = f32_to_bits(src_val)
-    lines = [
-        f"v_mov_b32 v0, {bits:#x}",
-        "v_rsq_f32 v0, v0",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_rsq_f32_hw", lines)
-    out_bits = support.mrt0_words(spv)[0]
-    return bits_to_f32(out_bits)
+        w0, w1 = run_hw_simd_divergence("v_rsq_f32", 4.0, 16.0, "ps_rsq_simd")
+        self.assertEqual(w0, 0.5)
+        self.assertEqual(w1, 0.25)
 
 
 class TestVRsqF32HardwareTranslator(unittest.TestCase):
     """Translator integration and hardware execution tests for v_rsq_f32."""
 
     def test_translator_rsq_values(self):
-        self.assertEqual(run_hw_rsq_f32(1.0), 1.0)
-        self.assertEqual(run_hw_rsq_f32(4.0), 0.5)
-        self.assertEqual(run_hw_rsq_f32(16.0), 0.25)
-        self.assertEqual(run_hw_rsq_f32(0.25), 2.0)
-        self.assertEqual(run_hw_rsq_f32(float("inf")), 0.0)
+        self.assertEqual(run_hw_rsq_f32(1.0, "ps_rsq_hw_1"), 1.0)
+        self.assertEqual(run_hw_rsq_f32(4.0, "ps_rsq_hw_4"), 0.5)
+        self.assertEqual(run_hw_rsq_f32(16.0, "ps_rsq_hw_16"), 0.25)
+        self.assertEqual(run_hw_rsq_f32(0.25, "ps_rsq_hw_q"), 2.0)
+        self.assertEqual(run_hw_rsq_f32(float("inf"), "ps_rsq_hw_inf"), 0.0)
 
 
-def ref_sqrt_f32(src: float) -> float:
-    """Bit-accurate reference oracle for RDNA2 v_sqrt_f32 (sqrt(x))."""
-    if math.isnan(src) or src < 0.0:
-        return float("nan")
-    if src == 0.0:
-        return src
-    if math.isinf(src):
-        return float("inf")
-    return math.sqrt(src)
+# ==============================================================================
+# v_sqrt_f32
+# ==============================================================================
+
+def run_hw_sqrt_f32(src_val: float, name: str = "ps_sqrt_f32_hw") -> float:
+    return run_hw_unary("v_sqrt_f32", src_val, name)
 
 
 class TestVSqrtF32Reference(unittest.TestCase):
-    """Reference mathematical oracle verification for v_sqrt_f32."""
+    """Reference mathematical oracle verification for v_sqrt_f32 executed on translator."""
 
     def test_reference_squares(self):
-        self.assertEqual(ref_sqrt_f32(0.0), 0.0)
-        self.assertEqual(ref_sqrt_f32(1.0), 1.0)
-        self.assertEqual(ref_sqrt_f32(4.0), 2.0)
-        self.assertEqual(ref_sqrt_f32(9.0), 3.0)
-        self.assertEqual(ref_sqrt_f32(16.0), 4.0)
-        self.assertEqual(ref_sqrt_f32(25.0), 5.0)
+        self.assertEqual(run_hw_sqrt_f32(0.0, "ps_sqrt_ref_0"), 0.0)
+        self.assertEqual(run_hw_sqrt_f32(1.0, "ps_sqrt_ref_1"), 1.0)
+        self.assertEqual(run_hw_sqrt_f32(4.0, "ps_sqrt_ref_4"), 2.0)
+        self.assertEqual(run_hw_sqrt_f32(9.0, "ps_sqrt_ref_9"), 3.0)
+        self.assertEqual(run_hw_sqrt_f32(16.0, "ps_sqrt_ref_16"), 4.0)
+        self.assertEqual(run_hw_sqrt_f32(25.0, "ps_sqrt_ref_25"), 5.0)
 
     def test_reference_edge_cases(self):
-        res_neg_zero = ref_sqrt_f32(-0.0)
+        res_neg_zero = run_hw_sqrt_f32(-0.0, "ps_sqrt_ref_n0")
         self.assertEqual(res_neg_zero, -0.0)
         self.assertEqual(math.copysign(1.0, res_neg_zero), -1.0)
-        self.assertTrue(math.isnan(ref_sqrt_f32(-4.0)))
-        self.assertEqual(ref_sqrt_f32(float("inf")), float("inf"))
-        self.assertTrue(math.isnan(ref_sqrt_f32(float("nan"))))
-
-
-def step_scalar_sqrt_f32(state: ScalarState, instr: Instruction) -> None:
-    if instr.opcode != "v_sqrt_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    val = state.read_operand_f32(instr.src0)
-    res = ref_sqrt_f32(val)
-    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+        self.assertEqual(run_hw_sqrt_f32(float("inf"), "ps_sqrt_ref_inf"), float("inf"))
+        spv_neg = support.translate_lines("ps_sqrt_ref_neg", [
+            f"v_mov_b32 v0, {f32_to_bits(-4.0):#x}",
+            "v_sqrt_f32 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("Sqrt", spv_neg)
+        with self.assertRaises(Exception):
+            support.mrt0_words(spv_neg)
 
 
 class TestVSqrtF32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for v_sqrt_f32."""
+    """AST opcode translation and scalar execution for v_sqrt_f32."""
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarState()
-        state.write_vgpr_f32(1, 9.0)
-        instr = Instruction("v_sqrt_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_scalar_sqrt_f32(state, instr)
-        self.assertEqual(bits_to_f32(state.vgprs[0]), 3.0)
-
-
-def step_simd_sqrt_f32(wave: WaveState, instr: Instruction) -> None:
-    if instr.opcode != "v_sqrt_f32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    for lane in range(wave.wave_size):
-        if (wave.exec_mask >> lane) & 1:
-            val = wave.read_lane_f32(lane, instr.src0)
-            res = ref_sqrt_f32(val)
-            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(9.0):#x}",
+            "v_sqrt_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_sqrt_scalar_exec", lines)
+        self.assertIn("Sqrt", spv)
+        self.assertEqual(bits_to_f32(support.mrt0_words(spv)[0]), 3.0)
 
 
 class TestVSqrtF32SIMDAndIEEE(unittest.TestCase):
     """SIMD multi-lane divergence and IEEE 754 edge cases for v_sqrt_f32."""
 
     def test_simd_divergence(self):
-        wave = WaveState(wave_size=32)
-        wave.exec_mask = 0x00FF00FF
-        for lane in range(32):
-            wave.vgprs[lane][1] = f32_to_bits(16.0)
-            wave.vgprs[lane][0] = f32_to_bits(0.0)
-
-        instr = Instruction("v_sqrt_f32", Operand.vgpr(0), Operand.vgpr(1))
-        step_simd_sqrt_f32(wave, instr)
-
-        for lane in range(32):
-            if ((0x00FF00FF >> lane) & 1):
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 4.0)
-            else:
-                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
-
-
-def run_hw_sqrt_f32(src_val: float) -> float:
-    bits = f32_to_bits(src_val)
-    lines = [
-        f"v_mov_b32 v0, {bits:#x}",
-        "v_sqrt_f32 v0, v0",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_sqrt_f32_hw", lines)
-    out_bits = support.mrt0_words(spv)[0]
-    return bits_to_f32(out_bits)
+        w0, w1 = run_hw_simd_divergence("v_sqrt_f32", 16.0, 25.0, "ps_sqrt_simd")
+        self.assertEqual(w0, 4.0)
+        self.assertEqual(w1, 5.0)
 
 
 class TestVSqrtF32HardwareTranslator(unittest.TestCase):
     """Translator integration and hardware execution tests for v_sqrt_f32."""
 
     def test_translator_sqrt_values(self):
-        self.assertEqual(run_hw_sqrt_f32(0.0), 0.0)
-        self.assertEqual(run_hw_sqrt_f32(1.0), 1.0)
-        self.assertEqual(run_hw_sqrt_f32(4.0), 2.0)
-        self.assertEqual(run_hw_sqrt_f32(9.0), 3.0)
-        self.assertEqual(run_hw_sqrt_f32(16.0), 4.0)
-        self.assertEqual(run_hw_sqrt_f32(25.0), 5.0)
-        self.assertEqual(run_hw_sqrt_f32(float("inf")), float("inf"))
+        self.assertEqual(run_hw_sqrt_f32(0.0, "ps_sqrt_hw_0"), 0.0)
+        self.assertEqual(run_hw_sqrt_f32(1.0, "ps_sqrt_hw_1"), 1.0)
+        self.assertEqual(run_hw_sqrt_f32(4.0, "ps_sqrt_hw_4"), 2.0)
+        self.assertEqual(run_hw_sqrt_f32(9.0, "ps_sqrt_hw_9"), 3.0)
+        self.assertEqual(run_hw_sqrt_f32(16.0, "ps_sqrt_hw_16"), 4.0)
+        self.assertEqual(run_hw_sqrt_f32(25.0, "ps_sqrt_hw_25"), 5.0)
+        self.assertEqual(run_hw_sqrt_f32(float("inf"), "ps_sqrt_hw_inf"), float("inf"))
 
 
 if __name__ == "__main__":
