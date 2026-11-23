@@ -314,6 +314,28 @@ int main() {
     CHECK(!JsonReader("\"\\u00").parse(json));
     CHECK(JsonReader("\"\\u0041\"").parse(json) && json.string == "A");
 
+    // Reusing an output replaces the previous document, rather than appending to its containers or string.
+    Json reused;
+    CHECK(JsonReader("{\"enabled\":false,\"old\":1}").parse(reused));
+    CHECK(JsonReader("{\"enabled\":true}").parse(reused));
+    CHECK(reused.object.size() == 1 && reused.find("enabled") && reused.find("enabled")->boolean &&
+          !reused.find("old"));
+    CHECK(JsonReader("{}").parse(reused) && reused.object.empty());
+    CHECK(JsonReader("[1,2]").parse(reused));
+    CHECK(JsonReader("[3]").parse(reused) && reused.array.size() == 1 && reused.array[0].number == 3);
+    CHECK(JsonReader("[]").parse(reused) && reused.array.empty());
+    CHECK(JsonReader("\"old\"").parse(reused));
+    CHECK(JsonReader("\"new\"").parse(reused) && reused.string == "new");
+    CHECK(JsonReader("\"\"").parse(reused) && reused.string.empty());
+    // A change of kind must not leave old object keys visible through find().
+    CHECK(JsonReader("{\"old\":1}").parse(reused));
+    CHECK(JsonReader("null").parse(reused) && reused.kind == Json::Kind::null && !reused.find("old"));
+    // A failed parse must not contaminate the next successful parse into the same result.
+    CHECK(!JsonReader("[1,").parse(reused));
+    CHECK(JsonReader("[2]").parse(reused) && reused.array.size() == 1 && reused.array[0].number == 2);
+    CHECK(!JsonReader("\"partial\\").parse(reused));
+    CHECK(JsonReader("\"ok\"").parse(reused) && reused.string == "ok");
+
     const auto shader = container({{dynamic, 600}});
     CHECK(dxbc_part(shader, "PRIV").size() == 4 && !dxbc_part(shader, "DXIL").empty() && dxbc_part(shader, "RTS0").empty());
     CHECK(fssm_program(shader) == skewed(600));

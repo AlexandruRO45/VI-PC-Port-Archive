@@ -330,6 +330,8 @@ public:
     explicit JsonReader(std::string_view text) : text_(text) {}
 
     bool parse(Json& out) {
+        // A caller may reuse the result, including after a failed parse left partial contents.
+        out = Json{};
         if (!value(out, 0)) return false;
         space();
         return pos_ == text_.size();
