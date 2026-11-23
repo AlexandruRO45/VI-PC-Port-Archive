@@ -1392,6 +1392,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_fence_timing_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_fence_timing COMMAND d3d12_fence_timing_test)
     set_tests_properties(d3d12_fence_timing PROPERTIES SKIP_RETURN_CODE 77)
+    # Seeded random fence/queue programs on the layer and on the host D3D12 device, compared at settle points.
+    add_executable(d3d12_fence_fuzz_test test/d3d12_fence_fuzz_test.cpp)
+    target_link_libraries(d3d12_fence_fuzz_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_fence_fuzz_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_fence_fuzz_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_fuzz COMMAND d3d12_fence_fuzz_test)
+    set_tests_properties(d3d12_fence_fuzz PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     # Fence events the host runtime sets or refuses (released fences, no fences), compared with the host devices.
     add_executable(d3d12_fence_events_test test/d3d12_fence_events_test.cpp)
     target_link_libraries(d3d12_fence_events_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

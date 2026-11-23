@@ -2291,6 +2291,15 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `E_INVALIDARG`, as on the PC runtime. A fence released while an event waits on it counts as reached for that
   wait, as on the PC runtime (RTX 5070 and WARP): `SetEventOnCompletion` and `ANY` set the event, `ALL` counts it
   as one fence (`d3d12_fence_events_test`).
+- `d3d12_fence_fuzz_test` replays seeded random programs of queue `Signal`/`Wait`, CPU `Signal`,
+  `SetEventOnCompletion` and `ExecuteCommandLists` on three queues and four fences, on the layer and on the host
+  D3D12 device, and compares every fence's value and event once the queues have settled. Each fence has one
+  signaller and waits only reach values already given to it (or a CPU fence the program signals later), so the
+  settled state is the same on any correct implementation. ctest runs the default mode (40 seeds). Options cover
+  what the layer is known to differ on: `--release` (fences released while queues or events use them, D3D-496;
+  on `main` `3faac557` a satisfied queue `Wait`, the fence released and the queue's next submission crash, the
+  fixed case `--case pending-wait-release`), `--rewinds` (D3D-472) and `--big` (steps beyond the 2^31-1 timeline
+  limit). A mismatch prints the seed and the program up to the first settle point that differs.
 - The swapchain owns acquire/present semaphores and N frames in flight. A present waits for the frame's
   render-finished semaphore; the next acquire waits for the image's present-complete semaphore.
 - Queue types: a direct queue maps to a graphics+compute queue, a compute queue to a compute-only family if one
