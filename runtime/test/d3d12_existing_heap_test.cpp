@@ -106,7 +106,14 @@ int compare_cases(const std::vector<Case>& ours, const std::vector<Case>& host, 
     for (size_t i = 0; i < ours.size() && i < host.size(); ++i) {
         const D3D12_HEAP_DESC& a = ours[i].desc;
         const D3D12_HEAP_DESC& b = host[i].desc;
-        const bool same = ours[i].hr == host[i].hr && a.SizeInBytes == b.SizeInBytes && a.Alignment == b.Alignment &&
+        // The host's Alignment varies from run to run for the same allocation (64 KiB on some runs, 4 MiB on others,
+        // on an RX 9070 XT, an RTX 5090 and WARP; found in review), so it is not compared: the layer's must be 64 KiB
+        // for an opened heap, and the host's either of the two.
+        const bool alignment_ok =
+            !SUCCEEDED(ours[i].hr) ||
+            (a.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+             (b.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT || b.Alignment == 4ull * 1024 * 1024));
+        const bool same = ours[i].hr == host[i].hr && a.SizeInBytes == b.SizeInBytes && alignment_ok &&
                           a.Properties.Type == b.Properties.Type &&
                           a.Properties.CPUPageProperty == b.Properties.CPUPageProperty &&
                           a.Properties.MemoryPoolPreference == b.Properties.MemoryPoolPreference && a.Flags == b.Flags;
@@ -176,7 +183,7 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     Ref<ID3D12Resource> buffer;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, IID_PPV_ARGS(&buffer.p)), S_OK);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
     EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
     auto* bytes = static_cast<std::uint8_t*>(pages);
     for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
@@ -216,11 +223,14 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     texture.Width = texture.Height = 64;
     texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    Ref<ID3D12Resource> refused;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, IID_PPV_ARGS(&refused.p)), E_NOTIMPL);
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&refused.p)),
-              E_INVALIDARG);
-    EXPECT(refused.p == nullptr);
+    // A texture isn't placed on the pages yet: the title gets an ordinary committed texture instead of a refusal.
+    Ref<ID3D12Resource> placed_texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, 0x6u, IID_PPV_ARGS(&placed_texture.p)), S_OK);
+    EXPECT(placed_texture.p != nullptr && placed_texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+    // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
+    Ref<ID3D12Resource> fallback;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
+    EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
     std::printf("%s: %s, %llu bytes: GPU VA is the address, a GPU copy reads the CPU's writes\n", who, kind,
                 static_cast<unsigned long long>(size));
     return 0;
@@ -232,6 +242,9 @@ int check_title_placed_all(ID3D12Device* device) {
     void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!pages) return 1;
     failures += check_title_placed(device, "VirtualAlloc range", pages, size);
+    // Inside a page, as the title places small UAV buffers (64-byte aligned, found in review on an RTX 5090): the
+    // import starts at the page and the buffer is bound at the offset.
+    failures += check_title_placed(device, "64 bytes into a page", static_cast<char*>(pages) + 64, 0x1000 - 64);
     VirtualFree(pages, 0, MEM_RELEASE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
@@ -239,6 +252,48 @@ int check_title_placed_all(ID3D12Device* device) {
     failures += check_title_placed(device, "section view", view, size);
     UnmapViewOfFile(view);
     CloseHandle(section);
+
+    // Cache-modified ranges are not imported (WC imports read wrong bytes on an RTX 5090 in review). Some Wine
+    // versions report a requested WC allocation as plain read-write memory; check the protection actually supplied.
+    // PAGE_NOCACHE also exercises the fallback on those hosts, rather than dropping the cache-protection check.
+    const char* who = "vulkan slot-133 buffer";
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (DWORD modifier : {DWORD(PAGE_WRITECOMBINE), DWORD(PAGE_NOCACHE)}) {
+        void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | modifier);
+        EXPECT(pages != nullptr);
+        MEMORY_BASIC_INFORMATION region{};
+        EXPECT(VirtualQuery(pages, &region, sizeof(region)) == sizeof(region));
+        const bool cache_modified = (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) != 0;
+        {
+            Ref<ID3D12Resource> buffer;
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
+            if (cache_modified) {
+                EXPECT(buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+            } else {
+                EXPECT(region.Protect == PAGE_READWRITE);
+                EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+            }
+        }
+        std::printf("%s: cache modifier 0x%lx, reported protection 0x%lx: %s\n", who, modifier, region.Protect,
+                    cache_modified ? "ordinary-buffer fallback verified"
+                                   : "modifier not reported; read-write import verified");
+        VirtualFree(pages, 0, MEM_RELEASE);
+    }
+    char* partial = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
+    EXPECT(partial != nullptr && VirtualAlloc(partial, size / 2, MEM_COMMIT, PAGE_READWRITE) == partial);
+    {
+        // Pages not committed yet (xmem commits on first touch) are not imported either: the fallback answers.
+        Ref<ID3D12Resource> fallback;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
+        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(partial));
+    }
+    VirtualFree(partial, 0, MEM_RELEASE);
+    std::printf("%s: a partly committed range falls back to an ordinary buffer\n", who);
     return failures;
 }
 

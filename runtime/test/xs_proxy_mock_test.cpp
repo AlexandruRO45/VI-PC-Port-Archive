@@ -94,6 +94,7 @@ struct Mock {
     Mock* device10_alias;    // device: when set, QueryInterface(ID3D12Device10) answers this object, not itself
     UINT64 allocation_size;  // device: what GetResourceAllocationInfo (slot 25) answers
     IUnknown* private_data;  // resource: the SetPrivateDataInterface object, released with the last reference
+    UINT64 gpu_va;           // resource: what GetGPUVirtualAddress (slot 11) answers
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -221,6 +222,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         return S_OK;
     }
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::resource && slot == 11) return m->gpu_va;  // GetGPUVirtualAddress
     if (m->kind == Kind::resource && slot == 5) {                     // SetPrivateDataInterface(guid, object)
         auto* const object = reinterpret_cast<IUnknown*>(a2);
         if (object) object->AddRef();
@@ -373,9 +375,9 @@ using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
 std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2 = 0,
-                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0) {
+                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0) {
     void* const* vtable = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, 0, 0, 0, 0, 0, 0,
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0,
                                                   0, 0, 0);
 }
 
@@ -494,6 +496,49 @@ int check_levels() {
 
         // 133: past every PC device vtable; the retail title calls it. Refused, not a jump through a missing entry.
         EXPECT(hr_of(raw(device, 133)) == E_NOTIMPL && mock->calls[127] == 0);
+
+        // 133 with a handler (CreatePlacedResourceX): the arguments in the title's positions (va, desc, state,
+        // clear, riid, out) reach the handler with the real device, the Xbox flag bits masked to the PC ones the host
+        // takes (0x20004 -> 0x4, and 0x200 dropped) and the buffer's Xbox layout word made ROW_MAJOR.
+        {
+            static void* seen_real = nullptr;
+            static void* seen_va = nullptr;
+            static D3D12_RESOURCE_DESC seen_desc{};
+            static GUID seen_iid{};
+            static std::uint32_t seen_layout = 0;
+            const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
+                                                     const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
+                                                     REFIID iid, void** out) -> HRESULT {
+                seen_layout = layout;
+                seen_real = real_device;
+                seen_va = va;
+                seen_desc = desc;
+                seen_iid = iid;
+                *out = reinterpret_cast<void*>(0x1330);
+                return S_OK;
+            };
+            xs::set_placed_at_va_handler(handler);
+            D3D12_RESOURCE_DESC xbox_desc{};
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_desc.Width = 0x10000;
+            xbox_desc.Height = xbox_desc.DepthOrArraySize = xbox_desc.MipLevels = 1;
+            xbox_desc.SampleDesc.Count = 1;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);  // the Xbox row-major word
+            xbox_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20204);
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            void* placed = nullptr;
+            void* const va = reinterpret_cast<void*>(0x7f0000000000ull);
+            const HRESULT r133 = hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0,
+                                           word(&resource_iid), word(&placed)));
+            xs::set_placed_at_va_handler(nullptr);
+            EXPECT(r133 == S_OK && placed == reinterpret_cast<void*>(0x1330));
+            EXPECT(seen_real == xs::device_proxy_real_device(device) && seen_va == va);
+            EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
+            EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && seen_desc.Width == 0x10000);
+            EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
+            EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
+            EXPECT(xs::device_slot_overridden(133));
+        }
 
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
         Mock* const fence_mock = reinterpret_cast<Mock*>(real_fence);
@@ -1364,17 +1409,24 @@ struct PlacedHandlerState {
     void* va = nullptr;
     D3D12_RESOURCE_DESC desc{};
     unsigned char first_byte = 0xcc;  // the memory's first byte when the handler ran: zeroed or the title's
+    std::uint32_t layout = 0;
     HRESULT result = S_OK;
+    bool elsewhere = false;  // succeed with a buffer that is not at `va`, as the Vulkan layer does when it cannot import
+    Mock* made = nullptr;
 } g_placed;
 
-HRESULT mock_placed_handler(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
+HRESULT mock_placed_handler(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
+                            REFIID riid, void** out) {
     ++g_placed.calls;
     g_placed.real = real;
     g_placed.va = va;
     g_placed.desc = desc;
+    g_placed.layout = layout;
     g_placed.first_byte = *static_cast<const unsigned char*>(va);
     if (FAILED(g_placed.result)) return g_placed.result;
     Mock* child = new_mock(Kind::resource);
+    child->gpu_va = g_placed.elsewhere ? 0x10000000ull : reinterpret_cast<UINT64>(va);
+    g_placed.made = child;
     return mock_query(child, &riid, out);
 }
 
@@ -1422,6 +1474,7 @@ int check_committed_buffers_on_xmem() {
            g_heap_hook.last_alloc_attr == xs::kXmemCommittedResourceAttributes);
     EXPECT(g_placed.calls == 1 && g_placed.va == arena && g_placed.real == reinterpret_cast<ID3D12Device*>(mock));
     EXPECT(g_placed.desc.Width == buffer.Width && g_placed.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    EXPECT(g_placed.layout == 0xFFFFFFFFu);  // a buffer takes no barrier layout: UNDEFINED
     EXPECT(g_placed.first_byte == 0 && arena[kTaken - 1] == 0);  // the whole allocation, as a committed resource
     EXPECT(mock->calls[27] == 0);
     EXPECT(reinterpret_cast<Mock*>(resource)->private_data != nullptr && g_heap_hook.free_calls == 0);
@@ -1460,6 +1513,18 @@ int check_committed_buffers_on_xmem() {
     EXPECT(slot76(buffer, 0, &resource) == S_OK && resource);
     EXPECT(g_placed.calls == 1 && mock->calls[27] == pc_fallback_before + 1 && g_heap_hook.alloc_calls == 1);
     EXPECT(reinterpret_cast<Mock*>(resource)->kind == Kind::resource && reinterpret_cast<Mock*>(resource)->private_data);
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+
+    // The handler answers with a buffer that is not at the hook's address (the Vulkan layer's slot-133 fallback when it
+    // cannot import the pages): that buffer is given back, and the PC device makes one with the title's heap.
+    reset();
+    g_placed.elsewhere = true;
+    resource = nullptr;
+    const unsigned pc_elsewhere_before = mock->calls[27];
+    EXPECT(slot76(buffer, 0, &resource) == S_OK && resource);
+    EXPECT(g_placed.calls == 1 && g_placed.made && g_placed.made->refs == 0);  // released at once
+    EXPECT(resource != g_placed.made && mock->calls[27] == pc_elsewhere_before + 1 && g_heap_hook.alloc_calls == 1);
+    EXPECT(reinterpret_cast<Mock*>(resource)->private_data && g_heap_hook.free_calls == 0);
     EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
 
     // ...and the PC device refuses too: the title gets the PC answer and a null object, the memory goes back at once.

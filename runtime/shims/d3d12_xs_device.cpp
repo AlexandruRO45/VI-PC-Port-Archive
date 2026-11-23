@@ -1787,6 +1787,20 @@ bool xmem_buffer_backing_enabled() {
     return enabled;
 }
 
+constexpr std::uint32_t kBarrierLayoutUndefined = 0xFFFFFFFFu;  // D3D12_BARRIER_LAYOUT_UNDEFINED
+
+// True when `resource` is a buffer whose GPU VA is `address`: the handler placed it on those pages.
+bool resource_at_address(void* resource, const void* address) {
+    if (!resource) return false;
+    ID3D12Resource* r = nullptr;
+    if (FAILED(static_cast<IUnknown*>(resource)->QueryInterface(__uuidof(ID3D12Resource), reinterpret_cast<void**>(&r))) ||
+        !r)
+        return false;
+    const bool at = r->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address);
+    r->Release();
+    return at;
+}
+
 // Heap flags a buffer on the title's memory cannot honour: memory shared with another device or process. Such a
 // resource stays on the PC device's memory and the hook memory is bookkeeping.
 constexpr std::uint32_t kHeapFlagsNotOnTitleMemory = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
@@ -1841,7 +1855,16 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
         return create_pc();
     }
     if (!(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) std::memset(memory, 0, size);
-    HRESULT hr = handler(self->real, memory, desc, riid, out);
+    // A buffer takes no barrier layout: UNDEFINED, which the handler reads as COMMON.
+    HRESULT hr = handler(self->real, memory, desc, kBarrierLayoutUndefined, riid, out);
+    // The handler answers slot 133 with an ordinary DEFAULT buffer when it cannot import the pages, so that the title
+    // still gets a resource. A committed resource has a better fallback, the PC device with the title's own heap
+    // properties, so a buffer that is not at the hook's address is given back and made there instead.
+    if (SUCCEEDED(hr) && !resource_at_address(*out, memory)) {
+        static_cast<IUnknown*>(*out)->Release();
+        *out = nullptr;
+        hr = E_NOTIMPL;
+    }
     if (SUCCEEDED(hr)) {
         static std::atomic<bool> logged{false};
         if (first_call(logged))
@@ -2047,11 +2070,18 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
     if (!handler) return E_NOTIMPL;
     if (!out || !xbox_desc || !riid) return E_POINTER;
-    constexpr auto kPcResourceFlags = static_cast<D3D12_RESOURCE_FLAGS>(0x7ff);
+    // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
+    // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.
+    // The PC flags up to RAYTRACING_ACCELERATION_STRUCTURE (0x100) and USE_TIGHT_ALIGNMENT (0x400); 0x200 is
+    // dropped, as committed_resource_refusal says the host refuses it (found in review).
+    constexpr std::uint32_t kPcResourceFlags = 0x5ff;
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
-    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) pc_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // The Xbox layout word (0x101 tiled, 0x1 row-major buffer) is no PC layout: ROW_MAJOR for a buffer and UNKNOWN
+    // for everything else, as slot 76 does.
+    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -2060,7 +2090,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      xbox_flags, state);
     }
-    return handler(self->real, va, pc_desc, *riid, out);
+    return handler(self->real, va, pc_desc, state, *riid, out);
 }
 
 template <unsigned Slot>
@@ -2377,7 +2407,7 @@ bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == kPcCreateCommittedResource ||
-        slot == kPcCreateCommittedResource1)
+        slot == kPcCreateCommittedResource1 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
