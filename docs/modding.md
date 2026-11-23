@@ -135,10 +135,29 @@ a camera. Whether the game exposes it to the player is not known.
 `camViewModeSettings` order: third person near, medium, far, cinematic, first person). All three are
 settings in `mod.json`, so a different answer changes the manifest, not the runtime.
 
+**What the image does show (measured 2026-11-23).** None of the twelve GTA V camera metadata class names is
+present anywhere in the executable by `joaat` — `camViewModeSettings`, `camFollowPedCameraMetadata`,
+`camFirstPersonShooterCameraMetadata`, `camThirdPersonNearCameraMetadata`,
+`camThirdPersonMediumCameraMetadata`, `camThirdPersonFarCameraMetadata`, `camCinematicCameraMetadata`,
+`camFirstPersonPedCameraMetadata`, `camFirstPersonVehicleCameraMetadata`, `camViewModeSettingsDefault`,
+`camViewModeSettingsFirstPerson` and `camViewMode` all have zero hits. So the absence above is a property of
+the executable and not of the carving. `firstperson` (`0xee38e8e0`) does appear, once, as an immediate at RVA
+`0x19bfb3`: a `cmovne` selects one of two hash pairs and the function writes the pair plus an int to the
+caller's out struct. That is a mode-to-hash mapping, not a `mode = get(context)` getter — it returns no small
+enum. `thirdPerson` (`0xd97f7e81`) appears once as data at RVA `0x6181d60`, behind a run of the small integers
+`1`..`7`; `cinematic` has no instruction in `.text` that embeds it. Nothing in that evidence fixes the context
+numbering or the first-person enum value.
+
+The getter is therefore **not reachable by name or hash**, and the lead list below needed correcting: the two
+name-based leads are dead, and the probe is the only way in.
+
 **Day one:** find the getter, then run `gta6rt --dry-run <exe> --view-mode-getter RVA` and check the log
-line's count of redirected calls. Leads: the code that reads the view-mode input (GTA V's
-`INPUT_NEXT_CAMERA`, an action hash), the switch over the five view-mode values that selects a camera
-metadata per mode, and the callers of the `UseFirstPersonCameraMatrix` check in the cloth code (they ask
-whether the active view is first person). The hook (`hook_image_results` in `runtime/src/code_hooks.h`) runs
+line's count of redirected calls. Two leads that looked promising are dead and are recorded here so nobody
+re-walks them: `INPUT_NEXT_CAMERA` (`0x7f8d09b8`) appears once, at RVA `0x6191244`, inside an unsorted run of
+hashes in `.rdata`, and no instruction in `.text` embeds it — the input path reads that table at run time, so
+there is no call site to hook; and the `UseFirstPersonCameraMatrix` check in the cloth code is also only a
+name, absent from the image by `joaat`. What is left is the switch over the view-mode values that selects a
+camera metadata per mode, and the getter has to be found from its shape — a small function whose result is
+compared against `4` and whose argument is a context index — rather than from a name. The hook (`hook_image_results` in `runtime/src/code_hooks.h`) runs
 the original and overrides its result; it is for getters with at most four register arguments and an
 integer result. ctest `code_hooks` and `mods` cover the thunk and the override.
