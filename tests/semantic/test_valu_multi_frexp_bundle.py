@@ -521,5 +521,29 @@ class VFrexpMantF64AstInterpreterTests(unittest.TestCase):
         res = oracle_frexp_mant_f64(0x4000000000000000)
         self.assertEqual(res, 0x3FE0000000000000)
 
+class VFrexpMantF64SimdDivergenceTests(unittest.TestCase):
+    def test_frexp_mant_f64_simd_exec_masking(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0x33333333
+        for i in range(32):
+            wave.set_vgpr(i, 2, 0xAAAAAAAA)
+            wave.set_vgpr(i, 3, 0xBBBBBBBB)
+            if (wave.exec_mask >> i) & 1:
+                # 3.0 * 2^i
+                d_val = d2u(3.0 * math.pow(2.0, i))
+                mant = oracle_frexp_mant_f64(d_val)
+                wave.set_vgpr(i, 2, mant & MASK32)
+                wave.set_vgpr(i, 3, (mant >> 32) & MASK32)
+        # 3.0 = 0.75 * 4 -> mantissa is 0.75d (0x3FE8000000000000)
+        expected_lo = 0x00000000
+        expected_hi = 0x3FE80000
+        for i in range(32):
+            if (0x33333333 >> i) & 1:
+                self.assertEqual(wave.get_vgpr(i, 2), expected_lo)
+                self.assertEqual(wave.get_vgpr(i, 3), expected_hi)
+            else:
+                self.assertEqual(wave.get_vgpr(i, 2), 0xAAAAAAAA)
+                self.assertEqual(wave.get_vgpr(i, 3), 0xBBBBBBBB)
+
 if __name__ == "__main__":
     unittest.main()
