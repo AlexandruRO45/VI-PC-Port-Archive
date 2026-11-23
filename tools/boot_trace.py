@@ -298,18 +298,14 @@ def format_text(summary: dict, limit: int) -> str:
         )
         if d3d12["methods"]:
             out.append(f"  first per method: {_tail(d3d12['methods'], limit)}")
-        if d3d12["unsupported"]:
-            unsupported = [f"#{c['seq']} {c['method']}" for c in d3d12["unsupported"]]
-            out.append(f"  unsupported: {_tail(unsupported, limit)}")
-        if d3d12["failed"]:
-            failed = [f"#{c['seq']} {c['method']}" for c in d3d12["failed"]]
-            out.append(f"  failed: {_tail(failed, limit)}")
-        if d3d12["refused"]:
-            refused = [f"#{c['seq']} {c['method']}" for c in d3d12["refused"]]
-            out.append(f"  refused: {_tail(refused, limit)}")
-        if d3d12.get("partial"):
-            partial = [f"#{c['seq']} {c['method']}" for c in d3d12["partial"]]
-            out.append(f"  partial: {_tail(partial, limit)}")
+        for outcome in ("unsupported", "failed", "refused", "partial"):
+            calls = d3d12.get(outcome, ())[:limit]
+            if not calls:
+                continue
+            listed = ", ".join(f"#{call['seq']} {call['method']}" for call in calls)
+            omitted = d3d12["outcomes"][outcome] - len(calls)
+            suffix = f", ... {omitted} more" if omitted else ""
+            out.append(f"  {outcome}: {listed}{suffix}")
     return "\n".join(out)
 
 
