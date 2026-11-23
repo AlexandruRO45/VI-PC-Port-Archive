@@ -84,8 +84,14 @@ def sha256(path: str, *, expected_size: int | None = None) -> str:
     return _hash_file(path, expected_size=expected_size)[1]
 
 
-def walk(game_dir: str, *, exclude=None):
+def walk(game_dir: str, *, exclude=None, needed=None):
+    # needed: the manifest's paths. A folder that cannot be listed and holds none of them, such as System Volume
+    # Information at a drive root, is skipped; the top folder, or one that holds a listed file, still fails.
     def scan_failed(error: OSError) -> None:
+        if needed is not None and error.filename is not None:
+            rel = os.path.normcase(os.path.relpath(error.filename, game_dir))
+            if rel != os.curdir and not any(os.path.normcase(n).startswith(rel + os.sep) for n in needed):
+                return
         raise error
 
     excluded_dir = excluded_name = None
@@ -204,7 +210,7 @@ def load_manifest(manifest: str) -> dict:
 
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
-    have = dict(walk(game_dir, exclude=manifest))
+    have = dict(walk(game_dir, exclude=manifest, needed=want))
     if not want and have:
         # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
         raise ManifestError(f"{manifest} lists no files, but {game_dir} holds {len(have)}; create it again")

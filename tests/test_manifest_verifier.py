@@ -348,6 +348,27 @@ class TestManifestVerifier(unittest.TestCase):
             self.assertIn("ERROR:", stderr_buf.getvalue())
             self.assertIn("Permission denied", stderr_buf.getvalue())
 
+    def test_unlistable_folder_without_listed_files_is_skipped(self) -> None:
+        # A drive root holds System Volume Information, which cannot be listed; only a folder that may hold a
+        # listed file has to be readable.
+        os.makedirs(os.path.join(self.game_dir, "locked"))
+        blocked = set()
+        scandir = os.scandir
+
+        def scan(path):
+            if path in blocked:
+                raise PermissionError(13, "Access is denied", path)
+            return scandir(path)
+
+        with patch.object(os, "scandir", side_effect=scan):
+            blocked.add(os.path.join(self.game_dir, "locked"))
+            report = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
+            self.assertTrue(report.passed)
+            self.assertEqual(len(report.matched), len(SYNTHETIC_SIZES))
+            blocked.add(os.path.join(self.game_dir, "nested", "deep"))
+            with self.assertRaises(PermissionError):
+                mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
+
     def test_load_manifest_invalid_json(self) -> None:
         bad_json = os.path.join(self.root, "bad.json")
         with open(bad_json, "w", encoding="utf-8") as f:

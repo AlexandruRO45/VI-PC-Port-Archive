@@ -210,6 +210,36 @@ class ManifestCreateVerifyTest(unittest.TestCase):
                     with self.assertRaisesRegex(manifest.ManifestError, r"alpha\.bin.*size changed before hashing"):
                         manifest.verify(self.pkg, self.out_manifest, jobs=jobs)
 
+    def test_verify_skips_an_unlistable_folder_that_holds_no_listed_file(self):
+        # A drive root holds System Volume Information, which cannot be listed; only a folder that may hold a
+        # listed file has to be readable.
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+        os.makedirs(os.path.join(self.pkg, "locked"))
+        blocked = set()
+        scandir = os.scandir
+
+        def scan(path):
+            if path in blocked:
+                raise PermissionError(13, "Access is denied", path)
+            return scandir(path)
+
+        with patch.object(os, "scandir", side_effect=scan):
+            blocked.add(os.path.join(self.pkg, "locked"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manifest.verify(self.pkg, self.out_manifest, jobs=1), 0)
+            self.assertIn("OK", out.getvalue())
+            blocked.add(os.path.join(self.pkg, "content"))
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(PermissionError):
+                manifest.verify(self.pkg, self.out_manifest, jobs=1)
+            if os.name == "nt":  # a listed path in another case is still under the folder
+                blocked.discard(os.path.join(self.pkg, "content"))
+                blocked.add(os.path.join(self.pkg, "CONTENT"))
+                os.rename(os.path.join(self.pkg, "content"), os.path.join(self.pkg, "CONTENT"))
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(PermissionError):
+                    manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
     def test_verify_detects_missing_file(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)
