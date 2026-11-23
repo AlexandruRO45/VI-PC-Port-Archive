@@ -3340,7 +3340,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: upload buffer in COMMON", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_COMMON);
-         }, +device10, false, true},
+         }, +device10},
         {"committed: upload buffer in GENERIC_READ", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_GENERIC_READ);
          }},
@@ -3541,7 +3541,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: readback buffer in COMMON", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_READBACK}, buffer_desc(256), D3D12_RESOURCE_STATE_COMMON);
-         }, +device10, false, true},
+         }, +device10},
         {"committed: readback buffer in COPY_DEST", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_READBACK}, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST);
          }},
