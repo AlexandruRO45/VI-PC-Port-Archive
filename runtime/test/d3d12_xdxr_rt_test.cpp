@@ -13,12 +13,12 @@
 // `python -I tools/xdxr_bvh.py check-build <out dir>` validates them and traces rays against brute force (ctest:
 // d3d12_xdxr_rt + d3d12_xdxr_rt_check). Exit 77 without a Vulkan device, or with LEONIDA_RT_AS=khr. No game files.
 #include "../shims/d3d12_com.h"
+#include "xdxr_build_output.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
@@ -74,10 +74,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string dir = argv[1];
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        const auto ext = entry.path().extension();
-        if (ext == ".bin" || ext == ".json") std::filesystem::remove(entry.path(), ec);
+    if (const auto ec = prepare_xdxr_build_output(dir, false)) {
+        std::fprintf(stderr, "cannot create output directory %s: %s\n", dir.c_str(), ec.message().c_str());
+        return 1;
     }
 
     // LEONIDA_RT_AS=khr builds #743's VkAccelerationStructureKHR instead, whose bytes are the driver's own.
