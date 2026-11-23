@@ -2,7 +2,7 @@
 
 Usage:
     python -I tools/gdk_runtime_calls.py <image> [<image> ...] [--json] [--out DIR]
-                                       [--table FILE] [--runtime-source FILE]
+                                       [--table FILE] [--runtime-source FILE-OR-FOLDER]
 
 A title linked with xgameruntime.lib imports no GDK function. Each function of the library is a thunk that calls a
 helper with a class id and an interface id (the helper initializes the runtime once and calls QueryApiImpl), then
@@ -38,7 +38,8 @@ Output: per image and class, the class and interface ids, the slots called with 
 their thunks are referenced, the thunk count, and whether the runtime serves the class (a `constexpr GUID
 k...Class` with its id in one of runtime/shims/xgameruntime*.cpp: xgameruntime.cpp and the classes it hands on to
 xgameruntime_user.cpp, _gamesave.cpp, _store.cpp, _offline.cpp; the class only, not each slot); then the known ids present in the image that
-no thunk reaches. Text by default, --json for JSON. --out DIR writes both, as <image file name>.gdk_calls.txt and
+no thunk reaches. Text by default, --json for JSON. --runtime-source is one shim source or a folder of
+xgameruntime*.cpp (default: the shims folder). --out DIR writes both, as <image file name>.gdk_calls.txt and
 .json (x.dll-2.gdk_calls.txt for a second input named x.dll), and prints one summary line per image instead.
 
 Exit status 1 when an image (or the class table) can't be read, or an image is cut off before the end of its
