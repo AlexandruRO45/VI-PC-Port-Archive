@@ -354,3 +354,51 @@ class TestSubrevCoU32SIMD(unittest.TestCase):
             self.assertEqual(state.vgprs[0][i], 0xBAADF00D)
         # Borrow mask must only include lower 32
         self.assertEqual(state.sdst_mask, 0xFFFFFFFF)
+
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+class TestSubrevCoU32Aliasing(unittest.TestCase):
+    def test_alias_vdst_src0(self) -> None:
+        # v1 = v2 - v1 (destination aliases src0)
+        state = ScalarCpuState.create()
+        state.vgprs[1] = 40
+        state.vgprs[2] = 100
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(1),
+            sdst=TypedOperand.vcc_lo(),
+            src0=TypedOperand.vgpr(1),
+            src1=TypedOperand.vgpr(2),
+        )
+        step_scalar_subrev_co(ast, state)
+        self.assertEqual(state.vgprs[1], 60)
+        self.assertEqual(state.vcc, 0)
+
+    def test_alias_vdst_src1(self) -> None:
+        # v2 = v2 - v1 (destination aliases src1)
+        state = ScalarCpuState.create()
+        state.vgprs[1] = 30
+        state.vgprs[2] = 85
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(2),
+            sdst=TypedOperand.vcc_lo(),
+            src0=TypedOperand.vgpr(1),
+            src1=TypedOperand.vgpr(2),
+        )
+        step_scalar_subrev_co(ast, state)
+        self.assertEqual(state.vgprs[2], 55)
+        self.assertEqual(state.vcc, 0)
+
+    def test_alias_all_same_vgpr(self) -> None:
+        # v0 = v0 - v0 -> 0, borrow 0
+        state = ScalarCpuState.create()
+        state.vgprs[0] = 0x12345678
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(0),
+            sdst=TypedOperand.vcc_lo(),
+            src0=TypedOperand.vgpr(0),
+            src1=TypedOperand.vgpr(0),
+        )
+        step_scalar_subrev_co(ast, state)
+        self.assertEqual(state.vgprs[0], 0)
+        self.assertEqual(state.vcc, 0)
