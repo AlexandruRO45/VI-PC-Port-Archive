@@ -185,9 +185,8 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return out
 
 
-def load_manifest(manifest: str) -> dict:
-    """The manifest's "files" table, checked entry by entry, so a damaged file is reported by name rather than
-    as a JSONDecodeError, KeyError or TypeError traceback halfway through verify."""
+def load_manifest_doc(manifest: str) -> tuple[dict, str | None]:
+    """The manifest's "files" table and optional "expected_exe" field, checked entry by entry."""
     with open(manifest, encoding="utf-8") as f:
         try:
             doc = json.load(f, object_pairs_hook=_reject_duplicate_keys)
@@ -199,11 +198,20 @@ def load_manifest(manifest: str) -> dict:
     for rel, info in files.items():
         if not (isinstance(info, dict) and type(info.get("size")) is int and isinstance(info.get("sha256"), str)):
             raise ManifestError(f"{manifest}: entry {rel!r} needs an integer \"size\" and a \"sha256\" string")
-    return files
+    expected_exe = doc.get("expected_exe") if isinstance(doc, dict) and isinstance(doc.get("expected_exe"), str) else None
+    if expected_exe:
+        expected_exe = expected_exe.replace("\\", "/")
+    return files, expected_exe
+
+
+def load_manifest(manifest: str) -> dict:
+    """The manifest's "files" table, checked entry by entry, so a damaged file is reported by name rather than
+    as a JSONDecodeError, KeyError or TypeError traceback halfway through verify."""
+    return load_manifest_doc(manifest)[0]
 
 
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
-    want = load_manifest(manifest)
+    want, expected_exe = load_manifest_doc(manifest)
     have = dict(walk(game_dir, exclude=manifest))
     if not want and have:
         # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
@@ -241,7 +249,8 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
         if kind:
             print(f"{kind:<10}{rel}")
             bad += 1
-    for rel in sorted(set(have) - set(want)):
+    ignored = {expected_exe} if expected_exe else set()
+    for rel in sorted(set(have) - set(want) - ignored):
         print(f"{'NEW':<10}{rel}")
     print("OK" if not bad else f"{bad} problem(s)")
     return 1 if bad else 0

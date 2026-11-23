@@ -280,6 +280,36 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         self.assertIn("NEW       content/unexpected_new.dat", output)
         self.assertIn("OK", output)
 
+    def test_verify_suppresses_expected_exe_from_new_files(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        # Append expected_exe to the manifest document
+        with open(self.out_manifest, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["expected_exe"] = "game_scarlett_master.exe"
+        with open(self.out_manifest, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+
+        # Place the expected executable and an unexpected extra file on disk
+        exe_path = os.path.join(self.pkg, "game_scarlett_master.exe")
+        with open(exe_path, "wb") as f:
+            f.write(b"mock executable")
+
+        extra = os.path.join(self.pkg, "content", "other_new.dat")
+        with open(extra, "wb") as f:
+            f.write(b"untracked file")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 0)
+        output = out.getvalue()
+        self.assertNotIn("game_scarlett_master.exe", output)
+        self.assertIn("NEW       content/other_new.dat", output)
+        self.assertIn("OK", output)
+
     def test_verify_accumulates_multiple_corruptions(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)
