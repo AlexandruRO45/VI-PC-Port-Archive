@@ -600,7 +600,8 @@ Whole map export (`tools/texture_slot_formats.py <work>/assets --archive levels`
 the 343,327 `levels` models (20,128,930 bindings, 115 parameters), each texture counted once per parameter and its
 format taken from where its 64-bit `Id64` resolves exactly (a texture pool `AssetKey` and/or an embedded `Key`, their
 formats pooled). An all-zero key or hash means "none" and is never joined (the export has none). The stored 32-bit
-name hash is only a fallback candidate (35 textures over all parameters; not counted below). The
+name hash is only a fallback candidate (35 textures over all parameters, none resting on several keyless rows of one
+format and size; not counted below). The
 formats agree with the sample above. The last column is over the whole export (382,781 models, 124 parameters): most
 BC5 normal maps are outside the map.
 

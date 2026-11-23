@@ -309,5 +309,15 @@ class ReviewCases(unittest.TestCase):
                 self.assertEqual(code, 2, (item, err))
                 self.assertIn("invalid manifest JSON", err)
 
+    def test_keyless_rows_of_one_format_and_size_are_an_uncertain_candidate(self):
+        # whattheflop on #4980: two keyless rows with the same hash, format and size can be different textures
+        row = {"Hash": "11111111", "Format": "BC1_UNORM", "Width": 4, "Height": 4, "Key": None}
+        for rows, uncertain in ((1, 0), (2, 1)):
+            with tempfile.TemporaryDirectory() as tmp:
+                exp = minimal(tmp, [model([(BUMP, "00000000000000B2", "11111111")])],
+                              emb_hash_rows=[dict(row) for _ in range(rows)])
+                d = tsf.census(exp)["parameters"][BUMP]
+                self.assertEqual((d["candidate"], d["candidate_uncertain"], d["ambiguous"]), (1, uncertain, 0), rows)
+
 if __name__ == "__main__":
     unittest.main()
