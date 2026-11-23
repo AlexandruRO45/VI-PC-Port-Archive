@@ -248,3 +248,29 @@ class TestValuPkMaxI16ScalarInterpreter(unittest.TestCase):
         res = state.execute(inst)
         self.assertEqual(res, 0x00050005)
         self.assertEqual(state.vgpr[0], 0x00050005)
+
+
+class TestValuPkMaxI16SimdDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and per-lane packed comparisons."""
+
+    def test_simd_per_lane_varying_inputs(self):
+        for lane in range(64):
+            val0 = (s16(lane - 32) & MASK16) | (((32 - lane) & MASK16) << 16)
+            val1 = 0x00000000
+            expected = ref_pk_max_i16(val0, val1)
+            self.assertEqual(ref_pk_max_i16(val0, val1), expected)
+
+    def test_simd_lane_masking_active_inactive(self):
+        exec_mask = 0x5555555555555555
+        dest_vgpr = [0xDEADBEEF] * 64
+
+        for lane in range(64):
+            is_active = (exec_mask & (1 << lane)) != 0
+            if is_active:
+                dest_vgpr[lane] = ref_pk_max_i16(lane, lane + 1)
+
+        for lane in range(64):
+            if (exec_mask & (1 << lane)) != 0:
+                self.assertEqual(dest_vgpr[lane], ref_pk_max_i16(lane, lane + 1))
+            else:
+                self.assertEqual(dest_vgpr[lane], 0xDEADBEEF)
