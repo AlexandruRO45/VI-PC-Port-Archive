@@ -95,6 +95,9 @@ int wmain(int argc, wchar_t** argv) {
             archetype_lookup_rva = static_cast<uint32_t>(rva);
             if (comma != std::wstring::npos) archetype_lookup_arg = v.substr(comma + 1) == L"1" ? 1 : 0;
         }
+        // An option this parser does not know - including a value-taking one whose value is missing at the end - is not
+        // an image name: mapping it reported "cannot open --game-dir" and exit 1, hiding the real mistake.
+        else if (a.rfind(L"--", 0) == 0) return usage();
         else if (image.empty()) image = a;
         else return usage();
     }
