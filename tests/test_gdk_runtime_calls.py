@@ -390,6 +390,22 @@ class ImageTest(unittest.TestCase):
         self.assertIn("report written as thunks.dll-2.gdk_calls.txt/.json", stderr.getvalue())
         self.assertIn("path is a file, not a directory", stderr.getvalue())
 
+    def test_the_default_source_is_every_runtime_shim(self):
+        # The classes xgameruntime.cpp hands on to its sibling files count as served: XUserImpl, XGameSaveImpl and
+        # XStoreImpl live in xgameruntime_user.cpp, _gamesave.cpp and _store.cpp.
+        served = grc.served_classes(grc.read_runtime_source(grc.DEFAULT_RUNTIME_SOURCE))
+        names = set(served.values())
+        for name in ("kThreadingClass", "kUserClass", "kSaveClass", "kStoreClass"):
+            self.assertIn(name, names)
+        self.assertEqual(served.get("704c3f58-e629-4cc2-b197-30511b996fe2"), "kSaveClass")
+        # xgameruntime.cpp serves XGameRuntimeFeatureImpl; the ids its feature table only names (k...ClassId) don't count.
+        self.assertEqual(served.get("8836fe87-edb9-4fe3-8dad-05f0d2cd5b40"), "kGameRuntimeFeatureClass")
+        self.assertNotIn("1b339674-328d-4283-a200-3171f18d3639", served)   # XLauncherImpl
+        empty = os.path.join(self.tmp, "no-shims")
+        os.makedirs(empty, exist_ok=True)
+        with self.assertRaises(OSError):
+            grc.read_runtime_source(empty)
+
     def test_main_json_to_stdout(self):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
