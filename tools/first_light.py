@@ -713,15 +713,13 @@ def check_image(data: bytes, manifest: dict) -> dict:
     else:
         covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
     ratio = covered / (width * height)
-    if (
-        not manifest.get("min_coverage", 0.0)
-        <= ratio
-        <= manifest.get("max_coverage", 1.0)
-    ):
-        raise AssertionError(
-            f"coverage {ratio:.4f} outside "
-            f"[{manifest.get('min_coverage', 0.0)}, {manifest.get('max_coverage', 1.0)}]"
-        )
+    minimum = manifest.get("min_coverage", 0.0)
+    maximum = manifest.get("max_coverage", 1.0)
+    for field, value in (("min_coverage", minimum), ("max_coverage", maximum)):
+        if type(value) not in (int, float) or (type(value) is float and not math.isfinite(value)):
+            raise AssertionError(f"{field} must be a finite number")
+    if not minimum <= ratio <= maximum:
+        raise AssertionError(f"coverage {ratio:.4f} outside [{minimum}, {maximum}]")
     if (clear := manifest.get("clear_pixel")) is not None:
         i = pixel_offset(clear, "clear_pixel")
         if any(not _close(pixels[i + c], clear_val, 1e-5) for c in range(4)):

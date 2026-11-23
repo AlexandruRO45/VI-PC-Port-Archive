@@ -499,6 +499,22 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
 
+    def test_coverage_bounds_must_be_finite_numbers(self):
+        for field in ("min_coverage", "max_coverage"):
+            for value in (float("nan"), float("-inf"), float("inf"), None, "0.5", True):
+                with self.subTest(field=field, value=value):
+                    manifest = {**self.manifest, field: value}
+                    with self.assertRaisesRegex(AssertionError, f"{field} must be a finite number"):
+                        check_image(self.image(), manifest)
+
+    def test_coverage_bounds_remain_inclusive_and_optional(self):
+        manifest = {**self.manifest, "min_coverage": 0.25, "max_coverage": 0.25}
+        self.assertEqual(check_image(self.image(), manifest)["ratio"], 0.25)
+        with self.assertRaisesRegex(AssertionError, r"coverage 0\.2500 outside"):
+            check_image(self.image(), {**manifest, "min_coverage": 0.3, "max_coverage": 1})
+        del manifest["min_coverage"], manifest["max_coverage"]
+        self.assertEqual(check_image(self.image(), manifest)["ratio"], 0.25)
+
 
 class ProbeCoordinateTests(unittest.TestCase):
     rgba = (0.25, 0.75, 0.0, 1.0)
