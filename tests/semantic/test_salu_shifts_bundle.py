@@ -308,6 +308,23 @@ class TestSLshlB64Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xBCDEF000)
 
+def ref_s_lshr_b64(src: int, shift: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_lshr_b64 -> (result, scc)."""
+    sh = shift & 63
+    res = (src & MASK64) >> sh
+    scc = 1 if res != 0 else 0
+    return res, scc
+
+
+class TestSLshrB64Oracle(unittest.TestCase):
+    def test_cross_dword_shift(self) -> None:
+        # Shift upper dword into lower dword
+        self.assertEqual(ref_s_lshr_b64(0x1234567800000000, 32), (0x12345678, 1))
+
+    def test_shift_count_masking_64(self) -> None:
+        self.assertEqual(ref_s_lshr_b64(0x100, 64), (0x100, 1))
+        self.assertEqual(ref_s_lshr_b64(0x100, 65), (0x80, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
