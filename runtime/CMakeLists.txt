@@ -1154,6 +1154,16 @@ if(BUILD_TESTING)
     add_test(NAME gta6rt_option_values COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_option_value.cmake")
+    # An empty value (`--trace ""`, an unset variable in a boot script) is the same missing value: read as the option
+    # not given, the trace the runbook asks for was never created and the run read as clean. Python passes the empty
+    # argument as typed, which the cmake script above cannot.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME gta6rt_option_value_empty COMMAND "${Python3_EXECUTABLE}" -I
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/check_option_value_empty.py"
+        --loader "$<TARGET_FILE:gta6rt>" --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+      set_tests_properties(gta6rt_option_value_empty PROPERTIES TIMEOUT 90)
+    endif()
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)

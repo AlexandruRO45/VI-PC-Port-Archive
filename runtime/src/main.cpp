@@ -78,9 +78,11 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
         // The value of these options is a path, so a following option is a missing value and the usage error, never a
         // value. `--trace --trace-d3d12` used to take the option as the file name and exit 0, so a mistyped command
-        // line read as a clean run: a file named --trace-d3d12 appeared and the D3D12 trace stayed off.
+        // line read as a clean run: a file named --trace-d3d12 appeared and the D3D12 trace stayed off. An empty value
+        // (`--trace ""`, an unset variable in a boot script) is not a path either: both were read as the option not
+        // given, so the trace the first-boot runbook asks for was never created and the run read as clean.
         else if (a == L"--trace" || a == L"--game-dir" || a == L"--overlay" || a == L"--mods") {
-            if (i + 1 >= argc || std::wstring(argv[i + 1]).rfind(L"--", 0) == 0) return usage();
+            if (i + 1 >= argc || !*argv[i + 1] || std::wstring(argv[i + 1]).rfind(L"--", 0) == 0) return usage();
             const wchar_t* value = argv[++i];
             if (a == L"--trace") trace_file = value;
             else if (a == L"--game-dir") game_dir = value;
