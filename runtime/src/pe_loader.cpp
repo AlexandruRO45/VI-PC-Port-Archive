@@ -13,6 +13,7 @@
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -185,20 +186,33 @@ void cleanup_tls_clones_internal() {
 
 void cleanup_tls_clones_at_exit() { cleanup_tls_clones_internal(); }
 
-// The owner process named by "leonida_tls_host_<pid>_<slot>.dll"; 0 when the name does not carry one.
+// Recognize the complete clone name before the sweep treats a file as ours. The home tag is used by the
+// executable TLS-index-0 helper; ordinary helpers use a decimal slot. Zero means the name is not a clone.
 DWORD clone_owner_pid(const wchar_t* name) {
-    constexpr wchar_t prefix[] = L"leonida_tls_host_";
-    const wchar_t* p = name;
-    for (size_t i = 0; i < sizeof(prefix) / sizeof(wchar_t) - 1; ++i)
-        if (*p++ != prefix[i]) return 0;
-    if (*p < L'0' || *p > L'9') return 0;
-    unsigned long pid = 0;
-    while (*p >= L'0' && *p <= L'9') {
-        pid = pid * 10 + (*p - L'0');
-        if (pid > 0xFFFFFFFFul) return 0;
-        ++p;
-    }
-    return static_cast<DWORD>(pid);
+    constexpr std::wstring_view prefix = L"leonida_tls_host_";
+    std::wstring_view rest(name);
+    if (!rest.starts_with(prefix) || !rest.ends_with(L".dll")) return 0;
+    rest.remove_prefix(prefix.size());
+    rest.remove_suffix(4);
+    const size_t separator = rest.find(L'_');
+    if (separator == std::wstring_view::npos) return 0;
+    const auto decimal = [](std::wstring_view text, DWORD& value) {
+        if (text.empty()) return false;
+        value = 0;
+        for (wchar_t c : text) {
+            if (c < L'0' || c > L'9') return false;
+            const DWORD digit = static_cast<DWORD>(c - L'0');
+            // DWORD/unsigned long is 32 bits on Windows: testing after multiplication would already have wrapped.
+            if (value > (MAXDWORD - digit) / 10) return false;
+            value = value * 10 + digit;
+        }
+        return true;
+    };
+    DWORD pid = 0, slot = 0;
+    if (!decimal(rest.substr(0, separator), pid) || !pid) return 0;
+    const std::wstring_view tag = rest.substr(separator + 1);
+    if (tag != L"home" && !decimal(tag, slot)) return 0;
+    return pid;
 }
 
 bool process_alive(DWORD pid) {
@@ -222,7 +236,7 @@ void sweep_stale_tls_clones(const std::filesystem::path& dir) {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         const std::filesystem::path path = dir / fd.cFileName;
         const DWORD owner = clone_owner_pid(fd.cFileName);
-        if (owner && owner != GetCurrentProcessId() && process_alive(owner)) continue;
+        if (!owner || (owner != GetCurrentProcessId() && process_alive(owner))) continue;
         // An exclusive open (no sharing) conflicts with any handle another process holds on the file, so a failure
         // means the copy->load sequence or a mapped image still owns it. Only unowned files reach DeleteFileW, and
         // that stays harmless for a mapped image.

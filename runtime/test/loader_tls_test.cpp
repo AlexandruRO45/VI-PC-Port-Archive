@@ -725,10 +725,28 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     const fs::path stale_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_31.dll");
     const fs::path held_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(dead.pid) + L"_32.dll");
     const fs::path live_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(live.pid) + L"_33.dll");
+    const fs::path stale_home = clone_root / (L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_home.dll");
     const char bytes[8] = "purgeXX";
     write_file(stale_file, bytes, 8);
     write_file(held_file, bytes, 8);
     write_file(live_file, bytes, 8);
+    write_file(stale_home, bytes, 8);
+    // Matching the sweep's wildcard does not establish ownership. These are ordinary files, not loader clones.
+    const std::wstring pid = std::to_wstring(GetCurrentProcessId());
+    const std::wstring prefix = L"leonida_tls_host_";
+    const std::vector<std::wstring> malformed = {
+        prefix + L"notes_" + pid + L".dll",
+        prefix + L"0_" + pid + L".dll",
+        prefix + pid + L"notes.dll",
+        prefix + pid + L"_.dll",
+        prefix + pid + L"_-1.dll",
+        prefix + pid + L"_backup.dll",
+        prefix + pid + L"_35.dll.dll",
+        prefix + pid + L"_4294967296.dll",
+        prefix + std::to_wstring(uint64_t{0x100000000} + GetCurrentProcessId()) + L"_35.dll",
+        prefix + L"9999999999999999999999999999999999999999_" + pid + L".dll",
+    };
+    for (const auto& name : malformed) write_file(clone_root / name, bytes, sizeof bytes);
     // An open handle without FILE_SHARE_DELETE stands in for another process's guard or mapped image: the purge's
     // exclusive-open probe must fail against it.
     HANDLE held = CreateFileW(held_file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -744,10 +762,21 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
         check(first.tls_index != rt::kNoTlsIndex && mapped_second.tls_index != rt::kNoTlsIndex,
               "the purge test loads two simultaneous TLS modules");
     }
+    for (const auto& name : malformed) {
+        const fs::path path = clone_root / name;
+        const bool exists = fs::exists(path);
+        check(exists, "the purge preserves a malformed clone filename");
+        if (exists)
+            check(read_file(path) == std::vector<uint8_t>(bytes, bytes + sizeof bytes),
+                  "the preserved non-clone file is unchanged");
+        std::error_code ec;
+        fs::remove(path, ec);
+    }
     const auto clone_of_this_process = own_clone_files();
     check(clone_of_this_process.size() == 1, "this process owns exactly one clone file after the two-module load");
 
     check(!fs::exists(stale_file), "the purge deleted the clone whose owner process is gone");
+    check(!fs::exists(stale_home), "the purge deleted the stale home helper clone");
     check(fs::exists(held_file), "the purge skipped the clone another handle holds open");
     check(fs::exists(live_file), "the purge skipped the clone whose owner process is still alive");
 
