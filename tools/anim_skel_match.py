@@ -135,9 +135,12 @@ def print_report(report):
 
 def parse_offset(text):
     try:
-        return int(text, 0)
+        offset = int(text, 0)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not an offset: {text!r}") from None
+    if offset < 0:
+        raise argparse.ArgumentTypeError("offset must be non-negative")
+    return offset
 
 
 def main(argv=None):

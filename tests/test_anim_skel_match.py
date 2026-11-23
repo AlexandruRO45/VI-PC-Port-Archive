@@ -91,6 +91,24 @@ class CommandLine(unittest.TestCase):
                 self.assertEqual(sm.main([*args, str(report)]), 0)
             self.assertTrue(report.is_file())
 
+    def test_negative_stream_offset_cannot_select_a_stream_from_the_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            anim = Path(tmp) / "anim.rpf"
+            packs = Path(tmp) / "packs.rpf"
+            stream = zlib.compress(b"SKEL_Synthetic\x00")
+            anim.write_bytes(b"\x00" * 16 + stream)
+            packs.write_bytes(b"\x00")
+            args = [str(anim), str(packs)]
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(sm.main([*args, "--stream", "16"]), 0)
+            with redirect_stderr(io.StringIO()) as err, redirect_stdout(io.StringIO()) as out:
+                with self.assertRaises(SystemExit) as failure:
+                    sm.main([*args, "--stream", str(-len(stream))])
+            self.assertEqual(failure.exception.code, 2)
+            self.assertIn("--stream", err.getvalue())
+            self.assertIn("non-negative", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
+
     def test_offsets_parse_as_hex_or_decimal(self):
         self.assertEqual(sm.parse_offset("0x101a32160"), 0x101A32160)
         self.assertEqual(sm.parse_offset("4096"), 4096)
