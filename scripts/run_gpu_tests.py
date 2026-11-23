@@ -49,7 +49,7 @@ from check import barycentric_problem
 from check import NAN_PAYLOAD_TEST, nan_payload_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
-from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
+from check import FMA_FUSED_ENV, FMA_FUSED_LITERAL_ENV, judge_fma_fused   # cs_fma_fused(_literal): strict under LEONIDA_FMA=khr, fused/split under glsl
 from check import bary_persp_problem   # ps_persp_bary's perspective-correct reference
 
 
@@ -1123,10 +1123,12 @@ def run_suite(a, work: str) -> int:
             else:
                 results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
                                 else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
-        elif name == "cs_fma_fused":
+        elif name in ("cs_fma_fused", "cs_fma_fused_literal"):
             # Single-rounded f32 FMA (+ f16 round-to-odd): strict under LEONIDA_FMA=khr (OpFmaKHR, exit 77 if
             # unsupported), fused-or-split f32 allowed under default --fma glsl (e.g. Mesa RADV splits 5/7).
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **FMA_FUSED_ENV))
+            # cs_fma_fused_literal has the f16 triple as literals, which Metal folds to 0 (#8556).
+            sgprs = FMA_FUSED_ENV if name == "cs_fma_fused" else FMA_FUSED_LITERAL_ENV
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **sgprs))
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
@@ -1134,7 +1136,7 @@ def run_suite(a, work: str) -> int:
             else:
                 # TEST-1147: judge by the mode the translator recorded in index.json, as check.py does.
                 # --fma exact has no KHR capability, so capability/env alone used to accept split words here.
-                meta = index.get("cs_fma_fused") or {}
+                meta = index.get(name) or {}
                 mode = meta.get("fma") or ""
                 if mode:
                     # The recorded mode wins over a stale LEONIDA_FMA, as in check.py.

@@ -354,6 +354,9 @@ USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
 # (LEONIDA_FMA=khr, shaderFmaFloat32 in index.json) every word must match FMA_FUSED; under default --fma glsl a
 # spec-compliant driver (e.g. Mesa RADV 26.2.6) may legally split GLSL.std.450 Fma.
 FMA_FUSED_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002,0x6ce1,0x4200,0x8004"}
+# cs_fma_fused_literal.asm: the same words with the f16 triple as literals (only s4..s7 come in); Metal folds its
+# out[7] to 0 (#8556).
+FMA_FUSED_LITERAL_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002"}
 FMA_FUSED = [0x33800000, 0xa8800000, 0x3a000400, 0x33800000, 0x33800000, 0x33800000, 0x28800000, 0x00007351]
 FMA_SPLIT = [0x00000000, 0x00000000, 0x3a000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00007351]
 # cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,
@@ -1023,22 +1026,22 @@ def judge_fma_fused(words, khr, exact=False):
     return True, f"{7 - n_split}/7 f32 fused, {n_split}/7 split (GLSL Fma; LEONIDA_FMA=khr for OpFmaKHR), f16 exact"
 
 
-def fma_fused_test(tools, spirv):
-    """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr and --fma exact, fused-or-split f32 under
-    --fma glsl)."""
-    shader = os.path.join(spirv, "cs_fma_fused.spv")
+def fma_fused_test(tools, spirv, name="cs_fma_fused", sgprs=FMA_FUSED_ENV):
+    """Run cs_fma_fused (or cs_fma_fused_literal) and judge against FMA_FUSED (strict under --fma khr and --fma exact,
+    fused-or-split f32 under --fma glsl)."""
+    shader = os.path.join(spirv, name + ".spv")
     # --fma exact also guarantees single rounding (built from NoContraction ops), but records no KHR capability.
     # Without the index field a fresh shell cannot tell it from the default GLSL Fma (TEST-1147).
-    mode = shader_fma_mode(spirv, "cs_fma_fused")
+    mode = shader_fma_mode(spirv, name)
     if mode:
         # A recorded mode is authoritative: a stale LEONIDA_FMA from the build shell must not override it.
         strict = mode in ("khr", "exact")
     else:
         # An older index has no mode field: capability and environment are the only remaining signals.
-        strict = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
+        strict = ("shaderFmaFloat32" in shader_features(spirv, name)
                   or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
-                    env=dict(os.environ, **FMA_FUSED_ENV))
+                    env=dict(os.environ, **sgprs))
     if code == UNSUPPORTED:
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -1798,6 +1801,8 @@ def main():
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
+    results.append(("cs_fma_fused_literal", fma_fused_test(tools, spirv, "cs_fma_fused_literal",
+                                                           FMA_FUSED_LITERAL_ENV)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
     results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",

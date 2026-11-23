@@ -776,22 +776,27 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
 
 
 class FmaFusedSuite(unittest.TestCase):
-    """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
+    """run_gpu_tests.py runs cs_fma_fused and cs_fma_fused_literal under --filter, honoring LEONIDA_FMA=khr vs default
+    glsl."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
+    NAMES = ("cs_fma_fused", "cs_fma_fused_literal")
 
-    def run_fma(self, rc, msg, fma_env=None, fma_mode=None):
+    def run_fma(self, rc, msg, fma_env=None, fma_mode=None, literal_msg=None):
         with tempfile.TemporaryDirectory() as tmp:
             if fma_mode:
                 (Path(tmp) / "spirv").mkdir(parents=True, exist_ok=True)
                 (Path(tmp) / "spirv" / "index.json").write_text(
-                    json.dumps({"cs_fma_fused": {"fma": fma_mode}}), encoding="utf-8")
+                    json.dumps({name: {"fma": fma_mode} for name in self.NAMES}), encoding="utf-8")
             args = SimpleNamespace(filter="cs_fma_fused", build=tmp, llvm_mc="unused")
 
             def fake_run(cmd, env=None, gpu=True):
                 if Path(cmd[0]).stem == "vk_compute_test":
-                    self.assertEqual((env or {}).get("VKC_SGPRS"), rgt.FMA_FUSED_ENV["VKC_SGPRS"])
-                    return rc, msg
-                (Path(tmp) / "spirv" / "cs_fma_fused.spv").touch()
+                    literal = Path(cmd[1]).stem == "cs_fma_fused_literal"
+                    want = rgt.FMA_FUSED_LITERAL_ENV if literal else rgt.FMA_FUSED_ENV
+                    self.assertEqual((env or {}).get("VKC_SGPRS"), want["VKC_SGPRS"])
+                    return rc, literal_msg if literal and literal_msg is not None else msg
+                for name in self.NAMES:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
                 return 0, ""
 
             output = io.StringIO()
@@ -838,6 +843,14 @@ class FmaFusedSuite(unittest.TestCase):
         rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
+
+    def test_literal_fixture_fails_on_the_folded_f16_word(self):
+        # #8556: Metal folds the literal f16 multiply-add of cs_fma_fused_literal to 0; cs_fma_fused still passes.
+        import check
+        rc, out = self.run_fma(0, dump(check.FMA_FUSED), literal_msg=dump(check.FMA_FUSED[:7] + [0]))
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"PASS  cs_fma_fused ")
+        self.assertRegex(out, r"FAIL  cs_fma_fused_literal +word 7 \(f16\): got 0x00000000")
 
 
 if __name__ == "__main__":

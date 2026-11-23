@@ -35,8 +35,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all
+         # and cs_fma_fused_literal
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -102,9 +103,10 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_f32_sat":
                 return cvt_answer(env)
-            if name == "cs_fma_fused":
+            if name in ("cs_fma_fused", "cs_fma_fused_literal"):
                 # The operands come in through VKC_SGPRS; without them the fused words are not produced.
-                self.assertEqual((env or {}).get("VKC_SGPRS"), check.FMA_FUSED_ENV["VKC_SGPRS"])
+                sgprs = check.FMA_FUSED_ENV if name == "cs_fma_fused" else check.FMA_FUSED_LITERAL_ENV
+                self.assertEqual((env or {}).get("VKC_SGPRS"), sgprs["VKC_SGPRS"])
                 return 0, "out[0..7] = " + " ".join(map(str, check.FMA_FUSED)) + "\n"
             self.assertNotIn("VKC_SGPRS", env or {})
             if name in PARTIAL:
@@ -1077,6 +1079,22 @@ class FmaFusedChecks(unittest.TestCase):
         res = self.run_fma([], khr_index=True, code=77, raw_out="unsupported: cs_fma_fused.spv needs VK_KHR_shader_fma\n")
         self.assertIsInstance(res, check.Skip)
         self.assertIn("VK_KHR_shader_fma", res)
+
+    def test_literal_fixture_has_its_own_operands_and_index_entry(self):
+        # #8556: cs_fma_fused_literal takes only s4..s7, and Metal's folded out[7] = 0 fails it.
+        folded = check.FMA_FUSED[:7] + [0]
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps({"cs_fma_fused_literal": {"fma": "khr"}}), encoding="utf-8")
+            for words, want in ((check.FMA_FUSED, ""), (folded, "word 7"), (self.RADV_SPLIT, "word 0")):
+                out = "out[0..7] = " + " ".join(map(str, words)) + "\n"
+                with patch.object(check, "run", return_value=(0, out)) as run:
+                    res = check.fma_fused_test("tools", tmp, "cs_fma_fused_literal", check.FMA_FUSED_LITERAL_ENV)
+                self.assertEqual(Path(run.call_args.args[1]).name, "cs_fma_fused_literal.spv")
+                self.assertEqual(run.call_args.kwargs["env"]["VKC_SGPRS"], check.FMA_FUSED_LITERAL_ENV["VKC_SGPRS"])
+                if want:
+                    self.assertIn(want, res)
+                else:
+                    self.assertEqual(res, "")
 
 if __name__ == "__main__":
     unittest.main()
