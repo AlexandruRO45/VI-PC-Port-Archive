@@ -410,5 +410,26 @@ class CompletePoolEarlyReturn(unittest.TestCase):
         pool.assert_not_called()
 
 
+    def test_a_pool_hashes_the_decoder_sources_once_for_all_its_strict_fallback_rows(self):
+        # With a profile, each row the calibrated decoder can't take falls back to strict decoding; hashing the
+        # sources per row read them 32 times over for 32 rows. A new pass computes the stamp again.
+        pool = mock.Mock(chunks=[(0,)], virtual_size=64)
+        pool.descriptor.return_value = {"base": 0, "dimension": 1, "format": 71}
+        pool.span.return_value = 8
+        pool.codecs.return_value = ttpf_assets.bcpack.SUPPORTED_REBUILD_CODECS
+        calibrated = mock.Mock()
+        calibrated.LocalDecoder.return_value.formats = set()
+        with tempfile.TemporaryDirectory() as out, ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(sys.modules, calibrated_texture=calibrated))
+            stack.enter_context(mock.patch.object(ttpf_assets.ttpf, "Pool", return_value=pool))
+            stack.enter_context(mock.patch.object(ttpf_assets.ttpf, "analyze", side_effect=ValueError("limited")))
+            stamps = stack.enter_context(mock.patch.object(ttpf_assets, "strict_stamp",
+                                                           wraps=ttpf_assets.strict_stamp))
+            for passes in (1, 2):
+                manifest = {"Textures": [synthetic_row(Index=i) for i in range(32)]}
+                self.assertEqual(ttpf_assets.complete_pool("synthetic", out, manifest, ("v1-profile", {})), (0, 32))
+                self.assertEqual(stamps.call_count, passes)
+
+
 if __name__ == "__main__":
     unittest.main()

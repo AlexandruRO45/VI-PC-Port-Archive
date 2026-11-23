@@ -158,7 +158,7 @@ def complete_pool(source, directory, manifest, settings):
     written = blocked = 0
     superseded = set()   # the files the rows named before they were switched to a full chain
     with closing(ttpf.Pool(source)) as pool:
-        decoder = None
+        decoder = strict = None
         if profile is not None:
             from calibrated_texture import LocalDecoder
             decoder = LocalDecoder(pool, profile)
@@ -179,7 +179,9 @@ def complete_pool(source, directory, manifest, settings):
                         method = stamp
                         blob = decoder.dds(index)
                     else:
-                        method = stamp if profile is None else strict_stamp()
+                        if profile is not None and strict is None:
+                            strict = strict_stamp()   # once per pass: it reads and hashes six sources
+                        method = strict or stamp
                         analysis = ttpf.analyze(pool, index)
                         blob = ttpf.texture_dds(pool, analysis)
                 except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
