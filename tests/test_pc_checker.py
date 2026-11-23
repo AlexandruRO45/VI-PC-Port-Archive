@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -46,6 +47,36 @@ class GpuScore(unittest.TestCase):
     def test_estimate_keeps_ordering(self):
         self.assertLess(pc.gpu_score("RTX 6060"), pc.gpu_score("RTX 6070"))
         self.assertLess(pc.gpu_score("RTX 6070"), pc.gpu_score("RTX 6080"))
+
+    def test_amd_pro_mobile_estimated(self):
+        score, exact = pc.gpu_lookup("AMD Radeon Pro 5300M")
+        self.assertIsNotNone(score)
+        self.assertFalse(exact)
+        self.assertLess(score, pc.gpu_score("AMD Radeon RX 5500 XT"))
+
+    def test_trailing_m_is_mobile(self):
+        self.assertLess(pc.gpu_score("AMD Radeon RX 5600M"),
+                        pc.gpu_score("AMD Radeon RX 5600 XT"))
+
+    def test_trailing_m_keeps_variant(self):
+        # 9070M XT is the mobile RX 9070 with the XT suffix, not a plain 9070.
+        self.assertAlmostEqual(pc.gpu_score("AMD Radeon RX 9070M XT"),
+                               pc.gpu_score("AMD Radeon RX 9070") * 1.12 * 0.8)
+
+    def test_pro_w_is_not_a_mobile_rx(self):
+        # "pro w 6800" is the desktop workstation spelling, so it must not get
+        # the RX 6800 score with the mobile penalty.
+        self.assertNotEqual(pc.gpu_score("Radeon Pro W6800"), 115 * 0.8)
+
+
+class DetectAll(unittest.TestCase):
+    def test_discrete_gpu_beats_integrated(self):
+        gpus = [("Intel UHD Graphics 630", None), ("AMD Radeon Pro 5300M", None)]
+        with patch.object(pc, "detect_gpus", return_value=gpus), \
+                patch.object(pc, "detect_cpu", return_value="Intel Core i7-9750H"), \
+                patch.object(pc, "detect_ram_gb", return_value=32):
+            info = pc.detect_all()
+        self.assertEqual(info["gpu"], "AMD Radeon Pro 5300M")
 
 
 class CpuScore(unittest.TestCase):

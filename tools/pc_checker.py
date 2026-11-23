@@ -150,17 +150,25 @@ def _gen_score(table: dict, series: int, tier: int, step: int):
     return _pick(row, tier) * scale
 
 
+def _rx_score(num, suffix=None):
+    tier = num // 100 % 10 if num < 9000 else num % 100 // 10   # RDNA4: 9060, 9070
+    return _gen_score(RX_BASE, num // 1000, tier, 1) * _RX_SUFFIX.get(suffix, 1.0)
+
+
 def _estimate_gpu(n: str):
     """Score from the model number of a normalised name, or None."""
     m = re.search(r"\b(?:rtx|gtx)\s*(\d{2})(\d{2})\b(?:\s*(ti super|super|ti)\b)?", n)
     if m:
         return (_gen_score(NV_BASE, int(m[1]), int(m[2]), 10)
                 * _NV_SUFFIX.get(m[3], 1.0))
+    # A 4-digit AMD name with a trailing M is scored from the RX table for that
+    # number, then gpu_lookup applies the 0.8 mobile multiplier.
+    m = re.search(r"\b(?:rx|pro)\s*(\d{4})\s*m\b(?:\s*(xtx|xt|gre)\b)?", n)
+    if m:
+        return _rx_score(int(m[1]), m[2])
     m = re.search(r"\brx\s*(\d{4})\b(?:\s*(xtx|xt|gre)\b)?", n)
     if m:
-        num = int(m[1])
-        tier = num // 100 % 10 if num < 9000 else num % 100 // 10   # RDNA4: 9060, 9070
-        return _gen_score(RX_BASE, num // 1000, tier, 1) * _RX_SUFFIX.get(m[2], 1.0)
+        return _rx_score(int(m[1]), m[2])
     m = re.search(r"\barc\s*([abc])\s*(\d)(\d{2})\b", n)
     if m:
         return _gen_score(ARC_BASE, "abc".index(m[1]) + 1, int(m[2]), 1)
@@ -176,7 +184,12 @@ def gpu_lookup(name: str):
     if ("uhd" in raw or "iris" in raw or "hd graphics" in raw or n == ""
             or re.fullmatch(r"vega \d+", n)):
         return 15, True  # integrated graphics
-    mult = 0.8 if ("laptop" in raw or "mobile" in raw or "max-q" in raw) else 1.0
+    mobile = "laptop" in raw or "mobile" in raw or "max-q" in raw
+    # "RX 5600M" and "Radeon Pro 5300M" are mobile parts, but the raw name
+    # doesn't say laptop or mobile, so the trailing M has to stand in for it.
+    if re.search(r"\b(?:rx|pro)\s*\d{4}\s*m\b", n):
+        mobile = True
+    mult = 0.8 if mobile else 1.0
     best = None
     for key, (_disp, score) in GPU_INDEX.items():
         if re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", n):
