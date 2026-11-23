@@ -13,7 +13,8 @@ BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
     python -I tools/bary_fallback_gs.py <spirv dir> --pair VS PS
 
 The paired helper forwards a VS ClipDistance or CullDistance array. The suffix identifies the kind and length.
-Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
+Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles with spirv-as (default) or
+in-process with tools/spirv_asm.py (--assembler python) and validates with spirv-val unless --no-validate is set.
 Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
 import argparse
@@ -167,9 +168,35 @@ def write_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
     return written
 
 
-def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None) -> list[str]:
-    """Assemble and validate each helper with SPIRV-Tools for Vulkan 1.2 before publishing its text and binary.
-    Returns the .spv paths; raises RuntimeError with the tool output on failure."""
+def _assemble_python(shader: str, asm: str, staged_spv: str) -> None:
+    """Assemble SPIR-V text in process with tools/spirv_asm.py for Vulkan 1.2."""
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    import spirv_asm
+
+    try:
+        spv_bytes = spirv_asm.assemble(shader, target_env="vulkan1.2")
+    except spirv_asm.SpirvAsmError as err:
+        raise RuntimeError(f"spirv_asm failed for {asm}:\n{err}") from None
+    Path(staged_spv).write_bytes(spv_bytes)
+
+
+def build_for_index(
+    spirv_dir: str | os.PathLike[str],
+    pair: tuple[str, str] | None = None,
+    *,
+    assembler: str = "spirv-as",
+    validate: bool = True,
+) -> list[str]:
+    """Assemble (and by default validate) each helper for Vulkan 1.2 before publishing its text and binary.
+
+    `assembler="spirv-as"` invokes the external spirv-as binary (default); `assembler="python"` assembles
+    in process with `tools/spirv_asm.py`. When `validate=False`, skip running `spirv-val` after assembly.
+    Returns the .spv paths; raises RuntimeError with the tool output on failure.
+    """
+    if assembler not in ("spirv-as", "python"):
+        raise ValueError(f"unknown assembler: {assembler!r}")
     built = []
     for asm, shader in _helpers_for_index(spirv_dir, pair):
         spv = asm[: -len(".spvasm")] + ".spv"
@@ -177,8 +204,14 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
             staged_asm = os.path.join(staging, os.path.basename(asm))
             staged_spv = os.path.join(staging, os.path.basename(spv))
             Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
-            for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
-                        ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
+            cmds = []
+            if assembler == "python":
+                _assemble_python(shader, asm, staged_spv)
+            else:
+                cmds.append(["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv])
+            if validate:
+                cmds.append(["spirv-val", "--target-env", "vulkan1.2", staged_spv])
+            for cmd in cmds:
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 if r.returncode:
                     raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
@@ -192,13 +225,25 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("spirv_dir")
     parser.add_argument("--pair", nargs=2, metavar=("VS", "PS"), help="build for these index entries")
+    parser.add_argument(
+        "--assembler",
+        choices=("spirv-as", "python"),
+        default="spirv-as",
+        help="SPIR-V assembler: spirv-as (default) or python (in-process tools/spirv_asm.py)",
+    )
+    parser.add_argument("--no-validate", action="store_true", help="skip spirv-val after assembly")
     args = parser.parse_args(argv[1:])
     if not os.path.exists(args.spirv_dir):
         parser.exit(2, f"ERROR: {args.spirv_dir}: does not exist\n")
     if not os.path.isdir(args.spirv_dir):
         parser.exit(1, f"{args.spirv_dir}: not a directory\n")
     try:
-        paths = build_for_index(args.spirv_dir, tuple(args.pair) if args.pair else None)
+        paths = build_for_index(
+            args.spirv_dir,
+            tuple(args.pair) if args.pair else None,
+            assembler=args.assembler,
+            validate=not args.no_validate,
+        )
     except (OSError, ValueError, RuntimeError) as err:
         parser.exit(1, f"{err}\n")
     for path in paths:

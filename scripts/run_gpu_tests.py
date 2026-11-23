@@ -924,7 +924,7 @@ def run_suite(a, work: str) -> int:
         return 1
     if bary_fallback():
         import bary_fallback_gs
-        for gs in bary_fallback_gs.build_for_index(spirv_dir):
+        for gs in bary_fallback_gs.build_for_index(spirv_dir, assembler=assembler, validate=not no_validate):
             print("bary fallback GS:", os.path.basename(gs))
 
     if MESH_COMPUTE:

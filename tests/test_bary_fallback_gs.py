@@ -591,6 +591,123 @@ class TestBuildForIndex(unittest.TestCase):
                     bary_fallback_gs.build_for_index(tmp)
             self.assertEqual(run_mock.call_count, 2)
 
+    def test_python_assembler_without_validation_builds_all_variants_with_no_subprocess(self):
+        import spirv_asm
+
+        index = {
+            "vs_clip": {"stage": "vs", "capabilities": ["ClipDistance"], "clip_distance_count": 4},
+            "vs_cull": {"stage": "vs", "capabilities": ["CullDistance"], "cull_distance_count": 3},
+            "ps_empty": {"stage": "ps", "inputs": [], "bary_fallback_input": {"location": 0}},
+            "ps_multi": {"stage": "ps", "inputs": [0, 2, 5], "bary_fallback_input": {"location": 1}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            with mock.patch.object(bary_fallback_gs.subprocess, "run") as run_mock:
+                plain = bary_fallback_gs.build_for_index(tmp, assembler="python", validate=False)
+                clip = bary_fallback_gs.build_for_index(tmp, pair=("vs_clip", "ps_multi"), assembler="python", validate=False)
+                cull = bary_fallback_gs.build_for_index(tmp, pair=("vs_cull", "ps_multi"), assembler="python", validate=False)
+            run_mock.assert_not_called()
+
+            all_built = [*plain, *clip, *cull]
+            self.assertEqual(
+                all_built,
+                [
+                    os.path.join(tmp, "ps_empty.bary_gs.spv"),
+                    os.path.join(tmp, "ps_multi.bary_gs.spv"),
+                    os.path.join(tmp, "ps_multi.bary_gs.clip4.spv"),
+                    os.path.join(tmp, "ps_multi.bary_gs.cull3.spv"),
+                ],
+            )
+            for spv_path in all_built:
+                spv = Path(spv_path)
+                asm = spv.with_suffix(".spvasm")
+                self.assertTrue(asm.is_file())
+                data = spv.read_bytes()
+                self.assertEqual(len(data) % 4, 0)
+                self.assertEqual(int.from_bytes(data[:4], "little"), spirv_asm.SPIRV_MAGIC)
+                self.assertEqual(int.from_bytes(data[4:8], "little"), spirv_asm.TARGET_ENV_VERSION["vulkan1.2"])
+                self.assertEqual(data, spirv_asm.assemble(asm.read_text(encoding="utf-8"), target_env="vulkan1.2"))
+            # No leftover staging directories.
+            self.assertFalse(any(p.startswith(".bary-gs-") for p in os.listdir(tmp)))
+
+    def test_python_assembler_with_validation_invokes_only_spirv_val(self):
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            with mock.patch.object(
+                bary_fallback_gs.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["spirv-val"], 0, "", ""),
+            ) as run_mock:
+                built = bary_fallback_gs.build_for_index(tmp, assembler="python", validate=True)
+
+            self.assertEqual(built, [os.path.join(tmp, "ps_a.bary_gs.spv")])
+            self.assertEqual(run_mock.call_count, 1)
+            cmd = run_mock.call_args.args[0]
+            self.assertEqual(cmd[:3], ["spirv-val", "--target-env", "vulkan1.2"])
+            self.assertTrue(Path(built[0]).is_file())
+            self.assertTrue(Path(built[0]).with_suffix(".spvasm").is_file())
+
+    def test_spirv_as_without_validation_skips_spirv_val(self):
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            with mock.patch.object(
+                bary_fallback_gs.subprocess,
+                "run",
+                side_effect=_successful_spirv_tools,
+            ) as run_mock:
+                built = bary_fallback_gs.build_for_index(tmp, assembler="spirv-as", validate=False)
+
+            self.assertEqual(built, [os.path.join(tmp, "ps_a.bary_gs.spv")])
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertEqual(run_mock.call_args.args[0][0], "spirv-as")
+            self.assertEqual(Path(built[0]).read_bytes(), b"synthetic binary")
+
+    def test_python_assembler_error_preserves_published_pair_and_cleans_staging(self):
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            built, = bary_fallback_gs.build_for_index(tmp, assembler="python", validate=False)
+            published = Path(built)
+            published_asm = published.with_suffix(".spvasm")
+            original = published.read_bytes()
+            original_asm = published_asm.read_bytes()
+
+            with mock.patch.object(bary_fallback_gs, "gs_spvasm", return_value="OpNotARealOpcode\n"):
+                with self.assertRaisesRegex(RuntimeError, r"spirv_asm failed for .*ps_a\.bary_gs\.spvasm"):
+                    bary_fallback_gs.build_for_index(tmp, assembler="python", validate=False)
+
+            self.assertEqual(published.read_bytes(), original)
+            self.assertEqual(published_asm.read_bytes(), original_asm)
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm"])
+
+    def test_unknown_assembler_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(bary_fallback_gs.subprocess, "run") as run_mock:
+                with self.assertRaisesRegex(ValueError, "unknown assembler"):
+                    bary_fallback_gs.build_for_index(tmp, assembler="bogus")
+            run_mock.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("spirv-val"), "needs spirv-val")
+    def test_python_assembled_helpers_pass_spirv_val(self):
+        index = {
+            "vs_clip": {"stage": "vs", "capabilities": ["ClipDistance"], "clip_distance_count": 3},
+            "vs_cull": {"stage": "vs", "capabilities": ["CullDistance"], "cull_distance_count": 2},
+            "ps_a": {"stage": "ps", "inputs": [0, 2], "bary_fallback_input": {"location": 1}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            self.assertEqual(len(bary_fallback_gs.build_for_index(tmp, assembler="python", validate=True)), 1)
+            self.assertEqual(
+                len(bary_fallback_gs.build_for_index(tmp, pair=("vs_clip", "ps_a"), assembler="python", validate=True)),
+                1,
+            )
+            self.assertEqual(
+                len(bary_fallback_gs.build_for_index(tmp, pair=("vs_cull", "ps_a"), assembler="python", validate=True)),
+                1,
+            )
+
 
 class TestMainAndCLI(unittest.TestCase):
     def _call_main(self, argv):
@@ -736,6 +853,8 @@ class TestMainAndCLI(unittest.TestCase):
         p = run_cli("--help")
         self.assertEqual(p.returncode, 0)
         self.assertIn("--pair VS PS", p.stdout)
+        self.assertIn("--assembler", p.stdout)
+        self.assertIn("--no-validate", p.stdout)
         self.assertEqual(p.stderr, "")
 
         p = run_cli()
@@ -743,6 +862,21 @@ class TestMainAndCLI(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
         with tempfile.TemporaryDirectory() as tmp:
+            p = run_cli(tmp, "--assembler", "bogus")
+            self.assertEqual(p.returncode, 2)
+            self.assertNotIn("Traceback", p.stderr)
+
+            # Real subprocess under python -I assembling in-process with tools/spirv_asm.py (no SPIRV-Tools).
+            py_dir = os.path.join(tmp, "py-asm")
+            os.makedirs(py_dir)
+            with open(os.path.join(py_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}, f)
+            p = run_cli(py_dir, "--assembler", "python", "--no-validate")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout.splitlines(), [os.path.join(py_dir, "ps_a.bary_gs.spv")])
+            self.assertEqual(p.stderr, "")
+            self.assertTrue(os.path.isfile(os.path.join(py_dir, "ps_a.bary_gs.spv")))
+            self.assertTrue(os.path.isfile(os.path.join(py_dir, "ps_a.bary_gs.spvasm")))
             p = run_cli(tmp, "--pair", "only_vs")
             self.assertEqual(p.returncode, 2)
             self.assertNotIn("Traceback", p.stderr)
