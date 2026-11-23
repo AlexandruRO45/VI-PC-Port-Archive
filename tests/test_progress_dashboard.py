@@ -178,6 +178,37 @@ class Freshness(unittest.TestCase):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), None))
         self.assertEqual(got["test_progress_dashboard.py"], ("verified", "unknown"))
 
+    def test_ctest_exit_code_skips_use_the_current_disabled_log(self):
+        # CTest writes the same LastTest verdict for an exit-code skip and a pass.
+        last_test = ("1/4 Test: skip:exit\nTest Passed.\n"
+                     "2/4 Test: ordinary\nTest Passed.\n"
+                     "3/4 Test: moved\nTest Passed.\n"
+                     "4/4 Test: failed\nTest Failed.\n")
+        disabled_tests = "1:skip:exit\n8:moved\n"
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(pd, "ROOT", root), \
+                mock.patch.object(pd, "last_commit_time", return_value=None):
+            logs = os.path.join(root, "runtime", "build", "Testing", "Temporary")
+            os.makedirs(logs)
+            last_test_path = os.path.join(logs, "LastTest.log")
+            disabled_path = os.path.join(logs, "LastTestsDisabled.log")
+            for path, contents in ((last_test_path, last_test), (disabled_path, disabled_tests)):
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(contents)
+            os.utime(last_test_path, (100, 100))
+            for mtime, skip_status, passes in ((101, "unknown", 2), (100, "unknown", 2), (99, "verified", 3)):
+                with self.subTest(disabled_log_mtime=mtime):
+                    os.utime(disabled_path, (mtime, mtime))
+                    col = pd.Collector()
+                    pd.collect_ctest(col, SimpleNamespace(junit=[]))
+                    self.assertEqual({c["name"]: c["status"] for c in col.components}, {
+                        "skip:exit": skip_status,
+                        "ordinary": "verified",
+                        "moved": "verified",
+                        "failed": "failed",
+                    })
+                    metric = next(m for m in col.metrics if m["id"] == "runtime.current")
+                    self.assertEqual((metric["numerator"], metric["denominator"]), (passes, 4))
+
     def test_ctest_junit_passes_age_like_lasttest_log(self):
         ctest_suite = '<testsuite disabled="0" hostname="" timestamp="2026-11-22T10:00:00">{}</testsuite>'
         sources = {

@@ -397,9 +397,9 @@ def parse_junit(xml):
     return out
 
 
-def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
+def parse_lasttest(text: str, *, disabled_entries=()) -> list[tuple[str, str, float | None]]:
     """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log."""
-    out, name, secs = [], None, None
+    out, name, entry, secs = [], None, None, None
     captured = False
     nested_runs = 0
     lines = text.splitlines()
@@ -414,9 +414,10 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             elif not nested_runs and line == "<end of output>" and next_line.startswith("Test time ="):
                 captured = False
             continue
-        m = re.match(r"^\d+/\d+ Test: (.+)$", line)
+        m = re.match(r"^(\d+)/\d+ Test: (.+)$", line)
         if m:
-            name, secs = m.group(1).strip(), None
+            test_number, test_name = m.groups()
+            name, entry, secs = test_name.strip(), f"{test_number}:{test_name}", None
             continue
         if not name:
             continue
@@ -437,6 +438,8 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             res = "skip"
         else:
             continue
+        if res == "pass" and entry in disabled_entries:
+            res = "skip"
         out.append((name, res, secs))
         name = None
     return out
@@ -449,8 +452,18 @@ def collect_ctest(col, args):
     log = os.path.join(ROOT, "runtime", "build", "Testing", "Temporary", "LastTest.log")
     sets = []
     if os.path.isfile(log):
-        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))], True))
-        col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
+        disabled_log = os.path.join(os.path.dirname(log), "LastTestsDisabled.log")
+        disabled_entries = set()
+        try:
+            # CTest writes this after LastTest.log, only when there are disabled or skipped tests.
+            # A run with no skips can leave an older copy in place.
+            if os.stat(disabled_log).st_mtime_ns >= os.stat(log).st_mtime_ns:
+                disabled_entries = set(read_utf8(disabled_log).splitlines())
+        except FileNotFoundError:
+            pass
+        rows = [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log), disabled_entries=disabled_entries)]
+        sets.append(("ctest", log, rows, True))
+        col.source("ctest_lasttest", log, "ok", len(rows))
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
     for path in args.junit or []:
