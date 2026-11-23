@@ -115,6 +115,18 @@ class Fuzzer(unittest.TestCase):
         self.assertEqual((counts["harness-error"], counts["skip"]), (1, {}))
         self.assertIn("reference broke", first)
 
+    def test_a_run_where_every_program_skipped_exits_2(self):
+        """A run that compared nothing is not a pass: every program skipped exits 2 (#4365, the same fuzzers)."""
+        def skipped(name, lines, wave=64):
+            return "skip", "reference: not modelled"
+        real = wave_diff.run_one
+        wave_diff.run_one = skipped
+        try:
+            self.assertEqual(wave_diff.main(["--programs", "3", "--max-ops", "1", "--wave", "32"]), 2)
+        finally:
+            wave_diff.run_one = real
+        self.assertEqual(wave_diff.main(["--programs", "1", "--max-ops", "2"]), 0)
+
     def test_seeded_run_on_both_wave_sizes(self):
         counts, first = wave_diff.run_suite(programs=8, seed=1, max_ops=10, waves=(32, 64))
         self.assertEqual(counts["mismatch"], 0, first)

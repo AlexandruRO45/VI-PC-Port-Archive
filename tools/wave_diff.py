@@ -28,7 +28,7 @@ a v_cndmask condition) or as data (s_bcnt, s_ff). Known gaps on main stay off un
     python -I tools/wave_diff.py --self-test       # canaries: a match, a caught sabotage, a counted skip
 
 Exit code 0 when every program matches, 1 on a mismatch (lane, register, both words and the listing), 2 on harness
-errors. Skips are counted with their reasons, never silent.
+errors or when every program was skipped. Skips are counted with their reasons, never silent.
 """
 import argparse
 import gc
@@ -524,6 +524,9 @@ def main(argv=None):
     if first is not None:
         print("FIRST FAILURE:\n" + first)
         return 1 if counts["mismatch"] else 2
+    if not counts["pass"]:   # nothing was compared: every program was skipped
+        print("no program ran: every one was skipped")
+        return 2
     return 0
 
 
