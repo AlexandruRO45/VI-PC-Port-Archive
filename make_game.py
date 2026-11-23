@@ -1905,7 +1905,7 @@ def checker_supports(exe: str, *options: str) -> bool:
     2) before touching Vulkan. Builds before --inflight-file don't reject unknown arguments, so asking is the only way
     to tell."""
     try:
-        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     usage = (r.stdout or "") + (r.stderr or "")

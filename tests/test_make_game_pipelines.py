@@ -5,6 +5,7 @@ Standard library only; no GPU, no Vulkan SDK, no game data: the checker is mocke
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,24 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import make_game  # noqa: E402
+
+
+class CheckerUsageTest(unittest.TestCase):
+    def test_undecodable_usage_keeps_option_detection_working(self):
+        run = subprocess.run
+
+        def synthetic_checker(command, **kwargs):
+            self.assertEqual(command, ["vk_pipeline_check"])
+            kwargs.setdefault("encoding", "utf-8")
+            return run([
+                sys.executable, "-I", "-c",
+                "import sys; sys.stdout.buffer.write(b'\\xff\\n--inflight-file'); "
+                "sys.stderr.buffer.write(b'--limit'); sys.exit(2)",
+            ], **kwargs)
+
+        with mock.patch.object(make_game.subprocess, "run", side_effect=synthetic_checker):
+            self.assertTrue(make_game.checker_supports("vk_pipeline_check", "--inflight-file", "--limit"))
+            self.assertFalse(make_game.checker_supports("vk_pipeline_check", "--unknown"))
 
 
 class PipelinesJobsTest(unittest.TestCase):
