@@ -751,6 +751,17 @@ def _holds_lane_mask(ins, x, lm_map):
     return False
 
 
+_PAIR_MASK_WORD_READERS = frozenset({"s_bcnt0_i32_b64", "s_bcnt1_i32_b64", "s_ff0_i32_b64", "s_ff1_i32_b64"})
+
+
+def _reads_mask_word(ins, x, lm_map):
+    """Whether a _MASK_WORD_READERS op collects a whole mask word (Gen.wave_mask) from operand `x`: a lane mask, or
+    for the b64 forms an SGPR pair with a lane mask in either word (Gen.mixed_pair_words, SHADER-823)."""
+    if _holds_lane_mask(ins, x, lm_map):
+        return True
+    return base_op(ins["op"]) in _PAIR_MASK_WORD_READERS and x.get("k") == "sgpr" and x.get("n", 1) == 2 and         any(x["r"] + i in lm_map for i in range(2))
+
+
 def _is_mask_op(ins, x, lm_map):
     """Matches Gen.is_mask_op in tools/rdna2spirv.py (special exec/vcc operands always take the mask path)."""
     if _holds_lane_mask(ins, x, lm_map):
@@ -855,7 +866,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                     if any(_is_mask_op(ins, x, lm) for x in a[1:]):
                         return False, _EMPTY_MEM_STATS, 0, (), ()
             elif mask_chk == _MASK_CHK_WORD_READER:
-                if len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
+                if len(a) > 1 and _reads_mask_word(ins, a[1], lane_masks.get(id(ins), {})):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
             elif mask_chk == _MASK_CHK_MBCNT:
                 if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
@@ -1222,7 +1233,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                             clean = False
                             continue
                 elif mask_chk == _MASK_CHK_WORD_READER:
-                    if len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {})):
+                    if len(a) > 1 and _reads_mask_word(ins, a[1], lane_masks.get(id(ins), {})):
                         clean = False
                         continue
                 elif mask_chk == _MASK_CHK_MBCNT:
@@ -1461,7 +1472,7 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
         lm = lane_masks.get(id(ins), {})
         return any(_is_mask_op(ins, x, lm) for x in a[1:])
     if mask_chk == _MASK_CHK_WORD_READER:
-        return len(a) > 1 and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
+        return len(a) > 1 and _reads_mask_word(ins, a[1], lane_masks.get(id(ins), {}))
     if mask_chk == _MASK_CHK_MBCNT:
         return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
     lm = lane_masks.get(id(ins), {})
