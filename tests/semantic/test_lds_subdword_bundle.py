@@ -368,5 +368,25 @@ class TestDsReadU16HardwareTranslator(unittest.TestCase):
         self.assertEqual(L.out(mem, 0, 0), 0xCDEF)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_i16 Reference Oracle
+# ------------------------------------------------------------------------------
+
+class TestDsReadI16Oracle(unittest.TestCase):
+    def setUp(self):
+        self.lds = LDSMemory()
+
+    def test_read_i16_sign_extension(self):
+        # 0x7FFF = +32767
+        self.lds.write_u16(0, 0x7FFF)
+        self.assertEqual(self.lds.read_i16(0), 32767)
+        # 0x8000 = -32768 -> 0xFFFF8000
+        self.lds.write_u16(2, 0x8000)
+        self.assertEqual(self.lds.read_i16(2), 0xFFFF_8000)
+        # 0xFFFF = -1 -> 0xFFFFFFFF
+        self.lds.write_u16(4, 0xFFFF)
+        self.assertEqual(self.lds.read_i16(4), 0xFFFF_FFFF)
+
+
 if __name__ == '__main__':
     unittest.main()
