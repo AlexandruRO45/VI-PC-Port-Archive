@@ -359,5 +359,37 @@ class TestAddLshlU32Oracle(unittest.TestCase):
     def test_shift_count_mask(self) -> None:
         self.assertEqual(oracle_add_lshl_u32(2, 3, 33), 10)
 
+# ---------------------------------------------------------------------------
+# Opcode 3: v_add_lshl_u32 - AST and Interpreter
+# ---------------------------------------------------------------------------
+
+class TestAddLshlU32ASTInterpreter(unittest.TestCase):
+    def test_ast_construction(self) -> None:
+        inst = VOP3Instruction(
+            TriOpcode.V_ADD_LSHL_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        self.assertEqual(inst.opcode, TriOpcode.V_ADD_LSHL_U32)
+
+    def test_interpreter_step(self) -> None:
+        interp = BundleInterpreter()
+        interp.vgprs[1] = 4
+        interp.vgprs[2] = 6
+        interp.vgprs[3] = 3
+        inst = VOP3Instruction(
+            TriOpcode.V_ADD_LSHL_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = interp.step(inst)
+        # (4 + 6) << 3 = 10 << 3 = 80
+        self.assertEqual(res, 80)
+        self.assertEqual(interp.vgprs[0], 80)
+
 if __name__ == "__main__":
     unittest.main()
