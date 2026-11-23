@@ -31,6 +31,10 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
     """SPIR-V assembly for a triangle pass-through GS: Position and the vec4 inputs at `locations`, copied per vertex,
     plus the one-hot barycentric vec3 at `bary_location`."""
     locations = sorted(set(int(n) for n in locations))
+    if type(bary_location) is str and bary_location.strip().lstrip("-").isdigit():
+        bary_location = int(bary_location)   # so the collision test below compares like with like
+    if type(bary_location) is not int:
+        raise ValueError(f"bary location must be an integer, got {bary_location!r}")
     if bary_location in locations:
         raise ValueError(f"bary location {bary_location} collides with a pass-through location")
     ins = [f"%in{n}" for n in locations]
@@ -152,8 +156,19 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
         fb = meta.get("bary_fallback_input") if isinstance(meta, dict) else None
         if not fb:
             continue
+        if not isinstance(fb, dict):
+            raise ValueError(f"{index_path}: index entry {name!r} has a bary_fallback_input that is not a "
+                             f"JSON object: {fb!r}")
+        location = fb.get("location")
+        if type(location) is not int:
+            raise ValueError(f"{index_path}: index entry {name!r} has a bary_fallback_input location that is "
+                             f"not an integer: {location!r}")
+        inputs = meta.get("inputs", [])
+        if not isinstance(inputs, list):
+            raise ValueError(f"{index_path}: index entry {name!r} has inputs that are not a list of integers: "
+                             f"{inputs!r}")
         path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
-        shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
+        shader = gs_spvasm(inputs, location, clip_count, cull_count)
         yield path, shader
 
 

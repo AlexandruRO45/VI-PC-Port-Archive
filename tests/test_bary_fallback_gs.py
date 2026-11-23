@@ -229,6 +229,19 @@ class TestGsSpvasm(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "collides"):
                     bary_fallback_gs.gs_spvasm(locs, bary)
 
+    def test_bary_location_must_be_an_integer(self):
+        for bad in (None, True, False, 1.0, 2.5, "", " ", "-", "-a", "1x", "0x2", "1_0", [1], (1,), {}, "abc"):
+            with self.subTest(bary_location=bad):
+                with self.assertRaisesRegex(ValueError, "bary location must be an integer"):
+                    bary_fallback_gs.gs_spvasm([0], bad)
+
+    def test_numeric_string_bary_location_is_compared_as_a_number(self):
+        # A stale index can carry the location as a string; it must still collide with the int location.
+        with self.assertRaisesRegex(ValueError, "collides"):
+            bary_fallback_gs.gs_spvasm([5], "5")
+        self.assertEqual(bary_fallback_gs.gs_spvasm([0, 1], "2"), bary_fallback_gs.gs_spvasm([0, 1], 2))
+        self.assertEqual(bary_fallback_gs.gs_spvasm([0, 1], "-2"), bary_fallback_gs.gs_spvasm([0, 1], -2))
+
     def test_clip_distance_counts_1_to_8(self):
         for count in range(1, 9):
             with self.subTest(clip_count=count):
@@ -424,6 +437,46 @@ class TestWriteForIndex(unittest.TestCase):
             self._write_index(tmp, "{not valid json")
             with self.assertRaises(json.JSONDecodeError):
                 bary_fallback_gs.write_for_index(tmp)
+
+    def test_rejects_malformed_bary_fallback_input(self):
+        cases = {
+            "int": (5, "bary_fallback_input that is not a JSON object"),
+            "string": ("5", "bary_fallback_input that is not a JSON object"),
+            "list": ([5], "bary_fallback_input that is not a JSON object"),
+            "missing location": ({"component_type": "f32"}, "location that is not an integer"),
+            "null location": ({"location": None}, "location that is not an integer"),
+            "string location": ({"location": "5"}, "location that is not an integer"),
+            "bool location": ({"location": True}, "location that is not an integer"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for tag, (fb, expected) in cases.items():
+                with self.subTest(case=tag):
+                    index_path = self._write_index(tmp, {"ps_a": {"stage": "ps", "inputs": [0],
+                                                                  "bary_fallback_input": fb}})
+                    with self.assertRaisesRegex(ValueError, re.escape(expected)) as caught:
+                        bary_fallback_gs.write_for_index(tmp)
+                    self.assertIn(f"index entry 'ps_a'", str(caught.exception))
+                    self.assertEqual(os.listdir(tmp), [os.path.basename(index_path)])
+
+    def test_rejects_non_list_inputs_field(self):
+        cases = {"null": None, "int": 3, "string": "0,1", "object": {"0": "vec4"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            for tag, inputs in cases.items():
+                with self.subTest(case=tag):
+                    self._write_index(tmp, {"ps_a": {"stage": "ps", "inputs": inputs,
+                                                     "bary_fallback_input": {"location": 5}}})
+                    with self.assertRaisesRegex(ValueError, "inputs that are not a list of integers") as caught:
+                        bary_fallback_gs.write_for_index(tmp)
+                    self.assertIn("index entry 'ps_a'", str(caught.exception))
+                    self.assertEqual(os.listdir(tmp), ["index.json"])
+
+    def test_string_locations_in_inputs_still_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, {"ps_a": {"stage": "ps", "inputs": ["1", "0"],
+                                             "bary_fallback_input": {"location": 2}}})
+            written = bary_fallback_gs.write_for_index(tmp)
+            with open(written[0], encoding="utf-8") as f:
+                self.assertEqual(f.read(), bary_fallback_gs.gs_spvasm([0, 1], 2))
 
 
 class TestBuildForIndex(unittest.TestCase):
@@ -724,6 +777,40 @@ class TestMainAndCLI(unittest.TestCase):
                         self.assertEqual(code, 1)
                         self.assertEqual(out, "")
                         self.assertEqual(err, f"{index_path}: index entry {name!r} must be a JSON object\n")
+
+    def test_main_reports_malformed_fallback_entries_without_a_traceback(self) -> None:
+        cases = {
+            "ps_scalar": ({"stage": "ps", "inputs": [0], "bary_fallback_input": 5},
+                          "has a bary_fallback_input that is not a JSON object: 5"),
+            "ps_no_location": ({"stage": "ps", "inputs": [0], "bary_fallback_input": {"component_type": "f32"}},
+                               "has a bary_fallback_input location that is not an integer: None"),
+            "ps_string_location": ({"stage": "ps", "inputs": [5], "bary_fallback_input": {"location": "5"}},
+                                   "has a bary_fallback_input location that is not an integer: '5'"),
+            "ps_scalar_inputs": ({"stage": "ps", "inputs": 3, "bary_fallback_input": {"location": 5}},
+                                 "has inputs that are not a list of integers: 3"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = os.path.join(tmp, "index.json")
+            for tag, (entry, tail) in cases.items():
+                with self.subTest(case=tag):
+                    with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({"ps": entry}, f)
+                    code, out, err = self._call_main(["bary_fallback_gs.py", tmp])
+                    self.assertEqual(code, 1)
+                    self.assertEqual(out, "")
+                    self.assertEqual(err, f"{index_path}: index entry 'ps' {tail}\n")
+                    self.assertNotIn("Traceback", err)
+                    self.assertEqual(os.listdir(tmp), ["index.json"])
+
+            # --pair reaches the same guard through the consumer entry.
+            pair_index = {"vs": {"stage": "vs"}, "ps": {"stage": "ps", "bary_fallback_input": [5]}}
+            with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(pair_index, f)
+            code, out, err = self._call_main(["bary_fallback_gs.py", tmp, "--pair", "vs", "ps"])
+            self.assertEqual(code, 1)
+            self.assertEqual(out, "")
+            self.assertEqual(err, f"{index_path}: index entry 'ps' has a bary_fallback_input that is not a "
+                                  "JSON object: [5]\n")
 
     def test_cli_subprocess_isolated_mode(self):
         def run_cli(*args):
