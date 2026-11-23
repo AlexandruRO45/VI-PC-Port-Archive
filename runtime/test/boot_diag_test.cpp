@@ -474,6 +474,35 @@ void test_breakpoint_restore_failure() {
     check(count_of(all_text(), "restore-failure disabled") == 1, "the breakpoint failure is logged once");
 }
 
+int previous_filter_calls = 0;
+EXCEPTION_POINTERS* previous_filter_info = nullptr;
+bool previous_filter_saw_report = false;
+
+LONG WINAPI fake_previous_filter(EXCEPTION_POINTERS* info) {
+    ++previous_filter_calls;
+    previous_filter_info = info;
+    previous_filter_saw_report = has(all_text(), "UNHANDLED");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void test_previous_filter() {
+    const auto original = SetUnhandledExceptionFilter(&fake_previous_filter);
+    install_fault_handlers(FaultConfig{});
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+    CONTEXT context{};
+    RtlCaptureContext(&context);
+    record.ExceptionAddress = reinterpret_cast<void*>(context.Rip);
+    EXCEPTION_POINTERS info{&record, &context};
+    clear_out();
+    const LONG result = detail::top_level_filter(&info);
+    check(previous_filter_calls == 1 && previous_filter_info == &info && previous_filter_saw_report,
+          "the previous filter receives the exception once after the report");
+    check(result == EXCEPTION_EXECUTE_HANDLER, "the previous filter's result is propagated");
+    remove_fault_handlers();
+    SetUnhandledExceptionFilter(original);
+}
+
 void test_handler_error_state() {
     EXCEPTION_RECORD record{};
     record.ExceptionCode = kThreadNameException;
@@ -766,6 +795,7 @@ int main(int argc, char** argv) {
     install_fault_handlers(fc);
     test_watchdog(w);
     remove_fault_handlers();
+    test_previous_filter();
     set_sink(nullptr, nullptr);
     test_unhandled();
 

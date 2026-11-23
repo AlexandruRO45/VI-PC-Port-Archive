@@ -400,7 +400,7 @@ inline LONG WINAPI top_level_filter(EXCEPTION_POINTERS* info) {
         dump_all_threads("an exception nobody handled; the process ends after this", nullptr);
         in_handler = false;
     }
-    return EXCEPTION_CONTINUE_SEARCH;  // the process ends as it would without this filter
+    return previous_filter ? previous_filter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
 }  // namespace detail
 
