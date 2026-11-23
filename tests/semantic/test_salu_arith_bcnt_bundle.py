@@ -114,6 +114,24 @@ class TestSAbsI32ASTAndInterpreter(unittest.TestCase):
         words = run_salu_bundle_ps(exec_prog, "ps_exec_s_abs_i32")
         self.assertEqual(words[0], 0x3)
 
+class TestSAbsI32SIMDAndEdgeCases(unittest.TestCase):
+    """Stage 3 for s_abs_i32: boundary edge cases and status flag tracking."""
+
+    def test_s_abs_i32_edge_cases(self):
+        cases = [(['s_mov_b32 s1, 0', 's_abs_i32 s0, s1'], 0), (['s_mov_b32 s1, 1', 's_abs_i32 s0, s1'], 1), (['s_mov_b32 s1, 0xFFFFFFFF', 's_abs_i32 s0, s1'], 1), (['s_mov_b32 s1, 0x7FFFFFFF', 's_abs_i32 s0, s1'], 2147483647), (['s_mov_b32 s1, 0x80000000', 's_abs_i32 s0, s1'], 2147483648)]
+        for idx, (lines, expected) in enumerate(cases):
+            with self.subTest(case_idx=idx):
+                prog = list(lines) + [
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                words = run_salu_bundle_ps(prog, f"ps_edge_s_abs_i32_{idx}")
+                self.assertEqual(words[0], expected)
+
 
 if __name__ == '__main__':
     unittest.main()
