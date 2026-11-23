@@ -113,6 +113,21 @@ class TestVCvtF16F32AST(unittest.TestCase):
         self.assertEqual(expr.eval(1.5), 0x3E00)
         self.assertEqual(expr.eval(-2.0), 0xC000)
 
+class TestVCvtF16F32SIMD(unittest.TestCase):
+    def test_simd_lane_divergence(self) -> None:
+        # 32 divergent lanes with varying exponents
+        inputs = [2.0 ** (i - 16) for i in range(32)]
+        results = [ref_v_cvt_f16_f32(x) for x in inputs]
+        for i, val in enumerate(inputs):
+            back = f16_bits_to_float(results[i])
+            self.assertAlmostEqual(back, val, places=2)
+
+    def test_ieee754_boundaries(self) -> None:
+        # Max normal f16 is 65504 (0x7BFF)
+        self.assertEqual(ref_v_cvt_f16_f32(65504.0), 0x7BFF)
+        # Smallest positive subnormal is 2^-24 ~ 5.96e-8 (0x0001)
+        self.assertEqual(ref_v_cvt_f16_f32(2.0 ** -24), 0x0001)
+
 
 if __name__ == "__main__":
     unittest.main()
