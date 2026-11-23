@@ -7506,7 +7506,7 @@ public:
             }
             if (optimal & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
                 s1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-                // A D3D12 multisample resolve needs the same image usages as texture_create_info(): colour
+                // A D3D12 multisample resolve needs the same image usages as TextureCreateInfo: colour
                 // attachment plus transfer source/destination (and the ordinary sampled usage).
                 VkImageFormatProperties image_properties{};
                 const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
