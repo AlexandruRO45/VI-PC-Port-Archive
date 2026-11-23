@@ -1424,7 +1424,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--amd-wave64-lds-workaround", "amd_wave64_lds_workaround"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -2542,6 +2543,9 @@ def main() -> int:
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
                          "native wave64 on affected AMD Windows drivers")
+    ap.add_argument("--amd-wave64-lds-workaround", action="store_true",
+                    help="optimize emulated wave64 compute shaders that use LDS with spirv-opt -Os "
+                         "(AMD Windows driver compilation crash, #857); use with --wave64-emulate on")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
                          "devices whose vk_pipeline_check skips a shader without "

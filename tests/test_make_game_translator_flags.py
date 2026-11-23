@@ -18,7 +18,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import make_game  # noqa: E402
 
-ALL_FLAGS = ("--no-float-controls", "--bary-fallback", "--texel-offset-fallback", "--mesh-compute")
+ALL_FLAGS = ("--no-float-controls", "--bary-fallback", "--texel-offset-fallback", "--mesh-compute",
+             "--amd-wave64-lds-workaround")
 
 
 class FallbackFlagsTest(unittest.TestCase):
@@ -69,9 +70,10 @@ class TranslateFallbacksTest(unittest.TestCase):
             return self.shards_in(spirv, fallbacks=fallbacks, jobs=jobs, pre_parts=pre_parts)
 
     def test_shards_get_the_fallback_flags(self):
-        for args in self.shards(fallbacks=("--no-float-controls", "--bary-fallback")):
-            self.assertEqual(args.count("--no-float-controls"), 1, args)
-            self.assertEqual(args.count("--bary-fallback"), 1, args)
+        flags = ("--no-float-controls", "--bary-fallback", "--amd-wave64-lds-workaround")
+        for args in self.shards(fallbacks=flags):
+            for flag in flags:
+                self.assertEqual(args.count(flag), 1, args)
 
     def test_no_fallback_flags_by_default(self):
         for args in self.shards():

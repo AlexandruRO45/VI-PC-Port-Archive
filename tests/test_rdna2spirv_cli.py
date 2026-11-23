@@ -331,7 +331,7 @@ class ValidatedOutput(unittest.TestCase):
         self.module = self.out / "ps_fixture.spv"
         self.index = self.out / "index.json"
 
-    def translate(self, *, reject_at=None):
+    def translate(self, *, reject_at=None, extra=()):
         def spirv_tool(cmd, **kwargs):
             tool = cmd[0]
             if tool == "spirv-as":
@@ -346,7 +346,7 @@ class ValidatedOutput(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, int(rejected), "", "synthetic rejection" if rejected else "")
 
         output = io.StringIO()
-        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out), *extra]), \
                 mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
             self.exit_code = rdna2spirv.main()
         return output.getvalue()
@@ -490,6 +490,52 @@ class ValidatedOutput(unittest.TestCase):
         self.assertEqual(len(message.strip().splitlines()), 1, message)
         self.assertFalse(self.module.exists())
         self.assertFalse(self.index.exists())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_amd_wave64_workaround_does_not_optimize_a_pixel_shader(self):
+        output = self.translate(extra=("--amd-wave64-lds-workaround",))
+        self.assertIn("1 pass spirv-val", output)
+        self.assertEqual(self.module.read_bytes(), b"new module")
+
+    def test_amd_wave64_workaround_validates_the_optimized_module_before_publishing(self):
+        calls = []
+        reject_output = False
+
+        def spirv_tool(cmd, **kwargs):
+            tool = cmd[0]
+            calls.append(tool)
+            path = Path(kwargs["cwd"], cmd[3] if tool == "spirv-as" else cmd[-1])
+            if tool == "spirv-as":
+                path.write_bytes(b"original module")
+            elif tool == "spirv-opt":
+                self.assertEqual(path.read_bytes(), b"original module")
+                path.write_bytes(b"optimized module")
+            elif tool == "spirv-val":
+                data = path.read_bytes()
+                self.assertEqual(data, b"original module" if calls[-2] == "spirv-as" else b"optimized module")
+                if reject_output and data == b"optimized module":
+                    return subprocess.CompletedProcess(cmd, 1, "", "synthetic optimized module rejected")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        argv = [TOOL, str(self.src), "--out", str(self.out), "--wave64-emulate", "--amd-wave64-lds-workaround"]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(rdna2spirv, "translate", return_value="synthetic assembly") as translate, \
+                mock.patch.object(rdna2spirv, "shader_meta", return_value={"stage": "cs"}), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(output):
+            translate.last_gen = mock.Mock(stage="cs", emulate=True, uses_lds=True)
+            rdna2spirv.main()
+            self.assertIn("1 pass spirv-val", output.getvalue())
+            self.assertEqual(calls, ["spirv-as", "spirv-val", "spirv-opt", "spirv-val"])
+            self.assertEqual(self.module.read_bytes(), b"optimized module")
+            calls.clear()
+            reject_output = True
+            rdna2spirv.main()
+            self.assertIn("INVALID: synthetic optimized module rejected", output.getvalue())
+            self.assertEqual(calls, ["spirv-as", "spirv-val", "spirv-opt", "spirv-val"])
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
         self.assertEqual(list(self.out.glob("*.tmp")), [])
 
     def test_validator_rejection_does_not_publish_binary(self):

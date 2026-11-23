@@ -295,6 +295,18 @@ on an Apple M3 Max (MoltenVK 1.4.2 and 1.4.3): 17 workgroup shapes from 1 to 102
 subgroups, with and without full subgroups and register pressure, all 32 lanes in order. A device whose default
 isn't the requested size still prints `not available`, and those tests skip.
 
+## AMD Windows wave64 LDS workaround
+
+On affected AMD Windows drivers ([#857](https://github.com/ItsNotRexed/Leonida/issues/857)), shader
+compilation can crash in the driver when wave64 compute shaders are emulated through workgroup
+memory. The build defaults to native wave64 on these drivers. For a build that needs emulation,
+add `--wave64-emulate on --amd-wave64-lds-workaround` to `make_game.py`. For direct translations,
+pass `--wave64-emulate --amd-wave64-lds-workaround` to `tools/rdna2spirv.py`.
+
+This uses `spirv-opt -Os` from SPIRV-Tools on emulated compute shaders that use LDS. Validation
+runs before and after optimization. The build records this flag with the shader outputs so that
+enabling or disabling it when resuming a build re-translates them.
+
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
 Graphics stages have no emulation: on a 32-wide subgroup a wave64 VS, PS or GS runs as two 32-lane halves, and the

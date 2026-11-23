@@ -17528,13 +17528,14 @@ def _run_spirv_tool(cmd, **kwargs):
         raise
 
 
-def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True):
+def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True, *, amd_wave64_lds_workaround=False):
     """Keep the assembled module out of the final path until validation succeeds.
 
     `assembler="spirv-as"` invokes the external spirv-as binary on `sa` (default);
     `assembler="python"` encodes `asm_text` (or reads `sa`) directly in memory with
     tools/spirv_asm.py, avoiding the spirv-as subprocess and temporary .spvasm I/O.
     When `validate=False`, skip running `spirv-val` after assembly.
+    The AMD LDS workaround optimizes a validated staging module and validates the result before publishing.
     """
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
@@ -17565,10 +17566,19 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True):
                     result.stdout = result.stdout.decode("utf-8", "replace")
                 if isinstance(result.stderr, bytes):
                     result.stderr = result.stderr.decode("utf-8", "replace")
+        # Offset on non-gather: VK_KHR_maintenance8
+        validator = ["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", tmp.name]
         if result.returncode == 0 and validate:
-            # Offset on non-gather: VK_KHR_maintenance8
-            result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
-                                     tmp.name], capture_output=True, text=True, cwd=folder)
+            result = _run_spirv_tool(validator, capture_output=True, text=True, cwd=folder)
+        if result.returncode == 0 and amd_wave64_lds_workaround:
+            # #857: the AMD Windows driver can crash compiling valid workgroup-based wave64 LDS shaders.
+            # Use our validator's maintenance8 allowances for the input and output, so spirv-opt needn't
+            # validate the input again with its stricter settings.
+            result = _run_spirv_tool(["spirv-opt", "--target-env=vulkan1.2", "--skip-validation",
+                                     "-Os", tmp.name, "-o", tmp.name],
+                                    capture_output=True, text=True, cwd=folder)
+            if result.returncode == 0:
+                result = _run_spirv_tool(validator, capture_output=True, text=True, cwd=folder)
         if result.returncode == 0:
             tmp.replace(sv)
         else:
@@ -17654,6 +17664,9 @@ def main():
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
+    ap.add_argument("--amd-wave64-lds-workaround", action="store_true",
+                    help="run spirv-opt -Os on emulated wave64 compute shaders that use LDS, to avoid an AMD "
+                         "Windows driver compilation crash (#857); needs spirv-opt on PATH")
     ap.add_argument("--wave64-graphics", choices=("warn", "error", "off"), default="warn",
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
@@ -17700,6 +17713,8 @@ def main():
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
     a = ap.parse_args()
+    if a.amd_wave64_lds_workaround and a.no_validate:
+        ap.error("--amd-wave64-lds-workaround requires spirv-val")
     # A file at --out (or one above it) can never become a folder. Refuse it here, before
     # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
     # shader_disasm.py and #1632's tex_export.py.
@@ -17831,14 +17846,16 @@ def main():
         if write_asm:
             with open(sa, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
+        g = translate.last_gen if a.amd_wave64_lds_workaround else None
+        workaround = bool(g and g.stage == "cs" and g.emulate and g.uses_lds)
         try:
-            r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler, validate=not a.no_validate)
+            r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler, validate=not a.no_validate,
+                               amd_wave64_lds_workaround=workaround)
         except OSError as e:
-            # A missing spirv-as/spirv-val fails every shader the same way; report it once as a setup
-            # error (exit 2) instead of a FileNotFoundError traceback from the first one.
-            if e.filename not in ("spirv-as", "spirv-val"):
+            # Report missing external tools once as a setup error (exit 2).
+            if e.filename not in ("spirv-as", "spirv-val", "spirv-opt"):
                 raise
-            print(f"ERROR: {e.filename} not found; install SPIRV-Tools (spirv-as, spirv-val) "
+            print(f"ERROR: {e.filename} not found; install SPIRV-Tools (spirv-as, spirv-val, spirv-opt) "
                   "and put it on PATH", file=sys.stderr)
             return 2
         if r.returncode == 0:
