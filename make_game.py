@@ -2534,7 +2534,9 @@ def path_is_within(path: str, directory: str) -> bool:
 
 def _invoke_stage(name: str, fn) -> None:
     """Run a stage (optionally on a worker thread). fail() uses sys.exit; turn that into an exception the pool
-    can collect so siblings can finish before the process stops."""
+    can collect so siblings can finish before the process stops. Any other exception (OSError, ValueError...)
+    has printed nothing yet: report it through fail()'s channel first, on one line, so the run does not stop
+    with exit code 1 and no message."""
     with leonida_tui.stage_scope(name):
         try:
             fn()
@@ -2542,6 +2544,13 @@ def _invoke_stage(name: str, fn) -> None:
             if e.code in (0, None):
                 return
             raise RuntimeError(f"stage exited with {e.code}") from e
+        except Exception as e:
+            detail = " ".join(str(e).splitlines())
+            try:
+                fail(f"{name} stage failed: {type(e).__name__}: {detail}")
+            except SystemExit:
+                pass
+            raise RuntimeError(f"stage {name} raised {type(e).__name__}") from e
 
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,

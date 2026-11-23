@@ -349,6 +349,39 @@ class SerialOverlapTest(unittest.TestCase):
         self.assertIn("start-pipelines", order)
         self.assertLess(order.index("end-runtime"), order.index("start-pipelines"))
 
+    def test_stage_exception_is_reported_before_exit(self):
+        """A stage raising something other than fail()/SystemExit must print an error, not exit 1 silently."""
+        import io
+
+        denied = os.path.join("some", "dir", "locked.bin")
+
+        def boom(*a, **k):
+            raise PermissionError(13, "Permission denied", denied)
+
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap), tempfile.TemporaryDirectory() as tmp:
+                game = os.path.join(tmp, "g")
+                os.makedirs(game)
+                err = io.StringIO()
+                with mock.patch.object(make_game, "shaders"), \
+                        mock.patch.object(make_game, "assets", side_effect=boom), \
+                        mock.patch.object(make_game, "runtime"), \
+                        mock.patch.object(make_game, "log"), \
+                        mock.patch.object(leonida_tui, "current_board", return_value=None), \
+                        mock.patch.object(sys, "stderr", err):
+                    with self.assertRaises(SystemExit) as cm:
+                        make_game.run_build_stages(
+                            ["shaders", "assets", "runtime"],
+                            game=game, work=os.path.join(tmp, "w"), out=os.path.join(tmp, "o"), v={},
+                            wav=False, jobs=2, runtime_build=None, emulate=False, keep_emulated=True,
+                            fallbacks=(), overlap=overlap)
+                self.assertEqual(cm.exception.code, 1)
+                text = err.getvalue()
+                self.assertIn("ERROR:", text)
+                self.assertIn("assets", text)
+                self.assertIn("PermissionError", text)
+                self.assertIn("locked.bin", text)
+
 
 class SetupDefaultsTest(unittest.TestCase):
     def test_esc_keeps_clamped_defaults(self):
