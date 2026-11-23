@@ -473,5 +473,24 @@ class TestSMulHiU32Oracle(unittest.TestCase):
     def test_oracle_zero_operands(self) -> None:
         self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0), 0)
 
+class TestSMulHiU32ASTAndSignExtensions(unittest.TestCase):
+    def test_ast_instruction_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.S_MUL_HI_U32,
+            ASTOperand.sgpr(4),
+            ASTOperand.sgpr(2),
+            ASTOperand.sgpr(3),
+        )
+        self.assertEqual(inst.disasm(), "s_mul_hi_u32 s4, s2, s3")
+
+    def test_imm_source_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.S_MUL_HI_U32,
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(1),
+            ASTOperand.imm(0x80000000),
+        )
+        self.assertEqual(inst.disasm(), "s_mul_hi_u32 s0, s1, 0x80000000")
+
 if __name__ == "__main__":
     unittest.main()
