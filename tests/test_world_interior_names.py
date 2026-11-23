@@ -391,6 +391,42 @@ class CliTest(unittest.TestCase):
         self.assertEqual(asked, [70])
         self.assertEqual((s["interior_names"], s["placements"]), (2, 3))  # 70 windows on 2 workers, same result
 
+    def test_no_report_is_written_without_out(self):
+        # The report holds game data (every key's hash and distances), so the default run must not leave it in the
+        # folder it is started from; it used to write reports/world_interior_names.json there.
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(interiors())
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            with redirect_stdout(io.StringIO()) as so:
+                self.assertEqual(T.main([folder, "--names", self.names]), 0)
+        finally:
+            os.chdir(cwd)
+        self.assertIn("interior_names", so.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "reports")))
+
+    def test_an_out_it_cannot_write_is_one_line(self):
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(interiors())
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("not a folder")
+        err = io.StringIO()
+        sys.stderr, saved = err, sys.stderr
+        try:
+            with redirect_stdout(io.StringIO()) as so:
+                self.assertEqual(T.main([folder, "--names", self.names,
+                                         "--out", os.path.join(blocker, "r.json")]), 2)
+        finally:
+            sys.stderr = saved
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        self.assertEqual(so.getvalue(), "")
+
     def test_malformed_names_file_is_one_line(self):
         folder = os.path.join(self.tmp.name, "carved")
         os.makedirs(folder)
