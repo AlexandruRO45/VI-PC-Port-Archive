@@ -134,6 +134,94 @@ def run_compute_kernel(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand representation."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > 256:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class DSOffset:
+    """Immediate byte offset modifier for DS instructions."""
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.offset < 0 or self.offset > 65535:
+            raise ValueError(f"offset must be in unsigned 16-bit range [0, 65535]: {self.offset}")
+
+
+class Opcode(enum.Enum):
+    """LDS instruction opcodes."""
+    DS_READ_I16 = "ds_read_i16"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a ds_read_i16 instruction."""
+    opcode: Opcode
+    vdst: Register
+    vaddr: Register
+    offset: DSOffset = dataclasses.field(default_factory=DSOffset)
+
+    def __post_init__(self) -> None:
+        if not self.vdst.is_vgpr or self.vdst.count != 1:
+            raise ValueError(f"vdst must be a single 32-bit VGPR (count=1): {self.vdst}")
+        if not self.vaddr.is_vgpr or self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a single 32-bit VGPR (count=1): {self.vaddr}")
+
+    def to_assembly(self) -> str:
+        vd_str = self.vdst.format_asm()
+        va_str = self.vaddr.format_asm()
+        off_str = f" offset:{self.offset.offset}" if self.offset.offset != 0 else ""
+        return f"{self.opcode.value} {vd_str}, {va_str}{off_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of LDS instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
 class TestLdsReadI16ReferenceOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and hardware translator execution."""
 
@@ -180,6 +268,69 @@ class TestLdsReadI16ReferenceOracle(unittest.TestCase):
         self.assertIn("OpBitFieldSExtract", spv)
         mem = run_compute_kernel(lines, lanes=1)
         self.assertEqual(mem.get(0), 0xFFFF8000)
+
+
+
+class TestLdsReadI16AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_construction(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        v1 = Register(RegKind.VGPR, 1)
+        self.assertEqual(v0.format_asm(), "v0")
+        self.assertEqual(v1.format_asm(), "v1")
+
+    def test_instruction_formatting(self) -> None:
+        inst_no_off = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 3),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        self.assertEqual(inst_no_off.to_assembly(), "ds_read_i16 v3, v1")
+
+        inst_with_off = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 4),
+            vaddr=Register(RegKind.VGPR, 2),
+            offset=DSOffset(offset=12),
+        )
+        self.assertEqual(inst_with_off.to_assembly(), "ds_read_i16 v4, v2 offset:12")
+
+    def test_instruction_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_READ_I16,
+                vdst=Register(RegKind.SGPR, 1),
+                vaddr=Register(RegKind.VGPR, 2),
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_READ_I16,
+                vdst=Register(RegKind.VGPR, 1),
+                vaddr=Register(RegKind.SGPR, 2),
+            )
+
+    def test_offset_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            DSOffset(offset=-1)
+        with self.assertRaises(ValueError):
+            DSOffset(offset=65536)
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 5),
+            vaddr=Register(RegKind.VGPR, 1),
+            offset=DSOffset(offset=2),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 6),
+            vaddr=Register(RegKind.VGPR, 1),
+        ))
+        expected = "ds_read_i16 v5, v1 offset:2\nds_read_i16 v6, v1"
+        self.assertEqual(prog.to_assembly(), expected)
 
 
 if __name__ == "__main__":
