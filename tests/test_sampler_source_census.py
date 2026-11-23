@@ -590,6 +590,25 @@ class SamplerSourceCensus(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR: cannot read the carve index"), p.stderr)
 
+    def test_json_report_refuses_to_overwrite_an_input(self):
+        """The report is written after every input was read, so a --json naming one must be refused first."""
+        self.work.add("a", "ps", USER_TABLE)
+        index = os.path.join(self.work.root, "index.json")
+        with open(index, "rb") as f:
+            before = f.read()
+        for target, message in ((index, "ERROR: --json would overwrite the carve index"),
+                                (os.path.join(self.work.disasm, "a.s"),
+                                 "ERROR: --json must not write inside the disasm folder"),
+                                (os.path.join(self.work.root, "a.dxbc"),
+                                 "ERROR: --json would overwrite an input the census reads")):
+            p = subprocess.run([sys.executable, "-I", TOOL, self.work.disasm, "--json", target],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            self.assertTrue(p.stderr.startswith(message), p.stderr)
+            self.assertEqual(p.stdout, "")                 # refused before the census printed anything
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), before)             # and the carve index still holds what it did
+
 
 if __name__ == "__main__":
     unittest.main()
