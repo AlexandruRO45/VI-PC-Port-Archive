@@ -2044,7 +2044,10 @@ Pipeline creation:
     size is `E_INVALIDARG`, and `*ppPipelineLibrary` is left as it was. One of the layer's own blobs from another
     format version is `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, the documented code for a cache from another driver.
     A pointer with size 0 is an empty library; a longer blob than the header is accepted; a null output is
-    `S_FALSE`.
+    `S_FALSE`. The layer's blob (format version 2) holds, per stored PSO, its name, kind and `GetCachedBlob` bytes:
+    the library made from it loads those names, rebuilding each PSO from the description passed to `Load*` (which
+    must match the stored key, else `E_INVALIDARG`); a blob cut short or with a bad length is `E_INVALIDARG`, one
+    made on another adapter or driver `D3D12_ERROR_ADAPTER_NOT_FOUND` or `D3D12_ERROR_DRIVER_VERSION_MISMATCH`.
   - The library is a device child, not a pageable object: `QueryInterface(ID3D12Pageable)` is `E_NOINTERFACE`.
   - `LoadComputePipeline`/`LoadGraphicsPipeline`/`LoadPipeline` with a null output are `E_INVALIDARG`, as is an
     unknown or empty name. `Serialize` with a buffer smaller than `GetSerializedSize()` is `E_INVALIDARG`. The

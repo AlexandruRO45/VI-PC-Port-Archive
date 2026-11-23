@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <cstring>
 #include <memory>
@@ -3107,6 +3108,7 @@ public:
 
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
     void set_cache_key(leonida::cached_pso::Key key) { cache_key_ = std::move(key); }
+    bool has_cache_key() const { return !cache_key_.empty(); }
 
     // A null pointer is accepted with S_OK, as by the PC runtime (measured on an RTX 3060 and WARP).
     HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob** blob) override {
@@ -3979,9 +3981,16 @@ struct TextureView {
 };
 
 // In-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4). D3D12 cached blobs are driver-specific
-// and ignored across runs; Serialize writes a versioned header so CreatePipelineLibrary recognizes our own blobs.
+// and ignored across runs. Serialize writes the versioned header, then per entry (sorted by name, so equal libraries
+// give equal blobs): the name length and its characters (u32 each), a flags byte (1 compute, 2 graphics; exactly one),
+// the length of the PSO's cached blob (0 or cached_pso::blob_bytes) and those bytes. The cached blob already carries
+// the adapter, the driver and the description key (src/cached_pso.h), so a library restored from a blob has no PSO
+// yet: LoadComputePipeline and LoadGraphicsPipeline rebuild it from the description they are given with the stored
+// blob as its CachedPSO, which the device checks like any other CachedPSO. A PSO made from a stream carries no key;
+// LoadPipeline rebuilds it from the stream and the entry's kind is checked.
 // As on the host runtime (d3d12_pipeline_library_host_test), a foreign, truncated or corrupt blob is E_INVALIDARG;
-// one of ours from another version is D3D12_ERROR_DRIVER_VERSION_MISMATCH. A pipeline library is a device child,
+// one of ours from another version is D3D12_ERROR_DRIVER_VERSION_MISMATCH, one made on another adapter or driver
+// D3D12_ERROR_ADAPTER_NOT_FOUND or D3D12_ERROR_DRIVER_VERSION_MISMATCH. A pipeline library is a device child,
 // not a pageable object: the host answers E_NOINTERFACE for ID3D12Pageable.
 class PipelineLibrary final
     : public Child<PipelineLibrary, ID3D12PipelineLibrary1Stubs, ID3D12Object, ID3D12DeviceChild,
@@ -3997,12 +4006,21 @@ public:
         std::uint32_t reserved;
     };
     static constexpr std::uint32_t kMagic = 0x314C504Cu;  // "LPL1"
-    static constexpr std::uint32_t kVersion = 1;
+    static constexpr std::uint32_t kVersion = 2;          // 2: entries follow the header
+    static constexpr std::uint8_t kFlagCompute = 1;
+    static constexpr std::uint8_t kFlagGraphics = 2;
+
+    struct Entry {
+        ID3D12PipelineState* pso = nullptr;  // null for an entry restored from a blob
+        std::vector<std::uint8_t> blob;      // GetCachedBlob's bytes; empty for a PSO without a key
+        std::uint8_t flags = 0;
+    };
+    using EntryMap = std::map<std::wstring, Entry>;
 
     ~PipelineLibrary() override {
         std::lock_guard lock(mutex_);
-        for (auto& [name, pso] : entries_)
-            if (pso) pso->Release();
+        for (auto& [name, entry] : entries_)
+            if (entry.pso) entry.pso->Release();
         entries_.clear();
     }
 
@@ -4016,12 +4034,75 @@ public:
         return h.version == kVersion ? S_OK : D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     }
 
+    // check_blob, then the entries. Every length is checked against what is left of the blob before it is used.
+    // The structure is checked first (E_INVALIDARG); then each cached blob against this device
+    // (D3D12_ERROR_ADAPTER_NOT_FOUND, D3D12_ERROR_DRIVER_VERSION_MISMATCH).
+    static HRESULT parse_blob(const void* data, SIZE_T size, const leonida::cached_pso::Identity& identity,
+                              EntryMap& out) {
+        if (const HRESULT hr = check_blob(data, size); FAILED(hr)) return hr;
+        namespace cp = leonida::cached_pso;
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        Header h{};
+        std::memcpy(&h, bytes, sizeof(h));
+        std::size_t pos = sizeof(Header);
+        const auto left = [&] { return static_cast<std::size_t>(size) - pos; };
+        EntryMap entries;
+        for (std::uint32_t i = 0; i < h.count; ++i) {
+            if (left() < 4) return E_INVALIDARG;
+            const std::uint32_t length = cp::get32(bytes + pos);
+            pos += 4;
+            if (length == 0 || length > left() / 4) return E_INVALIDARG;
+            std::wstring name(length, L'\0');
+            for (std::uint32_t c = 0; c < length; ++c) {
+                const std::uint32_t unit = cp::get32(bytes + pos + 4u * c);
+                if (unit == 0 || unit > static_cast<std::uint32_t>((std::numeric_limits<wchar_t>::max)())) return E_INVALIDARG;
+                name[c] = static_cast<wchar_t>(unit);
+            }
+            pos += 4u * length;
+            if (left() < 5) return E_INVALIDARG;
+            Entry entry;
+            entry.flags = bytes[pos++];
+            if (entry.flags != kFlagCompute && entry.flags != kFlagGraphics) return E_INVALIDARG;
+            const std::uint32_t blob_size = cp::get32(bytes + pos);
+            pos += 4;
+            if (blob_size != 0 && blob_size != cp::blob_bytes) return E_INVALIDARG;
+            if (blob_size > left()) return E_INVALIDARG;
+            entry.blob.assign(bytes + pos, bytes + pos + blob_size);
+            pos += blob_size;
+            if (!entries.emplace(std::move(name), std::move(entry)).second) return E_INVALIDARG;
+        }
+        for (const auto& [name, entry] : entries) {
+            if (entry.blob.empty()) continue;
+            constexpr std::size_t kKeyOffset = 4 + 4 + 12 + 16;
+            const cp::Key key(reinterpret_cast<const char*>(entry.blob.data()) + kKeyOffset, cp::key_bytes);
+            if (const HRESULT hr = check_cached_pso(identity, key, {entry.blob.data(), entry.blob.size()}); FAILED(hr))
+                return hr;
+        }
+        out = std::move(entries);
+        return S_OK;
+    }
+
+    void adopt(EntryMap entries) {
+        std::lock_guard lock(mutex_);
+        entries_ = std::move(entries);
+    }
+
     HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pipeline) override {
         if (!name || !*name || !pipeline) return E_INVALIDARG;
-        if (!PipelineState::from<PipelineState>(pipeline)) return E_INVALIDARG;
+        PipelineState* ps = PipelineState::from<PipelineState>(pipeline);
+        if (!ps) return E_INVALIDARG;
+        Entry entry;
+        entry.pso = pipeline;
+        entry.flags = ps->graphics() ? kFlagGraphics : kFlagCompute;
+        if (ps->has_cache_key()) {
+            ID3DBlob* cached = nullptr;
+            if (FAILED(ps->GetCachedBlob(&cached)) || !cached) return E_FAIL;
+            const auto* p = static_cast<const std::uint8_t*>(cached->GetBufferPointer());
+            entry.blob.assign(p, p + cached->GetBufferSize());
+            cached->Release();
+        }
         std::lock_guard lock(mutex_);
-        auto [it, inserted] = entries_.emplace(name, pipeline);
-        if (!inserted) return E_INVALIDARG;
+        if (!entries_.emplace(name, std::move(entry)).second) return E_INVALIDARG;
         pipeline->AddRef();
         return S_OK;
     }
@@ -4031,7 +4112,7 @@ public:
         if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
         *out = nullptr;
         if (!name || !*name || !desc) return E_INVALIDARG;
-        return load_entry(name, false, true, riid, out);
+        return load_entry(name, false, true, desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
@@ -4039,7 +4120,7 @@ public:
         if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
         *out = nullptr;
         if (!name || !*name || !desc) return E_INVALIDARG;
-        return load_entry(name, true, false, riid, out);
+        return load_entry(name, true, false, desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
@@ -4047,33 +4128,95 @@ public:
         if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
         *out = nullptr;
         if (!name || !*name || !desc || !desc->SizeInBytes || !desc->pPipelineStateSubobjectStream) return E_INVALIDARG;
-        return load_entry(name, false, false, riid, out);
+        return load_entry(name, false, false, desc, riid, out);
     }
 
-    SIZE_T STDMETHODCALLTYPE GetSerializedSize() override { return sizeof(Header); }
+    SIZE_T STDMETHODCALLTYPE GetSerializedSize() override {
+        std::lock_guard lock(mutex_);
+        return serialized_size_locked();
+    }
 
     HRESULT STDMETHODCALLTYPE Serialize(void* data, SIZE_T size) override {
-        if (!data || size < sizeof(Header)) return E_INVALIDARG;
+        if (!data) return E_INVALIDARG;
         std::lock_guard lock(mutex_);
-        const Header h{kMagic, kVersion, static_cast<std::uint32_t>(entries_.size()), 0};
-        std::memcpy(data, &h, sizeof(h));
+        const std::size_t need = serialized_size_locked();
+        if (size < need) return E_INVALIDARG;
+        namespace cp = leonida::cached_pso;
+        std::vector<std::uint8_t> out;
+        out.reserve(need);
+        cp::put32(out, kMagic);
+        cp::put32(out, kVersion);
+        cp::put32(out, static_cast<std::uint32_t>(entries_.size()));
+        cp::put32(out, 0);
+        for (const auto& [name, entry] : entries_) {
+            cp::put32(out, static_cast<std::uint32_t>(name.size()));
+            for (const wchar_t c : name) cp::put32(out, static_cast<std::uint32_t>(c));
+            out.push_back(entry.flags);
+            cp::put32(out, static_cast<std::uint32_t>(entry.blob.size()));
+            out.insert(out.end(), entry.blob.begin(), entry.blob.end());
+        }
+        std::memcpy(data, out.data(), out.size());
         return S_OK;
     }
 
 private:
-    HRESULT load_entry(LPCWSTR name, bool require_compute, bool require_graphics, REFIID riid, void** out) {
+    std::size_t serialized_size_locked() const {
+        std::size_t total = sizeof(Header);
+        for (const auto& [name, entry] : entries_) total += 4 + 4 * name.size() + 1 + 4 + entry.blob.size();
+        return total;
+    }
+
+    HRESULT load_entry(LPCWSTR name, bool require_compute, bool require_graphics, const void* desc, REFIID riid,
+                       void** out) {
         std::lock_guard lock(mutex_);
         const auto it = entries_.find(name);
         if (it == entries_.end()) return E_INVALIDARG;
-        PipelineState* ps = PipelineState::from<PipelineState>(it->second);
+        if (!it->second.pso) return rebuild_entry(it->second, require_compute, require_graphics, desc, riid, out);
+        PipelineState* ps = PipelineState::from<PipelineState>(it->second.pso);
         if (!ps) return E_INVALIDARG;
         if (require_compute && !ps->compute()) return E_INVALIDARG;
         if (require_graphics && !ps->graphics()) return E_INVALIDARG;
-        return it->second->QueryInterface(riid, out);
+        return it->second.pso->QueryInterface(riid, out);
+    }
+
+    // An entry restored from a blob: a new PSO from the description, checked against the stored cached blob.
+    HRESULT rebuild_entry(const Entry& entry, bool require_compute, bool require_graphics, const void* desc,
+                          REFIID riid, void** out) {
+        if (require_compute && !(entry.flags & kFlagCompute)) return E_INVALIDARG;
+        if (require_graphics && !(entry.flags & kFlagGraphics)) return E_INVALIDARG;
+        ID3D12Device* device = nullptr;
+        if (FAILED(GetDevice(IID_PPV_ARGS(&device))) || !device) return E_FAIL;
+        const D3D12_CACHED_PIPELINE_STATE cached{entry.blob.empty() ? nullptr : entry.blob.data(), entry.blob.size()};
+        HRESULT hr = E_INVALIDARG;
+        if (require_compute) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC copy = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc);
+            copy.CachedPSO = cached;
+            hr = device->CreateComputePipelineState(&copy, riid, out);
+        } else if (require_graphics) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC copy = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc);
+            copy.CachedPSO = cached;
+            hr = device->CreateGraphicsPipelineState(&copy, riid, out);
+        } else {
+            ID3D12Device2* device2 = nullptr;
+            if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device2))) && device2) {
+                ID3D12PipelineState* built = nullptr;
+                hr = device2->CreatePipelineState(static_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(desc),
+                                                  IID_PPV_ARGS(&built));
+                device2->Release();
+                if (SUCCEEDED(hr)) {
+                    const PipelineState* ps = PipelineState::from<PipelineState>(built);
+                    const bool right_kind = ps && (entry.flags & kFlagCompute ? ps->compute() : ps->graphics());
+                    hr = right_kind ? built->QueryInterface(riid, out) : E_INVALIDARG;
+                    built->Release();
+                }
+            }
+        }
+        device->Release();
+        return hr;
     }
 
     std::mutex mutex_;
-    std::unordered_map<std::wstring, ID3D12PipelineState*> entries_;
+    EntryMap entries_;
 };
 
 // Process-wide backing for ID3D12Device9::CreateShaderCacheSession and ID3D12ShaderCacheSession (D3D-34).
@@ -5804,13 +5947,15 @@ public:
     HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void* blob, SIZE_T size, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device1::CreatePipelineLibrary";
         // A refused blob leaves *out as it was, as the host runtime does; a wrong interface nulls it (hand_out).
+        PipelineLibrary::EntryMap restored;
         if (size > 0) {
-            const HRESULT checked = PipelineLibrary::check_blob(blob, size);
+            const HRESULT checked = PipelineLibrary::parse_blob(blob, size, state_.pso_identity, restored);
             if (FAILED(checked)) return d3d12_trace::result(method, checked);
         }
         if (!out) return d3d12_trace::result(method, S_FALSE);
         *out = nullptr;
         auto* lib = new PipelineLibrary();
+        lib->adopt(std::move(restored));
         lib->attach_device(identity());
         return d3d12_trace::result(method, hand_out(lib, riid, out));
     }

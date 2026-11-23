@@ -13,6 +13,7 @@
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
+#include "../src/cached_pso.h"
 #include "../src/shader_library.h"
 
 #include <cstring>
@@ -107,12 +108,12 @@ int main() {
         Ref<ID3D12PipelineLibrary> bad;
         EXPECT(device->CreatePipelineLibrary(nullptr, 16, IID_PPV_ARGS(&bad.p)) == E_INVALIDARG && !bad.p);
         // A foreign or truncated blob is E_INVALIDARG, as on the host runtime (d3d12_pipeline_library_host_test);
-        // one of ours from another version is D3D12_ERROR_DRIVER_VERSION_MISMATCH ("LPL1", version 2).
+        // one of ours from another version is D3D12_ERROR_DRIVER_VERSION_MISMATCH ("LPL1", version 3).
         const std::uint32_t foreign[4] = {0xDEADBEEFu, 1u, 0u, 0u};
         EXPECT(device->CreatePipelineLibrary(foreign, sizeof(foreign), IID_PPV_ARGS(&bad.p)) == E_INVALIDARG && !bad.p);
         const std::uint8_t tiny[4] = {1, 2, 3, 4};
         EXPECT(device->CreatePipelineLibrary(tiny, sizeof(tiny), IID_PPV_ARGS(&bad.p)) == E_INVALIDARG && !bad.p);
-        const std::uint32_t other_version[4] = {0x314C504Cu, 2u, 0u, 0u};
+        const std::uint32_t other_version[4] = {0x314C504Cu, 3u, 0u, 0u};
         EXPECT(device->CreatePipelineLibrary(other_version, sizeof(other_version), IID_PPV_ARGS(&bad.p)) ==
                    D3D12_ERROR_DRIVER_VERSION_MISMATCH &&
                !bad.p);
@@ -216,6 +217,75 @@ int main() {
     Ref<ID3D12PipelineLibrary> reloaded;
     EXPECT(SUCCEEDED(device->CreatePipelineLibrary(blob.data(), blob.size(), IID_PPV_ARGS(&reloaded.p))) && reloaded.p);
 
+    // GetSerializedSize is exactly what Serialize writes: header, then per entry the name (length + u32 chars), a
+    // flags byte, the cached blob's length and bytes.
+    Ref<ID3DBlob> cs_cached, gfx_cached;
+    EXPECT(SUCCEEDED(cs_pso->GetCachedBlob(&cs_cached.p)) && SUCCEEDED(gfx_pso->GetCachedBlob(&gfx_cached.p)));
+    EXPECT(blob_size == 16 + (4 + 4 * 2 + 1 + 4 + cs_cached.p->GetBufferSize()) +
+                            (4 + 4 * 3 + 1 + 4 + gfx_cached.p->GetBufferSize()));
+    std::vector<std::uint8_t> roomy(blob_size + 8, 0xCD);
+    EXPECT(SUCCEEDED(lib->Serialize(roomy.data(), roomy.size())));
+    EXPECT(std::memcmp(roomy.data(), blob.data(), blob_size) == 0);
+    for (std::size_t i = blob_size; i < roomy.size(); ++i) EXPECT(roomy[i] == 0xCD);
+
+    // 3b. A library restored from the blob loads what was stored: the PSO is rebuilt from the description.
+    Ref<ID3D12PipelineState> restored_cs, restored_gfx, nope;
+    EXPECT(reloaded->LoadComputePipeline(L"missing", &cs_desc, IID_PPV_ARGS(&nope.p)) == E_INVALIDARG && !nope.p);
+    EXPECT(reloaded->LoadComputePipeline(L"gfx", &cs_desc, IID_PPV_ARGS(&nope.p)) == E_INVALIDARG && !nope.p);
+    EXPECT(reloaded->LoadGraphicsPipeline(L"cs", &gfx_desc, IID_PPV_ARGS(&nope.p)) == E_INVALIDARG && !nope.p);
+    {
+        // A description that is not the stored one fails the stored key.
+        D3D12_COMPUTE_PIPELINE_STATE_DESC other = cs_desc;
+        const auto other_dxbc = shader_container(fssm_program({0x43532001, 0xbf810000, 0xbf810000}));
+        other.CS = {other_dxbc.data(), other_dxbc.size()};
+        EXPECT(reloaded->LoadComputePipeline(L"cs", &other, IID_PPV_ARGS(&nope.p)) == E_INVALIDARG && !nope.p);
+    }
+    EXPECT(SUCCEEDED(reloaded->LoadComputePipeline(L"cs", &cs_desc, IID_PPV_ARGS(&restored_cs.p))) && restored_cs.p);
+    EXPECT(restored_cs.p != cs_pso.p);
+    EXPECT(SUCCEEDED(reloaded->LoadGraphicsPipeline(L"gfx", &gfx_desc, IID_PPV_ARGS(&restored_gfx.p))) &&
+           restored_gfx.p);
+
+    // A restored library serializes to the same bytes.
+    {
+        std::vector<std::uint8_t> again(reloaded->GetSerializedSize());
+        EXPECT(again.size() == blob.size());
+        EXPECT(SUCCEEDED(reloaded->Serialize(again.data(), again.size())));
+        EXPECT(again == blob);
+    }
+
+    // 3c. Truncated, corrupt and foreign blobs are refused at create, and *out is left alone.
+    for (std::size_t n = 1; n < blob.size(); ++n) {
+        Ref<ID3D12PipelineLibrary> cut;
+        EXPECT(device->CreatePipelineLibrary(blob.data(), n, IID_PPV_ARGS(&cut.p)) == E_INVALIDARG && !cut.p);
+    }
+    {
+        Ref<ID3D12PipelineLibrary> bad;
+        auto huge_name = blob;
+        const std::uint32_t big = 0xFFFFFFFFu;
+        std::memcpy(huge_name.data() + 16, &big, sizeof(big));  // the first entry's name length
+        EXPECT(device->CreatePipelineLibrary(huge_name.data(), huge_name.size(), IID_PPV_ARGS(&bad.p)) == E_INVALIDARG &&
+               !bad.p);
+        auto huge_count = blob;
+        std::memcpy(huge_count.data() + 8, &big, sizeof(big));
+        EXPECT(device->CreatePipelineLibrary(huge_count.data(), huge_count.size(), IID_PPV_ARGS(&bad.p)) ==
+                   E_INVALIDARG &&
+               !bad.p);
+        auto flipped = blob;
+        flipped.back() ^= 0x5A;  // inside the last cached blob's checksum
+        EXPECT(device->CreatePipelineLibrary(flipped.data(), flipped.size(), IID_PPV_ARGS(&bad.p)) == E_INVALIDARG &&
+               !bad.p);
+        // A cached blob from another adapter (its vendor id, with the checksum made again) is refused as one.
+        auto other_adapter = blob;
+        const std::size_t cached_at = 16 + 4 + 4 * 2 + 1 + 4;  // the first entry's cached blob
+        other_adapter[cached_at + 8] ^= 0xFF;
+        const std::uint32_t sum = leonida::cached_pso::fnv1a(other_adapter.data() + cached_at,
+                                                            leonida::cached_pso::blob_bytes - 4);
+        std::memcpy(other_adapter.data() + cached_at + leonida::cached_pso::blob_bytes - 4, &sum, sizeof(sum));
+        EXPECT(device->CreatePipelineLibrary(other_adapter.data(), other_adapter.size(), IID_PPV_ARGS(&bad.p)) ==
+                   D3D12_ERROR_ADAPTER_NOT_FOUND &&
+               !bad.p);
+    }
+
     // 4. Execute the loaded compute PSO and loaded graphics PSO on the GPU.
     Ref<ID3D12CommandQueue> queue;
     const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
@@ -293,7 +363,7 @@ int main() {
     const float offset[2] = {0.0f, 0.0f};
     list->SetGraphicsRoot32BitConstants(0, 2, offset, 0);
     list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
-    list->SetPipelineState(loaded_gfx.p);
+    list->SetPipelineState(restored_gfx.p);
     list->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
     const auto to_src = transition(rt.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
