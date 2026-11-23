@@ -521,18 +521,23 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     entry_scale[0] = {}
     entry_pstride[0] = {}
     entry_vscale[0] = {}
-    decoded = [None] * nblk
+    def iter_block_ops(b):
+        for ins in blocks[b]:
+            op = base_op(ins["op"])
+            if op == "s_endpgm":
+                break
+            reads, writes = _split_operands(ins, op)
+            yield ins, op, reads, writes
+
+    multi_pass = nblk > 1 or bool(succ[0])
+    decoded = [None] * nblk if multi_pass else None
 
     def block_ops(b):
+        if not multi_pass:
+            return iter_block_ops(b)
         ops = decoded[b]
         if ops is None:
-            ops = []
-            for ins in blocks[b]:
-                op = base_op(ins["op"])
-                if op == "s_endpgm":
-                    break
-                reads, writes = _split_operands(ins, op)
-                ops.append((ins, op, reads, writes))
+            ops = list(iter_block_ops(b))
             decoded[b] = ops
         return ops
 
@@ -542,7 +547,7 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
             out[k] = out[k] | v if k in out else v
         return out
 
-    if nblk > 1 or succ[0]:
+    if multi_pass:
         work = [0]
         while work:
             b = work.pop()
