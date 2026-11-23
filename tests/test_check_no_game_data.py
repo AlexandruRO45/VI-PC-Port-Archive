@@ -7,6 +7,7 @@ name, files that must pass (text, PNG, a lone "MZ", magics past the start), and 
 repository. The script runs as itself, through its own command line.
 """
 import bz2
+import codecs
 import gzip
 import io
 import lzma
@@ -261,6 +262,36 @@ class CheckNoGameData(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("renamed.txt: FSSM shader", result.stdout)
         self.assertNotIn("untracked.bin", result.stdout)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("git"), "POSIX locales only; needs git")
+    def test_tracked_names_round_trip_under_a_latin1_locale(self):
+        # Every name tracked_files() returns encodes back to the bytes Git lists, so the file is read, not skipped.
+        git = ["git", "-c", "init.defaultBranch=main"]
+        subprocess.run([*git, "init", "-q", self.dir], check=True)
+        for name in (b"plain.txt", "caf\u00e9.txt".encode("utf-8")):
+            with open(os.path.join(os.fsencode(self.dir), name), "wb") as f:
+                f.write(b"plain text\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.dir, check=True)
+        listed = subprocess.run(["git", "ls-files", "-z"], cwd=self.dir, check=True, capture_output=True).stdout
+        expected = sorted(f"{n.hex()} True" for n in listed.split(b"\0") if n)
+        self.assertEqual(len(expected), 2, expected)
+        probe = ("import importlib.util, os, sys\n"
+                 "spec = importlib.util.spec_from_file_location('check', sys.argv[1])\n"
+                 "module = importlib.util.module_from_spec(spec)\n"
+                 "spec.loader.exec_module(module)\n"
+                 "print(sys.getfilesystemencoding())\n"
+                 "for p in module.tracked_files(os.getcwd()):\n"
+                 "    print(os.fsencode(os.path.relpath(p)).hex(), os.path.isfile(p))\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LC_") and k != "LANG"}
+        for locale_name in ("en_US.ISO-8859-1", "en_US.ISO8859-1", "de_DE.ISO-8859-1"):
+            result = subprocess.run([sys.executable, "-I", "-c", probe, SCRIPT], cwd=self.dir,
+                                    env={**env, "LC_ALL": locale_name}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            if codecs.lookup(lines[0]).name == "iso8859-1":
+                self.assertEqual(sorted(lines[1:]), expected)
+                return
+        self.skipTest("no ISO-8859-1 locale installed")
 
 
 if __name__ == "__main__":

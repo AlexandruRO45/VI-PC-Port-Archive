@@ -248,7 +248,10 @@ def classify_file(path):
 
 def tracked_files(root):
     out = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True).stdout
-    return [os.path.join(root, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
+    # -z lists each name as its bytes on disk. On POSIX the file system encoding maps them back to the same file
+    # under any locale (a UTF-8 decode doesn't in an ISO-8859-1 one); Git for Windows lists UTF-8.
+    names = out.decode("utf-8", "surrogateescape") if os.name == "nt" else os.fsdecode(out)
+    return [os.path.join(root, p) for p in names.split("\0") if p]
 
 
 def check(paths):
