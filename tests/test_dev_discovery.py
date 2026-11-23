@@ -47,7 +47,6 @@ class DiscoveryTests(unittest.TestCase):
         for relative in PRODUCERS:
             self.assertFalse((self.checkout / relative).with_suffix(".ran").exists())
 
-
     def test_inventory_reflects_this_checkout(self):
         for tool_id, present_path, missing_id, missing_path in (
             ("boot-trace", PRODUCERS[0], "guest-scene", PRODUCERS[1]),
@@ -56,7 +55,9 @@ class DiscoveryTests(unittest.TestCase):
             with self.subTest(tool=tool_id):
                 producer = self.checkout / present_path
                 producer.parent.mkdir(exist_ok=True)
-                producer.write_text("import sys\nprint(sys.argv[1:])\n", encoding="utf-8")
+                producer.write_text(
+                    "import sys\nprint(sys.argv[1:])\n", encoding="utf-8", newline="\n",
+                )
                 # A namesake file in the caller's directory must not count.
                 decoy = self.cwd / missing_path
                 decoy.parent.mkdir(exist_ok=True)
