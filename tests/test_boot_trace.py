@@ -196,6 +196,22 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["events"], 2)
         self.assertEqual(trace["bad_lines"], 1)
 
+    def test_malformed_dllmain_results_do_not_count_as_outcomes(self):
+        events = [{"kind": "dllmain"}]
+        events.extend({"kind": "dllmain", "result": value} for value in ("false", True, None, 0.0))
+        events.extend([
+            {"kind": "dllmain", "module": "ok.dll", "result": -1},
+            {"kind": "dllmain", "module": "failed.dll", "result": 0},
+            {"kind": "exit", "code": 7},
+        ])
+        self.write(self.startup, events)
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual(trace["bad_lines"], 5)
+        self.assertEqual(trace["bad_line_numbers"], [1, 2, 3, 4, 5])
+        self.assertEqual(trace["events"], 3)
+        self.assertEqual(trace["dllmain"], {"ok": 1, "failed": 1, "failed_modules": ["failed.dll"]})
+        self.assertEqual(trace["exit"], 7)
+
     def test_malformed_exit_records_preserve_the_last_valid_code(self):
         for code in (0, -7):
             with self.subTest(code=code):
