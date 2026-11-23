@@ -216,6 +216,33 @@ class WalkTests(unittest.TestCase):
         with self.assertRaises(dwo.OutOfSegmentError):
             list(dwo.walk_drawable(self.system, len(self.system)))
 
+    def test_walk_chain_and_drawable_support_lod_index_0_to_3_and_reject_invalid(self):
+        b = Builder(4096)
+        g0 = build_geometry(b, vertices=64)
+        g1 = build_geometry(b, vertices=96)
+        m0, e0 = build_model(b, [g0])
+        m1, e1 = build_model(b, [g1])
+        lod0, _ = build_lod(b, [m0])
+        lod1, _ = build_lod(b, [m1])
+        drawable = b.alloc(176)
+        b.ptr(drawable + 80, lod0)
+        b.ptr(drawable + 88, lod1)
+        seg = bytes(b.buf)
+
+        self.assertEqual(list(dwo.walk_drawable(seg, drawable, lod_index=0)), [g0])
+        self.assertEqual(list(dwo.walk_drawable(seg, drawable, lod_index=1)), [g1])
+        chain1 = dwo.walk_chain(seg, drawable, lod_index=1)
+        self.assertEqual(chain1["lod"], lod1)
+        self.assertEqual(chain1["models"], [{"model": m1, "entries": e1, "geometries": [g1]}])
+
+        for bad_lod in (-1, 4, True, False):
+            with self.subTest(bad_lod=bad_lod):
+                with self.assertRaises(dwo.WalkError):
+                    dwo.walk_chain(seg, drawable, lod_index=bad_lod)
+                with self.assertRaises(dwo.WalkError):
+                    list(dwo.walk_drawable(seg, drawable, lod_index=bad_lod))
+
+
 
 class ReverseScanTests(unittest.TestCase):
     @classmethod
@@ -274,6 +301,59 @@ class ReverseScanTests(unittest.TestCase):
         # only their parent is unknown.
         for geo in self.off["d_geos"]:
             dwo.geometry_shape_check(self.system, geo)
+
+    def test_geometry_shape_check_rejects_non_60000000_graphics_pointers_and_undersized_ib(self):
+        geo = self.off["d_geos"][0]
+        info = dwo.geometry_shape_check(self.system, geo)
+        vb, ib = info["vertex_buffer"], info["index_buffer"]
+
+        for field_at in (vb + 24, ib + 24):
+            for bad_ptr in (0x70001000, 0x80000000, 0xFFFFFFFFFFFFFFFF):
+                with self.subTest(field_at=field_at, bad_ptr=hex(bad_ptr)):
+                    mutated = bytearray(self.system)
+                    struct.pack_into("<Q", mutated, field_at, bad_ptr)
+                    with self.assertRaises(dwo.WalkError):
+                        dwo.geometry_shape_check(bytes(mutated), geo)
+
+        # meshlets=2, triangles=8, refs=16 requires 12 + 16*2 + 4*8 + 2*16 = 108 bytes (27 words);
+        # icount=6 (24 bytes >= 12) is still too small to hold the declared group.
+        mutated = bytearray(self.system)
+        struct.pack_into("<I", mutated, ib + 8, 6)
+        with self.assertRaises(dwo.WalkError):
+            dwo.geometry_shape_check(bytes(mutated), geo)
+
+    def test_classify_parent_and_hexdump_near_segment_end(self):
+        # 1. Source pointer at the very last 8-byte slot of a segment: context_dump must not
+        # emit an out-of-bounds empty row past len(seg).
+        seg = bytearray(256)
+        entries_off = 32
+        src_off = len(seg) - 8
+        struct.pack_into("<Q", seg, src_off, dwo.PTR_BASE + entries_off)
+        parents = dwo.classify_parent(bytes(seg), entries_off)
+        self.assertEqual(len(parents), 1)
+        self.assertEqual(parents[0]["classification"], "unknown parent")
+        self.assertEqual(parents[0]["context_offset"], len(seg) - 32)
+        lines = parents[0]["context_dump"].splitlines()
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            addr_str, hex_part = line.split("  ", 1)
+            self.assertLess(int(addr_str, 16), len(seg))
+            self.assertTrue(hex_part.strip())
+
+        tail_dump = dwo._hexdump(bytes(seg), len(seg) - 16, 32)
+        self.assertEqual(len(tail_dump.splitlines()), 1)
+
+        # 2. Model-shaped record pointing at an entries_table_off near EOF that cannot hold
+        # 8 * used bytes must not be classified as model-compatible.
+        seg2 = bytearray(256)
+        near_eof_entries = len(seg2) - 8  # room for only 1 pointer (8 bytes), not 4 (32 bytes)
+        model_off = 64
+        struct.pack_into("<Q", seg2, model_off + 8, dwo.PTR_BASE + near_eof_entries)
+        struct.pack_into("<HH", seg2, model_off + 16, 4, 4)
+        struct.pack_into("<H", seg2, model_off + 54, 4)
+        parents2 = dwo.classify_parent(bytes(seg2), near_eof_entries)
+        self.assertEqual(len(parents2), 1)
+        self.assertEqual(parents2[0]["classification"], "unknown parent")
 
 
 if __name__ == "__main__":

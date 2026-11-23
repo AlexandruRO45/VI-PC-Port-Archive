@@ -107,17 +107,19 @@ def _count(system, at, what):
     return used
 
 
-def walk_chain(system, drawable_off):
+def walk_chain(system, drawable_off, lod_index=0):
     """Walk the regular drawable -> LOD -> model -> geometry chain.
 
     Returns the whole chain: {"drawable": ..., "lod": ...,
     "models": [{"model": ..., "entries": ..., "geometries": [...]}, ...]}.
     A schema violation raises a WalkError subclass with the concrete reason.
     """
+    if isinstance(lod_index, bool) or not isinstance(lod_index, int) or lod_index not in range(4):
+        raise WalkError(f"drawable LOD index must be between 0 and 3 (got {lod_index!r})")
     if not 0 <= drawable_off <= len(system) - 176:
         raise OutOfSegmentError(
             f"drawable +0x{drawable_off:x} falls outside the {len(system)}-byte system segment (176 B needed)")
-    lod = _system_pointer(system, drawable_off + 80, 16, "LOD")
+    lod = _system_pointer(system, drawable_off + 80 + 8 * lod_index, 16, "LOD")
     models_n = _count(system, lod + 8, f"LOD +0x{lod:x}")
     table = _system_pointer(system, lod, 8 * models_n, "model-pointer table")
     models = []
@@ -136,15 +138,16 @@ def walk_chain(system, drawable_off):
     return {"drawable": drawable_off, "lod": lod, "models": models}
 
 
-def walk_drawable(system, drawable_off):
-    """Enumerate the geometry offsets of the drawable's primary LOD (a generator).
+def walk_drawable(system, drawable_off, lod_index=0):
+    """Enumerate the geometry offsets of the drawable's LOD (a generator, default LOD 0).
 
     Exactly the schema of meshlet_page.drawable_geometries(); on a violation it raises
     a WalkError subclass (used != capacity, a model+54 contradiction, a pointer outside
     the segment).
     """
-    for model in walk_chain(system, drawable_off)["models"]:
+    for model in walk_chain(system, drawable_off, lod_index=lod_index)["models"]:
         yield from model["geometries"]
+
 
 
 def reverse_pointers(system):
@@ -170,6 +173,8 @@ def _hexdump(system, at, nbytes=32):
     rows = []
     for row in range(0, nbytes, 16):
         chunk = system[at + row:at + row + 16]
+        if not chunk:
+            break
         rows.append(f"+0x{at + row:06x}  {chunk.hex(' ')}")
     return "\n".join(rows)
 
@@ -198,7 +203,8 @@ def classify_parent(system, entries_table_off, index=None):
         if model >= 0 and model + 56 <= len(system):
             used, capacity = struct.unpack_from("<HH", system, model + 16)
             at54 = struct.unpack_from("<H", system, model + 54)[0]
-            if 1 <= used <= 256 and used == capacity and at54 == used:
+            if (1 <= used <= 256 and used == capacity and at54 == used
+                    and 0 <= entries_table_off <= len(system) - 8 * used):
                 rec["classification"] = "model-compatible"
                 rec["model"] = model
                 rec["geometry_count"] = used
@@ -208,7 +214,7 @@ def classify_parent(system, entries_table_off, index=None):
                 rec["model_candidate"] = model
         else:
             rec["classification"] = "unknown parent"
-        start = max(0, src - 8)
+        start = max(0, min(src - 8, len(system) - 32))
         rec["context_offset"] = start
         rec["context_dump"] = _hexdump(system, start, 32)
         out.append(rec)
@@ -234,7 +240,8 @@ def geometry_shape_check(system, geometry_off):
     descriptor = _system_pointer(system, geometry_off + 64, 16, "meshlet descriptor")
     ib = _system_pointer(system, descriptor, 64, "index-buffer record")
     for field_at, what in ((vb + 24, "vertex-buffer"), (ib + 24, "index-buffer")):
-        if struct.unpack_from("<Q", system, field_at)[0] < GRAPHICS_BASE:
+        raw_gfx = struct.unpack_from("<Q", system, field_at)[0]
+        if not (GRAPHICS_BASE <= raw_gfx < GRAPHICS_BASE + 0x10000000):
             raise WalkError(
                 f"{what} +0x{field_at - 24:x}: the +24 pointer is not a 0x60000000-based graphics pointer")
     vcount, vstride = struct.unpack_from("<IH", system, vb + 8)
@@ -251,7 +258,8 @@ def geometry_shape_check(system, geometry_off):
     meshlets, triangles, binding = struct.unpack_from("<HHI", system, descriptor + 8)
     refs = (binding >> 8) & 0x7FFFFF
     icount, istride = struct.unpack_from("<IH", system, ib + 8)
-    if istride != 4 or icount * 4 < 12 or binding >> 31 or not (meshlets and triangles and refs):
+    min_group_bytes = 12 + 16 * meshlets + 4 * triangles + 2 * refs
+    if istride != 4 or icount * 4 < min_group_bytes or binding >> 31 or not (meshlets and triangles and refs):
         raise WalkError(f"meshlet descriptor +0x{descriptor:x}: invalid or unsupported binding "
                         f"(meshlets={meshlets}, triangles={triangles}, "
                         f"refs={refs}, index-buffer stride={istride})")
