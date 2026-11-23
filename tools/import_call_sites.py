@@ -3,12 +3,15 @@
 Usage:
     python -I tools/import_call_sites.py <image> [--import DLL!NAME ...] [--dll DLL ...] [--json]
 
-An MSVC image calls an imported function through a thunk, `jmp qword [rip+disp32]` through the import's address-table
-slot, and reaches the thunk with `call rel32` (or `jmp rel32` as a tail call). This finds each wanted import's thunk,
-then every `E8`/`E9 rel32` in an executable section whose target is that thunk. Nothing is run and nothing is
-disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another instruction that happens to land on a
-thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
-slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
+An MSVC image calls an imported function in one of two ways. A call to a function the image does not declare
+`dllimport` goes through a thunk, `jmp qword [rip+disp32]` through the import's address-table slot, and reaches the
+thunk with `call rel32` (or `jmp rel32` as a tail call). A `dllimport` call skips the thunk and goes straight through
+the slot, `call qword ptr [rip+disp32]` (FF 15). This finds each wanted import's thunk and address-table slot, then
+every `E8`/`E9 rel32` in an executable section whose target is that thunk and every `FF 15` whose target is that
+slot; both are call sites of the import and are counted as calls. Nothing is run and nothing is disassembled, so this
+is a byte pattern: a stray `E8`, `E9` or `FF 15` inside another instruction that happens to land on a thunk or a slot
+would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the slot) is
+not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
 With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. Output is counts
 and RVAs only, no instruction bytes (docs/runtime_imports.md, "The retail executable (RT-5)").
@@ -26,6 +29,7 @@ if ROOT not in sys.path:
 import pe_inspect  # noqa: E402
 
 JMP_INDIRECT = re.compile(b"\xff\x25")
+CALL_INDIRECT = re.compile(b"\xff\x15")
 REL_BRANCH = re.compile(b"[\xe8\xe9]")
 
 
@@ -52,8 +56,10 @@ def import_slots(img):
 
 
 def call_sites(data, wanted=None, dlls=None):
-    """Per import: its thunk RVAs and the RVAs of the `call` and `jmp` instructions that target them.
+    """Per import: its thunk RVAs and the RVAs of the `call` and `jmp` instructions that reach it.
 
+    `call` holds the `call rel32` instructions that target a thunk and the `FF 15` calls that go straight through the
+    import's address-table slot; `jmp` the `jmp rel32` tail calls to a thunk.
     `wanted` is a set of 'dll!name' (compared case-insensitively on the dll), `dlls` a set of dll names; with both
     None every import is scanned.
     """
@@ -94,6 +100,14 @@ def call_sites(data, wanted=None, dlls=None):
             key = thunks.get(rva + s + 5 + struct.unpack_from("<i", blob, s + 1)[0])
             if key:
                 out[key]["call" if blob[s] == 0xE8 else "jmp"].append(rva + s)
+    for rva, blob in code:                       # a dllimport call goes through the slot, with no thunk
+        for m in CALL_INDIRECT.finditer(blob):
+            s = m.start()
+            if s + 6 > len(blob):
+                continue
+            key = slots.get(rva + s + 6 + struct.unpack_from("<i", blob, s + 2)[0])
+            if key:
+                out[key]["call"].append(rva + s)
     for entry in out.values():
         for field in entry.values():
             field.sort()

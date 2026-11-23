@@ -1,7 +1,8 @@
 """Unit tests for tools/import_call_sites.py: thunks and the direct calls to them, on an image built here byte by byte.
 
-The image has two executable-code layouts the tool must tell apart: calls (E8) and tail jumps (E9) to the thunk of an
-import, and an import nothing calls. It needs no game files and no third-party packages.
+The image has the executable-code layouts the tool must tell apart: calls (E8) and tail jumps (E9) to the thunk of an
+import, a `dllimport` call straight through the import's address-table slot (FF 15) with no thunk, an FF 15 to an
+address that is no slot, and an import nothing calls. It needs no game files and no third-party packages.
 
     python -I tests/test_import_call_sites.py
 """
@@ -34,14 +35,17 @@ THUNK_ORD = TEXT_RVA + 0x20
 IAT_FOO = IDATA_RVA + 0x60
 IAT_BAR = IAT_FOO + 8
 IAT_ORD = IAT_FOO + 16
+IAT_BAZ = IAT_FOO + 24
 OTHER_IAT_RVA = IDATA_RVA + 0xE0
+SLOT_CALL = TEXT_RVA + 0x150        # call qword ptr [rip+x] straight through IAT_BAZ, which has no thunk
+NOT_A_SLOT_CALL = TEXT_RVA + 0x160  # the same bytes targeting an address that is not an import slot
 
 
 def rel32(from_end, target):
     return struct.pack("<i", target - from_end)
 
 
-def build_image(callers):
+def build_image(callers, slot_callers=()):
     """A PE32+ with one import descriptor (xmem.dll: XMemFoo, XMemBar, #7) and the given `.text` callers."""
     buf = bytearray(0x3000)
     buf[0:2] = b"MZ"
@@ -68,12 +72,13 @@ def build_image(callers):
     lookup = IDATA_RVA + 0x40
     names = IDATA_RVA + 0xA0
     struct.pack_into("<IIIII", buf, IDATA_RVA, lookup, 0, 0, IDATA_RVA + 0xD0, IAT_FOO)
-    entries = (names, names + 0x10, (1 << 63) | 7)
+    entries = (names, names + 0x10, (1 << 63) | 7, names + 0x20)
     for i, value in enumerate(entries):
         struct.pack_into("<Q", buf, lookup + i * 8, value)
         struct.pack_into("<Q", buf, IAT_FOO + i * 8, value)
     buf[names + 2:names + 2 + 8] = b"XMemFoo\0"
     buf[names + 0x10 + 2:names + 0x10 + 2 + 8] = b"XMemBar\0"
+    buf[names + 0x20 + 2:names + 0x20 + 2 + 8] = b"XMemBaz\0"
     buf[IDATA_RVA + 0xD0:IDATA_RVA + 0xD0 + 9] = b"xmem.dll\0"
 
     # .text: the thunks are `jmp qword [rip+disp32]` to the address-table slots.
@@ -83,6 +88,9 @@ def build_image(callers):
     for at, opcode, target in callers:
         buf[at] = opcode
         buf[at + 1:at + 5] = rel32(at + 5, target)
+    for at, target in slot_callers:              # call qword ptr [rip+disp32], straight through a slot
+        buf[at:at + 2] = b"\xff\x15"
+        buf[at + 2:at + 6] = rel32(at + 6, target)
     return bytes(buf)
 
 
@@ -95,15 +103,26 @@ class ImportCallSitesTest(unittest.TestCase):
             (TEXT_RVA + 0x130, 0xE8, THUNK_ORD),
             (TEXT_RVA + 0x140, 0xE8, TEXT_RVA + 0x200),  # a call to something that is not a thunk
         ]
-        self.data = build_image(self.callers)
+        self.slot_callers = [(SLOT_CALL, IAT_BAZ), (NOT_A_SLOT_CALL, TEXT_RVA + 0x300)]
+        self.data = build_image(self.callers, self.slot_callers)
 
     def test_counts_calls_and_jumps_per_import(self):
         out = import_call_sites.call_sites(self.data)["imports"]
-        self.assertEqual(sorted(out), ["xmem.dll!#7", "xmem.dll!XMemBar", "xmem.dll!XMemFoo"])
+        self.assertEqual(sorted(out), ["xmem.dll!#7", "xmem.dll!XMemBar", "xmem.dll!XMemBaz", "xmem.dll!XMemFoo"])
         foo = out["xmem.dll!XMemFoo"]
         self.assertEqual(foo["thunks"], [THUNK_FOO])
         self.assertEqual(foo["call"], [TEXT_RVA + 0x100, TEXT_RVA + 0x110])
         self.assertEqual(foo["jmp"], [TEXT_RVA + 0x120])
+
+    def test_a_call_straight_through_a_slot_is_a_call_site(self):
+        # XMemBaz has no thunk at all: every call to it is `call qword ptr [rip+slot]`, which the thunk scan cannot see.
+        baz = import_call_sites.call_sites(self.data)["imports"]["xmem.dll!XMemBaz"]
+        self.assertEqual((baz["thunks"], baz["call"], baz["jmp"]), ([], [SLOT_CALL], []))
+
+    def test_an_ff15_to_an_address_that_is_no_slot_is_not_a_call_site(self):
+        out = import_call_sites.call_sites(self.data)["imports"]
+        self.assertEqual(sum(len(e["call"]) for e in out.values()), 2 + 1 + 1)  # two E8 to Foo, one to #7, one FF 15
+        self.assertEqual([e["call"] for e in out.values() if NOT_A_SLOT_CALL in e["call"]], [])
 
     def test_an_import_nothing_calls_has_a_thunk_and_no_sites(self):
         bar = import_call_sites.call_sites(self.data)["imports"]["xmem.dll!XMemBar"]
@@ -117,7 +136,7 @@ class ImportCallSitesTest(unittest.TestCase):
     def test_wanted_names_and_dlls_select_imports(self):
         out = import_call_sites.call_sites(self.data, wanted={"XMEM.DLL!xmemfoo"})["imports"]
         self.assertEqual(list(out), ["xmem.dll!XMemFoo"])
-        self.assertEqual(len(import_call_sites.call_sites(self.data, dlls={"XMem.dll"})["imports"]), 3)
+        self.assertEqual(len(import_call_sites.call_sites(self.data, dlls={"XMem.dll"})["imports"]), 4)
         self.assertEqual(import_call_sites.call_sites(self.data, dlls={"other.dll"})["imports"], {})
 
     def test_a_call_is_not_counted_for_a_different_thunk(self):
