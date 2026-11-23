@@ -214,5 +214,43 @@ class VCvtPkrtzF16F32TranslatorTests(unittest.TestCase):
         self.assertEqual(word & 0xFFFF, 0x7BFF)
         self.assertEqual((word >> 16) & 0xFFFF, 0xFBFF)
 
+# -----------------------------------------------------------------------------
+# Opcode 2: v_cvt_pknorm_i16_f16
+# -----------------------------------------------------------------------------
+
+def ref_norm16_i16(u: int) -> int:
+    f = bits_to_f16(u & MASK16)
+    if math.isnan(f):
+        return 0
+    cl = max(-1.0, min(1.0, f))
+    val = round(cl * 32767.0)
+    return val & MASK16
+
+
+def ref_cvt_pknorm_i16_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0), dhi: bool = False) -> int:
+    h0 = (s0 >> (16 * sel[0])) & MASK16
+    h1 = (s1 >> (16 * sel[1])) & MASK16
+    n0 = ref_norm16_i16(h0)
+    n1 = ref_norm16_i16(h1)
+    res = (n1 << 16) | n0
+    if dhi:
+        res = (res << 16) & MASK32
+    return res & MASK32
+
+
+class VCvtPknormI16F16OracleTests(unittest.TestCase):
+    def test_cardinals(self):
+        res = ref_cvt_pknorm_i16_f16(0x3C00, 0xBC00)
+        self.assertEqual(res & 0xFFFF, 0x7FFF)
+        self.assertEqual((res >> 16) & 0xFFFF, 0x8001)
+
+    def test_zero(self):
+        self.assertEqual(ref_cvt_pknorm_i16_f16(0x0000, 0x8000), 0x00000000)
+
+    def test_intermediate_scale(self):
+        res = ref_cvt_pknorm_i16_f16(0x3800, 0x3800)
+        self.assertEqual(res & 0xFFFF, 0x4000)
+        self.assertEqual((res >> 16) & 0xFFFF, 0x4000)
+
 if __name__ == '__main__':
     unittest.main()
