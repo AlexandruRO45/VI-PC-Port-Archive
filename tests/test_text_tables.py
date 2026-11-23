@@ -252,9 +252,17 @@ class TestVariants(unittest.TestCase):
             with open(out, encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(len(rows), 1)
-            self.assertEqual((rows[0]["gender"], rows[0]["plurality"], rows[0]["case"],
+            self.assertEqual((rows[0]["lang"], rows[0]["gender"], rows[0]["plurality"], rows[0]["case"],
                               rows[0]["source_a"], rows[0]["source_b"], rows[0]["text"]),
-                             ("None", "Singular", "None", "Player", "Speaker", "Bonjour"))
+                             ("xx", "None", "Singular", "None", "Player", "Speaker", "Bonjour"))
+
+    def test_variants_uses_resolved_archive_language(self):
+        # Short variant tables ("Bonjour") guess "xx" alone; when Scan provides archive_lang, variants inherit it.
+        res = make_variant_resource([("ZZ_GREET", 10, 11, [("Bonjour", 0, 1, 0)])])
+        scan = T.VariantScan()
+        scan.archive_lang = {("arc", 0x1000): "fr"}
+        scan.add("src", 0x1100, res, archive=("arc", 0x1000))
+        self.assertEqual([(s, o, lang) for s, o, lang, _vt in scan.variants], [("src", 0x1100, "fr")])
 
     def test_variants_read_the_source_once(self):
         # A source that disappears as soon as its scan ends must not be reopened for the variant rows: they

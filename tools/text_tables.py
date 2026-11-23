@@ -358,15 +358,23 @@ class VariantScan(Scan):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.variant_found = []                             # (source, offset, lang, {hash: [variant]})
+        self.variant_found = []                             # (source, offset, guess, archive, {hash: [variant]})
 
     def add(self, *args, **kwargs):
         super().add(*args, **kwargs)
         source, offset, data = args[0], args[1], args[2]
+        archive = args[3] if len(args) > 3 else kwargs.get("archive")
         if _is_resource(data) and b"\x01\x01\x00\x00" in data:
             for table in variant_tables(data):
                 texts = [v["text"] for items in table.values() for v in items]
-                self.variant_found.append((source, offset, language(texts), table))
+                self.variant_found.append((source, offset, language(texts), archive, table))
+
+    @property
+    def variants(self):
+        """[(source, offset, lang, {hash: [variant]})] using archive-resolved language when available."""
+        archive_lang = getattr(self, "archive_lang", {})
+        return [(s, o, archive_lang.get(archive, guess), vt)
+                for s, o, guess, archive, vt in self.variant_found]
 
 
 def _clean(s: str) -> str:
@@ -459,7 +467,7 @@ def main(argv=None) -> int:
                      ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
                        "gender": v["gender"], "plurality": v["plurality"], "case": v["case"],
                        "source_a": v["source_a"], "source_b": v["source_b"], "text": _clean(v["text"])}
-                      for s, o, lang, vt in scan.variant_found for h, items in vt.items() for v in items)))
+                      for s, o, lang, vt in scan.variants for h, items in vt.items() for v in items)))
     # Stage every report next to its destination, then swap them all in. A write that fails part-way must
     # leave the previous reports intact instead of truncating the ones that came before it.
     staged = []
