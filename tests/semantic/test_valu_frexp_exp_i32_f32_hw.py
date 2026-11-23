@@ -404,5 +404,47 @@ class TestFrexpExpI32F32SIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.vgprs[0][lane], 0xCAFE_BABE)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestFrexpExpI32F32RegisterAliasing(unittest.TestCase):
+    def setUp(self):
+        self.machine = ScalarMachine()
+
+    def test_in_place_alias_vgpr(self):
+        # v0 = v_frexp_exp_i32_f32(v0)
+        self.machine.vgprs[0] = f32_to_bits(1.0)  # 0x3F800000
+        insn = VFrexpExpI32F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 0),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[0], 1)
+
+    def test_in_place_alias_negative_exponent(self):
+        # v3 = v_frexp_exp_i32_f32(v3) with 0.125f (exp -2)
+        self.machine.vgprs[3] = f32_to_bits(0.125)
+        insn = VFrexpExpI32F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 3),
+            src0=RegisterOperand(OperandType.VGPR, 3),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[3], 0xFFFF_FFFE)
+
+    def test_unrelated_registers_preserved(self):
+        self.machine.vgprs[0] = 0x1111_1111
+        self.machine.vgprs[1] = f32_to_bits(8.0)  # exp 4
+        self.machine.vgprs[2] = 0x2222_2222
+        insn = VFrexpExpI32F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[0], 4)
+        self.assertEqual(self.machine.vgprs[1], f32_to_bits(8.0))
+        self.assertEqual(self.machine.vgprs[2], 0x2222_2222)
+
+
 if __name__ == '__main__':
     unittest.main()
