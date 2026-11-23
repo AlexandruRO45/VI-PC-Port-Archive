@@ -326,10 +326,6 @@ class ResourceAndValidationTest(unittest.TestCase):
                 self.assertEqual(f.read(), "keep")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def adat_archive(with_bank=True):
     """Config streams, a raw `METADATA` decoy, then (optionally) a zero-stream AWC bank and a stream after it."""
     cfg = [zlib.compress(b"config-%d " % i * 300) for i in range(2)]
@@ -385,3 +381,7 @@ class CarveUntilAdatTest(unittest.TestCase):
         doc, _ = carve_args(self, data, "--until-adat", "--limit", str(0x20))
         self.assertIsNone(doc["summary"]["first_adat_bank"])
         self.assertEqual(doc["summary"]["span"], 0x20)
+
+
+if __name__ == "__main__":
+    unittest.main()

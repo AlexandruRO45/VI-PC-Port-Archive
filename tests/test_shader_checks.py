@@ -1061,9 +1061,6 @@ class FmaFusedChecks(unittest.TestCase):
         self.assertIsInstance(res, check.Skip)
         self.assertIn("VK_KHR_shader_fma", res)
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TexelOffsetFormsChecks(unittest.TestCase):
     """ps_texoff_forms (image_sample_o, image_sample_b_o, image_gather4_l_o): the judgement of a dump."""
@@ -1106,3 +1103,7 @@ class PixelTestRegistry(unittest.TestCase):
             with patch.object(check, "pixels", return_value=([want], "")) as pixels:
                 self.assertEqual(check.pixel_test("tools", tmp, "ps_legacy_mul"), "")
             self.assertEqual(pixels.call_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
