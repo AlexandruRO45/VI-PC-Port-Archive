@@ -139,8 +139,9 @@ form and all 40 resolve (none ambiguous), in one document; the linked items sit 
   unknown and contribute no edges.
 - Content-set joining is exact string equality. `common:/`, `$(common)/`, case and slash variants
   are not normalized; the 31 `common:/` entries stay unresolved.
-- `parentPath` and `parentFile` are locators, not mounts. They are counted, not followed by the tool.
-  The 40 `parentPath` sites resolve inside their own document (see above); the 3 `parentFile` sites do not.
+- `parentPath` and `parentFile` are locators, not mounts: neither becomes a document edge. `parentPath`
+  is resolved inside its own document (`parent_path_inheritance`, above), 40 of 40 sites; the 3
+  `parentFile` sites are only counted.
 - Only `filename`, `loadPath`, `includedSets`, `parentPath` and `parentFile` are modeled. No
   XInclude occurs in the corpus, and no general include processor is implemented.
 - The counts are for this version's `common.rpf`; another package can differ.
