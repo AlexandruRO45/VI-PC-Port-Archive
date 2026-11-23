@@ -354,3 +354,39 @@ class TestSMovrelsB64Indexing(unittest.TestCase):
         spv = support.translate_lines("ps_smovrels_b64_scc", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0x9999)
+
+
+class TestSMovrelsB64Integration(unittest.TestCase):
+    def test_full_pipeline_compilation(self):
+        lines = [
+            "s_mov_b32 s20, 0xAAAA5555",
+            "s_mov_b32 s21, 0x5555AAAA",
+            "s_mov_b32 m0, 0",
+            "s_movrels_b64 s[10:11], s[20:21]",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, s11",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b64_full", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0xAAAA5555)
+        self.assertEqual(out[1], 0x5555AAAA)
+
+    def test_negative_rejects_single_sgpr_operands(self):
+        lines = [
+            "s_movrels_b64 s10, s[20:21]",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_smovrels_b64_single_dst", lines)
+
+    def test_negative_rejects_single_source(self):
+        lines = [
+            "s_movrels_b64 s[10:11], s20",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_smovrels_b64_single_src", lines)
