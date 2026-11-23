@@ -59,7 +59,7 @@ import glb_writer  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
-MAX_IMPLICIT_SPARSE_ROWS = 1_000_000
+MAX_IMPLICIT_ACCESSOR_ROWS = 1_000_000
 CHUNK_TYPE_JSON = 0x4E4F534A
 CHUNK_TYPE_BIN = 0x004E4942
 TARGET_ARRAY_BUFFER = 34962
@@ -1182,10 +1182,14 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
 
         if "bufferView" in acc:
             check_region(acc, label, count, elem_bytes, component_size)
-        elif not has_sparse:
-            raise bad(f"{label} has no bufferView")
         elif "byteOffset" in acc:
             raise bad(f"{label} cannot specify byteOffset without a base bufferView")
+        elif not has_sparse:
+            required = doc.get("extensionsRequired", [])
+            if not isinstance(required, list):
+                raise bad("extensionsRequired must be a list")
+            if "KHR_draco_mesh_compression" in required:
+                raise PedAssembleError(f"{path}: required KHR_draco_mesh_compression is unsupported")
         if not has_sparse:
             return
 
@@ -1412,7 +1416,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
 
     # Unlike dense rows, a zero base has no corresponding bytes in the file to bound the
     # Python lists built for each visible attribute and each instance of the mesh.
-    remaining_implicit_rows = MAX_IMPLICIT_SPARSE_ROWS
+    remaining_implicit_rows = MAX_IMPLICIT_ACCESSOR_ROWS
 
     def read_accessor(index):
         nonlocal remaining_implicit_rows
@@ -1421,7 +1425,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             rows = int(acc["count"])
             if rows > remaining_implicit_rows:
                 raise PedAssembleError(f"{path}: accessors[{index}] would exceed the per-file limit of "
-                                       f"{MAX_IMPLICIT_SPARSE_ROWS:,} implicit sparse rows")
+                                       f"{MAX_IMPLICIT_ACCESSOR_ROWS:,} implicit accessor rows")
             remaining_implicit_rows -= rows
         return _read_glb_accessor(doc, bin_chunk, index)
 

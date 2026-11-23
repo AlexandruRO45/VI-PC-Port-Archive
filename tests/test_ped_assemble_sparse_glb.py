@@ -108,6 +108,7 @@ class SparseGlbTests(unittest.TestCase):
 
     def test_implicit_rows_count_each_attribute_and_mesh_instance(self):
         doc, data = triangle(dense=True)
+        del doc["accessors"][1]["sparse"]  # COLOR_0 has neither a base view nor overrides.
         doc["nodes"].append(dict(mesh=0))
         doc["scenes"][0]["nodes"].append(1)
         doc["meshes"].append(doc["meshes"][0])  # No node imports this mesh.
@@ -115,13 +116,16 @@ class SparseGlbTests(unittest.TestCase):
             src = Path(directory) / "two_parts.glb"
             src.write_bytes(container(json.dumps(doc).encode(), bytes(data)))
             # Colors and indices each expand 3 rows per instance. Positions have a dense base.
-            with patch.object(ped_assemble, "MAX_IMPLICIT_SPARSE_ROWS", 12):
-                self.assertEqual(len(ped_assemble.read_glb_parts(src)), 2)
-            with patch.object(ped_assemble, "MAX_IMPLICIT_SPARSE_ROWS", 11):
-                with self.assertRaisesRegex(ped_assemble.PedAssembleError, "implicit sparse rows"):
+            with patch.object(ped_assemble, "MAX_IMPLICIT_ACCESSOR_ROWS", 12):
+                parts = ped_assemble.read_glb_parts(src)
+                self.assertEqual(len(parts), 2)
+                for part in parts:
+                    self.assertEqual(part.colors, [(0, 0, 0, 0)] * 3)
+            with patch.object(ped_assemble, "MAX_IMPLICIT_ACCESSOR_ROWS", 11):
+                with self.assertRaisesRegex(ped_assemble.PedAssembleError, "per-file limit"):
                     ped_assemble.read_glb_parts(src)
             src.write_bytes(container(json.dumps(document()).encode()))
-            with patch.object(ped_assemble, "MAX_IMPLICIT_SPARSE_ROWS", 0):
+            with patch.object(ped_assemble, "MAX_IMPLICIT_ACCESSOR_ROWS", 0):
                 self.assertEqual(len(ped_assemble.read_glb_parts(src)), 1)
 
     def test_sparse_integer_fields_accept_whole_json_numbers(self):
@@ -141,6 +145,28 @@ class SparseGlbTests(unittest.TestCase):
             part, = ped_assemble.read_glb_parts(src)
         self.assertEqual(part.positions[-1], (0, 2, 0))
         self.assertEqual(part.triangles, [(0, 2, 1)])
+
+    def test_required_draco_geometry_cannot_be_read_as_zero_rows(self):
+        doc, data = triangle()
+        extension = "KHR_draco_mesh_compression"
+        doc["extensionsUsed"] = [extension]
+        prim = doc["meshes"][0]["primitives"][0]
+        prim["extensions"] = {extension: {"bufferView": 0, "attributes": {"POSITION": 0}}}
+        del doc["accessors"][1]["sparse"]  # Uncompressed fallback colors are zero.
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / "draco.glb"
+            src.write_bytes(container(json.dumps(doc).encode(), bytes(data)))
+            part, = ped_assemble.read_glb_parts(src)
+            self.assertEqual(part.positions[-1], (0, 2, 0))
+            self.assertEqual(part.colors, [(0, 0, 0, 0)] * 3)
+
+            doc["extensionsRequired"] = [extension]
+            for key in ("bufferView", "byteOffset", "sparse"):
+                del doc["accessors"][0][key]
+            del doc["accessors"][2]["sparse"]
+            src.write_bytes(container(json.dumps(doc).encode(), bytes(data)))
+            with self.assertRaisesRegex(ped_assemble.PedAssembleError, extension):
+                ped_assemble.read_glb_parts(src)
 
     def assert_bad_position(self, src, doc, data):
         src.write_bytes(container(json.dumps(doc).encode(), bytes(data)))
