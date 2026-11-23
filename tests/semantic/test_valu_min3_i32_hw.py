@@ -360,5 +360,58 @@ class TestVMin3I32SIMDDivergence(unittest.TestCase):
             expected = min(i * 10 - 300, 0, 100)
             self.assertEqual(to_s32(lane.vgprs[4]), expected)
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestVMin3I32Aliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self):
+        """v_min3_i32 v1, v1, v2, v3: D aliases S0."""
+        state = LaneRegisterState()
+        state.vgprs[1] = to_u32(50)
+        state.vgprs[2] = to_u32(-20)
+        state.vgprs[3] = to_u32(10)
+
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=1),
+            src0=RegOperand(RegisterKind.VGPR, index=1),
+            src1=RegOperand(RegisterKind.VGPR, index=2),
+            src2=RegOperand(RegisterKind.VGPR, index=3)
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(to_s32(state.vgprs[1]), -20)
+        self.assertEqual(to_s32(state.vgprs[2]), -20)  # S1 untouched
+        self.assertEqual(to_s32(state.vgprs[3]), 10)   # S2 untouched
+
+    def test_alias_all_operands_same_register(self):
+        """v_min3_i32 v1, v1, v1, v1: D, S0, S1, S2 all alias v1."""
+        state = LaneRegisterState()
+        state.vgprs[1] = to_u32(-999)
+
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=1),
+            src0=RegOperand(RegisterKind.VGPR, index=1),
+            src1=RegOperand(RegisterKind.VGPR, index=1),
+            src2=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(to_s32(state.vgprs[1]), -999)
+
+    def test_alias_src0_and_src1_same_register(self):
+        state = LaneRegisterState()
+        state.vgprs[1] = to_u32(10)
+        state.vgprs[2] = to_u32(-50)
+
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=3),
+            src0=RegOperand(RegisterKind.VGPR, index=1),
+            src1=RegOperand(RegisterKind.VGPR, index=1),
+            src2=RegOperand(RegisterKind.VGPR, index=2)
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(to_s32(state.vgprs[3]), -50)
+
 if __name__ == "__main__":
     unittest.main()
