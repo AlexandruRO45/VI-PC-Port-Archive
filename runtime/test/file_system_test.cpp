@@ -652,7 +652,45 @@ void run_checks(const std::filesystem::path& root) {
             if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
             return h == INVALID_HANDLE_VALUE && error == 0 ? DWORD{ERROR_GEN_FAILURE} : error;
         };
-        int index = 0, compared = 0;
+        // Wine 11 answers two of these differently from Windows (fork CI, winehq-stable): its CREATE_ALWAYS replaces a
+        // hidden or system file whatever the open asks for, and the replaced file keeps its old attributes instead of
+        // taking the requested ones. The shim gives Windows' answers, so the host is probed first, and on a host that
+        // answers like Wine those two comparisons are reported as SKIP. The read-only cases, on which both hosts
+        // refuse, are compared everywhere.
+        const auto probe_file = root / "native-replace" / "probe.bin";
+        bool host_refuses_without[2] = {true, true};  // HIDDEN, SYSTEM: the host refuses a replace that omits it
+        for (int bit = 0; bit < 2; ++bit) {
+            const DWORD attribute = bit == 0 ? kHidden : kSystem;
+            write_path(probe_file, "probe");
+            ::SetFileAttributesW(probe_file.c_str(), attribute);
+            const DWORD kept = ::GetFileAttributesW(probe_file.c_str());
+            if (kept != INVALID_FILE_ATTRIBUTES && (kept & attribute) != 0) {
+                SetLastError(0);
+                const HANDLE h = ::CreateFileW(probe_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, kNormal,
+                                               nullptr);
+                host_refuses_without[bit] = h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED;
+                if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            }
+            ::SetFileAttributesW(probe_file.c_str(), kNormal);
+        }
+        bool host_applies_requested = true;  // a replaced file takes the attributes the open asks for
+        {
+            write_path(probe_file, "probe");
+            const HANDLE h =
+                ::CreateFileW(probe_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, kReadOnly, nullptr);
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            const DWORD after = ::GetFileAttributesW(probe_file.c_str());
+            host_applies_requested = after != INVALID_FILE_ATTRIBUTES && (after & kReadOnly) != 0;
+            ::SetFileAttributesW(probe_file.c_str(), kNormal);
+        }
+        if (!host_refuses_without[0] || !host_refuses_without[1])
+            std::printf("SKIP the host's CREATE_ALWAYS replaces a hidden (%s) or system (%s) file without the attribute "
+                        "in the request (Wine): the shim refuses as Windows does, and those cases are not compared\n",
+                        host_refuses_without[0] ? "refused" : "replaced", host_refuses_without[1] ? "refused" : "replaced");
+        if (!host_applies_requested)
+            std::printf("SKIP the host's CREATE_ALWAYS keeps the replaced file's attributes (Wine): the attributes after "
+                        "an accepted replace are not compared\n");
+        int index = 0, compared = 0, skipped = 0;
         for (const DWORD existing : existing_cases) {
             for (const DWORD requested : requested_cases) {
                 for (const DWORD access : access_cases) {
@@ -678,6 +716,18 @@ void run_checks(const std::filesystem::path& root) {
                             (package_before & kShown) != wanted || (native_before & kShown) != wanted) {
                             std::printf("NOTE the host does not keep attributes 0x%lx here, case not compared\n",
                                         static_cast<unsigned long>(existing));
+                        } else if ((existing & kReadOnly) == 0 &&
+                                   (((existing & kHidden) != 0 && !host_refuses_without[0]) ||
+                                    ((existing & kSystem) != 0 && !host_refuses_without[1]))) {
+                            ++skipped;
+                            const DWORD mapped_error = open_always(false, api, native_file, logical, access, requested);
+                            std::printf("  not compared (see SKIP above), shim error %lu\n",
+                                        static_cast<unsigned long>(mapped_error));
+                            check(read_path(package_file) == "package bytes" &&
+                                      ::GetFileAttributesW(package_file.c_str()) == package_before,
+                                  "CREATE_ALWAYS leaves the package file's bytes and attributes as they were");
+                            check(mapped_error == 0 || !std::filesystem::exists(overlay_folder),
+                                  "a refused CREATE_ALWAYS leaves no file or folder in the overlay");
                         } else {
                             ++compared;
                             const DWORD native_error = open_always(true, api, native_file, logical, access, requested);
@@ -705,10 +755,11 @@ void run_checks(const std::filesystem::path& root) {
                                     attributes_w(std::wstring(logical.begin(), logical.end()).c_str());
                                 check(std::filesystem::exists(overlay_file) && read_path(overlay_file).empty(),
                                       "an accepted CREATE_ALWAYS makes an empty overlay file");
-                                check(native_after != INVALID_FILE_ATTRIBUTES && mapped_after != INVALID_FILE_ATTRIBUTES &&
-                                          (native_after & kShown) == (mapped_after & kShown),
-                                      "an accepted CREATE_ALWAYS leaves the read-only, hidden and system bits the host "
-                                      "leaves");
+                                if (host_applies_requested)
+                                    check(native_after != INVALID_FILE_ATTRIBUTES && mapped_after != INVALID_FILE_ATTRIBUTES &&
+                                              (native_after & kShown) == (mapped_after & kShown),
+                                          "an accepted CREATE_ALWAYS leaves the read-only, hidden and system bits the host "
+                                          "leaves");
                             }
                         }
                         // Only these synthetic files, so remove_all can take them at the end.
@@ -718,7 +769,8 @@ void run_checks(const std::filesystem::path& root) {
                 }
             }
         }
-        std::printf("CREATE_ALWAYS: %d of %d attribute cases compared with the host\n", compared, index);
+        std::printf("CREATE_ALWAYS: %d of %d attribute cases compared with the host, %d skipped as above\n", compared,
+                    index, skipped);
         check(compared > 0, "at least the read-only CREATE_ALWAYS cases are compared with the host");
 
         // A package file the title deleted is gone from its view, whatever its attributes: CREATE_ALWAYS makes the
