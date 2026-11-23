@@ -177,6 +177,14 @@ class FoldingVolumeTests(unittest.TestCase):
             self.assertTrue(report_paths.same_report_path(self.p("R.json"), self.p("r.json")))
         probe.assert_called_once_with(os.path.realpath(self.p("R.json")), os.path.realpath(self.p("r.json")))
 
+    def test_each_path_is_resolved_once_per_call(self):
+        # #6220's review: the key and the volume probe both want the resolved names, so resolving each path
+        # once costs two realpath calls per guard, not four. A guard runs once per input file, so this is the
+        # whole cost: on main the same call resolves four times.
+        with mock.patch.object(report_paths.os.path, "realpath", wraps=os.path.realpath) as resolved:
+            report_paths.same_report_path(self.p("out.json"), self.p("lights.json"))
+        self.assertEqual(resolved.call_count, 2, "each path is resolved once, not once per check")
+
 
 class NoPrivateCopiesTests(unittest.TestCase):
     def functions(self, tool):
