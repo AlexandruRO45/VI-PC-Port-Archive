@@ -400,11 +400,21 @@ class ShaderMetaIntegrationTests(unittest.TestCase):
             step_calls += 1
             return real_step(*args, **kwargs)
 
-        with patch.object(M, "_split_operands", count_split), patch.object(M, "_step_state", count_step):
+        with patch.object(M, "_split_operands", count_split):
             res_straight = M.analyse_instructions(straight, [[]])
         self.assertEqual(split_calls, 2)
-        self.assertEqual(step_calls, 2)
         self.assertTrue(res_straight["table_loads"])
+
+        # A wrapper around _step_state with the original 6-arg signature (e.g. ptr_truncation_census) still works.
+        def legacy_step(sym, scale, ptr_stride, vscale, ins, events=None):
+            nonlocal step_calls
+            step_calls += 1
+            return real_step(sym, scale, ptr_stride, vscale, ins, events=events)
+
+        with patch.object(M, "_step_state", legacy_step):
+            res_wrapped = M.analyse_instructions(straight, [[]])
+        self.assertEqual(step_calls, 2)
+        self.assertEqual(res_wrapped, res_straight)
 
         # Branching/looping CFG: each reachable instruction is still split once across fixpoint + reporting.
         loop_blocks = [

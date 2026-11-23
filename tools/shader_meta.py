@@ -236,13 +236,11 @@ def _valid_stride(n):
     return isinstance(n, int) and 4 <= n <= 4096 and n % 4 == 0
 
 
-def _step_state(sym, scale, ptr_stride, vscale, ins, events=None, op=None, writes=None):
-    """Advance symbolic SGPR origin/constants and descriptor-stride state by one instruction."""
+def _step_state_decoded(sym, scale, ptr_stride, vscale, ins, op, writes, events=None):
+    """Advance symbolic SGPR origin/constants and descriptor-stride state by one pre-decoded instruction."""
     a = ins["args"]
     if not a:
         return
-    if op is None:
-        op = base_op(ins["op"])
 
     # Record pointer, descriptor, stride and literal-sampler observations BEFORE writes clobber operands.
     if events is not None:
@@ -329,8 +327,6 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None, op=None, write
                 vscale.pop(r, None)
 
     # Update SGPR symbolic state for writes.
-    if writes is None:
-        _, writes = _split_operands(ins, op)
     if not writes:
         return
 
@@ -489,6 +485,18 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None, op=None, write
             ptr_stride.pop(r, None)
 
 
+def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
+    """Advance symbolic SGPR origin/constants and descriptor-stride state by one instruction."""
+    if not ins["args"]:
+        return
+    op = base_op(ins["op"])
+    _, writes = _split_operands(ins, op)
+    _step_state_decoded(sym, scale, ptr_stride, vscale, ins, op, writes, events=events)
+
+
+_DEFAULT_STEP_STATE = _step_state
+
+
 def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     """Analyse reachable RDNA2 basic blocks for user-SGPR reads/kinds, descriptor strides and literal samplers.
 
@@ -547,6 +555,8 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
             out[k] = out[k] | v if k in out else v
         return out
 
+    use_fast_step = _step_state is _DEFAULT_STEP_STATE
+
     if multi_pass:
         work = [0]
         while work:
@@ -557,7 +567,10 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
             pstride = dict(entry_pstride[b])
             vscale = dict(entry_vscale[b])
             for ins, op, _, writes in block_ops(b):
-                _step_state(sym, scale, pstride, vscale, ins, events=None, op=op, writes=writes)
+                if use_fast_step:
+                    _step_state_decoded(sym, scale, pstride, vscale, ins, op, writes, events=None)
+                else:
+                    _step_state(sym, scale, pstride, vscale, ins, events=None)
                 if writes:
                     written.update(writes)
             out_w = frozenset(written)
@@ -609,7 +622,10 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
             for r in reads:
                 if r in user_range and r not in written:
                     rbw.add(r)
-            _step_state(sym, scale, pstride, vscale, ins, events=events, op=op, writes=writes)
+            if use_fast_step:
+                _step_state_decoded(sym, scale, pstride, vscale, ins, op, writes, events=events)
+            else:
+                _step_state(sym, scale, pstride, vscale, ins, events=events)
             if writes:
                 written.update(writes)
 
