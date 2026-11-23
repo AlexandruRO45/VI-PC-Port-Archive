@@ -518,9 +518,11 @@ bool map_run(Window& window, uintptr_t address, uint64_t size, const std::shared
 }
 
 // Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
-// GPU memory, which the D3D12 layer reads on the CPU.
+// GPU memory, which the D3D12 layer reads on the CPU. Three carry PAGE_WRITECOMBINE, which MapViewOfFile3 refuses
+// with ERROR_INVALID_PARAMETER (measured under Wine 11.22); the view keeps only the base protection.
 DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+    const DWORD base = window.protect & ~(PAGE_WRITECOMBINE | PAGE_NOCACHE);
+    return base == PAGE_NOACCESS ? PAGE_READWRITE : base;
 }
 
 // Where a title's VirtualProtect changed part of a view: ranges whose protection is not the window's.

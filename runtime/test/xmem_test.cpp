@@ -575,6 +575,25 @@ void test_physical_runs(const PhysicalApi& api) {
     VirtualFree(other, 0, MEM_RELEASE);
 }
 
+// A window reserved write-combined (the console's 0x2404 keeps PAGE_READWRITE | PAGE_WRITECOMBINE once the graphics
+// bits are dropped) still takes views.
+void test_physical_write_combine(const PhysicalApi& api) {
+    auto* const window = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE | PAGE_WRITECOMBINE | 0x2000));
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    const bool setup = window && api.allocate(0x280, &count, pages) == TRUE;
+    check(setup, "write-combine: reserve a window and allocate pages");
+    if (!setup) return;
+    check(api.map(window, 2, pages) == window, "write-combine: pages map into a write-combined window");
+    if (query(window).State == MEM_COMMIT) {
+        window[kPage64k] = 0x5a;
+        check(window[kPage64k] == 0x5a, "write-combine: the mapped pages are writable");
+    }
+    check(api.map(window, 2, nullptr) == window && api.free_pages(2, pages) == TRUE, "write-combine: unmap and free");
+    VirtualFree(window, 0, MEM_RELEASE);
+}
+
 // A host failure part-way through a call restores the mappings and protections from before it.
 void test_physical_rollback(const PhysicalApi& api) {
     const auto alloc2 = reinterpret_cast<PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*,
@@ -870,6 +889,7 @@ int main() {
         test_placeholders(physical);
         test_physical_runs(physical);
         test_physical_rollback(physical);
+        test_physical_write_combine(physical);
     }
 
     print_result();
