@@ -887,6 +887,8 @@ def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
     if pc_tail:
         cmd.append("--pc-tail-ubo")
     r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"rdna2spirv.py exited {r.returncode}:\n{(r.stdout + r.stderr)[-2000:]}")
     index = spirv / "index.json"
     if not index.exists():
         raise RuntimeError(f"rdna2spirv.py exited {r.returncode} without an index.json:\n{(r.stdout + r.stderr)[-2000:]}")
