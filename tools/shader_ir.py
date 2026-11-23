@@ -8,6 +8,7 @@ As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid
 As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything and reports coverage)
 """
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -235,8 +236,9 @@ def parse_line(line):
 
 
 def parse_file(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
+    with open(path, "rb") as f:
+        raw = f.read()
+    lines = raw.decode("utf-8", errors="replace").splitlines()
     info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [], "invalid": 0}
     m = HDR.match(lines[0]) if lines else None
     pc = int(m.group(2), 16) if m else 0
@@ -244,6 +246,7 @@ def parse_file(path):
     # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
     # between the last printed instruction and it
     info["code_end"] = int(m.group(3), 16) if m else None
+    info["src_sha256"] = hashlib.sha256(raw).hexdigest()
     start = 1 if (lines and not lines[0].startswith("\t")) else 0
     for ln in lines[start:]:
         if ln.startswith("; ---"):

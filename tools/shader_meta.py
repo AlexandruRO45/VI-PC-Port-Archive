@@ -713,26 +713,53 @@ def fspx_state_sha256_file(disasm_path, name):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()):
+_UNSET = object()
+
+
+def _sha256_optional_file(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=(),
+            *, root=None, fssm_bytes=_UNSET, code_bytes=_UNSET, dxbc_bytes=_UNSET):
     """Collect all build-time runtime metadata for one translated shader."""
     meta = {}
-    digest = fssm_sha256_file(disasm_path, name)
+    parent = root if root is not None else os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    if fssm_bytes is _UNSET:
+        digest = _sha256_optional_file(os.path.join(parent, "fssm", name + ".fssm"))
+    elif fssm_bytes is not None:
+        digest = hashlib.sha256(fssm_bytes).hexdigest()
+    else:
+        digest = None
     if digest is not None:
         meta["fssm_sha256"] = digest
     else:
-        code_digest = fspx_code_sha256_file(disasm_path, name)
+        if code_bytes is _UNSET:
+            code_digest = _sha256_optional_file(os.path.join(parent, "fspx", name + ".code"))
+        elif code_bytes is not None:
+            code_digest = hashlib.sha256(code_bytes).hexdigest()
+        else:
+            code_digest = None
         if code_digest is not None:
             meta["fspx_code_sha256"] = code_digest
-            state_digest = fspx_state_sha256_file(disasm_path, name)
+            state_digest = _sha256_optional_file(os.path.join(parent, "fspx", name + ".state"))
             if state_digest is not None:
                 meta["fspx_state_sha256"] = state_digest
 
     dxbc_info = {}
-    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
-    dxbc_path = os.path.join(parent, name + ".dxbc")
-    if os.path.isfile(dxbc_path):
-        with open(dxbc_path, "rb") as f:
-            dxbc_info = read_dxbc_meta(f.read())
+    if dxbc_bytes is _UNSET:
+        dxbc_path = os.path.join(parent, name + ".dxbc")
+        try:
+            with open(dxbc_path, "rb") as f:
+                dxbc_info = read_dxbc_meta(f.read())
+        except OSError:
+            pass
+    elif dxbc_bytes is not None:
+        dxbc_info = read_dxbc_meta(dxbc_bytes)
     if "input_signature" in dxbc_info:
         meta["input_signature"] = dxbc_info["input_signature"]
 

@@ -15772,6 +15772,79 @@ def reg_reads_writes(insns):
     return rr, ww
 
 
+_UNSET_SIDECAR = object()
+
+
+def _read_optional_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+class _ShaderSidecars:
+    """Per-shader sidecar cache so translate() + shader_meta() resolve realpath() and read each sidecar once."""
+
+    def __init__(self, path, name):
+        self.root = os.path.dirname(os.path.dirname(os.path.realpath(path)))
+        self.fssm_path = os.path.join(self.root, "fssm", name + ".fssm")
+        self.code_path = os.path.join(self.root, "fspx", name + ".code")
+        self.meta_path = os.path.join(self.root, "fspx", name + ".json")
+        self.dxbc_path = os.path.join(self.root, name + ".dxbc")
+        self._fssm = _UNSET_SIDECAR
+        self._code = _UNSET_SIDECAR
+        self._dxbc = _UNSET_SIDECAR
+        self._meta = _UNSET_SIDECAR
+
+    def fssm_bytes(self):
+        if self._fssm is _UNSET_SIDECAR:
+            self._fssm = _read_optional_bytes(self.fssm_path)
+        return self._fssm
+
+    def code_bytes(self):
+        if self._code is _UNSET_SIDECAR:
+            self._code = _read_optional_bytes(self.code_path)
+        return self._code
+
+    def dxbc_bytes(self):
+        if self._dxbc is _UNSET_SIDECAR:
+            self._dxbc = _read_optional_bytes(self.dxbc_path)
+        return self._dxbc
+
+    def require_dxbc(self):
+        d = self.dxbc_bytes()
+        if d is None:
+            raise Unsupported("no shader container (signatures, PSV0)")
+        return d
+
+    def fspx_meta(self):
+        if self._meta is _UNSET_SIDECAR:
+            raw = _read_optional_bytes(self.meta_path)
+            if raw is None:
+                self._meta = None
+            else:
+                try:
+                    self._meta = _json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    self._meta = None
+        return self._meta
+
+    def native_blob_optional(self):
+        data = self.fssm_bytes()
+        if data is not None:
+            return data
+        return self.code_bytes()
+
+    def native_blob(self):
+        data = self.native_blob_optional()
+        if data is not None:
+            return data
+        with open(self.fssm_path, "rb") as f:
+            self._fssm = f.read()
+        return self._fssm
+
+
 def shader_container(path, name):
     """The DXBC container next to the .s file's folder (<folder>/../<name>.dxbc). A pipeline-library program whose
     source isn't in the carve has none (docs/shader_library.md): Unsupported for that shader, where the bare open()
@@ -15783,9 +15856,9 @@ def shader_container(path, name):
         raise Unsupported("no shader container (signatures, PSV0)") from None
 
 
-def input_signature_full(path, name):
+def input_signature_full(path, name, *, dxbc_bytes=None):
     """ISG1 elements as (system value, declared mask, read/write mask)."""
-    d = shader_container(path, name)
+    d = shader_container(path, name) if dxbc_bytes is None else dxbc_bytes
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"ISG1":
@@ -15796,9 +15869,9 @@ def input_signature_full(path, name):
     return []
 
 
-def input_signature(path, name):
+def input_signature(path, name, *, dxbc_bytes=None):
     """ISG1 elements of the shader's DXBC container: (register, mask, system value, component type)."""
-    d = shader_container(path, name)
+    d = shader_container(path, name) if dxbc_bytes is None else dxbc_bytes
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"ISG1":
@@ -15896,9 +15969,9 @@ def restore_mix_literal(ins, raw, literal):
             ins["args"][1 + i] = {**ins["args"][1 + i], "v": literal}
 
 
-def output_signature(path, name):
+def output_signature(path, name, *, dxbc_bytes=None):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
-    d = shader_container(path, name)
+    d = shader_container(path, name) if dxbc_bytes is None else dxbc_bytes
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"OSG1":
@@ -15913,13 +15986,18 @@ def output_signature(path, name):
     return []
 
 
-def output_signature_full(path, name):
+def output_signature_full(path, name, *, dxbc_bytes=_UNSET_SIDECAR):
     """OSG1 elements as (register, semantic_index, system_value, mask, rw_mask)."""
-    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    if not os.path.isfile(dxbc):
+    if dxbc_bytes is _UNSET_SIDECAR:
+        dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
+        if not os.path.isfile(dxbc):
+            return []
+        with open(dxbc, "rb") as f:
+            d = f.read()
+    elif dxbc_bytes is None:
         return []
-    with open(dxbc, "rb") as f:
-        d = f.read()
+    else:
+        d = dxbc_bytes
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"OSG1":
@@ -15996,11 +16074,11 @@ def check_read_methods(methods, insns):
         if methods[attr["a"]] != want:
             raise Unsupported(f"PS input {attr['a']} read method {methods[attr['a']]} read by {op}")
 
-def mesh_psv(path, name):
+def mesh_psv(path, name, *, dxbc_bytes=None):
     """PSV0 runtime info of a mesh shader: MSInfo (GroupSharedBytesUsed, GroupSharedViewIDDependentBytes,
     PayloadSizeInBytes, u16 MaxOutputVertices, u16 MaxOutputPrimitives), wave lane counts, then PSVRuntimeInfo1
     (stage, UsesViewID, u8 SigPrimVectors, u8 MeshOutputTopology, ...) and PSVRuntimeInfo2 NumThreadsX/Y/Z."""
-    d = shader_container(path, name)
+    d = shader_container(path, name) if dxbc_bytes is None else dxbc_bytes
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"PSV0":
@@ -16047,7 +16125,7 @@ def ds_const_extent(op, key, value):
     return (start + size - 1) // 4 + 1
 
 
-def check_printed_encodings(path, info):
+def check_printed_encodings(path, info, *, code_end=_UNSET_SIDECAR, blob=_UNSET_SIDECAR):
     """A listing without undecodable words is translated from LLVM's text, which shows the instruction LLVM decoded,
     not the bytes it read. Where those bytes sit next to the listing (fssm/ or fspx/), each instruction's printed
     encoding must be the bytes at its offset (same_encoding), so a field the decoder drops is refused instead of
@@ -16056,15 +16134,26 @@ def check_printed_encodings(path, info):
     Only a listing whose header names the code range it was disassembled from (shader_disasm.py), with a blob that
     holds that range, is checked: a hand-written listing, run_gpu_tests.py's "code 0x0..0x0 (synthetic)" and a
     test's header-only blob are not the bytes the text came from."""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        m = HDR.match(f.readline())
-    if not m or int(m.group(3), 16) <= int(m.group(2), 16):
+    if code_end is _UNSET_SIDECAR:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            m = HDR.match(f.readline())
+        if not m:
+            return
+        code_start, code_end = int(m.group(2), 16), int(m.group(3), 16)
+    else:
+        if code_end is None:
+            return
+        code_start = info["code_start"]
+    if code_end <= code_start:
         return
-    fssm, code, _ = native_paths(path, info["name"])
-    if not (os.path.isfile(fssm) or os.path.isfile(code)):
+    if blob is _UNSET_SIDECAR:
+        fssm, code, _ = native_paths(path, info["name"])
+        if not (os.path.isfile(fssm) or os.path.isfile(code)):
+            return
+        blob = native_blob(path, info["name"])
+    elif blob is None:
         return
-    blob = native_blob(path, info["name"])
-    if int(m.group(3), 16) > len(blob):
+    if code_end > len(blob):
         return
     for ins in info["insns"]:
         if not ins.get("enc"):
@@ -16080,8 +16169,13 @@ def check_printed_encodings(path, info):
                               f"{enc.hex()} (a field the disassembler dropped)")
 
 
-def cs_dispatch_state(path, name):
+def cs_dispatch_state(path, name, *, fssm_bytes=_UNSET_SIDECAR, fspx_meta=_UNSET_SIDECAR):
     """(COMPUTE_PGM_RSRC2, group x, y, z): FSSM header words 0x138..0x144, or an FSPX program's kind-0 entry."""
+    if fssm_bytes is not _UNSET_SIDECAR:
+        if fssm_bytes is not None:
+            return struct.unpack_from("<4I", fssm_bytes, 0x138)
+        if fspx_meta is not _UNSET_SIDECAR and isinstance(fspx_meta, dict):
+            return (fspx_meta["rsrc2"], *fspx_meta["threads"])
     fssm, _, meta = native_paths(path, name)
     if os.path.isfile(fssm) or not os.path.isfile(meta):
         with open(fssm, "rb") as f:
@@ -16092,10 +16186,16 @@ def cs_dispatch_state(path, name):
     return (m["rsrc2"], *m["threads"])
 
 
-def fspx_wave_size(path, name):
+def fspx_wave_size(path, name, *, fssm_bytes=_UNSET_SIDECAR, fspx_meta=_UNSET_SIDECAR):
     """32 or 64 from an FSPX program's dispatch state, or None: the `wave32` field tools/fspx_unpack.py writes to
     fspx/<name>.json from kind 0's word 4 bit 20 (set = wave32; docs/fspx.md, "Kind 0: dispatch state"). None when
     the program has an FSSM blob, no fspx/<name>.json, or a kind 0 too short to hold word 4."""
+    if fssm_bytes is not _UNSET_SIDECAR:
+        if fssm_bytes is not None:
+            return None
+        if fspx_meta is not _UNSET_SIDECAR:
+            wave32 = fspx_meta.get("wave32") if isinstance(fspx_meta, dict) else None
+            return None if not isinstance(wave32, bool) else (32 if wave32 else 64)
     fssm, _, meta = native_paths(path, name)
     if os.path.isfile(fssm) or not os.path.isfile(meta):
         return None
@@ -16117,11 +16217,12 @@ def translate(path):
         # parse_file only reads tab-indented instructions, so a hand-written or re-indented .s parses to nothing
         # and used to translate to a module that passes spirv-val and does no work at all. Refuse it instead.
         raise Unsupported("no instructions (nothing tab-indented?)")
+    sidecars = _ShaderSidecars(path, info["name"])
     if info["invalid"]:
         # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
         # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
         # translate only code reachable from entry; a branch into data is rejected below.
-        blob = native_blob(path, info["name"])
+        blob = sidecars.native_blob()
         pos = info["code_start"]
         for ins in insns:
             enc = bytes.fromhex(ins["enc"])
@@ -16153,9 +16254,14 @@ def translate(path):
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
-        check_printed_encodings(path, info)
+        code_end = info.get("code_end")
+        blob = sidecars.native_blob_optional() if code_end is not None and code_end > info["code_start"] else None
+        check_printed_encodings(path, info, code_end=code_end, blob=blob)
     g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
     g.exec_static_true = not any(writes_exec(i) for i in insns)
+    g._src_path = os.fspath(path)
+    g._src_sha256 = info["src_sha256"]
+    g._fssm_path = sidecars.fssm_path
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
                            (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
@@ -16172,19 +16278,15 @@ def translate(path):
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
     # heuristic (+ wave64 default for NGG mesh shaders) when no FSSM sidecar is present (FSPX or
     # synthetic listings).
-    fssm_path = native_paths(path, info["name"])[0]
-    fssm_ws = None
-    try:
-        with open(fssm_path, "rb") as f:
-            fssm_ws = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
-    except OSError:
-        pass
+    fssm_data = sidecars.fssm_bytes()
+    fssm_ws = fssm_header.wave_size(fssm_data[:fssm_header.WAVE_FLAGS_OFFSET + 4]) if fssm_data is not None else None
     # An FSPX program (the FidelityFX DLL's) has no FSSM header; its kind-0 dispatch state carries the wave size
     # instead (word 4 bit 20 = wave32, docs/fspx.md). Only the strict markers count against it: a _b64 op on vcc or
     # exec is not one, since these programs move vcc as an ordinary SGPR pair (s_mov_b64 vcc, s[..]) in wave32 code.
     # Nor is s_bfm_b64: it is 64-bit data in wave32 code (958 pipeline-library compute programs whose state says
     # wave32, 905 of them with *_saveexec_b32, build an S# with it; see the s_bfm_b64 translation).
-    fspx_ws = fspx_wave_size(path, info["name"]) if fssm_ws is None else None
+    fspx_meta = sidecars.fspx_meta() if fssm_data is None else None
+    fspx_ws = fspx_wave_size(path, info["name"], fssm_bytes=fssm_data, fspx_meta=fspx_meta) if fssm_ws is None else None
     if fssm_ws is not None:
         if fssm_ws == 32 and code_w64:
             raise Unsupported("FSSM wave32 header contradicts wave64 code")
@@ -16200,13 +16302,14 @@ def translate(path):
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if stage == "gs":
+        dxbc_data = sidecars.require_dxbc()
         ins_by_reg = {}
-        for reg, mask, sv, ctype in input_signature(path, info["name"]):
+        for reg, mask, sv, ctype in input_signature(path, info["name"], dxbc_bytes=dxbc_data):
             if reg in ins_by_reg and (ins_by_reg[reg] == 1) != (sv == 1):
                 raise Unsupported("gs signature")
             ins_by_reg.setdefault(reg, sv)
         ins_sig = sorted(ins_by_reg.items())
-        outs = output_signature(path, info["name"])
+        outs = output_signature(path, info["name"], dxbc_bytes=dxbc_data)
         if not ins_sig or not outs:
             raise Unsupported("gs signature")
         n_emit = sum(1 for i in insns if base_op(i["op"]) == "s_sendmsg" and
@@ -16223,7 +16326,7 @@ def translate(path):
         # the output topology. System inputs (Mesa radv_shader_args.c, mesh as NGG on GFX10.3): v5 = first launch
         # vertex ID of the lane, groupIndex * NumThreads + lane ("vertex_id" slot); the merged-wave-info SGPR (s3 here) holds the wave id in [27:24]; user data
         # follows in s16.. (from push constants, like every stage).
-        psv = mesh_psv(path, info["name"])
+        psv = mesh_psv(path, info["name"], dxbc_bytes=sidecars.require_dxbc())
         if psv is None:
             raise Unsupported("mesh PSV0")
         if psv["topology"] != 2:
@@ -16259,7 +16362,7 @@ def translate(path):
         # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z
         # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
         # kind-0 entry (docs/fspx.md).
-        rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
+        rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"], fssm_bytes=fssm_data, fspx_meta=fspx_meta)
         if (rsrc2 >> 10) & 1:
             raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
@@ -16300,7 +16403,7 @@ def translate(path):
         # Pixel-shader system VGPRs (12,098 of 12,101 PS exact; docs/design.md): v0-v1 = barycentrics (modelled through
         # v_interp -> attributes), then v2.. = the SV_Position components the shader reads, packed in order.
         # Anything else a PS reads before writing is an input layout we haven't confirmed: reject it.
-        sig = input_signature_full(path, info["name"])
+        sig = input_signature_full(path, info["name"], dxbc_bytes=sidecars.require_dxbc())
         pos = [rw for sv, m, rw in sig if sv == 1]
         used = pos[0] if pos else 0
         # Position w: AMD's POS_W_FLOAT input holds 1/w. Mesa (src/amd/common/nir/ac_nir_lower_intrinsics_to_args.c)
@@ -16360,13 +16463,10 @@ def translate(path):
         # table position is declared as a fragment input (the table lists inputs the code never reads: 775 of
         # 12,101 PS overcount by one or more), and the mask marks 16-bit interpolants for the v_interp path
         # above. No sidecar, or a sidecar with no table, leaves the code-driven declarations untouched.
-        try:
-            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm",
-                                   info["name"] + ".fssm"), "rb") as f:
-                blob = f.read()
-            count, fp16 = fssm_header.interpolants(blob)
-            methods = fssm_header.read_methods(blob)
-        except OSError:
+        if fssm_data is not None:
+            count, fp16 = fssm_header.interpolants(fssm_data)
+            methods = fssm_header.read_methods(fssm_data)
+        else:
             count, fp16, methods = 0, 0, []
         check_read_methods(methods, insns)
         if count:
@@ -16376,15 +16476,16 @@ def translate(path):
                 g.inputs.setdefault(f"%in_attr{n}", n)
     if stage == "ps":
         # D3D_NAME_TARGET (64); OSG1 keeps SV_Target n in register n, so the semantic index is the render target.
-        g.mrt_targets = sorted({sem for _, sem, sysv, _, _ in output_signature_full(path, info["name"]) if sysv == 64})
+        g.mrt_targets = sorted({sem for _, sem, sysv, _, _ in output_signature_full(
+            path, info["name"], dxbc_bytes=sidecars.dxbc_bytes()) if sysv == 64})
     if stage in ("vs", "ms"):
         g.pos_map, g.pos_misc, g.clip_count, g.cull_count = pos_export_layout(
-            output_signature_full(path, info["name"]), insns)
+            output_signature_full(path, info["name"], dxbc_bytes=sidecars.dxbc_bytes()), insns)
     if stage == "vs" and any(base_op(i["op"]) == "s_swappc_b64" for i in insns):
         # The call goes to a driver-generated fetch program (not in the blob). Verified rule over 788 shaders:
         # input-signature register r, component c is fetched into v(4 + 4r + c). Replace the call with Vulkan
         # vertex inputs (location = register) written into those VGPRs at entry.
-        sig = [s for s in input_signature(path, info["name"]) if s[2] == 0]
+        sig = [s for s in input_signature(path, info["name"], dxbc_bytes=sidecars.require_dxbc()) if s[2] == 0]
         # Any component of a declared register may be read: components the vertex format lacks come back as the
         # format defaults (0, 0, 1 for y, z, w) from the hardware fetch, and Vulkan fills a vec4 input from a
         # narrower format the same way. Seen: .w of an xyz position.
@@ -16434,8 +16535,13 @@ def translate(path):
         g.vm_latch = stage == "ps" and exec_changes_after_vm([insns], [[]])
         g.park_masks(([insns], [[]]))
         halves_analysis(g, [insns], [[]])
-        g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
-                                            user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+        g.build_meta = _shader_meta.collect(
+            path, info["name"], [insns], [[]],
+            user_sgpr_limit=user_limit, system_sgprs=sys_sgprs,
+            root=sidecars.root, fssm_bytes=fssm_data,
+            code_bytes=_shader_meta._UNSET if sidecars._code is _UNSET_SIDECAR else sidecars._code,
+            dxbc_bytes=sidecars.dxbc_bytes(),
+        )
         g.fit_shared_memory()
         end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
         g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
@@ -16507,8 +16613,13 @@ def translate(path):
     g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
     g.park_masks((blocks, succ))
     halves_analysis(g, blocks, succ)
-    g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
-                                        user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+    g.build_meta = _shader_meta.collect(
+        path, info["name"], blocks, succ,
+        user_sgpr_limit=user_limit, system_sgprs=sys_sgprs,
+        root=sidecars.root, fssm_bytes=fssm_data,
+        code_bytes=_shader_meta._UNSET if sidecars._code is _UNSET_SIDECAR else sidecars._code,
+        dxbc_bytes=sidecars.dxbc_bytes(),
+    )
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
     folds, fold_chain, absorbed = {}, {}, set()
@@ -17331,11 +17442,19 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if getattr(g, "fixed_format_codes", None):
         m["fixed_format_codes"] = sorted(g.fixed_format_codes)
     if src_path:
-        src_hash = _sha256_file(src_path)
+        if getattr(g, "_src_sha256", None) and os.fspath(src_path) == getattr(g, "_src_path", None):
+            src_hash = g._src_sha256
+        else:
+            src_hash = _sha256_file(src_path)
         if src_hash:
             m["src_sha256"] = src_hash
     if fssm_path:
-        fssm_hash = _sha256_file(fssm_path)
+        cached_fssm = g.build_meta.get("fssm_sha256") if g.build_meta else None
+        if cached_fssm and getattr(g, "_fssm_path", None) and (
+                os.path.normcase(os.path.abspath(fssm_path)) == os.path.normcase(g._fssm_path)):
+            fssm_hash = cached_fssm
+        else:
+            fssm_hash = _sha256_file(fssm_path)
         if fssm_hash:
             m["fssm_sha256"] = fssm_hash
     if g.frag_inputs:
