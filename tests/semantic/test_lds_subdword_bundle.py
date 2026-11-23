@@ -212,5 +212,25 @@ class TestDsReadU8HardwareTranslator(unittest.TestCase):
         self.assertEqual(L.out(mem, 0, 0), 0xEF)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_i8 Reference Oracle
+# ------------------------------------------------------------------------------
+
+class TestDsReadI8Oracle(unittest.TestCase):
+    def setUp(self):
+        self.lds = LDSMemory()
+
+    def test_read_i8_sign_extension(self):
+        # 0x7F = +127
+        self.lds.write_u8(0, 0x7F)
+        self.assertEqual(self.lds.read_i8(0), 127)
+        # 0x80 = -128 -> 0xFFFFFF80
+        self.lds.write_u8(1, 0x80)
+        self.assertEqual(self.lds.read_i8(1), 0xFFFF_FF80)
+        # 0xFF = -1 -> 0xFFFFFFFF
+        self.lds.write_u8(2, 0xFF)
+        self.assertEqual(self.lds.read_i8(2), 0xFFFF_FFFF)
+
+
 if __name__ == '__main__':
     unittest.main()
