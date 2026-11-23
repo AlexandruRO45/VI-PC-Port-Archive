@@ -312,7 +312,7 @@ def read_tests(path: str) -> list[dict] | None:
     try:
         with open(path, encoding="utf-8-sig") as f:
             doc = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
         return None
     tests = doc.get("tests") if isinstance(doc, dict) else None

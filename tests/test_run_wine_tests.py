@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -577,6 +578,23 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("ERROR: cannot read", err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
+
+    def test_deeply_nested_ctest_inventory_is_an_input_error(self):
+        listing = self.root / "ctest.json"
+        depth = 20000
+        listing.write_bytes(b'{"tests":' + b"[" * depth + b"0" + b"]" * depth + b"}")
+        summary = self.root / "summary.md"
+        run = subprocess.run(
+            [sys.executable, "-I", rwt.__file__, "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
+             "--root", str(self.root), "--summary", str(summary)],
+            capture_output=True, text=True, errors="replace", timeout=10,
+        )
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertEqual(run.stdout, "")
+        self.assertEqual(len(run.stderr.splitlines()), 1)
+        self.assertIn("ERROR:", run.stderr)
+        self.assertIn(listing.name, run.stderr)
+        self.assertFalse(summary.exists())
 
     def test_json_that_is_not_ctest_output_is_one_error_line(self):
         code, _, err = self.run_main_json([{"name": "t"}])
