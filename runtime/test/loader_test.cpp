@@ -487,6 +487,26 @@ void test_imports() {
             failed(what.c_str(), e.what());
         }
     }
+    // The bundled-module ops back GetModuleHandle(nullptr) and GetModuleFileName for mapped images (the shim
+    // bodies live in library_loader.cpp, which this target does not link): a null handle asks for the first
+    // image load() mapped, a module's own handle for the path it was loaded from.
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(
+            write_image_as(make_import_image("testshim.dll", "F"), "importer_identity.exe"));
+        if (rt::shims::bundled_main_module() != m.base)
+            return failed("GetModuleHandle(nullptr) answers the first image load() mapped",
+                          "it answered a different module");
+        const std::filesystem::path* main_path = rt::shims::bundled_module_path(nullptr);
+        const std::filesystem::path* own_path = rt::shims::bundled_module_path(m.base);
+        if (!main_path || *main_path != m.path)
+            return failed("GetModuleFileName(nullptr) names the main image's load path", "it did not");
+        if (!own_path || *own_path != m.path)
+            return failed("GetModuleFileName(module) names the module's own load path", "it did not");
+        pass("GetModuleHandle(nullptr)/GetModuleFileName answer for mapped images through the bundled ops");
+    } catch (const std::exception& e) {
+        failed("the bundled-module ops answer module identity for mapped images", e.what());
+    }
 }
 
 void test_import_name_rvas() {
