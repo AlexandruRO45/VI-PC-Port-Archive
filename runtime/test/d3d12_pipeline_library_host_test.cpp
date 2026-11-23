@@ -6,7 +6,9 @@
 // is recorded, with whether the output pointer was written; the two records must be the same, step by step. The
 // serialized size and bytes are each device's own format and are not compared. A step the host runtime faults on is
 // reported and not compared. No shaders or game data. Skips (77) without a Vulkan GPU; without a host D3D12 device
-// only the layer's own record is printed. Set LEONIDA_D3D49_VERBOSE=1 to print every step.
+// only the layer's own record is printed, and the same under Wine or Proton, whose host D3D12 (vkd3d, vkd3d-proton) is
+// not the reference (host_wine.h). Set LEONIDA_D3D49_VERBOSE=1 to print every step.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
@@ -357,7 +359,7 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
 
         Ref<ID3D12Device1> host;
-        host.p = create_host();
+        if (!hostwine::host_is_wine()) host.p = create_host();
 
         // Each device gets the other's serialized empty library as a foreign blob.
         std::vector<std::uint8_t> ours_blob, host_blob;
