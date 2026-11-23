@@ -618,6 +618,26 @@ class PublishTest(unittest.TestCase):
 class OutputPathTest(unittest.TestCase):
     """A report path that is already a folder is a usage error, not a PermissionError traceback."""
 
+    def test_blocked_report_parent_is_a_cli_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "carved")
+            os.mkdir(source)
+            blocker = os.path.join(tmp, "blocked")
+            with open(blocker, "wb") as f:
+                f.write(b"keep")
+            for flag, name in (("--out", "report.json"), ("--csv", "report.csv")):
+                with self.subTest(flag=flag):
+                    report = os.path.join(blocker, name)
+                    result = subprocess.run([sys.executable, "-I", TOOL, source, flag, report],
+                                            cwd=tmp, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertTrue(result.stderr.startswith("ERROR: cannot write report:"), result.stderr)
+                    self.assertIn(blocker, result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                    self.assertFalse(result.stdout)
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep")
+
     def test_out_that_is_a_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             source, out = os.path.join(tmp, "carved"), os.path.join(tmp, "reports")

@@ -349,7 +349,13 @@ def main() -> int:
             ap.error(str(e))
 
     add_distribution(summary, rows)
-    written = write_outputs(rows, summary, out_path, a.csv)
+    try:
+        written = write_outputs(rows, summary, out_path, a.csv)
+    except OSError as e:
+        path = e.filename2 or e.filename
+        detail = f"{path}: {e.strerror or e}" if path else str(e)
+        print(f"ERROR: cannot write report: {detail}", file=sys.stderr)
+        return 2
     print(json.dumps(summary, indent=1))
     print(f"wrote {out_path}" + (f", {', '.join(written)}" if written else ""))
     return 0
