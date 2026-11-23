@@ -7171,23 +7171,28 @@ class Gen:
             signed = op.endswith("i16")
             halves = []
             for h, sl in ((0, sel), (1, selhi)):
-                amt, val, am, r16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                amt, r16 = self.tmp(), self.tmp()
                 if sl[0]:
                     half = self.tmp()
                     self.emit(f"{half} = OpShiftRightLogical %uint {sh_src} {self.cu(16)}")
                     self.emit(f"{amt} = OpBitwiseAnd %uint {half} {self.cu(15)}")
                 else:
                     self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(0)} {self.cu(4)}")
-                if sl[1]:
-                    # The high half: x >> 16 already extends it the right way for the shift that follows.
-                    right = "OpShiftRightArithmetic" if signed else "OpShiftRightLogical"
-                    self.emit(f"{val} = {right} %uint {val_src} {self.cu(16)}")
+                # The value half goes through the same readers as every other 16-bit op here, which is what gives
+                # v_pk_ashrrev_i16 an %int value: reading the half with a bare shift on %uint (or with a
+                # BitFieldSExtract into %uint) leaves bit 31 clear, and an OpShiftRightArithmetic on that value
+                # sign-extends nothing, so the low 16 bits after a shift of a negative half come out wrong -
+                # (0x8000 >>arith 4) is 0xF800, the %uint form gives 0x0800, and (0xFFFF >>arith 4) is 0xFFFF
+                # against 0x0FFF. The shift amount stays %uint; only the value being shifted carries a sign.
+                val = self.i16_half(val_src, sl[1]) if signed else self.u16_half(val_src, sl[1])
+                if signed:
+                    shifted = self.tmp()
+                    self.emit(f"{shifted} = OpShiftRightArithmetic %int {val} {amt}")
+                    am = self.int_bits(shifted)
                 else:
-                    ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
-                    self.emit(f"{val} = {ext} %uint {val_src} {self.cu(0)} {self.cu(16)}")
-                k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical",
-                     "v_pk_ashrrev_i16": "OpShiftRightArithmetic"}[op]
-                self.emit(f"{am} = {k} %uint {val} {amt}")
+                    am = self.tmp()
+                    k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical"}[op]
+                    self.emit(f"{am} = {k} %uint {val} {amt}")
                 self.emit(f"{r16} = OpBitwiseAnd %uint {am} {self.cu(0xFFFF)}")
                 halves.append(r16)
             hi, r = self.tmp(), self.tmp()
