@@ -252,8 +252,9 @@ class TestVariants(unittest.TestCase):
             with open(out, encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(len(rows), 1)
-            self.assertEqual((rows[0]["gender"], rows[0]["plurality"], rows[0]["text"]),
-                             ("None", "Singular", "Bonjour"))
+            self.assertEqual((rows[0]["gender"], rows[0]["plurality"], rows[0]["case"],
+                              rows[0]["source_a"], rows[0]["source_b"], rows[0]["text"]),
+                             ("None", "Singular", "None", "Player", "Speaker", "Bonjour"))
 
     def test_variants_read_the_source_once(self):
         # A source that disappears as soon as its scan ends must not be reopened for the variant rows: they

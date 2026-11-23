@@ -454,10 +454,11 @@ def main(argv=None) -> int:
                       for s, o, lang, t in scan.tables for h, text in t.items())))
     if a.variants:
         jobs.append((a.variants,
-                     ["source", "offset", "lang", "hash", "label", "gender", "plurality", "case", "text"],
+                     ["source", "offset", "lang", "hash", "label", "gender", "plurality", "case", "source_a",
+                      "source_b", "text"],
                      ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
                        "gender": v["gender"], "plurality": v["plurality"], "case": v["case"],
-                       "text": _clean(v["text"])}
+                       "source_a": v["source_a"], "source_b": v["source_b"], "text": _clean(v["text"])}
                       for s, o, lang, vt in scan.variant_found for h, items in vt.items() for v in items)))
     # Stage every report next to its destination, then swap them all in. A write that fails part-way must
     # leave the previous reports intact instead of truncating the ones that came before it.

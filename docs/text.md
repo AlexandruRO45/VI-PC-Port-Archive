@@ -158,6 +158,7 @@ keys and their text sit in different archives, and every report comes from that 
 | `--dialogue` | `wave`, `key`, `label`, `speaker`, `text_<lang>` per language |
 | `--tables` | `source`, `offset`, `lang`, `group`, `strings`, `resolved` |
 | `--strings` | `source`, `offset`, `lang`, `hash`, `label`, `text` |
+| `--variants` | `source`, `offset`, `lang`, `hash`, `label`, `gender`, `plurality`, `case`, `source_a`, `source_b`, `text` |
 
 Standard library only. The four archives above take about 2 minutes on one core from a carve.
 
