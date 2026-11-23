@@ -134,6 +134,9 @@ class LlvmStallTests(unittest.TestCase):
             probe = ic.probe_llvm_mc("llvm-mc", ["s_endpgm", "v_add_f32"])
         self.assertEqual(list(probe), ["error"])
         self.assertIn("did not answer", probe["error"])
+        self.assertIn(f"within {ic.PROBE_TIMEOUT} s", probe["error"])
+        self.assertIn("s_endpgm", probe["error"])    # names the mnemonic that stalled
+        self.assertEqual(run.call_args.kwargs["timeout"], ic.PROBE_TIMEOUT)
         self.assertEqual(run.call_count, 1)      # the remaining names are not each given the full timeout again
 
     def test_main_reports_the_stall_next_to_each_name(self) -> None:
