@@ -317,10 +317,16 @@ def main(argv=None):
         for uid, (d, f) in enumerate(cases):
             count = geometry(d, f)[3]
             kernels.append(asm.Kernel(kernel_lines(d, f, uid), 32, count, count * 4, raw=True))
-        for (d, f), got in zip(cases, oracle.run(kernels)):
+        results = oracle.run(kernels)
+        if len(results) != len(cases):
+            raise RuntimeError(f"the hardware runner returned {len(results)} results for {len(cases)} kernels")
+        for (d, f), got in zip(cases, results):
             name = f"{d} {f}"
-            if isinstance(got, str):
-                print(f"harness error: {name}: {got}")
+            want_words = geometry(d, f)[3] * 4
+            if got is None or isinstance(got, str) or len(got) != want_words:
+                why = "no result" if got is None else got if isinstance(got, str) else (
+                    f"expected {want_words} words, got {len(got)}")
+                print(f"harness error: {name}: {why}")
                 rc = 2
                 continue
             e = classify(d, f, got)

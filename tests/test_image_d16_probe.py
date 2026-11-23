@@ -134,6 +134,39 @@ class Compare(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("texel 3: x read back", out)
 
+    def test_malformed_or_missing_oracle_results_are_harness_errors(self):
+        class ShortResultOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                return super().run(kernels, words=words)[:-1]
+
+        class ExtraResultOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                res = super().run(kernels, words=words)
+                return res + [res[-1]]
+
+        class NoneEntryOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                res = super().run(kernels, words=words)
+                res[0] = None
+                return res
+
+        class TruncatedWordsOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                res = super().run(kernels, words=words)
+                res[0] = res[0][:-1]
+                return res
+
+        for oracle, expected_msg in (
+            (ShortResultOracle(), "the hardware runner returned 1 results for 2 kernels"),
+            (ExtraResultOracle(), "the hardware runner returned 3 results for 2 kernels"),
+            (NoneEntryOracle(), "1d r32_uint: no result"),
+            (TruncatedWordsOracle(), "1d r32_uint: expected 256 words, got 255"),
+        ):
+            with self.subTest(msg=expected_msg):
+                rc, out = run_main(oracle, "--dims", "1d,2d", "--formats", "r32_uint")
+                self.assertEqual(rc, 2, out)
+                self.assertIn(f"harness error: {expected_msg}", out)
+
     def test_load_and_load_mip_disagreeing_exits_1(self):
         rc, out = run_main(FakeOracle(mip_off=True), "--dims", "3d", "--formats", "r32g32_sint")
         self.assertEqual(rc, 1, out)
