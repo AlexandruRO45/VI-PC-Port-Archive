@@ -757,8 +757,8 @@ int check_xbox_slots() {
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid) {
-    const char* frame_interval = valid ? "96" : "2";
-    const char* schedule_event = valid ? "97" : "2";
+    const char* frame_interval = valid ? "96" : "43";
+    const char* schedule_event = valid ? "97" : "84";
     const char* wait_event = valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
@@ -796,8 +796,7 @@ int run_env_slots(bool valid) {
         EXPECT(release(allocator) == 0);
         EXPECT(release(queue) == 0);
     } else {
-        // Values outside 3..127 are ignored: the five defaults still answer, and a public method that is not a
-        // default is forwarded unchanged (console slot 86 is the PC's ID3D12Device2 slot 47).
+        // Fixed handlers and values outside 3..127 keep the defaults. Console slot 86 still forwards to PC slot 47.
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);

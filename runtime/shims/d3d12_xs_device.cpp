@@ -194,6 +194,13 @@ unsigned env_device_slot(const char* name, unsigned fallback) {
                      value);
         return fallback;
     }
+    if (console::device_slot(slot).kind == console::DeviceMethod::handled ||
+        slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+        slot == 36 || slot == console::device_console_slot(45) || slot == console::device_console_slot(46) ||
+        slot == console::device_console_slot(50) || slot == 111) {
+        std::fprintf(stderr, "[rt] d3d12_xs: %s=%s is a reserved device slot; the default is kept\n", name, value);
+        return fallback;
+    }
     return static_cast<unsigned>(slot);
 }
 
@@ -1109,6 +1116,10 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         const bool succeeds = info.kind == M::accepted || info.kind == M::undecided || info.kind == M::present_x;
         report_queue_call(Slot, info, succeeds, caller, a1, a2, a3, a4);
         d3d12_trace::record(child_trace_name<K>(Slot), succeeds ? "called" : "unsupported");
+        if constexpr (Slot == 26 || Slot == 28) {
+            // Either slot can be GetDesc. Preserve the hidden return pointer without touching its storage.
+            if (info.kind == M::undecided) return a1;
+        }
         return hr_to_u64(succeeds ? S_OK : E_NOTIMPL);
     } else {
         note_child_slot<K>(Slot);
@@ -1252,9 +1263,9 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
     return E_NOTIMPL;
 }
 
-// Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
-// (S_FALSE for a valid description on the PC), as #558 does for slot 14. Console slot 48 (CreateCommandQueueX) ends
-// here too, with its description translated.
+// Both CreateCommandQueue and CreateCommandQueueX call this helper with the same description. The X route records
+// its own slot before calling proxy_create_command_queue, which also counts the shared path at slot 8.
+// Without an output, the real device supplies the capability answer (as for slot 14 in #558).
 HRESULT create_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid, void** out) {
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
@@ -1906,8 +1917,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return 0;
     } else {
         note_slot(Slot);
-        // The public HLE's Xbox device slots (#6935: 48/73/78/79/80 by default, movable by environment) come first,
-        // so a moved route still wins over the console table below.
+        // The public HLE routes (48/73/78/79/80 by default) take precedence over the console table below.
+        // Environment overrides targeting one of the fixed handlers above are rejected.
         const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
         if (Slot == routes.frame_interval) {
             log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
