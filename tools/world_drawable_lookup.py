@@ -1,4 +1,7 @@
-"""Predict model export offsets from local world_archetypes and rpf9_names reports."""
+"""Predict model export offsets from local world_archetypes and rpf9_names reports.
+
+Usage: `python -I tools/world_drawable_lookup.py --help` lists the options.
+"""
 import argparse
 from collections import Counter, defaultdict
 import json
