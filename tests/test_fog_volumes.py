@@ -240,6 +240,28 @@ class FogVolumesTests(unittest.TestCase):
                     fv.main([td, "--jobs", bad])
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_chunk_boundary_zlib_header_is_not_dropped(self):
+        comp = zlib.compress(build_synthetic_fog_0x7a([
+            {"IsBox": 1, "PositionOffset": (1.0, 2.0, 3.0), "ProfileIndex": 5},
+        ]))
+        boundary = 128
+        after_first = (boundary - 1) + len(comp)
+        boundary2 = ((after_first + 63) // 64 + 1) * 64
+        buf = bytearray(boundary2 + len(comp) + 32)
+        buf[0:4] = b"9FPR"
+        buf[boundary - 1:boundary - 1 + len(comp)] = comp
+        buf[boundary2:boundary2 + len(comp)] = comp
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "boundary.rpf")
+            with open(rpf, "wb") as f:
+                f.write(buf)
+            offs0, c0, i0 = fv._scan_rpf_chunk((rpf, 0, boundary))
+            offs1, c1, i1 = fv._scan_rpf_chunk((rpf, boundary, boundary2))
+            offs2, c2, i2 = fv._scan_rpf_chunk((rpf, boundary2, len(buf)))
+            self.assertEqual((offs0, c0, i0), ([boundary - 1], 1, 0))
+            self.assertEqual((offs1, c1, i1), ([], 0, 0))
+            self.assertEqual((offs2, c2, i2), ([boundary2], 1, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

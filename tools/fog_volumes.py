@@ -162,7 +162,8 @@ def _scan_rpf_chunk(args: tuple[str, int, int]) -> tuple[list[int], int, int]:
         size = len(m)
         pos = start
         while pos < end:
-            mt = ZHDR.search(m, pos, end)
+            # ZHDR is 2 bytes; end + 1 lets a header starting at end - 1 match without entering [end, ...).
+            mt = ZHDR.search(m, pos, min(end + 1, size))
             if not mt:
                 break
             off = mt.start()
