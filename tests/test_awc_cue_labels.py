@@ -48,6 +48,15 @@ class LabelTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.output.exists())
 
+    def test_reject_deeply_nested_sheet(self):
+        self.sheet.write_text("[" * 100000 + "]" * 100000, encoding="utf-8", newline="\n")
+        result = subprocess.run([sys.executable, "-I", TOOL, self.sheet, self.output],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["error: cue sheet JSON is nested too deeply"])
+        self.assertFalse(self.output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
