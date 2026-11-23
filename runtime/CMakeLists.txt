@@ -1261,6 +1261,11 @@ if(TARGET Vulkan::Headers)
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
+    add_test(NAME vk_harness_shader_input COMMAND "${CMAKE_COMMAND}"
+             "-DTOOL=$<TARGET_FILE:vk_harness>"
+             "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_harness_shader_input"
+             "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+             -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_harness_shader_input.cmake")
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
     if(WIN32)
       # Reads SizeOfStackReserve from the built file; the program is not run, so it needs no emulator.

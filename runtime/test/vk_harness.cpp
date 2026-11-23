@@ -59,12 +59,24 @@ static PFN_vkGetInstanceProcAddr gipa;
         }                                                                        \
     } while (0)
 
-static std::vector<uint32_t> read_spv(const char* path) {
-    std::ifstream f(path, std::ios::binary);
-    std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
-    std::vector<uint32_t> w(b.size() / 4);
-    std::memcpy(w.data(), b.data(), w.size() * 4);
-    return w;
+static bool read_spv(const char* path, std::vector<uint32_t>& words) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::fprintf(stderr, "cannot open SPIR-V file '%s'\n", path);
+        return false;
+    }
+    constexpr std::streamoff word_size = sizeof(uint32_t);
+    const std::streamoff size = f.tellg();
+    if (size < 5 * word_size || size % word_size != 0) {
+        std::fprintf(stderr, "invalid SPIR-V file size for '%s'\n", path);
+        return false;
+    }
+    words.resize(static_cast<std::size_t>(size / word_size));
+    if (!f.seekg(0) || !f.read(reinterpret_cast<char*>(words.data()), size)) {
+        std::fprintf(stderr, "cannot read SPIR-V file '%s'\n", path);
+        return false;
+    }
+    return true;
 }
 
 static bool parse_u32(const char*& s, uint32_t& v) {
@@ -166,6 +178,16 @@ int main(int argc, char** argv) {
     } else if (argc > 5) {
         W = atoi(argv[4]); H = atoi(argv[5]);
     }
+    const char* mesh_vs_path = std::getenv("VKH_MESH_COMPUTE");
+    if (mesh_vs_path && !*mesh_vs_path) mesh_vs_path = nullptr;
+    const bool mesh_compute = mesh_vs_path != nullptr;
+    const char* gs_path = std::getenv("VKH_GS");
+    // Use the same words for capability checks and module creation.
+    std::vector<uint32_t> first_code, fs_code, mesh_vs_code, gs_code;
+    if (!read_spv(argv[1], first_code) || !read_spv(argv[2], fs_code) ||
+        (mesh_compute && !read_spv(mesh_vs_path, mesh_vs_code)) ||
+        (gs_path && !read_spv(gs_path, gs_code))) return 1;
+
     // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37).
     uint32_t pc[38] = {};
     const char* draw_mesh_path = std::getenv("VKH_DRAW_MESH");
@@ -300,7 +322,6 @@ int main(int argc, char** argv) {
     // A translated pixel shader that reads BaryCoordKHR aborts the driver when the device lacks barycentrics
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
-    const std::vector<uint32_t> fs_code = read_spv(argv[2]);
     bool needs_barycentric = false, needs_float64 = false;
     for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
         const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
@@ -346,9 +367,6 @@ int main(int argc, char** argv) {
     // output buffer (VKH_MESH_SLOT bytes per workgroup, address in push-constant dwords 36..37). Then
     // vs.spv (tools/mesh_compute_vs.py) draws groups * VKH_MESH_PRIMS * 3 vertices with the fragment shader. No
     // VK_EXT_mesh_shader is needed.
-    const char* mesh_vs_path = std::getenv("VKH_MESH_COMPUTE");
-    if (mesh_vs_path && !*mesh_vs_path) mesh_vs_path = nullptr;
-    const bool mesh_compute = mesh_vs_path != nullptr;
     uint64_t mesh_slot = 0;
     uint32_t mesh_prims = 0;
     if (mesh_compute) {
@@ -477,7 +495,6 @@ int main(int argc, char** argv) {
     dci.pNext = chain;
     // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders. VKH_SUBGROUP_SIZE then
     // applies to it, unless VKH_GS_HELPER=1 says the GS only feeds the pixel shader under test.
-    const char* gs_path = std::getenv("VKH_GS");
     const char* count_opt = std::getenv("VKH_GS_PRIMITIVES");
     const bool count_gs = count_opt && std::strcmp(count_opt, "1") == 0;
     if (count_gs && (!gs_path || !*gs_path || mesh || mesh_compute)) {
@@ -511,9 +528,10 @@ int main(int argc, char** argv) {
     // shaderInt64 only when a stage has 64-bit integers. Heap and --mesh-compute addresses are 64-bit, but rdna2spirv.py
     // builds them from 32-bit pairs unless the shader also does 64-bit arithmetic (SHADER-423), so the module decides,
     // not VKH_HEAP (TEST-468).
-    bool needs_int64 = leonida::vk_test::needs_shader_int64(fs_code);
-    for (const char* p : std::initializer_list<const char*>{argv[1], mesh_vs_path, gs_path})
-        if (p && !needs_int64) needs_int64 = leonida::vk_test::needs_shader_int64(read_spv(p));
+    const bool needs_int64 = leonida::vk_test::needs_shader_int64(fs_code) ||
+                             leonida::vk_test::needs_shader_int64(first_code) ||
+                             leonida::vk_test::needs_shader_int64(mesh_vs_code) ||
+                             leonida::vk_test::needs_shader_int64(gs_code);
     if (needs_int64) {
         if (!f2q.features.shaderInt64) {
             std::fprintf(stderr, "unsupported: a stage declares Int64 and the device has no shaderInt64\n");
@@ -628,8 +646,7 @@ int main(int argc, char** argv) {
     fbi.renderPass = rp; fbi.attachmentCount = rpi.attachmentCount; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
     bool tail_block = false;   // some stage reads the --pc-tail-ubo block (declares set 1)
-    auto module = [&](const char* p, VkShaderModule* m) {
-        auto code = read_spv(p);
+    auto module = [&](const std::vector<uint32_t>& code, VkShaderModule* m) {
         if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
             tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -637,8 +654,8 @@ int main(int argc, char** argv) {
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
     VkShaderModule vs, fs, csm = VK_NULL_HANDLE;
-    CHECK(module(mesh_compute ? mesh_vs_path : argv[1], &vs)); CHECK(module(argv[2], &fs));
-    if (mesh_compute) CHECK(module(argv[1], &csm));
+    CHECK(module(mesh_compute ? mesh_vs_code : first_code, &vs)); CHECK(module(fs_code, &fs));
+    if (mesh_compute) CHECK(module(first_code, &csm));
     VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -648,7 +665,7 @@ int main(int argc, char** argv) {
     uint32_t nstages = 2;
     if (gs_path) {
         VkShaderModule gsm;
-        CHECK(module(gs_path, &gsm));
+        CHECK(module(gs_code, &gsm));
         stages[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT; stages[2].module = gsm; stages[2].pName = "main";
         nstages = 3;
     }
