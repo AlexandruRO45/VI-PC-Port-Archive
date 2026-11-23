@@ -4,10 +4,13 @@
 // xgameruntime-docs' layout; arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -181,6 +184,64 @@ int main() {
     check(at<Register>(device, 4)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == S_OK &&
               at<Unregister>(device, 5)(device, token, false),
           "device association registration and unregistration");
+    // RT-391: each unregister slot takes back only a live token of its own registration, once.
+    check(!at<Unregister>(device, 5)(device, token, false), "a device association token unregisters only once");
+    XTaskQueueRegistrationToken never_issued{~0ull};
+    check(!at<Unregister>(device, 5)(device, never_issued, false) && !at<Unregister>(device, 8)(device, never_issued, true),
+          "a token no registration handed out is refused");
+    XTaskQueueRegistrationToken association{}, audio{};
+    check(at<Register>(device, 4)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &association) == S_OK &&
+              at<Register>(device, 7)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &audio) == S_OK &&
+              association.token != 0 && audio.token != 0 && association.token != audio.token,
+          "both registrations hand out distinct tokens");
+    check(!at<Unregister>(device, 8)(device, association, false) && !at<Unregister>(device, 5)(device, audio, false),
+          "neither unregister slot takes the other registration's token");
+    check(at<Unregister>(device, 8)(device, audio, true) && !at<Unregister>(device, 8)(device, audio, true),
+          "an audio endpoint token unregisters once");
+    check(at<Unregister>(device, 5)(device, association, false),
+          "a token refused by the other slot is still live for its own");
+    XTaskQueueRegistrationToken untouched{12345};
+    check(at<Register>(device, 4)(device, nullptr, nullptr, nullptr, &untouched) == E_INVALIDARG &&
+              at<Register>(device, 7)(device, nullptr, nullptr, nullptr, &untouched) == E_INVALIDARG &&
+              untouched.token == 12345 &&
+              at<Register>(device, 4)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), nullptr) ==
+                  E_INVALIDARG &&
+              at<Register>(device, 7)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), nullptr) ==
+                  E_INVALIDARG,
+          "a registration without a callback or a token is refused and hands out nothing");
+    XTaskQueueRegistrationToken streaming_token{};
+    check(at<Register>(streaming, 12)(streaming, nullptr, nullptr, reinterpret_cast<void*>(&on_state),
+                                      &streaming_token) == S_OK &&
+              !at<Unregister>(device, 5)(device, streaming_token, false) &&
+              !at<Unregister>(device, 8)(device, streaming_token, false),
+          "a streaming connection-state token is not a device registration");
+    XTaskQueueRegistrationToken again{};
+    check(at<Register>(device, 4)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &again) == S_OK &&
+              again.token != association.token && !at<Unregister>(device, 5)(device, association, false) &&
+              at<Unregister>(device, 5)(device, again, true),
+          "registering again hands out a new token; the unregistered one stays refused");
+    {
+        // Several threads register and unregister on both registrations at once: every token unregisters exactly
+        // once, from its own slot.
+        constexpr int kThreads = 8, kRounds = 250;
+        std::atomic<int> wrong{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t)
+            threads.emplace_back([&, t] {
+                const int reg = t % 2 ? 7 : 4, unreg = t % 2 ? 8 : 5, other = t % 2 ? 5 : 8;
+                for (int i = 0; i < kRounds; ++i) {
+                    XTaskQueueRegistrationToken mine{};
+                    if (at<Register>(device, reg)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state),
+                                                  &mine) != S_OK ||
+                        at<Unregister>(device, other)(device, mine, false) ||
+                        !at<Unregister>(device, unreg)(device, mine, i % 2 == 0) ||
+                        at<Unregister>(device, unreg)(device, mine, false))
+                        wrong.fetch_add(1);
+                }
+            });
+        for (std::thread& thread : threads) thread.join();
+        check(wrong.load() == 0, "concurrent registrations each unregister once, from their own slot");
+    }
     wchar_t endpoint[8] = {L'x'};
     size_t used = 99;
     check(FAILED(at<Endpoint>(device, 6)(device, 1, 0, 8, endpoint, &used)) && endpoint[0] == 0 && used == 0,

@@ -15,8 +15,10 @@
 //   XGameStreamingImpl  the game is never streamed: initialising succeeds, IsStreaming is false, there are no
 //                       clients, the connection-state registration hands out a token that never fires.
 //   XDisplayImpl        XDisplayTryEnableHdrMode: Disabled (the host output is SDR), Enabled with LEONIDA_HDR=1.
-//   XUserDeviceImpl     every device belongs to the offline user; associations and audio endpoints never change; the
-//                       user has no audio endpoint of its own; finding a controller shows no UI (as on desktop).
+//   XUserDeviceImpl     every device belongs to the offline user; associations and audio endpoints never change, so
+//                       their registrations hand out tokens that never fire, and each unregister takes back a live
+//                       token of its own registration once; the user has no audio endpoint of its own; finding a
+//                       controller shows no UI (as on desktop).
 //   XAccessibilityImpl  high contrast is Off, closed captions can't be configured, no voice is installed (enumerating
 //                       calls back zero times), XSpeechSynthesizerCreate fails (E_FAIL) with a null handle, the other
 //                       speech calls refuse the handle they were never given (E_INVALIDARG), speech-to-text display
@@ -34,6 +36,7 @@
 #include <cstring>
 #include <iterator>
 #include <mutex>
+#include <set>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -456,17 +459,29 @@ HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* dev
 // 4: HRESULT XUserRegisterForDeviceAssociationChanged(XTaskQueueHandle queue, void* context,
 //        XUserDeviceAssociationChangedCallback* callback, XTaskQueueRegistrationToken* token)
 // 7: HRESULT XUserRegisterForDefaultAudioEndpointUtf16Changed(XTaskQueueHandle, void*, callback, token*)
-// Associations and endpoints never change offline: a token, no callback.
+// Associations and endpoints never change offline: a token, no callback. Each of the two registrations keeps the
+// tokens it handed out, so its unregister slot can tell a live token from one it never issued (RT-391).
+enum class DeviceRegistration { association, audio_endpoint };
+std::set<uint64_t> g_device_tokens[2];
+
+template <DeviceRegistration Kind>
 HRESULT STDMETHODCALLTYPE device_register(void*, XTaskQueueHandle, void*, void* callback,
                                           XTaskQueueRegistrationToken* token) {
     if (!callback || !token) return E_INVALIDARG;
     std::lock_guard<std::mutex> lock(g_streaming_mutex);
     token->token = g_next_token++;
+    g_device_tokens[static_cast<int>(Kind)].insert(token->token);
     return S_OK;
 }
 
-// 5, 8: bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait): never pending.
-bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+// 5, 8: bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait): no callback is ever running, so `wait`
+// changes nothing. True removes a token the matching register slot handed out and has not taken back; a token
+// already unregistered, never issued, or issued by the other registration is false, and stays as it was.
+template <DeviceRegistration Kind>
+bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken token, bool) {
+    std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    return g_device_tokens[static_cast<int>(Kind)].erase(token.token) != 0;
+}
 
 // 6: HRESULT XUserGetDefaultAudioEndpointUtf16(XUserLocalId user, XUserDefaultAudioEndpointKind kind,
 //        size_t endpointIdUtf16Count, wchar_t* endpointIdUtf16, size_t* endpointIdUtf16Used)
@@ -512,11 +527,11 @@ HRESULT STDMETHODCALLTYPE device_query_interface(void*, REFIID iid, void** out);
 const void* const kUserDeviceVtable[] = {
     FN(device_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
     FN(device_find_user),                   // 3  XUserFindForDevice
-    FN(device_register),                    // 4  XUserRegisterForDeviceAssociationChanged
-    FN(device_unregister),                  // 5  XUserUnregisterForDeviceAssociationChanged
-    FN(device_audio_endpoint),              // 6  XUserGetDefaultAudioEndpointUtf16
-    FN(device_register),                    // 7  XUserRegisterForDefaultAudioEndpointUtf16Changed
-    FN(device_unregister),                  // 8  XUserUnregisterForDefaultAudioEndpointUtf16Changed
+    FN(device_register<DeviceRegistration::association>),       // 4  XUserRegisterForDeviceAssociationChanged
+    FN(device_unregister<DeviceRegistration::association>),     // 5  XUserUnregisterForDeviceAssociationChanged
+    FN(device_audio_endpoint),                                  // 6  XUserGetDefaultAudioEndpointUtf16
+    FN(device_register<DeviceRegistration::audio_endpoint>),    // 7  XUserRegisterForDefaultAudioEndpointUtf16Changed
+    FN(device_unregister<DeviceRegistration::audio_endpoint>),  // 8  XUserUnregisterForDefaultAudioEndpointUtf16Changed
     FN(device_find_controller_async),       // 9  XUserFindControllerForUserWithUiAsync
     FN(device_find_controller_result),      // 10 XUserFindControllerForUserWithUiResult
 };

@@ -438,6 +438,12 @@ on the executable, the rest is not:
   are no clients, and the connection-state registration hands out a token that never fires. Every per-client slot
   answers `E_GAMESTREAMING_NOT_INITIALIZED` (0x89245400), which a caller reading a bool sees as false (low byte
   0).
+- **User devices:** every device belongs to the offline user, and the user has no audio endpoint of its own. The
+  device-association (slot 4) and default-audio-endpoint (slot 7) registrations each hand out a token that never
+  fires, since neither changes offline, and keep it until it is unregistered. The matching unregister slot (5, 8)
+  returns true once for a live token of its own registration, and false for one already unregistered, never
+  issued, or issued by the other registration or by streaming (RT-391). `wait` changes nothing, since no callback is
+  ever running.
 - **Not reached by the executable:** the parameter lists of `XGameUiShowMessageDialogAsync` and
   `XGameStreamingRegisterConnectionStateChanged` are the GDK reference's, and the executable has no caller to check
   them against. `tools/gdk_runtime_calls.py` finds no thunk for the message dialog and none for any
