@@ -125,5 +125,62 @@ class VCvtF32I32AstValidationTests(unittest.TestCase):
         self.assertEqual(ast.src0.kind, RegKind.IMM)
         self.assertEqual(ast.src0.raw_val, -100)
 
+class ScalarLaneState:
+    def __init__(self):
+        self.vgprs: dict[int, int] = {}
+        self.sgprs: dict[int, int] = {}
+
+    def get_operand_val(self, op: Operand) -> int:
+        if op.kind == RegKind.VGPR:
+            return self.vgprs.get(op.index, 0) & MASK32
+        elif op.kind == RegKind.SGPR:
+            return self.sgprs.get(op.index, 0) & MASK32
+        else:
+            return op.raw_val & MASK32
+
+    def set_vgpr(self, idx: int, val: int):
+        self.vgprs[idx] = val & MASK32
+
+
+def execute_scalar_cvt_f32_i32(state: ScalarLaneState, ast: InstructionAST) -> None:
+    src_val = state.get_operand_val(ast.src0)
+    res = oracle_cvt_f32_i32(src_val)
+    state.set_vgpr(ast.dst.index, res)
+
+
+class VCvtF32I32ScalarInterpreterTests(unittest.TestCase):
+    def test_interpreter_positive_conversion(self):
+        state = ScalarLaneState()
+        state.set_vgpr(1, 100)
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+        )
+        execute_scalar_cvt_f32_i32(state, ast)
+        self.assertEqual(state.vgprs[0], 0x42C80000)  # 100.0f
+
+    def test_interpreter_negative_conversion(self):
+        state = ScalarLaneState()
+        state.set_vgpr(1, 0xFFFFFF9C)  # -100 in two's-complement
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+        )
+        execute_scalar_cvt_f32_i32(state, ast)
+        self.assertEqual(state.vgprs[0], 0xC2C80000)  # -100.0f
+
+    def test_interpreter_zero_conversion(self):
+        state = ScalarLaneState()
+        state.set_vgpr(1, 0)
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+        )
+        execute_scalar_cvt_f32_i32(state, ast)
+        self.assertEqual(state.vgprs[0], 0x00000000)
+
 if __name__ == "__main__":
     unittest.main()
