@@ -123,6 +123,73 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertEqual(len(p.stderr.splitlines()), 1)
         self.assertEqual(sorted(os.listdir(out)), [])
 
+    def test_fallback_writes_the_listing_it_already_decoded(self):
+        # No header offset: scan 4, 8, then 12 bytes. The 12-byte candidate includes an invalid word.
+        with open(self.fssm, "wb") as f:
+            f.write(bytes(0x100) + b"\x01\x02\x03\x04" + CODE)
+        mc = self.fake("import sys\n"
+                       "from pathlib import Path\n"
+                       "tokens = sys.stdin.read().split()\n"
+                       "if len(tokens) == 4:\n"
+                       "    print('s_endpgm')\n"
+                       "elif len(tokens) == 8:\n"
+                       "    seen = Path(__file__).with_suffix('.seen')\n"
+                       "    if seen.exists():\n"
+                       "        sys.stderr.write('error: disassembler unavailable on repeat\\n')\n"
+                       "        sys.exit(1)\n"
+                       "    seen.touch()\n"
+                       "    print(%r, end='')\n"
+                       "else:\n"
+                       "    sys.stderr.write('warning: invalid instruction encoding\\n')\n" % ASM)
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("code 0x104..0x10c (scan)", listing)
+        self.assertTrue(listing.endswith(ASM), listing)
+
+    def test_fallback_refuses_an_unconfirmed_longer_candidate(self):
+        with open(self.fssm, "wb") as f:
+            f.write(bytes(0x100) + b"\x01\x02\x03\x04" + CODE)
+        mc = self.fake("import sys\n"
+                       "from pathlib import Path\n"
+                       "tokens = sys.stdin.read().split()\n"
+                       "if len(tokens) == 4:\n"
+                       "    print('s_endpgm')\n"
+                       "elif len(tokens) == 8:\n"
+                       "    print(%r, end='')\n"
+                       "else:\n"
+                       "    seen = Path(__file__).with_suffix('.seen')\n"
+                       "    if seen.exists():\n"
+                       "        print(%r, end='')\n"
+                       "        sys.stderr.write('warning: invalid instruction encoding\\n')\n"
+                       "    else:\n"
+                       "        seen.touch()\n"
+                       "        sys.stderr.write('error: disassembler unavailable\\n')\n"
+                       "        sys.exit(1)\n" % (ASM, ASM))
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("error: disassembler unavailable", p.stderr)
+        self.assertEqual(os.listdir(out), [])
+
+    def test_fallback_without_a_listing_reports_the_tool_error(self):
+        with open(self.fssm, "wb") as f:
+            f.write(bytes(0x100) + CODE)
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "if '-show-encoding' not in sys.argv:\n"
+                       "    print('s_endpgm')\n"
+                       "else:\n"
+                       "    sys.stderr.write('error: disassembler unavailable\\n')\n"
+                       "    sys.exit(1)\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("error: disassembler unavailable", p.stderr)
+        self.assertEqual(os.listdir(out), [])
+
     def test_no_code_is_an_error_when_no_listings_are_written(self):
         with open(self.fssm, "wb") as f:
             f.write(b"FSSM\x01\x01" + bytes(320))
