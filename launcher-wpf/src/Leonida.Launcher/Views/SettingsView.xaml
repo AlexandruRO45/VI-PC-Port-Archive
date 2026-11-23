@@ -3,11 +3,78 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
   <UserControl.Resources>
     <Style x:Key="Small" TargetType="Button" BasedOn="{StaticResource Outline}">
-      <Setter Property="Padding" Value="10,4"/>
+      <Setter Property="Padding" Value="12,6"/>
       <Setter Property="Margin" Value="8,0,0,0"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
     </Style>
-    <Style x:Key="Body" TargetType="StackPanel">
-      <Setter Property="Margin" Value="18,14,18,16"/>
+    <!-- One setting: name and description on the left, its control on the right, a line under it -->
+    <Style x:Key="Row" TargetType="Border">
+      <Setter Property="BorderBrush" Value="{DynamicResource Line}"/>
+      <Setter Property="BorderThickness" Value="0,0,0,1"/>
+      <Setter Property="Padding" Value="0,20"/>
+    </Style>
+    <Style x:Key="RowTitle" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="15.5"/>
+      <Setter Property="Foreground" Value="{DynamicResource Heading}"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+    <Style x:Key="RowText" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="12.5"/>
+      <Setter Property="Foreground" Value="{DynamicResource SubText}"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Margin" Value="0,5,0,0"/>
+    </Style>
+    <Style x:Key="RowLeft" TargetType="StackPanel">
+      <Setter Property="Margin" Value="0,0,40,0"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style x:Key="Pick" TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
+      <Setter Property="Width" Value="300"/>
+      <Setter Property="Height" Value="40"/>
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="Padding" Value="12,5,30,5"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style x:Key="Field" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+      <Setter Property="Height" Value="36"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Padding" Value="8,0"/>
+    </Style>
+    <!-- The pages in the left column: a group heading, then its pages -->
+    <Style x:Key="Group" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="FontSize" Value="15"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="Margin" Value="24,26,0,8"/>
+    </Style>
+    <Style x:Key="PageNav" TargetType="RadioButton">
+      <Setter Property="Foreground" Value="{StaticResource SideMuted}"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="GroupName" Value="settings"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border x:Name="b" Background="Transparent" Height="36">
+              <Grid>
+                <Rectangle x:Name="bar" Width="3" HorizontalAlignment="Left" Fill="{StaticResource Sunset}" Visibility="Hidden"/>
+                <ContentPresenter Margin="24,0,0,0" VerticalAlignment="Center"/>
+              </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="b" Property="Background" Value="{StaticResource SideHover}"/>
+                <Setter Property="Foreground" Value="#FFFFFF"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter Property="Foreground" Value="#FFFFFF"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter TargetName="bar" Property="Visibility" Value="Visible"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
   </UserControl.Resources>
 
@@ -17,201 +84,357 @@
       <ColumnDefinition/>
     </Grid.ColumnDefinitions>
 
-    <!-- ===== Left: the sections, and Back ===== -->
+    <!-- ===== Left: the launcher and its version, the pages, Back ===== -->
     <Border Background="{StaticResource Ink}">
       <DockPanel>
-        <StackPanel DockPanel.Dock="Top" Margin="0,30,0,18">
-          <TextBlock Text="SETTINGS" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="34" Margin="22,0,0,0"/>
-          <Rectangle Height="4" Width="110" Fill="{StaticResource Sunset}" HorizontalAlignment="Left" Margin="22,2,0,0"/>
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="24,34,0,10">
+          <Border Width="44" Height="44" CornerRadius="4" ClipToBounds="True">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                <GradientStop Color="#2A1452" Offset="0"/><GradientStop Color="#B42A78" Offset="0.62"/><GradientStop Color="#FF8A3D" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <Image Source="../Assets/logo.png" Margin="4" RenderOptions.BitmapScalingMode="HighQuality"/>
+          </Border>
+          <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+            <TextBlock Text="Leonida Launcher" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
+            <TextBlock x:Name="SideVersion" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
+          </StackPanel>
         </StackPanel>
         <Border DockPanel.Dock="Bottom" BorderBrush="#262626" BorderThickness="0,1,0,0" Padding="0,10,0,14">
           <Button x:Name="BackButton" Style="{StaticResource SideAction}" Tag="&#xE72B;" Content="Back" Click="OnBack" FontSize="14"
                   AutomationProperties.Name="Back"/>
         </Border>
         <StackPanel>
-          <RadioButton x:Name="NavLauncher" Style="{StaticResource SideNav}" Tag="&#xE713;" Content="Launcher settings" GroupName="settings"
-                       Checked="OnSection" AutomationProperties.Name="Launcher settings"/>
-          <RadioButton x:Name="NavLeonida" Style="{StaticResource SideNav}" Tag="&#xE7FC;" Content="Leonida settings" GroupName="settings"
-                       Checked="OnSection" AutomationProperties.Name="Leonida settings"/>
+          <TextBlock Text="Launcher settings" Style="{StaticResource Group}"/>
+          <RadioButton x:Name="NavGeneral" Style="{StaticResource PageNav}" Tag="general" Content="General" Checked="OnSection" AutomationProperties.Name="General"/>
+          <RadioButton x:Name="NavBuilds" Style="{StaticResource PageNav}" Tag="builds" Content="Builds" Checked="OnSection" AutomationProperties.Name="Builds"/>
+          <RadioButton x:Name="NavOnline" Style="{StaticResource PageNav}" Tag="online" Content="Online" Checked="OnSection" AutomationProperties.Name="Online"/>
+          <RadioButton x:Name="NavAbout" Style="{StaticResource PageNav}" Tag="about" Content="About and files" Checked="OnSection" AutomationProperties.Name="About and files"/>
+          <TextBlock Text="Leonida settings" Style="{StaticResource Group}"/>
+          <RadioButton x:Name="NavSetup" Style="{StaticResource PageNav}" Tag="setup" Content="Your setup" Checked="OnSection" AutomationProperties.Name="Your setup"/>
+          <RadioButton x:Name="NavPlay" Style="{StaticResource PageNav}" Tag="play" Content="Play" Checked="OnSection" AutomationProperties.Name="Play options"/>
+          <RadioButton x:Name="NavFolders" Style="{StaticResource PageNav}" Tag="folders" Content="Folders and Python" Checked="OnSection" AutomationProperties.Name="Folders and Python"/>
         </StackPanel>
       </DockPanel>
     </Border>
 
-    <!-- ===== Launcher settings ===== -->
-    <ScrollViewer Grid.Column="1" x:Name="LauncherSection" VerticalScrollBarVisibility="Auto" Padding="48,70,48,24">
-      <StackPanel MaxWidth="1100">
-        <TextBlock Text="Launcher settings" Style="{StaticResource H1}" FontSize="44" Margin="0,0,0,18"/>
-        <Grid>
-          <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="22"/><ColumnDefinition/></Grid.ColumnDefinitions>
-          <StackPanel Grid.Column="0">
-            <Border Style="{StaticResource Card}">
-              <DockPanel>
-                <Border DockPanel.Dock="Top" Style="{StaticResource Caption}"><TextBlock Text="Appearance" Style="{StaticResource CaptionText}"/></Border>
-                <StackPanel Style="{StaticResource Body}">
-                  <TextBlock Text="LANGUAGE" Style="{StaticResource Label}"/>
-                  <ComboBox x:Name="LanguageBox" Width="220" HorizontalAlignment="Left" SelectionChanged="OnLanguage" AutomationProperties.Name="Language"/>
-                  <TextBlock Style="{StaticResource Hint}" Text="The launcher's language. README pages and the build's output stay in English."/>
-                  <TextBlock Text="THEME" Style="{StaticResource Label}" Margin="0,14,0,4"/>
-                  <ComboBox x:Name="ThemeBox" Width="220" HorizontalAlignment="Left" SelectionChanged="OnTheme" AutomationProperties.Name="Theme"/>
-                  <TextBlock Text="START PAGE" Style="{StaticResource Label}" Margin="0,14,0,4"/>
-                  <ComboBox x:Name="StartPageBox" Width="220" HorizontalAlignment="Left" SelectionChanged="OnChanged"/>
-                  <CheckBox x:Name="StartCollapsed" Content="Start with the sidebar collapsed" Margin="0,12,0,0" Checked="OnChanged" Unchecked="OnChanged"/>
-                  <TextBlock Text="Your avatar" Style="{StaticResource Label}" Margin="0,16,0,6"/>
-                  <StackPanel Orientation="Horizontal">
-                    <ContentControl x:Name="AvatarPreview" Width="56" Height="56"/>
-                    <Button Style="{StaticResource Outline}" Content="New random avatar" Click="OnNewAvatar" Margin="14,0,0,0" VerticalAlignment="Center"/>
-                  </StackPanel>
-                </StackPanel>
-              </DockPanel>
-            </Border>
-            <Border Style="{StaticResource Card}">
-              <DockPanel>
-                <Border DockPanel.Dock="Top" Style="{StaticResource Caption}"><TextBlock Text="Online" Style="{StaticResource CaptionText}"/></Border>
-                <StackPanel Style="{StaticResource Body}">
-                  <CheckBox x:Name="AllowOnline" Checked="OnChanged" Unchecked="OnChanged">
-                    <TextBlock TextWrapping="Wrap" Text="Allow online features (GitHub profile pictures in Credits, the Can I Run checker)"/>
-                  </CheckBox>
-                  <TextBlock Style="{StaticResource Hint}" Text="Off: nothing is fetched; Credits uses your git history and Can I Run shows only your hardware."/>
-                </StackPanel>
-              </DockPanel>
-            </Border>
-          </StackPanel>
+    <!-- ===== Right: the page shown ===== -->
+    <ScrollViewer Grid.Column="1" x:Name="Pages" VerticalScrollBarVisibility="Auto" Padding="64,66,64,30">
+      <StackPanel Width="860" HorizontalAlignment="Left">
+        <TextBlock x:Name="PageTitle" Style="{StaticResource H1}" FontSize="40"/>
+        <Rectangle Height="4" Width="96" Fill="{StaticResource Sunset}" HorizontalAlignment="Left" Margin="0,2,0,10"/>
 
-          <StackPanel Grid.Column="2">
-            <Border Style="{StaticResource Card}">
-              <DockPanel>
-                <Border DockPanel.Dock="Top" Style="{StaticResource Caption}"><TextBlock Text="Builds" Style="{StaticResource CaptionText}"/></Border>
-                <StackPanel Style="{StaticResource Body}">
-                  <CheckBox x:Name="StopGracefully" Content="Stop builds with Ctrl+C first (they resume next time)" Checked="OnChanged" Unchecked="OnChanged"/>
-                  <StackPanel Orientation="Horizontal" Margin="22,6,0,0">
-                    <TextBlock Text="then end them after" VerticalAlignment="Center"/>
-                    <TextBox x:Name="GraceBox" Width="52" Margin="8,0" TextChanged="OnChanged"/>
-                    <TextBlock Text="seconds" VerticalAlignment="Center"/>
-                  </StackPanel>
-                  <CheckBox x:Name="NotifyDone" Content="Flash the taskbar when a build ends" Margin="0,12,0,0" Checked="OnChanged" Unchecked="OnChanged"/>
-                  <CheckBox x:Name="SoundDone" Content="Play a sound when a build ends" Checked="OnChanged" Unchecked="OnChanged"/>
-                  <TextBlock Text="CONSOLE TEXT SIZE" Style="{StaticResource Label}" Margin="0,14,0,4"/>
-                  <DockPanel>
-                    <TextBlock x:Name="FontValue" DockPanel.Dock="Right" Width="40" TextAlignment="Right" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                    <Slider x:Name="FontSlider" Minimum="10" Maximum="18" TickFrequency="0.5" IsSnapToTickEnabled="True" ValueChanged="OnFont" VerticalAlignment="Center"/>
-                  </DockPanel>
-                  <Border Background="{StaticResource ConsoleBg}" Padding="10,6" Margin="0,6,0,0">
-                    <TextBlock x:Name="FontPreview" Text="11:13:27  check: Xbox Series package 1.0.2.1, 108 files" Foreground="#D6D6D6" FontFamily="{StaticResource Mono}"/>
-                  </Border>
-                  <TextBlock Text="DELETE BUILD LOGS OLDER THAN" Style="{StaticResource Label}" Margin="0,14,0,4"/>
-                  <StackPanel Orientation="Horizontal">
-                    <TextBox x:Name="KeepLogsBox" Width="52" TextChanged="OnChanged"/>
-                    <TextBlock Text="days (0 keeps them all)" VerticalAlignment="Center" Margin="8,0,0,0"/>
-                  </StackPanel>
-                </StackPanel>
-              </DockPanel>
-            </Border>
-            <Border Style="{StaticResource Card}">
-              <DockPanel>
-                <Border DockPanel.Dock="Top" Style="{StaticResource Caption}"><TextBlock Text="Files" Style="{StaticResource CaptionText}"/></Border>
-                <StackPanel Style="{StaticResource Body}">
-                  <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,10"><Run Text="Settings file:"/> <Run x:Name="SettingsPath"/></TextBlock>
-                  <WrapPanel>
-                    <Button Style="{StaticResource Danger}" Content="Restore defaults" Click="OnReset"/>
-                    <Button Style="{StaticResource Outline}" Content="Open logs folder" Click="OnLogs"/>
-                  </WrapPanel>
-                </StackPanel>
-              </DockPanel>
-            </Border>
-          </StackPanel>
-        </Grid>
-      </StackPanel>
-    </ScrollViewer>
+        <!-- ===== General ===== -->
+        <StackPanel x:Name="PageGeneral">
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Language" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="The launcher's language. README pages and the build's output stay in English." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <ComboBox Grid.Column="1" x:Name="LanguageBox" Style="{StaticResource Pick}" SelectionChanged="OnLanguage" AutomationProperties.Name="Language"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Theme" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Light, dark, or the same as Windows' app mode." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <ComboBox Grid.Column="1" x:Name="ThemeBox" Style="{StaticResource Pick}" SelectionChanged="OnTheme" AutomationProperties.Name="Theme"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Start page" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="What the launcher opens on." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <ComboBox Grid.Column="1" x:Name="StartPageBox" Style="{StaticResource Pick}" SelectionChanged="OnChanged" AutomationProperties.Name="Start page"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Start with the sidebar collapsed" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Only the icons show; the button at the bottom of the sidebar opens it." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="StartCollapsed" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged"
+                        AutomationProperties.Name="Start with the sidebar collapsed"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Your avatar" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="A random picture for the avatar menu. Nothing about you is used." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <ContentControl x:Name="AvatarPreview" Width="44" Height="44"/>
+                <Button Style="{StaticResource Small}" Content="New random avatar" Click="OnNewAvatar" Margin="14,0,0,0"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+        </StackPanel>
 
-    <!-- ===== Leonida settings ===== -->
-    <ScrollViewer Grid.Column="1" x:Name="LeonidaSection" Visibility="Collapsed" VerticalScrollBarVisibility="Auto" Padding="48,70,48,24">
-      <StackPanel MaxWidth="1100">
-        <TextBlock Text="Leonida settings" Style="{StaticResource H1}" FontSize="44" Margin="0,0,0,18"/>
-        <Grid>
-          <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="22"/><ColumnDefinition/></Grid.ColumnDefinitions>
-          <StackPanel Grid.Column="0">
-            <Border Style="{StaticResource Card}">
-              <DockPanel>
-                <Border DockPanel.Dock="Top" Style="{StaticResource Caption}">
+        <!-- ===== Builds ===== -->
+        <StackPanel x:Name="PageBuilds" Visibility="Collapsed">
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Stop builds gently" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="STOP sends Ctrl+C first, so the build continues where it left off next time. Off: STOP ends it at once." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="StopGracefully" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged"
+                        AutomationProperties.Name="Stop builds gently"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Time to stop" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="How long a gentle stop may take before the build is ended (5 to 600 seconds)." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBox x:Name="GraceBox" Style="{StaticResource Field}" Width="70" TextAlignment="Right" TextChanged="OnChanged" AutomationProperties.Name="Time to stop"/>
+                <TextBlock Text="seconds" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="{DynamicResource SubText}"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Flash the taskbar" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="When a build ends while the launcher is in the background." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="NotifyDone" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Flash the taskbar"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Play a sound" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="When a build ends." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="SoundDone" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Play a sound"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <StackPanel>
+              <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel Style="{StaticResource RowLeft}">
+                  <TextBlock Text="Console text size" Style="{StaticResource RowTitle}"/>
+                  <TextBlock Text="The build console on the BUILD tab." Style="{StaticResource RowText}"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <Slider x:Name="FontSlider" Width="250" Minimum="10" Maximum="18" TickFrequency="0.5" IsSnapToTickEnabled="True" ValueChanged="OnFont"
+                          VerticalAlignment="Center" AutomationProperties.Name="Console text size"/>
+                  <TextBlock x:Name="FontValue" Width="44" TextAlignment="Right" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="{DynamicResource Heading}"/>
+                </StackPanel>
+              </Grid>
+              <Border Background="{StaticResource ConsoleBg}" Padding="12,8" Margin="0,14,0,0" CornerRadius="3">
+                <TextBlock x:Name="FontPreview" Text="11:13:27  check: Xbox Series package 1.0.2.1, 108 files" Foreground="#D6D6D6" FontFamily="{StaticResource Mono}"/>
+              </Border>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Keep build logs" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Older logs are deleted when the launcher starts. 0 keeps them all." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBox x:Name="KeepLogsBox" Style="{StaticResource Field}" Width="70" TextAlignment="Right" TextChanged="OnChanged" AutomationProperties.Name="Keep build logs"/>
+                <TextBlock Text="days" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="{DynamicResource SubText}"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+        </StackPanel>
+
+        <!-- ===== Online ===== -->
+        <StackPanel x:Name="PageOnline" Visibility="Collapsed">
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Online features" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="GitHub profile pictures and commit counts in Credits, and the Can I Run checker." Style="{StaticResource RowText}"/>
+                <TextBlock Text="Off: nothing is fetched; Credits uses your git history and Can I Run shows only your hardware." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="AllowOnline" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Online features"/>
+            </Grid>
+          </Border>
+        </StackPanel>
+
+        <!-- ===== About and files ===== -->
+        <StackPanel x:Name="PageAbout" Visibility="Collapsed">
+          <Border Style="{StaticResource Row}">
+            <StackPanel>
+              <TextBlock Text="Version" Style="{StaticResource RowTitle}"/>
+              <TextBlock x:Name="AboutVersion" Style="{StaticResource RowText}"/>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <StackPanel>
+              <TextBlock Text="Settings file" Style="{StaticResource RowTitle}"/>
+              <TextBlock x:Name="SettingsPath" Style="{StaticResource RowText}" FontFamily="{StaticResource Mono}" FontSize="12"/>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Build logs" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Each build's full output, kept for the days set in Builds." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <Button Grid.Column="1" Style="{StaticResource Small}" Content="Open logs folder" Click="OnLogs"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Restore defaults" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Every launcher setting and build option goes back to its default. The build history and logs stay." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <Button Grid.Column="1" Style="{StaticResource Danger}" Content="Restore defaults" Click="OnReset" VerticalAlignment="Center"/>
+            </Grid>
+          </Border>
+        </StackPanel>
+
+        <!-- ===== Your setup ===== -->
+        <StackPanel x:Name="PageSetup" Visibility="Collapsed">
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock x:Name="Summary" Style="{StaticResource RowTitle}" FontWeight="SemiBold"/>
+                <TextBlock x:Name="ChecksNote" Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <Button Grid.Column="1" Style="{StaticResource Small}" Content="Check again" Click="OnRefresh"/>
+            </Grid>
+          </Border>
+          <ItemsControl x:Name="ToolList">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="0,12">
                   <DockPanel>
-                    <Button DockPanel.Dock="Right" Content="Check again" Click="OnRefresh" Foreground="#FFFFFF" Background="Transparent" BorderThickness="0" Cursor="Hand" FontWeight="SemiBold"/>
-                    <TextBlock Text="Your setup" Style="{StaticResource CaptionText}"/>
+                    <TextBlock DockPanel.Dock="Left" FontFamily="{StaticResource Icons}" FontSize="16" Margin="0,2,14,0" VerticalAlignment="Top"
+                               Text="{Binding Glyph}" Foreground="{Binding Color}"/>
+                    <StackPanel>
+                      <TextBlock Foreground="{DynamicResource Heading}" FontSize="14"><Run Text="{Binding Name, Mode=OneWay}" FontWeight="SemiBold"/><Run Text="{Binding For, Mode=OneWay}" Foreground="{DynamicResource Faint}" FontSize="11.5"/></TextBlock>
+                      <TextBlock Text="{Binding Detail}" FontSize="12" Foreground="{DynamicResource SubText}" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                      <TextBlock Text="{Binding Hint}" FontSize="12" Foreground="{StaticResource Bad}" TextWrapping="Wrap" Visibility="{Binding HintVisibility}"/>
+                    </StackPanel>
                   </DockPanel>
                 </Border>
-                <StackPanel Style="{StaticResource Body}">
-                  <TextBlock x:Name="Summary" FontSize="15" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,4"/>
-                  <TextBlock x:Name="ChecksNote" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
-                  <ItemsControl x:Name="ToolList">
-                    <ItemsControl.ItemTemplate>
-                      <DataTemplate>
-                        <Border BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="0,8">
-                          <DockPanel>
-                            <TextBlock DockPanel.Dock="Left" FontFamily="{StaticResource Icons}" FontSize="16" Margin="0,1,12,0" VerticalAlignment="Top"
-                                       Text="{Binding Glyph}" Foreground="{Binding Color}"/>
-                            <StackPanel>
-                              <TextBlock><Run Text="{Binding Name, Mode=OneWay}" FontWeight="SemiBold"/><Run Text="{Binding For, Mode=OneWay}" Foreground="{DynamicResource Faint}" FontSize="11.5"/></TextBlock>
-                              <TextBlock Text="{Binding Detail}" FontSize="11.5" Foreground="{DynamicResource SubText}" TextWrapping="Wrap"/>
-                              <TextBlock Text="{Binding Hint}" FontSize="11.5" Foreground="{StaticResource Bad}" TextWrapping="Wrap" Visibility="{Binding HintVisibility}"/>
-                            </StackPanel>
-                          </DockPanel>
-                        </Border>
-                      </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                  </ItemsControl>
-                  <TextBlock x:Name="DiskText" FontSize="12.5" Margin="0,10,0,0" TextWrapping="Wrap"/>
-                </StackPanel>
-              </DockPanel>
-            </Border>
-          </StackPanel>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <TextBlock x:Name="DiskText" FontSize="12.5" Margin="0,16,0,0" TextWrapping="Wrap" Foreground="{DynamicResource SubText}"/>
+        </StackPanel>
 
-          <StackPanel Grid.Column="2">
-            <Border Style="{StaticResource Card}">
-              <DockPanel>
-                <Border DockPanel.Dock="Top" Style="{StaticResource Caption}"><TextBlock Text="Play" Style="{StaticResource CaptionText}"/></Border>
-                <StackPanel Style="{StaticResource Body}">
-                  <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,10"
-                             Text="PLAY runs gta6rt.exe --run on game_scarlett_master.exe from your copy (runtime/README.md)."/>
-                  <TextBlock Text="OVERLAY FOLDER  (--overlay)" Style="{StaticResource Label}"/>
-                  <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                    <TextBox x:Name="OverlayBox" TextChanged="OnPlayChanged" ToolTip="Where whatever the title writes goes, so the package is never modified. Empty: &lt;game&gt;\overlay. Needed when the package is on a read-only drive."/>
-                    <Button Grid.Column="1" Style="{StaticResource Small}" Content="Browse" Click="OnBrowseOverlay"/></Grid>
-                  <TextBlock Text="MODS FOLDER  (--mods)" Style="{StaticResource Label}" Margin="0,12,0,4"/>
-                  <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                    <TextBox x:Name="ModsBox" TextChanged="OnPlayChanged" ToolTip="Mods to load (docs/modding.md). Empty: the mods folder next to gta6rt.exe."/>
-                    <Button Grid.Column="1" Style="{StaticResource Small}" Content="Browse" Click="OnBrowseMods"/></Grid>
-                  <CheckBox x:Name="VulkanBackend" Content="Vulkan D3D12 backend  (LEONIDA_D3D12=vulkan)" Margin="0,12,0,2" Checked="OnPlayChanged" Unchecked="OnPlayChanged"/>
-                  <CheckBox x:Name="TraceD3D12" Content="Trace D3D12 calls  (--trace-d3d12)" Checked="OnPlayChanged" Unchecked="OnPlayChanged"/>
-                  <TextBlock Text="STARTUP TRACE FILE  (--trace, a new file)" Style="{StaticResource Label}" Margin="0,12,0,4"/>
-                  <TextBox x:Name="TraceFileBox" TextChanged="OnPlayChanged"/>
-                  <TextBlock Text="GAME ARGUMENTS  (after --)" Style="{StaticResource Label}" Margin="0,12,0,4"/>
-                  <TextBox x:Name="GameArgsBox" TextChanged="OnPlayChanged" FontFamily="{StaticResource Mono}"/>
-                </StackPanel>
-              </DockPanel>
-            </Border>
+        <!-- ===== Play ===== -->
+        <StackPanel x:Name="PagePlay" Visibility="Collapsed">
+          <TextBlock Style="{StaticResource RowText}" Margin="0,6,0,6"
+                     Text="PLAY runs gta6rt.exe --run on game_scarlett_master.exe from your copy (runtime/README.md)."/>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Overlay folder" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="--overlay: where whatever the title writes goes, so the package is never modified. Empty: &lt;game&gt;\overlay." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBox x:Name="OverlayBox" Style="{StaticResource Field}" Width="300" TextChanged="OnPlayChanged" AutomationProperties.Name="Overlay folder"/>
+                <Button Style="{StaticResource Small}" Content="Browse" Click="OnBrowseOverlay"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Mods folder" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="--mods: mods to load (docs/modding.md). Empty: the mods folder next to gta6rt.exe." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBox x:Name="ModsBox" Style="{StaticResource Field}" Width="300" TextChanged="OnPlayChanged" AutomationProperties.Name="Mods folder"/>
+                <Button Style="{StaticResource Small}" Content="Browse" Click="OnBrowseMods"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Vulkan D3D12 backend" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="LEONIDA_D3D12=vulkan" Style="{StaticResource RowText}" FontFamily="{StaticResource Mono}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="VulkanBackend" Style="{StaticResource Tick}" Checked="OnPlayChanged" Unchecked="OnPlayChanged" AutomationProperties.Name="Vulkan D3D12 backend"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Trace D3D12 calls" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="--trace-d3d12" Style="{StaticResource RowText}" FontFamily="{StaticResource Mono}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="TraceD3D12" Style="{StaticResource Tick}" Checked="OnPlayChanged" Unchecked="OnPlayChanged" AutomationProperties.Name="Trace D3D12 calls"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Startup trace file" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="--trace: a new file the runtime writes its start-up trace to." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <TextBox Grid.Column="1" x:Name="TraceFileBox" Style="{StaticResource Field}" Width="300" TextChanged="OnPlayChanged" AutomationProperties.Name="Startup trace file"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Game arguments" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Passed to the title after --." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <TextBox Grid.Column="1" x:Name="GameArgsBox" Style="{StaticResource Field}" Width="300" TextChanged="OnPlayChanged" FontFamily="{StaticResource Mono}"
+                       AutomationProperties.Name="Game arguments"/>
+            </Grid>
+          </Border>
+        </StackPanel>
 
-            <Border Style="{StaticResource Card}">
-              <DockPanel>
-                <Border DockPanel.Dock="Top" Style="{StaticResource Caption}"><TextBlock Text="Leonida folder, Python and environment" Style="{StaticResource CaptionText}"/></Border>
-                <StackPanel Style="{StaticResource Body}">
-                  <TextBlock Text="LEONIDA FOLDER (WITH BUILD.BAT)" Style="{StaticResource Label}"/>
-                  <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                    <TextBox x:Name="RepoBox" IsReadOnly="True" Background="{DynamicResource CardAlt}"/>
-                    <Button Grid.Column="1" Style="{StaticResource Small}" Content="Change" Click="OnChooseRepo"/></Grid>
-                  <TextBlock Style="{StaticResource Hint}" Text="Found by itself when Leonida.exe is next to Build.bat."/>
-                  <TextBlock Text="PYTHON" Style="{StaticResource Label}" Margin="0,12,0,4"/>
-                  <TextBlock x:Name="PythonText" TextWrapping="Wrap" FontSize="12.5"/>
-                  <Grid Margin="0,6,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                    <TextBox x:Name="PythonBox" ToolTip="Empty: found as Build.bat finds it (py -3.14 … py -3, then python)."/>
-                    <Button Grid.Column="1" Style="{StaticResource Small}" Content="Browse" Click="OnBrowsePython"/></Grid>
-                  <TextBlock Text="ENVIRONMENT VARIABLES FOR BUILDS AND PLAY" Style="{StaticResource Label}" Margin="0,12,0,4"/>
-                  <TextBox x:Name="EnvBox" AcceptsReturn="True" Height="86" VerticalScrollBarVisibility="Auto" FontFamily="{StaticResource Mono}" FontSize="12"
-                           ToolTip="One NAME=value per line, e.g. LLVM_MC=C:\path\to\llvm-mc.exe. A variable left out keeps the value Windows gives it."/>
-                  <WrapPanel Margin="0,10,0,0"><Button Style="{StaticResource Dark}" Content="Apply and check again" Click="OnApply"/></WrapPanel>
-                </StackPanel>
-              </DockPanel>
-            </Border>
-          </StackPanel>
-        </Grid>
+        <!-- ===== Folders and Python ===== -->
+        <StackPanel x:Name="PageFolders" Visibility="Collapsed">
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Leonida folder" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="The folder with Build.bat. Found by itself when Leonida.exe is next to Build.bat." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBox x:Name="RepoBox" Style="{StaticResource Field}" Width="300" IsReadOnly="True" Background="{DynamicResource CardAlt}" AutomationProperties.Name="Leonida folder"/>
+                <Button Style="{StaticResource Small}" Content="Change" Click="OnChooseRepo"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Python" Style="{StaticResource RowTitle}"/>
+                <TextBlock x:Name="PythonText" Style="{StaticResource RowText}"/>
+                <TextBlock Text="Empty: found as Build.bat finds it (py -3.14 … py -3, then python)." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBox x:Name="PythonBox" Style="{StaticResource Field}" Width="300" AutomationProperties.Name="Python"/>
+                <Button Style="{StaticResource Small}" Content="Browse" Click="OnBrowsePython"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <StackPanel>
+              <TextBlock Text="Environment variables" Style="{StaticResource RowTitle}"/>
+              <TextBlock Text="For builds and Play. One NAME=value per line, e.g. LLVM_MC=C:\path\to\llvm-mc.exe. A variable left out keeps the value Windows gives it." Style="{StaticResource RowText}"/>
+              <TextBox x:Name="EnvBox" AcceptsReturn="True" Height="96" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto" FontFamily="{StaticResource Mono}" FontSize="12"
+                       AutomationProperties.Name="Environment variables"/>
+            </StackPanel>
+          </Border>
+          <WrapPanel Margin="0,18,0,0"><Button Style="{StaticResource Dark}" Content="Apply and check again" Click="OnApply"/></WrapPanel>
+        </StackPanel>
       </StackPanel>
     </ScrollViewer>
   </Grid>

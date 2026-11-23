@@ -84,7 +84,12 @@
           </RadioButton>
           <TextBlock x:Name="LibraryHeader" Text="Library" Foreground="#FFFFFF" FontWeight="Bold" FontSize="15" Margin="20,16,0,10"/>
           <RadioButton x:Name="LibLeonida" AutomationProperties.Name="Library Leonida" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibLeonida" Checked="OnLibLeonida">
-            <StackPanel Orientation="Horizontal">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
               <Border Width="38" Height="38" CornerRadius="3" ClipToBounds="True">
                 <Border.Background>
                   <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
@@ -93,13 +98,26 @@
                 </Border.Background>
                 <Image Source="Assets/logo.png" Margin="3" RenderOptions.BitmapScalingMode="HighQuality"/>
               </Border>
-              <StackPanel x:Name="LibText" Margin="12,0,0,0" VerticalAlignment="Center">
+              <StackPanel x:Name="LibText" Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
                 <TextBlock Text="Leonida" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
-                <TextBlock x:Name="LibStatus" Foreground="{StaticResource SideMuted}" FontSize="11.5" TextTrimming="CharacterEllipsis" MaxWidth="170"/>
+                <TextBlock x:Name="LibStatus" Foreground="{StaticResource SideMuted}" FontSize="11.5" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
-            </StackPanel>
+              <!-- Build progress: a ring with the percentage inside; it spins while a stage has no percentage -->
+              <Grid x:Name="LibRing" Grid.Column="2" Width="36" Height="36" Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed"
+                    AutomationProperties.Name="Build progress">
+                <!-- Track and arc share one circle: centre 18,18, radius 15 (MainWindow.RingRadius) -->
+                <Path Width="36" Height="36" Stroke="#2E2E2E" StrokeThickness="3">
+                  <Path.Data><EllipseGeometry Center="18,18" RadiusX="15" RadiusY="15"/></Path.Data>
+                </Path>
+                <Path x:Name="LibRingArc" Width="36" Height="36" Stroke="{StaticResource Sunset}" StrokeThickness="3"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" RenderTransformOrigin="0.5,0.5">
+                  <Path.RenderTransform><RotateTransform x:Name="LibRingSpin"/></Path.RenderTransform>
+                </Path>
+                <TextBlock x:Name="LibRingText" Foreground="#FFFFFF" FontSize="10" FontWeight="Bold" Width="36" TextAlignment="Center"
+                           VerticalAlignment="Center" LineStackingStrategy="BlockLineHeight" LineHeight="12"/>
+              </Grid>
+            </Grid>
           </RadioButton>
-          <ProgressBar x:Name="LibProgress" Style="{StaticResource Meter}" Height="3" Margin="70,2,20,0" Visibility="Collapsed"/>
           <RadioButton x:Name="LibCanIRun" AutomationProperties.Name="Can I Run Leonida" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibCanIRun" Checked="OnLibCanIRun" Margin="0,4,0,0">
             <StackPanel Orientation="Horizontal">
               <Border Width="38" Height="38" CornerRadius="3" Background="#1E1E1E">

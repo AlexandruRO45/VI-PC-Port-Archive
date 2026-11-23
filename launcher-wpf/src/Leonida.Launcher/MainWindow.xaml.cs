@@ -2,6 +2,7 @@ using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Threading;
 using Leonida.Core;
 
@@ -19,7 +20,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         UpdateAvatar();
-        VersionText.Text = "v" + (typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "1.0.0");
+        VersionText.Text = "v" + (typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "1.0.1");
         RestoreWindow();
         Loaded += async (_, _) =>
         {
@@ -186,6 +187,48 @@ public partial class MainWindow : Window
 
     // ---------- status ----------
 
+    const double RingRadius = 15;   // the grey track in MainWindow.xaml uses the same circle
+    System.Windows.Media.Animation.DoubleAnimation? ringSpin;
+
+    /// <summary>The sidebar's build ring: an arc for <paramref name="pct"/> with the number inside, or a spinning
+    /// quarter arc when the running stage has no percentage.</summary>
+    void SetRing(double? pct, bool visible)
+    {
+        LibRing.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        bool spin = visible && pct == null;
+        if (spin && ringSpin == null)
+        {
+            ringSpin = new System.Windows.Media.Animation.DoubleAnimation(0, 360, TimeSpan.FromSeconds(1.1))
+                { RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever };
+            LibRingSpin.BeginAnimation(RotateTransform.AngleProperty, ringSpin);
+        }
+        else if (!spin && ringSpin != null)
+        {
+            LibRingSpin.BeginAnimation(RotateTransform.AngleProperty, null);
+            LibRingSpin.Angle = 0;
+            ringSpin = null;
+        }
+        if (!visible) return;
+        double frac = pct is double p ? Math.Clamp(p / 100.0, 0, 1) : 0.25;
+        LibRingText.Text = pct is double q ? $"{Math.Floor(q):0}%" : "";
+        LibRingArc.Data = Arc(18, 18, RingRadius, frac);
+    }
+
+    /// <summary>An arc from 12 o'clock clockwise over <paramref name="frac"/> of the circle.</summary>
+    static Geometry Arc(double cx, double cy, double r, double frac)
+    {
+        if (frac >= 0.9999) return new EllipseGeometry(new Point(cx, cy), r, r);
+        if (frac <= 0.0001) return Geometry.Empty;
+        double a = frac * 2 * Math.PI;
+        var start = new Point(cx, cy - r);
+        var end = new Point(cx + r * Math.Sin(a), cy - r * Math.Cos(a));
+        var fig = new PathFigure { StartPoint = start, IsClosed = false };
+        fig.Segments.Add(new ArcSegment(end, new Size(r, r), 0, frac > 0.5, SweepDirection.Clockwise, true));
+        var g = new PathGeometry([fig]);
+        g.Freeze();
+        return g;
+    }
+
     void Refresh()
     {
         var s = state.Session;
@@ -194,15 +237,13 @@ public partial class MainWindow : Window
             var sh = s.Monitor.Shaders;
             var stage = s.Monitor.Stages.FirstOrDefault(x => x.State == StageState.Running);
             double? pct = stage?.Name == "shaders" && sh is { Total: > 0, Done: int d, Total: int t } ? 100.0 * d / t : null;
-            LibStatus.Text = Loc.F("Building · {0}", (stage?.Name ?? Loc.T("Starting")) + (pct is double p ? $" {p:0}%" : ""));
-            LibProgress.Visibility = state.Settings.Current.SidebarCollapsed ? Visibility.Collapsed : Visibility.Visible;
-            LibProgress.IsIndeterminate = pct == null;
-            if (pct is double q) LibProgress.Value = q;
+            LibStatus.Text = Loc.F("Building · {0}", stage?.Name ?? Loc.T("Starting"));
+            SetRing(pct, visible: !state.Settings.Current.SidebarCollapsed);
             TabBuild.Content = Loc.T("BUILD") + (pct is double r ? $" {r:0}%" : " ●");
         }
         else
         {
-            LibProgress.Visibility = Visibility.Collapsed;
+            SetRing(null, visible: false);
             TabBuild.Content = Loc.T("BUILD") + (Builds.Instance.IsPlaying ? " ●" : "");
             var install = Builds.Instance.Install();
             LibStatus.Text = Loc.T(!state.HasRepo ? "Leonida folder not found"

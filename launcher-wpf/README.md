@@ -8,7 +8,10 @@ run the same `make_game.py` with the same arguments, so a build started in eithe
 
 ## Get it
 
-Run this from the Leonida folder. It needs the .NET 8 SDK, which the build already needs for `rpf9dump`.
+**Double-click `launcher_builder.bat`** in the Leonida folder (next to `Build.bat`). It checks for the .NET 8 SDK,
+which the build already needs for `rpf9dump`, says where to get it if it is missing, and builds the launcher.
+
+Or run the same thing from a terminal in the Leonida folder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File launcher-wpf\build.ps1
@@ -34,7 +37,7 @@ tabs at the top right. The avatar next to the tabs opens **Settings**.
 | **Leonida › BUILD** | The running or last build: each stage, the measured numbers, the shader translation, and the console. |
 | **Leonida › HISTORY** | Every build the launcher ran, with its result, duration, stages, shaders, warnings, errors and peak memory. Each build has its log and a "build again with these options" button. |
 | **Can I Run Leonida** | Your CPU, GPU and memory, read from Windows, compared with every console on the [community checker](https://assttro.github.io/can-i-run-leonida/)'s list. It runs automatically, and **Detect again** reads the hardware again. |
-| **Settings** (avatar menu) | **Launcher settings**: language, theme, start page, avatar, online features, how builds stop, end-of-build notice, console text size and log clean-up. **Leonida settings**: the setup check (`make_game.py`'s own preflight), Play's options, the Leonida folder, Python and environment variables. |
+| **Settings** (avatar menu) | One page per group, one setting per row. **Launcher settings**: *General* (language, theme, start page, sidebar, avatar), *Builds* (how builds stop, end-of-build notice, console text size, log clean-up), *Online*, *About and files* (version, settings file, logs, restore defaults). **Leonida settings**: *Your setup* (`make_game.py`'s own preflight), *Play* (Play's options), *Folders and Python* (the Leonida folder, Python, environment variables). |
 
 The launcher is in **English** and **Polish**; choose the language in Launcher settings. The README pages and the
 build's own output stay in English.
@@ -139,7 +142,7 @@ Dark theme:
 |---|---|
 | ![The Leonida page, dark](docs/screenshots/dark-leonida.png) | ![Home, dark](docs/screenshots/dark-home.png) |
 | ![Credits, dark](docs/screenshots/dark-credits.png) | ![The build popup, dark](docs/screenshots/dark-build-popup.png) |
-| ![Can I Run Leonida, dark](docs/screenshots/dark-can-i-run.png) | |
+| ![Can I Run Leonida, dark](docs/screenshots/dark-can-i-run.png) | ![Settings, dark](docs/screenshots/dark-settings.png) |
 
 ## Layout
 
