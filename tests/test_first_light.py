@@ -670,6 +670,28 @@ class PropRuleTests(unittest.TestCase):
         # a manifest with no content at all is still just empty
         self.assertEqual(list(prop.stream_items([])), [])
 
+    def test_a_manifest_with_no_items_is_empty_not_a_format_error(self):
+        import first_light_prop as prop
+
+        empty = json.dumps({"Count": 0, "Items": []}, indent=2) + "\n"
+        self.assertEqual(list(prop.stream_items(empty.splitlines(True))), [])
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(empty)
+            with self.assertRaises(SystemExit) as cm:
+                prop.main([folder])
+        self.assertIn("no drawable in the manifest passes the rule", str(cm.exception))
+
+    def test_limit_below_one_is_rejected(self):
+        import first_light_prop as prop
+
+        for value in ("0", "-1"):
+            with self.subTest(limit=value):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        prop.main([".", "--limit", value])
+                self.assertEqual(cm.exception.code, 2)
+
     @staticmethod
     def box_obj(n=7, size=(2.0, 1.5, 1.0)):
         """A hand-made prop: a box whose six faces are n x n grids with UVs. -> (OBJ text, vertices, triangles)"""

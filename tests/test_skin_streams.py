@@ -548,6 +548,86 @@ class TestWindow(unittest.TestCase):
         self.assertIsNone(ss.Window(io.BytesIO(bytes(size))).find_zlib(0, size))
 
 
+class TestNextStream(unittest.TestCase):
+    """next_stream takes a Window, bytes or an mmap (anim_glb and fragment_children pass mmaps)."""
+
+    PAYLOAD = bytes(range(200)) * 3
+
+    def blob(self):
+        stream = zlib.compress(self.PAYLOAD, 9)
+        pad = b"\0" * 40
+        return pad + stream + b"\0" * 24, len(pad), len(stream)
+
+    def check(self, m, size, start, used):
+        data, at, n = ss.next_stream(m, 0, size)
+        self.assertEqual((data, at, n), (self.PAYLOAD, start, used))
+        self.assertIsNone(ss.next_stream(m, start + used, size))
+
+    def test_bytes(self):
+        raw, start, used = self.blob()
+        self.check(raw, len(raw), start, used)
+
+    def test_mmap(self):
+        import mmap
+        raw, start, used = self.blob()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "blob.bin")
+            with open(path, "wb") as fh:
+                fh.write(raw)
+            with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                self.check(m, len(raw), start, used)
+
+    def test_window(self):
+        raw, start, used = self.blob()
+        self.check(ss.Window(io.BytesIO(raw)), len(raw), start, used)
+
+
+class TestFvfLayouts(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+        import fvf_layouts
+        self.fl = fvf_layouts
+
+    @staticmethod
+    def mesh(slots, vertices, gfx_len):
+        return mock.Mock(slots=slots, vertices=vertices, gfx_at=0, gfx_len=gfx_len)
+
+    def test_census_counts_layouts_skips_skinned_and_measures_unit_normals(self):
+        c = self.fl.Census(sample_verts=4)
+        # slot 3: a 4-byte unorm8x4 normal pointing +Z (0x80 ~ 0, 0xFF ~ 1) at offset 0
+        normals = bytes((128, 128, 255, 0)) * 4
+        plain = self.mesh({0: (8, 16, 16), 3: (4, 30, 0)}, 4, len(normals) + 32)
+        skinned = self.mesh({0: (8, 16, 16), 16: (4, 28, 0)}, 4, 64)
+        c.on_mesh(plain, normals + bytes(32))
+        c.on_mesh(skinned, bytes(64))
+        c.on_mesh(plain, bytes(3))     # graphics data shorter than the mesh claims: counted, not decoded
+        self.assertEqual((c.meshes, c.skinned), (3, 1))
+        self.assertEqual(sum(c.layouts.values()), 2)
+        n, unit = c.normals[(3, 4, 30, "unorm8x4.xyz*2-1")]
+        self.assertEqual(n, 4)
+        self.assertGreaterEqual(unit, 0)
+        self.assertEqual(c.slot_meshes[(3, 4, 30)], 1)
+
+    def test_layout_text_and_unknown_format_names(self):
+        self.assertEqual(self.fl.fmt_name(4, 9999), "4b/fmt9999?")
+        key = ((0, 8, 16), (3, 4, 9999))
+        self.assertEqual(self.fl.layout_text(key), f"0:{self.fl.fmt_name(8, 16)} 3:4b/fmt9999?")
+
+    def test_scan_archive_hands_every_mesh_to_on_mesh(self):
+        # Through scan_archive itself: a rigid (skinned-slot) mesh is walked and reaches the callback, and
+        # skin tallies still cover it.
+        system, gfx, _mesh = rigid_mesh()
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "synthetic.rpf")
+            with open(path, "wb") as fh:
+                fh.write(build_archive(system, gfx))
+            stats = ss.scan_archive(path, 8, lambda _t: None, on_mesh=lambda mesh, g: seen.append((mesh, g)))
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1], gfx)
+        self.assertEqual(stats["meshes"], 1)
+
+
 class TestCli(unittest.TestCase):
     @staticmethod
     def _archive(tmp, name="synthetic.rpf"):

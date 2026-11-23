@@ -40,6 +40,8 @@ def stream_items(lines):
         line = line.rstrip("\r\n")
         if line.strip():
             seen_content = True
+        if line == '  "Items": []':
+            seen_items = True   # a windowed export can legitimately hold no item: empty, not a format error
         if item is None:
             if line == "    {":
                 item = {}
@@ -123,10 +125,17 @@ def pick(models_dir: str, limit: int = 1) -> list[dict]:
     return found
 
 
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("models", help="the folder `rpf9dump models` wrote (OBJs and manifest.json)")
-    ap.add_argument("--limit", type=int, default=1, help="how many candidates to list (default 1: the pick)")
+    ap.add_argument("--limit", type=positive_int, default=1, help="how many candidates to list (default 1: the pick)")
     a = ap.parse_args(argv)
     found = pick(os.path.abspath(a.models), a.limit)
     if not found:

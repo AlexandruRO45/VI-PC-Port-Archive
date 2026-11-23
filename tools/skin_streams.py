@@ -397,7 +397,11 @@ class Window:
 
 def next_stream(m, fp, size):
     """The next zlib stream at or after `fp` (padding between streams is zero): (data, start, used)."""
-    at = m.find_zlib(fp, size)
+    if hasattr(m, "find_zlib"):
+        at = m.find_zlib(fp, size)
+    else:   # bytes, an mmap: anything that supports ZHDR.search(m, pos, endpos)
+        mt = ZHDR.search(m, fp, size)
+        at = mt.start() if mt else None
     if at is None:
         return None
     data, used = inflate_at(m, at, size)
