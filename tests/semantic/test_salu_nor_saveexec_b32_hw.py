@@ -330,5 +330,71 @@ class TestSNorSaveExecScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.exec_lo, 0)
         self.assertEqual(self.state.scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32-Bit EXEC Masking
+# -----------------------------------------------------------------------------
+
+class SIMDMultiLaneDivergenceModel32:
+    """Models multi-lane execution in Wave32 environments for NOR logic."""
+
+    @staticmethod
+    def active_lanes_from_mask(mask: int) -> Set[int]:
+        return {lane for lane in range(32) if (mask & (1 << lane)) != 0}
+
+    @staticmethod
+    def mask_from_active_lanes(lanes: Set[int]) -> int:
+        return sum(1 << l for l in lanes if 0 <= l < 32)
+
+    @staticmethod
+    def nor_divergence_transition(current_exec: int, s0_mask: int) -> Tuple[int, int, int]:
+        """In Wave32 control flow, s_nor_saveexec_b32 turns on ONLY lanes
+
+        where NEITHER S0 nor previous EXEC had active threads.
+        """
+        new_exec, saved_exec, scc = s_nor_saveexec_b32_oracle(s0_mask, current_exec)
+        return new_exec, saved_exec, scc
+
+
+class TestSNorSaveExecSIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD Wave32 multi-lane divergence and NOR lane activation."""
+
+    def test_inactive_lane_resurrection(self):
+        # Current active: lanes 0..15 (0x0000_FFFF)
+        current_exec = 0x0000_FFFF
+        # S0: lanes 16..23 (0x00FF_0000)
+        s0_mask = 0x00FF_0000
+
+        # NOR activates lanes 24..31 (0xFF00_0000)
+        new_exec, saved_exec, scc = SIMDMultiLaneDivergenceModel32.nor_divergence_transition(
+            current_exec, s0_mask
+        )
+        self.assertEqual(saved_exec, current_exec)
+        self.assertEqual(new_exec, 0xFF00_0000)
+        self.assertEqual(scc, 1)
+
+        active_lanes = SIMDMultiLaneDivergenceModel32.active_lanes_from_mask(new_exec)
+        self.assertEqual(active_lanes, set(range(24, 32)))
+
+    def test_complete_wave_deactivation(self):
+        # If S0 covers all remaining lanes, new EXEC becomes empty (wave sleeps)
+        current_exec = 0x5555_5555
+        s0_mask = 0xAAAA_AAAA
+        new_exec, saved_exec, scc = SIMDMultiLaneDivergenceModel32.nor_divergence_transition(
+            current_exec, s0_mask
+        )
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(len(SIMDMultiLaneDivergenceModel32.active_lanes_from_mask(new_exec)), 0)
+
+    def test_single_lane_divergence(self):
+        # Lane 0 and Lane 31
+        current_exec = 1 << 0
+        s0_mask = 1 << 31
+        new_exec, d, scc = s_nor_saveexec_b32_oracle(s0_mask, current_exec)
+        # All lanes except 0 and 31 become active
+        expected = MASK32 & ~((1 << 0) | (1 << 31))
+        self.assertEqual(new_exec, expected)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
