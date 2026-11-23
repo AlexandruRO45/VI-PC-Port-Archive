@@ -262,6 +262,25 @@ class MetaTest(unittest.TestCase):
         self.assertEqual(meta.ref(v), (T.LIGHT, meta.blocks[29][2] + 0x500))
         self.assertEqual(meta.system_shaped, 1)
 
+    def test_system_pointer_whose_low_bits_name_a_block(self):
+        # PTR | 0x60 also reads as a pool reference to block 0x60 at pool offset 0x500. With 96 blocks that block
+        # exists but is 16 bytes long, so the pool form does not resolve and the value is the system pointer.
+        r = Resource()
+        r.struct(T.LIGHT, 1, [])
+        for _ in range(0x60):
+            r.block(T.LIGHT, bytes(0x10))
+        meta = T.Meta(r.build())
+        self.assertEqual(meta.ref(PTR | 0x60), (None, 0x60))
+        self.assertEqual(meta.ref(PTR | 0x20), (None, 0x20))
+        self.assertEqual(meta.ref(pool(0x60, 8)), (T.LIGHT, meta.blocks[0x5F][2] + 8))   # the pool form still wins
+        self.assertIsNone(meta.ref(pool(0x60, 0x10)))      # past the block, and not a system pointer either
+        self.assertEqual(meta.system_shaped, 0)
+        # A list whose pointer is such a system pointer is read, not reported empty.
+        at = meta.blocks[0][2]
+        b = bytearray(meta.b)
+        struct.pack_into("<QHH", b, at, PTR | 0x60, 3, 3)
+        self.assertEqual(T.Meta(bytes(b)).list52(at), (0x60, 3))
+
     def test_not_a_resource(self):
         with self.assertRaises(ValueError):
             T.Meta(bytes(0x60))

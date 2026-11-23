@@ -139,7 +139,11 @@ class Meta:
 
     def ref(self, v):
         """Resolve a pointer: a pool reference (1-based block number in bits 0..11, byte offset from bit 20),
-        or a 0x5xxxxxxx system pointer. Returns (block struct hash or None, offset) or None."""
+        or a 0x5xxxxxxx system pointer. Returns (block struct hash or None, offset) or None.
+
+        The pool form is tried first and only then the system pointer: a system pointer to an offset below 0x1000
+        also reads as a pool reference to block `offset` at pool offset 0x500..0x5ff, which is usually past that
+        block, and must still resolve as the pointer it is."""
         bi, off = v & 0xFFF, v >> 20
         if (v >> 12) & 0xFF == 0 and 1 <= bi <= len(self.blocks):
             name, size, base = self.blocks[bi - 1]
@@ -147,7 +151,6 @@ class Meta:
                 # A pool offset of 0x500..0x5ff makes the value look like a 0x5xxxxxxx pointer as well.
                 self.system_shaped += v >> 28 == 5 and v >> 32 == 0
                 return name, base + off
-            return None
         p = WI._ptr(v, len(self.b))
         return None if p is None else (None, p)
 
