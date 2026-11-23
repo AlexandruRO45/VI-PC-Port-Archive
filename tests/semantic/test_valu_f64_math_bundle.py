@@ -257,5 +257,20 @@ class VMulF64SimdIeeeTests(unittest.TestCase):
     def test_mul_zero_times_inf_is_nan(self):
         self.assertTrue(is_nan_u64(oracle_mul_f64(F64_POS_ZERO, F64_POS_INF)))
 
+class VMulF64TranslatorTests(unittest.TestCase):
+    def test_mul_f64_translation_or_refusal(self):
+        lines = [
+            "v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3FF00000",
+            "v_mov_b32 v2, 0", "v_mov_b32 v3, 0x40000000",
+            "v_mul_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        try:
+            spv = translate_lines("ps_mul_f64_test", lines)
+            self.assertIn("OpCapability", spv)
+        except rdna2spirv.Unsupported as caught:
+            self.assertIn("v_mul_f64", str(caught))
+
 if __name__ == "__main__":
     unittest.main()
