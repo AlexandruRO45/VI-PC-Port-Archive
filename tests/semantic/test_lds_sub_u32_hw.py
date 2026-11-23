@@ -575,6 +575,88 @@ class TestDSSubU32BoundaryExtremes(unittest.TestCase):
         idx2 = self.lds.resolve_dword_index(4096)
         self.assertEqual(idx2, 0)
 
+class TestDSSubU32NegativeAndTranslator(unittest.TestCase):
+    """Part 8: Negative controls, syntax rejection, mutation detection, and translator execution."""
 
-if __name__ == '__main__':
+    def test_syntax_rejection(self) -> None:
+        invalid_assemblies = [
+            "ds_sub_u32",
+            "ds_sub_u32 v1",
+            "ds_sub_u32 v1, v2, v3",
+            "ds_sub_rtn_u32 v1, v2",
+            "ds_sub_u32 s1, v2",
+            "ds_sub_rtn_u32 s0, v1, v2",
+            "ds_sub_u32 v1, v2 offset:-1",
+            "ds_sub_u32 v1, v2 offset:70000",
+            "ds_sub_u32 v1, v2 bad_mod",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises(ValueError):
+                    DSSubU32Instruction.parse(asm)
+
+    def test_mutation_detection_addition_instead_of_subtraction(self) -> None:
+        def mutant_add_u32(a: int, b: int) -> int:
+            return (a + b) & MASK32
+
+        oracle_res = ref_ds_sub_u32(100, 40)
+        mutant_res = mutant_add_u32(100, 40)
+        self.assertEqual(oracle_res, 60)
+        self.assertEqual(mutant_res, 140)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_detection_inverted_operands(self) -> None:
+        def mutant_rsub_u32(a: int, b: int) -> int:
+            return (b - a) & MASK32
+
+        oracle_res = ref_ds_sub_u32(100, 40)
+        mutant_res = mutant_rsub_u32(100, 40)
+        self.assertEqual(oracle_res, 60)
+        self.assertEqual(mutant_res, 0xFFFFFFC4)  # -60 mod 2^32
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_translator_emits_op_atomic_isub(self) -> None:
+        """Verifies tools/rdna2spirv.py emits OpAtomicISub for ds_sub_u32 and ds_sub_rtn_u32."""
+        self.assertIn("ds_sub_u32", rdna2spirv.Gen.LDS_ATOMICS)
+        self.assertEqual(rdna2spirv.Gen.LDS_ATOMICS["ds_sub_u32"], "OpAtomicISub")
+
+        lines = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 10",
+            "ds_sub_u32 v1, v2",
+            "ds_sub_rtn_u32 v5, v1, v2 offset:16",
+            "s_waitcnt lgkmcnt(0)",
+        ]
+        spv = L.translate(lines)
+        self.assertIn("OpAtomicISub", spv)
+        self.assertIn("OpAccessChain", spv)
+
+    def test_translator_backed_execution_via_lds_run(self) -> None:
+        """Executes translated ds_sub_u32 and ds_sub_rtn_u32 in spirv_mini_interp."""
+        # Test 1: 100 - 40 = 60
+        init = {0x40: 100}
+        ops = [("ds_sub_rtn_u32", 0x40, 0, (40,))]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(rtns, [100])
+        self.assertEqual(fin, {0x40: 60})
+
+        # Test 2: Underflow wrapping: 0 - 5 = 0xFFFFFFFB
+        init2 = {0x44: 0}
+        ops2 = [("ds_sub_rtn_u32", 0x44, 0, (5,))]
+        rtns2, fin2 = L.run_chain(ops2, init2)
+        self.assertEqual(rtns2, [0])
+        self.assertEqual(fin2, {0x44: 0xFFFFFFFB})
+
+        # Test 3: Non-returning ds_sub_u32 with offset
+        init3 = {0x48: 50, 0x4C: 200}
+        ops3 = [
+            ("ds_sub_u32", 0x48, 4, (50,)),       # 0x48 + 4 = 0x4C: 200 - 50 = 150
+            ("ds_sub_rtn_u32", 0x48, 0, (10,)),   # 0x48: 50 - 10 = 40
+        ]
+        rtns3, fin3 = L.run_chain(ops3, init3)
+        self.assertEqual(rtns3, [0xDEAD, 50])
+        self.assertEqual(fin3, {0x48: 40, 0x4C: 150})
+
+
+if __name__ == "__main__":
     unittest.main()
