@@ -263,8 +263,9 @@ int main() {
     } else {
         Record theirs;
         run(host.p, theirs);
-        // D3D12 refuses MEMORY_POOL_L1 on a UMA adapter. The layer answers UMA = FALSE on every GPU (it presents a
-        // discrete one), so a UMA host's refusal of the L1 cases is a different architecture, not a layer bug.
+        // D3D12 refuses MEMORY_POOL_L1 on a UMA adapter. The layer answers UMA on an integrated GPU and refuses L1
+        // there too, so with the host on the layer's own adapter every case is compared; a host of the other
+        // architecture (LEONIDA_HOST_ADAPTER, or WARP) refusing or accepting the L1 cases is not a layer bug.
         D3D12_FEATURE_DATA_ARCHITECTURE host_arch{}, our_arch{};
         const bool uma_differs =
             SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &host_arch, sizeof(host_arch))) &&
