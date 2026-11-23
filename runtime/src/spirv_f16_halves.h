@@ -10,10 +10,13 @@
 //   1. Fast-paths unchanged when every PS `f16_halves` entry is already exported at the exact same locations by VS.
 //   2. Chooses mutually non-colliding `[lo_loc, hi_loc]` slots in `0..top_location` (keeping PS locations unchanged
 //      whenever they do not collide with any raw VS output; otherwise relocating PS `OpDecorate Location` in place).
+//      A relocation reserves every raw VS output and raw PS input; only when that leaves too few free locations does
+//      it reserve just the raw outputs the PS reads (and those it cannot demote), giving up the others (none when
+//      the VS declares stream output).
 //   3. Specializes the VS SPIR-V binary for the pair: reuses matching static `f16_halves` outputs (updating their
-//      `Location` decorations), demotes unneeded static `f16_halves` outputs to `Private` (freeing their locations),
-//      and synthesizes `UnpackHalf2x16` half exports right before every `OpReturn` in the Vertex entry function for
-//      any param the VS did not emit statically.
+//      `Location` decorations), demotes unneeded static `f16_halves` outputs and the given-up raw outputs a half
+//      lands on to `Private` (freeing their locations), and synthesizes `UnpackHalf2x16` half exports right before
+//      every `OpReturn` in the Vertex entry function for any param the VS did not emit statically.
 //
 // Pure C++20 stdlib, no Vulkan or Windows headers required.
 
@@ -110,6 +113,8 @@ constexpr std::uint16_t kOpAtomicFAddEXT = 6035;
 
 constexpr std::uint32_t kExecModelVertex = 0;
 constexpr std::uint32_t kExecModelFragment = 4;
+constexpr std::uint32_t kExecutionModeXfb = 11;
+constexpr std::uint32_t kCapabilityTransformFeedback = 53;
 
 constexpr std::uint32_t kStorageInput = 1;
 constexpr std::uint32_t kStorageOutput = 3;
@@ -411,6 +416,12 @@ inline std::set<std::uint32_t> collect_non_demotable_vars(const Module& mod, std
 // exported by the VS at the exact smooth location the PS reads, within `0..top_location` (default 29, MoltenVK's
 // 124-component vertex output limit counting gl_Position).
 //
+// The PS must be the only stage that reads the VS's outputs: no geometry or tessellation stage and no stream output,
+// as at graphics PSO creation (d3d12_vulkan_device.cpp refuses hull/domain shaders and stream output, and skips this
+// link when the PSO has a geometry shader). A relocation that runs out of locations relies on it: it demotes raw VS
+// outputs the PS does not read to `Private`, unless the VS declares stream output itself (the TransformFeedback
+// capability or the Xfb execution mode), which keeps every raw output.
+//
 // Returns true on success (including the no-op fast path when no patching is needed). On failure returns false and
 // writes a concise reason to `*error` if non-null; the caller's word vectors are only replaced on success.
 inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEntry& vs_entry,
@@ -492,75 +503,23 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
         if (!ps_static_half_locs.count(loc)) insert_var_slots(ps_raw_locs, ps_loc_slots, loc, var_id);
     }
 
-    // Choose paired [lo, hi] locations for every param in ps_entry.f16_halves.
-    // Keep PS's existing locations unchanged whenever none collides with VS raw outputs or exceeds top_location.
-    bool keep_ps_locs = true;
-    std::set<std::uint32_t> seen_ps_halves;
-    for (const auto& [param, pair] : ps_entry.f16_halves) {
-        for (std::uint32_t loc : pair) {
-            if (loc > top_location || vs_raw_locs.count(loc) || !seen_ps_halves.insert(loc).second) {
-                keep_ps_locs = false;
-                break;
-            }
-        }
-        if (!keep_ps_locs) break;
-    }
-
-    std::map<std::uint32_t, std::array<std::uint32_t, 2>> pair_halves;
-    if (keep_ps_locs) {
-        pair_halves = ps_entry.f16_halves;
-    } else {
-        std::set<std::uint32_t> reserved = vs_raw_locs;
-        reserved.insert(ps_raw_locs.begin(), ps_raw_locs.end());
-        std::vector<std::uint32_t> free_locs;
-        for (std::int64_t loc = top_location; loc >= 0; --loc)
-            if (!reserved.count(std::uint32_t(loc))) free_locs.push_back(std::uint32_t(loc));
-        const std::size_t need = 2 * ps_entry.f16_halves.size();
-        if (free_locs.size() < need)
-            return fail("f16_halves: need " + std::to_string(need) + " free locations in 0.." +
-                        std::to_string(top_location) + ", only " + std::to_string(free_locs.size()) + " available");
-        std::size_t k = 0;
-        for (const auto& [param, old_pair] : ps_entry.f16_halves) {
-            const std::uint32_t hi = free_locs[2 * k];
-            const std::uint32_t lo = free_locs[2 * k + 1];
-            pair_halves[param] = {lo, hi};
-            ++k;
-        }
-    }
-
-    // Patch PS OpDecorate Location in place if we relocated any PS half input.
-    bool ps_changed = false;
-    if (!keep_ps_locs) {
-        std::map<std::uint32_t, std::uint32_t> ps_var_new_loc;
-        for (const auto& [param, old_pair] : ps_entry.f16_halves) {
-            const auto& new_pair = pair_halves[param];
-            for (std::size_t h = 0; h < 2; ++h) {
-                const auto it = ps_inputs.find(old_pair[h]);
-                if (it != ps_inputs.end()) ps_var_new_loc[it->second] = new_pair[h];
-            }
-        }
-        for (Inst& inst : ps_mod.insts) {
-            if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == kDecorationLocation) {
-                const auto it = ps_var_new_loc.find(inst.words[1]);
-                if (it != ps_var_new_loc.end() && inst.words[3] != it->second) {
-                    inst.words[3] = it->second;
-                    ps_changed = true;
-                }
-            }
-        }
-    }
-
-    // Inspect VS types, globals, entry point, and uses of existing static f16_halves variables.
+    // Inspect VS types, globals, entry point, and uses of its output variables (before choosing locations: a
+    // relocation that runs out of locations needs to know which raw outputs can be demoted).
     std::uint32_t float_ty = 0, uint_ty = 0, v2float_ty = 0, v4float_ty = 0;
     std::uint32_t ptr_out_v4_ty = 0, ptr_priv_v4_ty = 0, null_v4_id = 0, glsl_id = 0;
     std::map<std::uint32_t, std::uint32_t> ptr_pointee;     // ptr_type_id -> pointee_type_id
     std::map<std::uint32_t, std::uint32_t> var_ptr_type;    // var_id -> ptr_type_id
     std::uint32_t vs_entry_fn = 0;
     std::size_t vs_ep_idx = vs_mod.insts.size();
+    bool vs_stream_output = false;  // stream output can capture any VS output, read by the PS or not
 
     for (std::size_t idx = 0; idx < vs_mod.insts.size(); ++idx) {
         const Inst& inst = vs_mod.insts[idx];
-        if (inst.opcode == kOpExtInstImport && inst.words.size() >= 3) {
+        if (inst.opcode == kOpCapability && inst.words.size() >= 2 && inst.words[1] == kCapabilityTransformFeedback) {
+            vs_stream_output = true;
+        } else if (inst.opcode == kOpExecutionMode && inst.words.size() >= 3 && inst.words[2] == kExecutionModeXfb) {
+            vs_stream_output = true;
+        } else if (inst.opcode == kOpExtInstImport && inst.words.size() >= 3) {
             if (decode_literal_string(std::span<const std::uint32_t>(inst.words).subspan(2)) == "GLSL.std.450")
                 glsl_id = inst.words[1];
         } else if (inst.opcode == kOpEntryPoint && inst.words.size() >= 4 && inst.words[1] == kExecModelVertex) {
@@ -594,6 +553,92 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
     // Check which existing VS variables have non-load/store pointer uses (those cannot be safely demoted to Private).
     const std::set<std::uint32_t> non_demotable_vars = collect_non_demotable_vars(vs_mod, glsl_id);
 
+    // Choose paired [lo, hi] locations for every param in ps_entry.f16_halves.
+    // Keep PS's existing locations unchanged whenever none collides with VS raw outputs or exceeds top_location.
+    bool keep_ps_locs = true;
+    std::set<std::uint32_t> seen_ps_halves;
+    for (const auto& [param, pair] : ps_entry.f16_halves) {
+        for (std::uint32_t loc : pair) {
+            if (loc > top_location || vs_raw_locs.count(loc) || !seen_ps_halves.insert(loc).second) {
+                keep_ps_locs = false;
+                break;
+            }
+        }
+        if (!keep_ps_locs) break;
+    }
+
+    std::map<std::uint32_t, std::array<std::uint32_t, 2>> pair_halves;
+    std::set<std::uint32_t> demote_raw_vars;  // raw VS outputs the PS does not read whose location a half took
+    if (keep_ps_locs) {
+        pair_halves = ps_entry.f16_halves;
+    } else {
+        const auto free_locations = [&](const std::set<std::uint32_t>& reserved) {
+            std::vector<std::uint32_t> free_locs;
+            for (std::int64_t loc = top_location; loc >= 0; --loc)
+                if (!reserved.count(std::uint32_t(loc))) free_locs.push_back(std::uint32_t(loc));
+            return free_locs;
+        };
+        std::set<std::uint32_t> reserved = vs_raw_locs;
+        reserved.insert(ps_raw_locs.begin(), ps_raw_locs.end());
+        std::vector<std::uint32_t> free_locs = free_locations(reserved);
+        const std::size_t need = 2 * ps_entry.f16_halves.size();
+        // When reserving every raw VS output leaves too few locations, reserve only the PS's raw inputs and the raw
+        // outputs that have to stay, and give up the others: the PS is the only reader of the VS's outputs (see above),
+        // so a raw output it does not read only holds a location, and one that a half lands on is demoted to Private.
+        // A raw output can be given up when it is a 32-bit float vec4 (it fills its location, so no other output
+        // shares it) with only OpLoad/OpStore uses, as for the static halves demoted below. Pairs that fit the full
+        // reservation skip this and link as before, and a VS that declares stream output gives up none.
+        std::map<std::uint32_t, std::uint32_t> spare_raw_outputs;  // location -> raw VS output given up
+        if (free_locs.size() < need && !vs_stream_output) {
+            reserved = ps_raw_locs;
+            for (const auto& [loc, var_id] : vs_raw_outputs) {
+                const auto pty = var_ptr_type.find(var_id);
+                const bool is_v4 = pty != var_ptr_type.end() && v4float_ty && ptr_pointee[pty->second] == v4float_ty;
+                if (is_v4 && !ps_raw_locs.count(loc) && !non_demotable_vars.count(var_id))
+                    spare_raw_outputs[loc] = var_id;
+                else
+                    insert_var_slots(reserved, vs_loc_slots, loc, var_id);
+            }
+            free_locs = free_locations(reserved);
+        }
+        if (free_locs.size() < need)
+            return fail("f16_halves: need " + std::to_string(need) + " free locations in 0.." +
+                        std::to_string(top_location) + ", only " + std::to_string(free_locs.size()) + " available");
+        std::size_t k = 0;
+        for (const auto& [param, old_pair] : ps_entry.f16_halves) {
+            const std::uint32_t hi = free_locs[2 * k];
+            const std::uint32_t lo = free_locs[2 * k + 1];
+            pair_halves[param] = {lo, hi};
+            for (const std::uint32_t loc : {lo, hi}) {
+                const auto spare = spare_raw_outputs.find(loc);
+                if (spare != spare_raw_outputs.end()) demote_raw_vars.insert(spare->second);
+            }
+            ++k;
+        }
+    }
+
+    // Patch PS OpDecorate Location in place if we relocated any PS half input.
+    bool ps_changed = false;
+    if (!keep_ps_locs) {
+        std::map<std::uint32_t, std::uint32_t> ps_var_new_loc;
+        for (const auto& [param, old_pair] : ps_entry.f16_halves) {
+            const auto& new_pair = pair_halves[param];
+            for (std::size_t h = 0; h < 2; ++h) {
+                const auto it = ps_inputs.find(old_pair[h]);
+                if (it != ps_inputs.end()) ps_var_new_loc[it->second] = new_pair[h];
+            }
+        }
+        for (Inst& inst : ps_mod.insts) {
+            if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == kDecorationLocation) {
+                const auto it = ps_var_new_loc.find(inst.words[1]);
+                if (it != ps_var_new_loc.end() && inst.words[3] != it->second) {
+                    inst.words[3] = it->second;
+                    ps_changed = true;
+                }
+            }
+        }
+    }
+
     // Decide per VS static f16_halves entry: reuse (update Location) or demote (Output -> Private, strip interface decs).
     std::map<std::uint32_t, std::uint32_t> vs_var_new_loc;
     std::set<std::uint32_t> demote_vars;
@@ -624,6 +669,9 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
             }
         }
     }
+    // Demote the given-up raw outputs a half landed on the same way. One may still feed a synthesized half (the PS
+    // reads the param's halves but not the param itself): the epilogue's OpLoad reads the Private variable as well.
+    demote_vars.insert(demote_raw_vars.begin(), demote_raw_vars.end());
 
     // Params that must be synthesized in the VS epilogue.
     struct SynthParam {
@@ -816,7 +864,8 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
             continue;
         }
 
-        // Demote unneeded static VS f16_halves OpVariable from Output to Private (emitted after new_types).
+        // Demote unneeded static VS f16_halves OpVariables and the given-up raw outputs a half lands on from Output
+        // to Private (emitted after new_types).
         if (!globals_inserted && inst.opcode == kOpVariable && inst.words.size() >= 4 &&
             demote_vars.count(inst.words[2])) {
             inst.words[1] = ptr_priv_v4_ty;
