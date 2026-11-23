@@ -7615,9 +7615,12 @@ class Gen:
         elif op in ("v_div_fixup_f16", "v_div_fixup_f64"):
             # Final IEEE-754 special-case fixup for division (RDNA2 ISA VOP3, S0=quot, S1=denom, S2=num):
             # sign_out = sign(S1) ^ sign(S2); NaN(S2) -> quiet(S2); NaN(S1) -> quiet(S1);
-            # (0/0 or inf/inf) -> -qNaN; (x/inf or 0/y) -> +-0; (x/0 or inf/y or NaN(S0)) -> +-inf;
+            # (0/0 or inf/inf) -> -qNaN; (x/inf or 0/y) -> +-0; (x/0 or inf/y) -> +-inf;
             # otherwise copysign(S0, sign_out). Computed bit-exact on integer words; Float64 is only needed
             # when VOP3 output modifiers (omod/clamp) are present on v_div_fixup_f64.
+            # NaN(S0) differs by width: f64 -> +-inf with sign_out (measured on RDNA2 gfx1036, TEST-983),
+            # below the NaN(S1)/NaN(S2)/0-over-0/underflow cases; f16 keeps copysign(S0, sign_out) with its
+            # payload (ISA pseudocode, not measured).
             has_omod = any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods)
             if op == "v_div_fixup_f16":
                 sel, dhi = self.opsel_bits(mods, 3)
@@ -7733,7 +7736,7 @@ class Gen:
                     self.emit(f"{man_nz} = OpINotEqual %bool {man_or} {self.cu(0)}")
                     self.emit(f"{inan} = OpLogicalAnd %bool {exp_max} {man_nz}")
                     return mag, iz, iinf, inan
-                m0, _, _, _ = cls64(lo0, hi0)
+                m0, _, _, nan0 = cls64(lo0, hi0)
                 _, z1, inf1, nan1 = cls64(lo1, hi1)
                 _, z2, inf2, nan2 = cls64(lo2, hi2)
                 e1, e2, ediff, ediff_i, uf, of = (self.tmp() for _ in range(6))
@@ -7758,10 +7761,13 @@ class Gen:
                 self.emit(f"{b_zero} = OpLogicalOr %bool {b_zero1} {uf}")
                 self.emit(f"{b_inf1} = OpLogicalOr %bool {z1} {inf2}")
                 self.emit(f"{b_inf} = OpLogicalOr %bool {b_inf1} {of}")
+                # NaN(S0) -> +-inf (sign_out) in the "otherwise" slot: every case above still overrides it.
+                b_inf_or_nan0 = self.tmp()
+                self.emit(f"{b_inf_or_nan0} = OpLogicalOr %bool {b_inf} {nan0}")
                 z0 = self.cu(0)
                 h1, l1, h2, l2, h3, l3, h4, l4, r_hi, r_lo = (self.tmp() for _ in range(10))
-                self.emit(f"{h1} = OpSelect %uint {b_inf} {inf_hi} {norm_hi}")
-                self.emit(f"{l1} = OpSelect %uint {b_inf} {z0} {lo0}")
+                self.emit(f"{h1} = OpSelect %uint {b_inf_or_nan0} {inf_hi} {norm_hi}")
+                self.emit(f"{l1} = OpSelect %uint {b_inf_or_nan0} {z0} {lo0}")
                 self.emit(f"{h2} = OpSelect %uint {b_zero} {sgn} {h1}")
                 self.emit(f"{l2} = OpSelect %uint {b_zero} {z0} {l1}")
                 self.emit(f"{h3} = OpSelect %uint {b_ind} {self.cu(0xFFF80000)} {h2}")

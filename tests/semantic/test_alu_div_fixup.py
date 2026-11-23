@@ -5,7 +5,10 @@ v_div_fixup_{f16,f64} D, S0 (quot), S1 (denom), S2 (num) resolves IEEE-754 divis
   - NaN(S2) -> quiet(S2); NaN(S1) -> quiet(S1)
   - (0/0) or (inf/inf) -> canonical negative qNaN (0xFE00 / 0xFFF80000_00000000)
   - (x/inf) or (0/y) -> copysign(0, sign_out)
-  - (x/0) or (inf/y) or NaN(S0) -> copysign(inf, sign_out)
+  - (x/0) or (inf/y) -> copysign(inf, sign_out)
+  - NaN(S0): f64 -> copysign(inf, sign_out), measured on RDNA2 gfx1036 (TEST-983); this sits below
+    every case above and below the underflow-to-zero case. f16 -> copysign(S0, sign_out) keeping
+    the payload (ISA pseudocode, not measured).
   - otherwise copysign(S0, sign_out)
 """
 import os
@@ -191,13 +194,63 @@ class DivFixupF64Tests(unittest.TestCase):
             ("zero_div_finite_pos", D_ONE, D_NEG2, D_NEG0, D_POS0),
             ("finite_div_zero_neg", D_ONE, D_NEG0, D_ONE, D_NINF),
             ("inf_div_finite_pos", D_ONE, D_NEG2, D_NINF, D_INF),
-            ("nan_quot_signed_passthrough", 0xFFF8123456789ABC, D_NEG2 & ~(1 << 63), D_ONE, 0x7FF8123456789ABC),
+            ("nan_quot_to_inf_pos", 0xFFF8123456789ABC, D_NEG2 & ~(1 << 63), D_ONE, D_INF),
             ("exp_underflow_to_zero", D_ONE, 0x4630000000000000, 0x0010000000000000, D_POS0),  # 2^-1022 / 2^100
             ("exp_overflow_to_inf", D_ONE, 0x0010000000000000, 0x4630000000000000, D_INF),     # 2^100 / 2^-1022
         )
         for name, s0, s1, s2, want in cases:
             with self.subTest(case=name):
                 self.assertEqual(run_f64(s0, s1, s2), want)
+
+    def test_nan_quotient_gives_signed_infinity(self):
+        # NaN(S0) -> copysign(inf, sign(S1) ^ sign(S2)) on RDNA2 gfx1036 (TEST-983): qNaN, sNaN, both
+        # signs of the NaN, payloads (incl. all-ones low word), and both output signs.
+        nans = (
+            ("qnan", 0x7FF8000000000000),
+            ("qnan_neg", 0xFFF8000000000000),
+            ("qnan_payload", 0x7FF8123456789ABC),
+            ("snan", 0x7FF0000000000001),
+            ("snan_neg_payload", 0xFFF4000000000005),
+            ("all_ones_low", 0xFFFFFFFFFFFFFFF0),
+        )
+        denoms = (
+            ("sign_out_pos", D_ONE, D_ONE, D_INF),
+            ("sign_out_neg_s1", D_NEG2, D_ONE, D_NINF),
+            ("sign_out_neg_s2", D_ONE, D_NEG2, D_NINF),
+            ("sign_out_pos_both_neg", D_NEG2, D_NEG2, D_INF),
+        )
+        for nname, nan in nans:
+            for dname, s1, s2, want in denoms:
+                with self.subTest(nan=nname, case=dname):
+                    self.assertEqual(run_f64(nan, s1, s2), want)
+        # Control: a normal (non-NaN) quotient is still passed through, not replaced by inf.
+        self.assertEqual(run_f64(D_THREE, D_ONE, D_ONE), D_THREE)
+
+    def test_nan_quotient_priority_below_other_cases(self):
+        # Every earlier case still beats NaN(S0): NaN(S2), NaN(S1), 0/0, inf/inf, x/inf, 0/y,
+        # x/0, inf/y and guaranteed underflow (2^-1022 / 2^100 -> +0, f32 priority 6 analogue).
+        qn = 0x7FF8123456789ABC
+        cases = (
+            ("nan_s2", D_SNAN1, D_QNAN2, D_QNAN2 | (0x00080000 << 32)),
+            ("nan_s1", D_SNAN1, D_ONE, D_SNAN1 | (0x00080000 << 32)),
+            ("zero_div_zero", D_POS0, D_NEG0, D_CANON_NAN),
+            ("inf_div_inf", D_INF, D_NINF, D_CANON_NAN),
+            ("finite_div_inf", D_NINF, D_ONE, D_NEG0),
+            ("zero_div_finite", D_NEG2, D_NEG0, D_POS0),
+            ("finite_div_zero", D_NEG0, D_ONE, D_NINF),
+            ("inf_div_finite", D_NEG2, D_NINF, D_INF),
+            ("exp_underflow_to_zero", 0x4630000000000000, 0x0010000000000000, D_POS0),
+        )
+        for name, s1, s2, want in cases:
+            with self.subTest(case=name):
+                self.assertEqual(run_f64(qn, s1, s2), want)
+
+    def test_f16_nan_quotient_unchanged(self):
+        # f16 NaN(S0) is not measured; it keeps copysign(S0, sign_out) with its payload.
+        self.assertEqual(
+            run_f16(0xBEEF0000 | 0x7E12, 0xCAFE0000 | H_ONE, 0xDEAD0000 | H_NEG2),
+            (SEED_DST & 0xFFFF0000) | 0xFE12,
+        )
 
     def test_modifiers_plain_no_float64_and_omod_float64_validates(self):
         # Plain form: no Float64 needed, supports abs/neg and SGPR/inline sources
