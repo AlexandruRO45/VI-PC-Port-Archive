@@ -4,8 +4,9 @@
 //
 // The read is held back by the GPU, not by the CPU: queue A waits for a fence that queue C signals after a run of
 // 64 MiB copies between host buffers (the gate, sized from a measured run to last about 300 ms). C's Signal is
-// submitted first, so A's batch is submitted at once with a Vulkan wait (nothing is held, queue_holds.h). While the
-// gate is closed the buffer is released and one of the same size is made. Checked:
+// submitted first, so A's batch is submitted at once with a Vulkan wait (nothing is held, queue_holds.h). C is a COPY
+// queue; on a device that gives a single queue (llvmpipe) the gate runs on A itself, DIRECT, ahead of the read. While
+// the gate is closed the buffer is released and one of the same size is made. Checked:
 //   1. the new buffer gets another range and A reads the released buffer's data, not the new buffer's zeros;
 //   2. once A has completed (and the submission after the release), the next buffer gets the released range back;
 //   3. with a 16 MiB arena: a 12 MiB buffer made and released four times with nothing submitted gets the same range
@@ -30,7 +31,7 @@ namespace {
 
 constexpr UINT64 kGateBytes = 64ull << 20;
 constexpr double kGateMs = 300;
-bool skipped = false;  // no Vulkan device or queues: exit 77
+bool skipped = false;  // no Vulkan device or no DIRECT queue: exit 77
 
 #define CHECK(c)                                                         \
     do {                                                                 \
@@ -118,6 +119,7 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 struct Rig {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> gate_queue, reader;
+    D3D12_COMMAND_LIST_TYPE gate_type = D3D12_COMMAND_LIST_TYPE_COPY;
     ComPtr<ID3D12Fence> gate, done;
     UINT64 gate_value = 0, done_value = 0;
     ComPtr<ID3D12Resource> gate_src, gate_dst;
@@ -128,10 +130,15 @@ struct Rig {
     // 77: no Vulkan device (skipped), 1: failure, 0: ready.
     int init() {
         if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device)))) return 77;
-        D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COPY};
-        if (FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&gate_queue)))) return 77;
-        desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
         if (FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&reader)))) return 77;
+        desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        if (FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&gate_queue)))) {
+            gate_queue = reader;  // one queue: the gate goes ahead of the read on it
+            gate_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        }
+        std::printf("gate on %s\n", gate_queue == reader ? "the reader's DIRECT queue (no second queue)"
+                                                         : "a COPY queue, the read on a DIRECT one");
         if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))) ||
             FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done))))
             return 1;
@@ -180,10 +187,10 @@ struct Rig {
         return value != 0;
     }
 
-    // The gate on the COPY queue: `gate_copies` copies of 64 MiB from an upload to a readback buffer, one after the
-    // other (a null aliasing barrier between them is a full memory barrier), then Signal(gate). Returns the value.
+    // The gate on its queue: `gate_copies` copies of 64 MiB from an upload to a readback buffer, one after the other
+    // (a null aliasing barrier between them is a full memory barrier), then Signal(gate). Returns the value.
     UINT64 submit_gate() {
-        ID3D12GraphicsCommandList* list = begin(D3D12_COMMAND_LIST_TYPE_COPY);
+        ID3D12GraphicsCommandList* list = begin(gate_type);
         if (!list) return 0;
         D3D12_RESOURCE_BARRIER between{};
         between.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
@@ -325,7 +332,7 @@ int main() {
     const bool in_flight = in_flight_read();
     const bool arena_16 = !skipped && small_arena();
     if (skipped) {
-        std::puts("no Vulkan device with a COPY and a DIRECT queue: skipped");
+        std::puts("no Vulkan device with a DIRECT queue: skipped");
         return 77;
     }
     const bool ok = in_flight && arena_16;
