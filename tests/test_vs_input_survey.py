@@ -84,6 +84,29 @@ def test_vs_input_survey():
         return subprocess.run([sys.executable, "-I", tool, *args], capture_output=True, text=True)
 
     with tempfile.TemporaryDirectory() as tmp:
+        dx = build(tmp)
+        known = {"stage": "vs", "file": "a_vs.dxbc"}
+        missing = {"stage": "vs", "file": "missing.dxbc"}
+        pixel = {"stage": "ps", "file": "e_ps.dxbc"}
+        report = os.path.join(tmp, "counts.json")
+        verdicts = {}
+        for label, entries, total, absent in (("no VS", [pixel], 0, 0), ("all missing", [missing], 1, 1),
+                                              ("partial", [known, missing], 2, 1), ("complete", [known], 1, 0)):
+            with open(os.path.join(dx, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(entries, f)
+            result = cli(dx, "--json", report)
+            check(result.returncode == 0 and not result.stderr, f"{label}: survey succeeds")
+            with open(report, encoding="utf-8") as f:
+                counts = json.load(f)
+            check((counts["vertex_shaders"], counts["missing_listings"]) == (total, absent),
+                  f"{label}: original coverage counts preserved")
+            verdicts[label] = next(line for line in result.stdout.splitlines() if line.startswith("layout:"))
+        check("legacy (non-NGG)" in verdicts["complete"], "complete marker-free survey identifies legacy layout")
+        for label in ("no VS", "all missing", "partial"):
+            check(verdicts[label] != verdicts["complete"], f"{label}: no unconditional legacy verdict")
+        check(verdicts["no VS"] != verdicts["all missing"], "no indexed vertex shaders and absent listings are distinct")
+
+    with tempfile.TemporaryDirectory() as tmp:
         d = os.path.join(tmp, "dxbc")
         os.mkdir(d)
         plain = os.path.join(tmp, "plain")
