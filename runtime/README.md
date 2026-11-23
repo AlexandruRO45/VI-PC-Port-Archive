@@ -136,6 +136,10 @@ clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
 
+The TLS callback table is a zero-terminated array of relocated virtual addresses that point inside the mapped image;
+after relocation each entry is bounds-checked before it is called, and a synthetic three-callback test covers order,
+reasons, dry-run and a missing terminator.
+
 Current limits, by design:
 
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own

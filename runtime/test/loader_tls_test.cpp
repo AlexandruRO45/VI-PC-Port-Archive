@@ -12,8 +12,10 @@
 #include <intrin.h>
 #include <process.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "free_image_base.h"
 #include "pe_loader.h"
 
 namespace {
@@ -53,7 +56,13 @@ void write_file(const fs::path& path, const void* data, size_t size) {
 struct TempDir {
     fs::path path;
     TempDir() {
-        path = fs::temp_directory_path() / ("leonida_loader_tls_test_" + std::to_string(GetCurrentProcessId()));
+        wchar_t* env = nullptr;
+        size_t size = 0;
+        fs::path base;
+        if (_wdupenv_s(&env, &size, L"LEONIDA_TEST_DIR") == 0 && env && *env) base = env;
+        std::free(env);
+        if (base.empty()) base = fs::temp_directory_path();
+        path = base / ("leonida_loader_tls_test_" + std::to_string(GetCurrentProcessId()));
         std::error_code ec;
         fs::remove_all(path, ec);
         fs::create_directories(path);
@@ -757,6 +766,175 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     fs::remove(live_file, ec);
 }
 
+// ---- Hand-built TLS callback fixtures -------------------------------------------------------------------------------
+//
+// Both images below are assembled from constants only: no game data, no compiler-produced bytes. The callback table in
+// IMAGE_TLS_DIRECTORY64 has no length field, so run_callbacks() follows it until a zero entry, checking every entry
+// against the mapped image before calling it. Each callback is a short x64 stub that records the (base, reason,
+// reserved) it was called with and appends its id to a shared log, making the exact call order observable.
+//
+// --dry-run is load() without initialise() (src/main.cpp), so a fresh load() with a cleared log is the dry-run check.
+
+constexpr uint32_t kSynthImageSize = 0x2000;
+constexpr uint32_t kSynthFileSize = 0x1200;
+constexpr uint32_t kSynthTextRva = 0x1000;
+constexpr uint32_t kSynthTextRaw = 0x200;
+constexpr uint32_t kSynthTextSize = 0x1000;
+
+constexpr uint32_t kTlsDirRva = kSynthTextRva + 0x000;
+constexpr uint32_t kTlsIndexRva = kSynthTextRva + 0x040;
+constexpr uint32_t kStubRva[3] = {kSynthTextRva + 0x100, kSynthTextRva + 0x140, kSynthTextRva + 0x180};
+constexpr uint32_t kTableRva = kSynthTextRva + 0x200;   // terminated: three entries plus a zero entry
+constexpr uint32_t kLastTableRva = kSynthTextRva + 0xFE8;  // unterminated: last entry is the image's final 8 bytes
+
+struct CallbackState {
+    uint32_t count;
+    uint32_t order[8];
+    uint64_t base[3];
+    uint64_t reason[3];
+    uint64_t reserved[3];
+};
+static CallbackState g_callback_state;
+
+void reset_callback_state() { std::memset(&g_callback_state, 0, sizeof(g_callback_state)); }
+
+void emit_u8(std::vector<uint8_t>& c, uint8_t v) { c.push_back(v); }
+
+void emit_u32(std::vector<uint8_t>& c, uint32_t v) {
+    for (int i = 0; i < 4; ++i) c.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+
+void emit_u64(std::vector<uint8_t>& c, uint64_t v) {
+    for (int i = 0; i < 8; ++i) c.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+
+// movabs rax, state; mov [rax+base], rcx; mov [rax+reason], rdx; mov [rax+reserved], r8;
+// mov ecx, [rax]; mov dword [rax+rcx*4+order], id; inc dword [rax]; ret
+void emit_callback_stub(std::vector<uint8_t>& c, uint64_t state_va, uint32_t slot, uint32_t id) {
+    const uint32_t base_off = static_cast<uint32_t>(offsetof(CallbackState, base)) + slot * 8;
+    const uint32_t reason_off = static_cast<uint32_t>(offsetof(CallbackState, reason)) + slot * 8;
+    const uint32_t reserved_off = static_cast<uint32_t>(offsetof(CallbackState, reserved)) + slot * 8;
+    const uint32_t order_off = static_cast<uint32_t>(offsetof(CallbackState, order));
+    emit_u8(c, 0x48); emit_u8(c, 0xB8); emit_u64(c, state_va);
+    emit_u8(c, 0x48); emit_u8(c, 0x89); emit_u8(c, 0x88); emit_u32(c, base_off);
+    emit_u8(c, 0x48); emit_u8(c, 0x89); emit_u8(c, 0x90); emit_u32(c, reason_off);
+    emit_u8(c, 0x4C); emit_u8(c, 0x89); emit_u8(c, 0x80); emit_u32(c, reserved_off);
+    emit_u8(c, 0x8B); emit_u8(c, 0x08);
+    emit_u8(c, 0xC7); emit_u8(c, 0x84); emit_u8(c, 0x88); emit_u32(c, order_off); emit_u32(c, id);
+    emit_u8(c, 0xFF); emit_u8(c, 0x00);
+    emit_u8(c, 0xC3);
+}
+
+// The image has no relocations, so its VAs are image_base + RVA and the loader must map it at image_base.
+std::vector<uint8_t> make_synthetic_tls_image(uint64_t image_base, bool terminated) {
+    std::vector<uint8_t> bytes(kSynthFileSize, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x80;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(bytes.data() + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 1;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.ImageBase = image_base;
+    nt->OptionalHeader.SizeOfHeaders = kSynthTextRaw;
+    nt->OptionalHeader.SizeOfImage = kSynthImageSize;
+    nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    auto& tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    tls_dir.VirtualAddress = kTlsDirRva;
+    tls_dir.Size = sizeof(IMAGE_TLS_DIRECTORY64);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    std::memcpy(sec->Name, ".text", 6);
+    sec->VirtualAddress = kSynthTextRva;
+    sec->Misc.VirtualSize = kSynthTextSize;
+    sec->PointerToRawData = kSynthTextRaw;
+    sec->SizeOfRawData = kSynthTextSize;
+    sec->Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+
+    // Callback-only TLS: no data template. AddressOfIndex is written by load() before protect_sections().
+    auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(bytes.data() + kTlsDirRva - kSynthTextRva + kSynthTextRaw);
+    tls->AddressOfIndex = image_base + kTlsIndexRva;
+    tls->AddressOfCallBacks = image_base + (terminated ? kTableRva : kLastTableRva);
+
+    const uint64_t state_va = reinterpret_cast<uint64_t>(&g_callback_state);
+    for (uint32_t i = 0; i < 3; ++i) {
+        std::vector<uint8_t> stub;
+        emit_callback_stub(stub, state_va, i, i + 1);
+        std::memcpy(bytes.data() + kStubRva[i] - kSynthTextRva + kSynthTextRaw, stub.data(), stub.size());
+    }
+    const uint32_t table_rva = terminated ? kTableRva : kLastTableRva;
+    auto* table = reinterpret_cast<uint64_t*>(bytes.data() + table_rva - kSynthTextRva + kSynthTextRaw);
+    for (uint32_t i = 0; i < 3; ++i) table[i] = image_base + kStubRva[i];
+    if (terminated) table[3] = 0;
+    return bytes;
+}
+
+bool order_is(const uint32_t* expected, uint32_t n) {
+    if (g_callback_state.count != n) return false;
+    for (uint32_t i = 0; i < n; ++i)
+        if (g_callback_state.order[i] != expected[i]) return false;
+    return true;
+}
+
+void test_three_callbacks(const fs::path& dir) {
+    std::printf("\n-- synthetic TLS image with three callbacks --\n");
+    const uint64_t image_base = leonida_test::free_image_base(0x181000000);
+    const auto bytes = make_synthetic_tls_image(image_base, true);
+    const fs::path path = dir / "synthetic_tls_three_callbacks.bin";
+    write_file(path, bytes.data(), bytes.size());
+
+    reset_callback_state();
+    {
+        rt::Loader loader(dir);
+        rt::Module& m = loader.load(path);
+        check(order_is(nullptr, 0), "load() (the --dry-run path) runs no TLS callback");
+
+        loader.run_tls_callbacks(m, DLL_PROCESS_ATTACH);
+        const uint32_t ordered[3] = {1, 2, 3};
+        check(order_is(ordered, 3), "process attach runs all three callbacks in table order");
+        bool reasons = true, bases = true, reserved = true;
+        for (uint32_t i = 0; i < 3; ++i) {
+            reasons = reasons && g_callback_state.reason[i] == DLL_PROCESS_ATTACH;
+            bases = bases && g_callback_state.base[i] == reinterpret_cast<uint64_t>(m.base);
+            reserved = reserved && g_callback_state.reserved[i] == 0;
+        }
+        check(reasons, "each attach callback receives DLL_PROCESS_ATTACH");
+        check(bases, "each attach callback receives the mapped image base");
+        check(reserved, "each attach callback receives a null reserved argument");
+
+        reset_callback_state();
+        loader.run_tls_callbacks(m, DLL_PROCESS_DETACH);
+        check(order_is(ordered, 3), "process detach runs all three callbacks in table order");
+        reasons = true;
+        for (uint32_t i = 0; i < 3; ++i) reasons = reasons && g_callback_state.reason[i] == DLL_PROCESS_DETACH;
+        check(reasons, "each detach callback receives DLL_PROCESS_DETACH");
+    }
+}
+
+void test_unterminated_callback_table(const fs::path& dir) {
+    std::printf("\n-- synthetic TLS image without a callback-table terminator --\n");
+    const uint64_t image_base = leonida_test::free_image_base(0x182000000);
+    const auto bytes = make_synthetic_tls_image(image_base, false);
+    const fs::path path = dir / "synthetic_tls_unterminated.bin";
+    write_file(path, bytes.data(), bytes.size());
+
+    reset_callback_state();
+    rt::Loader loader(dir);
+    rt::Module& m = loader.load(path);
+    check(order_is(nullptr, 0), "load() of the unterminated image runs no TLS callback");
+    bool threw = false;
+    try {
+        loader.run_tls_callbacks(m, DLL_PROCESS_ATTACH);
+    } catch (const std::exception&) {
+        threw = true;  // the documented corrupt-TLS-directory path; the message is deliberately not checked
+    }
+    check(threw, "the missing terminator fails with a C++ exception, not an out-of-bounds read");
+    const uint32_t ordered[3] = {1, 2, 3};
+    check(order_is(ordered, 3), "the bounded failure happens after all three entries, in order");
+}
+
 void print_result() {
     if (g_failures == 0)
         std::printf("\nloader_tls_test: OK (%d checks)\n", g_checks);
@@ -792,6 +970,8 @@ int main(int argc, char** argv) {
         test_thread_outlives_loader(tls_dll);
         test_multiple_tls_modules(tls_dll, temp.path);
         test_orphan_slot_generation_reuse(tls_dll);
+        test_three_callbacks(temp.path);
+        test_unterminated_callback_table(temp.path);
 
         // The --run path calls cleanup_tls_clones() before ExitProcess because atexit never runs there.
         std::printf("\n-- explicit clone cleanup (the ExitProcess path) --\n");
