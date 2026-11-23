@@ -15,6 +15,7 @@ against `--main` (default `origin/main`), using one history scan for the whole b
   repeated line is not reported, since code and tables repeat lines legitimately. Only text files (.md, .txt,
   .rst) make the verdict `duplicates`; a block in code is listed, since equal lines in two functions are ordinary.
 - `conflict`: whether `git merge-tree` reports a conflict (the duplicate check is then on the conflicted tree).
+- `tree_matches_main`: true only when the simulated merge is conflict-free and leaves main's tree unchanged.
 
 Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
 tree matches main, as after a multi-commit squash merge), `duplicates`, `conflict` or `clean`.
@@ -162,6 +163,7 @@ def check(repo, main, number, ref, min_length, merges):
         verdict = "clean"
     return {"pr": number, "ref": ref, "verdict": verdict, "merges": merges,
             "commits": {"total": total, "on_main": on_main}, "conflict": conflict,
+            "tree_matches_main": unchanged,
             "duplicates": {p: len(v) for p, v in dups.items()},
             "duplicate_samples": {p: v[:3] for p, v in dups.items()}}
 
@@ -180,7 +182,7 @@ def main(argv=None):
     ap.add_argument("--repo", default=".", help="repository folder (default: the current one)")
     ap.add_argument("--min-length", type=int, default=40, help="shortest stripped line counted as a duplicate (40)")
     ap.add_argument("--depth", type=int, default=5000, help="first-parent commits searched for earlier merges (5000)")
-    ap.add_argument("--json", action="store_true", help="one JSON report instead of text")
+    ap.add_argument("--json", action="store_true", help="one JSON report including tree_matches_main")
     args = ap.parse_args(argv)
     try:
         history = prior_merges(args.repo, args.main, (n for n, _ in args.pairs), args.depth)
@@ -196,6 +198,9 @@ def main(argv=None):
             print(f"#{r['pr']} {r['verdict']}: {c['on_main']}/{c['total']} commit(s) already on main"
                   + (", merged tree matches main"
                      if r["verdict"] == "already-merged" and c["on_main"] != c["total"] else "")
+                  + (", merge would change the current main tree"
+                     if r["verdict"] == "already-merged" and not r["conflict"] and not r["tree_matches_main"]
+                     else "")
                   + (f", merged before at {', '.join(r['merges'])}" if r["merges"] else "")
                   + (", conflicts" if r["conflict"] else ""))
             for path, n in sorted(r["duplicates"].items()):
