@@ -125,5 +125,97 @@ class TestVMin3I32Oracle(unittest.TestCase):
         self.assertIn("OpFunction", spv)
         self.assertIn("OpReturn", spv)
 
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegisterKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL32 = auto()
+
+
+@dataclass(frozen=True)
+class RegOperand:
+    kind: RegisterKind
+    index: int = 0
+
+    def format(self) -> str:
+        if self.kind == RegisterKind.VGPR:
+            return f"v{self.index}"
+        elif self.kind == RegisterKind.SGPR:
+            return f"s{self.index}"
+        elif self.kind == RegisterKind.LITERAL32:
+            return f"{self.index:#x}"
+        return f"reg_{self.index}"
+
+
+@dataclass
+class VMin3I32Instruction:
+    dst: RegOperand
+    src0: RegOperand
+    src1: RegOperand
+    src2: RegOperand
+    opcode: str = "v_min3_i32"
+
+    def validate(self) -> None:
+        if self.opcode != "v_min3_i32":
+            raise ValueError(f"Invalid opcode {self.opcode}")
+        if self.dst.kind != RegisterKind.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
+        if self.dst.index > 255:
+            raise ValueError(f"Destination VGPR index out of range: v{self.dst.index}")
+        for src, name in ((self.src0, "src0"), (self.src1, "src1"), (self.src2, "src2")):
+            if src.kind == RegisterKind.VGPR and src.index > 255:
+                raise ValueError(f"{name} VGPR index out of range: v{src.index}")
+            elif src.kind == RegisterKind.SGPR and src.index > 105:
+                raise ValueError(f"{name} SGPR index out of range: s{src.index}")
+
+    def emit_assembly(self) -> str:
+        self.validate()
+        return f"{self.opcode} {self.dst.format()}, {self.src0.format()}, {self.src1.format()}, {self.src2.format()}"
+
+
+class TestVMin3I32AST(unittest.TestCase):
+    """Unit tests for symbolic AST representation and validation."""
+
+    def test_ast_valid_vgpr_operands(self):
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=4),
+            src0=RegOperand(RegisterKind.VGPR, index=1),
+            src1=RegOperand(RegisterKind.VGPR, index=2),
+            src2=RegOperand(RegisterKind.VGPR, index=3)
+        )
+        self.assertEqual(instr.emit_assembly(), "v_min3_i32 v4, v1, v2, v3")
+
+    def test_ast_valid_sgpr_and_literal_operands(self):
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=5),
+            src0=RegOperand(RegisterKind.SGPR, index=8),
+            src1=RegOperand(RegisterKind.VGPR, index=2),
+            src2=RegOperand(RegisterKind.LITERAL32, index=0x100)
+        )
+        self.assertEqual(instr.emit_assembly(), "v_min3_i32 v5, s8, v2, 0x100")
+
+    def test_ast_invalid_sgpr_destination(self):
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=0),
+            src0=RegOperand(RegisterKind.VGPR, index=1),
+            src1=RegOperand(RegisterKind.VGPR, index=2),
+            src2=RegOperand(RegisterKind.VGPR, index=3)
+        )
+        with self.assertRaises(TypeError):
+            instr.validate()
+
+    def test_ast_vgpr_out_of_range(self):
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=256),
+            src0=RegOperand(RegisterKind.VGPR, index=1),
+            src1=RegOperand(RegisterKind.VGPR, index=2),
+            src2=RegOperand(RegisterKind.VGPR, index=3)
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
 if __name__ == "__main__":
     unittest.main()
