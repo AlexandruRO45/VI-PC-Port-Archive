@@ -11,9 +11,11 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import fssm_header  # noqa: E402
+import report_paths  # noqa: E402
 import wave32_pixel_scan as scan  # noqa: E402
 
 
@@ -171,6 +173,78 @@ class ScanTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
             scan.main(["no_such_shaders_dir_xyz"])
         self.assertNotEqual(cm.exception.code, 0)
+
+    def test_uses_shared_same_report_path(self):
+        self.assertIs(scan.same_report_path, report_paths.same_report_path)
+
+    def test_out_same_as_source_rejected(self):
+        with tempfile.TemporaryDirectory() as src:
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([src, "--out", src])
+            self.assertNotEqual(cm.exception.code, 0)
+
+    def test_out_overwriting_a_scanned_shader_rejected(self):
+        with tempfile.TemporaryDirectory() as src:
+            name, text = PS_LANE_ID
+            target = os.path.join(src, name)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(text)
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                scan.main([src, "--out", target])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input it scans", err.getvalue())
+            with open(target, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)
+
+    def test_out_overwriting_fssm_header_or_carve_index_rejected(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            disasm = root / "dxbc" / "disasm"
+            fssm = root / "dxbc" / "fssm"
+            disasm.mkdir(parents=True)
+            fssm.mkdir(parents=True)
+            index = root / "dxbc" / "index.json"
+            index.write_text(json.dumps([{"file": "ps_0001.dxbc", "stage": "ps"}]), encoding="utf-8")
+            name, text = PS_LANE_ID
+            (disasm / name).write_text(text, encoding="utf-8", newline="\n")
+            header = fssm / (Path(name).stem + ".fssm")
+            data = fssm_header.MAGIC + bytes(fssm_header.WAVE_FLAGS_OFFSET)
+            header.write_bytes(data)
+
+            # Test carve index
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                scan.main([str(disasm), "--out", str(index)])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input it scans", err.getvalue())
+
+            # Test fssm header
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                scan.main([str(disasm), "--out", str(header)])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input it scans", err.getvalue())
+            self.assertEqual(header.read_bytes(), data)
+
+    def test_uses_shared_same_report_path_and_catches_folding_volume_case_alias(self):
+        with tempfile.TemporaryDirectory() as work:
+            disasm = os.path.join(work, "dxbc", "disasm")
+            os.makedirs(disasm)
+            index = os.path.join(work, "dxbc", "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump([{"file": "ps_0001.dxbc", "stage": "ps"}], f)
+            name, text = PS_LANE_ID
+            with open(os.path.join(disasm, name), "w", encoding="utf-8") as f:
+                f.write(text)
+            folded_index = os.path.join(work, "dxbc", "INDEX.JSON")
+            with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+                  mock.patch.object(report_paths, "_resolved_key", side_effect=str),
+                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe,
+                  contextlib.redirect_stderr(io.StringIO())):
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([disasm, "--out", folded_index])
+                self.assertEqual(cm.exception.code, 2)
+            self.assertGreaterEqual(probe.call_count, 1)
 
 
 if __name__ == "__main__":
