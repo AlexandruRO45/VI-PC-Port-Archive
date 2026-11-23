@@ -551,6 +551,52 @@ class GlbInspectTests(unittest.TestCase):
             self.assertEqual(animation["samplers"][0]["interpolation"], "LINEAR")
             self.assertEqual(animation["issues"], [])
 
+    def test_animation_input_bounds_in_text_and_json(self):
+        # Two timestamps followed by two VEC3 translations. Outputs need no bounds.
+        payload = struct.pack("<8f", 0, 2, 0, 0, 0, 1, 0, 0)
+        for missing, input_index in (((), 0), (("min",), 0), (("max",), 0),
+                                     (("min", "max"), 0), ((), 9)):
+            with self.subTest(missing=missing, input_index=input_index), tempfile.TemporaryDirectory() as folder:
+                times = {"bufferView": 0, "componentType": 5126, "type": "SCALAR",
+                         "count": 2, "min": [0], "max": [2]}
+                for key in missing:
+                    del times[key]
+                doc = {
+                    "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{}],
+                    "buffers": [{"byteLength": len(payload)}],
+                    "bufferViews": [{"buffer": 0, "byteLength": 8},
+                                    {"buffer": 0, "byteOffset": 8, "byteLength": 24}],
+                    "accessors": [times, {"bufferView": 1, "componentType": 5126, "type": "VEC3", "count": 2}],
+                    "animations": [{"samplers": [{"input": input_index, "output": 1}],
+                                    "channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}]}],
+                }
+                path = os.path.join(folder, "motion.glb")
+                with open(path, "wb") as handle:
+                    handle.write(glb(doc, payload))
+                out = os.path.join(folder, "report.json")
+                result = self.run_tool(path, "--json", out)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(out, encoding="utf-8") as handle:
+                    animation = json.load(handle)["animations"][0]
+                duration = 2.0 if input_index == 0 and "max" not in missing else None
+                self.assertEqual(animation["duration"], duration)
+                self.assertEqual(animation["samplers"][0]["duration"], duration)
+                self.assertIn("duration=" + ("(missing)" if duration is None else "2.0"), result.stdout)
+                issues = animation["issues"]
+                printed = [line.strip()[len("issue: "):] for line in result.stdout.splitlines()
+                           if line.strip().startswith("issue: ")]
+                self.assertEqual(printed, issues)
+                if input_index != 0:
+                    self.assertEqual(issues, ["sampler[0] input accessor is missing"])
+                elif missing:
+                    self.assertTrue(issues)
+                    for issue in issues:
+                        self.assertIn("sampler[0]", issue)
+                    for key in ("min", "max"):
+                        self.assertEqual(key in " ".join(issues), key in missing)
+                else:
+                    self.assertEqual(issues, [])
+
     def test_animation_reference_issues_are_reported(self):
         gltf = animated_gltf()
         gltf["animations"][0]["channels"] = [
