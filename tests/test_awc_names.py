@@ -2,6 +2,7 @@
 
     python -I tests/test_awc_names.py
 """
+import codecs
 import contextlib
 import csv
 import importlib.util
@@ -322,6 +323,19 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "hashes.json"), json.dumps({"0000abcd": "Some_Word"}))
             self.assertEqual(A.read_words(path), ["Some_Word"])
+
+    def test_hashdict_json_words_with_a_utf8_bom(self):
+        # Windows PowerShell 5.1's Set-Content/Out-File write a UTF-8 BOM; encoding="utf-8" rejects it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "hashes.json"),
+                         codecs.BOM_UTF8 + json.dumps({"0000abcd": "Some_Word"}).encode("utf-8"))
+            self.assertEqual(A.read_words(path), ["Some_Word"])
+
+    def test_text_word_list_with_a_utf8_bom(self):
+        # The BOM must not stick to the first word: '\ufeffSome_Word' matches no stream id.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "words.txt"), codecs.BOM_UTF8 + b"Some_Word\nOther_Word\n")
+            self.assertEqual(A.read_words(path), ["Some_Word", "Other_Word"])
 
     def test_needs_a_dictionary(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

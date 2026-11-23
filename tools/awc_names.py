@@ -35,6 +35,7 @@ Standard library only. The output names game files: it is a local work product a
 attached to an issue. The tests use synthetic banks and words.
 """
 import argparse
+import codecs
 import collections
 import csv
 import json
@@ -159,18 +160,21 @@ def _files(path: str):
 
 
 def read_words(path: str) -> list:
-    """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words."""
+    """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words.
+    A UTF-8 BOM is skipped: Windows PowerShell 5.1's Set-Content/Out-File write one."""
     with open(path, "rb") as fh:
-        head = fh.read(1).lstrip()
-    if path.lower().endswith(".json") or head == b"{":
-        with open(path, encoding="utf-8") as fh:
+        head = fh.read(4)
+    if head.startswith(codecs.BOM_UTF8):
+        head = head[len(codecs.BOM_UTF8):]
+    if path.lower().endswith(".json") or head[:1].lstrip() == b"{":
+        with open(path, encoding="utf-8-sig") as fh:
             doc = json.load(fh)
         if isinstance(doc, dict):
             return [str(v) for v in doc.values()]
         if isinstance(doc, list):
             return [str(v) for v in doc]
         raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
         return [line.strip() for line in fh if line.strip()]
 
 
