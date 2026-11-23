@@ -17443,6 +17443,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
     # name. On Windows they read their command line in the ANSI code page, so a folder name outside it (a Cyrillic or
     # CJK user name, say) reached them as '?' and every shader failed with "file does not exist".
     folder = os.path.dirname(os.path.abspath(tmp))
+    spirv_val = find_spirv_tool("spirv-val") or "spirv-val"
     try:
         if assembler == "python":
             import spirv_asm
@@ -17453,12 +17454,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
             except (OSError, spirv_asm.SpirvAsmError) as exc:
                 result = subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
         else:
-            spirv_as = find_spirv_tool("spirv-as")
-            if not spirv_as:
-                raise SpirvToolNotFoundError("spirv-as")
-            spirv_val = find_spirv_tool("spirv-val")
-            if not spirv_val:
-                raise SpirvToolNotFoundError("spirv-val")
+            spirv_as = find_spirv_tool("spirv-as") or "spirv-as"
             try:
                 with open(sa, "rb") as f:
                     source = f.read()
@@ -17700,13 +17696,6 @@ def main():
         # .spvasm text stays for diagnosis, as it does on a rejection.
         Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
         invalid.add(name)
-
-    if a.assembler != "python":
-        missing_tool = next((t for t in ("spirv-as", "spirv-val") if not find_spirv_tool(t)), None)
-        if missing_tool:
-            print(f"ERROR: {missing_tool} not found; install SPIRV-Tools (spirv-as, spirv-val) "
-                  "and put it on PATH", file=sys.stderr)
-            return 2
 
     for p in files:
         name = os.path.splitext(os.path.basename(p))[0]
