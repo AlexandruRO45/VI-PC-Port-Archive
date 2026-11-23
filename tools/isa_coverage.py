@@ -163,10 +163,14 @@ def _mnemonic_collection(node):
     return hits if isinstance(node, ast.Dict) or len(hits) >= 2 else []
 
 
+def parse_translator(path):
+    with open(path, encoding="utf-8-sig") as f:
+        return ast.parse(f.read(), path)
+
+
 def scan_translator(path):
     """Static scan of the translator source. Returns the sets described in the module docstring."""
-    with open(path, encoding="utf-8") as f:
-        tree = ast.parse(f.read(), path)
+    tree = parse_translator(path)
     exact = collections.defaultdict(set)      # name -> {source kind}
     prefixes = collections.defaultdict(set)   # prefix -> {line}
     suffixes = collections.defaultdict(set)
@@ -276,8 +280,7 @@ def classify(name, scan, handled_elsewhere):
 
 def accepted_names(path):
     """Names compared or tabled anywhere except inside a test whose body only raises Unsupported."""
-    with open(path, encoding="utf-8") as f:
-        tree = ast.parse(f.read(), path)
+    tree = parse_translator(path)
     skip = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.If) and _unconditional_op_names(node.test) and _only_raises_unsupported(node.body):
@@ -440,6 +443,9 @@ def main(argv=None):
         ap.error(f"--translator {a.translator}: {e.strerror or e}")
     except UnicodeDecodeError as e:
         ap.error(f"--translator {a.translator}: not valid UTF-8 ({e.reason} at byte {e.start})")
+    except SyntaxError as e:
+        location = f" at line {e.lineno}, column {e.offset}" if e.lineno is not None else ""
+        ap.error(f"--translator {a.translator}: invalid Python syntax{location} ({e.msg})")
     rep = build_report(isa, scan, accepted)
     if a.llvm_mc:
         probe = probe_llvm_mc(a.llvm_mc, [e["name"] for e in rep["not_in_rdna2"]])
