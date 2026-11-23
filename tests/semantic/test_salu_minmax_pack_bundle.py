@@ -477,5 +477,13 @@ class SPackHhB32B16AstInterpreterTests(unittest.TestCase):
         state.set_sgpr(2, res)
         self.assertEqual(state.get_sgpr(2), 0x87654321)
 
+class SPackHhB32B16SimdDivergenceTests(unittest.TestCase):
+    def test_pack_hh_scc_preserved(self):
+        state = ScalarRegisterState()
+        state.scc = 0
+        res = oracle_pack_hh_b32_b16(0x11110000, 0x22220000)
+        self.assertEqual(state.scc, 0)
+        self.assertEqual(res, 0x22221111)
+
 if __name__ == "__main__":
     unittest.main()
