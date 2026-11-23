@@ -239,5 +239,77 @@ class TestDSMskorB32AST(unittest.TestCase):
         self.assertEqual(inst.to_asm(), "ds_mskor_rtn_b32 v5, v1, v2, v3")
 
 
+class RegisterFile:
+    """Architectural VGPR and SGPR register storage."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarThreadState:
+    """Thread state for scalar LDS execution."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.rf: RegisterFile = RegisterFile()
+        self.lds: LDSMemory = lds
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar interpreter for DS MSKOR instructions."""
+
+    def execute(self, state: ScalarThreadState, inst: DSMskorInstruction) -> Tuple[Optional[int], int]:
+        addr = state.rf.get_vgpr(inst.vaddr)
+        mask = state.rf.get_vgpr(inst.vmask)
+        data = state.rf.get_vgpr(inst.vdata)
+        eff_addr = (addr + inst.offset.value) & MASK32
+
+        if inst.opcode == DSOpcode.DS_MSKOR_RTN_B32:
+            old_val = state.lds.atomic_mskor(eff_addr, mask, data)
+            new_val = state.lds.read_dword(eff_addr)
+            assert inst.vdst is not None
+            state.rf.set_vgpr(inst.vdst, old_val)
+            return old_val, new_val
+        else:
+            old_val = state.lds.atomic_mskor(eff_addr, mask, data)
+            new_val = state.lds.read_dword(eff_addr)
+            return None, new_val
+
+
+class TestDSMskorB32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution(self) -> None:
+        self.lds.write_dword(0x40, 0x12345678)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 0x00FF0000)
+        self.state.rf.set_vgpr(VGPR(3), 0x00AA0000)
+        self.state.rf.set_vgpr(VGPR(5), 0xDEADBEEF)
+
+        inst = DSMskorInstruction(
+            opcode=DSOpcode.DS_MSKOR_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vmask=VGPR(2),
+            vdata=VGPR(3),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(new, 0x12AA5678)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(5)), 0x12345678)
+        self.assertEqual(self.lds.read_dword(0x40), 0x12AA5678)
+
+
 if __name__ == "__main__":
     unittest.main()
