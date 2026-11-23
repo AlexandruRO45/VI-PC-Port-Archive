@@ -355,6 +355,7 @@ from the ANSI code page.
 | `kind` | When | Fields |
 |---|---|---|
 | `trace_open` | first line | `pid` |
+| `game_dir` | `--init` and `--run`, before the image is loaded ([src/game_dir_check.h](src/game_dir_check.h)); with `rpf` 0, stderr also gets a `[rt] warning` line | `exists` (`--game-dir` is a folder), `rpf` (archives at its top level and under `pack/`) |
 | `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |

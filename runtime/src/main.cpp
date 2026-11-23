@@ -29,6 +29,7 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "game_dir_check.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -151,6 +152,20 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
         return 2;
+    }
+    // A --game-dir without the package's archives (game_dir_check.h): the title's first data reads fail and it ends
+    // in its own asserts, which reads like a runtime bug. Said once, before any image code runs; never fatal.
+    if (init || run) {
+        const leonida::GameDirArchives archives = leonida::count_game_dir_archives(game_dir);
+        if (rt::startup_trace::enabled())
+            rt::startup_trace::event("game_dir", "\"exists\":" + std::string(archives.exists ? "true" : "false") +
+                                                     ",\"rpf\":" + std::to_string(archives.rpf));
+        if (archives.rpf == 0)
+            std::fprintf(stderr,
+                         "[rt] warning: --game-dir %s; the title reads its data from the package's .rpf archives, so "
+                         "point --game-dir at the installed package (game/xbox-1.0.2.1.json lists its files). A "
+                         "stand-in image without data can ignore this.\n",
+                         archives.exists ? "holds no .rpf archive" : "is not a folder");
     }
 
     try {

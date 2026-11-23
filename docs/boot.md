@@ -87,25 +87,28 @@ Useful switches:
 
 Read the startup trace first; the first event that is not the expected one is the run's first fact.
 
-1. **`map`** — is the executable at its preferred base (`relocated: false`), and are the expected package DLLs
+1. **`game_dir`** — `rpf` should be the package's archive count (22 for 1.0.2.1). With `rpf: 0` (stderr also says
+   `[rt] warning: --game-dir holds no .rpf archive`), `--game-dir` is a folder with only the executable: the title's
+   first data reads fail (`file_open_failed`) and the run ends in the title's own asserts. Fix the folder first.
+2. **`map`** — is the executable at its preferred base (`relocated: false`), and are the expected package DLLs
    mapped? A missing module is an import-table or search-path problem.
-2. **`unimplemented_call`** — the first `dll!name` and its `caller` (module+RVA). Add a shim, a host binding or a
+3. **`unimplemented_call`** — the first `dll!name` and its `caller` (module+RVA). Add a shim, a host binding or a
    deliberate failure in `runtime/shims/registry.cpp`; rerun with `LEONIDA_UNIMPLEMENTED=stop` to halt at the first
    remaining blocker.
-3. **`tls_callback` / `dllmain`** — a failed DllMain, or a TLS callback that faults, usually points at the CRT or
+4. **`tls_callback` / `dllmain`** — a failed DllMain, or a TLS callback that faults, usually points at the CRT or
    TLS index. The summary shows the address and phase of the last observed TLS callback
    (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no
    completion result. The loader's own TLS is checked by `run_tiny_game_tls`.
-4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
+5. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
    so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last
    observation alone does not establish what caused the run to stop.
-5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
-6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
+6. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
+7. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
    submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.
    Compare the method's position with the public SDK vtable. An unknown slot is expected until the executable names it
    (Q2, Q6). The `[rt]` lines in the same log carry the 24 device words, feature IDs and warnings.
-7. **First frame** — after the device and queues, the first `CreateRootSignature`, PSO, `Draw*` and `PresentX` (or
+8. **First frame** — after the device and queues, the first `CreateRootSignature`, PSO, `Draw*` and `PresentX` (or
    DXGI) calls are the frame's critical path. The layer's M0–M4 tests already exercise the offscreen parts; the
    present slots are the part that cannot be measured from the package alone.
 

@@ -246,6 +246,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
 
+  # --game-dir's archive count (src/game_dir_check.h) over synthetic folders; header-only, no shims.
+  add_executable(game_dir_check_test test/game_dir_check_test.cpp)
+  target_compile_options(game_dir_check_test PRIVATE /W4 /permissive- /utf-8)
+
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
@@ -1006,6 +1010,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
+  endif()
+  if(WIN32 AND TARGET game_dir_check_test)
+    add_test(NAME game_dir_check COMMAND game_dir_check_test)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
