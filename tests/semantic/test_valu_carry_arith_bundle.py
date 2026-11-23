@@ -369,5 +369,23 @@ class VAddCoCiU32AstInterpreterTests(unittest.TestCase):
         self.assertEqual(regs["v0"], 0xFFFFFFFF)
         self.assertEqual(regs["vcc"], 0)
 
+class VAddCoCiU32SimdBoundaryTests(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_add_co_ci_u32."""
+
+    def test_simd_divergent_lanes(self):
+        lanes = 64
+        src0 = [0xFFFFFFFF for _ in range(lanes)]
+        src1 = [0 for _ in range(lanes)]
+        cins = [i % 2 for i in range(lanes)]
+        out = [ref_add_co_ci_u32(s0, s1, ci) for s0, s1, ci in zip(src0, src1, cins)]
+        for i in range(lanes):
+            s, c = out[i]
+            if i % 2 == 1:
+                self.assertEqual(s, 0)
+                self.assertEqual(c, 1)
+            else:
+                self.assertEqual(s, 0xFFFFFFFF)
+                self.assertEqual(c, 0)
+
 if __name__ == "__main__":
     unittest.main()
