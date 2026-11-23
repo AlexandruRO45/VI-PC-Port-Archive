@@ -161,5 +161,16 @@ class ReadOnlyReportTests(unittest.TestCase):
                 self.assertEqual(f.read(), "previous report")
 
 
+class ReportNewlineTests(unittest.TestCase):
+    def test_the_written_report_ends_with_a_newline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            self.assertIsNone(bbp.write_json_report(out, {"a": [1]}))
+            with open(out, "rb") as f:
+                raw = f.read()
+        self.assertTrue(raw.endswith(b"\n"), raw[-20:])
+        self.assertEqual(json.loads(raw.decode("utf-8")), {"a": [1]})
+
+
 if __name__ == "__main__":
     unittest.main()
