@@ -5,6 +5,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import lighting_pass as lp  # noqa: E402
@@ -56,7 +57,7 @@ class Matching(unittest.TestCase):
         self.assertFalse(lp.is_directional(NODIR_TEXT))
 
     def test_ps_rejects_other_layouts(self):
-        self.assertFalse(lp.ps_matches(PS_ENTRY, PS_TEXT.replace("0x1400", "0x1420")))     # no shadow-mask T#
+        self.assertFalse(lp.ps_matches(PS_ENTRY, PS_TEXT.replace("0x1400", "0x1420")))     # no mask T#
         self.assertFalse(lp.ps_matches(PS_ENTRY, PS_TEXT.replace("0xfff", "0x3ff")))       # another normal encoding
         self.assertFalse(lp.ps_matches(PS_ENTRY, PS_TEXT + "\texp mrt2, v0, v0, v0, v0\n"))
         entry = dict(PS_ENTRY, user_sgpr_reads=[{"kind": "ptr32_lo", "sgpr": 8}])
@@ -94,16 +95,18 @@ class Layout(unittest.TestCase):
     def test_build_plan_and_heap(self):
         with tempfile.TemporaryDirectory() as t:
             plan = lp.build(t, "vs.spv", "ps.spv", PS_TEXT, [[0, 12582912, 407896064, 0]], normal=(0, 0, 1),
-                            sun=(1.0, 0.0, 0.0), sun_colour=2.0, shadow=0)
-            with open(plan, encoding="utf-8") as f:
-                lines = f.read().splitlines()
+                            sun=(1.0, 0.0, 0.0), tint=2.0, mask=0, diffuse=(255, 0, 0))
+            with open(plan, "rb") as f:
+                raw = f.read()
+            self.assertNotIn(b"\r", raw)                       # the plan is written with \n line ends on every OS
+            lines = raw.decode("utf-8").splitlines()
             self.assertIn("push 8 0", lines)
             self.assertIn("push 14 8000", lines)
             self.assertIn("sampler 0 c00000 18500000 0", lines)
             self.assertEqual(sum(l.startswith("target ") for l in lines), 2)
             images = {int(l.split()[-1], 16): l.split() for l in lines if l.startswith("image ")}
             self.assertEqual(images[0x900][1], "2darray")
-            with open(images[lp.SHADOW_T][6], "rb") as f:
+            with open(images[lp.MASK_T][6], "rb") as f:
                 self.assertEqual(set(f.read()), {0})
             with open(images[lp.NORMAL_T][6], "rb") as f:
                 px = f.read(4)
@@ -112,9 +115,31 @@ class Layout(unittest.TestCase):
                 heap = f.read()
             cb = lambda va: struct.unpack_from("<I", heap, va)[0]
             self.assertEqual(struct.unpack_from("<3f", heap, cb(lp.TABLE_A + lp.SCALE_V)), (1.0, 1.0, 1.0))
-            self.assertEqual(struct.unpack_from("<3f", heap, cb(lp.TABLE_B + lp.SUN_V) + lp.SUN_DIR), (-1.0, -0.0, -0.0))
-            self.assertEqual(struct.unpack_from("<3f", heap, cb(lp.TABLE_B + lp.SUN_V) + lp.SUN_COLOUR), (2.0, 2.0, 2.0))
+            self.assertEqual(struct.unpack_from("<3f", heap, cb(lp.TABLE_B + lp.LIGHT_V) + lp.SUN_DIR), (-1.0, -0.0, -0.0))
+            self.assertEqual(struct.unpack_from("<3f", heap, cb(lp.TABLE_B + lp.LIGHT_V) + lp.TINT), (2.0, 2.0, 2.0))
             self.assertEqual(struct.unpack_from("<f", heap, cb(lp.TABLE_A + lp.OCCL_V) + lp.OCCL)[0], 0.0)
+
+    def test_diffuse_slot(self):
+        text = PS_TEXT + "\ts_load_dwordx8 s[40:47], s[8:9], 0x920\n\timage_load v[2:5], [v51, v52], s[40:47] dmask:0xf dim:SQ_RSRC_IMG_2D unorm\n"
+        with tempfile.TemporaryDirectory() as t:
+            plan = lp.build(t, "vs.spv", "ps.spv", text, [], normal=(0, 0, 1), sun=(1.0, 0.0, 0.0), tint=1.0,
+                            f0=(10, 20, 30), diffuse=(255, 0, 0))
+            with open(plan, encoding="utf-8") as f:
+                images = {int(l.split()[-1], 16): l.split() for l in f.read().splitlines() if l.startswith("image ")}
+            for slot, px in ((lp.DIFFUSE_T, bytes([255, 0, 0, 255])), (lp.F0_T, bytes([10, 20, 30, 255]))):
+                with open(images[slot][6], "rb") as f:
+                    self.assertEqual(f.read(4), px)
+
+    def test_read_rgb_checks_both_targets(self):
+        with tempfile.TemporaryDirectory() as t:
+            px = struct.pack("<4e", 1.0, 2.0, 3.0, 1.0) * 4
+            for name, data in (("o_t0.bin", px), ("o_t1.bin", px)):
+                with open(os.path.join(t, name), "wb") as f:
+                    f.write(data)
+            self.assertEqual(lp.read_rgb(t), ([1.0, 2.0, 3.0], True))
+            with open(os.path.join(t, "o_t1.bin"), "wb") as f:      # a NaN in the last pixel of target 1
+                f.write(px[:-8] + struct.pack("<4e", 0.0, 0.0, 0.0, float("nan")))
+            self.assertEqual(lp.read_rgb(t), ([1.0, 2.0, 3.0], False))
 
     def test_pick(self):
         with tempfile.TemporaryDirectory() as t:
@@ -138,7 +163,7 @@ class Layout(unittest.TestCase):
 class Checks(unittest.TestCase):
     # Six normals in lp.NORMALS order: +sun, -sun, then four across.
     GOOD = dict(dir_terms=[3.0, 0.3, 1, 1, 1, 1], flip_terms=[0.5, 7.0, 1, 1, 1, 1],
-                shadow_terms=[0.0] * 6, nodir_terms=[0.0] * 6, finite=True)
+                mask_terms=[0.0] * 6, nodir_terms=[0.0] * 6, finite=True)
 
     def test_pass(self):
         self.assertTrue(lp.check(**self.GOOD)[0])
@@ -146,8 +171,8 @@ class Checks(unittest.TestCase):
     def test_failures(self):
         for change in (dict(dir_terms=[3.0, 3.0, 1, 1, 1, 1]),        # the normal does not matter
                        dict(flip_terms=[7.0, 0.5, 1, 1, 1, 1]),       # a flipped sun lights the same side
-                       dict(shadow_terms=[1.0] + [0.0] * 5),          # the shadow mask does not gate the sun
-                       dict(nodir_terms=[0.1] * 6),                   # the other variant reacts to the sun
+                       dict(mask_terms=[1.0] + [0.0] * 5),            # the mask does not gate the lighting term
+                       dict(nodir_terms=[0.1] * 6),                   # the other variant reacts to the light
                        dict(dir_terms=[0.0] * 6),
                        dict(finite=False)):
             self.assertFalse(lp.check(**dict(self.GOOD, **change))[0], change)
@@ -164,6 +189,26 @@ class Cli(unittest.TestCase):
     def test_missing_tool(self):
         with tempfile.TemporaryDirectory() as t:
             self.assertEqual(lp.main(["--work", t, "--build", t]), 77)
+
+    def test_runner_exit_77_is_a_skip(self):
+        with tempfile.TemporaryDirectory() as t:
+            spirv, disasm = os.path.join(t, "shaders", "spirv"), os.path.join(t, "shaders", "dxbc", "disasm")
+            os.makedirs(spirv)
+            os.makedirs(disasm)
+            items = {"vs_a": (VS_ENTRY, VS_TEXT), "ps_dir": (PS_ENTRY, PS_TEXT), "ps_nodir": (PS_ENTRY, NODIR_TEXT)}
+            for n, (e, text) in items.items():
+                open(os.path.join(spirv, n + ".spv"), "wb").close()
+                with open(os.path.join(disasm, n + ".s"), "w", encoding="utf-8") as f:
+                    f.write(text)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({n: e for n, (e, _) in items.items()}, f)
+            open(os.path.join(t, "vk_lighting"), "wb").close()
+            done = lp.subprocess.CompletedProcess([], 77, "", "no bufferDeviceAddress")
+            with mock.patch.object(lp.subprocess, "run", return_value=done), mock.patch("sys.stdout"):
+                self.assertEqual(lp.main(["--work", t, "--build", t]), 77)
+            done = lp.subprocess.CompletedProcess([], 3, "", "device lost")
+            with mock.patch.object(lp.subprocess, "run", return_value=done), mock.patch("sys.stdout"):
+                self.assertEqual(lp.main(["--work", t, "--build", t]), 1)
 
 
 if __name__ == "__main__":

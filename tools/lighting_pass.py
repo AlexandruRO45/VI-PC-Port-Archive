@@ -5,9 +5,10 @@
 
 Picks, by layout and never by name, a full-screen VS and two lighting PS from <work>/shaders (one that reads the
 directional-light constants, one that does not; docs/lighting_pass.md §2), lays out the table the PS reads
-(LIGHT_LAYOUT: G-buffer T#s, the sun shadow mask, the sun direction, colour and intensity), runs
-runtime/test/vk_lighting for each probe and prints counts only. Every input is synthetic: a uniform normal and
-albedo per run, mid-grey in the other slots. Exit 0 PASS, 1 FAIL, 77 when the tool or a shader is missing.
+(the normal, the specular F0 and the diffuse albedo of the G-buffer, the light direction, and the tint and mask that
+multiply the whole lighting result), runs runtime/test/vk_lighting for each probe and prints counts only. Every input
+is synthetic: a uniform normal, F0 and albedo per run, mid-grey in the other slots. Exit 0 PASS, 1 FAIL, 77 when the
+tool or a shader is missing or vk_lighting reports that the device lacks a feature it needs (its own exit 77).
 """
 import argparse
 import json
@@ -27,23 +28,28 @@ PS_USER = [("ptr32_lo", 8), ("ptr32_lo", 9), ("ptr32_lo", 14)]
 VS_USER = [("const32", 10)]
 # Table offsets measured on the standard-material variants (docs/lighting_pass.md §3).
 NORMAL_T = 0x1240        # A: G-buffer mrt1, the 24-bit octahedral normal (12 bits per axis in g, b, a)
-ALBEDO_T = 0xBC0         # A: G-buffer mrt0, albedo (rgb)
-SHADOW_T = 0x1400        # A: the sun shadow mask, one value per pixel that multiplies the sun term
-SCALE_V = 0x2A0          # A: V# of the pass scales: 0x0 pre-scale, 0x4 output scale, 0x8 sun intensity
-OCCL_V = 0x2C0           # A: V#; 0x244 attenuates the sun (0 = none)
-SUN_V = 0x0              # B: V# of the light constants: sun direction at 0x110 (x, y, z), sun colour at 0x148
-SUN_DIR, SUN_COLOUR, SUN_INTENSITY, OCCL = 0x110, 0x148, 0x8, 0x244
-PS_LAYOUT = (rf"\bs_load_dwordx8 {REG}, s\[8:9\], {NORMAL_T:#x}\b", rf"\bs_load_dwordx8 {REG}, s\[8:9\], {ALBEDO_T:#x}\b",
-             rf"\bs_load_dwordx8 {REG}, s\[8:9\], {SHADOW_T:#x}\b", rf"\bs_load_dwordx4 {REG}, s\[8:9\], {SCALE_V:#x}\b",
+F0_T = 0xBC0             # A: rgb behaves as the specular F0 (docs/lighting_pass.md §3)
+DIFFUSE_T = 0x920        # A: rgb is the diffuse albedo (a is read as well; the tool keeps it at 255)
+MASK_T = 0x1400          # A: one value per pixel; with TINT it multiplies the whole lighting result by lerp(1, tint, mask)
+SCALE_V = 0x2A0          # A: V# of the pass scales: 0x0 pre-scale, 0x4 output scale, 0x8 scales the lighting term
+OCCL_V = 0x2C0           # A: V#; 0x244 attenuates the lighting term (0 = none)
+LIGHT_V = 0x0            # B: V# of the light constants: light direction at 0x110 (x, y, z), the tint at 0x148
+SUN_DIR, TINT, INTENSITY, OCCL = 0x110, 0x148, 0x8, 0x244
+PS_LAYOUT = (rf"\bs_load_dwordx8 {REG}, s\[8:9\], {NORMAL_T:#x}\b", rf"\bs_load_dwordx8 {REG}, s\[8:9\], {F0_T:#x}\b",
+             rf"\bs_load_dwordx8 {REG}, s\[8:9\], {MASK_T:#x}\b", rf"\bs_load_dwordx4 {REG}, s\[8:9\], {SCALE_V:#x}\b",
              r"\bv_and_b32_e32 v\d+, 0xfff, v\d+", r"\bv_bfe_u32 v\d+, v\d+, 12, 12\b")
-DIR_LAYOUT = (rf"\bs_buffer_load_dwordx4 {REG}, {REG}, {SUN_COLOUR:#x}\b", rf"\bs_buffer_load_dword s\d+, {REG}, {SUN_INTENSITY:#x}\b")
+DIR_LAYOUT = (rf"\bs_buffer_load_dwordx4 {REG}, {REG}, {TINT:#x}\b", rf"\bs_buffer_load_dword s\d+, {REG}, {INTENSITY:#x}\b")
 # vk_lighting formats (VkFormat numbers).
 RGBA8, RGBA16F = 37, 97
 DIMS = {"2D": "2d", "2D_ARRAY": "2darray", "3D": "3d", "1D": "1d", "CUBE": "cube"}
 TABLE_A, TABLE_B, RES_HEAP, CB0, CB_SIZE = 0x0, 0x4000, 0x8000, 0x10000, 0x4000
 W, H = 32, 18
 NORMALS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
-SUN = (1.0, 0.0, 0.0)     # towards the sun; the shader takes the negated vector (it lights where -dot(n, d) > 0)
+SUN = (1.0, 0.0, 0.0)     # towards the light; the shader takes the negated vector (it lights where -dot(n, d) > 0)
+
+
+class Skip(Exception):
+    """vk_lighting exited 77: the device lacks a feature the runner needs."""
 
 
 def _user(entry):
@@ -159,7 +165,7 @@ def oct24(n):
     return q(u) | (q(v) << 12)
 
 
-def build(folder, vs, ps, text, literal_samplers, normal, sun, sun_colour, shadow=255, albedo=(200, 200, 200)):
+def build(folder, vs, ps, text, literal_samplers, normal, sun, tint, mask=255, f0=(200, 200, 200), diffuse=(128, 128, 128)):
     """Write heap.bin and plan.txt for one probe into folder; returns the plan path."""
     slots = table_slots(text)
     heap = bytearray(CB0 + CB_SIZE * sum(1 for v in slots.values() if v[0] == "V"))
@@ -178,7 +184,8 @@ def build(folder, vs, ps, text, literal_samplers, normal, sun, sun_colour, shado
             continue
         q = oct24(normal)
         texel = {("A", NORMAL_T): bytes([255, q & 255, (q >> 8) & 255, (q >> 16) & 255]),
-                 ("A", ALBEDO_T): bytes([*albedo, 255]), ("A", SHADOW_T): bytes([shadow] * 4)}.get((tab, off), bytes([128, 128, 128, 255]))
+                 ("A", F0_T): bytes([*f0, 255]), ("A", DIFFUSE_T): bytes([*diffuse, 255]),
+                 ("A", MASK_T): bytes([mask] * 4)}.get((tab, off), bytes([128, 128, 128, 255]))
         w, h, d = {"2d": (W, H, 1), "2darray": (W, H, 4), "cube": (8, 8, 6), "3d": (8, 8, 8), "1d": (64, 1, 1)}[dim]
         name = os.path.join(folder, f"t_{tab}{off:x}.bin")
         with open(name, "wb") as f:
@@ -187,57 +194,60 @@ def build(folder, vs, ps, text, literal_samplers, normal, sun, sun_colour, shado
     def put(tab, off, at_off, values):
         if (tab, off) in cbs:
             struct.pack_into(f"<{len(values)}f", heap, cbs[(tab, off)] + at_off, *values)
-    put("A", SCALE_V, 0, [1.0, 1.0, 1.0])          # pre-scale, output scale, sun intensity
+    put("A", SCALE_V, 0, [1.0, 1.0, 1.0])          # pre-scale, output scale, lighting-term scale
     put("A", OCCL_V, OCCL, [0.0])
-    put("B", SUN_V, SUN_DIR, [-c for c in sun])
-    put("B", SUN_V, SUN_COLOUR, [sun_colour] * 3)
+    put("B", LIGHT_V, SUN_DIR, [-c for c in sun])
+    put("B", LIGHT_V, TINT, [tint] * 3)
     with open(os.path.join(folder, "heap.bin"), "wb") as f:
         f.write(heap)
     path = os.path.join(folder, "plan.txt")
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(plan) + "\n")
     return path
 
 
 def read_rgb(folder):
-    """(mean r, g, b over target 0, all finite) from vk_lighting's readback."""
-    with open(os.path.join(folder, "o_t0.bin"), "rb") as f:
-        b = f.read()
-    v = struct.unpack(f"<{len(b) // 2}e", b)
-    n = len(v) // 4
-    finite = all(math.isfinite(x) for x in v)
-    return [sum(v[c::4]) / n for c in range(3)], finite
+    """(mean r, g, b over target 0, every pixel of both targets finite) from vk_lighting's readback."""
+    finite, out = True, None
+    for t in (0, 1):
+        with open(os.path.join(folder, f"o_t{t}.bin"), "rb") as f:
+            b = f.read()
+        v = struct.unpack(f"<{len(b) // 2}e", b)
+        finite = finite and all(math.isfinite(x) for x in v)
+        if t == 0:
+            out = [sum(v[c::4]) / (len(v) // 4) for c in range(3)]
+    return out, finite
 
 
-def sun_terms(run, sun, **kw):
-    """Per normal in NORMALS: mean output r with the sun colour 1 minus with 0, and whether every pixel was finite."""
+def lighting_terms(run, sun, **kw):
+    """Per normal in NORMALS: the total lighting term, mean output r with the tint 1 minus with 0 (with the mask at 255
+    that is the whole lit result; docs/lighting_pass.md §3), and whether every pixel was finite."""
     terms, finite = [], True
     for n in NORMALS:
-        lit, f1 = run(normal=n, sun=sun, sun_colour=1.0, **kw)
-        dark, f0 = run(normal=n, sun=sun, sun_colour=0.0, **kw)
+        lit, f1 = run(normal=n, sun=sun, tint=1.0, **kw)
+        dark, f0 = run(normal=n, sun=sun, tint=0.0, **kw)
         terms.append(lit[0] - dark[0])
         finite = finite and f1 and f0
     return terms, finite
 
 
-def check(dir_terms, flip_terms, shadow_terms, nodir_terms, finite):
-    """(ok, message): the lit normal (+sun) gets at least 3x the sun term of the opposite one, a flipped sun swaps
-    them, a zero shadow mask removes at least 99 % of it, the variant without directional light has none, and every
-    output is finite. NORMALS[0] faces SUN, NORMALS[1] faces away."""
+def check(dir_terms, flip_terms, mask_terms, nodir_terms, finite):
+    """(ok, message): the normal facing the light gets at least 3x the total lighting term of the opposite one, a
+    flipped light swaps them, a zero mask removes at least 99 % of it (the tint is then no longer applied), the variant
+    without directional light has none, and every output is finite. NORMALS[0] faces SUN, NORMALS[1] faces away."""
     lit, away = dir_terms[0], dir_terms[1]
     ok = (finite and lit > 0 and lit >= 3 * max(away, 0.0) and flip_terms[1] >= 3 * max(flip_terms[0], 0.0)
-          and flip_terms[1] > 0 and abs(shadow_terms[0]) <= 0.01 * lit and all(abs(t) <= 1e-3 * lit for t in nodir_terms))
-    msg = (f"sun term facing {lit:.4g} away {away:.4g}; flipped sun facing {flip_terms[0]:.4g} away {flip_terms[1]:.4g}; "
-           f"shadow mask 0: {shadow_terms[0]:.4g}; no-directional variant max |{max(abs(t) for t in nodir_terms):.3g}|; "
+          and flip_terms[1] > 0 and abs(mask_terms[0]) <= 0.01 * lit and all(abs(t) <= 1e-3 * lit for t in nodir_terms))
+    msg = (f"total lighting facing {lit:.4g} away {away:.4g}; flipped light facing {flip_terms[0]:.4g} away {flip_terms[1]:.4g}; "
+           f"mask 0: {mask_terms[0]:.4g}; no-directional variant max |{max(abs(t) for t in nodir_terms):.3g}|; "
            f"finite {finite}")
     return ok, msg
 
 
 def albedo_ok(outputs):
-    """outputs[c]: mean output rgb with a one-hot albedo in channel c (red, green, blue). Each one puts its own channel
-    above the other two by at least 5 % and leaves those two equal (within 0.1 %). Raising one channel does not
-    raise the output monotonically (part of the specular follows the albedo through the mid-grey material slots, so
-    the other channels fall); the per-channel selectivity is what the albedo slot guarantees."""
+    """outputs[c]: mean output rgb with a one-hot diffuse albedo (DIFFUSE_T) in channel c (red, green, blue). Each one
+    puts its own channel above the other two by at least 5 % and leaves those two equal (within 0.1 %): the diffuse
+    albedo only scales its own channel."""
     for c, o in enumerate(outputs):
         others = [o[k] for k in range(3) if k != c]
         if not (o[c] > 0 and all(o[c] >= 1.05 * x for x in others) and abs(others[0] - others[1]) <= 1e-3 * o[c]):
@@ -289,6 +299,8 @@ def main(argv=None):
             os.makedirs(folder, exist_ok=True)
             plan = build(folder, vs, ps, text, samplers, **kw)
             r = subprocess.run([tool, plan], capture_output=True, text=True)
+            if r.returncode == 77:
+                raise Skip((r.stderr or r.stdout).strip()[-300:])
             if r.returncode:
                 raise RuntimeError(f"vk_lighting exit {r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
             return read_rgb(folder)
@@ -296,12 +308,15 @@ def main(argv=None):
 
     try:
         run_dir, run_nodir = runner(dps), runner(nps)
-        d, f1 = sun_terms(run_dir, SUN)
-        flip, f2 = sun_terms(run_dir, tuple(-c for c in SUN))
-        shad, f3 = sun_terms(run_dir, SUN, shadow=0)
-        nod, f4 = sun_terms(run_nodir, SUN)
-        hot = [run_dir(normal=NORMALS[0], sun=SUN, sun_colour=1.0, albedo=tuple(255 if k == c else 0 for k in range(3)))
+        d, f1 = lighting_terms(run_dir, SUN)
+        flip, f2 = lighting_terms(run_dir, tuple(-c for c in SUN))
+        shad, f3 = lighting_terms(run_dir, SUN, mask=0)
+        nod, f4 = lighting_terms(run_nodir, SUN)
+        hot = [run_dir(normal=NORMALS[0], sun=SUN, tint=1.0, diffuse=tuple(255 if k == c else 0 for k in range(3)))
                for c in range(3)]
+    except Skip as e:
+        print(f"lighting_pass: SKIP, vk_lighting exit 77: {e}")
+        return 77
     except RuntimeError as e:
         print(f"lighting_pass: {e}")
         return 1
@@ -311,7 +326,7 @@ def main(argv=None):
     ok, msg = check(d, flip, shad, nod, f1 and f2 and f3 and f4 and all(f for _, f in hot))
     outs = [o for o, _ in hot]
     ok = ok and albedo_ok(outs)
-    print(f"lighting_pass: {runs[0]} runs of {W}x{H}; {msg}; one-hot albedo r/g/b: "
+    print(f"lighting_pass: {runs[0]} runs of {W}x{H}; {msg}; one-hot diffuse albedo r/g/b: "
           + ", ".join("/".join(f"{x:.4g}" for x in o) for o in outs))
     print("lighting_pass: PASS" if ok else "lighting_pass: FAIL")
     return 0 if ok else 1
