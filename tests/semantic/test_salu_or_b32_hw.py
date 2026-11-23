@@ -1,4 +1,6 @@
-"""Semantic reference oracle and architectural model for RDNA2 s_or_b32.
+from __future__ import annotations
+
+"""Hardware-rule tests and bit-accurate translator execution for s_or_b32.
 
 AMD RDNA2 / GFX10 Scalar ALU (SALU) Architecture:
   - 32-bit Scalar Bitwise OR:
@@ -14,19 +16,17 @@ AMD RDNA2 / GFX10 Scalar ALU (SALU) Architecture:
     - Commutativity:          A | B == B | A
     - Associativity:          (A | B) | C == A | (B | C)
     - De Morgan duality:      ~(A | B) == (~A) & (~B)
-"""
-from __future__ import annotations
 
-import ast
-import dataclasses
-import enum
+Standard library Python only (unittest, struct, math, os, sys).
+Strictly zero game data.
+All test cases compile and execute through support.translate_lines and support.mrt0_words.
+"""
+
 import math
 import os
-import random
 import struct
 import sys
 import unittest
-from typing import Dict, List, Optional, Set, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -52,7 +52,7 @@ def ref_scc(val: int) -> int:
     return 1 if (val & MASK32) != 0 else 0
 
 
-def run_salu_or_b32(s0: int, s1: int) -> tuple[int, int]:
+def run_salu_or_b32(s0: int, s1: int, tag: str = "run") -> tuple[int, int]:
     """Execute s_or_b32 s2, s0, s1 through translate_lines and mrt0_words, returning (s2, scc)."""
     lines = [
         f"s_mov_b32 s0, {s0 & MASK32:#x}",
@@ -66,10 +66,14 @@ def run_salu_or_b32(s0: int, s1: int) -> tuple[int, int]:
         "exp mrt0 v0, v1, v2, v3 done vm",
         "s_endpgm",
     ]
-    spv = translate_lines(f"ps_or_{s0 & MASK32:08x}_{s1 & MASK32:08x}", lines)
+    spv = translate_lines(f"ps_or_{tag}_{s0 & MASK32:08x}_{s1 & MASK32:08x}", lines)
     out = mrt0_words(spv)
     return out[0], out[1]
 
+
+# -----------------------------------------------------------------------------
+# Commit 1: Reference Mathematical Oracle and Architectural Model
+# -----------------------------------------------------------------------------
 
 class SaluOrB32OracleTests(unittest.TestCase):
     """Reference mathematical oracle and architectural model tests for s_or_b32."""
@@ -87,7 +91,7 @@ class SaluOrB32OracleTests(unittest.TestCase):
                 s0 = MASK32 if b0 else 0
                 s1 = MASK32 if b1 else 0
                 want = MASK32 if expected else 0
-                got, scc = run_salu_or_b32(s0, s1)
+                got, scc = run_salu_or_b32(s0, s1, tag=f"tt_{b0}_{b1}")
                 self.assertEqual(got, want)
                 self.assertEqual(scc, expected)
 
@@ -105,23 +109,23 @@ class SaluOrB32OracleTests(unittest.TestCase):
         ]
         for a in test_values:
             with self.subTest(identity=hex(a)):
-                res_id, scc_id = run_salu_or_b32(a, 0)
+                res_id, scc_id = run_salu_or_b32(a, 0, tag=f"id_{a:#x}")
                 self.assertEqual(res_id, a)
                 self.assertEqual(scc_id, 1 if a != 0 else 0)
 
-                res_ann, scc_ann = run_salu_or_b32(a, MASK32)
+                res_ann, scc_ann = run_salu_or_b32(a, MASK32, tag=f"ann_{a:#x}")
                 self.assertEqual(res_ann, MASK32)
                 self.assertEqual(scc_ann, 1)
 
-                res_idem, scc_idem = run_salu_or_b32(a, a)
+                res_idem, scc_idem = run_salu_or_b32(a, a, tag=f"idem_{a:#x}")
                 self.assertEqual(res_idem, a)
                 self.assertEqual(scc_idem, 1 if a != 0 else 0)
 
         for a in test_values[:4]:
             for b in test_values[:4]:
                 with self.subTest(commutative=(hex(a), hex(b))):
-                    res_ab, _ = run_salu_or_b32(a, b)
-                    res_ba, _ = run_salu_or_b32(b, a)
+                    res_ab, _ = run_salu_or_b32(a, b, tag=f"comm_ab_{a:#x}_{b:#x}")
+                    res_ba, _ = run_salu_or_b32(b, a, tag=f"comm_ba_{b:#x}_{a:#x}")
                     self.assertEqual(res_ab, res_ba)
 
     def test_de_morgan_duality(self):
@@ -158,18 +162,18 @@ class SaluOrB32OracleTests(unittest.TestCase):
         """Test single-bit walking, byte boundaries, and alternating bit patterns via translator."""
         for i in [0, 1, 7, 8, 15, 16, 23, 24, 30, 31]:
             bit = 1 << i
-            res, scc = run_salu_or_b32(bit, 0)
+            res, scc = run_salu_or_b32(bit, 0, tag=f"bit_walk_{i}")
             self.assertEqual(res, bit)
             self.assertEqual(scc, 1)
 
-            res_self, scc_self = run_salu_or_b32(bit, bit)
+            res_self, scc_self = run_salu_or_b32(bit, bit, tag=f"bit_self_{i}")
             self.assertEqual(res_self, bit)
             self.assertEqual(scc_self, 1)
 
         for i in [0, 7, 15, 23, 30]:
             b0 = 1 << i
             b1 = 1 << (i + 1)
-            combined, scc_comb = run_salu_or_b32(b0, b1)
+            combined, scc_comb = run_salu_or_b32(b0, b1, tag=f"bit_comb_{i}")
             self.assertEqual(combined, b0 | b1)
             self.assertEqual(scc_comb, 1)
 
@@ -184,7 +188,7 @@ class SaluOrB32OracleTests(unittest.TestCase):
         ]
         for a, b, expected_scc in cases:
             with self.subTest(a=hex(a), b=hex(b)):
-                res, scc = run_salu_or_b32(a, b)
+                res, scc = run_salu_or_b32(a, b, tag=f"scc_map_{a:#x}_{b:#x}")
                 self.assertEqual(res, (a | b) & MASK32)
                 self.assertEqual(scc, expected_scc)
 
@@ -208,150 +212,45 @@ class SaluOrB32OracleTests(unittest.TestCase):
         self.assertEqual(out[1], 1)
 
 
-class OperandType(enum.Enum):
-    SGPR = "sgpr"
-    IMM_INT = "imm_int"
-    IMM_HEX = "imm_hex"
-    SPECIAL = "special"
-
-
-@dataclasses.dataclass(frozen=True)
-class Operand:
-    name: str
-    op_type: OperandType
-    value: Optional[int] = None
-
-    @classmethod
-    def sgpr(cls, idx: int) -> Operand:
-        if not (0 <= idx <= 105):
-            raise ValueError(f"SGPR index out of range [0, 105]: s{idx}")
-        return cls(name=f"s{idx}", op_type=OperandType.SGPR, value=idx)
-
-    @classmethod
-    def imm_int(cls, val: int) -> Operand:
-        return cls(name=str(val), op_type=OperandType.IMM_INT, value=val)
-
-    @classmethod
-    def imm_hex(cls, val: int) -> Operand:
-        return cls(name=f"{val:#x}", op_type=OperandType.IMM_HEX, value=val & MASK32)
-
-    @classmethod
-    def special(cls, name: str) -> Operand:
-        valid_specials = {"exec_lo", "exec_hi", "vcc_lo", "vcc_hi", "m0", "scc", "null"}
-        if name not in valid_specials:
-            raise ValueError(f"Invalid special register: {name}")
-        return cls(name=name, op_type=OperandType.SPECIAL)
-
-
-@dataclasses.dataclass
-class AstInstruction:
-    opcode: str
-    dst: Operand
-    src0: Operand
-    src1: Operand
-
-    def emit_asm(self) -> str:
-        return f"{self.opcode} {self.dst.name}, {self.src0.name}, {self.src1.name}"
-
-    def type_check(self) -> bool:
-        if self.opcode != "s_or_b32":
-            return False
-        if self.dst.op_type not in (OperandType.SGPR, OperandType.SPECIAL):
-            return False
-        return True
-
-
-class Expr:
-    def evaluate(self, env: Dict[str, int]) -> int:
-        raise NotImplementedError
-
-
-@dataclasses.dataclass
-class ConstExpr(Expr):
-    val: int
-
-    def evaluate(self, env: Dict[str, int]) -> int:
-        return self.val & MASK32
-
-
-@dataclasses.dataclass
-class RegExpr(Expr):
-    name: str
-
-    def evaluate(self, env: Dict[str, int]) -> int:
-        return env.get(self.name, 0) & MASK32
-
-
-@dataclasses.dataclass
-class BitwiseOrExpr(Expr):
-    left: Expr
-    right: Expr
-
-    def evaluate(self, env: Dict[str, int]) -> int:
-        l = self.left.evaluate(env)
-        r = self.right.evaluate(env)
-        return ref_s_or_b32(l, r)
-
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST and Register Formatting Validation
+# -----------------------------------------------------------------------------
 
 class SaluOrB32AstTests(unittest.TestCase):
     """Symbolic AST opcode definitions and typed expressions for s_or_b32."""
 
-    def test_ast_construction_and_formatting(self):
-        """Construct AST nodes and format into assembly lines."""
-        inst = AstInstruction(
-            opcode="s_or_b32",
-            dst=Operand.sgpr(2),
-            src0=Operand.sgpr(0),
-            src1=Operand.sgpr(1),
-        )
-        self.assertTrue(inst.type_check())
-        self.assertEqual(inst.emit_asm(), "s_or_b32 s2, s0, s1")
+    def test_ast_various_sgprs(self):
+        """Verify translator accepts various SGPR destinations and sources."""
+        pairs = [
+            ("s2", "s0", "s1"),
+            ("s10", "s4", "s6"),
+            ("s105", "s104", "s103"),
+        ]
+        for dst, s0, s1 in pairs:
+            lines = [
+                f"s_or_b32 {dst}, {s0}, {s1}",
+                "s_endpgm",
+            ]
+            spv = translate_lines(f"ps_ast_sgpr_{dst}_{s0}_{s1}", lines)
+            self.assertIn("OpBitwiseOr %uint", spv)
 
-        inst_imm = AstInstruction(
-            opcode="s_or_b32",
-            dst=Operand.sgpr(4),
-            src0=Operand.sgpr(4),
-            src1=Operand.imm_hex(0x80000000),
-        )
-        self.assertTrue(inst_imm.type_check())
-        self.assertEqual(inst_imm.emit_asm(), "s_or_b32 s4, s4, 0x80000000")
+    def test_ast_special_registers(self):
+        """Verify translator accepts special registers (exec_lo, vcc_lo, m0, null)."""
+        cases = [
+            ["s_or_b32 exec_lo, exec_lo, vcc_lo", "s_endpgm"],
+            ["s_or_b32 vcc_lo, exec_lo, vcc_lo", "s_endpgm"],
+            ["s_or_b32 m0, m0, 0xF00", "s_endpgm"],
+            ["s_or_b32 null, s0, s1", "s_endpgm"],
+        ]
+        for idx, lines in enumerate(cases):
+            spv = translate_lines(f"ps_ast_special_or_{idx}", lines)
+            self.assertIn("OpBitwiseOr %uint", spv)
 
-    def test_ast_type_validation(self):
-        """Validate destination constraints and register index bounds."""
-        with self.assertRaises(ValueError):
-            Operand.sgpr(106)
-
-        with self.assertRaises(ValueError):
-            Operand.special("invalid_reg")
-
-        bad_dst_inst = AstInstruction(
-            opcode="s_or_b32",
-            dst=Operand.imm_int(42),
-            src0=Operand.sgpr(0),
-            src1=Operand.sgpr(1),
-        )
-        self.assertFalse(bad_dst_inst.type_check())
-
-    def test_ast_expression_evaluation(self):
-        """Evaluate symbolic AST expression trees against reference oracle."""
-        env = {"s0": 0x00FF0000, "s1": 0x0000FF00}
-        expr = BitwiseOrExpr(RegExpr("s0"), RegExpr("s1"))
-        self.assertEqual(expr.evaluate(env), 0x00FFFF00)
-
-        nested = BitwiseOrExpr(expr, ConstExpr(0x000000FF))
-        self.assertEqual(nested.evaluate(env), 0x00FFFFFF)
-
-    def test_ast_assembly_translation(self):
-        """Generate assembly from AST and translate with support.translate_lines."""
-        inst = AstInstruction(
-            opcode="s_or_b32",
-            dst=Operand.sgpr(2),
-            src0=Operand.sgpr(0),
-            src1=Operand.imm_hex(0xFF),
-        )
+    def test_ast_literal_and_inline_constants(self):
+        """Verify translation of literal and inline constant sources."""
         lines = [
             "s_mov_b32 s0, 0x1000",
-            inst.emit_asm(),
+            "s_or_b32 s2, s0, 0xFF",
             "v_mov_b32 v0, s2",
             "v_mov_b32 v1, 0",
             "v_mov_b32 v2, 0",
@@ -363,154 +262,50 @@ class SaluOrB32AstTests(unittest.TestCase):
         out = mrt0_words(spv)
         self.assertEqual(out[0], 0x10FF)
 
+    def test_ast_pipeline_execution(self):
+        """Verify translated SPIR-V structure contains expected opcodes."""
+        lines = [
+            "s_or_b32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, s3",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_ast_pipeline_exec", lines)
+        self.assertIn("OpCapability Shader", spv)
+        self.assertIn("OpBitwiseOr %uint", spv)
+        self.assertIn("OpSelect", spv)
+        self.assertIn("OpReturn", spv)
 
-class ScalarRegisterState:
-    """Architectural state machine modeling RDNA2 scalar execution."""
 
-    def __init__(self, num_sgprs: int = 106) -> None:
-        self.sgprs: List[int] = [0] * num_sgprs
-        self.exec_lo: int = MASK32
-        self.exec_hi: int = MASK32
-        self.vcc_lo: int = 0
-        self.vcc_hi: int = 0
-        self.m0: int = 0
-        self.scc: int = 0
-
-    def read_reg(self, name: str) -> int:
-        if name.startswith("s") and name[1:].isdigit():
-            idx = int(name[1:])
-            if not (0 <= idx < len(self.sgprs)):
-                raise ValueError(f"SGPR index out of range: {name}")
-            return self.sgprs[idx] & MASK32
-        if name == "exec_lo":
-            return self.exec_lo & MASK32
-        if name == "exec_hi":
-            return self.exec_hi & MASK32
-        if name == "vcc_lo":
-            return self.vcc_lo & MASK32
-        if name == "vcc_hi":
-            return self.vcc_hi & MASK32
-        if name == "m0":
-            return self.m0 & MASK32
-        if name == "scc":
-            return self.scc & 1
-        if name == "null":
-            return 0
-        raise ValueError(f"Unknown register: {name}")
-
-    def write_reg(self, name: str, val: int) -> None:
-        v = val & MASK32
-        if name.startswith("s") and name[1:].isdigit():
-            idx = int(name[1:])
-            if not (0 <= idx < len(self.sgprs)):
-                raise ValueError(f"SGPR index out of range: {name}")
-            self.sgprs[idx] = v
-        elif name == "exec_lo":
-            self.exec_lo = v
-        elif name == "exec_hi":
-            self.exec_hi = v
-        elif name == "vcc_lo":
-            self.vcc_lo = v
-        elif name == "vcc_hi":
-            self.vcc_hi = v
-        elif name == "m0":
-            self.m0 = v
-        elif name == "scc":
-            self.scc = 1 if v != 0 else 0
-        elif name == "null":
-            pass
-        else:
-            raise ValueError(f"Unknown register: {name}")
-
-    def resolve_src(self, src: str | int) -> int:
-        if isinstance(src, int):
-            return src & MASK32
-        s = src.strip()
-        if s.startswith("0x") or s.startswith("-0x"):
-            return int(s, 16) & MASK32
-        try:
-            return int(s) & MASK32
-        except ValueError:
-            return self.read_reg(s)
-
-    def execute_s_or_b32(self, dst: str, src0: str | int, src1: str | int) -> int:
-        v0 = self.resolve_src(src0)
-        v1 = self.resolve_src(src1)
-        res = ref_s_or_b32(v0, v1)
-        self.write_reg(dst, res)
-        self.scc = ref_scc(res)
-        return res
-
-    def run_program(self, lines: List[str]) -> None:
-        for raw in lines:
-            ln = raw.split(";")[0].strip()
-            if not ln:
-                continue
-            parts = ln.replace(",", " ").split()
-            op = parts[0]
-            if op == "s_mov_b32":
-                dst = parts[1]
-                src = parts[2]
-                self.write_reg(dst, self.resolve_src(src))
-            elif op == "s_or_b32":
-                dst = parts[1]
-                s0 = parts[2]
-                s1 = parts[3]
-                self.execute_s_or_b32(dst, s0, s1)
-            elif op == "s_cselect_b32":
-                dst = parts[1]
-                s0 = self.resolve_src(parts[2])
-                s1 = self.resolve_src(parts[3])
-                self.write_reg(dst, s0 if self.scc != 0 else s1)
-
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter & Execution
+# -----------------------------------------------------------------------------
 
 class SaluOrB32InterpreterTests(unittest.TestCase):
     """Deterministic scalar instruction interpreter tests for s_or_b32."""
 
     def test_interpreter_basic_or(self):
-        """Test standard scalar OR execution on SGPRs via interpreter and hardware translator."""
-        state = ScalarRegisterState()
-        state.write_reg("s0", 0x12340000)
-        state.write_reg("s1", 0x00005678)
-        res = state.execute_s_or_b32("s2", "s0", "s1")
-        self.assertEqual(res, 0x12345678)
-        self.assertEqual(state.read_reg("s2"), 0x12345678)
-        self.assertEqual(state.scc, 1)
-
-        hw_res, hw_scc = run_salu_or_b32(0x12340000, 0x00005678)
+        """Test standard scalar OR execution on SGPRs via hardware translator."""
+        hw_res, hw_scc = run_salu_or_b32(0x12340000, 0x00005678, tag="interp_basic")
         self.assertEqual(hw_res, 0x12345678)
         self.assertEqual(hw_scc, 1)
 
     def test_interpreter_scc_updates(self):
-        """Test that SCC is cleared strictly on zero results and set otherwise via interpreter and translator."""
-        state = ScalarRegisterState()
-        state.execute_s_or_b32("s0", 0, 0)
-        self.assertEqual(state.read_reg("s0"), 0)
-        self.assertEqual(state.scc, 0)
-
-        hw_res0, hw_scc0 = run_salu_or_b32(0, 0)
+        """Test that SCC is cleared strictly on zero results and set otherwise via translator."""
+        hw_res0, hw_scc0 = run_salu_or_b32(0, 0, tag="interp_scc0")
         self.assertEqual(hw_res0, 0)
         self.assertEqual(hw_scc0, 0)
 
-        state.execute_s_or_b32("s1", 0, 1)
-        self.assertEqual(state.read_reg("s1"), 1)
-        self.assertEqual(state.scc, 1)
-
-        hw_res1, hw_scc1 = run_salu_or_b32(0, 1)
+        hw_res1, hw_scc1 = run_salu_or_b32(0, 1, tag="interp_scc1")
         self.assertEqual(hw_res1, 1)
         self.assertEqual(hw_scc1, 1)
 
     def test_interpreter_special_registers(self):
         """Test OR operations reading and writing m0, vcc_lo, exec_lo, and null via translator."""
-        state = ScalarRegisterState()
-        state.write_reg("m0", 0x000000F0)
-        state.execute_s_or_b32("m0", "m0", 0x00000F00)
-        self.assertEqual(state.read_reg("m0"), 0x00000FF0)
-
-        state.execute_s_or_b32("null", 0x1234, 0x5678)
-        self.assertEqual(state.read_reg("null"), 0)
-        self.assertEqual(state.scc, 1)
-
         lines = [
             "s_mov_b32 m0, 0x000000F0",
             "s_or_b32 m0, m0, 0x00000F00",
@@ -529,7 +324,7 @@ class SaluOrB32InterpreterTests(unittest.TestCase):
         self.assertEqual(out[1], 1)
 
     def test_translator_interpreter_equivalence(self):
-        """Validate exact equivalence between Python interpreter and translated SPIR-V."""
+        """Validate exact equivalence between mathematical oracle and translated SPIR-V."""
         test_pairs = [
             (0x00000000, 0x00000000),
             (0x12345678, 0x00000000),
@@ -540,11 +335,6 @@ class SaluOrB32InterpreterTests(unittest.TestCase):
         ]
         for idx, (v0, v1) in enumerate(test_pairs):
             with self.subTest(v0=hex(v0), v1=hex(v1)):
-                sim = ScalarRegisterState()
-                sim.write_reg("s0", v0)
-                sim.write_reg("s1", v1)
-                sim.execute_s_or_b32("s2", "s0", "s1")
-
                 lines = [
                     f"s_mov_b32 s0, {v0:#x}",
                     f"s_mov_b32 s1, {v1:#x}",
@@ -559,9 +349,13 @@ class SaluOrB32InterpreterTests(unittest.TestCase):
                 ]
                 spv = translate_lines(f"ps_salu_interp_eq_{idx}", lines)
                 out = mrt0_words(spv)
-                self.assertEqual(out[0], sim.read_reg("s2"))
-                self.assertEqual(out[1], sim.scc)
+                self.assertEqual(out[0], ref_s_or_b32(v0, v1))
+                self.assertEqual(out[1], ref_scc(ref_s_or_b32(v0, v1)))
 
+
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# -----------------------------------------------------------------------------
 
 class SaluOrB32SimdDivergenceTests(unittest.TestCase):
     """SIMD multi-lane divergence and 32/64-bit EXEC masking for s_or_b32."""
@@ -571,45 +365,19 @@ class SaluOrB32SimdDivergenceTests(unittest.TestCase):
         even_lanes = 0x55555555  # lanes 0, 2, 4, ... 30
         odd_lanes = 0xAAAAAAAA   # lanes 1, 3, 5, ... 31
 
-        state = ScalarRegisterState()
-        state.write_reg("s0", even_lanes)
-        state.write_reg("s1", odd_lanes)
-        state.execute_s_or_b32("exec_lo", "s0", "s1")
-        self.assertEqual(state.read_reg("exec_lo"), MASK32)
-        self.assertEqual(state.scc, 1)
-
-        out, scc = run_salu_or_b32(even_lanes, odd_lanes)
+        out, scc = run_salu_or_b32(even_lanes, odd_lanes, tag="simd_divergence")
         self.assertEqual(out, MASK32)
         self.assertEqual(scc, 1)
 
     def test_wave64_dual_half_masks(self):
         """Manage 64-bit wavefront execution masks across dual halves via translator."""
-        state = ScalarRegisterState()
-        state.write_reg("s0", 0x0000FFFF)
-        state.write_reg("s1", 0xFFFF0000)
-        state.write_reg("s2", 0x000000FF)
-        state.write_reg("s3", 0xFFFFFF00)
-
-        state.execute_s_or_b32("exec_lo", "s0", "s1")
-        state.execute_s_or_b32("exec_hi", "s2", "s3")
-
-        self.assertEqual(state.read_reg("exec_lo"), MASK32)
-        self.assertEqual(state.read_reg("exec_hi"), MASK32)
-
-        out_lo, _ = run_salu_or_b32(0x0000FFFF, 0xFFFF0000)
-        out_hi, _ = run_salu_or_b32(0x000000FF, 0xFFFFFF00)
+        out_lo, _ = run_salu_or_b32(0x0000FFFF, 0xFFFF0000, tag="simd_lo")
+        out_hi, _ = run_salu_or_b32(0x000000FF, 0xFFFFFF00, tag="simd_hi")
         self.assertEqual(out_lo, MASK32)
         self.assertEqual(out_hi, MASK32)
 
     def test_vcc_condition_accumulation(self):
         """Accumulate vector condition outcomes via s_or_b32 via translator."""
-        state = ScalarRegisterState()
-        state.write_reg("vcc_lo", 0x00000000)
-        state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x0000000F)
-        state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x000000F0)
-        state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x00000F00)
-        self.assertEqual(state.read_reg("vcc_lo"), 0x00000FFF)
-
         lines = [
             "s_mov_b32 s2, 0x00000000",
             "s_or_b32 s2, s2, 0x0000000F",
@@ -643,19 +411,16 @@ class SaluOrB32SimdDivergenceTests(unittest.TestCase):
         self.assertIn("OpBitwiseOr", spv)
 
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
 class SaluOrB32AliasingTests(unittest.TestCase):
     """Register aliasing and in-place operand preservation for s_or_b32."""
 
     def test_self_aliasing_all_operands_identical(self):
         """s_or_b32 s0, s0, s0: in-place idempotent self-OR via translator."""
         val = 0xFEEDBEEF
-        state = ScalarRegisterState()
-        state.write_reg("s0", val)
-        res = state.execute_s_or_b32("s0", "s0", "s0")
-        self.assertEqual(res, val)
-        self.assertEqual(state.read_reg("s0"), val)
-        self.assertEqual(state.scc, 1)
-
         lines = [
             f"s_mov_b32 s0, {val:#x}",
             "s_or_b32 s0, s0, s0",
@@ -674,13 +439,6 @@ class SaluOrB32AliasingTests(unittest.TestCase):
 
     def test_in_place_dst_alias_src0(self):
         """s_or_b32 s0, s0, s1: accumulate into src0 while preserving src1 via translator."""
-        state = ScalarRegisterState()
-        state.write_reg("s0", 0x0F0F0F0F)
-        state.write_reg("s1", 0xF0F0F0F0)
-        state.execute_s_or_b32("s0", "s0", "s1")
-        self.assertEqual(state.read_reg("s0"), MASK32)
-        self.assertEqual(state.read_reg("s1"), 0xF0F0F0F0)
-
         lines = [
             "s_mov_b32 s0, 0x0F0F0F0F",
             "s_mov_b32 s1, 0xF0F0F0F0",
@@ -699,13 +457,6 @@ class SaluOrB32AliasingTests(unittest.TestCase):
 
     def test_in_place_dst_alias_src1(self):
         """s_or_b32 s1, s0, s1: accumulate into src1 while preserving src0 via translator."""
-        state = ScalarRegisterState()
-        state.write_reg("s0", 0x11111111)
-        state.write_reg("s1", 0x22222222)
-        state.execute_s_or_b32("s1", "s0", "s1")
-        self.assertEqual(state.read_reg("s0"), 0x11111111)
-        self.assertEqual(state.read_reg("s1"), 0x33333333)
-
         lines = [
             "s_mov_b32 s0, 0x11111111",
             "s_mov_b32 s1, 0x22222222",
@@ -724,18 +475,6 @@ class SaluOrB32AliasingTests(unittest.TestCase):
 
     def test_adjacent_register_isolation(self):
         """Modifying destination register must not touch adjacent SGPRs via translator."""
-        state = ScalarRegisterState()
-        state.write_reg("s0", 0x11111111)
-        state.write_reg("s1", 0x22222222)
-        state.write_reg("s2", 0x33333333)
-        state.write_reg("s3", 0x44444444)
-
-        state.execute_s_or_b32("s1", "s1", "s2")
-        self.assertEqual(state.read_reg("s0"), 0x11111111)
-        self.assertEqual(state.read_reg("s1"), 0x33333333)
-        self.assertEqual(state.read_reg("s2"), 0x33333333)
-        self.assertEqual(state.read_reg("s3"), 0x44444444)
-
         lines = [
             "s_mov_b32 s0, 0x11111111",
             "s_mov_b32 s1, 0x22222222",
@@ -775,19 +514,23 @@ class SaluOrB32AliasingTests(unittest.TestCase):
         self.assertEqual(out[1], 0xF0F0F0F0)
 
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and SCC Generation
+# -----------------------------------------------------------------------------
+
 class SaluOrB32ConditionCodeTests(unittest.TestCase):
     """Condition codes, status flags, and carry/borrow generation for s_or_b32."""
 
     def test_scc_zero_flag_exhaustion(self):
         """SCC must be 0 if and only if the bitwise result is exactly zero via translator."""
-        res0, scc0 = run_salu_or_b32(0, 0)
+        res0, scc0 = run_salu_or_b32(0, 0, tag="cc_zero")
         self.assertEqual(res0, 0)
         self.assertEqual(scc0, 0)
 
         for bit in [0, 1, 7, 15, 16, 24, 30, 31]:
             val = 1 << bit
             with self.subTest(bit=bit):
-                res, scc = run_salu_or_b32(val, 0)
+                res, scc = run_salu_or_b32(val, 0, tag=f"cc_bit_{bit}")
                 self.assertEqual(res, val)
                 self.assertEqual(scc, 1)
 
@@ -847,6 +590,10 @@ class SaluOrB32ConditionCodeTests(unittest.TestCase):
                 self.assertEqual(out[1], expected_sel)
 
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
 class SaluOrB32FloatBitPatternTests(unittest.TestCase):
     """IEEE 754 boundary extremes, subnormals, and NaN handling for s_or_b32."""
 
@@ -854,13 +601,13 @@ class SaluOrB32FloatBitPatternTests(unittest.TestCase):
         """Inject sign bit (0x80000000) into positive floats via translator."""
         pos_zero = 0x00000000
         neg_zero = 0x80000000
-        res, scc = run_salu_or_b32(pos_zero, 0x80000000)
+        res, scc = run_salu_or_b32(pos_zero, 0x80000000, tag="float_sign_zero")
         self.assertEqual(res, neg_zero)
         self.assertEqual(scc, 1)
 
         pos_one_bits = struct.unpack("<I", struct.pack("<f", 1.0))[0]
         neg_one_bits = struct.unpack("<I", struct.pack("<f", -1.0))[0]
-        res_neg_one, scc_neg = run_salu_or_b32(pos_one_bits, 0x80000000)
+        res_neg_one, scc_neg = run_salu_or_b32(pos_one_bits, 0x80000000, tag="float_sign_one")
         self.assertEqual(res_neg_one, neg_one_bits)
         self.assertEqual(scc_neg, 1)
 
@@ -868,7 +615,7 @@ class SaluOrB32FloatBitPatternTests(unittest.TestCase):
         """Set quiet bit (bit 22, 0x00400000) to convert signaling NaN to quiet NaN via translator."""
         snan_bits = 0x7F800001
         qnan_expected = 0x7FC00001
-        res, scc = run_salu_or_b32(snan_bits, 0x00400000)
+        res, scc = run_salu_or_b32(snan_bits, 0x00400000, tag="nan_quiet")
         self.assertEqual(res, qnan_expected)
         self.assertEqual(scc, 1)
 
@@ -876,7 +623,7 @@ class SaluOrB32FloatBitPatternTests(unittest.TestCase):
         """Promote subnormal float mantissa to infinity exponent using bitwise OR via translator."""
         subnorm = 0x000000FF
         inf_exp = 0x7F800000
-        res, scc = run_salu_or_b32(subnorm, inf_exp)
+        res, scc = run_salu_or_b32(subnorm, inf_exp, tag="subnorm_inf")
         self.assertEqual(res, inf_exp | subnorm)
         self.assertEqual(scc, 1)
         self.assertTrue(math.isnan(struct.unpack("<f", struct.pack("<I", res))[0]))
@@ -899,6 +646,10 @@ class SaluOrB32FloatBitPatternTests(unittest.TestCase):
         self.assertEqual(out[0], expected_neg_one)
 
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
 class SaluOrB32NegativeControlsTests(unittest.TestCase):
     """Negative controls, syntax rejection, and mutation detection for s_or_b32."""
 
@@ -912,7 +663,7 @@ class SaluOrB32NegativeControlsTests(unittest.TestCase):
             (0x00000001, 0x00000002),
         ]
         for a, b in pairs:
-            or_res, _ = run_salu_or_b32(a, b)
+            or_res, _ = run_salu_or_b32(a, b, tag=f"mut_matrix_{a:#x}_{b:#x}")
             and_res = (a & b) & MASK32
             xor_res = (a ^ b) & MASK32
             nor_res = (~(a | b)) & MASK32
@@ -925,15 +676,14 @@ class SaluOrB32NegativeControlsTests(unittest.TestCase):
                     self.assertNotEqual(or_res, xor_res)
                     self.assertNotEqual(or_res, add_res)
 
-    def test_interpreter_invalid_register_rejection(self):
-        """Interpreter must reject invalid register access."""
-        state = ScalarRegisterState()
-        with self.assertRaises(ValueError):
-            state.read_reg("v0")  # Vector register not allowed in SALU scalar state
-        with self.assertRaises(ValueError):
-            state.write_reg("s999", 1)
-        with self.assertRaises(ValueError):
-            state.resolve_src("unknown_symbol")
+    def test_reject_unsupported_opcode(self):
+        """Reject unsupported SALU opcode."""
+        lines = [
+            "s_unknown_b32 s0, s1, s2",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_lines("ps_neg_unknown_opcode", lines)
 
     def test_syntax_rejection_malformed_instruction(self):
         """RDNA2 parser / translator must reject malformed scalar instruction syntax."""
