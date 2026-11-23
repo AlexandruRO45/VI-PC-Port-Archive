@@ -260,6 +260,18 @@ class VulkanOracle(unittest.TestCase):
         self.assertIn("buffer_store_dword v9, v21, s[0:3], 0 offen offset:4", lines)
         self.assertEqual(lines[-1], "s_endpgm")
 
+    def test_wave64_program_uses_a_64_bit_vcc(self):
+        lines = ff.vk_program(self.case(), 64).splitlines()
+        self.assertIn("; group: 64,1,1", lines)
+        self.assertIn("; mattr: +wavefrontsize64,-wavefrontsize32", lines)
+        self.assertIn("s_mov_b64 exec, -1", lines)
+        self.assertIn("s_mov_b64 vcc, 0", lines)
+        self.assertIn("v_cndmask_b32_e64 v9, 0, 1, vcc", lines)
+        self.assertFalse([ln for ln in lines if "vcc_lo" in ln])
+        wave32 = ff.vk_program(self.case()).splitlines()
+        self.assertIn("s_mov_b32 vcc_lo, 0", wave32)
+        self.assertEqual(ff.hw_lines(self.case(), "gfx1030", wave=64)[-4], "v_cndmask_b32_e64 v9, 0, 1, vcc")
+
     def test_verdict_classes(self):
         c = self.case()
         self.assertEqual(ff.vk_verdict(c, [0x3f800000, 0], [0x3f800000, 0])[0], "match")

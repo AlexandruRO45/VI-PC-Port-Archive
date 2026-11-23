@@ -27,7 +27,7 @@ v_min/max/min3/max3/med3_f32 are hardware-only ops. Exit 77 when the hardware to
 docs/shader_validation.md ("32-bit float VALU on the GPU").
 
 With --oracle hw,vk the cases also run through the translator on a real Vulkan GPU: llvm-mc assembles each one for
-gfx1013 as a 32-lane compute program, rdna2spirv.py translates them, runtime/build/vk_compute_test (LEONIDA_VK_DEVICE
+gfx1013 as a compute program of one wave (--wave 32 or 64), rdna2spirv.py translates them, runtime/build/vk_compute_test (LEONIDA_VK_DEVICE
 picks the device) executes them and lane 0's v8 and VCC are judged against the hardware's words. The interpreter above
 runs Python floats; a driver runs its own denormal, NaN and rounding rules, and an input that is undefined in SPIR-V
 gets whatever the GPU does with it. A difference that comes from the f32 denormal mode (a denormal operand or result;
@@ -879,7 +879,7 @@ class Case:
         return self.op, self.vals, self.srcs, self.e64, self.out_mods
 
 
-def hw_lines(case, arch="gfx1150", guard=True):
+def hw_lines(case, arch="gfx1150", guard=True, wave=32):
     """The native kernel body: seeds, the instruction, VCC as 0/1 in v9, store v8 and v9. `guard` puts s_nop 7
     after the instruction (the transcendental unit and SGPR/VCC writes have wait-state rules the model lacks)."""
     from hw_oracle import asm
@@ -892,13 +892,19 @@ def hw_lines(case, arch="gfx1150", guard=True):
         out.append("s_nop 7")
     out += ["v_cndmask_b32_e64 v9, 0, 1, vcc_lo", f"v_mov_b32 v{HW_ZERO_REG}, 0",
             f"{HW_STORE[asm.family(arch)]} v{HW_ZERO_REG}, v[8:9], s[2:3]", "s_endpgm"]
-    return out
+    return wave64_mask(out) if wave == 64 else out
 
 
-def hw_run(oracle, cases, mode=HW_PRIMARY, guard=True):
-    """[v8, vcc] per case, or the assembler's complaint as a str."""
+def wave64_mask(lines):
+    """The wave32 spelling of a program with VCC as a 64-bit lane mask: s_mov_b64 vcc, 0 and vcc for vcc_lo."""
+    return [ln.replace("s_mov_b32 vcc_lo, 0", "s_mov_b64 vcc, 0").replace("vcc_lo", "vcc") for ln in lines]
+
+
+def hw_run(oracle, cases, mode=HW_PRIMARY, guard=True, wave=32):
+    """[v8, vcc] per case, or the assembler's complaint as a str. wave 64 runs one active lane in a wave64 wave."""
     from hw_oracle import asm
-    kernels = [asm.Kernel(hw_lines(c, oracle.arch, guard), 32, 1, 2, raw=True, mode=HW_MODES[mode]) for c in cases]
+    kernels = [asm.Kernel(hw_lines(c, oracle.arch, guard, wave), wave, 1, 2, raw=True, mode=HW_MODES[mode])
+               for c in cases]
     return oracle.run(kernels, words=2)
 
 
@@ -945,27 +951,31 @@ def hw_same(want, got, op=None):
 
 # ---- the translator on a Vulkan GPU (--oracle hw,vk) --------------------------------------------------------------
 
-VK_LANES = 32
 
-
-def vk_program(case):
-    """The case as a 32-lane compute program for vk_compute_test: the same seeds and instruction as the hardware
-    kernel, v8 and the VCC bit (v9) stored for every lane at lane * 8 through the V# in s[0:3]."""
+def vk_program(case, wave=32):
+    """The case as a compute program for vk_compute_test, one wave of `wave` lanes: the same seeds and instruction as
+    the hardware kernel, v8 and the VCC bit (v9) stored for every lane at lane * 8 through the V# in s[0:3]."""
     op, vals, srcs, e64, out_mods = case.args()
-    out = [f"; f32_fuzz {case.group} {case.index} {op}", f"; group: {VK_LANES},1,1", "; rsrc2: 0x8088",
-           "s_mov_b32 exec_lo, -1", "v_mov_b32 v20, v0"]            # v0 is the lane id until the seeds overwrite it
+    out = [f"; f32_fuzz {case.group} {case.index} {op}", f"; group: {wave},1,1", "; rsrc2: 0x8088"]
+    if wave == 64:
+        out.append("; mattr: +wavefrontsize64,-wavefrontsize32")
+    n_head = len(out)
+    out += ["s_mov_b64 exec, -1" if wave == 64 else "s_mov_b32 exec_lo, -1",
+            "v_mov_b32 v20, v0"]                                     # v0 is the lane id until the seeds overwrite it
     out += [f"v_mov_b32 v{r}, 0x{vals[r]:x}" for r in SEED_REGS]
     out.append("s_mov_b32 vcc_lo, 0")
     out.append(line(op, vals, srcs, e64, sorted(out_mods, key=lambda m: m != "clamp")))
     out += ["v_cndmask_b32_e64 v9, 0, 1, vcc_lo", "v_lshlrev_b32 v21, 3, v20",
             "buffer_store_dword v8, v21, s[0:3], 0 offen", "buffer_store_dword v9, v21, s[0:3], 0 offen offset:4",
             "s_endpgm"]
+    if wave == 64:
+        out = out[:n_head] + wave64_mask(out[n_head:])
     return "\n".join(out) + "\n"
 
 
-def vk_run(cases, build, work_parent=None, retries=2):
+def vk_run(cases, build, work_parent=None, retries=2, wave=32):
     """[v8, vcc] of lane 0 for each case after the translator and vk_compute_test, or a str: why it did not run.
-    The 32 lanes run the same program, so a lane that differs from lane 0 is reported instead of a result."""
+    The lanes run the same program, so a lane that differs from lane 0 is reported instead of a result."""
     shaders = os.path.join(os.path.dirname(TOOLS_DIR), "runtime", "test", "shaders")
     if shaders not in sys.path:
         sys.path.insert(0, shaders)
@@ -982,9 +992,11 @@ def vk_run(cases, build, work_parent=None, retries=2):
         os.mkdir(d)
     names, results = [], []
     mc = mc_command.mc_command() + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
+    if wave == 64:
+        mc.append("-mattr=+wavefrontsize64,-wavefrontsize32")
     for i, c in enumerate(cases):
         name = f"cs_f32vk_{i}"
-        text = vk_program(c)
+        text = vk_program(c, wave)
         path = os.path.join(work, name + ".asm")
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
@@ -1015,24 +1027,29 @@ def vk_run(cases, build, work_parent=None, retries=2):
             results[i] = "translator: not translated"
             continue
         dump = os.path.join(work, name + ".bin")
-        env = dict(os.environ, VKC_OUT_WORDS=str(2 * VK_LANES), VKC_DUMP=dump, VKC_SUBGROUP_SIZE=str(VK_LANES))
+        env = dict(os.environ, VKC_OUT_WORDS=str(2 * wave), VKC_DUMP=dump)
+        args = [exe, spv, "1", "dump"]
+        if wave == 64:
+            args.append("--require-wave64")
+        else:
+            env["VKC_SUBGROUP_SIZE"] = "32"
         for _ in range(retries + 1):
             if os.path.isfile(dump):
                 os.remove(dump)
-            r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env)
+            r = subprocess.run(args, capture_output=True, text=True, env=env)
             if r.returncode in (0, 77):
                 break
         msg = (r.stdout + r.stderr).strip()
         if r.returncode == 77:
             results[i] = "vk_compute_test: " + (msg.splitlines()[-1] if msg else "unsupported")
-        elif unpinned_subgroup(msg):
+        elif wave == 32 and unpinned_subgroup(msg):
             results[i] = f"the device can't run 32-lane subgroups ({unpinned_subgroup(msg)} lanes)"
-        elif r.returncode or not os.path.isfile(dump) or os.path.getsize(dump) != 8 * VK_LANES:
+        elif r.returncode or not os.path.isfile(dump) or os.path.getsize(dump) != 8 * wave:
             results[i] = f"vk_compute_test exit {r.returncode}"
         else:
             with open(dump, "rb") as f:
-                words = struct.unpack(f"<{2 * VK_LANES}I", f.read())
-            lanes = [list(words[k:k + 2]) for k in range(0, 2 * VK_LANES, 2)]
+                words = struct.unpack(f"<{2 * wave}I", f.read())
+            lanes = [list(words[k:k + 2]) for k in range(0, 2 * wave, 2)]
             odd = [k for k, w in enumerate(lanes) if not hw_same(lanes[0], w, cases[i].op)]
             results[i] = lanes[0] if not odd else f"lanes {odd[:3]} differ from lane 0 on identical inputs"
     if not os.environ.get("F32_FUZZ_KEEP"):
@@ -1064,11 +1081,11 @@ def vk_verdict(case, hw, got):
     return "mismatch", ""
 
 
-def vk_suite(oracle, cases, build, work_parent=None, show=2):
+def vk_suite(oracle, cases, build, work_parent=None, show=2, wave=32):
     """Run cases on the hardware and through the translator on the Vulkan device; print the tallies and return
     ({op: {class: n}}, the number of unexplained mismatches)."""
-    hw = hw_run(oracle, cases)
-    got = vk_run(cases, build, work_parent)
+    hw = hw_run(oracle, cases, wave=wave)
+    got = vk_run(cases, build, work_parent, wave=wave)
     tally, shown, skips = {}, {}, {}
     mismatches = 0
     for c, h, g in zip(cases, hw, got):
@@ -1820,6 +1837,9 @@ def main(argv=None):
                          "vk_compute_test). Exit 77 when the hardware tools are missing")
     ap.add_argument("--build", default=os.path.join(os.path.dirname(HERE), "runtime", "build"),
                     help="with vk: the folder with vk_compute_test")
+    ap.add_argument("--wave", type=int, choices=(32, 64), default=32,
+                    help="with vk: run the hardware and the translated programs as wave32 (default) or wave64 "
+                         "(needs native 64-wide subgroups; lane 0 is judged)")
     ap.add_argument("--work", default=None, help="with vk: a folder for the temporary files (F32_FUZZ_KEEP=1 keeps them)")
     ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
     ap.add_argument("--probes", type=int, default=12,
@@ -1902,7 +1922,7 @@ def main(argv=None):
                 if a.work:
                     os.makedirs(a.work, exist_ok=True)
                 try:
-                    _, vk_bad = vk_suite(oracle, cases, a.build, a.work, show=a.show)
+                    _, vk_bad = vk_suite(oracle, cases, a.build, a.work, show=a.show, wave=a.wave)
                 except FileNotFoundError as e:
                     print(e)
                     return 2

@@ -1084,6 +1084,11 @@ Seed 21 (500 random programs and 5 probes per op and kind, 1,175 cases, 163 skip
 adds `cs_legacy_mul_zero`); NVIDIA GeForce RTX 5080 (driver 616.92) 955 match, 56 denormal, 1 omod_neg_zero, 0 mismatch.
 The 56 are the f32 denormal gap (NVIDIA keeps denormal operands and results, RDNA2 in the game's MODE flushes them).
 A deliberately wrong translator (`v_floor_f32` emitting `Ceil`) makes 36 of 66 `v_floor_f32` cases mismatch.
+`--wave 64` runs the hardware kernels and the translated programs as wave64 (64 lanes, VCC a 64-bit mask,
+`vk_compute_test --require-wave64`; needs native 64-wide subgroups, so on the Radeon but not the RTX 5080). It found
+what wave32 does not: on the AMD Windows driver (26.10.1) the same `NMin`/`NMax` SPIR-V gives NaN for
+`v_min/max/min3/max3/med3_f32` with a NaN operand in a wave64 pipeline (67 of 1,230 cases, seed 41, 60 probes) where the
+hardware, a wave32 pipeline and the RTX 5080 give the other operand.
 
 - **Float MODE.** An assembled kernel's descriptor starts with IEEE 1, DX10_CLAMP 1, f32 denormals flushed
   (`.amdhsa_float_denorm_mode_32 0`), f16/f64 denormals kept (3), round to nearest (MODE `0x3c0`, read back with
