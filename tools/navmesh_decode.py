@@ -274,6 +274,12 @@ def wants_more(cls, b, nstreams):
     return declared is not None and nstreams < min(declared, MAX_STREAMS)
 
 
+def starts_resource(b):
+    """True when stream `b` opens a resource of its own, so it is not a continuation of the one before it: a
+    resource whose next stream is missing stays incomplete instead of swallowing the next one (as navmesh_links.py)."""
+    return len(b) >= MIN_STREAM and classify(b) != "other"
+
+
 def is_complete(cls, b, nstreams):
     """True when the resource in `b` has all streams declared by its header/block map (ignoring MAX_STREAMS)."""
     if cls == "psin":
@@ -809,7 +815,7 @@ def _scan_dir(path, deep, rows):
         parts = [(s, used, head)]
         buf = bytearray(head)
         while pending is not None and wants_more(cls, buf, len(parts)):
-            if len(buf) + len(pending[2]) > MAX_INFLATE:
+            if len(buf) + len(pending[2]) > MAX_INFLATE or starts_resource(pending[2]):
                 break
             parts.append(pending)
             _, _, cdata = pending
@@ -863,7 +869,7 @@ def _scan_rpf(path, start, limit, deep, rows):
                 parts = [(s, used, head)]
                 buf = bytearray(head)
                 while pending is not None and wants_more(cls, buf, len(parts)):
-                    if len(buf) + len(pending[2]) > MAX_INFLATE:
+                    if len(buf) + len(pending[2]) > MAX_INFLATE or starts_resource(pending[2]):
                         break
                     parts.append(pending)
                     cs, cused, cdata = pending

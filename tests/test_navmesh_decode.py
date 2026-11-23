@@ -649,6 +649,31 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
         self.assertEqual(doc["psin"]["complete"], 1)
 
+    def test_missing_continuation_does_not_swallow_the_next_resource(self):
+        """A two-stream 0DRP whose second stream is missing stays incomplete, and the navmesh tile after it is
+        decoded on its own instead of being appended as the cover resource's continuation, in both modes."""
+        p0, _ = build_0drp(total_size=0x1000, split_at=0x1000, node_count=2, override_n4e=0)
+        nav = build_navmesh(sector=(260 << 9) | 250)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            for off, blob in ((0x001000, p0), (0x003000, nav)):
+                with open(os.path.join(carve, f"{off:012x}.bin"), "wb") as f:
+                    f.write(blob)
+            arc = os.path.join(tmp, "a.rpf")
+            make_rpf(arc, [p0, nav])
+            for path in (carve, arc):
+                doc = nd.scan(path, deep=True)
+                with self.subTest(mode=doc["mode"]):
+                    self.assertEqual(doc["resources"]["0drp"]["resources"], 1)
+                    self.assertEqual(doc["resources"]["0drp"]["incomplete"], 1)
+                    self.assertEqual(doc["resources"]["0drp"]["streams"], {"1": 1})
+                    self.assertIn("navmesh", doc["resources"])
+                    self.assertEqual(doc["resources"]["navmesh"]["resources"], 1)
+                    self.assertEqual(doc["resources"]["navmesh"]["incomplete"], 0)
+                    for name, counts in doc["checks"]["navmesh"].items():
+                        self.assertEqual(counts["fail"], 0, f"navmesh.{name} failed: {counts}")
+
     def test_carved_directory_mode_and_window_limit(self):
         sector = (260 << 9) | 250
         p0, p1 = build_0drp(total_size=0x1000, split_at=0x1000, node_count=2, override_n4e=0)
