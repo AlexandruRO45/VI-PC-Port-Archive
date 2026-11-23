@@ -4,7 +4,7 @@
 // "what is missing for the BVH path" into a concrete list instead of a guess.
 //
 // Skips unless LEONIDA_GAME_DIR points at a package root containing XboxBvhBuilder.dll.
-// With the variable unset the test prints "SKIP" and exits 77, so ctest stays green without a game copy.
+// With the variable unset the test prints "SKIP" and exits 0, so ctest stays green without a game copy.
 // No game data is read beyond mapping the DLL; no stream content is committed.
 //
 // LEONIDA_GAME_DIR=<package root>
@@ -175,8 +175,9 @@ int main() {
     std::printf("  Construction is blocked until D3D-4/D3D-8 implements CreateRootSignature.\n");
     std::printf("  Skipping constructor call; reporting ABI findings from stages 1-3 only.\n");
 
+    // create_device_proxy takes over the caller's reference to the device: the proxy's Release releases it
+    // (d3d12_xs_device.cpp, proxy_release -> real->Release()), so releasing `vulkan` here would double-free.
     proxy->Release();
-    vulkan->Release();
     std::printf("RESULT: M0 diagnostic complete (construction blocked on CreateRootSignature)\n");
     return 0;
 }
