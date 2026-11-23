@@ -14,10 +14,16 @@ def compute_header(asm_path, shift=0):
             continue
         if not line.startswith(";"):
             break
-        size = re.match(r";\s*group:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", line)
-        if size:
-            group = tuple(map(int, size.groups()))
-        elif line[1:].lstrip().startswith("rsrc2:"):
+        directive = line[1:].lstrip()
+        if directive.startswith("group:"):
+            value = directive.removeprefix("group:").partition(";")[0].strip()
+            dimensions = re.fullmatch(r"(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", value)
+            if not dimensions:
+                raise ValueError(f"malformed group directive {line!r} (expected X,Y,Z)")
+            group = tuple(map(int, dimensions.groups()))
+            if any(dimension < 1 or dimension > 0xFFFFFFFF for dimension in group):
+                raise ValueError("group dimensions must be in 1..4294967295")
+        elif directive.startswith("rsrc2:"):
             rsrc2 = int(line.split(":", 1)[1].strip(), 0)
     header = bytearray(0x148)
     struct.pack_into("<4I", header, 0x138, shifted_rsrc2(rsrc2, shift), *group)
