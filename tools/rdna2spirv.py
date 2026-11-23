@@ -5234,26 +5234,24 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
+            # llvm-mc accepts 1..3-element op_sel/op_sel_hi lists for 2-source VOP3P ops (padding missing entries
+            # with 0 and ignoring the unused 3rd entry; e.g. ps_ops6.s emits op_sel:[1,0,0] op_sel_hi:[0,0,0]).
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
                 if m is None:
                     return default
                 try:
-                    body = m.split("[", 1)[1]
-                    if not body.endswith("]"):
-                        raise Unsupported(op + " modifiers")
-                    return [int(v) for v in body[:-1].split(",")]
-                except (IndexError, ValueError):
+                    vals = [int(v) for v in m.split("[", 1)[1][:-1].split(",")]
+                except ValueError:
                     raise Unsupported(op + " modifiers") from None
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
+                if len(vals) > 3 or any(b not in (0, 1) for b in vals):
+                    raise Unsupported(op + " modifiers")
+                return (vals + [0])[:2]
             if (any(not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
                     or any(s.get("neg") or s.get("abs") for s in a)):
                 raise Unsupported(op + " modifiers")
             sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
-            neg_lo, neg_hi = bits("neg_lo", [0, 0]), bits("neg_hi", [0, 0])
-            if (len(sel) != 2 or len(selhi) != 2 or len(neg_lo) != 2 or len(neg_hi) != 2
-                    or any(b not in (0, 1) for b in sel + selhi) or any(neg_lo) or any(neg_hi)):
+            if any(bits("neg_lo", [0, 0])) or any(bits("neg_hi", [0, 0])):
                 raise Unsupported(op + " modifiers")
             sh_src, val_src = self.src_u(a[1]), self.src_u(a[2])
             halves = []

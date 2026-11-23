@@ -121,17 +121,20 @@ class PkShiftB16Tests(unittest.TestCase):
         sh = 0x00070003
         val = 0x81234567
         combos = (
-            (None, None, ""),
-            ([1, 0], [0, 1], ""),
-            ([0, 1], [1, 0], ""),
-            ([0, 0], [0, 0], ""),
-            ([1, 1], [1, 1], ""),
-            ([1, 1], None, ""),
-            (None, [0, 0], ""),
-            ([1, 0], [0, 1], " neg_lo:[0,0] neg_hi:[0,0]"),
+            (None, None, (0, 0), (1, 1), ""),
+            ([1, 0], [0, 1], (1, 0), (0, 1), ""),
+            ([0, 1], [1, 0], (0, 1), (1, 0), ""),
+            ([0, 0], [0, 0], (0, 0), (0, 0), ""),
+            ([1, 1], [1, 1], (1, 1), (1, 1), ""),
+            ([1, 1], None, (1, 1), (1, 1), ""),
+            (None, [0, 0], (0, 0), (0, 0), ""),
+            ([1, 0, 0], [0, 0, 0], (1, 0), (0, 0), ""),
+            ([1], [1], (1, 0), (1, 0), ""),
+            ([0], None, (0, 0), (1, 1), ""),
+            ([1, 0], [0, 1], (1, 0), (0, 1), " neg_lo:[0,0] neg_hi:[0,0]"),
         )
         for op in OPS:
-            for sel, selhi, extra in combos:
+            for sel, selhi, want_sel, want_selhi, extra in combos:
                 line = f"{op} v0, v1, v2"
                 if sel is not None:
                     line += mod_str("op_sel", sel)
@@ -140,7 +143,7 @@ class PkShiftB16Tests(unittest.TestCase):
                 line += extra
                 with self.subTest(op=op, line=line):
                     got = run_shift(line, push=[sh, val])
-                    want = ref_pk_shift(op, sh, val, sel or (0, 0), selhi or (1, 1))
+                    want = ref_pk_shift(op, sh, val, want_sel, want_selhi)
                     self.assertEqual(got, want)
 
     def test_constants_sgpr_and_aliasing(self):
@@ -219,9 +222,12 @@ class PkShiftB16Tests(unittest.TestCase):
             "v_pk_lshrrev_b16 v0, v1, v2 div:2",
             "v_pk_lshlrev_b16 v0, v1, -v2",
             "v_pk_ashrrev_i16 v0, |v1|, v2",
-            "v_pk_lshlrev_b16 v0, v1, v2 op_sel:[0,0,0]",
-            "v_pk_lshrrev_b16 v0, v1, v2 op_sel_hi:[1]",
+            "v_pk_lshlrev_b16 v0, v1, v2 op_sel:[0,0,0,0]",
+            "v_pk_lshrrev_b16 v0, v1, v2 op_sel_hi:[1,1,1,1]",
             "v_pk_ashrrev_i16 v0, v1, v2 op_sel:[0,2]",
+            "v_pk_ashrrev_i16 v0, v1, v2 op_sel_hi:[1,2]",
+            "v_pk_lshlrev_b16 v0, v1, v2 op_sel:[a,b]",
+            "v_pk_lshrrev_b16 v0, v1, v2 op_sel:[]",
             "v_pk_lshlrev_b16 v0, v1, v2 op_sel:bad",
         )
         for line in bad_lines:
