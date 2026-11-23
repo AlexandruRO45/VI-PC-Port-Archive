@@ -22,6 +22,8 @@ DMA type's numeric value would appear if a shipped module created such a queue.
 
 It prints names, counts and GUID values only, no bytes of the image.
 
+A path it cannot read (an image, `--header`, or the `--json` folder) is one `ERROR:` line and exit 2.
+
 Usage:
     python -I tools/d3d12_guid_sites.py <image> [<image> ...] [--header PATH/d3d12.h]
                                         [--known NAME=GUID ...] [--json OUT]
@@ -350,11 +352,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     known: dict[str, uuid.UUID] = {}
-    header = args.header
-    if header is None:
-        header = default_header()
-    if header and os.path.isfile(header):
-        known.update(read_iids(header))
+    header = args.header or default_header()
+    if header:
+        try:
+            known.update(read_iids(header))
+        except OSError as e:
+            print(f"ERROR: cannot read {header}: {e.strerror or e}", file=sys.stderr)
+            return 2
     for pair in args.known:
         name, _, value = pair.partition("=")
         try:
@@ -371,6 +375,9 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, struct.error) as e:
             print(f"== {os.path.basename(path)}: skipped ({e})")
             continue
+        except OSError as e:
+            print(f"ERROR: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         results.append(r)
         print(f"== {r['image']}: {r['lea_count']} RIP-relative lea, "
               f"{len(r['guid_candidates'])} GUID-shaped referenced constants, "
@@ -386,9 +393,13 @@ def main(argv: list[str] | None = None) -> int:
         for line in r["imports_of_note"]:
             print(f"   GUID-named imports: {line}")
     if args.json:
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"known": len(known), "images": results}, f, indent=2)
-            f.write("\n")
+        try:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"known": len(known), "images": results}, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 

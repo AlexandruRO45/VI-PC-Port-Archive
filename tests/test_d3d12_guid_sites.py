@@ -176,7 +176,7 @@ class GuidSites(unittest.TestCase):
         image, _ = pe32plus(text, rdata)
         path = self.write("t6.dll", image)
         out = os.path.join(self.tmp.name, "out.json")
-        header = os.path.join(self.tmp.name, "none.h")
+        header = self.write("none.h", b"")  # a header with no MIDL_INTERFACE lines: 0 known IIDs
         result = subprocess.run(
             [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), path,
              "--header", header, "--known", f"ID3D12CommandQueue={QUEUE}", "--json", out],
@@ -187,5 +187,25 @@ class GuidSites(unittest.TestCase):
             data = json.load(f)
 
         self.assertEqual({c["value"] for c in data["images"][0]["guid_candidates"]}, {str(QUEUE), str(UNKNOWN)})
+    def test_unreadable_paths_are_one_error_line(self):
+        image, _ = pe32plus(lea(0x2000, 0x1000), QUEUE.bytes_le + b"\0" * 48)
+        path = self.write("t7.dll", image)
+        header = self.write("empty.h", b"")   # a header with no MIDL_INTERFACE lines is allowed
+        missing = os.path.join(self.tmp.name, "nope.dll")
+        cases = {
+            "image": [missing, "--header", header],
+            "header": [path, "--header", missing],
+            "json": [path, "--header", header, "--json", os.path.join(self.tmp.name, "no_dir", "out.json")],
+        }
+        for what, argv in cases.items():
+            result = subprocess.run(
+                [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), *argv],
+                capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(result.returncode, 2, f"{what}: {result.stderr}")
+            errors = [line for line in result.stderr.splitlines() if line.startswith("ERROR: ")]
+            self.assertEqual(len(errors), 1, f"{what}: {result.stderr}")
+            self.assertNotIn("Traceback", result.stderr, f"{what}: {result.stderr}")
+
+
 if __name__ == "__main__":
     unittest.main()
