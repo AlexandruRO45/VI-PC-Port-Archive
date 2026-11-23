@@ -495,6 +495,41 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         mem = run_cs_lds(instructions)
         self.assertEqual(mem.get(0), 0xFFFFFFFF)
 
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_out_of_bounds_register_rejection(self):
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+
+    def test_out_of_bounds_offset_rejection(self):
+        with self.assertRaises(ValueError):
+            DSMaxI32Instruction(
+                vaddr=Operand.vgpr(0),
+                vdata=Operand.vgpr(1),
+                offset=70000,
+            )
+
+    def test_mutation_operator_inverted_to_min(self):
+        # If max is mutated to min, max(-10, 5) would return -10 instead of 5
+        curr = to_unsigned_u32(-10)
+        val = to_unsigned_u32(5)
+        correct = ref_max_i32(curr, val)
+        mutated = to_unsigned_u32(min(to_signed_i32(curr), to_signed_i32(val)))
+        self.assertEqual(correct, 5)
+        self.assertEqual(mutated, curr)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_signed_vs_unsigned_divergence(self):
+        # In unsigned max, 0xFFFFFFFF (4294967295) is greater than 0.
+        # In signed max, -1 (0xFFFFFFFF) is LESS than 0.
+        # This catches any mutation that replaces OpAtomicSMax with OpAtomicUMax!
+        curr = 0
+        val = 0xFFFFFFFF  # -1
+        signed_max = ref_max_i32(curr, val)
+        unsigned_max = max(curr, val)
+        self.assertEqual(signed_max, 0)
+        self.assertEqual(unsigned_max, 0xFFFFFFFF)
+        self.assertNotEqual(signed_max, unsigned_max)
+
 
 if __name__ == "__main__":
     unittest.main()
