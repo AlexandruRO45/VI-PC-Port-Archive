@@ -1009,6 +1009,30 @@ class JsonDepthTest(unittest.TestCase):
                 self.assertEqual(rd(os.path.join(out, "payload.bin")), second)
                 self.assertFalse(os.path.exists(os.path.join(out, "payload.json")))
 
+    def test_a_later_extract_leaves_no_stale_profile_json(self):
+        # profile.json (kind 3) is a second file that describes payload.bin, so a later extract into the same folder
+        # that doesn't write one removes it, as it removes payload.json.
+        profile = make_asav(kind=3, title="Player", slot="Player", payload=saves.build_profile(account_id=0xCAFEF00D))
+        bad_version = make_asav(kind=3, payload=struct.pack("<II", 9, 3) + bytes(1636))
+        for second in (make_asav(kind=2, payload=b'{"revision": 1}'), bad_version):
+            with self.subTest(second=second[:4]), tempfile.TemporaryDirectory() as tmp:
+                source, out = os.path.join(tmp, "input.asav"), os.path.join(tmp, "x")
+                write(source, profile)
+                self.assertEqual(self.run_tool("extract", source, out).returncode, 0)
+                self.assertEqual(rd_json(os.path.join(out, "profile.json"))["account_id"], 0xCAFEF00D)
+                write(source, second)
+                result = self.run_tool("extract", source, out)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(os.path.exists(os.path.join(out, "profile.json")))
+        with tempfile.TemporaryDirectory() as tmp:   # and a profile written over a JSON payload removes payload.json
+            source, out = os.path.join(tmp, "input.asav"), os.path.join(tmp, "x")
+            write(source, make_asav(kind=2, payload=b'{"revision": 1}'))
+            self.assertEqual(self.run_tool("extract", source, out).returncode, 0)
+            write(source, profile)
+            self.assertEqual(self.run_tool("extract", source, out).returncode, 0)
+            self.assertFalse(os.path.exists(os.path.join(out, "payload.json")))
+            self.assertTrue(os.path.isfile(os.path.join(out, "profile.json")))
+
     def test_asav_payload_at_the_limit_is_written_as_json(self):
         levels = saves.MAX_JSON_DEPTH - 1
         payload = b'{"a":' + b"[" * levels + b"0" + b"]" * levels + b"}"

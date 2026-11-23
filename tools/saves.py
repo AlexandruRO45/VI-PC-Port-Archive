@@ -418,7 +418,8 @@ def extract(p, out):
         with open(os.path.join(out, 'payload.bin'), 'wb') as f:
             f.write(pl)
         pretty = os.path.join(out, 'payload.json')
-        written = False
+        profile = os.path.join(out, 'profile.json')
+        written = profiled = False
         if pl[:1] == b'{':
             try:
                 obj = json.loads(pl.rstrip(b'\0').decode('utf-8'))
@@ -432,16 +433,19 @@ def extract(p, out):
         elif h['kind'] == 3 and len(pl) >= 8:
             try:
                 prof = parse_profile(pl)
-                with open(os.path.join(out, 'profile.json'), 'w', encoding='utf-8', newline="\n") as f:
+                with open(profile, 'w', encoding='utf-8', newline="\n") as f:
                     json.dump(prof, f, indent=1)
+                profiled = True
             except ValueError as ex:
                 print('profile payload did not parse:', ex)
-        if not written:
-            # A payload.json left by an earlier extract into this folder describes another payload than payload.bin.
-            try:
-                os.remove(pretty)
-            except FileNotFoundError:
-                pass
+        # A payload.json or profile.json left by an earlier extract into this folder describes another payload than
+        # payload.bin.
+        for path, current in ((pretty, written), (profile, profiled)):
+            if not current:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
         print(f'ASAV kind {h["kind"]} ({h["slot_name"]}) -> {out}')
     else:
         sys.exit(f'{p}: extract supports JSAV and ASAV')
