@@ -1747,6 +1747,21 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_existing_heap COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
 
+    # DirectStorage physical-page writes reach imported buffers and their GPU aliases, including after remapping.
+    add_executable(dstorage_gpu_test
+      test/dstorage_gpu_test.cpp
+      shims/dstorage.cpp
+      shims/xmem.cpp
+      shims/file_system.cpp
+      shims/registry.cpp
+    )
+    target_link_libraries(dstorage_gpu_test PRIVATE gta6rt_d3d12_com psapi advapi32)
+    target_compile_definitions(dstorage_gpu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dstorage_gpu_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dstorage_gpu COMMAND dstorage_gpu_test)
+    set_tests_properties(dstorage_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+                        FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)
     target_link_libraries(d3d12_fence_timing_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
