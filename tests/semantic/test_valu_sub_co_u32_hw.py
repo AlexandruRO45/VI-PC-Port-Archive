@@ -184,5 +184,95 @@ class TestValuSubCoU32ASTDefinitions(unittest.TestCase):
         self.assertEqual(str(inst.src0), "s2")
         self.assertEqual(inst.src1, 42)
 
+# ---------------------------------------------------------------------------
+# Stage 3: Deterministic instruction interpreter
+# ---------------------------------------------------------------------------
+
+class ValuSubCoInterpreter:
+    """Scalar architectural interpreter for v_sub_co_u32."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+        self.vcc_lo = 0
+
+    def resolve(self, operand: Register | int) -> int:
+        if isinstance(operand, int):
+            return operand & MASK32
+        if operand.kind == RegKind.VGPR:
+            return self.vgprs[operand.index]
+        if operand.kind == RegKind.SGPR:
+            return self.sgprs[operand.index]
+        if operand.name == "vcc_lo":
+            return self.vcc_lo
+        return 0
+
+    def step(self, inst: VOP3COInstruction) -> tuple[int, int]:
+        s0 = self.resolve(inst.src0)
+        s1 = self.resolve(inst.src1)
+        diff, borrow = oracle_sub_co_u32(s0, s1)
+        self.vgprs[inst.vdst.index] = diff
+        borrow_mask = MASK32 if borrow else 0
+        if inst.sdst.kind == RegKind.SPECIAL and inst.sdst.name == "vcc_lo":
+            self.vcc_lo = borrow_mask
+        elif inst.sdst.kind == RegKind.SGPR:
+            self.sgprs[inst.sdst.index] = borrow_mask
+        return diff, borrow
+
+
+class TestValuSubCoU32ScalarInterpreter(unittest.TestCase):
+    """Stage 3: Deterministic scalar instruction interpreter for v_sub_co_u32."""
+
+    def test_interpreter_vgpr_subtraction(self) -> None:
+        interp = ValuSubCoInterpreter()
+        interp.vgprs[1] = 50
+        interp.vgprs[2] = 20
+
+        inst = VOP3COInstruction(
+            Opcode.V_SUB_CO_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.SPECIAL, 0, "vcc_lo"),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+        )
+        diff, borrow = interp.step(inst)
+        self.assertEqual(diff, 30)
+        self.assertEqual(borrow, 0)
+        self.assertEqual(interp.vgprs[0], 30)
+        self.assertEqual(interp.vcc_lo, 0)
+
+    def test_interpreter_borrow_into_sgpr(self) -> None:
+        interp = ValuSubCoInterpreter()
+        interp.vgprs[1] = 10
+        interp.vgprs[2] = 25
+
+        inst = VOP3COInstruction(
+            Opcode.V_SUB_CO_U32,
+            Register(RegKind.VGPR, 3),
+            Register(RegKind.SGPR, 8),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+        )
+        diff, borrow = interp.step(inst)
+        self.assertEqual(diff, (10 - 25) & MASK32)
+        self.assertEqual(borrow, 1)
+        self.assertEqual(interp.vgprs[3], (10 - 25) & MASK32)
+        self.assertEqual(interp.sgprs[8], MASK32)
+
+    def test_interpreter_literal_subtraction(self) -> None:
+        interp = ValuSubCoInterpreter()
+        interp.vgprs[1] = 100
+
+        inst = VOP3COInstruction(
+            Opcode.V_SUB_CO_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.SPECIAL, 0, "vcc_lo"),
+            Register(RegKind.VGPR, 1),
+            30,
+        )
+        diff, borrow = interp.step(inst)
+        self.assertEqual(diff, 70)
+        self.assertEqual(borrow, 0)
+
 if __name__ == "__main__":
     unittest.main()
