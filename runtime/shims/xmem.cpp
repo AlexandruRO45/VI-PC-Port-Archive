@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "shims.h"
@@ -35,29 +36,31 @@ constexpr size_t kAlign = 64;
 // startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
 // bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
 // which would fill the file. Off: one relaxed load per call.
-void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+// `api` is the exporting entry point, so a virtual allocation is not counted with XMemAlloc's words: the two APIs
+// carry different attribute words and a shared key would hide one of them.
+void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<bool, uint64_t>> seen;
+    static std::set<std::tuple<const char*, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({is_alloc, attributes}).second) return;
+        if (!seen.insert({api, attributes}).second) return;
     }
-    std::string fields = std::string("\"api\":\"") + (is_alloc ? "XMemAlloc" : "XMemFree") +
-                         "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
-    if (is_alloc) fields += ",\"size\":" + std::to_string(size);
+    std::string fields = std::string("\"api\":\"") + api + "\",\"attributes\":" +
+                         rt::startup_trace::quote(rt::startup_trace::hex(attributes));
+    if (size) fields += ",\"size\":" + std::to_string(size);
     fields += ",\"caller\":" +
               rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
+    note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
     return _aligned_malloc(size ? size : 1, kAlign);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes(false, attributes, 0, _ReturnAddress());
+    note_attributes("XMemFree", attributes, 0, _ReturnAddress());
     _aligned_free(p);
 }
 
@@ -131,6 +134,10 @@ constexpr DWORD kXmemLargePages = 0x20000000;
 constexpr DWORD kXmem64kPages = 0x20400000;
 constexpr DWORD kXmemPageModeMask = kXmem64kPages;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
+constexpr SIZE_T kXmemPageSize2m = 0x200000;
+// PAGE_GRAPHICS_* (0x800 and above) name a GPU binding of the range, not CPU access: the CPU protection is the
+// low PAGE_* bits the host understands.
+constexpr DWORD kHostProtectMask = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE | 0xFF;
 constexpr DWORD kXmemHostAllocationTypeMask =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
 
@@ -142,35 +149,44 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 }
 
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
-    // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region.
+    // Three shapes reach this export:
+    //   64 KiB reserve-only   MEM_RESERVE | kXmem64kPages      (the title backs it with physical pages later)
+    //   2 MiB reserve+commit  MEM_RESERVE | MEM_COMMIT | kXmemLargePages
+    //   ordinary Win32        no page mode
+    // A page mode picks a guest granularity, so the host reservation is aligned and rounded to it. It is never
+    // forwarded as MEM_LARGE_PAGES: that flag needs SeLockMemoryPrivilege and a 2 MiB pagefile the title does not
+    // control, while the guest only observes the granularity. The attribute word names the guest memory class; the
+    // shim keeps no per-class policy, so it is accepted for a page-mode call and traced. The PAGE_GRAPHICS_* bits
+    // are dropped: the range is CPU-backed here.
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    if (attributes != 0) {
-        // A reserve-only call needs address space, not physical pages or a GPU binding.
-        // These are the two 64 KiB access/protection pairs observed at startup. Preserve the
-        // CPU protection; no pages are backed at this point.
-        if (allocation_type != (MEM_RESERVE | kXmem64kPages)) {
-            SetLastError(ERROR_NOT_SUPPORTED);
-            return nullptr;
-        }
-        if (attributes == 0x03 && protect == (PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS)) {
-            protect = PAGE_NOACCESS;
-        } else if (attributes != 0x21 || protect != PAGE_READWRITE) {
-            SetLastError(ERROR_NOT_SUPPORTED);
-            return nullptr;
-        }
-    }
+
+    if (attributes != 0) note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
 
     const DWORD page_mode = allocation_type & kXmemPageModeMask;
-    if (page_mode == kXmemLargePages) {
+    SIZE_T guest_granularity = 0;
+    if (page_mode == kXmem64kPages) {
+        guest_granularity = kXmemPageSize64k;
+    } else if (page_mode == kXmemLargePages) {
+        guest_granularity = kXmemPageSize2m;
+    } else if (page_mode != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    if (page_mode == 0 && attributes != 0) {
+        // An attribute word outside a page mode is a shape the shim has no policy for.
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
-    if (page_mode != 0 && page_mode != kXmem64kPages) {
+
+    // attributes is the guest's memory-class word. Its bits are not fully known, so it is accepted for every page
+    // mode and traced, and the CPU protection comes from the low PAGE_* bits alone: PAGE_GRAPHICS_NOACCESS on its own
+    // then reads as PAGE_NOACCESS, which is what the guest asked the CPU for.
+    const DWORD host_protect = protect & kHostProtectMask;
+    if (host_protect == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
@@ -186,10 +202,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 
     SYSTEM_INFO system_info{};
     GetSystemInfo(&system_info);
-    const SIZE_T page_granularity = page_mode == kXmem64kPages ? kXmemPageSize64k : system_info.dwPageSize;
+    const SIZE_T page_granularity = guest_granularity != 0 ? guest_granularity : system_info.dwPageSize;
     const SIZE_T base_granularity =
-        page_mode == kXmem64kPages
-            ? kXmemPageSize64k
+        guest_granularity != 0
+            ? guest_granularity
             : ((host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize);
     if (page_granularity == 0 || (page_granularity & (page_granularity - 1)) != 0 || base_granularity == 0 ||
         (base_granularity & (base_granularity - 1)) != 0) {
@@ -214,12 +230,12 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                               ~(static_cast<uintptr_t>(page_granularity) - 1);
         address = reinterpret_cast<void*>(base);
         size = static_cast<SIZE_T>(end - base);
-    } else if (page_mode == kXmem64kPages && !round_up_size(size, page_granularity, size)) {
+    } else if (guest_granularity != 0 && !round_up_size(size, page_granularity, size)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
-    return VirtualAlloc(address, size, host_type, protect);
+    return VirtualAlloc(address, size, host_type, host_protect);
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,

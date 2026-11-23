@@ -166,6 +166,8 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     check(page_size != 0, "GetSystemInfo reports a non-zero page size");
     if (page_size == 0) return;
 
+    constexpr SIZE_T k_large_page_size = 2 * 1024 * 1024;
+
     const SIZE_T region_size = page_size * 3;
     void* const base = virtual_alloc(nullptr, region_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, 0,
                                      PAGE_READWRITE);
@@ -219,10 +221,36 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
 
     SetLastError(ERROR_SUCCESS);
-    void* const large_page = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0,
+    // The 2 MiB mode is emulated with ordinary pages: the length keeps the guest granularity, but the host only
+    // guarantees its own 64 KiB allocation granularity, so the base is not promised 2 MiB alignment.
+    void* const large_page = virtual_alloc(nullptr, k_large_page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0,
                                            PAGE_READWRITE);
-    check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "unsupported large-page allocation is rejected before host allocation");
+    check(large_page != nullptr, "2 MiB page mode reserves and commits through ordinary pages");
+    if (large_page) {
+        MEMORY_BASIC_INFORMATION region{};
+        check(VirtualQuery(large_page, &region, sizeof(region)) == sizeof(region) &&
+                  reinterpret_cast<uintptr_t>(large_page) % system_info.dwAllocationGranularity == 0 &&
+                  region.RegionSize >= k_large_page_size && region.State == MEM_COMMIT &&
+                  region.AllocationProtect == PAGE_READWRITE,
+              "2 MiB range is host-granularity aligned, committed for the CPU and long enough for the guest");
+        ((volatile unsigned char*)large_page)[0] = 1;
+        ((volatile unsigned char*)large_page)[k_large_page_size - 1] = 2;
+        check(VirtualFree(large_page, 0, MEM_RELEASE), "release the 2 MiB reservation");
+    }
+
+    // A guest page mode with attribute words the shim has no policy for still allocates: the word is traced, not
+    // enforced, and the graphics protection bits name the GPU side of the range, not CPU access.
+    void* const attributed_commit = virtual_alloc(nullptr, k_large_page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000,
+                                                  0x183, PAGE_GRAPHICS_READWRITE | 0x20000 | PAGE_READWRITE);
+    check(attributed_commit != nullptr,
+          "2 MiB commit accepts the title's attribute word and drops PAGE_GRAPHICS_*");
+    if (attributed_commit) {
+        MEMORY_BASIC_INFORMATION region{};
+        check(VirtualQuery(attributed_commit, &region, sizeof(region)) == sizeof(region) &&
+                  region.State == MEM_COMMIT && region.AllocationProtect == PAGE_READWRITE,
+              "graphics protection bits do not reach the host protection");
+        check(VirtualFree(attributed_commit, 0, MEM_RELEASE), "release the attributed 2 MiB reservation");
+    }
 
     SetLastError(ERROR_SUCCESS);
     void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
@@ -250,14 +278,34 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
             check(VirtualFree(reservation, 0, MEM_RELEASE), "release attributed reservation");
         }
         SetLastError(ERROR_SUCCESS);
-        check(!virtual_alloc(nullptr, guest_page, reserve64k | MEM_COMMIT, request.attributes,
-                             request.guest_protect) && GetLastError() == ERROR_NOT_SUPPORTED,
-              "reservation support does not commit or emulate physical pages");
+        // The same word with MEM_COMMIT backs the range with ordinary host pages: the title commits a 64 KiB-granular
+        // block this way for its own allocator.
+        void* const committed = virtual_alloc(nullptr, guest_page + 1, reserve64k | MEM_COMMIT, request.attributes,
+                                              request.guest_protect);
+        check(committed != nullptr, "attributed 64 KiB reserve+commit returns an address");
+        if (committed) {
+            MEMORY_BASIC_INFORMATION region{};
+            check(VirtualQuery(committed, &region, sizeof(region)) == sizeof(region) &&
+                      region.RegionSize == 2 * guest_page && region.State == MEM_COMMIT &&
+                      region.AllocationProtect == request.host_protect,
+                  "commit backs the rounded range with the requested CPU protection");
+            check(VirtualFree(committed, 0, MEM_RELEASE), "release the committed reservation");
+        }
     }
     SetLastError(ERROR_SUCCESS);
-    check(!virtual_alloc(nullptr, guest_page, reserve64k, 0x03, PAGE_READWRITE) &&
+    check(!virtual_alloc(nullptr, guest_page, 0, 0x181, PAGE_READWRITE) &&
               GetLastError() == ERROR_NOT_SUPPORTED,
-          "other attribute and CPU protection pairs stay unsupported");
+          "an attribute word without a guest page mode stays unsupported");
+
+    // The title's own allocator commits 20 MiB with the 0x181 word on top of 64 KiB pages.
+    SetLastError(ERROR_SUCCESS);
+    void* const title_heap = virtual_alloc(nullptr, 0x1400000, reserve64k | MEM_COMMIT, 0x181, PAGE_READWRITE);
+    check(title_heap != nullptr, "the title's 20 MiB 64 KiB commit is backed by host pages");
+    if (title_heap) {
+        ((volatile unsigned char*)title_heap)[0] = 1;
+        ((volatile unsigned char*)title_heap)[0x13fffff] = 2;
+        check(VirtualFree(title_heap, 0, MEM_RELEASE), "release the title-sized block");
+    }
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
