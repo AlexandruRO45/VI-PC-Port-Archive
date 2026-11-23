@@ -115,21 +115,23 @@ def xml_root(data: bytes) -> str:
 def tail_root(data: bytes) -> str:
     tail = data[-512:]
     m = XML_CLOSE_TAIL.search(tail)
-    if m is None and tail.rstrip(b" \t\r\n").endswith((b"-->", b"?>")):
-        # Walk complete markup tokens so a fake closing tag or opener in a comment or PI cannot end the root.
+    if m is None and b"</" in tail and tail.rstrip(b" \t\r\n").endswith((b"-->", b"?>")):
+        # Find the epilogue with full markup context. A comment, PI or CDATA can start before the tail,
+        # but any closing tag we recover must still be inside the tail.
+        tail_start = len(data) - len(tail)
         end, epilogue = 0, None
-        while start := XML_MARKUP_START.search(tail, end):
+        while start := XML_MARKUP_START.search(data, end):
             terminator = XML_MARKUP_END[start[0]]
-            close = tail.find(terminator, start.end())
+            close = data.find(terminator, start.end())
             if close < 0:
                 return ""
-            if terminator == b"]]>":
+            if start.start() < tail_start or terminator == b"]]>":
                 epilogue = None
-            elif epilogue is None or tail[end:start.start()].strip(b" \t\r\n"):
+            elif epilogue is None or data[end:start.start()].strip(b" \t\r\n"):
                 epilogue = start.start()
             end = close + len(terminator)
-        if epilogue is not None and not tail[end:].strip(b" \t\r\n"):
-            m = XML_CLOSE_TAIL.search(tail[:epilogue])
+        if epilogue is not None and not data[end:].strip(b" \t\r\n"):
+            m = XML_CLOSE_TAIL.search(data[tail_start:epilogue])
     return m.group(1).decode("ascii", "replace") if m else ""
 
 

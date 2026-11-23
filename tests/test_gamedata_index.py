@@ -342,11 +342,15 @@ class XmlClassificationTest(unittest.TestCase):
                 self.assertTrue(self.tool.standalone_xml(data))
 
         self.assertEqual(self.tool.tail_root(b"<Child/></Root><!-- note -->"), "Root")
+        long_doc = b"<Root>" + b"x" * 600 + b"</Root><?note literal <? and </Other>?>"
+        self.assertEqual(self.tool.tail_root(long_doc), "Root")
+        self.assertTrue(self.tool.standalone_xml(long_doc))
         for data in (b"<Root><!-- </Other> -->", b"<Root><?note </Other>?>",
                      b"<Root><![CDATA[</Other>]]><!-- note -->",
                      b"<Root><![CDATA[</Other><!-- note -->",
                      b"<Root></Root>invalid<!-- note -->",
                      b"<Root></Root><!--" + b" " * 512 + b" </Other> -->",
+                     b"<Root></Root><?note " + b"x" * 512 + b" </Other><?nested?>",
                      b"<Root></Root>" + b" " * 512 + b"<!-- note -->"):
             with self.subTest(data=data):
                 self.assertEqual(self.tool.tail_root(data), "")
