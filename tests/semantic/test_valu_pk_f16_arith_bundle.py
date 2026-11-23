@@ -352,5 +352,21 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
         lo, hi = unpack_f16x2(res_zero_inf)
         self.assertTrue(math.isnan(bits_to_f16(lo)))
 
+    def test_v_pk_fma_f16_translator_integration_and_negative_controls(self):
+        lines = [
+            "v_mov_b32 v1, 0x40004000",
+            "v_mov_b32 v2, 0x42004200",
+            "v_mov_b32 v3, 0x3c003c00",
+            "v_pk_fma_f16 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_v_pk_fma_f16", lines)
+        out = mrt0_words(spv)[0]
+        self.assertEqual(out, 0x47004700)
+
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_pk_fma", ["v_pk_fma_f16 v0, v1, v2", "s_endpgm"])
+
 if __name__ == '__main__':
     unittest.main()
