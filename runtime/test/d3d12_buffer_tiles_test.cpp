@@ -195,16 +195,36 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
     return true;
 }
 
+// A D3D12 device on `adapter` with tiled resources tier 2 or more, announced; null otherwise.
+ComPtr<ID3D12Device> tiled_device(IDXGIAdapter1* adapter) {
+    DXGI_ADAPTER_DESC1 desc{};
+    ComPtr<ID3D12Device> device;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (FAILED(adapter->GetDesc1(&desc)) ||
+        FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))) ||
+        FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+        options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+        return {};
+    std::printf("Native D3D12: %ls, tiled resources tier %u\n", desc.Description, unsigned(options.TiledResourcesTier));
+    return device;
+}
+
 // The host adapter for the native half. LEONIDA_HOST_ADAPTER picks it as in d3d12_copy_compare.h: "warp", or part of
 // an adapter name (case-insensitive); a value that names no adapter with tiled resources tier 2 skips the native half
-// rather than testing another GPU. Unset: the first hardware adapter with tier 2 or more.
-ComPtr<ID3D12Device> native_device() {
+// rather than testing another GPU. Unset: the adapter behind the layer's device (`layer_luid`, as host_adapter.h
+// rules), else the first hardware adapter with tier 2 or more. On a laptop with an RTX 5080 (NVIDIA 621.14) and an
+// Intel iGPU, the first adapter was the iGPU, whose native run read zeros from every tile of snapshot 1 while the
+// layer and the NVIDIA host driver agreed.
+ComPtr<ID3D12Device> native_device(LUID layer_luid) {
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
     char want[128] = {};
     GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
     std::string needle(want);
     std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    ComPtr<IDXGIAdapter1> layer;
+    if (needle.empty() && SUCCEEDED(factory->EnumAdapterByLuid(layer_luid, IID_PPV_ARGS(&layer))))
+        if (auto device = tiled_device(layer.Get())) return device;
     for (UINT i = 0;; ++i) {
         ComPtr<IDXGIAdapter1> adapter;
         if (needle == "warp") {
@@ -221,13 +241,7 @@ ComPtr<ID3D12Device> native_device() {
             for (const wchar_t* c = desc.Description; *c; ++c) name += char(std::tolower(*c < 128 ? *c : '?'));
             if (name.find(needle) == std::string::npos) continue;
         }
-        ComPtr<ID3D12Device> device;
-        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) continue;
-        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
-            options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) continue;
-        std::printf("Native D3D12: %ls, tiled resources tier %u\n", desc.Description, unsigned(options.TiledResourcesTier));
-        return device;
+        if (auto device = tiled_device(adapter.Get())) return device;
     }
     if (!needle.empty())
         std::printf("Native D3D12: no adapter matching LEONIDA_HOST_ADAPTER=%s with tiled resources tier 2 or more; "
@@ -252,7 +266,7 @@ int main() {
     if (!run(*vulkan.Get(), observed, true)) return 1;
     std::puts("Vulkan replay: 12 full tiles matched across aliased, skipped, unmapped, reused and remapped ranges");
     std::puts("A rejected update left all tile mappings intact");
-    if (auto device = native_device()) {
+    if (auto device = native_device(vulkan->GetAdapterLuid())) {
         if (!run(*device.Get(), native) || native != observed) return 1;
         std::puts("Native D3D12 matched all three GPU readbacks");
     }
