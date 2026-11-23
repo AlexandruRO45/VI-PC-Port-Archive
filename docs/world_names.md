@@ -79,7 +79,7 @@ no incomplete entity records):
 |---|---:|---:|
 | `rpf9_names.py --types dr,ft` (default `--max-inflate`, 1 MiB) | 227,422 (99.45%) | 1,667,978 (99.85%) |
 | `rpf9_names.py --types dr,ft --max-inflate 268435456` | 228,430 (99.89%) | 1,669,373 (99.94%) |
-| `rpf9_names.py --types dr` only (default) | 217,491 (95.11%) | 508,600 (30.45%) |
+| `rpf9_names.py --types dr` only (drawable names, default `--max-inflate`, 1 MiB) | 217,491 (95.11%) | 508,600 (30.45%) |
 
 Every resolved hash is **verified** by the entity's 64-bit key (Murmur3-64, see Result): 0 unverified, 0
 unconfirmed, 0 ambiguous. Two observations explain the earlier lower bound:
