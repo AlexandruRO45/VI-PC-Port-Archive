@@ -92,6 +92,20 @@ def not_found(exe: str, error: OSError, flag: str | None = None) -> str:
             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
+def find(*names: str) -> list | None:
+    """The llvm-mc to run, as an argv list: LLVM_MC when it is set (a path, or a whole command line such as the WSL
+    one above), else the first of `names` (default llvm-mc) found on PATH, else None. Tests that skip without
+    llvm-mc ask this, so a Windows path keeps its backslashes and a command line is not taken for one file."""
+    raw = os.environ.get("LLVM_MC", "").strip()
+    if raw:
+        return split_command(raw)
+    for name in names or ("llvm-mc",):
+        found = shutil.which(name)
+        if found:
+            return [found]
+    return None
+
+
 def has_amdgpu(cmd: list) -> bool:
     """True if this llvm-mc lists the amdgcn target in --version. The official Windows release archives have no
     AMDGPU target and answer every amdgcn triple with "unable to get target"; an llvm-mc that cannot be started

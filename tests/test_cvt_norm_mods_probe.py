@@ -6,7 +6,6 @@ import io
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -204,17 +203,17 @@ class ReferenceModelTests(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr[:800])
 
     def test_kernels_assemble_when_llvm_mc_available(self):
-        llvm_mc = os.environ.get("LLVM_MC") or shutil.which("llvm-mc")
-        if not llvm_mc or not os.path.isfile(llvm_mc):
+        llvm_mc = mc_command.find("llvm-mc")      # LLVM_MC may be a command line (WSL), not only a path
+        if not llvm_mc:
             self.skipTest("llvm-mc not found")
-        if not mc_command.has_amdgpu([llvm_mc]):
-            self.skipTest(f"{llvm_mc} has no AMDGPU target (its --version lists no amdgcn)")
+        if not mc_command.has_amdgpu(llvm_mc):
+            self.skipTest(f"{' '.join(llvm_mc)} has no AMDGPU target (its --version lists no amdgcn)")
         for wave in (32, 64):
             kernels, _ = pr.build_jobs(list(pr.OPS), [wave])
             text, _, _ = asm.module_text(kernels, "gfx1036", wave=wave)
             flags = ["-mattr=+wavefrontsize64"] if wave == 64 else []
             res = subprocess.run(
-                [llvm_mc, "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1036", *flags, "-filetype=obj", "-o", os.devnull],
+                [*llvm_mc, "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1036", *flags, "-filetype=obj", "-o", os.devnull],
                 input=text,
                 capture_output=True,
                 text=True,

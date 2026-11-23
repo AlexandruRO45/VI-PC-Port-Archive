@@ -17,7 +17,6 @@ from __future__ import annotations
 import glob
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
@@ -299,12 +298,12 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(list(out), [0x3F800000, 0x40400000, 0x3F800000, 0x40400000])
 
     def test_parity_with_llvm_mc_on_shader_fixtures(self):
-        mc = os.environ.get("LLVM_MC") or shutil.which("llvm-mc") or shutil.which("llvm-mc-18")
+        mc = mc_command.find("llvm-mc", "llvm-mc-18")   # LLVM_MC may be a command line (WSL), not only a path
         if not mc:
             self.skipTest("llvm-mc not available")
-        if not mc_command.has_amdgpu([mc]):
+        if not mc_command.has_amdgpu(mc):
             # Without the target every fixture fails to assemble and is passed over, so 0 would be checked.
-            self.skipTest(f"{mc} has no AMDGPU target (its --version lists no amdgcn)")
+            self.skipTest(f"{' '.join(mc)} has no AMDGPU target (its --version lists no amdgcn)")
         asms = sorted(glob.glob(os.path.join(ROOT, "runtime", "test", "shaders", "*.asm")))
         self.assertGreater(len(asms), 50)
 
@@ -337,7 +336,7 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             m = re.search(r"^;\s*mattr:\s*(\S+)", txt, re.M)
             mattr = m.group(1) if m else ""
             wave32 = "-wavefrontsize32" not in mattr and "+wavefrontsize64" not in mattr
-            cmd = [mc, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
+            cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
             if mattr:
                 cmd.append("-mattr=" + mattr)
             if os.path.basename(path) == "vs_clip.asm":
@@ -352,7 +351,7 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 ins = shader_ir.parse_line(ln)
                 if ins and ins["enc"]:
                     raw.extend(bytes.fromhex(ins["enc"]))
-            dcmd = [mc, "-disassemble", "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
+            dcmd = mc + ["-disassemble", "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
             if mattr:
                 dcmd.append("-mattr=" + mattr)
             dr = subprocess.run(dcmd, input=" ".join(f"0x{b:02x}" for b in raw), text=True, capture_output=True)

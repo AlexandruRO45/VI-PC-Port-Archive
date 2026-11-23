@@ -12,7 +12,6 @@ These tests verify:
 """
 import os
 import re
-import shlex
 import shutil
 import struct
 import subprocess
@@ -51,11 +50,8 @@ def vdata_reg(dmask, d16=False):
 
 
 def llvm_mc_cmd():
-    env = os.environ.get("LLVM_MC")
-    if env:
-        return shlex.split(env)
-    exe = shutil.which("llvm-mc")
-    return [exe] if exe else None
+    # mc_command, not shlex.split: shlex drops the backslashes of a Windows LLVM_MC path.
+    return mc_command.find("llvm-mc")
 
 
 def validate_spirv(spvasm):

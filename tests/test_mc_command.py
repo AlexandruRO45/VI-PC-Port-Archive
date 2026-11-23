@@ -187,6 +187,35 @@ class MissingLlvmMcTest(unittest.TestCase):
                 self.assertEqual("--llvm-mc" in p.stderr, name == "run_gpu_tests.py", p.stderr)
 
 
+class FindTest(unittest.TestCase):
+    """find() is how a test that skips without llvm-mc reads LLVM_MC: a path keeps its backslashes and a command
+    line is split, where shlex.split and a single-path check got the Windows path and the WSL form wrong."""
+
+    def test_a_windows_path_keeps_its_backslashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "llvm mc", "llvm-mc.exe")
+            os.makedirs(os.path.dirname(path))
+            open(path, "wb").close()
+            with mock.patch.dict(os.environ, {"LLVM_MC": path}):
+                self.assertEqual(mc_command.find(), [path])
+
+    def test_a_command_line_is_split(self):
+        with mock.patch.dict(os.environ, {"LLVM_MC": "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"}):
+            self.assertEqual(mc_command.find(), ["wsl", "-d", "Ubuntu", "-e", "/usr/lib/llvm-21/bin/llvm-mc"])
+
+    def test_without_llvm_mc_the_first_name_on_path_is_taken(self):
+        found = {"llvm-mc-18": "/usr/bin/llvm-mc-18"}
+        with mock.patch.dict(os.environ, {"LLVM_MC": ""}), \
+                mock.patch.object(mc_command.shutil, "which", side_effect=found.get) as which:
+            self.assertEqual(mc_command.find("llvm-mc", "llvm-mc-18"), ["/usr/bin/llvm-mc-18"])
+            self.assertEqual([c.args[0] for c in which.call_args_list], ["llvm-mc", "llvm-mc-18"])
+
+    def test_nothing_found_is_none(self):
+        with mock.patch.dict(os.environ, {"LLVM_MC": "  "}), \
+                mock.patch.object(mc_command.shutil, "which", return_value=None):
+            self.assertIsNone(mc_command.find())
+
+
 class HasAmdgpuTest(unittest.TestCase):
     """has_amdgpu() reads the registered targets from --version, so tests skip on the official Windows LLVM build
     (x86 only, "unable to get target" for every amdgcn triple) instead of failing."""
