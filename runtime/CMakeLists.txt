@@ -1279,6 +1279,19 @@ if(TARGET Vulkan::Headers)
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   endif()
+  # glslangValidator runs in the build folder and converts that folder's name to the ANSI code page for its debug
+  # info. On Windows a name with a character outside the code page (CJK or Cyrillic on a Western-locale system, say)
+  # makes it exit with 0xC0000409 (-1073740791) before writing anything, so every GLSL test shader fails to build.
+  # Measured with glslang 16.6.0 on windows-latest (code page 1252): a checkout under "测试 Ünï" fails at the first
+  # shader, one under "Pasta João Ünï" builds all 41. Say so here, where the cause is still visible.
+  string(REGEX REPLACE "[\t -~]" "" _leonida_build_dir_non_ascii "${CMAKE_CURRENT_BINARY_DIR}")
+  if(WIN32 AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE AND NOT _leonida_build_dir_non_ascii STREQUAL "")
+    message(WARNING
+      "The build folder has non-ASCII characters:\n  ${CMAKE_CURRENT_BINARY_DIR}\n"
+      "If the GLSL test shaders then fail with exit code 0xC0000409 (-1073740791), that is glslangValidator failing "
+      "to convert this folder's name to the Windows ANSI code page. Build from a folder whose name uses only "
+      "characters of your Windows language (or only ASCII), for example: cmake -S runtime -B C:/leonida-build")
+  endif()
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     add_executable(vk_overlapping_occlusion_test test/vk_overlapping_occlusion_test.cpp)
     target_link_libraries(vk_overlapping_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
