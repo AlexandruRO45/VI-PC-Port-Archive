@@ -15780,33 +15780,87 @@ def sdwa_reads_dst(op: str, mods: list[str]) -> bool:
 VGPR_READ_ONLY_PREFIXES = ("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "ds_write",
                            "global_store", "flat_store", "scratch_store")
 
+_RMW_A0_OPS = frozenset((
+    "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_pk_fmac_f16",
+    "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16",
+    "v_dot4c_i32_i8", "v_dot4c_u32_u8",
+    "v_dot8c_i32_i4", "v_dot8c_u32_u4",
+))
+
+
+def _vgpr_regs(arg):
+    if arg["k"] == "vgpr":
+        return list(range(arg["r"], arg["r"] + arg.get("n", 1)))
+    if arg["k"] == "vlist":
+        return list(arg["r"])
+    return []
+
+
+def _insn_vgpr_rw(ins):
+    """Return (reads, writes) VGPR register lists for one parsed instruction.
+
+    Shared by read_before_write_vgprs, interp_ij_analysis, reg_reads_writes and
+    interp_copy_sources so all VGPR liveness / write analyses agree on operand roles.
+    """
+    a = ins["args"]
+    if not a:
+        return [], []
+    op = ins["op"]
+    bop = base_op(op)
+    mods = ins.get("mods", ())
+    is_ds_non_rtn = (
+        op.startswith("ds_")
+        and "_rtn" not in op
+        and not op.startswith(("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute",
+                               "ds_append", "ds_consume", "ds_ordered_count"))
+    )
+    reads_all = (
+        op.startswith(VGPR_READ_ONLY_PREFIXES)
+        or is_ds_non_rtn
+        or (op.startswith(("global_atomic_", "buffer_atomic_", "image_atomic_"))
+            and "glc" not in mods)
+        or ("lds" in mods and op.startswith(("buffer_load_", "tbuffer_load_")))
+    )
+    if reads_all:
+        reads = []
+        for x in a:
+            reads.extend(_vgpr_regs(x))
+        return reads, []
+
+    reads = []
+    for x in (a if sdwa_reads_dst(op, mods) else a[1:]):
+        reads.extend(_vgpr_regs(x))
+    if a[0]["k"] == "vgpr":
+        writes = list(vgpr_dest_registers(ins, extra=int("tfe" in mods)))
+    else:
+        writes = _vgpr_regs(a[0])
+
+    # buffer_atomic_* / image_atomic_* with glc: a[0] (vdata) is both read and written;
+    # for cmpswap / fcmpswap with glc, vdata holds (src, cmp) and only the low half is overwritten.
+    if op.startswith(("buffer_atomic_", "image_atomic_")):
+        reads.extend(_vgpr_regs(a[0]))
+        if "cmpswap" in op and a[0]["k"] == "vgpr" and a[0].get("n", 1) >= 2:
+            writes = list(range(a[0]["r"], a[0]["r"] + a[0]["n"] // 2))
+    elif bop == "v_swap_b32":
+        reads.extend(_vgpr_regs(a[0]))
+    elif (bop in _RMW_A0_OPS
+          or (op.startswith(("global_load_", "buffer_load_", "ds_read_"))
+              and "_d16" in op and "format" not in op)):
+        if a[0]["k"] == "vgpr":
+            reads.append(a[0]["r"])
+
+    return reads, writes
+
 
 def read_before_write_vgprs(insns):
     """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes."""
     written, first = set(), []
     for ins in insns:
-        a, op = ins["args"], ins["op"]
-        if not a:
-            continue
-        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES) \
-            or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
-        regs = []
-        for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
-            if x["k"] == "vgpr":
-                regs += range(x["r"], x["r"] + x.get("n", 1))
-            elif x["k"] == "vlist":
-                regs += x["r"]
-        if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                            "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                            "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
-                (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
-                a[0]["k"] == "vgpr":   # d16 keeps a half
-            regs.append(a[0]["r"])
-        for r in regs:
+        reads, writes = _insn_vgpr_rw(ins)
+        for r in reads:
             if r not in written and r not in first:
                 first.append(r)
-        if not reads_all and a[0]["k"] == "vgpr":
-            written.update(vgpr_dest_registers(ins))
+        written.update(writes)
     return set(first)
 
 def interp_ij_analysis(insns, g):
@@ -15846,13 +15900,9 @@ def interp_ij_analysis(insns, g):
              "v_interp_p1ll_f16": "v_interp_p2_f16", "v_interp_p1lv_f16": "v_interp_p2_f16"}
     writes = defaultdict(list)                 # vgpr -> indexes of insns writing it (read_before_write rules)
     for n, ins in enumerate(insns):
-        a, op = ins["args"], ins["op"]
-        if not a:
-            continue
-        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
-        if not reads_all and a[0]["k"] == "vgpr":
-            for r in vgpr_dest_registers(ins):
-                writes[r].append(n)
+        _, ww = _insn_vgpr_rw(ins)
+        for r in ww:
+            writes[r].append(n)
     sites = []
     for n, ins in enumerate(insns):
         op = base_op(ins["op"])
@@ -16047,23 +16097,9 @@ def reg_reads_writes(insns):
     """(vgprs read, vgprs written) over a slice of insns, by read_before_write_vgprs' conventions."""
     rr, ww = set(), set()
     for ins in insns:
-        a, op = ins["args"], ins["op"]
-        if not a:
-            continue
-        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
-        regs = []
-        for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
-            if x["k"] == "vgpr":
-                regs += range(x["r"], x["r"] + x.get("n", 1))
-            elif x["k"] == "vlist":
-                regs += x["r"]
-        if base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                           "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                           "v_dot8c_i32_i4", "v_dot8c_u32_u4") and a[0]["k"] == "vgpr":
-            regs.append(a[0]["r"])
-        rr.update(regs)
-        if not reads_all and a[0]["k"] == "vgpr":
-            ww.update(vgpr_dest_registers(ins))
+        reads, writes = _insn_vgpr_rw(ins)
+        rr.update(reads)
+        ww.update(writes)
     return rr, ww
 
 
@@ -17126,11 +17162,8 @@ def interp_copy_sources(insns):
     writes = {}
     for i, ins in enumerate(insns):
         ins["seq"] = i      # program order: also unique without encoding comments (test fixtures share a pc)
-        a = ins["args"]
-        if not (a and a[0].get("k") == "vgpr") or base_op(ins["op"]).startswith(
-                ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "image_store", "ds_write")):
-            continue
-        for r in vgpr_dest_registers(ins, extra=int("tfe" in ins["mods"])):
+        _, ww = _insn_vgpr_rw(ins)
+        for r in ww:
             writes.setdefault(r, []).append(ins)
     copies = {}
     grew = True
