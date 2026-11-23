@@ -98,6 +98,17 @@ class TestSLshl1AddU32AST(unittest.TestCase):
         expr_ovf = SLshl1AddU32Expr(0x80000000, 1)
         self.assertEqual(expr_ovf.eval(), (1, 1))
 
+class TestSLshl1AddU32OverflowAndSCC(unittest.TestCase):
+    def test_overflow_from_addition(self) -> None:
+        # S0 not overflowing on shift, but sum overflowing
+        # 0x40000000 << 1 = 0x80000000; + 0x80000000 = 0x100000000 -> scc 1
+        res, scc = ref_s_lshl_add_u32(1, 0x40000000, 0x80000000)
+        self.assertEqual((res, scc), (0, 1))
+
+    def test_no_overflow_boundary(self) -> None:
+        res, scc = ref_s_lshl_add_u32(1, 0x7FFFFFFF, 1)
+        self.assertEqual((res, scc), (0xFFFFFFFF, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
