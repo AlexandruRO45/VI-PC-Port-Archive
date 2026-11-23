@@ -785,6 +785,41 @@ class GetLodChecks(unittest.TestCase):
             self.assertEqual(check.get_lod_test(tmp, tmp, "ps_get_lod"), "missing vk_texture_test" + check.EXE)
 
 
+class UnsupportedToolReasons(unittest.TestCase):
+    """texture_constant_test and clip_test: a tool's exit 77 is a SKIP that quotes its own "unsupported: ..." line."""
+
+    REASON = "unsupported: need 144 push constant bytes, device has 128"
+
+    def test_texture_constant_test_skips_with_the_tools_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_gather_wrap.spv").touch()
+            with patch.object(check, "run", return_value=(check.UNSUPPORTED, f"device: X\n{self.REASON}\n")):
+                result = check.texture_constant_test(tmp, tmp, "ps_gather_wrap")
+                self.assertIsInstance(result, check.Skip)
+                self.assertEqual(result, f"SKIP ({self.REASON})")
+            with patch.object(check, "run", return_value=(check.UNSUPPORTED, "")):
+                self.assertEqual(str(check.texture_constant_test(tmp, tmp, "ps_gather_wrap")),
+                                 "SKIP (unsupported device)")
+            with patch.object(check, "run", return_value=(1, "FAILED vkCreateGraphicsPipelines -> -3\n")):
+                result = check.texture_constant_test(tmp, tmp, "ps_gather_wrap")
+                self.assertNotIsInstance(result, check.Skip)
+                self.assertIn("exit 1", result)
+
+    def test_clip_test_skips_with_the_tools_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for reason in (self.REASON, "unsupported: shaderClipDistance"):
+                with patch.object(check, "run", return_value=(check.UNSUPPORTED, f"device: X\n{reason}\n")):
+                    result = check.clip_test(tmp, tmp, "vs_clip")
+                    self.assertIsInstance(result, check.Skip)
+                    self.assertEqual(result, f"SKIP ({reason})")
+            with patch.object(check, "run", return_value=(check.UNSUPPORTED, "")):
+                self.assertEqual(str(check.clip_test(tmp, tmp, "vs_clip")), "SKIP (unsupported device)")
+            with patch.object(check, "run", return_value=(1, "FAILED vkCreateGraphicsPipelines -> -3\n")):
+                result = check.clip_test(tmp, tmp, "vs_clip")
+                self.assertNotIsInstance(result, check.Skip)
+                self.assertIn("exit 1", result)
+
+
 class TexelOffsetChecks(unittest.TestCase):
     """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""
     LIMITS = "device: gpu\ntexel offset limits: -64..63, gather -32..31\n"

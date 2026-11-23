@@ -1254,6 +1254,9 @@ def texture_constant_test(tools, spirv, name):
         raw = Path(tmp) / "gather.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"), shader, raw,
                         "0", "92", "c00000", "14500000", "0")
+        if code == UNSUPPORTED:   # vk_texture_test: e.g. fewer push constant bytes than the texture tests need
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
         data = raw.read_bytes() if code == 0 and raw.is_file() else b""
     if len(data) != 64 * 64 * 16:
         return failure(code, out, 3)
@@ -1658,8 +1661,9 @@ def clip_test(tools, spirv, name):
             code, output = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, name + ".spv"),
                                os.path.join(spirv, "ps_clip_color.spv"), raw, "64", "64",
                                "0" if clip_x else "4", "0" if clip_y else "4")
-            if code == UNSUPPORTED:
-                return Skip("SKIP (shaderClipDistance unavailable)")
+            if code == UNSUPPORTED:   # vk_harness: no shaderClipDistance, or fewer push constant bytes than it needs
+                m = re.search(r"unsupported: .*", output)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
             if code:
                 return failure(code, output, 2)
             if not raw.is_file():
