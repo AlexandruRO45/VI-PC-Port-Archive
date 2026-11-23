@@ -3729,17 +3729,22 @@ public:
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) return E_FAIL;
         // A binding-free entry wins over one with bindings for the same program (pick_entry).
-        // An FSPX program from a container is matched on its kind-0 state too; a bare kind-6 program whose
-        // translations differ is ambiguous without that state and is refused (program_candidates).
+        // An FSPX program from a container is matched on its kind-0 state too; when multiple matching entries
+        // remain whose translations differ (bare kind-6 or a cross-index code+state collision), program_candidates
+        // refuses the lookup as ambiguous.
         bool ambiguous = false;
         const leonida::ShaderEntry* entry = pick_entry(library->program_candidates("cs", program, &ambiguous),
                                                        [](const leonida::ShaderEntry&) { return true; });
         if (!entry) {
             const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
-            if (ambiguous)
-                std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 program sha256 %s is ambiguous without its kind-0 "
-                                     "state: its translations differ\n", leonida::sha256_hex(program.bytes).c_str());
-            else
+            if (ambiguous) {
+                if (program.state.empty())
+                    std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 program sha256 %s is ambiguous without its kind-0 "
+                                         "state: its translations differ\n", leonida::sha256_hex(program.bytes).c_str());
+                else
+                    std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 and kind-0 program sha256 %s is ambiguous: "
+                                         "its translations differ\n", leonida::sha256_hex(program.bytes).c_str());
+            } else
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());

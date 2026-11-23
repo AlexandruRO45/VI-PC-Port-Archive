@@ -593,6 +593,35 @@ int main() {
         CHECK(combined.load(dir.string(), &error) && combined.size() == 2 && combined.fspx_size() == 1);
         CHECK(combined.fspx_candidates("cs", sha256_hex(dll_code)).size() == 1);
         CHECK(combined.fspx_candidates("cs", sha256_hex(lib_code)).empty());
+        // Cross-index collision: fspx/index.json and library/index.json both match the same (code, state) pair.
+        // Different modules are refused as ambiguous even with kind-0 state present; identical modules remain valid.
+        {
+            const std::uint32_t words_a[5] = {0x07230203, 0x00010500, 31, 1, 0};
+            const std::uint32_t words_b[5] = {0x07230203, 0x00010500, 32, 1, 0};
+            {
+                std::ofstream fspx_idx(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+                fspx_idx << "{\"upscaler_dup\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(lib_code)
+                         << "\", \"fspx_state_sha256\": \"" << sha256_hex(state_lib) << "\"}}";
+                std::ofstream lib_idx(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
+                lib_idx << "{\"lib_dup\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(lib_code)
+                        << "\", \"fspx_state_sha256\": \"" << sha256_hex(state_lib) << "\"}}";
+                std::ofstream spv_a(dir / "fspx" / "upscaler_dup.spv", std::ios::binary | std::ios::trunc);
+                spv_a.write(reinterpret_cast<const char*>(words_a), sizeof(words_a));
+                std::ofstream spv_b(dir / "library" / "lib_dup.spv", std::ios::binary | std::ios::trunc);
+                spv_b.write(reinterpret_cast<const char*>(words_b), sizeof(words_b));
+            }
+            CHECK(combined.load(dir.string(), &error) && combined.size() == 3 && combined.fspx_size() == 2);
+            ambiguous = false;
+            CHECK(combined.program_candidates("cs", compute_program(lib_payload), &ambiguous).empty() && ambiguous);
+            // Identical SPIR-V across both indexes is unambiguous.
+            {
+                std::ofstream spv_b_same(dir / "library" / "lib_dup.spv", std::ios::binary | std::ios::trunc);
+                spv_b_same.write(reinterpret_cast<const char*>(words_a), sizeof(words_a));
+            }
+            ambiguous = true;
+            const auto same = combined.program_candidates("cs", compute_program(lib_payload), &ambiguous);
+            CHECK(same.size() == 2 && !ambiguous);
+        }
         std::filesystem::remove_all(dir);
     }
 

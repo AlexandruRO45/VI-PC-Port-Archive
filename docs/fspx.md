@@ -208,9 +208,10 @@ are counted in `fspx_size()` so corpus orphan checks compare only the carved RPF
 | anything else | none: `E_INVALIDARG`, as before | |
 
 With kind 0 (the first two rows), an input whose state key matches no entry for its code key has no program and gets
-`E_INVALIDARG`, like any untranslated shader. Without it (a bare kind-6 program), the entries for the code key are
-used when they all have the same module; when their modules differ, the program is ambiguous without its kind-0
-state, so the call is refused with `E_INVALIDARG` and a log line saying so, instead of taking one of them.
+`E_INVALIDARG`, like any untranslated shader. Whenever multiple matching entries remain — either without kind 0 (a bare
+kind-6 program) or when both `fspx/index.json` and `library/index.json` match the same code and state keys — they are
+used only when all share the same module; when their modules differ, the lookup is ambiguous, so the call is refused
+with `E_INVALIDARG` and a log line saying so, instead of taking one of them.
 
 The payload is parsed with the DLL reader's rules above (sizes and offsets checked in 64-bit arithmetic against the
 clamped total), so a malformed directory, or one without kind 0 or kind 6, gives no program and `E_INVALIDARG`. The

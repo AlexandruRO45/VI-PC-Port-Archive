@@ -784,9 +784,10 @@ public:
     //   - FSSM: by fssm_sha256, as before;
     //   - FSPX with its kind-0 entry (a container or a bare payload): by fspx_code_sha256, then only the entries
     //     whose fspx_state_sha256 is the SHA-256 of that kind-0 entry;
-    //   - a bare kind-6 program, which comes without kind 0: by fspx_code_sha256 when all those entries have the
-    //     same module; when their modules differ the program is ambiguous, the result is empty and `ambiguous` is
-    //     set, instead of picking one of them.
+    //   - a bare kind-6 program, which comes without kind 0: by fspx_code_sha256.
+    // Whenever multiple FSPX entries remain (either bare kind-6 or a cross-index collision on the same code+state),
+    // they are returned only when all share the same module; if their modules differ, the lookup is ambiguous, the
+    // result is empty and `ambiguous` is set, instead of picking one of them.
     std::vector<const ShaderEntry*> program_candidates(std::string_view stage, const ComputeProgram& program,
                                                        bool* ambiguous = nullptr) const {
         if (ambiguous) *ambiguous = false;
@@ -797,7 +798,6 @@ public:
         if (!program.state.empty()) {
             const std::string state = sha256_hex(program.state);
             std::erase_if(all, [&](const ShaderEntry* e) { return e->fspx_state_sha256 != state; });
-            return all;
         }
         if (all.size() > 1) {
             const auto first = spirv(*all.front());
