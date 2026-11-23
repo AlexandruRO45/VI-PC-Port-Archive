@@ -6685,7 +6685,7 @@ class Gen:
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
-                    "image_gather4_lz_o", "image_gather4_l_o"):
+                    "image_gather4_lz_o", "image_gather4_l_o", "image_gather4h"):
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
@@ -11836,6 +11836,58 @@ class Gen:
         self.emit(f"{layer} = OpFSub %float {f[2]} {d}")
         return [s, t, layer] + f[3:]
 
+    def gather4h(self, image, index, t1, coords, channel, dest, d16):
+        """Four horizontal taps at the base mip, measured on gfx1036. The ordinary gather has a 2x2 footprint."""
+        self.uses_query = True
+        size, size_f, uv, texels, ticks, rounded, fixed = (self.tmp() for _ in range(7))
+        self.emit(f"{size} = OpImageQuerySizeLod %v2int {image} {self.cu(0)}")
+        self.emit(f"{size_f} = OpConvertSToF %v2float {size}")
+        # gfx1036 treats a NaN coordinate as zero. Beyond [-2,3] every tap already clamps to the edge,
+        # even at width 1. Bound before scaling so the fixed-point conversion cannot overflow.
+        bounded = []
+        for word in coords:
+            value = self.tof(word)
+            nan, clean, limited = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{nan} = OpIsNan %bool {value}")
+            self.emit(f"{clean} = OpSelect %float {nan} %f0 {value}")
+            self.emit(f"{limited} = OpExtInst %float %glsl FClamp {clean} {self.fconst(-2.0)} {self.fconst(3.0)}")
+            bounded.append(limited)
+        self.emit(f"{uv} = OpCompositeConstruct %v2float {' '.join(bounded)}")
+        self.emit(f"{texels} = OpFMul %v2float {uv} {size_f}")
+        self.emit(f"{ticks} = OpVectorTimesScalar %v2float {texels} {self.fconst(256.0)}")
+        self.emit(f"{rounded} = OpExtInst %v2float %glsl RoundEven {ticks}")
+        self.emit(f"{fixed} = OpConvertFToS %v2int {rounded}")
+        width, height, x, y, biased, center, row = (self.tmp() for _ in range(7))
+        self.emit(f"{width} = OpCompositeExtract %int {size} 0")
+        self.emit(f"{height} = OpCompositeExtract %int {size} 1")
+        self.emit(f"{x} = OpCompositeExtract %int {fixed} 0")
+        self.emit(f"{y} = OpCompositeExtract %int {fixed} 1")
+        self.emit(f"{biased} = OpISub %int {x} {self.as_int(self.cu(128))}")
+        self.emit(f"{center} = OpShiftRightArithmetic %int {biased} {self.cu(8)}")
+        self.emit(f"{row} = OpShiftRightArithmetic %int {y} {self.cu(8)}")
+        row, _ = self.gather_addr(row, height, 2)
+        footprint = []
+        for dx in (-1, 0, 1, 2):
+            col, xy = self.tmp(), self.tmp()
+            self.emit(f"{col} = OpIAdd %int {center} {self.as_int(self.cu(dx))}")
+            col, _ = self.gather_addr(col, width, 2)
+            self.emit(f"{xy} = OpCompositeConstruct %v2int {col} {row}")
+            footprint.append(xy)
+
+        def fetch_row(view, cls, ty):
+            scalar = ("%float", "%uint", "%int")[cls]
+            taps = []
+            for xy in footprint:
+                texel, tap = self.tmp(), self.tmp()
+                self.emit(f"{texel} = OpImageFetch {ty} {view} {xy} Lod {self.cu(0)}")
+                self.emit(f"{tap} = OpCompositeExtract {scalar} {texel} {channel}")
+                taps.append(tap)
+            result = self.tmp()
+            self.emit(f"{result} = OpCompositeConstruct {ty} {' '.join(taps)}")
+            return result
+
+        self.image_read_typed("dim:SQ_RSRC_IMG_2D", t1, image, index, 0xf, dest, d16, fetch_row)
+
     def image_op(self, op, a, mods):
         a16 = "a16" in mods
         d16 = "d16" in mods
@@ -11877,6 +11929,22 @@ class Gen:
             if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
                     or any(m not in (dim, dm, "a16", "d16") for m in mods)):
                 raise Unsupported(op + " needs scalar 2D depth comparison")
+        if op == "image_gather4h":
+            if (dim != "dim:SQ_RSRC_IMG_2D" or dmask not in (1, 2, 4, 8)
+                    or len(addr) != (1 if a16 else 2) or vdata.get("n", 1) != (2 if d16 else 4)
+                    or any(m not in (dim, dm, "a16", "d16") for m in mods)):
+                raise Unsupported(op + " needs a single channel of a 2D texture")
+            if len(a) != 4 or a[3]["k"] != "sgpr" or a[3].get("n", 1) != 4:
+                raise Unsupported(op + " sampler descriptor")
+            first = a[3]["r"]
+            word0, word1, word2 = (self.sgpr_imm.get(first + i) for i in range(3))
+            # The measured form reads the base mip and clamps horizontal taps even for wrap and mirror.
+            base_mip = ((word2 is not None and ((word2 >> 26) & 3) == 0) or
+                        (word1 is not None and (word1 & 0xffffff) == 0))
+            if not base_mip:
+                raise Unsupported(op + " needs a base-mip sampler")
+            if word0 is None or word0 & ~0x1ff or (word0 & 7) > 3 or ((word0 >> 3) & 7) > 3:
+                raise Unsupported(op + " needs normalized coordinates and non-border addressing")
         img_idx = self.desc_lookup_sgpr(a[2], 8)
         img = None              # a coherent image_load reads the storage view, not this sampled one
         if not coherent:
@@ -11913,6 +11981,9 @@ class Gen:
             if op == "image_load":
                 # 16-bit integer coordinates: each half is an unsigned 16-bit int, not an f16.
                 coords = self.unpack_image_a16_uints([self.load_reg("vgpr", r) for r in addr])
+        if op == "image_gather4h":
+            self.gather4h(img, img_idx, self.sgpr_word(a[2], 1), coords, dmask.bit_length() - 1, vdata, d16)
+            return
         if op == "image_load":
             if len(coords) < ncoord:
                 raise Unsupported("image_load coords")
