@@ -30,6 +30,11 @@ DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12
 per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
 summary leaves them as a count, so grep `^\[rt\]` for those.
 
+For a coordination comment, add `--counts-only` to the summary command. It prints event counts, Windows
+exception codes, the exit code and D3D12 outcome totals. It omits trace and game paths, module and method
+names, stack frames, addresses and free-form messages. Add `--json` for the same counts in JSON. Exception
+code totals cover the entire startup trace even when `--limit` is set.
+
 ## 2. Commands
 
 Windows (from the repository root):
