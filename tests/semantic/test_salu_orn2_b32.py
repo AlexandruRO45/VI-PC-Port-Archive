@@ -253,5 +253,97 @@ class TestSaluOrn2B32AST(unittest.TestCase):
                 ssrc1=RegOperand(RegKind.LITERAL, 0x5678),
             )
 
+class ScalarSALUInterpreter:
+    """Deterministic architectural scalar instruction interpreter for SALU state."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.scc: int = 0
+
+    def read_operand(self, op: RegOperand) -> int:
+        if op.kind == RegKind.SGPR:
+            return self.sgprs[op.index_or_val]
+        elif op.kind in (RegKind.LITERAL, RegKind.INLINE_INT):
+            return u32(op.index_or_val)
+        raise ValueError(f"Cannot read operand kind {op.kind} as scalar")
+
+    def write_sgpr(self, reg_idx: int, val: int) -> None:
+        self.sgprs[reg_idx] = u32(val)
+
+    def execute(self, inst: SALUInstruction) -> tuple[int, int]:
+        """Execute a single SALU instruction, updating state and returning (result, scc)."""
+        if inst.opcode == Opcode.S_MOV_B32:
+            val = self.read_operand(inst.ssrc0)
+            self.write_sgpr(inst.sdst.index_or_val, val)
+            return val, self.scc
+        elif inst.opcode == Opcode.S_ORN2_B32:
+            assert inst.ssrc1 is not None
+            s0 = self.read_operand(inst.ssrc0)
+            s1 = self.read_operand(inst.ssrc1)
+            res, scc = ref_orn2_b32(s0, s1)
+            self.write_sgpr(inst.sdst.index_or_val, res)
+            self.scc = scc
+            return res, scc
+        raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+
+class TestSaluOrn2B32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+
+    def test_interp_single_execution(self) -> None:
+        self.interp.write_sgpr(1, 0x11110000)
+        self.interp.write_sgpr(2, 0x00FF00FF)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        res, scc = self.interp.execute(inst)
+        expected_res = 0x11110000 | (~0x00FF00FF & MASK32)
+        self.assertEqual(res, expected_res)
+        self.assertEqual(self.interp.sgprs[0], expected_res)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.interp.scc, 1)
+
+    def test_interp_sequential_chain(self) -> None:
+        self.interp.write_sgpr(1, 0xAAAAAAAA)
+        self.interp.write_sgpr(2, 0x55555555)
+        # s3 = s1 | ~s2
+        inst1 = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 3),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        self.interp.execute(inst1)
+        self.assertEqual(self.interp.sgprs[3], 0xAAAAAAAA)
+        # s4 = s3 | ~s1 (0xAAAAAAAA | ~0xAAAAAAAA = 0xFFFFFFFF)
+        inst2 = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 4),
+            ssrc0=RegOperand(RegKind.SGPR, 3),
+            ssrc1=RegOperand(RegKind.SGPR, 1),
+        )
+        self.interp.execute(inst2)
+        self.assertEqual(self.interp.sgprs[4], 0xFFFFFFFF)
+        self.assertEqual(self.interp.scc, 1)
+
+    def test_interp_unmodified_registers(self) -> None:
+        self.interp.write_sgpr(10, 0x12345678)
+        self.interp.write_sgpr(11, 0x9ABCDEF0)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.interp.sgprs[10], 0x12345678)
+        self.assertEqual(self.interp.sgprs[11], 0x9ABCDEF0)
+
 if __name__ == "__main__":
     unittest.main()
