@@ -1483,6 +1483,22 @@ def build_world(
     if not os.path.exists(assets_dir):
         raise FileNotFoundError(f"assets path does not exist: {assets_dir}")
 
+    # The output must not overlap the input tree. --out inside assets_dir drops world.json,
+    # chunks/ and .chunks-staging-* into the folder the manifest walk scans, and --out that
+    # contains assets_dir lets _remove_stale_staging/_prune_stale_chunks delete directories
+    # and c_*.glb files the user supplied. Either direction is refused before any write.
+    assets_real = os.path.normcase(os.path.realpath(assets_dir))
+    out_real = os.path.normcase(os.path.realpath(out_dir))
+    try:
+        overlap = os.path.commonpath([assets_real, out_real]) in (assets_real, out_real)
+    except ValueError:  # different drives on Windows
+        overlap = False
+    if overlap:
+        raise ValueError(
+            f"--out {out_dir!r} must not be inside or contain the assets directory {assets_dir!r}; "
+            "the build writes world.json, chunks/ and staging directories there"
+        )
+
     glb_mod = _get_glb_writer()
     dds_mod = _get_dds_png() if textures else None
 

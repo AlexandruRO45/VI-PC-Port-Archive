@@ -1812,6 +1812,36 @@ class WorldBuildTest(unittest.TestCase):
             p = self._run_cli(missing, out_dir)
             self.assertNotEqual(p.returncode, 0)
 
+    def test_out_inside_or_containing_assets_is_refused_and_preserves_files(self):
+        """--out overlapping the assets tree used to let staging cleanup and chunk pruning delete user files."""
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = os.path.join(tmp, "assets")
+            _write_synthetic_assets(assets, origin_overlap=False)
+            # A user .glb under the assets tree that matches the chunk-name pattern the pruner deletes,
+            # plus a stray staging-looking directory.
+            victim = os.path.join(assets, "chunks")
+            os.makedirs(victim)
+            victim_file = os.path.join(victim, "c_0_0.glb")
+            with open(victim_file, "wb") as f:
+                f.write(b"user asset")
+            staging_lookalike = os.path.join(assets, ".chunks-staging-deadbeef")
+            os.makedirs(staging_lookalike)
+            with open(os.path.join(staging_lookalike, "keep.bin"), "wb") as f:
+                f.write(b"user dir")
+            before = self._output_snapshot(assets)
+
+            # --out inside assets_dir: refused, nothing under assets changes.
+            for out in (os.path.join(assets, "world"), assets):
+                with self.assertRaisesRegex(ValueError, "must not be inside or contain"):
+                    world_build.build_world(assets, out, textures=False)
+                p = self._run_cli(assets, out, "--no-textures")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("ERROR:", p.stderr)
+            # --out containing assets_dir: refused the same way.
+            with self.assertRaisesRegex(ValueError, "must not be inside or contain"):
+                world_build.build_world(os.path.join(tmp, "assets", "arch_a"), tmp, textures=False)
+            self.assertEqual(self._output_snapshot(assets), before)
+
 
 class WorldBuildStagingTest(unittest.TestCase):
     """A rebuild that fails or is interrupted must leave the previous world.json and its chunks as they were."""
