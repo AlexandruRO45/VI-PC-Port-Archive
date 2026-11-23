@@ -717,6 +717,10 @@ The compute path, end to end:
     (GCL9; the console `RSSetDepthBiasX`'s public form) replaces the RasterizerState values, persists across
     `SetPipelineState` as D3D12's other dynamic state does, and is restored to the PSO's values by `Reset` and
     `ClearState`. Without the flag the pipeline keeps its static bias and the call has no effect, as in D3D12.
+    On D24 stored as D32 the bias is the pixel stage's (D3D-309), so a dynamic PSO's stage reads the values from a
+    `{constant, clamp, slope}` push-constant block past the root data instead of `vkCmdSetDepthBias` — the
+    rasterizer's bias is off there, and the shader applies D24's fixed `r` and the clamp itself, so no
+    `depthBiasClamp` feature is needed on that path.
     `IASetIndexBufferStripCutValue`, the other GCL9 method, stays with the primitive-restart work (D3D-57).
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth

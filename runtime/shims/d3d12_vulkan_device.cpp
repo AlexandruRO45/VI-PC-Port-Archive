@@ -688,6 +688,13 @@ struct DeviceState {
     }
 
     bool depth_usable(VkFormat format) const {
+        // LEONIDA_D24_AS_D32: run the D24-less path (D32_SFLOAT_S8_UINT backing plus the patched pixel stage of
+        // depth24_fragment.h, D3D-309) on a GPU that does have D24, so tests cover it everywhere.
+        if (format == VK_FORMAT_D24_UNORM_S8_UINT) {
+            char text[8];
+            std::size_t length = 0;
+            if (getenv_s(&length, text, "LEONIDA_D24_AS_D32") == 0 && length > 1 && text[0] != '0') return false;
+        }
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
         return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
@@ -2770,9 +2777,24 @@ public:
                      int(samples));
             depth24_fragment = false;
         }
+        const bool dynamic_depth_bias = desc.Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+        // A dynamic PSO's pixel stage reads the bias from push constants instead of the baked values, so
+        // RSSetDepthBias applies on D24-as-D32 too: replay pushes the values it resolved for the draw into a
+        // {constant, clamp, slope} block past the 144 root-data bytes (vk.set_depth_bias would be a no-op — the
+        // rasterizer's bias is off here — and its float scaling is the wrong units for D24's fixed r).
         const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
                                                 desc.RasterizerState.SlopeScaledDepthBias,
-                                                desc.RasterizerState.DepthBiasClamp};
+                                                desc.RasterizerState.DepthBiasClamp,
+                                                depth24_fragment && dynamic_depth_bias
+                                                    ? std::uint32_t(sizeof(leonida::ShaderUserData))
+                                                    : 0u};
+        if (depth24_bias.dynamic() &&
+            device_.info.max_push_constants_size < sizeof(leonida::ShaderUserData) + sizeof(leonida::DepthBias)) {
+            log_once("D24 stored as D32 with dynamic depth bias needs 156 bytes of push constants; "
+                     "maxPushConstantsSize",
+                     int(device_.info.max_push_constants_size));
+            return E_NOTIMPL;
+        }
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             stage.fssm = leonida::fssm_program(
@@ -2973,7 +2995,7 @@ public:
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
         // rasterizer's bias stays off and zero there, dynamic or not, so its clamp needs no depthBiasClamp
         // feature either.
-        const bool dynamic_depth_bias = desc.Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+
         raster.depthBiasEnable =
             !depth24_fragment && (dynamic_depth_bias || r.DepthBias || r.SlopeScaledDepthBias != 0.0f);
         if (raster.depthBiasEnable) {
@@ -3142,7 +3164,16 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
+        // The D24-as-D32 dynamic-bias block the patched pixel stage reads (depth24_fragment.h) extends the same
+        // single range past the root data: a second range for the fragment stage alone is not allowed to share a
+        // stage with this one (VUID-VkPipelineLayoutCreateInfo-pPushConstantRanges-00292), and every
+        // vkCmdPushConstants over those bytes must name all the range's stages
+        // (VUID-vkCmdPushConstants-offset-01796), so the fragment bit joins the mask — the patched stage is a
+        // fragment shader even when the pipeline has no pixel shader of its own (depth-only passes).
+        if (depth24_bias.dynamic()) graphics_.push_stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
+        const VkPushConstantRange push{graphics_.push_stages, 0,
+                                       sizeof(leonida::ShaderUserData) +
+                                           (depth24_bias.dynamic() ? sizeof(leonida::DepthBias) : 0u)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -3171,9 +3202,16 @@ public:
         recipe_.blend = blend;
         // Before build(0): the dynamic state list reads depth_bias_dynamic, and replay needs the static values
         // (the default when the list set none) and the device's clamp feature (prepare_draw refuses a clamp it
-        // cannot honour).
-        graphics_.depth_bias = {raster.depthBiasConstantFactor, raster.depthBiasClamp, raster.depthBiasSlopeFactor};
+        // cannot honour). On D24-as-D32 the rasterizer's copy stays zero (skipped above), so the default is the
+        // desc's own values, in the RSSetDepthBias units the patched pixel stage scales itself; the clamp runs in
+        // the shader there, so the device feature is not asked for.
+        graphics_.depth_bias = depth24_bias.dynamic()
+                                   ? leonida::DepthBias{float(r.DepthBias), r.DepthBiasClamp,
+                                                        r.SlopeScaledDepthBias}
+                                   : leonida::DepthBias{raster.depthBiasConstantFactor, raster.depthBiasClamp,
+                                                        raster.depthBiasSlopeFactor};
         graphics_.depth_bias_dynamic = dynamic_depth_bias;
+        graphics_.depth_bias24_dynamic = depth24_bias.dynamic();
         graphics_.depth_bias_clamp_supported = device_.info.features.depthBiasClamp == VK_TRUE;
         graphics_.pipeline = build(0);
         if (!graphics_.pipeline) return E_FAIL;
@@ -3337,7 +3375,8 @@ private:
         VkDynamicState dynamic_states[std::size(fixed_states) + 2] = {};  // + depth bias, + vertex strides
         std::uint32_t dynamic_count = 0;
         for (const VkDynamicState state : fixed_states) dynamic_states[dynamic_count++] = state;
-        if (graphics_.depth_bias_dynamic) dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
+        if (graphics_.depth_bias_dynamic && !graphics_.depth_bias24_dynamic)
+            dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
         if (!r.bindings.empty()) dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)

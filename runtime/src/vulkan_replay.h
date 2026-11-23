@@ -757,6 +757,8 @@ struct GraphicsPipeline {
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     DepthBias depth_bias;               // the PSO's RasterizerState values: the default when the list sets none
     bool depth_bias_dynamic = false;    // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS: set per draw
+    bool depth_bias24_dynamic = false;  // that flag on D24-as-D32: the patched pixel stage reads the values from
+                                        // push constants (the rasterizer's bias is off there), not vkCmdSetDepthBias
     bool depth_bias_clamp_supported = false;  // the device's depthBiasClamp feature, for RSSetDepthBias clamps
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
@@ -1959,7 +1961,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
-    if (pipeline->depth_bias_dynamic && !vk.set_depth_bias) return ReplayResult::unsupported;
+    if (pipeline->depth_bias_dynamic && !pipeline->depth_bias24_dynamic && !vk.set_depth_bias)
+        return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
@@ -1968,7 +1971,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     // values in force, as in D3D12.
     p.depth_bias = pipeline->depth_bias;
     if (pipeline->depth_bias_dynamic && draw.depth_bias_set) p.depth_bias = draw.depth_bias;
-    if (p.depth_bias.clamp != 0.0f && !pipeline->depth_bias_clamp_supported)
+    if (p.depth_bias.clamp != 0.0f && !pipeline->depth_bias_clamp_supported && !pipeline->depth_bias24_dynamic)
         return ReplayResult::unsupported;
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
@@ -3814,10 +3817,17 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
             // The pipeline's own values are static state; a dynamic-depth-bias pipeline takes the effective values
-            // resolved in prepare_draw (RSSetDepthBias's, or the PSO's RasterizerState when the list set none).
-            if (graphics.depth_bias_dynamic)
-                vk.set_depth_bias(command_buffer, d.depth_bias.constant_factor, d.depth_bias.clamp,
-                                  d.depth_bias.slope_factor);
+            // resolved in prepare_draw (RSSetDepthBias's, or the PSO's RasterizerState when the list set none). On
+            // D24-as-D32 those values go to the patched pixel stage's push-constant block instead: the rasterizer's
+            // bias is off there, and the shader applies D24's fixed r scaling and the clamp itself.
+            if (graphics.depth_bias_dynamic) {
+                if (graphics.depth_bias24_dynamic)
+                    vk.push_constants(command_buffer, graphics.layout, graphics.push_stages,
+                                      sizeof(ShaderUserData), sizeof(d.depth_bias), &d.depth_bias);
+                else
+                    vk.set_depth_bias(command_buffer, d.depth_bias.constant_factor, d.depth_bias.clamp,
+                                      d.depth_bias.slope_factor);
+            }
             for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
                 if (!d.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],

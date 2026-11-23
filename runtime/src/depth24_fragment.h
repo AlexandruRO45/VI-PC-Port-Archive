@@ -12,6 +12,8 @@
 // depth, bias = DepthBias * r + SlopeScaledDepthBias * max(|dz/dx|, |dz/dy|) clamped by DepthBiasClamp (D3D's
 // formula), and quantise = depth24_to_float(depth24_quantize(.)) from depth24_convert.comp, so a fragment holds
 // exactly the float a D24 code reads back as. The rasterizer's own bias is then turned off for the pipeline.
+// A PSO with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS takes its values per draw instead: the three floats
+// RSSetDepthBias (or the desc, as the default) resolved to arrive as a push-constant block the stage loads.
 // A shader that writes its own depth (SV_Depth) keeps its value, quantised; D3D applies no bias to it.
 //
 // depth24_patch_fragment edits a translated pixel shader's SPIR-V; depth24_depth_only_fragment builds the stage
@@ -29,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -37,6 +40,12 @@ struct Depth24Bias {
     int constant = 0;     // D3D12_RASTERIZER_DESC::DepthBias
     float slope = 0.0f;   // SlopeScaledDepthBias
     float clamp = 0.0f;   // DepthBiasClamp: > 0 caps the bias, < 0 floors it, 0 leaves it
+    // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS: the values above are only the pipeline's defaults, and the
+    // ones RSSetDepthBias sets reach the draw as a {constant, clamp, slope} push-constant block at this offset
+    // (0: the pipeline is not dynamic, the values stay baked-in constants). The constant member holds the
+    // RSSetDepthBias float itself, still in r units — the shader scales it like depth24_bias_constant does.
+    std::uint32_t pc_offset = 0;
+    bool dynamic() const { return pc_offset != 0; }
     bool any() const { return constant != 0 || slope != 0.0f; }
 };
 
@@ -50,15 +59,18 @@ namespace spirv24 {
 enum : std::uint32_t {
     op_name = 5, op_line = 8, op_ext_inst_import = 11, op_ext_inst = 12, op_memory_model = 14, op_entry_point = 15,
     op_execution_mode = 16, op_capability = 17, op_type_void = 19, op_type_bool = 20, op_type_int = 21,
-    op_type_float = 22, op_type_vector = 23, op_type_pointer = 32, op_type_function = 33, op_constant = 43,
-    op_function = 54, op_function_end = 56, op_variable = 59, op_load = 61, op_store = 62, op_decorate = 71,
-    op_composite_extract = 81, op_convert_f_to_u = 109, op_convert_u_to_f = 112, op_bitcast = 124, op_i_add = 128,
-    op_f_add = 129, op_i_sub = 130, op_f_mul = 133, op_select = 169, op_i_equal = 170, op_u_greater_than = 172,
-    op_u_greater_than_equal = 174, op_shift_left_logical = 196, op_dpdx = 207, op_dpdy = 208, op_label = 248,
-    op_return = 253, op_no_line = 317, op_execution_mode_id = 331,
+    op_type_float = 22, op_type_vector = 23, op_type_struct = 30, op_type_pointer = 32, op_type_function = 33,
+    op_constant = 43, op_access_chain = 65, op_function = 54, op_function_end = 56, op_variable = 59, op_load = 61,
+    op_store = 62, op_decorate = 71, op_member_decorate = 72, op_composite_extract = 81, op_convert_f_to_u = 109,
+    op_convert_u_to_f = 112, op_bitcast = 124, op_i_add = 128, op_f_add = 129, op_i_sub = 130, op_f_mul = 133,
+    op_select = 169, op_i_equal = 170, op_u_greater_than = 172, op_u_greater_than_equal = 174,
+    op_f_ord_less_than = 184, op_f_ord_greater_than = 186, op_shift_left_logical = 196, op_dpdx = 207, op_dpdy = 208,
+    op_label = 248, op_return = 253, op_no_line = 317, op_execution_mode_id = 331,
 };
-enum : std::uint32_t { storage_input = 1, storage_output = 3 };
-enum : std::uint32_t { decoration_builtin = 11, builtin_frag_coord = 15, builtin_frag_depth = 22 };
+enum : std::uint32_t { storage_input = 1, storage_output = 3, storage_push_constant = 9 };
+enum : std::uint32_t { decoration_block = 2, decoration_offset = 35, decoration_builtin = 11, builtin_frag_coord = 15,
+                       builtin_frag_depth = 22 };
+
 enum : std::uint32_t { model_fragment = 4 };
 enum : std::uint32_t {
     mode_origin_upper_left = 7, mode_early_fragment_tests = 9, mode_depth_replacing = 12, mode_depth_greater = 14,
@@ -223,6 +235,61 @@ public:
     }
     void ensure_interface(std::uint32_t id) { interface_.push_back(id); }
     void mode(std::uint32_t m) { modes_.push_back(make(op_execution_mode, {entry_, m})); }
+    // A block of its own, for a stage that declares no root-data push constants: one variable, listed in the
+    // interface, its members carrying the block's offsets.
+    std::uint32_t push_constant(std::uint32_t offset) {
+        const std::uint32_t tf = t_float();
+        const std::uint32_t block = type(op_type_struct, {tf, tf, tf});
+        for (std::uint32_t member = 0; member < 3; ++member)
+            decorations_.push_back(
+                make(op_member_decorate, {block, member, decoration_offset, offset + 4 * member}));
+        decorations_.push_back(make(op_decorate, {block, decoration_block}));
+        const std::uint32_t pointer = type(op_type_pointer, {storage_push_constant, block});
+        const std::uint32_t id = m_.fresh();
+        globals_.push_back(make(op_variable, {pointer, id, storage_push_constant}));
+        interface_.push_back(id);
+        return id;
+    }
+    // A {f32, f32, f32} push-constant block at `offset`, past the root data the stages read as their first 144
+    // bytes, as the variable the caller AccessChains into: the entry point's own push-constant block grows the
+    // three members — a second PushConstant variable in one entry point is not allowed
+    // (VUID-StandaloneSpirv-OpVariable-06673) — and a stage that declares no root-data block gets a block of its
+    // own (then listed in the interface: SPIR-V 1.4 lists every global the entry point uses). Returns the
+    // variable and the first new member's index, or zeroes when the existing block cannot be extended.
+    std::pair<std::uint32_t, std::uint32_t> bias_push_constant(std::uint32_t offset) {
+        std::uint32_t var = 0, pointer_type = 0;
+        for (const Inst& i : existing_)
+            if (opcode(i) == op_variable && i.size() == 4 && i[3] == storage_push_constant) {
+                if (var) return {0, 0};  // more than one already: not ours to touch
+                var = i[2];
+                pointer_type = i[1];
+            }
+        if (!var) return {push_constant(offset), 0};
+        std::uint32_t block = 0, tf = 0;
+        for (const Inst& i : existing_) {
+            if (opcode(i) == op_type_pointer && i.size() == 4 && i[1] == pointer_type) block = i[3];
+            if (opcode(i) == op_type_float && i.size() == 3 && i[2] == 32) tf = i[1];  // declared before the struct
+        }
+        if (!block || !tf) return {0, 0};
+        std::uint32_t members = 0;
+        for (Inst& i : m_.insts())  // the module's own declaration, extended where it stands
+            if (opcode(i) == op_type_struct && i.size() >= 2 && i[1] == block) {
+                members = std::uint32_t(i.size() - 2);
+                i.insert(i.end(), {tf, tf, tf});
+                fix_length(i);
+                for (std::uint32_t member = 0; member < 3; ++member)
+                    decorations_.push_back(make(op_member_decorate, {block, members + member, decoration_offset,
+                                                                     offset + 4 * member}));
+            }
+        return members ? std::pair<std::uint32_t, std::uint32_t>{var, members} : std::pair{0u, 0u};
+    }
+    // Loads block member `member` (constant, then clamp, then slope, from `base`) of the push constant `pc`.
+    std::uint32_t pc_member(std::vector<Inst>& code, std::uint32_t pc, std::uint32_t member) {
+        const std::uint32_t tf = t_float();
+        const std::uint32_t pointer = type(op_type_pointer, {storage_push_constant, tf});
+        const std::uint32_t at = emit(code, op_access_chain, pointer, {pc, u32(member)});
+        return emit(code, op_load, tf, {at});
+    }
 
     // Instructions in a function body: emit returns the result id.
     std::uint32_t emit(std::vector<Inst>& code, std::uint32_t op, std::uint32_t type,
@@ -390,15 +457,41 @@ inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::
             p.ensure_interface(frag_coord);
         const std::uint32_t coord = p.emit(entry_code, op_load, tv4, {frag_coord});
         std::uint32_t z = p.emit(entry_code, op_composite_extract, tf, {coord, 2});
-        if (bias.any()) {
+        if (bias.any() || bias.dynamic()) {
             // In the entry block: uniform control flow, so the derivatives are defined.
             const std::uint32_t dx = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdx, tf, {z})});
             const std::uint32_t dy = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdy, tf, {z})});
             const std::uint32_t max_slope = p.ext(entry_code, tf, glsl_fmax, {dx, dy});
-            std::uint32_t amount = p.emit(entry_code, op_f_mul, tf, {p.f32(bias.slope), max_slope});
-            amount = p.emit(entry_code, op_f_add, tf, {amount, p.f32(depth24_bias_constant(bias.constant))});
-            if (bias.clamp > 0.0f) amount = p.ext(entry_code, tf, glsl_fmin, {amount, p.f32(bias.clamp)});
-            if (bias.clamp < 0.0f) amount = p.ext(entry_code, tf, glsl_fmax, {amount, p.f32(bias.clamp)});
+            std::uint32_t amount;
+            if (bias.dynamic()) {
+                // The values RSSetDepthBias (or the pipeline's defaults) resolved to for this draw. The clamp's
+                // sign is a runtime fact now, so D3D's two rules (cap when > 0, floor when < 0) both run, one of
+                // them as a no-op; a NaN clamp leaves the bias alone.
+                const auto [pc, base] = p.bias_push_constant(bias.pc_offset);
+                if (!pc) {
+                    why = "the pixel stage's push-constant block cannot carry the dynamic depth bias";
+                    return {};
+                }
+                const std::uint32_t slope = p.pc_member(entry_code, pc, base + 2);
+                const std::uint32_t constant = p.pc_member(entry_code, pc, base + 0);
+                const std::uint32_t clamp = p.pc_member(entry_code, pc, base + 1);
+                const std::uint32_t slope_term = p.emit(entry_code, op_f_mul, tf, {slope, max_slope});
+                const std::uint32_t constant_term = p.emit(entry_code, op_f_mul, tf,
+                                                           {constant, p.f32(depth24_bias_constant(1))});
+                amount = p.emit(entry_code, op_f_add, tf, {slope_term, constant_term});
+                const std::uint32_t tb = p.t_bool();
+                const std::uint32_t cap = p.emit(entry_code, op_f_ord_greater_than, tb, {clamp, p.f32(0.0f)});
+                const std::uint32_t capped = p.emit(entry_code, op_select, tf,
+                                                    {cap, p.ext(entry_code, tf, glsl_fmin, {amount, clamp}), amount});
+                const std::uint32_t floor = p.emit(entry_code, op_f_ord_less_than, tb, {clamp, p.f32(0.0f)});
+                amount = p.emit(entry_code, op_select, tf,
+                                {floor, p.ext(entry_code, tf, glsl_fmax, {capped, clamp}), capped});
+            } else {
+                amount = p.emit(entry_code, op_f_mul, tf, {p.f32(bias.slope), max_slope});
+                amount = p.emit(entry_code, op_f_add, tf, {amount, p.f32(depth24_bias_constant(bias.constant))});
+                if (bias.clamp > 0.0f) amount = p.ext(entry_code, tf, glsl_fmin, {amount, p.f32(bias.clamp)});
+                if (bias.clamp < 0.0f) amount = p.ext(entry_code, tf, glsl_fmax, {amount, p.f32(bias.clamp)});
+            }
             z = p.emit(entry_code, op_f_add, tf, {z, amount});
         }
         const std::uint32_t q = p.quantise(entry_code, z);

@@ -80,7 +80,15 @@ int main() {
     }
 
     unsigned scenarios = 0, failures = 0;
-    {
+    // The whole scenario suite runs twice: on a native D32_FLOAT depth target, and on D24_UNORM_S8_UINT forced
+    // through the D24-less path (LEONIDA_D24_AS_D32: D32_SFLOAT_S8_UINT backing, the patched pixel stage of
+    // depth24_fragment.h) — a GPU without D24 gets the same bias behaviour, so RSSetDepthBias must work there too,
+    // through the push-constant block the patched stage reads. The expected columns are the same on both: D24's
+    // r is fixed (no exponent scaling), and one column spans 2^17 of its steps.
+    const auto run_suite = [&](DXGI_FORMAT dsv_format, const char* suite) -> int {
+        EXPECT(_putenv(dsv_format == DXGI_FORMAT_D24_UNORM_S8_UINT ? "LEONIDA_D24_AS_D32=1"
+                                                                   : "LEONIDA_D24_AS_D32=0") == 0);
+        std::printf("%s\n", suite);
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
@@ -128,7 +136,7 @@ int main() {
         base.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         base.NumRenderTargets = 1;
         base.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        base.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        base.DSVFormat = dsv_format;
         base.SampleDesc.Count = 1;
         Ref<ID3D12PipelineState> dyn_a, dyn_b, plain;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = base;
@@ -168,10 +176,10 @@ int main() {
                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                          IID_PPV_ARGS(&target.p))));
         D3D12_RESOURCE_DESC depth_desc = rt_desc;
-        depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+        depth_desc.Format = dsv_format;
         depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         D3D12_CLEAR_VALUE cleared_to{};
-        cleared_to.Format = DXGI_FORMAT_D32_FLOAT;
+        cleared_to.Format = dsv_format;
         cleared_to.DepthStencil.Depth = 0.5f;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
                                                          D3D12_RESOURCE_STATE_DEPTH_WRITE, &cleared_to,
@@ -361,16 +369,21 @@ int main() {
         queue.reset();
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
-    }
+        return 0;
+    };
+    const int suites = run_suite(DXGI_FORMAT_D32_FLOAT, "native D32_FLOAT depth:") |
+                       run_suite(DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                 "D24_UNORM_S8_UINT depth stored as D32 (the D24-less path, LEONIDA_D24_AS_D32):");
     std::filesystem::remove_all(library);
     EXPECT(!failures);
-    EXPECT(scenarios == 8);
+    EXPECT(scenarios == 16);
+    EXPECT(suites == 0);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("RSSetDepthBias: %u scenarios matched (static, override, persistence, Reset, ClearState, ignored "
-                "without the flag, zero, slope bounds) on a %ux%u target\n",
+                "without the flag, zero, slope bounds) on a %ux%u target, on native D32 and on D24 stored as D32\n",
                 scenarios, target_size, target_size);
     return 0;
 }
