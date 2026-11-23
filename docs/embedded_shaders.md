@@ -26,17 +26,33 @@ python -I tools/pe_shader_containers.py <dll> --json <work>/containers.json --ex
 
 ## 2. Inventory
 
-The 16 DLLs and the package's root files were scanned. All the containers are in two DLLs:
+The 16 DLLs and the package's root files were scanned first (`XboxBvhBuilder.dll` and `amd_fidelityfx_upscaler_xbox.dll`); `game_scarlett_master.exe` (RT-5) adds 10 more console containers:
 
 | image | containers | bytes | min / median / max | chunks |
 |---|---:|---:|---:|---|
 | `XboxBvhBuilder.dll` | 52 | 674,404 | 4,072 / 7,454 / 74,508 | `SFI0 ISG1 OSG1 PSV0 RTS0 STAT ILDN HASH DXIL` |
 | `amd_fidelityfx_upscaler_xbox.dll` | 29 | 289,656 | 1,764 / 5,176 / 42,616 | `SFI0 ISG1 OSG1 PSV0 RTS0 HASH ACCC` |
 | other 14 DLLs | 0 | 0 | — | — |
+| `game_scarlett_master.exe` | 10 | 9,520 | 924 / 936 / 992 | `SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV` |
 
 The 29 `ACCC` containers hold `FSPX` payloads ([fspx.md](fspx.md)); the 52 `DXIL` containers are the subject of
 this note. The FSR DLL has one rejected `DXBC` hit: the bytes are an immediate in its own magic check, and the
 validator rejects it (the scan reports both counts).
+
+### Retail executable (`game_scarlett_master.exe`, RT-5)
+
+Scanning the retail executable (120,181,760 bytes, SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`)
+with `tools/pe_shader_containers.py` finds **10** valid DXBC containers (9,520 bytes total, file offsets
+`0x688cd3c`..`0x688fdf6`, sizes 924–992 bytes) and 1 rejected `DXBC` hit:
+
+* **Stages (`PSV0`):** **1** vertex shader (`0x688cd3c`, 992 bytes) and **9** pixel shaders (924–980 bytes). Unlike the
+  DLL containers above, none carries `ILDN`, `STAT`, `RTS0`, or LLVM bitcode (`has_bitcode = false`). All 10 carry
+  console-only `XBCH` (`XDAT` tag `0x0d`, 307–368 bytes) and `NOBC` (tag `0x07`, 28 bytes), plus a 12-byte `PRIV` chunk.
+* **Translation and GPU check:** `tools/pe_shader_containers.py --extract` previously hardcoded `"stage": "cs"` in
+  `index.json`, causing `rdna2spirv.py` to reject all 10 with `CS group size`. With `stage` read from `PSV0`, all 10
+  unpack via `tools/fssm_unpack.py` (10/10 `FSSM`, 1,245–4,176 bytes), disassemble cleanly via `tools/shader_disasm.py --backend python`
+  (10/10 clean), translate via `tools/rdna2spirv.py` (10/10 translated, all wave64 tier A), and pass `vk_pipeline_check`
+  on an NVIDIA GeForce RTX 5060 Laptop GPU (driver `617.14`, Windows 11): **10/10 modules and 10/10 pipelines OK** (1 VS, 9 PS, 0 failed, 0 skipped).
 
 **Every one of the 52 containers carries two representations of its program:**
 
@@ -294,7 +310,11 @@ with a translated corpus of 26,521 entries, none of them the builder's.
 | Radeon integrated (Ryzen 7 9700X), AMD 32.0.21042.62 (subgroups 32..64, limit 32,768) | `--wave64-emulate` | 49 of 50 `S_OK`, stops at #50 the same way |
 | same | native | 49 of 50 `S_OK`, stops at #50 the same way. That is the translator of `main` `561b65a8`; with the one of `3faac557`, 48 creations returned `S_OK` and #49 `LeafRehydration` did not come back from the driver's pipeline compile in 16 minutes (below) |
 
-With #1864's translator change applied to a local copy of the tools (not part of this step), 52 of 52 translate
+The rows above were measured before #1864 (`buffer_store_short`) was on `main`. With it (`main` `8575d36e`) the
+step translates 52 of 52, and on the Radeon with the emulated modules all 53 creations return `S_OK` and
+`bvh_builder_test` passes on the Vulkan device; the RTX 3070 and the native modules were not run again.
+
+Before that, with #1864's translator change applied to a local copy of the tools (not part of this step), 52 of 52 translate
 and pass `spirv-val`, and with the emulated modules all 53 creations return `S_OK` on both GPUs: the constructor
 and the destructor return and the test passes. So with the emulated modules the one thing between this step and a
 constructed builder on the Vulkan device is `buffer_store_short`. The PC-device run of the test (WARP) is
