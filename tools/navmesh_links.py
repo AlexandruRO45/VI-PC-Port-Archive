@@ -337,9 +337,17 @@ def main(argv=None):
         if os.path.isdir(args.out):
             sys.stderr.write(f"error: --out path is a directory: {args.out}\n")
             return 2
-        if os.path.abspath(args.out) == os.path.abspath(args.input):
+        out_abs = os.path.abspath(args.out)
+        in_abs = os.path.abspath(args.input)
+        if out_abs == in_abs:
             sys.stderr.write("error: --out must not overwrite the input path\n")
             return 2
+        try:
+            if os.path.samefile(out_abs, in_abs):
+                sys.stderr.write("error: --out must not overwrite the input path\n")
+                return 2
+        except FileNotFoundError:
+            pass
 
     doc = scan(args.input, start=args.start, limit=args.limit)
     if args.out is not None:

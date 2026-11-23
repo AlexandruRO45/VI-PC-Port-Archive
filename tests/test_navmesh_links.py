@@ -273,13 +273,27 @@ class NavmeshLinksTest(unittest.TestCase):
             rpf = os.path.join(tmp, "nav.rpf")
             make_rpf(rpf, build_tile())
             missing = os.path.join(tmp, "no_such.rpf")
-            for argv in (
+            link = os.path.join(tmp, "nav_link.rpf")
+            try:
+                os.link(rpf, link)
+                link_available = True
+            except OSError:
+                link_available = False
+            # same file on a case-insensitive filesystem, different spelling
+            case_variant = os.path.join(tmp, "NAV.RPF")
+            cases = [
                 [missing],
                 [rpf, "--start", "-1"],
                 [rpf, "--limit", "0"],
                 [rpf, "--out", tmp],
                 [rpf, "--out", rpf],
-            ):
+            ]
+            if link_available:
+                # same inode, different path: the abspath guard misses this
+                cases.append([rpf, "--out", link])
+            if os.name == "nt":
+                cases.append([rpf, "--out", case_variant])
+            for argv in cases:
                 rc = nl.main(argv)
                 self.assertEqual(rc, 2, f"expected exit code 2 for {argv}")
 
