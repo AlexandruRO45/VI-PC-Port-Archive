@@ -586,5 +586,57 @@ class TestConditionCodes(unittest.TestCase):
         spv_false = support.translate_lines("ps_scc_cselect_false", lines_false)
         self.assertEqual(support.mrt0_words(spv_false)[0], 0xBABE)
 
+
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes, Subnormals, and Bit Pattern Fidelity
+# ==============================================================================
+
+F32_POS_ZERO: int = 0x00000000
+F32_NEG_ZERO: int = 0x80000000
+F32_ONE: int = 0x3F800000
+F32_NEG_ONE: int = 0xBF800000
+F32_POS_INF: int = 0x7F800000
+F32_NEG_INF: int = 0xFF800000
+F32_QNAN: int = 0x7FC00000
+F32_SNAN: int = 0x7F800001
+F32_SUBNORMAL_MIN: int = 0x00000001
+F32_SUBNORMAL_MAX: int = 0x007FFFFF
+
+
+class TestIEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and bit pattern fidelity."""
+
+    def test_signed_zeros_distinction(self) -> None:
+        """Verify s_xnor_b32 operates purely bitwise and distinguishes +0.0 from -0.0."""
+        res, scc = ref_s_xnor_b32(F32_POS_ZERO, F32_NEG_ZERO)
+        self.assertEqual(res, 0x7FFFFFFF)
+        self.assertEqual(scc, 1)
+
+        trans_res, trans_scc = run_translator_salu_xnor(F32_POS_ZERO, F32_NEG_ZERO, name="ps_f32_zeros")
+        self.assertEqual(trans_res, 0x7FFFFFFF)
+        self.assertEqual(trans_scc, 1)
+
+    def test_nan_reflexivity_preservation(self) -> None:
+        """Verify NaN XNOR NaN produces 0xFFFFFFFF without NaN quieting or canonicalization."""
+        for nan_pattern in [F32_QNAN, F32_SNAN, 0x7FA5A5A5, 0xFFC00001]:
+            res, scc = ref_s_xnor_b32(nan_pattern, nan_pattern)
+            self.assertEqual(res, 0xFFFFFFFF)
+            self.assertEqual(scc, 1)
+
+            trans_res, trans_scc = run_translator_salu_xnor(nan_pattern, nan_pattern, name=f"ps_nan_{nan_pattern:x}")
+            self.assertEqual(trans_res, 0xFFFFFFFF)
+            self.assertEqual(trans_scc, 1)
+
+    def test_infinities_and_subnormals(self) -> None:
+        """Verify infinities and subnormal bit patterns undergo no FTZ (flush-to-zero)."""
+        res_inf, _ = ref_s_xnor_b32(F32_POS_INF, F32_NEG_INF)
+        self.assertEqual(res_inf, 0x7FFFFFFF)
+
+        res_sub, _ = ref_s_xnor_b32(F32_SUBNORMAL_MIN, 0)
+        self.assertEqual(res_sub, 0xFFFFFFFE)
+
+        trans_res, _ = run_translator_salu_xnor(F32_SUBNORMAL_MIN, 0, name="ps_subnormal_no_ftz")
+        self.assertEqual(trans_res, 0xFFFFFFFE)
+
 if __name__ == "__main__":
     unittest.main()
