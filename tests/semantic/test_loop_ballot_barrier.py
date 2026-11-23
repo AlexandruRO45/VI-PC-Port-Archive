@@ -69,8 +69,10 @@ def _parse_spv(asm):
     gvars = {}       # %name -> (storage_class, elem_type)
     fvars = []       # [(%name, elem_type, init_id_or_None)]
     blocks = {}      # %label -> [(res, op, args), ...]
+    fn_entry = {}    # %fn -> entry %label
+    fn_params = {}   # %fn -> [%param, ...]
     cur = None
-    in_main = False
+    pending_fn = None   # the function whose header (OpFunction .. first OpLabel) is being read
 
     for raw in asm.splitlines():
         s = raw.strip()
@@ -83,14 +85,22 @@ def _parse_spv(asm):
             res, op, args = None, toks[0], toks[1:]
 
         if op == "OpFunction":
-            in_main = (res == "%main")
+            # Every function's body is read, not only %main: structured wave64 emulation outlines
+            # lane-mask setup into helper functions and calls them with OpFunctionCall.
+            pending_fn = res
+            fn_params[res] = []
+            cur = None
+            continue
+        if op == "OpFunctionParameter":
+            if pending_fn is not None:
+                fn_params[pending_fn].append(res)
             continue
         if op == "OpFunctionEnd":
-            in_main = False
+            pending_fn = None
             cur = None
             continue
 
-        if not in_main:
+        if cur is None and pending_fn is None:
             if op == "OpTypeInt":
                 types[res] = ("int", int(args[0]), int(args[1]))
             elif op == "OpTypeBool":
@@ -127,6 +137,9 @@ def _parse_spv(asm):
             continue
 
         if op == "OpLabel":
+            if pending_fn is not None:
+                fn_entry[pending_fn] = res
+                pending_fn = None
             cur = res
             blocks[cur] = []
             continue
@@ -164,6 +177,8 @@ def _parse_spv(asm):
         "gvars": gvars,
         "fvars": fvars,
         "blocks": blocks,
+        "fn_entry": fn_entry,
+        "fn_params": fn_params,
         "make_zero": make_zero,
     }
 
@@ -199,6 +214,8 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     types = mod["types"]
     gvars = mod["gvars"]
     blocks = mod["blocks"]
+    fn_entry = mod["fn_entry"]
+    fn_params = mod["fn_params"]
     make_zero = mod["make_zero"]
     mem = {} if memory is None else memory
     pc_words = list(push_constants or [0] * 32)
@@ -222,7 +239,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     # Per-invocation state
     class Inv:
         __slots__ = ("gid", "sg_id", "sg_lane", "lid", "fn_mem", "ssa", "blk", "ip", "prev_blk",
-                     "done", "waiting_barrier", "waiting_sg", "steps")
+                     "done", "waiting_barrier", "waiting_sg", "steps", "calls")
 
         def __init__(self, gid):
             self.gid = gid
@@ -248,6 +265,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             self.waiting_barrier = None   # (blk, ip) when paused at OpControlBarrier
             self.waiting_sg = None        # (blk, ip, res, op, args) when paused at subgroup op
             self.steps = 0
+            self.calls = []               # (return blk, return ip, result id) per open OpFunctionCall
 
     invs = [Inv(i) for i in range(threads)]
     subgroups = []
@@ -350,7 +368,32 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             inv.ip += 1
             if op in ("OpSelectionMerge", "OpLoopMerge"):
                 continue
+            if op == "OpFunctionCall":
+                # Structured wave64 emulation calls outlined helpers (OpFunctionCall): bind the
+                # arguments to the callee's OpFunctionParameter ids, then run the callee's blocks.
+                fid = args[1]
+                if fid not in fn_entry or len(args) - 2 != len(fn_params[fid]):
+                    raise NotImplementedError(f"OpFunctionCall {fid} in {inv.blk}")
+                for param_id, arg in zip(fn_params[fid], args[2:]):
+                    inv.ssa[param_id] = val_of(inv, arg)
+                inv.calls.append((inv.blk, inv.ip, res))
+                inv.prev_blk = None
+                inv.blk = fn_entry[fid]
+                inv.ip = 0
+                continue
+            if op == "OpReturnValue":
+                if not inv.calls:
+                    raise NotImplementedError(f"OpReturnValue outside a called function in {inv.blk}")
+                value = val_of(inv, args[0])
+                blk, ip, res_id = inv.calls.pop()
+                inv.ssa[res_id] = value
+                inv.blk, inv.ip = blk, ip
+                continue
             if op == "OpReturn":
+                if inv.calls:
+                    blk, ip, _ = inv.calls.pop()
+                    inv.blk, inv.ip = blk, ip
+                    continue
                 inv.done = True
                 return
             if op == "OpBranch":
@@ -1023,7 +1066,9 @@ class DivergentLoopBallotTests(unittest.TestCase):
             with self.subTest(mode=label):
                 spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    # The structured emulation plan (wave64_emulate_opt.plan_structured_emulation)
+                    # emits inline helpers instead of the global round loop; both are valid emulations.
+                    self.assertIn(gen.control_flow, ("emulated wave64 rounds", "emulated wave64 structured"))
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
@@ -1341,7 +1386,7 @@ class BarrierInLoopsTests(unittest.TestCase):
         """
         prog = self._ring_shift_loop_cs(wave64=True, threads=128, iters=5)
         spv, gen = _translate_cs("cs_bar_loop_w64_emulate", prog, threads=128, lds_bytes=512, emulate=True)
-        self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+        self.assertIn(gen.control_flow, ("emulated wave64 rounds", "emulated wave64 structured"))
         for rev in (False, True):
             with self.subTest(reverse_subgroups=rev):
                 mem = run_compute_workgroup(spv, 128, 32, push_constants=VSHARP, reverse_subgroups=rev)
@@ -1414,7 +1459,7 @@ class BarrierInLoopsTests(unittest.TestCase):
         spv_em, gen_em = _translate_cs(
             "cs_div_bar_em", self._wave_divergent_barrier_loop_cs(True), threads=128, lds_bytes=512, emulate=True
         )
-        self.assertEqual(gen_em.control_flow, "emulated wave64 rounds")
+        self.assertIn(gen_em.control_flow, ("emulated wave64 rounds", "emulated wave64 structured"))
         mem_em = run_compute_workgroup(spv_em, 128, 32, push_constants=VSHARP)
         self.assertEqual([mem_em[4 * t] for t in range(128)], [2] * 64 + [4] * 64)
 
