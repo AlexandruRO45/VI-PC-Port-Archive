@@ -126,12 +126,12 @@ def fixture_dependencies(tests: list[dict]) -> dict[int, tuple[int, ...]]:
     metadata = [properties(test) for test in tests]
     setups: dict[str, list[int]] = {}
     for index, props in enumerate(metadata):
-        for fixture in props.get("FIXTURES_SETUP", []):
+        for fixture in string_list(props.get("FIXTURES_SETUP", [])):
             setups.setdefault(fixture, []).append(index)
     return {
         index: tuple(dict.fromkeys(
             setup
-            for fixture in props.get("FIXTURES_REQUIRED", [])
+            for fixture in string_list(props.get("FIXTURES_REQUIRED", []))
             for setup in setups.get(fixture, ())
             if setup != index
         ))
@@ -144,8 +144,8 @@ def truthy(value) -> bool:
     return str(value).strip().lower() in ("1", "on", "true", "yes")
 
 
-def regex_list(value: str | list[str]) -> list[str]:
-    """Treat a single string as one output expression, like a one-element CTest list."""
+def string_list(value: str | list[str]) -> list[str]:
+    """Treat a scalar CTest string property as a one-element list."""
     return [value] if isinstance(value, str) else value
 
 
@@ -223,9 +223,9 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
     if code == skip_code:
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
-    skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))
-    required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
-    forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
+    skip_patterns = string_list(props.get("SKIP_REGULAR_EXPRESSION", []))
+    required = string_list(props.get("PASS_REGULAR_EXPRESSION", []))
+    forbidden = string_list(props.get("FAIL_REGULAR_EXPRESSION", []))
     # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
     try:
         if any(re.search(pattern, out, re.DOTALL) for pattern in skip_patterns):
@@ -291,7 +291,8 @@ def valid_test_property(entry) -> bool:
     name, value = entry["name"], entry["value"]
     if name == "WORKING_DIRECTORY":
         return isinstance(value, str) and "\0" not in value
-    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
+    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION",
+                "DEPENDS", "FIXTURES_SETUP", "FIXTURES_REQUIRED"):
         return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
     return True
 
@@ -345,7 +346,8 @@ def main() -> int:
     sorter = TopologicalSorter(setups)
     for index, test in enumerate(tests):
         # DEPENDS controls order. Only failed fixture setups block a consumer.
-        sorter.add(index, *(indices[name] for name in properties(test).get("DEPENDS", []) if name in indices))
+        dependencies = string_list(properties(test).get("DEPENDS", []))
+        sorter.add(index, *(indices[name] for name in dependencies if name in indices))
     try:
         order = list(sorter.static_order())
     except CycleError:

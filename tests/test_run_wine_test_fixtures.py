@@ -13,7 +13,7 @@ WINDOWS_ROOT = "synthetic-checkout"
 
 class WineFixtureSetupTests(unittest.TestCase):
     def run_fixture(self, setup_status: int, *, fixture: bool = True, disabled: bool = False,
-                    dependent: bool = False, duplicate_setup: bool = False,
+                    dependent: bool = False, duplicate_setup: bool = False, scalar: bool = False,
                     ) -> tuple[int, str, list[str]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -34,7 +34,7 @@ class WineFixtureSetupTests(unittest.TestCase):
             setup_props: dict[str, object] = {"SKIP_RETURN_CODE": 77, "DISABLED": disabled}
             consumer_props: dict[str, object] = {"DEPENDS": ["setup"]}
             if fixture:
-                setup_props["FIXTURES_SETUP"] = ["input"]
+                setup_props["FIXTURES_SETUP"] = "input" if scalar else ["input"]
                 consumer_props["FIXTURES_REQUIRED"] = ["input"]
             setup = entry("setup", setup_status, setup_props)
             consumer = entry("consumer", 0, consumer_props)
@@ -42,7 +42,7 @@ class WineFixtureSetupTests(unittest.TestCase):
             if duplicate_setup:
                 tests.append(entry("second_setup", 0, setup_props, test_name="setup"))
             if dependent:
-                tests.append(entry("dependent", 0, {"DEPENDS": ["consumer"]}))
+                tests.insert(0, entry("dependent", 0, {"DEPENDS": "consumer" if scalar else ["consumer"]}))
             listing = root / "ctest.json"
             listing.write_text(json.dumps({"tests": tests}), encoding="utf-8", newline="\n")
             result = subprocess.run(
@@ -59,6 +59,11 @@ class WineFixtureSetupTests(unittest.TestCase):
 
     def test_explicit_dependency_still_runs_after_the_fixture_consumer(self) -> None:
         status, output, calls = self.run_fixture(0, dependent=True)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(calls, ["setup", "consumer", "dependent"])
+
+    def test_single_names_resolve_as_whole_dependency_and_fixture_names(self) -> None:
+        status, output, calls = self.run_fixture(0, dependent=True, scalar=True)
         self.assertEqual(status, 0, output)
         self.assertEqual(calls, ["setup", "consumer", "dependent"])
 
