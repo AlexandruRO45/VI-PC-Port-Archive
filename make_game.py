@@ -2058,7 +2058,11 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     xma_dir = os.path.join(out, "audio", "xma")
     xma_done = os.path.join(out, "audio", "xma.done")
     xma_record = os.path.join(xma_dir, DECODER_RECORD)
-    xma_stale = read_shader_setting(xma_record) != decoder
+    if _linked(xma_dir):
+        fail(f"assets: {xma_dir} is a symlink or junction; remove the link and rerun")
+    xma_matches = read_shader_setting(xma_record) == decoder
+    # A successful export can be represented by a completion marker alone.
+    xma_stale = os.path.isdir(xma_dir) and not xma_matches
     need_xma = xma_stale or not os.path.isfile(xma_done)
     ff = shutil.which("ffmpeg")
     need_xma_decode = bool(ff)  # decode_xma no-ops when nothing is pending
@@ -2111,14 +2115,14 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         progress.tick(force=True)
     if need_xma:
         log("assets: XMA2 streams")
+        get_exporter(work)
         if xma_stale:
             # Both exporters skip existing streams. Clear the old XMA and decoded PCM together, but only after
             # the new exporter can be built. Without the completion marker a stopped run can resume this export.
-            get_exporter(work)
             if os.path.isfile(xma_done):
                 os.remove(xma_done)
-            if os.path.isdir(xma_dir):
-                shutil.rmtree(xma_dir)
+            shutil.rmtree(xma_dir)
+        if not xma_matches:
             os.makedirs(xma_dir, exist_ok=True)
             with open(xma_record, "w", encoding="utf-8", newline="\n") as f:
                 f.write(decoder + "\n")

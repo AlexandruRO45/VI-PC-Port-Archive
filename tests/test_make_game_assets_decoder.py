@@ -5,6 +5,8 @@ does when an export finishes.
 
     python -I tests/test_make_game_assets_decoder.py
 """
+import contextlib
+import io
 import os
 import shutil
 import subprocess
@@ -24,7 +26,7 @@ class AssetsDecoderTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.work = tmp.name
         self.models = os.path.join(self.work, "assets", "scene", "models")
-        # The later steps of the stage are marked done so only the model and texture loop runs.
+        # Start with completion markers from before XMA exports recorded their fingerprint.
         audio = os.path.join(self.work, "assets", "audio")
         self.xma_dir = os.path.join(audio, "xma")
         self.xma_done = os.path.join(audio, "xma.done")
@@ -81,6 +83,27 @@ class AssetsDecoderTest(unittest.TestCase):
         self.assertEqual(self.export("d1"), ["xma"])
         self.assertTrue(os.path.isfile(partial))
         self.assertTrue(os.path.isfile(self.xma_done))
+
+    def test_fresh_xma_export_records_its_fingerprint(self):
+        os.rmdir(self.xma_dir)
+        os.remove(self.xma_done)
+        self.assertEqual(self.export("d1"), ["models", "textures", "xma"])
+        with open(os.path.join(self.xma_dir, make_game.DECODER_RECORD), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "d1\n")
+        self.assertEqual(self.export("d1"), [])
+
+    def test_linked_xma_output_is_rejected_before_changing_its_marker(self):
+        self.export("d1")
+        err = io.StringIO()
+        with mock.patch.object(make_game, "_linked", side_effect=lambda path: path == self.xma_dir), \
+                mock.patch.object(make_game.shutil, "rmtree") as remove_tree, \
+                contextlib.redirect_stderr(err):
+            with self.assertRaisesRegex(SystemExit, "^1$"):
+                self.export("d1")
+        remove_tree.assert_not_called()
+        self.assertIn("symlink or junction", err.getvalue())
+        with open(self.xma_done, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "rpf9dump xma finished\n")
 
     def test_a_folder_without_the_record_exports_again(self):
         self.export("d1")
