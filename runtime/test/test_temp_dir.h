@@ -27,6 +27,14 @@
 
 namespace testfiles {
 
+// A path for a diagnostic, as UTF-8. path::string() converts to the ANSI code page on Windows and throws
+// std::system_error (1113, "no mapping") for a character outside it, which would end the test in the very message
+// that was meant to report the problem.
+inline std::string utf8(const std::filesystem::path& p) {
+    const auto u8 = p.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+
 // <temp>/<name>_<pid>: a folder no other running process uses.
 inline std::filesystem::path process_temp_dir(std::string_view name) {
 #ifdef _WIN32
@@ -45,7 +53,7 @@ public:
         std::error_code ec;
         std::filesystem::remove_all(path_, ec);
         std::filesystem::create_directories(path_, ec);
-        if (ec) std::fprintf(stderr, "cannot create %s: %s\n", path_.string().c_str(), ec.message().c_str());
+        if (ec) std::fprintf(stderr, "cannot create %s: %s\n", utf8(path_).c_str(), ec.message().c_str());
     }
     ~ScratchDir() {
         std::error_code ec;
@@ -73,7 +81,7 @@ inline bool copy_file(const std::filesystem::path& from, const std::filesystem::
 #else
     std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
 #endif
-    if (ec) std::fprintf(stderr, "cannot copy %s to %s: %s\n", from.string().c_str(), to.string().c_str(),
+    if (ec) std::fprintf(stderr, "cannot copy %s to %s: %s\n", utf8(from).c_str(), utf8(to).c_str(),
                          ec.message().c_str());
     return !ec;
 }

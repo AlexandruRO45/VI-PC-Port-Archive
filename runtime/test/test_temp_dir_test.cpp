@@ -46,9 +46,20 @@ int main() {
         expect(testfiles::copy_file(src, dst), "copy_file overwrites an existing destination");
         expect(slurp(dst) == "second version", "the overwrite replaced the bytes");
 
-        std::fprintf(stderr, "(the next line is the expected message for a missing source)\n");
+        std::fprintf(stderr, "(the next two lines are the expected messages for a missing source)\n");
         expect(!testfiles::copy_file(kept / "absent.bin", dst), "a missing source returns false instead of throwing");
         expect(slurp(dst) == "second version", "a failed copy leaves the destination alone");
+
+        // Paths outside the ANSI code page: the copy works, and a missing source is reported, not thrown
+        // (path::string() would throw "no mapping" on Windows while formatting the message).
+        const auto unicode_dir = kept / L"m\u00f3dulos-\u4e2d\u6587";
+        std::filesystem::create_directories(unicode_dir);
+        const auto unicode_dst = unicode_dir / L"c\u00f3pia.bin";
+        expect(testfiles::copy_file(src, unicode_dst), "copy_file copies to a path with non-ANSI characters");
+        expect(slurp(unicode_dst) == "second version", "the Unicode-path copy has the bytes");
+        expect(!testfiles::copy_file(unicode_dir / L"ausente-\u00e9.bin", unicode_dst),
+               "a missing source with non-ANSI characters returns false instead of throwing");
+        expect(slurp(unicode_dst) == "second version", "the failed Unicode-path copy leaves the destination alone");
     }
     expect(!std::filesystem::exists(kept), "the scratch folder is removed with the object");
 
