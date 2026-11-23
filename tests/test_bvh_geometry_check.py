@@ -109,5 +109,23 @@ class TestChecks(unittest.TestCase):
             self.assertIn("must not overwrite", err.getvalue())
 
 
+    def test_json_paths_it_cannot_write_are_one_error_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        with tempfile.TemporaryDirectory() as d:
+            paths = [os.path.join(d, n) for n in ("in.bin", "vb.bin", "ib.bin")]
+            for p, data in zip(paths, (src, VB, IB)):
+                with open(p, "wb") as f:
+                    f.write(data)
+            missing = os.path.join(d, "nope", "r.json")
+            for target, expect in ((d, "error: --json %s is a folder, not a JSON file" % d),
+                                   (missing, "error: --json folder does not exist: %s" % os.path.dirname(missing))):
+                with contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()) as out:
+                    rc = C.main([paths[0], "--geom", paths[1] + "," + paths[2], "--json", target])
+                self.assertEqual(rc, 2)
+                self.assertEqual([line for line in err.getvalue().splitlines() if line], [expect])
+                self.assertEqual(out.getvalue(), "")        # the check never ran, so no report lines were printed
+            self.assertFalse(os.path.exists(os.path.dirname(missing)))
+
+
 if __name__ == "__main__":
     unittest.main()
