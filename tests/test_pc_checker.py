@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -104,6 +105,21 @@ class Evaluate(unittest.TestCase):
         _, _, rows = pc.evaluate(XBOX, "AMD Ryzen 5 5600", "NVIDIA GeForce RTX 6070", 32)
         self.assertFalse(rows[0][4])
         self.assertTrue(rows[1][4])
+
+
+class DetectGpus(unittest.TestCase):
+    def test_windows_fills_missing_nvidia_memory_from_registry(self):
+        name = "NVIDIA GeForce RTX 4070"
+        cim = '{"Name":"NVIDIA GeForce RTX 4070","AdapterRAM":4294967295}'
+        for smi_memory, expected in (("[N/A]", 12), ("8192", 8)):
+            with (
+                self.subTest(smi_memory=smi_memory),
+                mock.patch.object(pc.sys, "platform", "win32"),
+                mock.patch.object(pc.shutil, "which", return_value="nvidia-smi"),
+                mock.patch.object(pc, "_run", side_effect=[f"{name}, {smi_memory}", cim]),
+                mock.patch.object(pc, "_win_vram_map", return_value={name.lower(): 12}),
+            ):
+                self.assertEqual(pc.detect_gpus(), [(name, expected)])
 
 
 class Api(unittest.TestCase):

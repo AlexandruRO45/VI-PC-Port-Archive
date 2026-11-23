@@ -489,9 +489,20 @@ def detect_gpus() -> list:
         vmap = _win_vram_map()
         for d in data:
             name = (d.get("Name") or "").strip()
-            if not name or any(name.lower() == g[0].lower() for g in gpus):
+            if not name:
                 continue
-            vram = vmap.get(name.lower())
+            name_key = name.lower()
+            vram = vmap.get(name_key)
+            matches = [index for index, (gpu_name, _) in enumerate(gpus) if gpu_name.lower() == name_key]
+            if matches:
+                # Use the registry's 64-bit value when only the VRAM reading is missing.
+                # A shared model name cannot identify one of several nvidia-smi adapters.
+                if len(matches) == 1 and vram:
+                    index = matches[0]
+                    gpu_name, smi_vram = gpus[index]
+                    if smi_vram is None:
+                        gpus[index] = (gpu_name, round(vram))
+                continue
             if vram is None and d.get("AdapterRAM"):
                 vram = d["AdapterRAM"] / 2**30
             gpus.append((name, round(vram) if vram else None))
