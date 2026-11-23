@@ -26,7 +26,8 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
 
 - **Kendi Xbox Series paket kopyanız**, sürüm `1.0.2.1` (`MicrosoftGame.Config` dosyasını ve `.rpf` arşivlerini diskte
   düz dosyalar olarak barındıran klasör).
-- **Windows 10/11 x64** ve çalışma dosyaları için yaklaşık **400 GB boş disk alanı** (`--work` ile başka bir diske
+- **Windows 10/11 x64** ve çalışma dosyaları için yaklaşık **400 GB boş disk alanı** (yalnızca varlık dışa aktarımı,
+  ses adımından önce yaklaşık 2 saat 35 dk içinde yaklaşık 337 GB olarak ölçülmüştür; `--work` ile başka bir diske
   yönlendirilebilir). Bu rakam tam derleme içindir: yalnızca çalıştırmak için `--stages check,shaders,runtime`
   yaklaşık 30 GB ister, `assets` aşaması ise yaklaşık 370 GB.
 - [Python 3.12+](https://www.python.org/downloads/) (kurulumda *"Add python.exe to PATH"* seçeneğini işaretleyin).
@@ -110,9 +111,18 @@ ayarlamanıza imkân tanır; ardından tuşlarla geçiş yapılabilen aşama baz
 - **`--wave64-emulate`**: Wave64 compute ve mesh shader'larını her subgroup genişliğinde birebir çalışacak şekilde
   çevirir. NVIDIA ve Intel GPU'lar 32 şeritli subgroup kullandığı için buna ihtiyaç duyar. Varsayılan `auto` modu
   `vulkaninfo` çıktısına bakar ve tüm GPU'lar yerel 64 şeritli subgroup bildirmediği sürece emülasyonu otomatik açar.
-- **`--mesh-compute`**: `VK_EXT_mesh_shader` uzantısına sahip olmayan aygıtlar için mesh shader'larını compute
-  shader'ı olarak çevirir. Yerel mesh çizimlerinin çöktüğü Intel Windows Vulkan sürücüsünde (`BUILD-2202`) otomatik
-  olarak devreye girer (`--native-mesh` parametresi verilmedikçe).
+- **Yedek (fallback) bayrakları**: Eksik Vulkan özelliklerine sahip aygıtlar için çeviriciye benzer şekilde iletilen,
+  çevrilmiş shader'ların yanında saklanan ve değiştirildiklerinde yeniden çeviri başlatan dört seçenek
+  ([`docs/design.md`](../../design.md)):
+  - `--no-float-controls`: Pipeline denetimi `shaderSignedZeroInfNanPreserveFloat32` olmadan shader'ı atlayan aygıtlar
+    için `SignedZeroInfNanPreserve` özelliğini kaldırır (PR #664 çevirici bayrağını gerektirir).
+  - `--bary-fallback`: `VK_KHR_fragment_shader_barycentric` desteği olmayan aygıtlar için enterpole edilmiş girdiden
+    ham barisentrikleri okur.
+  - `--texel-offset-fallback`: `VK_KHR_maintenance8` desteği olmayan aygıtlar için `image_sample*_o` ofsetlerini
+    koordinata katar.
+  - `--mesh-compute`: `VK_EXT_mesh_shader` uzantısına sahip olmayan aygıtlar için mesh shader'larını compute shader'ı
+    olarak çevirir; yerel mesh çizimlerinin çöktüğü Intel Windows Vulkan sürücüsünde (`BUILD-2202`) otomatik olarak
+    devreye girer (`--native-mesh` parametresi verilmedikçe).
 - **`--work`**: Tam derleme için en az 400 GB boş alana sahip bir sürücü seçin (yalnızca çalıştırmak için yaklaşık
   30 GB, `assets` aşaması için yaklaşık 370 GB yeterlidir). En uzun adım shader çevirisidir ve varsayılan olarak
   CPU iş parçacıklarının yarısını kullanır (`--jobs` ile değiştirilebilir).
