@@ -560,6 +560,62 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
             self.assertEqual([row["name"] for row in json.load(f)], ["valid"])
         self.assertFalse(any(os.path.isdir(os.path.join(self.out, name)) for name in os.listdir(self.out)))
 
+    def test_unreadable_source_is_one_error_line(self):
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, make_dxbc([(b"PRIV", bytes(range(32)))])
+                                   ))
+        err = io.StringIO()
+        with mock.patch("shader_carve.mmap.mmap", side_effect=OSError(13, "Permission denied")):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([self.archive, self.out]), 2)
+        self.assertIn("ERROR: cannot map", err.getvalue())
+        self.assertIn("Permission denied", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_unreadable_file_handle_is_one_error_line(self):
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, make_dxbc([(b"PRIV", bytes(range(32)))])))
+        err = io.StringIO()
+        real_open = open
+
+        def deny(path, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(self.archive):
+                raise OSError(13, "Permission denied")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=deny):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([self.archive, self.out]), 2)
+        self.assertIn("ERROR: cannot read", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.out, "index.json")))
+
+    def test_unwritable_dxbc_is_one_error_line(self):
+        # A directory where the .dxbc file has to go: portable, and it fails at the write, not earlier.
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, make_dxbc([(b"PRIV", bytes(range(32)))])))
+        os.mkdir(self.out)
+        os.mkdir(os.path.join(self.out, "valid.dxbc"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shader_carve.main([self.archive, self.out]), 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        self.assertIn("valid.dxbc", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.out, "index.json")))
+
+    def test_unwritable_index_is_one_error_line(self):
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, make_dxbc([(b"PRIV", bytes(range(32)))])))
+        err = io.StringIO()
+        with mock.patch("shader_carve.os.replace", side_effect=OSError(28, "No space left on device")):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([self.archive, self.out]), 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        self.assertIn("index.json", err.getvalue())
+        self.assertIn("No space left on device", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
     def test_main_closes_mmap_on_exit(self):
         dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
         with open(self.archive, "wb") as f:
