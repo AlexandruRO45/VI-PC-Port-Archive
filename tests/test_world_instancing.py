@@ -334,6 +334,21 @@ class InstancedBuildTest(unittest.TestCase):
         gltf, _ = read_chunk(out, doc["chunks"][0]["id"])
         self.assertEqual((len(gltf["images"]), len(gltf["meshes"])), (1, 1))
 
+    def test_render_bucket_alpha_modes_in_both_instancing_modes(self):
+        for mode in ("gpu", "nodes"):
+            with self.subTest(mode=mode):
+                assets = os.path.join(self.tmp, f"bucket_assets_{mode}")
+                twb._write_bucket_fixture(assets, [1, 0x83, 0, 2])
+                ents = os.path.join(self.tmp, f"bucket_{mode}.jsonl")
+                twp.write_entities(ents, [twp.entity("cubes", (10 + 10 * i, 10, 0)) for i in range(3)])
+                out = os.path.join(self.tmp, f"bucket_world_{mode}")
+                doc = world_build.build_world(assets, out, placements=ents, instancing=mode)
+                self.assertEqual(doc["instancing"], mode)
+                self.assertEqual(doc["stats"]["textures_embedded"], 1)
+                gltf, _ = read_chunk(out, doc["chunks"][0]["id"])
+                self.assertEqual(len(gltf["meshes"]), 1)
+                twb.assert_bucket_materials(self, gltf)
+
     def test_texture_cache_respects_each_build_size(self) -> None:
         assets = os.path.join(self.tmp, "tex_assets")
         twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])

@@ -1335,15 +1335,23 @@ def _write_bucket_fixture(assets_dir, buckets):
     return models_dir, item
 
 
+BUCKET_MODES = ["BLEND", "MASK", "OPAQUE", "OPAQUE"]  # per cube group of _write_bucket_fixture [1, 0x83, 0, 2]
+
+
+def assert_bucket_materials(test, gltf):
+    """Per-primitive alpha mode, one shared image for the three materials, and the glTF default cutoff."""
+    prims = [p for m in gltf["meshes"] for p in m["primitives"]]
+    modes = [gltf["materials"][p["material"]].get("alphaMode", "OPAQUE") for p in prims]
+    test.assertEqual(modes[:4], BUCKET_MODES)
+    test.assertEqual(len(gltf["materials"]), 3)
+    test.assertEqual(len({gltf["materials"][p["material"]]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                          for p in prims}), 1)
+    test.assertEqual(len(gltf["images"]), 1)
+    test.assertTrue(all("alphaCutoff" not in m for m in gltf["materials"]))
+
+
 class RenderBucketAlphaTest(unittest.TestCase):
     # bucket 1 -> BLEND, 0x83 (bit 7 flag + bucket 3) -> MASK, the rest stay opaque
-
-    def _assert_materials(self, gltf):
-        self.assertEqual(sorted(m.get("alphaMode", "OPAQUE") for m in gltf["materials"]),
-                         ["BLEND", "MASK", "OPAQUE"])
-        for m in gltf["materials"]:
-            self.assertNotIn("alphaCutoff", m)  # glTF default cutoff, not a native one
-        self.assertEqual(len(gltf["images"]), 1)  # one PNG shared by the three materials
 
     def test_shader_alpha_modes(self):
         item = {"Materials": [
@@ -1352,9 +1360,24 @@ class RenderBucketAlphaTest(unittest.TestCase):
             {"ShaderIndex": 4, "RenderBucket": 1}, {"ShaderIndex": 4, "RenderBucket": 3},
             {"ShaderIndex": 5, "RenderBucket": 1}, {"ShaderIndex": 5, "RenderBucket": 0x81},
             {"ShaderIndex": 6, "RenderBucket": "1"}, {"ShaderIndex": 7, "RenderBucket": True},
+            {"ShaderIndex": 8, "RenderBucket": 1}, {"ShaderIndex": "8", "RenderBucket": 3},   # same slot
+            {"ShaderIndex": "9", "RenderBucket": 3}, {"ShaderIndex": True, "RenderBucket": 1},
         ]}
-        self.assertEqual(world_build.shader_alpha_modes(item), {0: "BLEND", 1: "MASK", 5: "BLEND"})
+        self.assertEqual(world_build.shader_alpha_modes(item), {0: "BLEND", 1: "MASK", 5: "BLEND", 9: "MASK"})
         self.assertEqual(world_build.shader_alpha_modes({}), {})
+
+    def test_file_name_never_decides_the_mode(self):
+        for name in ("a#BLEND.dds", "b#MASK.dds", "texb_c.dds", "d_.dds"):
+            with self.subTest(name=name):
+                path = os.path.abspath(name)
+                for mode in (None, "BLEND", "MASK"):
+                    prims = [{"group_index": 0, "uvs": [0.0]}]
+                    keys = world_build._assign_materials(prims, [0], {0: path}, True, {0: mode} if mode else None)
+                    self.assertEqual(world_build._material_alpha_mode(prims[0]["material"]), mode)
+                    self.assertEqual(list(keys.values()), [path])
+        self.assertEqual(len({k for m in (None, "BLEND", "MASK") for k in
+                              world_build._assign_materials([{"uvs": [0.0]}], [0], {0: "x"}, True,
+                                                            {0: m} if m else None)}), 3)
 
     def test_baked_world_keeps_modes_separate_for_one_dds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1366,7 +1389,7 @@ class RenderBucketAlphaTest(unittest.TestCase):
             self.assertEqual(world["stats"]["textures_embedded"], 1)  # one deduped image
             with open(_chunk_disk_path(out, world["chunks"][0]["url"]), "rb") as f:
                 gltf, _ = parse_and_validate_glb(f.read())
-            self._assert_materials(gltf)
+            assert_bucket_materials(self, gltf)
             self.assertEqual(len(gltf["meshes"][0]["primitives"]), 4)
 
     def test_no_textures_means_no_alpha_modes(self):
@@ -1380,26 +1403,6 @@ class RenderBucketAlphaTest(unittest.TestCase):
                 gltf, _ = parse_and_validate_glb(f.read())
             self.assertEqual(gltf.get("images", []), [])
             self.assertTrue(all("alphaMode" not in m for m in gltf.get("materials", [])))
-
-    def test_instanced_chunks_keep_modes_separate_for_one_dds(self):
-        for mode in ("gpu", "nodes"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
-                assets = os.path.join(tmp, "assets")
-                models_dir, item = _write_bucket_fixture(assets, [1, 0x83, 0, 2])
-                tex_map = world_build.resolve_model_textures(models_dir, item, {}, ALBEDO_PARAM)
-                pack = os.path.join(tmp, "0.lpk")
-                _, summary = world_build._pack_model_job(
-                    (0, os.path.join(models_dir, "cubes.obj"), item["MeshShaders"], tex_map, True, pack,
-                     world_build.shader_alpha_modes(item)))
-                self.assertEqual(len(summary["mat_to_dds"]), 3)
-                insts = [(0, False, (float(i * 10), 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
-                         for i in range(2)]
-                rec, embedded, skipped, _ = world_build._build_chunk_job(
-                    ("c", tmp, mode, insts, {0: pack}, summary["mat_to_dds"], True, 64))
-                self.assertEqual((embedded, skipped), (1, 0))
-                with open(os.path.join(tmp, "c.glb"), "rb") as f:
-                    gltf, _ = parse_and_validate_glb(f.read())
-                self._assert_materials(gltf)
 
 
 class BaseColorParamTest(unittest.TestCase):

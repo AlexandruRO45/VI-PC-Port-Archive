@@ -913,6 +913,17 @@ def _ref_param_hash(ref: dict) -> str | None:
     return None
 
 
+def _shader_index(mat: dict) -> int | None:
+    """A Materials record's ShaderIndex as resolve_model_textures and shader_alpha_modes read it."""
+    raw = mat.get("ShaderIndex")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve_model_textures(
     models_dir: str,
     item: dict,
@@ -965,14 +976,8 @@ def resolve_model_textures(
         for mat in materials:
             if not isinstance(mat, dict):
                 continue
-            raw_sidx = mat.get("ShaderIndex")
-            if raw_sidx is None or isinstance(raw_sidx, bool):
-                continue
-            try:
-                sidx = int(raw_sidx)
-            except (TypeError, ValueError):
-                continue
-            if sidx in result:
+            sidx = _shader_index(mat)
+            if sidx is None or sidx in result:
                 continue
 
             chosen: str | None = None
@@ -1037,8 +1042,8 @@ def shader_alpha_modes(item: dict) -> dict[int, str]:
     for mat in _list_field(item, "Materials"):
         if not isinstance(mat, dict):
             continue
-        sidx = mat.get("ShaderIndex")
-        if not isinstance(sidx, int) or isinstance(sidx, bool):
+        sidx = _shader_index(mat)
+        if sidx is None:
             continue
         bucket = mat.get("RenderBucket")
         ok = isinstance(bucket, int) and not isinstance(bucket, bool) and 0 <= bucket <= 0xFF
@@ -1047,12 +1052,14 @@ def shader_alpha_modes(item: dict) -> dict[int, str]:
             if len(v) == 1 and next(iter(v)) in _BUCKET_ALPHA}
 
 
+# Material key prefixes, one per alpha mode, placed before the texture path so a file name never decides the mode.
+_KEY_PREFIX = {None: "tex_", "BLEND": "texb_", "MASK": "texm_"}
+_KEY_MODE = {prefix: mode for mode, prefix in _KEY_PREFIX.items()}
+
+
 def _material_alpha_mode(mat_key: str) -> str | None:
-    """The alpha mode a ``_assign_materials`` key carries (``tex_<dds>#MODE``), or None for opaque."""
-    for mode in _BUCKET_ALPHA.values():
-        if mat_key.endswith("#" + mode):
-            return mode
-    return None
+    """The alpha mode a ``_assign_materials`` key carries (its prefix), or None for opaque."""
+    return _KEY_MODE.get(mat_key.split("_", 1)[0] + "_")
 
 
 def _material_spec(mat_key: str, dds_path: str, png: bytes) -> dict:
@@ -1068,7 +1075,7 @@ def _assign_materials(prims: list[dict], mesh_shaders: list, tex_map: dict, text
                       alpha_modes: dict | None = None) -> dict[str, str]:
     """Set each primitive's ``material`` key from its shader's resolved DDS; returns key -> DDS path.
 
-    A shader slot with an alpha mode in ``alpha_modes`` gets its own key (``#MODE`` suffix), so one DDS used
+    A shader slot with an alpha mode in ``alpha_modes`` gets its own key (a mode prefix), so one DDS used
     with different modes stays separate materials."""
     mat_to_dds: dict[str, str] = {}
     for p in prims:
@@ -1086,9 +1093,7 @@ def _assign_materials(prims: list[dict], mesh_shaders: list, tex_map: dict, text
             and sidx in tex_map
         ):
             dds_path = os.path.abspath(tex_map[sidx])
-            mat_key = f"tex_{os.path.normcase(dds_path)}"
-            if alpha_modes and sidx in alpha_modes:
-                mat_key += "#" + alpha_modes[sidx]
+            mat_key = _KEY_PREFIX[(alpha_modes or {}).get(sidx)] + os.path.normcase(dds_path)
             p["material"] = mat_key
             mat_to_dds[mat_key] = dds_path
         else:
