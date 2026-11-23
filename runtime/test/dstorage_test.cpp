@@ -965,6 +965,29 @@ void test_stats_timing(Env& env) {
     q->Release();
 }
 
+// IDStorageFileX::Close closes the file whatever its reference count, so CurrentOpenFileCount drops at Close, once;
+// the staging size stays locked until the file object itself is released (reported by @ryotdev on #8461).
+void test_close_counts_and_staging(Env& env) {
+    auto open_count = [&] {
+        DSTORAGE_STATS st{};
+        env.factory->GetStats(&st);
+        return st.CurrentOpenFileCount;
+    };
+    const auto before = open_count();
+    IDStorageFileX* f = open(env, L"GAME:\\data\\big.bin");
+    if (!f) return;
+    check(open_count() == before + 1, "an opened file is counted as open");
+    f->Close();
+    check(open_count() == before, "Close takes the file out of CurrentOpenFileCount while a reference is held");
+    f->Close();
+    check(open_count() == before, "a second Close does not count it out again");
+    check_hr(env.factory->SetStagingBufferSize(32u << 20), E_DSTORAGE_STAGING_BUFFER_LOCKED,
+             "staging size stays locked while a closed file object exists");
+    check(f->Release() == 0, "the last file reference frees it");
+    check(open_count() == before, "releasing a closed file does not count it out again");
+    check_hr(env.factory->SetStagingBufferSize(32u << 20), S_OK, "staging size unlocked once the file is released");
+}
+
 void test_stats(Env& env) {
     DSTORAGE_STATS st{};
     env.factory->GetStats(&st);
@@ -1012,6 +1035,7 @@ int main() {
     test_threads(env);
     test_iid_policy_events_and_cancel(env);
     test_stats_timing(env);
+    test_close_counts_and_staging(env);
     test_stats(env);
 
     fs::remove_all(env.root, ec);

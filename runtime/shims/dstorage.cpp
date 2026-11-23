@@ -187,6 +187,7 @@ struct Stats {
     std::mutex mutex;
     DSTORAGE_STATS s{};
     uint32_t live_queues = 0;  // all priorities; SetStagingBufferSize is refused while queues or files exist
+    uint32_t live_files = 0;   // file objects not yet released, closed or not: the staging-size guard counts these
 };
 
 Stats& stats() {
@@ -299,11 +300,12 @@ public:
         ++s.CurrentOpenFileCount;
         ++s.CumulativeOpenFileCount;
         s.MaxOpenFileCount = std::max(s.MaxOpenFileCount, s.CurrentOpenFileCount);
+        ++stats().live_files;
     }
     ~File() {
-        Close();
+        Close();   // takes the file out of CurrentOpenFileCount if the title never called Close
         std::lock_guard lock(stats().mutex);
-        --stats().s.CurrentOpenFileCount;
+        --stats().live_files;
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -336,6 +338,10 @@ public:
         if (handle_ != INVALID_HANDLE_VALUE) {
             CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
+            // CurrentOpenFileCount counts open files, and Close closes the file whatever its reference count
+            // (GDK reference, IDStorageFileX::Close and DSTORAGE_STATS): it drops here, once.
+            std::lock_guard stats_lock(stats().mutex);
+            --stats().s.CurrentOpenFileCount;
         }
     }
 
@@ -993,7 +999,7 @@ public:
             return bad_call("IDStorageFactoryX::SetStagingBufferSize", E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE,
                             "not one of 0, 16, 20, 24, 28 or 32 MiB");
         std::lock_guard lock(stats().mutex);
-        if (stats().live_queues || stats().s.CurrentOpenFileCount) return E_DSTORAGE_STAGING_BUFFER_LOCKED;
+        if (stats().live_queues || stats().live_files) return E_DSTORAGE_STAGING_BUFFER_LOCKED;
         staging_size_ = size;  // there is no staging buffer here; the size is only kept
         return S_OK;
     }
