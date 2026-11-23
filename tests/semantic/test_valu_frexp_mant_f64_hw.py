@@ -713,5 +713,91 @@ class TestValuFrexpMantF64BoundaryExtremes(unittest.TestCase):
         self.assertEqual(words[1], 0x3FE00000)
         self.assertEqual(words[0], 0x0)
 
+# ---------------------------------------------------------------------------
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestValuFrexpMantF64NegativeControls(unittest.TestCase):
+    """Phase 8: Negative controls and syntax rejection."""
+
+    def test_parse_empty_string(self) -> None:
+        with self.assertRaises(ValueError):
+            ValuFrexpMantF64Instruction.parse("")
+
+    def test_parse_invalid_opcodes(self) -> None:
+        with self.assertRaises(ValueError):
+            ValuFrexpMantF64Instruction.parse("v_frexp_mant_f32 v[0:1], v[2:3]")
+        with self.assertRaises(ValueError):
+            ValuFrexpMantF64Instruction.parse("v_frexp_exp_i32_f64 v[0:1], v[2:3]")
+
+    def test_parse_invalid_destinations(self) -> None:
+        # Destination must be 2 VGPRs
+        with self.assertRaises(ValueError):
+            ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v0, v[2:3]")
+        with self.assertRaises(ValueError):
+            ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 s[0:1], v[2:3]")
+
+    def test_parse_vop1_modifiers_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v[0:1], v[2:3] clamp")
+
+    def test_translator_rejects_sgpr_destination(self) -> None:
+        """Verify translator rejects SGPR destination for v_frexp_mant_f64."""
+        lines = [
+            "v_frexp_mant_f64 s[0:1], v[2:3]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Unsupported):
+            support.translate_lines("ps_frexp_mant_bad_dst", lines)
+
+
+class TestValuFrexpMantF64MutationDetection(unittest.TestCase):
+    """Phase 8: Mutation detection to verify test suite catches faulty implementations."""
+
+    def test_mutant_wrong_exponent_bias_detected(self) -> None:
+        """Mutant: using 1023 (1.0..2.0) instead of 1022 (0.5..1.0)."""
+        def faulty_mant(bits: int) -> int:
+            hi = (bits >> 32) & MASK32
+            lo = bits & MASK32
+            sgn = hi & 0x80000000
+            f_hi = hi & 0x000FFFFF
+            return ((sgn | 0x3FF00000 | f_hi) << 32) | lo
+
+        val_2_0 = f64_to_u64(2.0)
+        correct = oracle_frexp_mant_f64_bits(val_2_0)
+        mutant = faulty_mant(val_2_0)
+        self.assertEqual(u64_to_f64(correct), 0.5)
+        self.assertEqual(u64_to_f64(mutant), 1.0)
+        self.assertNotEqual(mutant, correct)
+
+    def test_mutant_sign_bit_dropped_detected(self) -> None:
+        """Mutant: dropping original sign bit."""
+        val_neg_2_0 = f64_to_u64(-2.0)
+        res = oracle_frexp_mant_f64_bits(val_neg_2_0)
+        self.assertEqual(u64_to_f64(res), -0.5)
+        self.assertTrue(bool(res & SIGN_BIT64))
+
+    def test_mutant_zero_modified_detected(self) -> None:
+        """Mutant: normalizing zero instead of passing through."""
+        res_pos = oracle_frexp_mant_f64_bits(0x0000000000000000)
+        self.assertEqual(res_pos, 0x0000000000000000)
+        res_neg = oracle_frexp_mant_f64_bits(0x8000000000000000)
+        self.assertEqual(res_neg, 0x8000000000000000)
+
+    def test_mutant_simd_exec_leak_detected(self) -> None:
+        """Mutant: inactive SIMD lane modifies destination register."""
+        state = SIMDState64(num_lanes=32, exec_mask=0x0)
+        interp = SIMDInterpreter64()
+
+        state.set_vgpr64(0, 2, f64_to_u64(2.0))
+        state.set_vgpr64(0, 0, 0xDEADBEEFCAFEBABE)
+
+        inst = ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v[0:1], v[2:3]")
+        res = interp.step(inst, state)
+
+        self.assertEqual(len(res), 0)
+        self.assertEqual(state.get_vgpr64(0, 0), 0xDEADBEEFCAFEBABE)
+
 if __name__ == "__main__":
     unittest.main()
