@@ -6,6 +6,7 @@ Scored with average RGB colours for BC1, BC2 and BC3 blocks (smoothness relative
 
 Usage:
     python -I tex_mode_probe.py <textures_index.json> <carve dir> [--fmt BC1] [--n 12]
+numpy is imported lazily, so `--help` works on a checkout without it.
 """
 import argparse
 import json
