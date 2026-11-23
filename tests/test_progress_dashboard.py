@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -76,6 +77,24 @@ class Tests(unittest.TestCase):
                     self.assertEqual(result["result"], "pass", result)
                     self.assertEqual(result["cases"], 2)
                     self.assertEqual(result["all_skipped"], skipped == 2)
+
+    def test_a_chatty_test_is_not_held_in_memory(self):
+        # 8 MiB printed used to be captured whole in the dashboard process: 16.8 MB of traced peak memory
+        # (the measurement in #6226). run_one_test reads a bounded tail now, so the peak stays well below it.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(pd, "ROOT", directory):
+            file = os.path.join(directory, "test_chatty.py")
+            with open(file, "w", encoding="utf-8", newline="\n") as f:
+                f.write("import sys\nfor _ in range(%d):\n    sys.stdout.write('x' * 65535 + '\\n')\n"
+                        "print('Ran 1 test')\n" % (16 * 8))
+            tracemalloc.start()
+            try:
+                result = pd.run_one_test("test_chatty.py", 60)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        self.assertEqual(result["result"], "pass", result)
+        self.assertEqual(result["cases"], 1)          # the counters are at the end, inside the tail that is read
+        self.assertLess(peak, 4 << 20)                # 8 MiB printed; before the fix this was ~16.8 MB
 
     def test_junit_ctest_and_pytest_flavours(self):
         ctest = '<testsuite><testcase name="loader" classname="loader" status="run" time="0.9"/>' \
