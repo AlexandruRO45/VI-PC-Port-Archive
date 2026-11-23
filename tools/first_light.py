@@ -496,6 +496,7 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 def draw_shader_paths(manifest: dict, out_dir: str) -> list[str]:
     """Resolve the replay stages within the run directory, in VS/PS order."""
     directory = Path(out_dir).resolve()
+    outputs = {directory / name for name in ("image.raw", "image.ppm", "manifest.json")}
     files = manifest["files"]
     paths = []
     for stage in ("vs", "ps"):
@@ -504,9 +505,12 @@ def draw_shader_paths(manifest: dict, out_dir: str) -> list[str]:
         if not isinstance(name, str) or not name or Path(name).anchor:
             raise SystemExit(f"{field}: expected a relative shader filename, got {name!r}")
         try:
-            path = (directory / name).resolve()
+            declared = directory / name
+            path = declared.resolve()
             if not path.is_relative_to(directory):
                 raise SystemExit(f"{field}: shader path {name!r} is outside the run directory")
+            if declared in outputs or path in outputs:
+                raise SystemExit(f"{field}: shader path {name!r} is reserved for replay output")
             if stage in files and not path.is_file():
                 raise SystemExit(f"{field}: shader file {name!r} is missing or is not a regular file")
         except (OSError, RuntimeError, ValueError) as error:

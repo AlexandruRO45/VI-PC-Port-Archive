@@ -462,6 +462,19 @@ class ShaderReplayTests(unittest.TestCase):
         self.assertEqual(self.launch.call_count, 0)
         self.assertEqual(raw.read_bytes(), b"previous readback")
 
+    def test_check_rejects_shader_paths_that_alias_outputs(self):
+        raw = self.out / "image.raw"
+        preview = self.out / "image.ppm"
+        for name in ("image.raw", "image.ppm", "manifest.json"):
+            with self.subTest(name=name):
+                raw.write_bytes(b"previous readback")
+                preview.write_bytes(b"previous preview")
+                with self.assertRaisesRegex(SystemExit, r"files\.vs:.*output"):
+                    self.check({"vs": name}, 0.25)
+                self.assertEqual(raw.read_bytes(), b"previous readback")
+                self.assertEqual(preview.read_bytes(), b"previous preview")
+        self.assertEqual(self.launch.call_count, 0)
+
 
 if __name__ == "__main__":
     sys.exit(unittest.main())
