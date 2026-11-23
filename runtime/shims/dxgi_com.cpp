@@ -841,7 +841,7 @@ bool physical_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags, st
         if (entry.Format != surface || UINT(entry.DisplayOrientation) != UINT(info.rotation) ||
             !entry.RefreshRate.Denominator || entry.Flags.RoundedFakeMode ||
             entry.Flags.ModePruningReason == D3DKMDT_MPR_ALLCAPS ||
-            entry.Flags.ModePruningReason == D3DKMDT_MPR_CLONE_PATH_PRUNED) continue;
+            (UINT(entry.Flags.ModePruningReason) & 0xfu) == D3DKMDT_MPR_CLONE_PATH_PRUNED) continue;
         const bool interlaced = entry.ScanLineOrdering == D3DDDI_VSSLO_INTERLACED_UPPERFIELDFIRST ||
                                 entry.ScanLineOrdering == D3DDDI_VSSLO_INTERLACED_LOWERFIELDFIRST;
         if (interlaced && !(flags & DXGI_ENUM_MODES_INTERLACED)) continue;
@@ -858,12 +858,10 @@ bool physical_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags, st
                          fmt, scan, scaling, BOOL(entry.Flags.Stereo)});
     }
     std::sort(modes.begin(), modes.end(), [](const auto& a, const auto& b) {
-        if (a.Width != b.Width) return a.Width < b.Width;
-        if (a.Height != b.Height) return a.Height < b.Height;
-        auto lhs = std::uint64_t(a.RefreshRate.Numerator) * b.RefreshRate.Denominator;
-        auto rhs = std::uint64_t(b.RefreshRate.Numerator) * a.RefreshRate.Denominator;
-        if (lhs != rhs) return lhs < rhs;
-        return std::tie(a.ScanlineOrdering, a.Scaling, a.Stereo) < std::tie(b.ScanlineOrdering, b.Scaling, b.Stereo);
+        return std::tie(a.Width, a.Height, a.RefreshRate.Numerator, a.RefreshRate.Denominator,
+                        a.ScanlineOrdering, a.Scaling, a.Stereo) <
+               std::tie(b.Width, b.Height, b.RefreshRate.Numerator, b.RefreshRate.Denominator,
+                        b.ScanlineOrdering, b.Scaling, b.Stereo);
     });
     return true;
 }

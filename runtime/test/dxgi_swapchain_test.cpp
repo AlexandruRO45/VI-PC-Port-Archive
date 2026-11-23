@@ -1,3 +1,4 @@
+#include <wrl/client.h>
 // Real Win32 HWND GPU test for the Vulkan-backed IDXGIFactory7 / IDXGISwapChain3 COM shim
 // (runtime/shims/dxgi_swapchain.h, runtime/shims/dxgi_com.{h,cpp}).
 // No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation
@@ -37,7 +38,7 @@ unsigned& validation_errors() {
 bool same_monitor_modes(IDXGIOutput* shim, IDXGIOutput* host) {
     using Key = std::tuple<UINT, UINT, UINT, UINT, UINT, UINT, UINT>;
     for (UINT flags : {0u, UINT(DXGI_ENUM_MODES_SCALING)}) {
-        auto read = [flags](IDXGIOutput* output, std::multiset<Key>& keys) {
+        auto read = [flags](IDXGIOutput* output, std::vector<Key>& keys) {
             UINT count = 0;
             constexpr auto format = DXGI_FORMAT_R8G8B8A8_UNORM;
             if (FAILED(output->GetDisplayModeList(format, flags, &count, nullptr))) return false;
@@ -45,17 +46,42 @@ bool same_monitor_modes(IDXGIOutput* shim, IDXGIOutput* host) {
             if (count && FAILED(output->GetDisplayModeList(format, flags, &count, modes.data()))) return false;
             for (UINT i = 0; i < count; ++i) {
                 const auto& m = modes[i];
-                keys.emplace(m.Width, m.Height, m.RefreshRate.Numerator, m.RefreshRate.Denominator, m.Format,
+                keys.emplace_back(m.Width, m.Height, m.RefreshRate.Numerator, m.RefreshRate.Denominator, m.Format,
                              m.ScanlineOrdering, m.Scaling);
             }
             return true;
         };
-        std::multiset<Key> expected, actual;
+        std::vector<Key> expected, actual;
         if (!read(host, expected)) return false;
-        if (expected.empty()) continue;
         if (!read(shim, actual) || actual != expected) {
             std::fprintf(stderr, "display mode list flags=%u: shim=%zu host=%zu\n", flags, actual.size(), expected.size());
             return false;
+        }
+    }
+    Microsoft::WRL::ComPtr<IDXGIOutput1> shim1, host1;
+    if (FAILED(host->QueryInterface(IID_PPV_ARGS(host1.GetAddressOf())))) return true;
+    if (FAILED(shim->QueryInterface(IID_PPV_ARGS(shim1.GetAddressOf())))) return false;
+    for (auto fmt : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+                     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT}) {
+        for (UINT flags : {0u, UINT(DXGI_ENUM_MODES_SCALING), UINT(DXGI_ENUM_MODES_STEREO),
+                           UINT(DXGI_ENUM_MODES_DISABLED_STEREO)}) {
+            auto read = [&](IDXGIOutput1* out, std::vector<DXGI_MODE_DESC1>& modes) {
+                UINT count = 0;
+                if (FAILED(out->GetDisplayModeList1(fmt, flags, &count, nullptr))) return false;
+                modes.resize(count);
+                if (count && FAILED(out->GetDisplayModeList1(fmt, flags, &count, modes.data()))) return false;
+                modes.resize(count);
+                return true;
+            };
+            std::vector<DXGI_MODE_DESC1> expected, actual;
+            if (!read(host1.Get(), expected) || !read(shim1.Get(), actual) || actual.size() != expected.size())
+                return false;
+            auto key = [](const DXGI_MODE_DESC1& m) {
+                return std::tie(m.Width, m.Height, m.RefreshRate.Numerator, m.RefreshRate.Denominator,
+                                m.Format, m.ScanlineOrdering, m.Scaling, m.Stereo);
+            };
+            for (size_t i = 0; i < actual.size(); ++i)
+                if (key(actual[i]) != key(expected[i])) return false;
         }
     }
     return true;
@@ -1387,8 +1413,12 @@ int main() {
                 if (SUCCEEDED(create_host(IID_PPV_ARGS(&hfac))) && hfac) {
                     IDXGIAdapter1* hadp = nullptr;
                     if (SUCCEEDED(hfac->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&hadp))) && hadp) {
-                        if (!compare_attached_modes(adapter1, hadp, our_output_count))
+                        if (!compare_attached_modes(adapter1, hadp, our_output_count)) {
+                            hadp->Release();
+                            hfac->Release();
+                            FreeLibrary(host_dxgi);
                             return fail("Physical display modes did not match host DXGI");
+                        }
                         if (hadp->EnumOutputs(0, nullptr) != adapter1->EnumOutputs(0, nullptr)) {
                             hadp->Release();
                             hfac->Release();
