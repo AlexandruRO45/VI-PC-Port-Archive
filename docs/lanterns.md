@@ -48,6 +48,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [9](#stage-9-deferred-lighting-with-tiled-light-culling) | A G-buffer of three render targets, then 256 point lights culled per 16x16 tile in LDS | One light moved changes the predicted pixels; culling off gives the same image |
 | [10](#stage-10-4x-msaa-resolved-with-resolvesubresource) | The frame drawn at 4x MSAA and resolved with `ResolveSubresource` | The 1x render differs on exactly the predicted edge pixels; `SampleMask` isolates each sample |
 | [11](#stage-11-ray-traced-shadows-through-blastlas) | One shadow ray per pixel through a TLAS over two BLASes, walked with `image_bvh_intersect_ray` | Masking one instance or swapping two BLAS references changes the predicted pixels; a stalled BVH stops at the step cap |
+| [20](#stage-20-samplers-held-as-literals) | A compute shader samples through three samplers it builds from immediates, as the console compiles static samplers | A POINT sampler made LINEAR, or the comparison bits cleared, changes the predicted samples |
 
 ## Stage 1
 
@@ -314,6 +315,37 @@ barycentric margin), run from the corners of each pixel's position box (the dept
 
 ```
 Lanterns stage 11: PASS, one shadow ray per pixel through a TLAS of 10 instances over 2 BLASes built by BuildRaytracingAccelerationStructure, traversed with image_bvh_intersect_ray: 97452 of 97452 single-colour pixels exact, masking one instance changed 1058 of 1058 predicted pixels, swapping two BLAS references changed 966 of 966; the step cap stopped 54348 of 54348 stalled rays and a full stack 54348 of 54348
+```
+
+## Stage 20: samplers held as literals
+
+The console's compiler turns a root signature's static samplers into literal S#s: four `s_mov_b32` immediates, then
+`image_sample`. Nothing in a heap or a root argument names them, so the layer has to register the words it finds in the
+shader when the pipeline is created. `cs_lanterns_samplers` holds three, all clamping, with `MIP_FILTER` point and
+`MIP_POINT_PRECLAMP` set as the title's literals have them: POINT, LINEAR (bilinear) and a LESS_EQUAL comparison with
+point filtering. The root signature also declares them as static samplers, as a title's does.
+
+One wave32 group, one probe per lane, explicit LOD 0 (`image_sample_l`, `image_sample_c_l`):
+
+- a 4x4 `R32_FLOAT` colour texture (texel (x, y) holds 1 + x + 4y) through POINT and through LINEAR;
+- a 4x4 depth texture (`R32_TYPELESS`, cleared quadrant by quadrant to 0.2, 0.4, 0.6 and 0.8 with rectangle clears, read
+  through an `R32_FLOAT` view) through the comparison sampler, and through POINT.
+
+How the check works. `lanterns_samplers.h` computes every expected value. Each probe sits a quarter or three quarters
+of a texel from the texel edges, so POINT meets no tie and the bilinear weights are 1/4 and 3/4; with small-integer texels
+every expected value is exact.
+
+- Every sample must have the expected float's bits.
+- LINEAR must differ from POINT at the probes where the reference says it does (30 of 32).
+- The comparison must give 0 or 1 (both occur), and a plain POINT sample of the same depth texture must give the depth:
+  a plain sample must not become a comparison by accident.
+- The output buffer starts poisoned.
+
+Mutations that fail: the POINT literal made LINEAR (`0x14000000` to `0x14500000` in its third word) gives 2 of 32 POINT
+probes exact; the comparison bits cleared (`0x3092` to `0x92`) gives the raw depths, 0 of 32 comparisons exact.
+
+```
+Lanterns stage 20: PASS, three samplers the shader holds as literal S#s (as the console's compiler writes static samplers): POINT 32 of 32 probes exact, LINEAR 32 of 32 (differing from POINT at 30 as predicted), LESS_EQUAL comparison 32 of 32 (12 pass, 20 fail), and a plain POINT sample of the same depth texture 32 of 32 raw depths
 ```
 
 ## Build and run

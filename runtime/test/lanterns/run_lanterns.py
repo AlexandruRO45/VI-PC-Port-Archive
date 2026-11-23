@@ -41,6 +41,7 @@ folder:
             whose samples differ, grey: uncertain)
   stage 11: the ray-traced shadows; sheet: frame | reference / the control (one instance masked) | mask /
             the second control (two instances swap BLAS references) | frame
+  stage 20: the probe card (rows POINT, LINEAR, comparison, plain depth sample; a cell per probe); sheet: card | reference
 """
 import argparse
 import array
@@ -101,6 +102,12 @@ PASS_LINES = {
          rf"changed {N} of {N}; the step cap stopped {N} of {N} stalled rays and a full stack {N} of {N}",
          lambda inst, a, b, m, mp, s, sp, cap, rays, full, frays: inst >= 2 and a == b and b >= 50000
          and m == mp and mp > 0 and s == sp and sp > 0 and cap == rays and rays > 0 and full == frays and frays > 0),
+    20: (rf"Lanterns stage 20: PASS, three samplers the shader holds as literal S#s \(as the console's compiler writes "
+         rf"static samplers\): POINT {N} of {N} probes exact, LINEAR {N} of {N} \(differing from POINT at {N} as "
+         rf"predicted\), LESS_EQUAL comparison {N} of {N} \({N} pass, {N} fail\), and a plain POINT sample of the same "
+         rf"depth texture {N} of {N} raw depths",
+         lambda p, pn, l, ln, d, c, cn, ps, fl, r, rn: p == pn == l == ln == c == cn == r == rn == 32 and d >= 8
+         and ps > 0 and fl > 0 and ps + fl == 32),
 }
 
 
@@ -344,6 +351,7 @@ PANELS = {
     11: {"main": [["stage11-frame.gpu"]],
          "sheet": [["stage11-frame.gpu", "stage11-frame.ref"], ["stage11-masked.gpu", "stage11-frame:mask"],
                    ["stage11-swapped.gpu", "stage11-frame.gpu"]]},
+    20: {"main": [["stage20-probes.gpu"]], "sheet": [["stage20-probes.gpu", "stage20-probes.ref"]]},
 }
 
 

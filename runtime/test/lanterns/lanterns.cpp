@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8|9|10|11 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -59,6 +59,11 @@
 // (lanterns_rt.h). The CPU traces the same rays. Control: a second TLAS with one instance's mask 0 must change exactly
 // the pixels the reference predicts.
 //
+// Stage 20: samplers a compute shader builds from immediates (literal S#s, as the console's compiler writes a root
+// signature's static samplers): POINT and LINEAR on a 4x4 colour texture, a LESS_EQUAL comparison and a plain POINT
+// sample on a 4x4 depth texture, one probe per lane (lanterns_samplers.h). Every sample must be exact; LINEAR must
+// differ from POINT where the reference says it does; the comparison must give 0 or 1, the plain sample the depth.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
@@ -73,6 +78,7 @@
 #include "lanterns_deferred_gpu.h"
 #include "lanterns_msaa.h"
 #include "lanterns_rt_gpu.h"
+#include "lanterns_samplers_gpu.h"
 #include "lanterns_textures_gpu.h"
 
 #include <algorithm>
@@ -941,6 +947,70 @@ int stage11(const std::filesystem::path& shader_dir, const std::filesystem::path
     return 0;
 }
 
+int stage20(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    const lanterns::Scene scene = lanterns::stage1();
+    lanterns::Shaders shaders;
+    std::vector<std::uint8_t> kernel;
+    if (!lanterns::load_shaders(shader_dir, 1, shaders) || !lanterns::load_samplers_shader(shader_dir, kernel)) return 1;
+    std::array<std::array<std::uint32_t, 4>, lanterns::kSamplerProbes> got{};
+    {
+        lanterns::Gpu gpu;
+        lanterns::SamplerKernel samplers;
+        if (!gpu.create(scene, shaders) || !samplers.create(gpu, kernel) || !samplers.run(got) || !gpu.idle()) return 1;
+    }
+    // Per probe and sample: the bits must be the expected float's. The data card: a row per sample kind, a cell per
+    // probe, shown as its value (texels / 16, comparisons and depths as they are); red where a sample is wrong.
+    const char* kinds[4] = {"POINT", "LINEAR", "LESS_EQUAL comparison", "POINT on the depth texture"};
+    unsigned exact[4] = {}, differs = 0, differs_seen = 0, passes = 0, poisoned = 0, reported = 0;
+    std::vector<Color> card(std::size_t(kWidth) * kHeight, Color{0.1f, 0.1f, 0.1f, 1}), card_ref = card;
+    for (unsigned lane = 0; lane < lanterns::kSamplerProbes; ++lane) {
+        const auto want = lanterns::sampler_expect(lane);
+        const lanterns::SamplerProbe p = lanterns::sampler_probe(lane);
+        for (unsigned k = 0; k < 4; ++k) {
+            float seen = 0;
+            std::memcpy(&seen, &got[lane][k], 4);
+            const bool ok = std::memcmp(&seen, &want[k], 4) == 0;
+            exact[k] += ok;
+            poisoned += got[lane][k] == lanterns::kSamplerPoison;
+            if (!ok && reported++ < 8)
+                std::printf("lanterns: probe %u at (%.2f, %.2f) texels, %s: %g (0x%08x), expected %g\n", lane, p.x, p.y,
+                            kinds[k], seen, got[lane][k], want[k]);
+            const float scale = k < 2 ? 1.0f / 16.0f : 1.0f;
+            const Color shown = ok ? Color{seen * scale, seen * scale, seen * scale, 1} : Color{0.9f, 0.15f, 0.1f, 1};
+            const Color shown_ref{want[k] * scale, want[k] * scale, want[k] * scale, 1};
+            for (unsigned y = 4; y + 4 < 64; ++y)
+                for (unsigned x = 1; x + 1 < 12; ++x) {
+                    const std::size_t i = std::size_t(k * 64 + y) * kWidth + lane * 12 + x;
+                    card[i] = shown, card_ref[i] = shown_ref;
+                }
+        }
+        if (want[1] != want[0]) {
+            ++differs;
+            differs_seen += std::memcmp(&got[lane][0], &want[0], 4) == 0 && std::memcmp(&got[lane][1], &want[1], 4) == 0;
+        }
+        passes += want[2] == 1.0f;
+    }
+    const unsigned n = lanterns::kSamplerProbes;
+    for (unsigned k = 0; k < 4; ++k)
+        std::printf("lanterns: %s: %u of %u probes exact\n", kinds[k], exact[k], n);
+    std::printf("lanterns: LINEAR differs from POINT at %u of %u probes (predicted), seen at %u; the comparison passes at %u "
+                "and fails at %u; %u poisoned words left\n", differs, n, differs_seen, passes, n - passes, poisoned);
+    lanterns::Reference shown_ref;
+    shown_ref.color = card_ref;
+    shown_ref.candidates.resize(card.size());
+    if (!dump(out_dir, "stage20-probes", card, shown_ref)) return 1;
+    const bool all = exact[0] == n && exact[1] == n && exact[2] == n && exact[3] == n;
+    if (!all || differs < 8 || differs_seen != differs || passes == 0 || passes == n || poisoned) {
+        std::fprintf(stderr, "lanterns: stage 20 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 20: PASS, three samplers the shader holds as literal S#s (as the console's compiler writes "
+                "static samplers): POINT %u of %u probes exact, LINEAR %u of %u (differing from POINT at %u as predicted), "
+                "LESS_EQUAL comparison %u of %u (%u pass, %u fail), and a plain POINT sample of the same depth texture "
+                "%u of %u raw depths\n", exact[0], n, exact[1], n, differs, exact[2], n, passes, n - passes, exact[3], n);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -965,8 +1035,9 @@ int main(int argc, char** argv) {
     case 9: return stage9(shader_dir, out_dir);
     case 10: return stage10(shader_dir, out_dir);
     case 11: return stage11(shader_dir, out_dir);
+    case 20: return stage20(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

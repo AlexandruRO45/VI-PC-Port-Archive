@@ -24,7 +24,8 @@ elseif(LEONIDA_TEST_LANTERNS)
   add_executable(lanterns ${_lanterns_src}/lanterns.cpp ${_lanterns_src}/lanterns_gpu.cpp
                           ${_lanterns_src}/lanterns_edges_gpu.cpp ${_lanterns_src}/lanterns_textures_gpu.cpp
                           ${_lanterns_src}/lanterns_shadow_gpu.cpp ${_lanterns_src}/lanterns_post_gpu.cpp
-                          ${_lanterns_src}/lanterns_deferred_gpu.cpp ${_lanterns_src}/lanterns_rt_gpu.cpp)
+                          ${_lanterns_src}/lanterns_deferred_gpu.cpp ${_lanterns_src}/lanterns_rt_gpu.cpp
+                          ${_lanterns_src}/lanterns_samplers_gpu.cpp)
   target_link_libraries(lanterns PRIVATE d3d12_xs_stub Vulkan::Headers)
   target_compile_definitions(lanterns PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
   target_compile_options(lanterns PRIVATE /W4 /permissive- /utf-8)
@@ -58,7 +59,8 @@ elseif(LEONIDA_TEST_LANTERNS)
                       ${_lanterns_src}/shaders/ps_lanterns_composite.asm
                       ${_lanterns_src}/shaders/vs_lanterns_gbuf.asm ${_lanterns_src}/shaders/ps_lanterns_gbuf.asm
                       ${_lanterns_src}/shaders/cs_lanterns_tiled.asm
-                      ${_lanterns_src}/shaders/cs_lanterns_rt_shadow.asm)
+                      ${_lanterns_src}/shaders/cs_lanterns_rt_shadow.asm
+                      ${_lanterns_src}/shaders/cs_lanterns_samplers.asm)
     get_filename_component(_lanterns_spirv_tools ${LEONIDA_SPIRV_AS} DIRECTORY)
     file(TO_NATIVE_PATH "${_lanterns_spirv_tools}" _lanterns_spirv_tools)
     add_custom_command(
