@@ -39,6 +39,9 @@
 #include "shims.h"
 
 namespace rt::winhttp {
+
+BOOL WINAPI close_handle(HINTERNET handle);
+
 namespace {
 
 enum class Kind { Session, Connect, Request };
@@ -145,6 +148,8 @@ HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nu
         h->refs.fetch_add(1);  // held while HANDLE_CREATED runs, so HANDLE_CLOSING comes after it
         HINTERNET self = to_hinternet(h);
         notify(h, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED, &self, sizeof(self));
+        for (Handle* p = parent; p && !h->closed.load(); p = p->parent)
+            if (p->closed.load()) close_handle(self);
         const bool closed = h->closed.load();
         release(h);
         if (closed) {

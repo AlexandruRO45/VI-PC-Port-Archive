@@ -123,6 +123,7 @@ void CALLBACK on_created_send_request(HINTERNET handle, DWORD_PTR, DWORD status,
 
 struct CreatedCloseProbe {
     CloseHandleFn close = nullptr;
+    HINTERNET close_instead = nullptr;
     int created_calls = 0;
     int closing_calls = 0;
     bool in_created = false;
@@ -140,7 +141,7 @@ void CALLBACK on_created_close_handle(HINTERNET handle, DWORD_PTR, DWORD status,
         ++p.created_calls;
         p.created_handle = handle;
         p.in_created = true;
-        if (p.close) p.close_result = p.close(handle);
+        if (p.close) p.close_result = p.close(p.close_instead ? p.close_instead : handle);
         p.in_created = false;
     } else if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING && info && length == sizeof(HINTERNET) &&
                *static_cast<HINTERNET*>(info) == handle) {
@@ -646,6 +647,44 @@ int main() {
         g_close_probe = nullptr;
         check(session_closed != FALSE && probe.closing_calls == 2 && probe.closing_handle == session,
               "closing session afterwards drops the last reference and reports HANDLE_CLOSING once");
+    }
+
+    // Host winhttp.dll (Windows 10 22H2) reports HANDLE_CREATED for a handle under a closed parent, then cancels it.
+    {
+        CreatedCloseProbe probe{};
+        g_close_probe = &probe;
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        const HINTERNET connection = connect(session, L"closed-session.invalid", 443, 0);
+        set_callback(connection, &on_created_close_handle, WINHTTP_CALLBACK_FLAG_HANDLES, 0);
+        check(close(session) != FALSE, "a session closes while its connection is open");
+        SetLastError(0);
+        const HINTERNET request =
+            open_request(connection, L"GET", L"/", nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        const DWORD request_error = GetLastError();
+        check(request == nullptr && request_error == ERROR_WINHTTP_OPERATION_CANCELLED,
+              "a request under a connection whose session is closed fails with ERROR_WINHTTP_OPERATION_CANCELLED");
+        check(probe.created_calls == 1 && probe.closing_calls == 1 && probe.closing_handle == probe.created_handle,
+              "and reports HANDLE_CREATED, then HANDLE_CLOSING, for it");
+        DWORD type = 0, type_size = sizeof(type);
+        check(query_option(connection, WINHTTP_OPTION_HANDLE_TYPE, &type, &type_size) != FALSE &&
+                  type == WINHTTP_HANDLE_TYPE_CONNECT,
+              "the connection itself stays open");
+        check(close(connection) != FALSE && probe.closing_calls == 2 && probe.closing_handle == connection,
+              "and closes afterwards");
+
+        CreatedCloseProbe parent_probe{close};
+        g_close_probe = &parent_probe;
+        const HINTERNET second = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        set_callback(second, &on_created_close_handle, WINHTTP_CALLBACK_FLAG_HANDLES, 0);
+        parent_probe.close_instead = second;
+        SetLastError(0);
+        const HINTERNET orphan = connect(second, L"closed-in-created.invalid", 443, 0);
+        const DWORD orphan_error = GetLastError();
+        g_close_probe = nullptr;
+        check(orphan == nullptr && orphan_error == ERROR_WINHTTP_OPERATION_CANCELLED && parent_probe.close_result &&
+                  parent_probe.created_calls == 1 && parent_probe.closing_calls == 2 &&
+                  parent_probe.closing_handle == second,
+              "a connection whose HANDLE_CREATED closes its session is cancelled, and both report HANDLE_CLOSING");
     }
 
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
