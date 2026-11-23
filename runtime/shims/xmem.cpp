@@ -356,6 +356,13 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
             return nullptr;
         }
     }
+    if (replace) {
+        constexpr DWORD kInvalidWithReplace = MEM_RESET | MEM_RESET_UNDO;
+        if ((host_type & kInvalidWithReplace) != 0) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+    }
     const bool window = page_mode != 0 && !commit && !new_placeholder && !write_watch;
     if ((new_placeholder || replace || window || page_mode == kXmemLargePages) && !placeholder_api().available()) {
         SetLastError(ERROR_NOT_SUPPORTED);

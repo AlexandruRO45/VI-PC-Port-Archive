@@ -694,17 +694,33 @@ void test_placeholder_and_write_watch_flags(XMemVirtualAllocFn virtual_alloc, XM
         check(VirtualQuery(ph_bytes, &before, sizeof(before)) && before.RegionSize == 3 * kPage64k,
               "fresh 3-page placeholder reports full 3-page RegionSize");
 
-        // Contradictory MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER must fail without splitting the placeholder.
-        SetLastError(ERROR_SUCCESS);
-        void* const bad_replace = virtual_alloc(
-            ph_bytes + kPage64k, kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER, 0,
-            PAGE_NOACCESS);
-        check(bad_replace == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
-              "MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER fails with ERROR_INVALID_PARAMETER");
+        // Contradictory placeholder replacement flags (MEM_RESERVE_PLACEHOLDER, MEM_RESET, MEM_RESET_UNDO, with or
+        // without a guest page mode) must fail with ERROR_INVALID_PARAMETER without splitting the placeholder.
+        struct BadReplaceCase {
+            DWORD flags;
+            const char* label;
+        };
+        const BadReplaceCase bad_replaces[] = {
+            {MEM_RESERVE | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER,
+             "MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER"},
+            {MEM_REPLACE_PLACEHOLDER | MEM_RESET, "MEM_REPLACE_PLACEHOLDER | MEM_RESET"},
+            {MEM_REPLACE_PLACEHOLDER | MEM_RESET | kXmem64kPages,
+             "MEM_REPLACE_PLACEHOLDER | MEM_RESET | kXmem64kPages"},
+            {MEM_REPLACE_PLACEHOLDER | MEM_RESET_UNDO, "MEM_REPLACE_PLACEHOLDER | MEM_RESET_UNDO"},
+            {MEM_REPLACE_PLACEHOLDER | MEM_RESET_UNDO | kXmem64kPages,
+             "MEM_REPLACE_PLACEHOLDER | MEM_RESET_UNDO | kXmem64kPages"},
+        };
+        for (const auto& tc : bad_replaces) {
+            SetLastError(ERROR_SUCCESS);
+            void* const bad_replace = virtual_alloc(ph_bytes + kPage64k, kPage64k, tc.flags, 0, PAGE_NOACCESS);
+            char msg[192];
+            std::snprintf(msg, sizeof msg, "%s fails with ERROR_INVALID_PARAMETER", tc.label);
+            check(bad_replace == nullptr && GetLastError() == ERROR_INVALID_PARAMETER, msg);
 
-        MEMORY_BASIC_INFORMATION after{};
-        check(VirtualQuery(ph_bytes, &after, sizeof(after)) && after.RegionSize == 3 * kPage64k,
-              "rejected MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER leaves placeholder unsplit");
+            MEMORY_BASIC_INFORMATION after{};
+            std::snprintf(msg, sizeof msg, "rejected %s leaves placeholder unsplit", tc.label);
+            check(VirtualQuery(ph_bytes, &after, sizeof(after)) && after.RegionSize == 3 * kPage64k, msg);
+        }
         check(VirtualFree(ph_bytes, 0, MEM_RELEASE), "release the unsplit placeholder");
     }
 
