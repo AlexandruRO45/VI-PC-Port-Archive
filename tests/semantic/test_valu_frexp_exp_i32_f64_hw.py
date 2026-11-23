@@ -584,5 +584,47 @@ class TestValuFrexpExpI32F64ConditionCodes(unittest.TestCase):
         self.assertEqual(flags.raw_exp_s32, -1)
 
 
+# ---------------------------------------------------------------------------
+# Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling
+# ---------------------------------------------------------------------------
+
+class TestValuFrexpExpI32F64IEEE754EdgeCases(unittest.TestCase):
+    """Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling for v_frexp_exp_i32_f64."""
+
+    def test_zeros(self) -> None:
+        self.assertEqual(to_s32(oracle_frexp_exp_i32_f64(POS_ZERO_BITS)), 0)
+        self.assertEqual(to_s32(oracle_frexp_exp_i32_f64(NEG_ZERO_BITS)), 0)
+
+    def test_infinities(self) -> None:
+        self.assertEqual(to_s32(oracle_frexp_exp_i32_f64(POS_INF_BITS)), 0)
+        self.assertEqual(to_s32(oracle_frexp_exp_i32_f64(NEG_INF_BITS)), 0)
+
+    def test_nans(self) -> None:
+        self.assertEqual(to_s32(oracle_frexp_exp_i32_f64(CANONICAL_QNAN)), 0)
+        snan = 0x7FF0_0000_0000_1234
+        self.assertEqual(to_s32(oracle_frexp_exp_i32_f64(snan)), 0)
+
+    def test_subnormals(self) -> None:
+        val = 1e-310
+        bits = f64_to_bits(val)
+        res_u32 = oracle_frexp_exp_i32_f64(bits)
+        self.assertEqual(to_s32(res_u32), math.frexp(val)[1])
+
+        lo, hi = split_f64_words(bits)
+        trans_u32 = run_translated_frexp_exp_f64(lo, hi)
+        self.assertEqual(trans_u32, res_u32)
+
+    def test_max_and_min_finite_doubles(self) -> None:
+        max_f64_bits = 0x7FEF_FFFF_FFFF_FFFF  # DBL_MAX
+        val_max = bits_to_f64(max_f64_bits)
+        res_max = oracle_frexp_exp_i32_f64(max_f64_bits)
+        self.assertEqual(to_s32(res_max), math.frexp(val_max)[1])
+
+        min_norm_bits = 0x0010_0000_0000_0000  # DBL_MIN normal
+        val_min = bits_to_f64(min_norm_bits)
+        res_min = oracle_frexp_exp_i32_f64(min_norm_bits)
+        self.assertEqual(to_s32(res_min), math.frexp(val_min)[1])
+
+
 if __name__ == "__main__":
     unittest.main()
