@@ -543,6 +543,15 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertIn(str(sub), err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}\n'
+        js = self.root / "census.json"
+        js.write_text(previous, encoding="utf-8", newline="\n")
+        with mock.patch.object(CC, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                CC.write_json(str(js), {"models": 0}, [])
+        self.assertEqual(js.read_text(encoding="utf-8"), previous)
+
 
 if __name__ == "__main__":
     unittest.main()

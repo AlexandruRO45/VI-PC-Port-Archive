@@ -39,11 +39,15 @@ import argparse
 import csv
 import json
 import os
+import stat
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:  # -I does not put the script's directory on sys.path
     sys.path.insert(0, HERE)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MODEL_JSON = "model.json"
@@ -869,10 +873,39 @@ def write_csv(path: str, rows: list) -> None:
 
 
 def write_json(path: str, summary: dict, rows: list) -> None:
+    """Publish `--json` through a staged temp file so a mid-write failure keeps any previous report."""
     _make_parent(path)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        json.dump({"summary": summary, "models": rows}, handle, indent=1, ensure_ascii=False)
-        handle.write("\n")
+    payload = {"summary": summary, "models": rows}
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=1, ensure_ascii=False)
+            handle.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".character_census-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1, ensure_ascii=False)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def main(argv=None) -> int:
