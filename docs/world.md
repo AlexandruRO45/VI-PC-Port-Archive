@@ -310,6 +310,19 @@ the union built without scale and 101 the union built with `scaleXY`/`scaleZ`; w
 than the stored extents, without scale none is. This says how the extents were computed, not how the renderer
 applies scale; the scale rule of [Map placement records](#map-placement-records) stays as it is.
 
+**Over the whole of `levels.rpf`** (the same command without `--start`/`--limit`: 188,445 resources, 6,125
+`CMapTypes` with 1,341,211 archetype definitions), all **23,532** maps are fully defined, and both rules hold:
+
+| 17,463 maps with a rotated entity | stored quaternion | conjugated quaternion |
+|---|---:|---:|
+| union equals the stored extents | 4,121 | **13,806** |
+| median of the largest bound error | 0.450 m | **0.000207 m** |
+
+The union of the conjugated boxes lies inside the stored extents in 17,463 of 17,463 maps, and the 3,657 maps that
+match neither are again wider, never narrower. Of the 3,860 maps with a scaled entity, 3,480 match the union built
+without scale and 1,993 the union built with it; with scale, 585 unions are larger than the stored extents,
+without scale none is.
+
 ```powershell
 python -I tools\world_archetypes.py <game>\levels.rpf --start 8589934592 --limit 1073741824 --check-extents --out <work>\world\archetypes_8-9.json
 ```
