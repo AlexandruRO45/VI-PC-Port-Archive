@@ -100,6 +100,9 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    // Before the crash reporter: it takes the faults of instructions the
+    // host CPU lacks, so only the rest are reported.
+    victory_loader::emulate_missing_instructions();
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -122,6 +125,9 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
+    for (instruction, count) in victory_loader::emulated_instructions() {
+        println!("emulated       {instruction}: {count} times");
+    }
     Ok(())
 }
 

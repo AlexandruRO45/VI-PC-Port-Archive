@@ -21,7 +21,10 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached; the picture is black and the host GPU fails within seconds |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT. On a second one with an
+Intel CPU (Core i5-13600KF, AMD RX 7800 XT) one run went the same way, by
+its log: 30 fps up to the loading screen, then the world's first frames and
+the host GPU failure.
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -32,7 +35,7 @@ What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Loader | Runs the title's executable and its DLLs in our process; instructions only AMD CPUs have are emulated on hosts without them; crash reports name the faulting code and are kept in `crashes.log` | `MWAITX` spins instead of sleeping |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
@@ -46,9 +49,9 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+Requirements: Windows 10/11 x64, a CPU with AVX2 (AMD or Intel, see below),
+a Direct3D 12 GPU with shader model 6.6 (and mesh shaders for the world),
+Rust (pinned in `rust-toolchain.toml`).
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -63,6 +66,13 @@ Run the title:
 cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
+
+The title's code is built for the console's AMD CPU. On a CPU without its
+AMD-only instructions (`CLZERO`, SSE4a, `MONITORX`/`MWAITX`, `RDPRU`), which
+means every Intel CPU, VIctory emulates them: the log says so at start
+(`the host CPU lacks instructions of the console's`), names each one as it
+is first used, and the totals are printed when the title exits. See
+[Host CPU](docs/architecture.md#host-cpu).
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
@@ -121,6 +131,12 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+A crash with `exception 0xc000001d` is an instruction the host CPU does not
+have and VIctory does not emulate yet; the report gives its address
+(`victory-image-….dll+<rva>`), and the bytes there in the image under the
+cache folder's `images` say which instruction it is. Emulated ones are
+listed in `crates/victory-loader/src/cpu.rs`.
 
 ## License
 

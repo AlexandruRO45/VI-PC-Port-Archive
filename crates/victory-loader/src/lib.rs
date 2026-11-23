@@ -17,10 +17,14 @@
 //!    runtime (`victory-hle`), the host or the title's DLLs, and route
 //!    anything unresolved to a generated stub that reports exactly what
 //!    was called;
-//! 5. initialise the title's DLLs, then run TLS callbacks and the entry
+//! 5. carry out the instructions of the console's CPU that the host's lacks
+//!    (`cpu`, a handler for the faults they raise);
+//! 6. initialise the title's DLLs, then run TLS callbacks and the entry
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod cpu;
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
@@ -36,6 +40,8 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use cpu::{emulate_missing_instructions, emulated_instructions, missing_instructions};
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
