@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -303,6 +304,28 @@ class TestArgumentValidation(unittest.TestCase):
                 self.assertEqual(exc.exception.code, 2)
                 self.assertIn(diagnostic, stderr.getvalue())
                 self.assertIn(index, stderr.getvalue())
+
+    def test_probe_reports_unreadable_swizzle_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            index = work / "index.json"
+            index.write_text("[]", encoding="utf-8", newline="\n")
+            header = work / "synthetic.h"
+            env = dict(os.environ, AMD_SWIZZLE_HEADER=str(header))
+            command = [sys.executable, "-I", str(Path(TOOLS_DIR) / "tex_mode_probe.py"), str(index), directory]
+            missing = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(missing.returncode, 2, missing.stderr)
+            self.assertIn(f"cannot read swizzle header {header}", missing.stderr)
+            self.assertNotIn("Traceback", missing.stderr)
+
+            declarations = "".join(
+                f"static const unsigned GFX10_SW_PATTERN_{name}[][1] = {{\n    {{0}},\n}};\n"
+                for name in ("NIBBLE01", "NIBBLE2", "NIBBLE3", "NIBBLE4")
+            )
+            header.write_text(declarations, encoding="utf-8", newline="\n")
+            readable = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(readable.returncode, 0, readable.stderr)
+            self.assertIn("probed 0 of 0 textures", readable.stdout)
 
     def test_probe_refuses_a_count_below_one_cli(self):
         for val in ["0", "-1", "x"]:
