@@ -445,6 +445,11 @@ if(BUILD_TESTING)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
+  # rt_unimplemented's per-import record (runtime/shims/unimplemented_import.h) against the map-under-mutex it replaced.
+  add_executable(unimplemented_import_test test/unimplemented_import_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(unimplemented_import_test PRIVATE Threads::Threads)
+  add_test(NAME unimplemented_import COMMAND unimplemented_import_test)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
