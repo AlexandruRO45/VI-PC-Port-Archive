@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import psin_names as N  # noqa: E402
+import rpf9_names as R  # noqa: E402
 from test_psin_data import make_container, ptr  # noqa: E402
 from test_psin_index import joaat  # noqa: E402
 
@@ -77,6 +78,27 @@ class TestDictionaries(unittest.TestCase):
             with open(t, "w") as f:
                 f.write("prop_lamp_03\n\n")
             self.assertEqual(N.load_names([j, t]), {"prop_crate_01", "veh_frame", "prop_lamp_03"})
+
+
+    def test_strips_every_archive_suffix_before_hashing(self):
+        cases = [(f"prop_{length}_{variant}", "A1bCd2Ef"[:length][::variant])
+                 for length in range(1, 9) for variant in (1, -1)]
+        encoded = " ".join(f"{stem}.#{suffix}" for stem, suffix in cases).encode("ascii")
+        types = R.parse_types(",".join(suffix for _, suffix in cases))
+        archived = [name for name, _ in R.extract_names(encoded, types)]
+        self.assertEqual(len(archived), len(cases))
+        with tempfile.TemporaryDirectory() as d:
+            report, text = os.path.join(d, "n.json"), os.path.join(d, "n.txt")
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": [{"names": archived}]}, f)
+            with open(text, "w", encoding="utf-8", newline="\n") as f:
+                f.write("literal.#LONG\n")
+            names = N.load_names([report, text])
+        self.assertEqual(names, {stem for stem, _ in cases} | {"literal.#LONG"})
+        d32, d64 = N.dictionaries(names)
+        for stem, _ in cases:
+            self.assertEqual(d32[joaat(stem)], stem)
+            self.assertEqual(d64[mm64(stem)], stem)
 
 
 class TestScan(unittest.TestCase):

@@ -39,7 +39,8 @@ from world_names import joaat, murmur3_x64_128  # noqa: E402
 CONTROL_SALT = "#zq"
 HASH32 = (0x4A, 0x4D, 0x4B)
 HASH64 = (0x4F,)
-SUFFIX = re.compile(r"\.#[a-z0-9]{2}$")
+# Match the ASCII resource suffix accepted by rpf9_names.py.
+SUFFIX = re.compile(r"\.#[A-Za-z0-9]{1,8}\Z")
 
 
 class HashWalker(psin_data.Walker):
