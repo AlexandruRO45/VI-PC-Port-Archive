@@ -487,5 +487,16 @@ class VPackB32F16AstTests(unittest.TestCase):
         self.assertEqual(ast.abs_mods, (True, False))
         self.assertEqual(ast.neg_mods, (False, True))
 
+def interpret_pack_b32_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0),
+                           abs_mods: tuple[bool, bool] = (False, False),
+                           neg_mods: tuple[bool, bool] = (False, False)) -> int:
+    return ref_pack_b32_f16(s0, s1, sel=sel, abs_mods=abs_mods, neg_mods=neg_mods)
+
+
+class VPackB32F16ScalarInterpreterTests(unittest.TestCase):
+    def test_scalar_execution(self):
+        res = interpret_pack_b32_f16(0xAAAA3C00, 0xBBBB4000)
+        self.assertEqual(res, 0x40003C00)
+
 if __name__ == '__main__':
     unittest.main()
