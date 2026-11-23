@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -77,7 +78,23 @@ std::string path_utf8(const std::filesystem::path& path) {
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path_utf8(p));
-    return {std::istreambuf_iterator<char>(f), {}};
+    // Bound input before allocating; shipped PE images are far smaller than this ceiling.
+    constexpr uintmax_t kMaxPeFileSize = uintmax_t{1} << 30;  // 1 GiB
+    std::error_code ec;
+    const uintmax_t size = std::filesystem::file_size(p, ec);
+    if (ec) throw std::runtime_error("cannot determine PE file size for " + path_utf8(p) + ": " + ec.message());
+    if (size > kMaxPeFileSize || size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max()) ||
+        size > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max()))
+        throw std::runtime_error("PE file exceeds the supported 1 GiB size limit: " + path_utf8(p));
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    if (size != 0) {
+        f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+        if (f.gcount() != static_cast<std::streamsize>(size))
+            throw std::runtime_error("PE file changed or was truncated while reading: " + path_utf8(p));
+    }
+    if (f.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("PE file changed while reading: " + path_utf8(p));
+    return bytes;
 }
 
 template <class T>
