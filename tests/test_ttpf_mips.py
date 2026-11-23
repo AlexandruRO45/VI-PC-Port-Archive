@@ -1797,6 +1797,56 @@ class BadPoolTest(unittest.TestCase):
                 with open(source, "rb") as f:
                     self.assertEqual(f.read(), before)
 
+    def test_export_force_protects_history_directory_files(self):
+        history = os.path.join(self.tmp.name, "history")
+        os.mkdir(history)
+        for codec in ("bc1", "bc3", "bc4", "bc5", "bc6h", "bc7"):
+            with self.subTest(codec=codec):
+                metadata = os.path.join(history, codec + ".json")
+                with open(metadata, "wb") as f:
+                    f.write(b"{}")
+                code, err = self.run_main("export", self.good, "0", metadata,
+                                          "--force", "--history", history)
+                self.assertEqual(code, 2, err)
+                self.assertIn("--history file", err)
+                self.assertIn(metadata, err)
+                with open(metadata, "rb") as f:
+                    self.assertEqual(f.read(), b"{}")
+
+    def test_export_force_protects_history_directory_hardlink(self):
+        history = os.path.join(self.tmp.name, "history")
+        os.mkdir(history)
+        metadata = os.path.join(history, "bc7.json")
+        with open(metadata, "wb") as f:
+            f.write(b"{}")
+        out = os.path.join(self.tmp.name, "alias.dds")
+        try:
+            os.link(metadata, out)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        code, err = self.run_main("export", self.good, "0", out, "--force", "--history", history)
+        self.assertEqual(code, 2, err)
+        self.assertIn(metadata, err)
+        for path in (metadata, out):
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"{}")
+
+    def test_export_can_replace_an_ordinary_dds_in_history_directory(self):
+        history = os.path.join(self.tmp.name, "history")
+        os.mkdir(history)
+        metadata = os.path.join(history, "bc1.json")
+        with open(metadata, "wb") as f:
+            f.write(b"{}")
+        out = os.path.join(history, "texture.dds")
+        with open(out, "wb") as f:
+            f.write(b"old export")
+        code, err = self.run_main("export", self.good, "0", out, "--force", "--history", history)
+        self.assertEqual(code, 0, err)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(4), b"DDS ")
+        with open(metadata, "rb") as f:
+            self.assertEqual(f.read(), b"{}")
+
 
 class SyntheticArrayPoolTest(unittest.TestCase):
     def setUp(self):

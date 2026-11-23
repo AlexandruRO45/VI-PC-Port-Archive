@@ -51,6 +51,7 @@ import sys
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report_paths  # noqa: E402
 import bcpack  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
 from tex_headers import (  # noqa: E402
@@ -2195,6 +2196,12 @@ def main(argv=None):
             return 2
         return 0
     if a.cmd == "export":
+        if a.history and os.path.isdir(a.history):
+            for codec in ("bc1", "bc3", "bc4", "bc5", "bc6h", "bc7"):
+                asset = os.path.join(a.history, codec + ".json")
+                if os.path.isfile(asset) and report_paths.same_report_path(a.out, asset):
+                    print(f"ERROR: {a.out} would overwrite the --history file {asset}", file=sys.stderr)
+                    return 2
         # Refuse an output that aliases an input asset or metadata before the pool is
         # opened (so its mmap can never be truncated on disk). --force may replace an
         # ordinary DDS but never a pool, a calibration profile, or a supplied history file.
