@@ -98,5 +98,76 @@ class TestVAlignbyteB32Reference(unittest.TestCase):
                 self.assertEqual(run_hw_alignbyte(s0, s1, sel, inline=True), ref_alignbyte(s0, s1, sel))
 
 
+class RegType(enum.Enum):
+    VGPR = 1
+    SGPR = 2
+    IMM = 3
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    value: int = 0
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+
+
+@dataclasses.dataclass(frozen=True)
+class VAlignbyteB32Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+
+
+class TestVAlignbyteB32AST(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation_valid(self):
+        inst = VAlignbyteB32Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.SGPR, 2),
+            src2=Operand(RegType.IMM, 0, value=3),
+        )
+        self.assertEqual(inst.dst.index, 0)
+        self.assertEqual(inst.src0.index, 1)
+        self.assertEqual(inst.src1.index, 2)
+        self.assertEqual(inst.src2.value, 3)
+
+    def test_ast_validation_rejects_invalid_dst(self):
+        with self.assertRaises(TypeError):
+            VAlignbyteB32Instruction(
+                dst=Operand(RegType.SGPR, 0),
+                src0=Operand(RegType.VGPR, 1),
+                src1=Operand(RegType.VGPR, 2),
+                src2=Operand(RegType.VGPR, 3),
+            )
+        with self.assertRaises(TypeError):
+            VAlignbyteB32Instruction(
+                dst=Operand(RegType.IMM, 0, value=0),
+                src0=Operand(RegType.VGPR, 1),
+                src1=Operand(RegType.VGPR, 2),
+                src2=Operand(RegType.VGPR, 3),
+            )
+
+    def test_ast_validation_rejects_out_of_range_index(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 106)
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, -1)
+
+
 if __name__ == "__main__":
     unittest.main()
