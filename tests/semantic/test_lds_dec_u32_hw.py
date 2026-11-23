@@ -536,5 +536,93 @@ class TestDSDecU32BoundaryExtremes(unittest.TestCase):
         self.assertEqual(ds_dec_u32_oracle(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFE)
 
 
+class TestDSDecU32NegativeAndMutation(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(0x10000)
+
+    def test_syntax_rejection_invalid_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            VGPR(256)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetMutant(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSDecInstruction) -> Tuple[Optional[int], int]:
+                no_off = DSDecInstruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata=inst.vdata,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory(num_dwords=1024)
+        lds.write_dword(0x10, 5)
+        lds.write_dword(0x20, 5)
+        state = ScalarThreadState(lds)
+        state.rf.set_vgpr(VGPR(1), 0x10)
+        state.rf.set_vgpr(VGPR(2), 5)
+
+        inst = DSDecInstruction(
+            opcode=DSOpcode.DS_DEC_U32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(0x10),
+        )
+        DroppedOffsetMutant().execute(state, inst)
+        self.assertEqual(lds.read_dword(0x10), 4)
+        self.assertEqual(lds.read_dword(0x20), 5)
+
+
+class TestDSDecU32TranslatorIntegration(unittest.TestCase):
+    """Hardware translator integration: tools/rdna2spirv.py and spirv_mini_interp."""
+
+    TABLE = (  # (M, D, want)
+        (0, 5, 5),          # M == 0 -> wraps to DATA
+        (5, 5, 4),          # M == DATA -> M - 1
+        (1, 5, 0),          # M == 1 -> M - 1 = 0
+        (10, 5, 5),         # M > DATA -> clamps to DATA
+        (0x80000000, 5, 5), # M > DATA -> clamps to DATA
+    )
+
+    def test_translator_one_operation_table(self) -> None:
+        for m, d, want in self.TABLE:
+            for op in ("ds_dec_rtn_u32", "ds_dec_u32"):
+                with self.subTest(op=op, m=hex(m), d=hex(d)):
+                    rtns, fin = L.run_chain([(op, 0x40, 0, (d,))], {0x40: m})
+                    expected_rtn = m if "_rtn_" in op else 0xDEAD
+                    self.assertEqual(rtns, [expected_rtn])
+                    self.assertEqual(fin, {0x40: want})
+
+    def test_translator_offset_addressing(self) -> None:
+        init = {0x40: 5, 0x54: 10}
+        rtns, fin = L.run_chain([("ds_dec_rtn_u32", 0x40, 0x14, (10,))], init)
+        self.assertEqual(rtns, [10])
+        self.assertEqual(fin, {0x54: 9})
+
+    def test_translator_chain_sequential_decrements(self) -> None:
+        # Sequential decrements on the same dword: 3 -> 2 -> 1 -> 0 -> 3
+        ops = [
+            ("ds_dec_rtn_u32", 0x40, 0, (3,)),
+            ("ds_dec_rtn_u32", 0x40, 0, (3,)),
+            ("ds_dec_rtn_u32", 0x40, 0, (3,)),
+            ("ds_dec_rtn_u32", 0x40, 0, (3,)),
+        ]
+        rtns, fin = L.run_chain(ops, {0x40: 3})
+        self.assertEqual(rtns, [3, 2, 1, 0])
+        self.assertEqual(fin, {0x40: 3})
+
+    def test_translator_rejects_malformed_syntax(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("bad_syntax", ["ds_dec_u32 v1"])
+
+
 if __name__ == "__main__":
     unittest.main()
