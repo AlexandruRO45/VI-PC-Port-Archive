@@ -62,19 +62,14 @@ def run_ps_sad_u8(instructions: Sequence[str]) -> list[int]:
 
 class TestReferenceOracleAndTranslator(unittest.TestCase):
     def test_basic_sad_all_zero_diff(self):
-        # Identical bytes: all diffs are 0
         self.assertEqual(ref_sad_u8(0x01020304, 0x01020304, 0), 0)
-        # With accumulator
         self.assertEqual(ref_sad_u8(0x01020304, 0x01020304, 100), 100)
 
     def test_basic_sad_known_values(self):
-        # 0x04030201 vs 0x00000000: sum = 4+3+2+1 = 10
         self.assertEqual(ref_sad_u8(0x04030201, 0x00000000, 0), 10)
-        # 0x00000000 vs 0xFFFFFFFF: each byte diff is 255, sum = 1020
         self.assertEqual(ref_sad_u8(0x00000000, 0xFFFFFFFF, 0), 1020)
 
     def test_accumulator_addition(self):
-        # 0x04030201 vs 0: sum=10, acc=50 -> result=60
         self.assertEqual(ref_sad_u8(0x04030201, 0x00000000, 50), 60)
 
     def test_translator_basic_execution(self):
@@ -94,6 +89,92 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
             "v_sad_u8 v3, v0, v1, v2",
         ])
         self.assertEqual(words[0], 60)
+
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    literal_val: int = 0
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of bounds [0, 255]")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of bounds [0, 105]")
+
+    @classmethod
+    def vgpr(cls, idx: int) -> Operand:
+        return cls(RegType.VGPR, index=idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> Operand:
+        return cls(RegType.SGPR, index=idx)
+
+    @classmethod
+    def literal(cls, val: int) -> Operand:
+        return cls(RegType.LITERAL, literal_val=val & MASK32)
+
+    def to_asm(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        else:
+            return f"{self.literal_val:#x}"
+
+
+@dataclass(frozen=True)
+class VSadU8Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination must be a VGPR for VALU instruction v_sad_u8")
+
+    def to_asm(self) -> str:
+        return f"v_sad_u8 {self.dst.to_asm()}, {self.src0.to_asm()}, {self.src1.to_asm()}, {self.src2.to_asm()}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_ast_construction_and_formatting(self):
+        insn = VSadU8Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(0),
+        )
+        self.assertEqual(insn.to_asm(), "v_sad_u8 v3, v0, s4, 0x0")
+
+    def test_ast_immutability(self):
+        insn = VSadU8Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        with self.assertRaises(Exception):
+            insn.dst = Operand.vgpr(4)  # type: ignore
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(TypeError):
+            VSadU8Instruction(
+                dst=Operand.sgpr(3),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
 
 
 if __name__ == "__main__":
