@@ -238,6 +238,55 @@ class EffectsTest(unittest.TestCase):
             with self.subTest(cut=cut), self.assertRaises(ValueError):
                 sgd5_effects.read_database(io.BytesIO(data[:cut]), layout)
 
+    def test_program_groups_respects_database_limit_with_trailing_data(self):
+        trailing, _ = database({0: ("Next",)}, [effect("Tail")])
+        header = b"SGD5" + bytes(4)
+
+        # Group counts extending past `limit` must fail even when zero bytes / another DB follow in the stream.
+        prefix = header + u32(0) * 3  # 3 of 6 group counts; limit=20 cuts before the remaining 3
+        stream = io.BytesIO(prefix + u32(0) * 6 + trailing)
+        stream.seek(8)
+        with self.assertRaises(ValueError):
+            sgd5_effects.program_groups(stream, 20)
+
+        # Truncation inside a program record header with trailing DB bytes must also be rejected at `limit`.
+        one_prog = header + u32(1) + program("Glow") + u32(0) * 5
+        for cut in (12, 13, 16, 18, 19, 22):
+            with self.subTest(cut=cut):
+                limited = io.BytesIO(one_prog[:cut] + trailing)
+                limited.seek(8)
+                with self.assertRaises(ValueError):
+                    sgd5_effects.program_groups(limited, cut)
+
+        # An absurd group count cannot fit even one minimum-size program before `limit`.
+        oversize = header + u32(0xffffffff) + u32(0) * 5
+        limited = io.BytesIO(oversize + trailing)
+        limited.seek(8)
+        with self.assertRaises(ValueError):
+            sgd5_effects.program_groups(limited, len(oversize))
+
+    def test_read_database_rejects_invalid_layout_and_overrun_effect_count(self):
+        data, _ = database({}, [effect("First")])
+        blob = io.BytesIO(data + data)
+        for bad_layout in ((-1, 8, 64), (0, 2, 64), (0, 64, 64), (0, 80, 64)):
+            with self.subTest(bad_layout=bad_layout), self.assertRaises(ValueError):
+                sgd5_effects.read_database(blob, bad_layout)
+        # Empty group counts finish at offset 32; `end=32` or `end=34` must not read the effect count from trailing data.
+        for bad_end in (28, 32, 34):
+            with self.subTest(bad_end=bad_end), self.assertRaises(ValueError):
+                sgd5_effects.read_database(blob, (0, 8, bad_end))
+
+    def test_program_identity_rejects_truncated_and_invalid_offsets(self):
+        for label_name, raw, start in [
+            ("empty stream", b"", 0),
+            ("truncated label", b"\x10abc", 0),
+            ("zero length byte", b"\x00" + b"X" * 30, 0),
+            ("truncated header window", program("Glow")[:10], 0),
+            ("negative offset", program("Glow"), -1),
+        ]:
+            with self.subTest(case=label_name), self.assertRaises(ValueError):
+                sgd5_effects.program_identity(io.BytesIO(raw), 0, 0, start)
+
     @unittest.skipUnless(os.environ.get("LEONIDA_GAME_DIR"), "set LEONIDA_GAME_DIR to check package counts")
     def test_xbox_package_counts(self):
         archive = Path(os.environ["LEONIDA_GAME_DIR"]) / "shaders.rpf"

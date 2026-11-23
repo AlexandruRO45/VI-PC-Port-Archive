@@ -29,6 +29,7 @@ from shader_carve import ENTRY
 
 # SGD5 signature, first native group count, end of the padded effect region.
 DATABASES = ((0x9000, 0x10E39, 0x10287000), (0x10287000, 0x10289C81, 0x10579000))
+MIN_PROGRAM_BYTES = 1 + 2 + 1 + 4 + 12 + 152 + 4
 IDENTIFIER = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{0,254}\x00")
 POOL = re.compile(rb"[\x20-\x7e\x00]+")
 STRING = re.compile(rb"[^\x00]+\x00")
@@ -40,25 +41,36 @@ def u32(data, pos=0):
     return struct.unpack_from("<I", data, pos)[0]
 
 
+def read_bounded(stream, size, limit, message):
+    if stream.tell() + size > limit:
+        raise ValueError(message)
+    data = stream.read(size)
+    if len(data) != size:
+        raise ValueError(message)
+    return data
+
+
 def program_groups(stream, limit):
     groups = []
     for _ in range(6):
-        count = u32(stream.read(4))
+        count = u32(read_bounded(stream, 4, limit, "program group count crosses the database boundary"))
+        if count * MIN_PROGRAM_BYTES > limit - stream.tell():
+            raise ValueError("program group count exceeds the database boundary")
         offsets = []
         for _ in range(count):
             start = stream.tell()
-            length = stream.read(1)
-            if not length or length[0] < 2:
+            length = read_bounded(stream, 1, limit, "program crosses the database boundary")[0]
+            if length < 2:
                 raise ValueError("invalid program label length")
-            label = stream.read(length[0])
-            if len(label) != length[0] or label[-1:] != b"\x00":
+            label = read_bounded(stream, length, limit, "truncated program label")
+            if label[-1:] != b"\x00":
                 raise ValueError("truncated program label")
-            stream.seek(1, 1)  # tag
-            size = u32(stream.read(4))
+            read_bounded(stream, 1, limit, "program header crosses the database boundary")  # tag
+            size = u32(read_bounded(stream, 4, limit, "program header crosses the database boundary"))
             if size < 12 or stream.tell() + size + 156 > limit:
                 raise ValueError("program crosses the database boundary")
             stream.seek(size + 152, 1)
-            trailer = u32(stream.read(4))
+            trailer = u32(read_bounded(stream, 4, limit, "truncated program trailer"))
             if stream.tell() + trailer > limit:
                 raise ValueError("program trailer crosses the database boundary")
             stream.seek(trailer, 1)
@@ -68,14 +80,22 @@ def program_groups(stream, limit):
 
 
 def program_identity(stream, group, ordinal, start):
+    if start < 0:
+        raise ValueError(f"invalid program offset {start}")
     stream.seek(start)
-    length = stream.read(1)[0]
+    raw_length = stream.read(1)
+    if not raw_length or raw_length[0] < 2:
+        raise ValueError(f"invalid or truncated program label at {start:#x}")
+    length = raw_length[0]
     # shader_carve.ENTRY can include a printable native length byte (and up to
     # 200 printable bytes in all). Match the same wire header to recover its key.
     terminator = start + length
     window_start = max(0, terminator - 200)
+    window_size = terminator + 18 - window_start
     stream.seek(window_start)
-    window = stream.read(terminator + 18 - window_start)
+    window = stream.read(window_size)
+    if len(window) < window_size:
+        raise ValueError(f"truncated program header at {start:#x}")
     pos = terminator - window_start
     while pos and 0x21 <= window[pos - 1] <= 0x7e:
         pos -= 1
@@ -200,15 +220,17 @@ def techniques(data, effect):
 
 def read_database(stream, layout, effect=None, technique=None, *, list_effects=False, shader_hash=None):
     database, first_group, end = layout
+    if database < 0 or first_group < database + 4 or first_group >= end:
+        raise ValueError(f"invalid SGD5 database layout {layout!r}")
     stream.seek(database)
     if stream.read(4) != b"SGD5":
         raise ValueError(f"expected Xbox 1.0.2.1 SGD5 database at {database:#x}")
     stream.seek(first_group)
     groups = program_groups(stream, end)
-    count = u32(stream.read(4))
-    base = stream.tell()
-    if base >= end:
+    if stream.tell() + 4 >= end:
         raise ValueError("missing effect region")
+    count = u32(read_bounded(stream, 4, end, "truncated SGD5 effect count"))
+    base = stream.tell()
     data = stream.read(end - base)
     if len(data) != end - base:
         raise ValueError("truncated effect region")
