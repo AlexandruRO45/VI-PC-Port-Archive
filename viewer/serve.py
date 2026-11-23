@@ -117,6 +117,7 @@ _VIEWER_PAGES = frozenset({"/", "/index.html"})
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     world = None
+    _resolved_world_path = None
     extensions_map = {
         **http.server.SimpleHTTPRequestHandler.extensions_map,
         ".glb": "model/gltf-binary",
@@ -141,9 +142,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return None
         clean = self.path.split("#", 1)[0].split("?", 1)[0]
         if self.world and clean.startswith("/world/"):
-            if safe_world_path(self.world, self.path) is None:
+            resolved = safe_world_path(self.world, self.path)
+            if resolved is None:
                 self.send_error(403, "Forbidden")
                 return None
+            self._resolved_world_path = resolved
+            try:
+                return super().send_head()
+            finally:
+                self._resolved_world_path = None
         elif clean not in _VIEWER_PAGES:
             self.send_error(404, "File not found")
             return None
@@ -152,6 +159,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def translate_path(self, path):
         clean = path.split("#", 1)[0].split("?", 1)[0]
         if self.world and clean.startswith("/world/"):
+            if self._resolved_world_path is not None and path == self.path:
+                return self._resolved_world_path
             resolved = safe_world_path(self.world, path)
             return resolved if resolved is not None else ""
         if clean not in _VIEWER_PAGES:
