@@ -10,6 +10,7 @@ int main() {
     try {
         const auto dir = std::filesystem::current_path();
         rt::Loader loader(dir);
+        auto& importer = loader.load(dir / "dll_attach_importer.dll");
         auto& a = loader.load(dir / "dll_attach_a.dll");
         loader.initialise();
 
@@ -34,7 +35,12 @@ int main() {
         const bool ok = attaches_a == 1 && attaches_b == 1;
         std::printf("%s: DLL_PROCESS_ATTACH counts A=%d B=%d (expected A=1 B=1)\n",
                     ok ? "PASS" : "FAIL", attaches_a, attaches_b);
-        return ok ? 0 : 9;
+        using DependencyReady = BOOL(WINAPI*)();
+        const auto dependency_was_ready =
+            reinterpret_cast<DependencyReady>(importer.exports.at("dependency_was_ready"));
+        const bool in_order = dependency_was_ready() != FALSE;
+        std::printf("%s: static importer observed completed attach of A\n", in_order ? "PASS" : "FAIL");
+        return ok && in_order ? 0 : 9;
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());
         return 1;

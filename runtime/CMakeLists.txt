@@ -776,7 +776,7 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
-    foreach(target dll_attach_a dll_attach_b)
+    foreach(target dll_attach_a dll_attach_b dll_attach_importer)
       add_library(${target} SHARED test/fixtures/dll_reentrant_attach.cpp)
       target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /GS-)
       target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -787,8 +787,11 @@ if(BUILD_TESTING)
         ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
     endforeach()
     target_compile_definitions(dll_attach_a PRIVATE ATTACH_DLL_A)
+    target_compile_definitions(dll_attach_importer PRIVATE ATTACH_DLL_IMPORTER)
+    target_link_libraries(dll_attach_importer PRIVATE dll_attach_a)
     # The import-only fixtures have no relocations, so give them distinct preferred bases.
     target_link_options(dll_attach_b PRIVATE /BASE:0x181000000)
+    target_link_options(dll_attach_importer PRIVATE /BASE:0x182000000)
     add_executable(dll_reentrant_attach_test
       test/dll_reentrant_attach_test.cpp
       src/pe_loader.cpp
@@ -799,7 +802,7 @@ if(BUILD_TESTING)
     target_compile_definitions(dll_reentrant_attach_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dll_reentrant_attach_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_libraries(dll_reentrant_attach_test PRIVATE psapi)
-    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b)
+    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b dll_attach_importer)
     set_target_properties(dll_reentrant_attach_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
     add_test(NAME dll_reentrant_attach COMMAND dll_reentrant_attach_test
       WORKING_DIRECTORY "$<TARGET_FILE_DIR:dll_reentrant_attach_test>")

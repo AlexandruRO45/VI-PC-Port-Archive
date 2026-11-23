@@ -5,6 +5,7 @@
 // ~Loader() delivers process detach before unmapping initialised modules. The TLS slot and template are set up by load().
 // gta6rt_tls_host.dll must sit next to the executable; the loader reuses the module TLS index the OS assigns it.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -36,7 +37,7 @@ struct Module {
     uint32_t entry_rva = 0;
     bool relocated = false;
     bool attaching = false;  // process attach is on the stack under the loader mutex
-    bool initialised = false;
+    std::atomic<bool> initialised{false};
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
     // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.
@@ -48,6 +49,7 @@ struct Module {
     bool dynamic_load = false;
 
     std::vector<ImportRecord> imports;
+    std::vector<Module*> dependencies;  // bundled imports, including forwarder targets
     std::map<std::string, void*> exports;           // by name, plus "#ordinal"
     std::map<std::string, std::string> forwarders;  // same keys, holding "module.symbol" for re-exports
 
@@ -127,19 +129,21 @@ public:
 
 private:
     void initialise(Module& m);
-    static void set_initialised(Module& m, bool value);
-    Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
+    Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_ or names_mutex_
+    void forget_module(const std::filesystem::path& path);
     Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
-    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
+    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth, std::vector<Module*>& dependencies);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
     void register_unwind(Module& m);
 
     mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
+    // TLS callbacks can look up a mapped name without waiting for a load that is setting up TLS.
+    mutable std::shared_mutex names_mutex_;  // leaf lock, acquired for writes under mutex_
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
