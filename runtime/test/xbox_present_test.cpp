@@ -1097,7 +1097,12 @@ int main() {
                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                 pump();
                 want_w = want_h = 0;  // the first present after a resize may still be at the old size (suboptimal swapchain)
-                for (int round = 0; round < 3; ++round) {
+                // The swapchain follows the window once the surface reports the new size, which can take more than
+                // three presents after SetWindowPos (seen on an RTX 5060 Ti, driver 621.24: still 400x300 at round 3,
+                // about 1 run in 6). Present until the frame has the new size: at least 3 rounds, at most 30.
+                const auto at_new_size = [&] { return frame.extent.width == size[0] && frame.extent.height == size[1]; };
+                for (int round = 0; round < 30 && (round < 3 || !at_new_size()); ++round) {
+                    if (round >= 3) pump();
                     one = parameters(quad.source, &middle_half, xbox_scale_filter_point);
                     // (A present the driver reports out of date right after the resize is not counted as shown, so the counter
                     // is not checked here; the frame is still composed and read back.)
@@ -1109,8 +1114,8 @@ int main() {
                     resized.dest[2] = middle_half.right * double(frame.extent.width);
                     resized.dest[3] = middle_half.bottom * double(frame.extent.height);
                     EXPECT(frame_matches(frame, &resized, 1, false, 203.0, 0));
-                    if (round == 2) EXPECT(frame.extent.width == size[0] && frame.extent.height == size[1]);
                 }
+                EXPECT(at_new_size());
             }
             want_w = width;
             want_h = height;
