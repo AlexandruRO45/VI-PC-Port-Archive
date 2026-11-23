@@ -801,6 +801,9 @@ def main(argv=None):
                     help="change the pipeline metadata, e.g. .graphics_registers/.spi_ps_input_cntl/0/.fp16_interp_mode=true")
     ap.add_argument("--json", help="write {device, wave, size, pixels} here")
     a = ap.parse_args(argv)
+    if a.json and os.path.isdir(a.json):
+        print(f"ERROR: --json is a directory, not a report file: {a.json}", file=sys.stderr)
+        return 2
     if not (a.asm or a.show_template):
         ap.error("nothing to do: give --asm and/or --show-template")
     if not all(0 < n <= 4096 for n in a.size):
@@ -837,9 +840,13 @@ def main(argv=None):
         for words, (count, xy) in summarize(px, a.size).items():
             print(f"{count:6d} px, first at {xy}: " + " ".join(f"0x{w:08x}" for w in words))
         if a.json:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": o.device, "wave": 64 if o.wave64 else 32, "size": list(a.size), "pixels": px},
-                          f, indent=1)
+            try:
+                with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"device": o.device, "wave": 64 if o.wave64 else 32, "size": list(a.size), "pixels": px},
+                              f, indent=1)
+            except OSError as e:
+                print(f"ERROR: cannot write {a.json}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+                return 2
         return 0
     finally:
         o.close()
