@@ -371,6 +371,25 @@ class TestLdsIncU32Aliasing(unittest.TestCase):
         mem = L.run(body, lanes=1)
         self.assertEqual(L.out(mem, 0, 0), 64)
 
+class TestLdsIncU32BoundariesAndNegative(unittest.TestCase):
+    def test_zero_threshold(self):
+        rtns, fin = L.run_chain([("ds_inc_u32", 0x40, 0, (0,))], {0x40: 0})
+        self.assertEqual(fin[0x40], 0)
+        rtns, fin = L.run_chain([("ds_inc_u32", 0x40, 0, (0,))], {0x40: 100})
+        self.assertEqual(fin[0x40], 0)
+
+    def test_max_u32_threshold(self):
+        rtns, fin = L.run_chain([("ds_inc_u32", 0x40, 0, (0xFFFFFFFF,))], {0x40: 0xFFFFFFFE})
+        self.assertEqual(fin[0x40], 0xFFFFFFFF)
+        rtns, fin = L.run_chain([("ds_inc_u32", 0x40, 0, (0xFFFFFFFF,))], {0x40: 0xFFFFFFFF})
+        self.assertEqual(fin[0x40], 0)
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            L.translate(["ds_inc_u32 v0"])
+        with self.assertRaises(Exception):
+            L.translate(["ds_inc_u32_bad_opcode v0, v1"])
+
 
 if __name__ == "__main__":
     unittest.main()
