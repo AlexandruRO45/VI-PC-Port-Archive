@@ -141,13 +141,6 @@ def main(argv=None):
         oracle.close()
         print(f"hardware oracle unavailable: {why}")
         return 77
-    import tsharp
-    try:
-        tsharp.check_arch(oracle.arch)          # the T# this probe builds; as image_fuzz.py --oracle hw reports it
-    except ValueError as e:
-        oracle.close()
-        print(f"hardware oracle unavailable: {e}")
-        return 77
     try:
         print(f"device: {oracle.device}")
         bad = 0
