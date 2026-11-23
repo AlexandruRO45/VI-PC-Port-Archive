@@ -9492,7 +9492,8 @@ class Gen:
         elif op == "s_getpc_b64":
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
-            if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
+            to_vcc = a[0]["k"] == "special" and a[0]["t"] == "vcc"   # an address in VCC is data (lane_masks)
+            if not to_vcc and (a[0]["k"] != "sgpr" or a[0].get("n") != 2):
                 raise Unsupported("s_getpc_b64 destination")
             if not ins.get("enc"):
                 # Without the `; encoding:` bytes the instruction's size, and so the next PC, is unknown.
@@ -9505,8 +9506,12 @@ class Gen:
             self.emit(f"{rlo} = OpCompositeExtract %uint {s} 0")
             self.emit(f"{c} = OpCompositeExtract %uint {s} 1")
             self.emit(f"{rhi} = OpIAdd %uint {hi} {c}")
-            self.store_reg("sgpr", a[0]["r"], rlo)
-            self.store_reg("sgpr", a[0]["r"] + 1, rhi)
+            if to_vcc:
+                self.emit(f"OpStore %vcc {rlo}")
+                self.emit(f"OpStore %vcc_hi {rhi}")
+            else:
+                self.store_reg("sgpr", a[0]["r"], rlo)
+                self.store_reg("sgpr", a[0]["r"] + 1, rhi)
             self.uses_codebase = True
             self.cu(3), self.cu(4)
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
@@ -11609,7 +11614,8 @@ class Gen:
             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
         slist_dst = d["k"] == "slist" and len(d["r"]) == n
         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
-                      else list(base["r"]) if base["k"] == "slist" else None)
+                      else list(base["r"]) if base["k"] == "slist"
+                      else ["vcc_lo", "vcc_hi"] if base["k"] == "special" and base["t"] == "vcc" else None)
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
 
