@@ -113,6 +113,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # integer ops with CPU-only checks until now (derivations in cs_w32_int_ext.asm)
             ("cs_w32_int_ext", [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050]),
             # 64-bit scalar data ops and v_mad_u64_u32 (derivations in cs_w32_salu64.asm)
+            # 64-bit VALU comparisons with null sources (derivations in cs_vcmp64_null.asm)
+            ("cs_vcmp64_null", [0xA5, 0x4D, 0xD4, 0xDA, 0xAD, 0xA5, 1, 0x7777]),
             # more ops with CPU-only checks until now (derivations in cs_w32_misc_ext.asm)
             # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
