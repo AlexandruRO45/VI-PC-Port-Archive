@@ -159,6 +159,21 @@ class TestDenormModeAST(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("cs_denorm_ast", prog, fssm=saveexec_run.fssm())
 
+class TestDenormModeBitfields(unittest.TestCase):
+    def test_bitfield_combinations(self):
+        for fp32_val in (0, 1, 2, 3):
+            for fp16_val in (0, 1, 2, 3):
+                imm = fp32_val | (fp16_val << 2)
+                res = model_denorm_mode(imm)
+                self.assertEqual(res["fp32"], fp32_val)
+                self.assertEqual(res["fp16_64"], fp16_val)
+
+    def test_translator_denorm_mode_unsupported(self):
+        for imm in (0, 1, 2, 3):
+            prog = [f"s_denorm_mode {imm}", "s_endpgm"]
+            with self.assertRaises(rdna2spirv.Unsupported):
+                support.translate_lines(f"cs_denorm_{imm}", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
