@@ -620,6 +620,48 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         ])
         self.assertEqual(words[0], SUBNORM_MIN)
 
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_negative_dst_rejection(self):
+        with self.assertRaises(TypeError):
+            VMed3F32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+
+    def test_out_of_bounds_register_rejection(self):
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_mutation_operator_inverted_to_max(self):
+        # If med is mutated to max, med3(1, 2, 3) would return 3 instead of 2
+        a, b, c = ONE_F32, TWO_F32, THREE_F32
+        correct = ref_med3_f32(a, b, c)
+        mutated = max(u32_to_f32(a), u32_to_f32(b), u32_to_f32(c))
+        self.assertNotEqual(correct, f32_to_u32(mutated))
+
+    def test_mutation_dropped_third_operand(self):
+        # If src2 is dropped, med3(10.0, 20.0, 15.0) would return incorrect value
+        s0 = f32_to_u32(10.0)
+        s1 = f32_to_u32(20.0)
+        s2 = f32_to_u32(15.0)
+        correct = ref_med3_f32(s0, s1, s2)
+        self.assertEqual(correct, s2)
+
+    def test_mutation_omitted_clamp(self):
+        # Clamping 2.0 with (0.0, 2.0, 3.0) must saturate to 1.0
+        val0 = POS_ZERO
+        val1 = TWO_F32
+        val2 = THREE_F32
+        clamped = ref_med3_f32(val0, val1, val2, clamp=True)
+        unclamped = ref_med3_f32(val0, val1, val2, clamp=False)
+        self.assertEqual(clamped, ONE_F32)
+        self.assertEqual(unclamped, TWO_F32)
+        self.assertNotEqual(clamped, unclamped)
+
 
 if __name__ == "__main__":
     unittest.main()
