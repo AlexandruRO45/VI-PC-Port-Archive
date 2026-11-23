@@ -100,6 +100,13 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def test_out_in_a_missing_folder_is_created(self):
+        out = os.path.join(self.root, "reports", "nested", "checklist.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ec.main(["--root", self.root, "--out", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("Checklist: what to confirm", f.read())
+
     def test_this_repository(self):
         notes = ec.collect(ROOT)
         self.assertTrue(notes)
