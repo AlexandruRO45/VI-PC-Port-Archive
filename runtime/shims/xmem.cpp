@@ -711,10 +711,9 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
     if (allocation_type & (MEM_RESET | MEM_RESET_UNDO)) {
         return VirtualAlloc(address, size, allocation_type & ~kXmemPageModeMask, host_protect(protect));
     }
-    if (!address && (allocation_type & MEM_COMMIT) && !(allocation_type & MEM_RESERVE)) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return nullptr;
-    }
+    // Win32 reserves and commits a commit-only request at a null address (measured on Windows 11 26200 in #4531), so
+    // the guest-page path gets the reserve it implies.
+    if (!address && (allocation_type & MEM_COMMIT)) allocation_type |= MEM_RESERVE;
     if (allocation_type & (kXmemLargePages | kXmem4MbPages)) {
         // VirtualAlloc refuses the VirtualAlloc2-only placeholder flags; keep that with page-size bits too.
         if (!(allocation_type & (MEM_RESERVE | MEM_COMMIT)) ||

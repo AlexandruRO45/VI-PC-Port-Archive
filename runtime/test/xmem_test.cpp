@@ -744,9 +744,12 @@ void test_title_virtual_alloc() {
 
                 SetLastError(ERROR_SUCCESS);
                 void* const commit_only = alloc(nullptr, mode.page, MEM_COMMIT | mode.bits | tags, PAGE_READWRITE);
-                check(commit_only == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
-                      "title commit-only with a null address fails for every guest page mode");
-                if (commit_only) VirtualFree(commit_only, 0, MEM_RELEASE);
+                check(commit_only && (reinterpret_cast<uintptr_t>(commit_only) & (mode.page - 1)) == 0,
+                      "title commit-only with a null address reserves and commits aligned guest pages, as Win32 does");
+                if (commit_only) {
+                    static_cast<volatile uint8_t*>(commit_only)[mode.page - 1] = 0x5a;
+                    VirtualFree(commit_only, 0, MEM_RELEASE);
+                }
 
                 SetLastError(ERROR_SUCCESS);
                 void* const low = alloc(reinterpret_cast<void*>(mode.page - 1), 1,
@@ -789,9 +792,11 @@ void test_title_virtual_alloc() {
 
         SetLastError(ERROR_SUCCESS);
         void* const commit_only = alloc(nullptr, kPage64k, MEM_COMMIT, PAGE_READWRITE);
-        check(commit_only == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
-              "title commit-only with a null address fails without guest page bits");
-        if (commit_only) VirtualFree(commit_only, 0, MEM_RELEASE);
+        check(commit_only != nullptr, "title commit-only with a null address succeeds without guest page bits, as Win32 does");
+        if (commit_only) {
+            static_cast<volatile uint8_t*>(commit_only)[0] = 0x5a;
+            VirtualFree(commit_only, 0, MEM_RELEASE);
+        }
 
         void* const gfx = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x2004);  // PAGE_GRAPHICS_READWRITE
         check(gfx != nullptr, "title VirtualAlloc with protect 0x2004 succeeds");
