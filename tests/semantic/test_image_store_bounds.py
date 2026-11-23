@@ -54,14 +54,17 @@ class ImageStoreBoundsTests(unittest.TestCase):
                 # the outermost guard: the first conditional branch after the size query
                 q = next(i for i, (r, _o, _a) in enumerate(lines) if r == sizes[0])
                 first = next(i for i in range(q, len(lines)) if lines[i][1] == "OpBranchConditional")
-                seen, todo = set(), [lines[first][2][0]]
+                seen, raw, todo = set(), set(), [lines[first][2][0]]
                 while todo:
                     v = todo.pop()
+                    raw.add(v)
                     if v in seen or v not in defs:
                         continue
                     seen.add(v)
                     todo += defs[v][1]
-                self.assertIn("%active", seen)
+                # the EXEC test (a kernel that never changes EXEC folds it to the constant %true)
+                self.assertTrue(raw & {"%active", "%true"} or any(defs[v][0] == "OpLoad" and defs[v][1][1] == "%active"
+                                                                  for v in seen))
                 if n == 1:
                     tests = [v for v in seen if defs[v][0] == "OpULessThan" and defs[v][1][2] == sizes[0]]
                     self.assertTrue(tests, "1D: coordinate < size missing")
