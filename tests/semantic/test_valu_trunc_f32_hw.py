@@ -267,5 +267,19 @@ class TestValuTruncF32Aliasing(unittest.TestCase):
         self.assertEqual(state.vgprs[0], f32_to_u32(99.0))
 
 
+class TestValuTruncF32ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_scc_and_vcc_unmodified(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+
+        instr = ASTInstruction(Opcode.V_TRUNC_F32, ASTOperand.vgpr(0), ASTOperand.imm(0))
+        ScalarInterpreter().step(instr, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
+
 if __name__ == "__main__":
     unittest.main()
