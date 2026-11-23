@@ -44,9 +44,9 @@ bool canonical(uint64_t a) {
     return top == 0 || top == 0x1FFFF;
 }
 
-// The legacy prefixes CLZERO ignores: operand size (66), REP/REPNE (F3/F2) and the segment overrides. LOCK (F0) is
-// not among them: LOCK on CLZERO is a real #UD.
+// CLZERO ignores REX, operand size (66), REP/REPNE (F3/F2) and the segment overrides. LOCK (F0) causes #UD.
 bool ignored_prefix(uint8_t b) {
+    if ((b & 0xF0) == 0x40) return true;  // REX
     switch (b) {
         case 0x66: case 0xF2: case 0xF3:
         case 0x2E: case 0x36: case 0x3E: case 0x26: case 0x64: case 0x65:
@@ -56,8 +56,8 @@ bool ignored_prefix(uint8_t b) {
     }
 }
 
-// CLZERO, 0F 01 FC, with any legacy prefixes and a REX that comes last before the 0F: zero the 64-byte cache line
-// that contains the address in RAX (the low 6 bits are ignored). The address-size prefix 67 selects EAX
+// CLZERO, 0F 01 FC, zeroes the 64-byte cache line that contains the address in RAX (the low 6 bits are ignored).
+// All REX bytes count toward the length, including before legacy prefixes. The address-size prefix 67 selects EAX
 // (zero-extended) instead. If the line cannot be written (not writable, not committed, a non-canonical address, or one
 // whose line wraps past the top of memory) the real instruction raises a page fault: the emulator reports it with
 // write_fault(), and the dispatcher turns it into the access violation the game would see on real hardware. A guard
@@ -70,7 +70,6 @@ size_t emulate_clzero(CONTEXT& ctx, const uint8_t* code, size_t available) {
         addr32 |= code[at] == 0x67;
         if (++at > kMaxInstructionLength - 3) return 0;
     }
-    if (at < available && (code[at] & 0xF0) == 0x40 && ++at > kMaxInstructionLength - 3) return 0;  // REX
     if (available < at + 3 || code[at] != 0x0F || code[at + 1] != 0x01 || code[at + 2] != 0xFC) return 0;
     const uint64_t address = addr32 ? (ctx.Rax & 0xFFFFFFFFull) : ctx.Rax;
     const uint64_t line_address = address & ~static_cast<uint64_t>(kCacheLine - 1);
