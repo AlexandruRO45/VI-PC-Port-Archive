@@ -34,10 +34,12 @@ void main() {
     if (k >= p.records) return;
     uint x = 0u, y = 0u, z = 0u, vertices = 0u;
     if (p.has_count == 0u || k < p.count.data[0]) {
-        const uint source = k * p.stride_words;
-        x = p.arguments.data[source];
-        y = p.arguments.data[source + 1u];
-        z = p.arguments.data[source + 2u];
+        // The record's address in 64 bits: k * stride can pass 2^32 words with a large ByteStride (D3D12 allows
+        // any multiple of 4), where a 32-bit word index would wrap and read an earlier record.
+        WordsIn record = WordsIn(uint64_t(p.arguments) + uint64_t(k) * uint64_t(p.stride_words) * 4ul);
+        x = record.data[0];
+        y = record.data[1];
+        z = record.data[2];
         const uint64_t groups = uint64_t(x) * uint64_t(y) * uint64_t(z);
         const uint64_t verts = groups * uint64_t(p.max_primitives) * 3ul;
         if (groups == 0ul) {
