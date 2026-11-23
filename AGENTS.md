@@ -65,9 +65,9 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
 ## Test without the game first
 
-None of these need game files. Most run in seconds - the translator suite takes a few minutes (433 files and 5 821
-tests in 224 s on 16 cores) and the two builds longer - so run one translator test file while you iterate and the
-whole suite once before the pull request:
+None of these need game files. Most run in seconds, the translator suite takes a few minutes, and the two builds
+take longer. Run one translator test file while you iterate and the whole suite once before the pull request.
+The parallel runner prints the file count, test count, failures and elapsed time in its final summary.
 
 ```powershell
 python -m compileall -q make_game.py tools tests
