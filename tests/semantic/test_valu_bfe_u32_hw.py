@@ -327,5 +327,23 @@ class TestVBfeU32RegisterAliasing(unittest.TestCase):
         self.assertEqual(mach.vgprs[0], 0)
 
 
+class TestVBfeU32ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and carry/borrow preservation."""
+
+    def test_vcc_and_scc_preserved(self):
+        vcc_initial = 0xDEADBEEF01234567
+        scc_initial = 1
+        vcc = vcc_initial
+        scc = scc_initial
+        res = ref_bfe_u32(0xFFFFFFFF, 0, 32)
+        self.assertEqual(res, 0)
+        self.assertEqual(vcc, vcc_initial)
+        self.assertEqual(scc, scc_initial)
+
+    def test_zero_result_does_not_set_vcc_or_scc(self):
+        res = ref_bfe_u32(0, 0, 10)
+        self.assertEqual(res, 0)
+
+
 if __name__ == '__main__':
     unittest.main()
