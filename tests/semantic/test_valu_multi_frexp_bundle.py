@@ -448,5 +448,15 @@ class VFrexpExpI32F64OracleTests(unittest.TestCase):
         self.assertEqual(oracle_frexp_exp_i32_f64(0x7FF0000000000000), 0)
         self.assertEqual(oracle_frexp_exp_i32_f64(0x7FF8000000000000), 0)
 
+class VFrexpExpI32F64AstInterpreterTests(unittest.TestCase):
+    def test_frexp_exp_f64_ast_construction(self):
+        ast = ValuInstructionAST("v_frexp_exp_i32_f64", Operand(RegKind.VGPR, 2), Operand(RegKind.VGPR, 0))
+        self.assertEqual(ast.mnemonic, "v_frexp_exp_i32_f64")
+
+    def test_frexp_exp_f64_scalar_execution(self):
+        # 8.0d (0x4020000000000000) -> 4
+        res = oracle_frexp_exp_i32_f64(0x4020000000000000)
+        self.assertEqual(res, 4)
+
 if __name__ == "__main__":
     unittest.main()
