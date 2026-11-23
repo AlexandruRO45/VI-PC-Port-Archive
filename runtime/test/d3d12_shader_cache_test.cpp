@@ -5,6 +5,7 @@
 // No game data.
 #include "vk_test_device.h"
 #include "d3d12_copy_compare.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -166,6 +167,21 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // The DISK-mode checks below keep their cache files under the temp directory: the USE_WORKING_DIR ones in
+    // leonida_shader_cache_disk_test, the others in the runtime's default <temp>/leonida_shader_cache, where
+    // ShaderCacheControl CLEAR deletes every leonida_sc_* file. Two copies of this test at once (ctest in two build
+    // trees, or two suites sharing one TEMP) shared both folders, and one copy's remove_all, writes and clears broke
+    // the other's first DISK StoreValue (8 of 16 copies run in pairs failed there); a single run also cleared the
+    // files other processes of the runtime kept in the default folder. TMP and TEMP name a folder of this process's
+    // own instead (test_temp_dir.h), before any session exists; the runtime's default folder follows them.
+    const testfiles::ScratchDir temp("leonida_shader_cache_test");
+    std::error_code temp_error;
+    if (!std::filesystem::is_directory(temp.path(), temp_error) ||
+        !SetEnvironmentVariableW(L"TMP", temp.path().c_str()) ||
+        !SetEnvironmentVariableW(L"TEMP", temp.path().c_str())) {
+        std::fprintf(stderr, "cannot point TMP and TEMP at %s\n", temp.path().string().c_str());
+        return 1;
+    }
     vktest::Device d;
     const auto status = d.initialize();
     if (status == vktest::DeviceStatus::unavailable) {
