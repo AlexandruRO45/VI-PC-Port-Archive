@@ -305,5 +305,29 @@ class RcpF16SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.lanes[i].get_vgpr(1), 0xAAAA0000)  # Inactive lane unchanged
 
+class RcpF16RegisterAliasingTests(unittest.TestCase):
+    def test_in_place_low_half_overwrite(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, 0x55AA0000 | F16_TWO)
+        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 0))
+        execute_scalar_rcp_f16(state, ast)
+        res = state.get_vgpr(0)
+        self.assertEqual(res >> 16, 0x55AA)  # High half preserved
+        self.assertEqual(res & 0xFFFF, F16_HALF)  # Low half updated
+
+    def test_in_place_high_half_overwrite(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, (F16_TWO << 16) | 0xBEEF)
+        ast = InstructionAST(
+            "v_rcp_f16",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 0),
+            ModifierFlags(op_sel=(1, 1)),
+        )
+        execute_scalar_rcp_f16(state, ast)
+        res = state.get_vgpr(0)
+        self.assertEqual(res & 0xFFFF, 0xBEEF)  # Low half preserved
+        self.assertEqual(res >> 16, F16_HALF)   # High half updated
+
 if __name__ == "__main__":
     unittest.main()
