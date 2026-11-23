@@ -639,6 +639,116 @@ void test_title_virtual_alloc() {
     }
 }
 
+// Placeholder and write-watch flag combinations: invalid MEM_RESERVE_PLACEHOLDER combinations fail with
+// ERROR_INVALID_PARAMETER without mutating an existing placeholder, and reserve-only MEM_WRITE_WATCH in a guest page
+// mode stays a writable watchable reservation rather than a physical-page placeholder window.
+void test_placeholder_and_write_watch_flags(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn get_write_watch) {
+    SetLastError(ERROR_SUCCESS);
+    void* const commit_ph = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | MEM_RESERVE_PLACEHOLDER, 0,
+                                          PAGE_READWRITE);
+    check(commit_ph == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "MEM_RESERVE | MEM_COMMIT | MEM_RESERVE_PLACEHOLDER fails with ERROR_INVALID_PARAMETER");
+    if (commit_ph) VirtualFree(commit_ph, 0, MEM_RELEASE);
+
+    SetLastError(ERROR_SUCCESS);
+    void* const rw_ph = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0, PAGE_READWRITE);
+    check(rw_ph == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "MEM_RESERVE | MEM_RESERVE_PLACEHOLDER with PAGE_READWRITE fails with ERROR_INVALID_PARAMETER");
+    if (rw_ph) VirtualFree(rw_ph, 0, MEM_RELEASE);
+
+    SetLastError(ERROR_SUCCESS);
+    void* const no_reserve_ph = virtual_alloc(nullptr, kPage64k, MEM_RESERVE_PLACEHOLDER, 0, PAGE_NOACCESS);
+    check(no_reserve_ph == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "MEM_RESERVE_PLACEHOLDER without MEM_RESERVE fails with ERROR_INVALID_PARAMETER");
+    if (no_reserve_ph) VirtualFree(no_reserve_ph, 0, MEM_RELEASE);
+
+    SetLastError(ERROR_SUCCESS);
+    void* const ww_ph =
+        virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_WRITE_WATCH | MEM_RESERVE_PLACEHOLDER, 0, PAGE_NOACCESS);
+    check(ww_ph == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "MEM_RESERVE | MEM_WRITE_WATCH | MEM_RESERVE_PLACEHOLDER fails with ERROR_INVALID_PARAMETER");
+    if (ww_ph) VirtualFree(ww_ph, 0, MEM_RELEASE);
+
+    SetLastError(ERROR_SUCCESS);
+    void* const reset_ph =
+        virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_RESET | MEM_RESERVE_PLACEHOLDER, 0, PAGE_NOACCESS);
+    check(reset_ph == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "MEM_RESERVE | MEM_RESET | MEM_RESERVE_PLACEHOLDER fails with ERROR_INVALID_PARAMETER");
+    if (reset_ph) VirtualFree(reset_ph, 0, MEM_RELEASE);
+
+    SetLastError(ERROR_SUCCESS);
+    void* const reset_undo_ph =
+        virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_RESET_UNDO | MEM_RESERVE_PLACEHOLDER, 0, PAGE_NOACCESS);
+    check(reset_undo_ph == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "MEM_RESERVE | MEM_RESET_UNDO | MEM_RESERVE_PLACEHOLDER fails with ERROR_INVALID_PARAMETER");
+    if (reset_undo_ph) VirtualFree(reset_undo_ph, 0, MEM_RELEASE);
+
+    // PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS (0x801) strips to PAGE_NOACCESS and still reserves a placeholder.
+    void* const gfx_noaccess_ph =
+        virtual_alloc(nullptr, 3 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0, 0x801);
+    check(gfx_noaccess_ph != nullptr,
+          "MEM_RESERVE | MEM_RESERVE_PLACEHOLDER with PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS succeeds");
+    if (gfx_noaccess_ph) {
+        auto* const ph_bytes = static_cast<uint8_t*>(gfx_noaccess_ph);
+        MEMORY_BASIC_INFORMATION before{};
+        check(VirtualQuery(ph_bytes, &before, sizeof(before)) && before.RegionSize == 3 * kPage64k,
+              "fresh 3-page placeholder reports full 3-page RegionSize");
+
+        // Contradictory MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER must fail without splitting the placeholder.
+        SetLastError(ERROR_SUCCESS);
+        void* const bad_replace = virtual_alloc(
+            ph_bytes + kPage64k, kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER, 0,
+            PAGE_NOACCESS);
+        check(bad_replace == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER fails with ERROR_INVALID_PARAMETER");
+
+        MEMORY_BASIC_INFORMATION after{};
+        check(VirtualQuery(ph_bytes, &after, sizeof(after)) && after.RegionSize == 3 * kPage64k,
+              "rejected MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER leaves placeholder unsplit");
+        check(VirtualFree(ph_bytes, 0, MEM_RELEASE), "release the unsplit placeholder");
+    }
+
+    // Reserve-only MEM_WRITE_WATCH with 64 KiB guest pages must remain committable and write-watched.
+    void* const ww64 =
+        virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_WRITE_WATCH | kXmem64kPages, 0, PAGE_READWRITE);
+    check(ww64 != nullptr, "MEM_RESERVE | MEM_WRITE_WATCH | kXmem64kPages reserves a region");
+    if (ww64) {
+        void* const committed = virtual_alloc(ww64, kPage64k, MEM_COMMIT | kXmem64kPages, 0, PAGE_READWRITE);
+        check(committed == ww64, "MEM_COMMIT | kXmem64kPages succeeds inside a 64 KiB write-watch reservation");
+        if (committed) {
+            static_cast<volatile uint8_t*>(committed)[0] = 0x3c;
+            void* watched[16]{};
+            ULONG_PTR count = 16;
+            ULONG granularity = 0;
+            const UINT status = get_write_watch(0, committed, kPage64k, watched, &count, &granularity);
+            check(status == NO_ERROR && count == 1 && watched[0] == committed,
+                  "XMemGetWriteWatch reports the written page in a 64 KiB write-watch region");
+        }
+        check(VirtualFree(ww64, 0, MEM_RELEASE), "release the 64 KiB write-watch region");
+    }
+
+    // Reserve-only MEM_WRITE_WATCH with 2 MiB guest pages must stay 2 MiB-aligned, committable, and write-watched.
+    void* const ww2m =
+        virtual_alloc(nullptr, kPage2m, MEM_RESERVE | MEM_WRITE_WATCH | kXmemLargePages, 0, PAGE_READWRITE);
+    check(ww2m != nullptr, "MEM_RESERVE | MEM_WRITE_WATCH | kXmemLargePages reserves a region");
+    if (ww2m) {
+        check((reinterpret_cast<uintptr_t>(ww2m) & (kPage2m - 1)) == 0,
+              "2 MiB write-watch reservation is 2 MiB-aligned");
+        void* const committed = virtual_alloc(ww2m, kPage2m, MEM_COMMIT | kXmemLargePages, 0, PAGE_READWRITE);
+        check(committed == ww2m, "MEM_COMMIT | kXmemLargePages succeeds inside a 2 MiB write-watch reservation");
+        if (committed) {
+            static_cast<volatile uint8_t*>(committed)[0] = 0x5e;
+            void* watched[16]{};
+            ULONG_PTR count = 16;
+            ULONG granularity = 0;
+            const UINT status = get_write_watch(0, committed, kPage2m, watched, &count, &granularity);
+            check(status == NO_ERROR && count == 1 && watched[0] == committed,
+                  "XMemGetWriteWatch reports the written page in a 2 MiB write-watch region");
+        }
+        check(VirtualFree(ww2m, 0, MEM_RELEASE), "release the 2 MiB write-watch region");
+    }
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -705,6 +815,7 @@ int main() {
     test_virtual_query(query);
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
+        test_placeholder_and_write_watch_flags(virtual_alloc, get_write_watch);
     }
     test_attribute_trace(alloc, free_mem, virtual_alloc);
     if (transfer) {
