@@ -854,3 +854,21 @@ class TestCmpxClassF32SIMDAndProperties(unittest.TestCase):
     def test_cascaded_cmpx_narrowing_hardware(self):
         val_cascade, _ = run_cmp_shader("f32", 0x3F800000, CLASS_POS_NORMAL, is_cmpx=True, test_id="cascade")
         self.assertEqual(val_cascade, 1)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestCmpxClassF32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            LiteralOperand(0x2_0000_0000_0000_0000)
+
+    def test_boundary_extremes_hardware(self):
+        val_snan, _ = run_cmp_shader("f32", 0x7F800001, CLASS_SNAN, is_cmpx=True, test_id="snan")
+        self.assertEqual(val_snan, 1)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        _, spv = run_cmp_shader("f32", 0x3F800000, CLASS_POS_NORMAL, is_cmpx=True, test_id="lowering")
+        self.assertIn("OpStore %active", spv)
