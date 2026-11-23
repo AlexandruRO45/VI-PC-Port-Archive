@@ -525,12 +525,46 @@ int main() {
             BOOL fullscreen = FALSE;
             const HRESULT desc_hr = chain->GetFullscreenDesc(&actual);
             const HRESULT state_hr = chain->GetFullscreenState(&fullscreen, nullptr);
-            chain->Release();
             if (FAILED(desc_hr) || FAILED(state_hr) || actual.RefreshRate.Numerator != 60 ||
                 actual.RefreshRate.Denominator != 1 || actual.ScanlineOrdering != requested.ScanlineOrdering ||
-                actual.Scaling != requested.Scaling || actual.Windowed != windowed || fullscreen != !windowed)
-                return fail("CreateSwapChainForHwnd did not retain fullscreen descriptor");
+                actual.Scaling != requested.Scaling || actual.Windowed != windowed || fullscreen != FALSE)
+                return fail("CreateSwapChainForHwnd descriptor or initial state");
+            if (FAILED(chain->SetFullscreenState(FALSE, nullptr)) ||
+                FAILED(chain->GetFullscreenDesc(&actual)) || !actual.Windowed ||
+                FAILED(chain->GetFullscreenState(&fullscreen, nullptr)) || fullscreen)
+                return fail("SetFullscreenState(FALSE) did not update descriptor and state");
+            if (FAILED(chain->SetFullscreenState(TRUE, nullptr)) ||
+                FAILED(chain->GetFullscreenDesc(&actual)) || !actual.Windowed ||
+                FAILED(chain->GetFullscreenState(&fullscreen, nullptr)) || fullscreen)
+                return fail("SetFullscreenState(TRUE) changed the windowed state");
+            chain->Release();
         }
+    }
+
+    // The legacy fullscreen request retains its descriptor but falls back to windowed.
+    {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        desc.BufferDesc.Width = 128;
+        desc.BufferDesc.Height = 128;
+        desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.OutputWindow = hwnd;
+        desc.Windowed = FALSE;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        IDXGISwapChain* chain = nullptr;
+        if (factory->CreateSwapChain(queue, &desc, &chain) != DXGI_STATUS_OCCLUDED || !chain)
+            return fail("legacy fullscreen fallback creation");
+        IDXGISwapChain1* chain1 = nullptr;
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC actual{};
+        BOOL fullscreen = TRUE;
+        if (FAILED(chain->QueryInterface(IID_PPV_ARGS(&chain1))) ||
+            FAILED(chain1->GetFullscreenDesc(&actual)) || actual.Windowed ||
+            FAILED(chain->GetFullscreenState(&fullscreen, nullptr)) || fullscreen)
+            return fail("legacy fullscreen fallback descriptor or state");
+        chain1->Release();
+        chain->Release();
     }
 
     // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.

@@ -324,9 +324,15 @@ public:
         return buffers_[buffer]->QueryInterface(riid, surface);
     }
 
-    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen, IDXGIOutput*) override {
+        if (!fullscreen) {
+            fullscreen_desc_.Windowed = TRUE;
+            fullscreen_ = FALSE;
+        }
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fs, IDXGIOutput** out) override {
-        if (fs) *fs = !fullscreen_desc_.Windowed;
+        if (fs) *fs = fullscreen_;
         if (out) *out = nullptr;
         return S_OK;
     }
@@ -619,6 +625,7 @@ private:
     HWND hwnd_ = nullptr;
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_{{0, 0}, DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
                                                     DXGI_MODE_SCALING_UNSPECIFIED, TRUE};
+    BOOL fullscreen_ = FALSE;
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
     HANDLE waitable_ = nullptr;
