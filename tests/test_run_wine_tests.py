@@ -606,6 +606,10 @@ class MainTest(unittest.TestCase):
             {"properties": [{"name": "PASS_REGULAR_EXPRESSION", "value": [42]}]},
             {"properties": [{"name": "FAIL_REGULAR_EXPRESSION", "value": {"bad": True}}]},
             {"properties": [{"name": "SKIP_REGULAR_EXPRESSION", "value": None}]},
+            {"properties": [{"name": "DEPENDS", "value": None}]},
+            {"properties": [{"name": "DEPENDS", "value": "setup"}]},
+            {"properties": [{"name": "FIXTURES_SETUP", "value": [42]}]},
+            {"properties": [{"name": "FIXTURES_REQUIRED", "value": [[]]}]},
             {"name": []},
         ):
             with self.subTest(fields=fields):
