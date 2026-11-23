@@ -195,10 +195,13 @@ def census(export, only=None):
                     part["no format"] += 1
                 continue
             textures = {}                 # identity -> [format, rows]
-            for h in hashes:
-                for ident, (fmt, rows) in (by_hash.get(h, {}) if h is not None else {}).items():
+            matched = [h for h in hashes if h is not None and h in by_hash]
+            for h in matched:
+                for ident, (fmt, rows) in by_hash[h].items():
                     textures.setdefault(ident, [fmt, 0])[1] += rows
-            if len(textures) == 1:
+            if len(matched) > 1:          # two different stored hashes match: ambiguous, as in texture_dicts
+                part["ambiguous"] += 1
+            elif len(textures) == 1:
                 part["candidate"] += 1
                 (ident, (fmt, rows)), = textures.items()
                 part["uncertain"] += ident[0] != "key" and rows > 1
