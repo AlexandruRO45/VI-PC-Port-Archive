@@ -253,7 +253,7 @@ DAZ_INPUTS = (MIN_NORMAL, -MIN_NORMAL, 1.0, -1.0)
 DAZ_ADDENDS = (-SUBNORMAL_INPUT, SUBNORMAL_INPUT, 0.5, 0.5)
 DAZ_EXPECT = {
     (False, False): (0x007FFE00, 0x807FFE00, f32(1.5), f32(-0.5)),
-    (True, False): (0x80000000, 0x00000000, f32(1.5), f32(-0.5)),
+    (True, False): (0x00000000, 0x80000000, f32(1.5), f32(-0.5)),
     (False, True): (f32(MIN_NORMAL), f32(-MIN_NORMAL), f32(1.5), f32(-0.5)),
     (True, True): (f32(MIN_NORMAL), f32(-MIN_NORMAL), f32(1.5), f32(-0.5)),
 }
@@ -433,7 +433,7 @@ def check_daz(harness_path, native_path, lifted_path, *extra_paths):
                 problem = fake_mask_case(host, load(path, True), f"control {variant}", accepted=True)
                 if problem:
                     raise AssertionError(problem)
-                print("control nomask: ignoring the synthetic mask accepted DAZ on a host that lacks it")
+                print("control nomask: ignoring the synthetic mask accepted DAZ despite the simulated refusal")
             else:
                 raise AssertionError(f"unexpected DAZ control {variant}")
     finally:

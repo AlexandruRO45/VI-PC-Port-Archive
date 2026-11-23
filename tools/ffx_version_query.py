@@ -387,6 +387,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = [f"word frame[{FRAME_WORDS}]{{}};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false, overflow=false, sign=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
+    if host_mxcsr is not None and host_mxcsr.denormals and any(i.mnemonic == M.LDMXCSR for i in body):
+        lines.append("uint32_t mxcsr_mask = 0;")
     allowed = {i.ip for i in body} | set(exits)
     # The x87 profile checks every x87 instruction of the body before any of it is lowered. x87 is True for
     # the fixed control word, or an x87_lower.Checked for the checked entry, which also accepts FLDCW.
@@ -886,10 +888,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             # so a refused word changes nothing and no later guest instruction runs.
             checks = (f"if (want & 0x8040u) {host_mxcsr.leave('unsupported')} "
                       if not host_mxcsr.denormals else
-                      f"if (want & 0x40u) {{ __declspec(align(16)) unsigned char mxcsr_fxsave[512]; "
+                      f"if (want & 0x40u) {{ if (!mxcsr_mask) {{ alignas(16) unsigned char mxcsr_fxsave[512]{{}}; "
                       "_fxsave(mxcsr_fxsave); "
-                      "uint32_t mxcsr_mask = *reinterpret_cast<const uint32_t*>(mxcsr_fxsave + 28); "
-                      "if (!mxcsr_mask) mxcsr_mask = 0xffbfu; "
+                      "memcpy(&mxcsr_mask, mxcsr_fxsave + 28, sizeof mxcsr_mask); "
+                      "if (!mxcsr_mask) mxcsr_mask = 0xffbfu; } "
                       f"if (!(mxcsr_mask & 0x40u)) {host_mxcsr.leave('unsupported')} }} ")
             stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
                     f"if (want & 0xffff0000u) {host_mxcsr.leave('reserved')} "
