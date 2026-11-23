@@ -777,6 +777,12 @@ def _is_model_manifest(path: str) -> bool:
     return True
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a build must not silently drop
+    # assets from an incomplete scan. main() turns the OSError into one ERROR line.
+    raise exc
+
+
 def discover_model_manifests(assets_dir: str) -> list[str]:
     """Find all rpf9dump model manifest.json files under assets_dir.
 
@@ -804,7 +810,7 @@ def discover_model_manifests(assets_dir: str) -> list[str]:
         found[os.path.normcase(abs_direct)] = abs_direct
 
     # 2. Archive directory (models/manifest.json) or whole assets tree.
-    for dirpath, dirnames, filenames in os.walk(abs_root):
+    for dirpath, dirnames, filenames in os.walk(abs_root, onerror=_walk_error):
         dirnames.sort()
         if "manifest.json" in filenames and os.path.basename(dirpath).lower() == "models":
             cand = os.path.abspath(os.path.join(dirpath, "manifest.json"))
@@ -826,7 +832,7 @@ def index_ttpf_textures(assets_dir: str) -> dict[str, str]:
     if not os.path.isdir(abs_root):
         return index
 
-    for dirpath, dirnames, filenames in os.walk(abs_root):
+    for dirpath, dirnames, filenames in os.walk(abs_root, onerror=_walk_error):
         dirnames.sort()
         if "manifest.json" not in filenames:
             continue

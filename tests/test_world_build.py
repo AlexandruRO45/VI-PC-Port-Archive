@@ -1617,6 +1617,31 @@ class WorldBuildTest(unittest.TestCase):
                 os.path.normcase(os.path.abspath(info["corrupt_dds_path"])),
             )
 
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; discovery used to return the
+        # remaining manifests, silently dropping the sub-folder's assets from the build.
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = os.path.join(tmp, "assets")
+            for base in (assets, os.path.join(assets, "sub")):
+                models = os.path.join(base, "models")
+                os.makedirs(models)
+                with open(os.path.join(models, "manifest.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"Items": [{"Name": "synthetic.#dr"}]}, handle)
+            sub = os.path.join(assets, "sub")
+            os.chmod(sub, 0o000)
+            try:
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                with self.assertRaises(OSError):
+                    world_build.discover_model_manifests(assets)
+                with self.assertRaises(OSError):
+                    world_build.index_ttpf_textures(assets)
+            finally:
+                os.chmod(sub, 0o755)
+
     def test_spatial_build_two_chunks_and_corrupt_texture_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets_dir = os.path.join(tmp, "assets")
