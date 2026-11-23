@@ -6,6 +6,7 @@ import subprocess
 
 
 RUNNER = []  # the command that runs a Windows executable here: empty on Windows, ["wine"] for a cross build
+ROOT_CONSTANTS_DETAIL = "[rt] SetGraphicsRoot32BitConstants #"
 
 
 def run_fixture(exe, *args):
@@ -14,7 +15,7 @@ def run_fixture(exe, *args):
                              errors="replace", timeout=120 if RUNNER else 30)
     if process.returncode:
         raise SystemExit(f"{exe} exited with {process.returncode}\n{process.stdout}{process.stderr}")
-    return [line for line in process.stderr.splitlines() if line.startswith("[d3d12-trace]")]
+    return process.stderr.splitlines()
 
 
 def main():
@@ -26,10 +27,11 @@ def main():
     options = parser.parse_args()
     RUNNER[:] = options.runner
 
-    if run_fixture(options.exe):
+    if any(line.startswith(("[d3d12-trace]", ROOT_CONSTANTS_DETAIL)) for line in run_fixture(options.exe)):
         raise SystemExit("D3D12 trace appeared with tracing disabled")
 
-    trace = run_fixture(options.exe, "--trace-d3d12")
+    stderr = run_fixture(options.exe, "--trace-d3d12")
+    trace = [line for line in stderr if line.startswith("[d3d12-trace]")]
     entries = []
     for number, line in enumerate(trace, 1):
         if "synthetic-marker-argument" in line:
@@ -49,6 +51,7 @@ def main():
             "ID3D12CommandQueue::Signal ok",
         ]
     else:
+        root_constants = "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants called"
         expected = [
             "ID3D12GraphicsCommandList::SetPipelineState called",
             "ID3D12GraphicsCommandList::SetGraphicsRootSignature called",
@@ -60,6 +63,7 @@ def main():
             "ID3D12GraphicsCommandList::Reset ok",
             "ID3D12GraphicsCommandList::SetDescriptorHeaps ignored",
             "ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable called",
+            root_constants,
             "ID3D12GraphicsCommandList::SetComputeRootSignature called",
             "ID3D12GraphicsCommandList::Dispatch called",
             "ID3D12GraphicsCommandList::DrawInstanced called",
@@ -71,6 +75,13 @@ def main():
     for entry in expected:
         if entry not in observed:
             raise SystemExit(f"Missing or out-of-order trace entry {entry!r}\n" + "\n".join(trace))
+    if not options.queue:
+        if entries.count(root_constants) != 1:
+            raise SystemExit("Expected exactly one graphics root constants call")
+        number = entries.index(root_constants) + 1  # trace numbers are contiguous and start at 1
+        details = [line for line in stderr if line.startswith(ROOT_CONSTANTS_DETAIL)]
+        if details != [f"{ROOT_CONSTANTS_DETAIL}{number} index=3 count=2 offset=5"]:
+            raise SystemExit(f"Expected only index, count and offset for graphics root constants call #{number}")
     print(f"D3D12 trace verified with {len(entries)} ordered entries")
 
 

@@ -19,13 +19,14 @@ inline bool enabled() noexcept {
 }
 
 // Callers supply fixed method names and outcomes only. Keep one ordered record per call across threads.
-inline void record(const char* method, const char* outcome = "called") noexcept {
-    if (!enabled()) return;
+inline unsigned long long record(const char* method, const char* outcome = "called") noexcept {
+    if (!enabled()) return 0;
     static std::mutex mutex;
     static unsigned long long sequence = 0;
     const std::lock_guard lock(mutex);
     std::fprintf(stderr, "[d3d12-trace] #%llu %s %s\n", ++sequence, method, outcome);
     std::fflush(stderr);
+    return sequence;
 }
 
 inline HRESULT result(const char* method, HRESULT code) noexcept {

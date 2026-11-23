@@ -309,6 +309,11 @@ public:
         constants(graphics_, index, 1, &value, offset);
     }
     void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT index, UINT count, const void* data, UINT offset) override {
+        const auto seq = d3d12_trace::record("ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants");
+        if (seq) {
+            std::fprintf(stderr, "[rt] SetGraphicsRoot32BitConstants #%llu index=%u count=%u offset=%u\n",
+                         seq, index, count, offset);
+        }
         constants(graphics_, index, count, data, offset);
     }
     void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {

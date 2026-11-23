@@ -324,6 +324,8 @@ $env:LEONIDA_D3D12 = 'vulkan'
 Each trace line contains a sequence number, a fixed API name and an outcome. `called` marks a void API call
 whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
 Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
+With tracing enabled, `SetGraphicsRoot32BitConstants` also writes a local `[rt]` line with the same sequence
+number, the root parameter index, and the count and destination offset in DWORDs. It does not log values or pointers.
 
 ### Startup trace: `--trace FILE`
 

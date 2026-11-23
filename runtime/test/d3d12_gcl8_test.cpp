@@ -89,6 +89,8 @@ int main(int argc, char** argv) {
     // Calls made before pipeline setup still belong in the trace. They invalidate this list without needing a GPU.
     list7.p->SetDescriptorHeaps(0, nullptr);
     list7.p->SetGraphicsRootDescriptorTable(0, {});
+    constexpr UINT constants[] = {0x13579bdfu, 0x2468ace0u};
+    list7.p->SetGraphicsRoot32BitConstants(3, 2, constants, 5);
     list7.p->SetComputeRootSignature(nullptr);
     list7.p->Dispatch(1, 1, 1);
     list7.p->DrawInstanced(3, 1, 0, 0);
