@@ -156,6 +156,16 @@ class RigDictionaryTest(unittest.TestCase):
         self.assertEqual(summary["counts"]["rig_dictionaries_unparsed"], 1)
         self.assertIn("truncated RIG block", dicts[0]["error"])
 
+    def test_rigs_report_saved_with_a_bom_is_read(self):
+        with open(self.rigs, "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump(RIGSETS, f)
+        out = os.path.join(self.tmp.name, "bom-out.json")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", self.rigs],
+                           capture_output=True, text=True, errors="replace")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["summary"]["rbf0_join"]["resolved"], 3)
+
     def test_cli_writes_counts_only(self):
         out = os.path.join(self.tmp.name, "out.json")
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", self.rigs],
