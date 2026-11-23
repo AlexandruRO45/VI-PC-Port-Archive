@@ -2,7 +2,8 @@
 
 Verified on AMD Radeon(TM) Graphics RDNA2 iGPU (gfx1036, driver 32.0.21045.29003).
 Under Leonida's default shader MODE (denorm16_64=3, denormals kept; IEEE=0):
-- f16 destination operations completely ignore omod scaling (mul:2, mul:4, div:2).
+- v_*_f16 ALU and v_cvt_f16_{u16,i16} ignore omod scaling (mul:2, mul:4, div:2);
+  v_cvt_f16_f32 intentionally retains Gen.f16_omod (tested in test_cvt_f16_omod.py).
 - clamp saturation to [0.0, 1.0] remains active and functional.
 - f32 destination operations (e.g. v_cvt_f32_f16, v_add_f32) scale with omod under IEEE=0.
 """
@@ -30,7 +31,7 @@ def validate_spirv(spv_text: str):
     with tempfile.TemporaryDirectory() as d:
         asm_p = os.path.join(d, "s.spvasm")
         bin_p = os.path.join(d, "s.spv")
-        with open(asm_p, "w", encoding="utf-8") as f:
+        with open(asm_p, "w", encoding="utf-8", newline="\n") as f:
             f.write(spv_text)
         r1 = subprocess.run([spirv_as, "--target-env", "vulkan1.2", asm_p, "-o", bin_p], capture_output=True, text=True)
         if r1.returncode != 0:

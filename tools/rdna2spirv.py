@@ -5219,7 +5219,8 @@ class Gen:
         # RDNA2 (GFX10.3) VOP3 OMOD applies before clamp iff MODE.ieee == 0 AND output denorms
         # for the destination precision are flushed. Under default shader MODE (IEEE=0, fp32
         # denorms flushed, fp16/fp64 denorms kept), omod scales f32 destinations (including
-        # v_cvt_f32_f16) and is ignored on f16 destinations while clamp still saturates [0, 1].
+        # v_cvt_f32_f16) and is ignored on v_*_f16 ALU and v_cvt_f16_{u16,i16} while clamp
+        # still saturates [0, 1]. v_cvt_f16_f32 intentionally retains Gen.f16_omod.
         if allow_omod:
             for m in mods:
                 if m in ("mul:2", "mul:4", "div:2"):
@@ -5235,7 +5236,8 @@ class Gen:
         return v
 
     def clamp_f16(self, v, mods):
-        # f16 destination under default MODE (denorm16_64=3): omod ignored by silicon, clamp kept.
+        # v_*_f16 ALU and v_cvt_f16_{u16,i16} under default MODE (denorm16_64=3): omod ignored,
+        # clamp kept. (v_cvt_f16_f32 intentionally stays on Gen.f16_omod; see docs/design.md.)
         return self.clamp_mods(v, mods, allow_omod=False)
 
     def flush_f32(self, f):
