@@ -285,6 +285,31 @@ class TestDsPermuteB32AST(unittest.TestCase):
             d = (s + 2) % 32
             self.assertEqual(out[d], datas[s])
 
+class TestDsPermuteB32SIMD(unittest.TestCase):
+    def test_simd_unwritten_destinations_are_zero(self) -> None:
+        # Only even lanes are active in EXEC
+        exec_mask = 0x55555555
+        addrs = [l * 4 for l in range(32)]
+        datas = [1000 + l for l in range(32)]
+        out = ref_ds_permute_b32(addrs, datas, offset=0, exec_mask=exec_mask)
+        for l in range(32):
+            if l % 2 == 0:
+                self.assertEqual(out[l], datas[l])
+            else:
+                self.assertEqual(out[l], 0)
+
+    def test_simd_inactive_destination_preserves_old(self) -> None:
+        # Upper 16 lanes inactive in EXEC
+        exec_mask = 0x0000FFFF
+        addrs = [l * 4 for l in range(32)]
+        datas = [1000 + l for l in range(32)]
+        old_dst = [0xDEAD0000 + l for l in range(32)]
+        out = ref_ds_permute_b32(addrs, datas, offset=0, exec_mask=exec_mask, old_dst=old_dst)
+        for l in range(16):
+            self.assertEqual(out[l], datas[l])
+        for l in range(16, 32):
+            self.assertEqual(out[l], old_dst[l])
+
 
 if __name__ == "__main__":
     unittest.main()
