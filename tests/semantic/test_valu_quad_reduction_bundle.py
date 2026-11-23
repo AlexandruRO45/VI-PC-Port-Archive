@@ -981,3 +981,36 @@ class TestDsPermuteB32ASTAndScalar(unittest.TestCase):
         res, _ = run_workgroup_lanes("ps_perm_shift", lines, lanes=4)
         # Lane 3 sends to 0 (33), 0 sends to 1 (30), 1 sends to 2 (31), 2 sends to 3 (32)
         self.assertEqual(res, [33, 30, 31, 32])
+
+
+# ------------------------------------------------------------------------------
+# ds_permute_b32 SIMD Divergence & Forward Cross-Lane Scatter
+# ------------------------------------------------------------------------------
+
+class TestDsPermuteB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergent_scatter_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_sub_nc_u32 v1, 3, v0",
+            "v_lshlrev_b32 v1, 2, v1",
+            "v_add_nc_u32 v2, v0, 55",
+            "ds_permute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_perm_div", lines, lanes=4)
+        self.assertEqual(res, [58, 57, 56, 55])
+
+    def test_collision_highest_lane_wins_hardware(self):
+        # Both lane 0 and lane 1 send to address 0 (lane 0). In RDNA2, highest active lane wins (lane 1)
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v1, 0",
+            "v_add_nc_u32 v2, v0, 100",
+            "ds_permute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_perm_collision", lines, lanes=4)
+        # Lane 3 is the highest lane sending to address 0
+        self.assertEqual(res[0], 103)
