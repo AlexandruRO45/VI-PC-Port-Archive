@@ -4950,6 +4950,10 @@ public:
         queue_families(info.physical, &queue_count, nullptr);
         std::vector<VkQueueFamilyProperties> queues(queue_count);
         queue_families(info.physical, &queue_count, queues.data());
+        // On every GPU, not only one with conditional rendering: the replay keeps the bindless flush and the D24/RGB96
+        // conversion passes off this family (d3d12_transfer_only_family_test).
+        if (info.copy_family < queue_count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+            state_.context->set_transfer_only_family(info.copy_family);
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
@@ -4957,8 +4961,6 @@ public:
                 VkPhysicalDeviceProperties limits{};
                 properties(info.physical, &limits);
                 const auto count = static_cast<std::uint32_t>(queues.size());
-                if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
-                    state_.context->set_transfer_only_family(info.copy_family);
                 if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                     state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
                     if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
