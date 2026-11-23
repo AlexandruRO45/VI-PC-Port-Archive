@@ -444,5 +444,46 @@ class TestValuRndneF32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(wave.lane_vgprs[lane][0], sentinel)
 
 
+class TestValuRndneF32RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_inplace_destination_aliasing(self):
+        state = VALURegisterState()
+        state.vgprs[0] = f32_to_bits(1.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
+        res = state.execute(inst)
+        self.assertEqual(res, F32_TWO)
+        self.assertEqual(state.vgprs[0], F32_TWO)
+
+    def test_operand_preservation_distinct_registers(self):
+        state = VALURegisterState()
+        original_src = f32_to_bits(2.5)
+        state.vgprs[5] = original_src
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(5))
+        state.execute(inst)
+        self.assertEqual(state.vgprs[0], F32_TWO)
+        self.assertEqual(state.vgprs[5], original_src)
+
+    def test_repeated_in_place_idempotence(self):
+        state = VALURegisterState()
+        state.vgprs[2] = f32_to_bits(3.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(2), ASTOperand.vgpr(2))
+        res1 = state.execute(inst)
+        self.assertEqual(res1, F32_FOUR)
+        res2 = state.execute(inst)
+        self.assertEqual(res2, F32_FOUR)
+        self.assertEqual(state.vgprs[2], F32_FOUR)
+
+    def test_multi_lane_aliased_self_update(self):
+        wave = WavefrontState(wave_size=32)
+        wave.exec_mask = 0xFFFFFFFF
+        for lane in range(32):
+            wave.lane_vgprs[lane][4] = f32_to_bits(1.5 if lane % 2 == 0 else 2.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(4), ASTOperand.vgpr(4))
+        wave.execute_wave(inst)
+        for lane in range(32):
+            self.assertEqual(wave.lane_vgprs[lane][4], F32_TWO)
+
+
 if __name__ == "__main__":
     unittest.main()
