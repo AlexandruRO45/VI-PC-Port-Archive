@@ -317,5 +317,171 @@ class SaluOrB32AstTests(unittest.TestCase):
         out = mrt0_words(spv)
         self.assertEqual(out[0], 0x10FF)
 
+
+class ScalarRegisterState:
+    """Architectural state machine modeling RDNA2 scalar execution."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs: List[int] = [0] * num_sgprs
+        self.exec_lo: int = MASK32
+        self.exec_hi: int = MASK32
+        self.vcc_lo: int = 0
+        self.vcc_hi: int = 0
+        self.m0: int = 0
+        self.scc: int = 0
+
+    def read_reg(self, name: str) -> int:
+        if name.startswith("s") and name[1:].isdigit():
+            idx = int(name[1:])
+            return self.sgprs[idx] & MASK32
+        if name == "exec_lo":
+            return self.exec_lo & MASK32
+        if name == "exec_hi":
+            return self.exec_hi & MASK32
+        if name == "vcc_lo":
+            return self.vcc_lo & MASK32
+        if name == "vcc_hi":
+            return self.vcc_hi & MASK32
+        if name == "m0":
+            return self.m0 & MASK32
+        if name == "scc":
+            return self.scc & 1
+        if name == "null":
+            return 0
+        raise ValueError(f"Unknown register: {name}")
+
+    def write_reg(self, name: str, val: int) -> None:
+        v = val & MASK32
+        if name.startswith("s") and name[1:].isdigit():
+            idx = int(name[1:])
+            self.sgprs[idx] = v
+        elif name == "exec_lo":
+            self.exec_lo = v
+        elif name == "exec_hi":
+            self.exec_hi = v
+        elif name == "vcc_lo":
+            self.vcc_lo = v
+        elif name == "vcc_hi":
+            self.vcc_hi = v
+        elif name == "m0":
+            self.m0 = v
+        elif name == "scc":
+            self.scc = 1 if v != 0 else 0
+        elif name == "null":
+            pass
+        else:
+            raise ValueError(f"Unknown register: {name}")
+
+    def resolve_src(self, src: str | int) -> int:
+        if isinstance(src, int):
+            return src & MASK32
+        s = src.strip()
+        if s.startswith("0x") or s.startswith("-0x"):
+            return int(s, 16) & MASK32
+        try:
+            return int(s) & MASK32
+        except ValueError:
+            return self.read_reg(s)
+
+    def execute_s_or_b32(self, dst: str, src0: str | int, src1: str | int) -> int:
+        v0 = self.resolve_src(src0)
+        v1 = self.resolve_src(src1)
+        res = ref_s_or_b32(v0, v1)
+        self.write_reg(dst, res)
+        self.scc = ref_scc(res)
+        return res
+
+    def run_program(self, lines: List[str]) -> None:
+        for raw in lines:
+            ln = raw.split(";")[0].strip()
+            if not ln:
+                continue
+            parts = ln.replace(",", " ").split()
+            op = parts[0]
+            if op == "s_mov_b32":
+                dst = parts[1]
+                src = parts[2]
+                self.write_reg(dst, self.resolve_src(src))
+            elif op == "s_or_b32":
+                dst = parts[1]
+                s0 = parts[2]
+                s1 = parts[3]
+                self.execute_s_or_b32(dst, s0, s1)
+            elif op == "s_cselect_b32":
+                dst = parts[1]
+                s0 = self.resolve_src(parts[2])
+                s1 = self.resolve_src(parts[3])
+                self.write_reg(dst, s0 if self.scc != 0 else s1)
+
+
+class SaluOrB32InterpreterTests(unittest.TestCase):
+    """Deterministic scalar instruction interpreter tests for s_or_b32."""
+
+    def test_interpreter_basic_or(self):
+        """Test standard scalar OR execution on SGPRs."""
+        state = ScalarRegisterState()
+        state.write_reg("s0", 0x12340000)
+        state.write_reg("s1", 0x00005678)
+        res = state.execute_s_or_b32("s2", "s0", "s1")
+        self.assertEqual(res, 0x12345678)
+        self.assertEqual(state.read_reg("s2"), 0x12345678)
+        self.assertEqual(state.scc, 1)
+
+    def test_interpreter_scc_updates(self):
+        """Test that SCC is cleared strictly on zero results and set otherwise."""
+        state = ScalarRegisterState()
+        state.execute_s_or_b32("s0", 0, 0)
+        self.assertEqual(state.read_reg("s0"), 0)
+        self.assertEqual(state.scc, 0)
+
+        state.execute_s_or_b32("s1", 0, 1)
+        self.assertEqual(state.read_reg("s1"), 1)
+        self.assertEqual(state.scc, 1)
+
+    def test_interpreter_special_registers(self):
+        """Test OR operations reading and writing m0, vcc_lo, exec_lo, and null."""
+        state = ScalarRegisterState()
+        state.write_reg("m0", 0x000000F0)
+        state.execute_s_or_b32("m0", "m0", 0x00000F00)
+        self.assertEqual(state.read_reg("m0"), 0x00000FF0)
+
+        state.execute_s_or_b32("null", 0x1234, 0x5678)
+        self.assertEqual(state.read_reg("null"), 0)
+        self.assertEqual(state.scc, 1)
+
+    def test_translator_interpreter_equivalence(self):
+        """Validate exact equivalence between Python interpreter and translated SPIR-V."""
+        test_pairs = [
+            (0x00000000, 0x00000000),
+            (0x12345678, 0x00000000),
+            (0x00000000, 0x87654321),
+            (0xAAAAAAAA, 0x55555555),
+            (0x0F0F0F0F, 0xF0F0F0F0),
+            (0x80000000, 0x00000001),
+        ]
+        for idx, (v0, v1) in enumerate(test_pairs):
+            with self.subTest(v0=hex(v0), v1=hex(v1)):
+                sim = ScalarRegisterState()
+                sim.write_reg("s0", v0)
+                sim.write_reg("s1", v1)
+                sim.execute_s_or_b32("s2", "s0", "s1")
+
+                lines = [
+                    f"s_mov_b32 s0, {v0:#x}",
+                    f"s_mov_b32 s1, {v1:#x}",
+                    "s_or_b32 s2, s0, s1",
+                    "v_mov_b32 v0, s2",
+                    "s_cselect_b32 s3, 1, 0",
+                    "v_mov_b32 v1, s3",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = translate_lines(f"ps_salu_interp_eq_{idx}", lines)
+                out = mrt0_words(spv)
+                self.assertEqual(out[0], sim.read_reg("s2"))
+                self.assertEqual(out[1], sim.scc)
+
 if __name__ == "__main__":
     unittest.main()
