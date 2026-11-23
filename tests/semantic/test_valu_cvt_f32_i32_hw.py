@@ -182,5 +182,65 @@ class VCvtF32I32ScalarInterpreterTests(unittest.TestCase):
         execute_scalar_cvt_f32_i32(state, ast)
         self.assertEqual(state.vgprs[0], 0x00000000)
 
+class WavefrontSimdState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.exec_mask: int = (1 << lane_count) - 1
+        self.lanes = [ScalarLaneState() for _ in range(lane_count)]
+        self.shared_sgprs: dict[int, int] = {}
+
+    def execute_valu(self, ast: InstructionAST) -> None:
+        for lane_id in range(self.lane_count):
+            if (self.exec_mask >> lane_id) & 1:
+                # Share sgprs across lanes
+                self.lanes[lane_id].sgprs = self.shared_sgprs
+                execute_scalar_cvt_f32_i32(self.lanes[lane_id], ast)
+
+
+class VCvtF32I32SimdDivergenceTests(unittest.TestCase):
+    def test_wave32_exec_mask_filtering(self):
+        wave = WavefrontSimdState(lane_count=32)
+        # Alternating active lanes: 0x55555555
+        wave.exec_mask = 0x55555555
+        for lane_id in range(32):
+            wave.lanes[lane_id].set_vgpr(0, 0xDEADBEEF)  # Pre-existing value
+            wave.lanes[lane_id].set_vgpr(1, lane_id)
+
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+        )
+        wave.execute_valu(ast)
+
+        for lane_id in range(32):
+            if (0x55555555 >> lane_id) & 1:
+                expected = oracle_cvt_f32_i32(lane_id)
+                self.assertEqual(wave.lanes[lane_id].vgprs[0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane_id].vgprs[0], 0xDEADBEEF)
+
+    def test_wave64_exec_mask_filtering(self):
+        wave = WavefrontSimdState(lane_count=64)
+        # Upper 32 lanes active only
+        wave.exec_mask = 0xFFFFFFFF00000000
+        for lane_id in range(64):
+            wave.lanes[lane_id].set_vgpr(0, 0xCAFEBABE)
+            wave.lanes[lane_id].set_vgpr(1, -lane_id)
+
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+        )
+        wave.execute_valu(ast)
+
+        for lane_id in range(64):
+            if lane_id >= 32:
+                expected = oracle_cvt_f32_i32(-lane_id)
+                self.assertEqual(wave.lanes[lane_id].vgprs[0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane_id].vgprs[0], 0xCAFEBABE)
+
 if __name__ == "__main__":
     unittest.main()
