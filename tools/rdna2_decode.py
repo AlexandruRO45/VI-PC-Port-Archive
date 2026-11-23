@@ -203,6 +203,20 @@ def _vreg(reg: int, n: int = 1) -> dict:
     return {"k": "vgpr", "r": reg & 0xFF, "n": max(1, n), "neg": False, "abs": False}
 
 
+# GFX10 special sources 230-239, as llvm-mc names them; 232-234 have none.
+_SRC_SPECIAL_NAMES = {
+    230: "src_flat_scratch_base_lo",
+    231: "src_flat_scratch_base_hi",
+    235: "src_shared_base",
+    236: "src_shared_limit",
+    237: "src_private_base",
+    238: "src_private_limit",
+    239: "src_pops_exiting_wave_id",
+}
+_SRC_SPECIAL_KIND = {"src_shared_base", "src_shared_limit", "src_private_base", "src_private_limit",
+                     "src_pops_exiting_wave_id"}
+
+
 def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = False) -> dict:
     """Decode a 9-bit RDNA2 source operand (0..511)."""
     if code <= 127:
@@ -225,6 +239,11 @@ def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = 
         op = {"k": "imm", "v": 0 if lit is None else lit}
     elif 256 <= code <= 511:
         op = _vreg(code - 256, n)
+    elif code in _SRC_SPECIAL_NAMES:
+        name = _SRC_SPECIAL_NAMES[code]
+        # The same kind shader_ir.parse_line gives llvm-mc's text: its SPECIAL set lists all but the flat-scratch pair.
+        op = ({"k": "special", "t": name, "neg": False, "abs": False} if name in _SRC_SPECIAL_KIND
+              else {"k": "raw", "t": name})
     else:
         op = {"k": "raw", "t": f"src_{code}"}
 
