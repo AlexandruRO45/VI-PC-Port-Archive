@@ -546,5 +546,45 @@ class TestValuAndOrB32RegisterAliasing(unittest.TestCase):
         self.assertEqual(res, 0x12345678)
         self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0x12345678)
 
+class TestValuAndOrB32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes (SCC, VCC) isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_scc_and_vcc_isolation(self) -> None:
+        # v_and_or_b32 must NOT modify scalar condition code SCC or vector condition code VCC
+        canary_vcc = 0x1234567887654321
+        canary_scc = 1
+        self.interp.vcc = canary_vcc
+        self.interp.scc = canary_scc
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=0,
+            src1=0,
+            src2=0,
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, canary_vcc)
+        self.assertEqual(self.interp.scc, canary_scc)
+
+    def test_carry_borrow_independence(self) -> None:
+        # Even with bit patterns that in integer add would carry or borrow, condition codes remain untouched
+        self.interp.vcc = 0
+        self.interp.scc = 0
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=0xFFFFFFFF,
+            src1=0xFFFFFFFF,
+            src2=0xFFFFFFFF,
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, 0)
+        self.assertEqual(self.interp.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
