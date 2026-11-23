@@ -188,7 +188,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)) as wave64, \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
-                mock.patch("make_game.runtime_gpu_features", return_value=features or {"fragment_shader_barycentric": None, "mesh_shader": None}), \
+                mock.patch("make_game.runtime_gpu_features", return_value=features or {"fragment_shader_barycentric": None}), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
@@ -226,34 +226,32 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(max_push_constants=None), ((), ()))
         self.assertEqual(self.run_main("--pc-tail-ubo", max_push_constants=256), (("--pc-tail-ubo",),) * 2)
 
-    def test_bary_fallback_and_mesh_compute_follow_the_device(self):
-        """Each on by itself where vk_subgroup_info says the GPU lacks its feature (RDNA1, Pascal), not where it
-        has it or can't tell; asked for explicitly, each is on everywhere."""
-        has = {"fragment_shader_barycentric": True, "mesh_shader": True}
-        self.assertEqual(self.run_main(features=has), ((), ()))
-        self.assertEqual(self.run_main(features={**has, "fragment_shader_barycentric": False}),
+    def test_bary_fallback_follows_the_device(self):
+        """On by itself where vk_subgroup_info says the GPU lacks fragmentShaderBarycentric (RDNA1, Pascal), not
+        where it has it or can't tell; asked for explicitly, on everywhere."""
+        self.assertEqual(self.run_main(features={"fragment_shader_barycentric": True}), ((), ()))
+        self.assertEqual(self.run_main(features={"fragment_shader_barycentric": False}),
                          (("--bary-fallback",),) * 2)
-        self.assertEqual(self.run_main(features={**has, "mesh_shader": False}), (("--mesh-compute",),) * 2)
-        rdna1 = {"fragment_shader_barycentric": False, "mesh_shader": False}
-        self.assertEqual(self.run_main(features=rdna1), (("--bary-fallback", "--mesh-compute"),) * 2)
-        self.assertEqual(self.run_main("--bary-fallback", "--mesh-compute", features=has),
-                         (("--bary-fallback", "--mesh-compute"),) * 2)
+        self.assertEqual(self.run_main("--bary-fallback", features={"fragment_shader_barycentric": True}),
+                         (("--bary-fallback",),) * 2)
 
-    def test_mesh_compute_is_decided_before_wave64(self):
-        """wave64_settings is asked with --mesh-compute already on, and the 152 bytes it needs set --pc-tail-ubo."""
-        no_mesh = {"fragment_shader_barycentric": True, "mesh_shader": False}
-        self.run_main(features=no_mesh)
-        self.assertEqual(self.wave64_kwargs, {"mesh_compute": True})
-        self.assertEqual(self.run_main(features=no_mesh, max_push_constants=144),
-                         (("--mesh-compute", "--pc-tail-ubo"),) * 2)
+    def test_mesh_compute_stays_manual(self):
+        """A GPU without mesh shaders doesn't turn --mesh-compute on: the runtime can't draw its output yet."""
+        with mock.patch("make_game.runtime_gpu_info",
+                        return_value={"fragment_shader_barycentric": True, "mesh_shader": False}):
+            self.assertEqual(make_game.runtime_gpu_features(), {"fragment_shader_barycentric": True})
+        self.assertEqual(self.run_main(features={"fragment_shader_barycentric": True}), ((), ()))
+        self.assertEqual(self.wave64_kwargs, {"mesh_compute": False})
+        self.assertEqual(self.run_main("--mesh-compute", features={"fragment_shader_barycentric": True}),
+                         (("--mesh-compute",),) * 2)
 
     def test_runtime_gpu_features_parses_probe(self):
-        for raw, want in (({"fragment_shader_barycentric": False, "mesh_shader": True}, (False, True)),
-                          ({}, (None, None)),
-                          ({"fragment_shader_barycentric": 0, "mesh_shader": "false"}, (None, None))):
+        for raw, want in (({"fragment_shader_barycentric": False}, False),
+                          ({"fragment_shader_barycentric": True}, True),
+                          ({}, None),
+                          ({"fragment_shader_barycentric": 0}, None)):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
-                got = make_game.runtime_gpu_features()
-                self.assertEqual((got["fragment_shader_barycentric"], got["mesh_shader"]), want)
+                self.assertEqual(make_game.runtime_gpu_features()["fragment_shader_barycentric"], want)
 
     def test_runtime_gpu_max_push_constants_parses_probe(self):
         for raw, want in (({"max_push_constants_size": 128}, 128),
@@ -298,7 +296,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
-                mock.patch("make_game.runtime_gpu_features", return_value=features or {"fragment_shader_barycentric": None, "mesh_shader": None}), \
+                mock.patch("make_game.runtime_gpu_features", return_value=features or {"fragment_shader_barycentric": None}), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.preflight"), \
                 mock.patch.object(make_game, "py", fake_py), \
@@ -330,15 +328,14 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
         self.assertEqual(self.build(per_vertex=False, max_push_constants=None)[0], [])
         self.assertEqual(self.recorded(), " ".join(self.AUTOMATIC))
 
-    def test_a_feature_probe_that_cannot_tell_keeps_bary_fallback_and_mesh_compute(self):
-        rdna1 = {"fragment_shader_barycentric": False, "mesh_shader": False}
-        both = ("--bary-fallback", "--mesh-compute")
-        self.assertEqual(self.build(per_vertex=True, max_push_constants=256, features=rdna1)[0], [both])
+    def test_a_feature_probe_that_cannot_tell_keeps_bary_fallback(self):
+        no_bary = {"fragment_shader_barycentric": False}
+        self.assertEqual(self.build(per_vertex=True, max_push_constants=256, features=no_bary)[0],
+                         [("--bary-fallback",)])
         translations, log = self.build(per_vertex=True, max_push_constants=256)
         self.assertEqual(translations, [])
-        self.assertEqual(self.recorded(), " ".join(both))
-        for flag in both:
-            self.assertIn(f"whether it needs {flag}; the shaders were translated with it and it stays on", log)
+        self.assertEqual(self.recorded(), "--bary-fallback")
+        self.assertIn("whether it needs --bary-fallback; the shaders were translated with it and it stays on", log)
 
     def test_a_probe_that_answers_still_decides(self):
         # Another GPU, or a driver that now takes PerVertexKHR inputs and 144 bytes: translating again is right.

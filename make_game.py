@@ -1282,19 +1282,18 @@ def runtime_gpu_per_vertex():
         return None
 
 
-def runtime_gpu_features() -> dict:
-    """fragment_shader_barycentric and mesh_shader as tools/vk_subgroup_info.py answers for the GPU the runtime
-    would use: True or False each, None when it can't tell (no answer, or a probe that doesn't report it)."""
-    info = runtime_gpu_info()
-    return {key: info[key] if isinstance(info.get(key), bool) else None
-            for key in ("fragment_shader_barycentric", "mesh_shader")}
-
-
 # The fallbacks make_game.py turns on by itself where the runtime's GPU lacks the feature they stand in for:
-# (flag, argparse attribute, runtime_gpu_features key, what the log names).
+# (flag, argparse attribute, tools/vk_subgroup_info.py key, what the log names). --mesh-compute joins once the
+# runtime can draw its output without VK_EXT_mesh_shader; until then it is only turned on by hand.
 FEATURE_FALLBACKS = (("--bary-fallback", "bary_fallback", "fragment_shader_barycentric",
-                      "fragmentShaderBarycentric (VK_KHR_fragment_shader_barycentric)"),
-                     ("--mesh-compute", "mesh_compute", "mesh_shader", "mesh shaders (VK_EXT_mesh_shader)"))
+                      "fragmentShaderBarycentric (VK_KHR_fragment_shader_barycentric)"),)
+
+
+def runtime_gpu_features() -> dict:
+    """Each FEATURE_FALLBACKS key as tools/vk_subgroup_info.py answers for the GPU the runtime would use: True or
+    False, None when it can't tell (no answer, or a probe that doesn't report it)."""
+    info = runtime_gpu_info()
+    return {key: info[key] if isinstance(info.get(key), bool) else None for _, _, key, _ in FEATURE_FALLBACKS}
 
 
 def runtime_gpu_max_push_constants():
@@ -2012,7 +2011,7 @@ def main() -> int:
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
-                         "without VK_EXT_mesh_shader; on by itself when the runtime's GPU lacks it")
+                         "without VK_EXT_mesh_shader")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -2079,7 +2078,6 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
-    # Before wave64: --mesh-compute changes which subgroup sizes the mesh shaders need.
     if "shaders" in stages and not all(getattr(a, attr) for _, attr, _, _ in FEATURE_FALLBACKS):
         features = runtime_gpu_features()
         for flag, attr, key, what in FEATURE_FALLBACKS:
