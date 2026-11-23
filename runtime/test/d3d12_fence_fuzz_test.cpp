@@ -406,7 +406,8 @@ int main(int argc, char** argv) {
                 o.big ? ", big steps" : "");
 
     unsigned failures = 0, settle_points = 0;
-    for (unsigned seed = o.start; seed < o.start + o.seeds; ++seed) {
+    for (unsigned run_index = 0; run_index < o.seeds; ++run_index) {  // counted from 0: start + seeds may wrap
+        const unsigned seed = o.start + run_index;
         const std::vector<Op> program = o.fixed.empty() ? generate(seed, o) : fixed_program(o.fixed);
         if (program.empty()) {
             std::fprintf(stderr, "unknown case %s\n", o.fixed.c_str());
