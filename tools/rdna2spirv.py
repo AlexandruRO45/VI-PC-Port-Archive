@@ -375,6 +375,12 @@ class Gen:
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
+        self.f16_in_fns: dict[int, list[str]] = {}        # hi (0/1) -> %f16_in_{lo,hi}_fn(%uint) -> %float (Pure)
+        self.f16_bits_fns: dict[tuple[bool, bool, bool], list[str]] = {}  # (rtz, exact_tiny, has_mode) -> Pure helper
+        self.mem_f16_fn: list[str] | None = None          # %mem_f16_fn(%float) -> %uint (Pure)
+        self.f16_pack2_fn: list[str] | None = None        # %f16_pack2_rne_fn(%float, %float) -> %uint (Pure)
+        self.fma_f16_odd_fn: list[str] | None = None      # %fma_f16_odd_fn(%float, %float, %float) -> %float (Pure)
+        self.fma_mix_odd_fn: list[str] | None = None      # %fma_mix_odd_fn(%float, %float, %float) -> %float (Pure)
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
@@ -634,22 +640,42 @@ class Gen:
         -> +-65504, an f32 denormal -> +-0 (f16_bits(rtz=True)), and a NaN keeps its sign and the top 10 bits of its
         payload without being quieted, 1 if those are all 0 (0x7fa00000 -> 0x7d00, 0x7f800001 -> 0x7c01). Measured
         natively on gfx1036 for 16_FLOAT stores and 32_FLOAT d16 loads (SHADER-358)."""
-        h = self.f16_bits(f, rtz=True)
-        x, mag, nan, top, one, keep, sg, nb, out = (self.tmp() for _ in range(9))
-        self.emit(f"{x} = OpBitcast %uint {f}")
-        self.emit(f"{mag} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
-        self.emit(f"{nan} = OpUGreaterThan %bool {mag} {self.cu(0x7F800000)}")
-        self.emit(f"{top} = OpBitFieldUExtract %uint {x} {self.cu(13)} {self.cu(10)}")
-        self.emit(f"{one} = OpIEqual %bool {top} {self.cu(0)}")
-        self.emit(f"{keep} = OpSelect %uint {one} {self.cu(1)} {top}")
-        self.emit(f"{sg} = OpShiftRightLogical %uint {x} {self.cu(16)}")
-        sgm = self.tmp()
-        self.emit(f"{sgm} = OpBitwiseAnd %uint {sg} {self.cu(0x8000)}")
-        kn = self.tmp()
-        self.emit(f"{kn} = OpBitwiseOr %uint {keep} {self.cu(0x7C00)}")
-        self.emit(f"{nb} = OpBitwiseOr %uint {sgm} {kn}")
-        self.emit(f"{out} = OpSelect %uint {nan} {nb} {h}")
-        return out
+        if f == "%f0":
+            return self.cu(0)
+        if self.mem_f16_fn is None:
+            saved = (self.body, self._active_ssa, self.bitcast_from)
+            self.body, self._active_ssa, self.bitcast_from = [], None, {}
+            try:
+                p_f = "%mem_f16_f"
+                h = self.f16_bits(p_f, rtz=True)
+                x, mag, nan, top, one, keep, sg, nb, out = (self.tmp() for _ in range(9))
+                self.emit(f"{x} = OpBitcast %uint {p_f}")
+                self.emit(f"{mag} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{nan} = OpUGreaterThan %bool {mag} {self.cu(0x7F800000)}")
+                self.emit(f"{top} = OpBitFieldUExtract %uint {x} {self.cu(13)} {self.cu(10)}")
+                self.emit(f"{one} = OpIEqual %bool {top} {self.cu(0)}")
+                self.emit(f"{keep} = OpSelect %uint {one} {self.cu(1)} {top}")
+                self.emit(f"{sg} = OpShiftRightLogical %uint {x} {self.cu(16)}")
+                sgm = self.tmp()
+                self.emit(f"{sgm} = OpBitwiseAnd %uint {sg} {self.cu(0x8000)}")
+                kn = self.tmp()
+                self.emit(f"{kn} = OpBitwiseOr %uint {keep} {self.cu(0x7C00)}")
+                self.emit(f"{nb} = OpBitwiseOr %uint {sgm} {kn}")
+                self.emit(f"{out} = OpSelect %uint {nan} {nb} {h}")
+                lines = self.body
+            finally:
+                self.body, self._active_ssa, self.bitcast_from = saved
+            self.mem_f16_fn = [
+                "%mem_f16_fn = OpFunction %uint Pure %fn_f16_bits",
+                "%mem_f16_f = OpFunctionParameter %float",
+                "%mem_f16_entry = OpLabel",
+                *lines,
+                f"         OpReturnValue {out}",
+                "OpFunctionEnd",
+            ]
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %uint %mem_f16_fn {f}")
+        return r
 
     def pack_f16_pair_int(self, f0, f1):
         """Two f32 values -> one u32 (lo f16 | hi f16 << 16), each narrowed by f16_bits: integer ops only, no
@@ -658,12 +684,32 @@ class Gen:
         samples and gathers, typed buffer loads): those are converted outside the VALU, so they stay round to
         nearest even and don't go through f16_pack2. f16_bits replaced #489's own f32_to_f16_int on 2026-11-22; the
         two gave the same bits on 30,648 inputs (every f32 exponent, ties, the subnormal and overflow edges, NaN)."""
-        lo = self.f16_bits(f0)
-        hi = self.f16_bits(f1)
-        hi_s, out = self.tmp(), self.tmp()
-        self.emit(f"{hi_s} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
-        self.emit(f"{out} = OpBitwiseOr %uint {lo} {hi_s}")
-        return out
+        if f1 == "%f0":
+            return self.f16_bits(f0)
+        if self.f16_pack2_fn is None:
+            saved = (self.body, self._active_ssa, self.bitcast_from)
+            self.body, self._active_ssa, self.bitcast_from = [], None, {}
+            try:
+                lo = self.f16_bits("%f16_p2_f0")
+                hi = self.f16_bits("%f16_p2_f1")
+                hi_s, out = self.tmp(), self.tmp()
+                self.emit(f"{hi_s} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
+                self.emit(f"{out} = OpBitwiseOr %uint {lo} {hi_s}")
+                lines = self.body
+            finally:
+                self.body, self._active_ssa, self.bitcast_from = saved
+            self.f16_pack2_fn = [
+                "%f16_pack2_rne_fn = OpFunction %uint Pure %fn_f16_pack2",
+                "%f16_p2_f0 = OpFunctionParameter %float",
+                "%f16_p2_f1 = OpFunctionParameter %float",
+                "%f16_p2_entry = OpLabel",
+                *lines,
+                f"         OpReturnValue {out}",
+                "OpFunctionEnd",
+            ]
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %uint %f16_pack2_rne_fn {f0} {f1}")
+        return r
 
     def f16_in(self, s, hi=0):
         """Read operand ``s`` as an f16 (low half, or high half when ``hi``) widened to f32, then apply its neg/abs.
@@ -672,7 +718,25 @@ class Gen:
         that an SDWA BYTE_1 select produced, from an inline constant or a VGPR alike (ps_sdwa_f16_const), while the
         same denormal in a register or a literal widens right. A half with a zero exponent field is therefore
         widened exactly with integer ops: sign * mantissa * 2^-24."""
-        return self.f16_in_bits(s, hi, apply_mods=False)[0]
+        return self.f16_in_bits(s, hi, apply_mods=False, need_bits=False)[0]
+
+    @staticmethod
+    def _f16_half_to_f32_bits(h_val):
+        """Exact IEEE-754 binary16 -> binary32 bit pattern for a non-NaN 16-bit half (exact subnormals, +-0, +-inf)."""
+        sign = (h_val >> 15) & 1
+        exp = (h_val >> 10) & 0x1F
+        mant = h_val & 0x3FF
+        if exp == 0:
+            if mant == 0:
+                mag = 0
+            else:
+                msb = mant.bit_length() - 1
+                mag = ((msb + 103) << 23) | ((mant << (23 - msb)) & 0x7FFFFF)
+        elif exp == 31:
+            mag = 0x7F800000
+        else:
+            mag = ((exp + 112) << 23) | (mant << 13)
+        return (sign << 31) | mag
 
     @staticmethod
     def _f16_const_nan(s, hi=0):
@@ -715,33 +779,89 @@ class Gen:
             self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
         return h
 
-    def f16_in_bits(self, s, hi=0, apply_mods=True):
+    def _call_f16_in(self, u, hi):
+        """Widen low (hi=0) or high (hi=1) f16 half of u32 ``u`` to ``%float`` via a shared Pure helper."""
+        hi_bit = 1 if hi else 0
+        tag = "hi" if hi_bit else "lo"
+        fn_name = f"%f16_in_{tag}_fn"
+        if hi_bit not in self.f16_in_fns:
+            saved = (self.body, self._active_ssa, self.bitcast_from)
+            self.body, self._active_ssa, self.bitcast_from = [], None, {}
+            try:
+                p_u = f"%f16_in_{tag}_u"
+                v2, f = self.tmp(), self.tmp()
+                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {p_u}")
+                self.emit(f"{f} = OpCompositeExtract %float {v2} {hi_bit}")
+                ex, small, mant, mf, den, neg, isneg, sden, out = (self.tmp() for _ in range(9))
+                h = self._f16_half_word(p_u, hi_bit)
+                self.emit(f"{ex} = OpBitwiseAnd %uint {h} {self.cu(0x7C00)}")
+                self.emit(f"{small} = OpIEqual %bool {ex} {self.cu(0)}")
+                self.emit(f"{mant} = OpBitwiseAnd %uint {h} {self.cu(0x3FF)}")
+                self.emit(f"{mf} = OpConvertUToF %float {mant}")
+                self.emit(f"{den} = OpFMul %float {mf} {self.fconst(2.0 ** -24)}")
+                self.emit(f"{neg} = OpFNegate %float {den}")
+                self.emit(f"{isneg} = OpUGreaterThanEqual %bool {h} {self.cu(0x8000)}")
+                self.emit(f"{sden} = OpSelect %float {isneg} {neg} {den}")
+                self.emit(f"{out} = OpSelect %float {small} {sden} {f}")
+                lines = self.body
+            finally:
+                self.body, self._active_ssa, self.bitcast_from = saved
+            self.f16_in_fns[hi_bit] = [
+                f"{fn_name} = OpFunction %float Pure %fn_f16_in",
+                f"{p_u} = OpFunctionParameter %uint",
+                f"%f16_in_{tag}_entry = OpLabel",
+                *lines,
+                f"         OpReturnValue {out}",
+                "OpFunctionEnd",
+            ]
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %float {fn_name} {u}")
+        return r
+
+    def f16_in_bits(self, s, hi=0, apply_mods=True, need_bits=True):
         """Like ``f16_in``, also returning ``(h_bits, const_nan_status)``; ``h_bits`` keeps abs/neg if ``apply_mods``."""
+        if "sdwa_sel" not in s and s["k"] in ("fimm", "imm"):
+            if s["k"] == "fimm":
+                try:
+                    u_val = struct.unpack("<H", struct.pack("<e", s["v"]))[0]
+                except OverflowError:
+                    raise Unsupported("f16 inline constant out of range") from None
+            else:
+                u_val = s["v"] & 0xFFFFFFFF
+            h_val = (u_val >> 16) if hi else (u_val & 0xFFFF)
+            if (h_val & 0x7FFF) <= 0x7C00:
+                f32_bits = self._f16_half_to_f32_bits(h_val)
+                if s.get("abs"):
+                    f32_bits &= 0x7FFFFFFF
+                if s.get("neg"):
+                    f32_bits ^= 0x80000000
+                if f32_bits == 0x00000000:
+                    f_id = "%f0"
+                elif f32_bits == 0x3F800000:
+                    f_id = "%f1"
+                else:
+                    f_id = self.tof(self.cu(f32_bits))
+                h_mod_val = h_val
+                if apply_mods:
+                    if s.get("abs"):
+                        h_mod_val &= 0x7FFF
+                    if s.get("neg"):
+                        h_mod_val ^= 0x8000
+                return f_id, (self.cu(h_mod_val) if need_bits else None), False
         u = self.src_h(s)
-        v2, f = self.tmp(), self.tmp()
-        self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-        self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
-        ex, small, mant, mf, den, neg, isneg, sden, out = (self.tmp() for _ in range(9))
-        h = self._f16_half_word(u, hi)
-        self.emit(f"{ex} = OpBitwiseAnd %uint {h} {self.cu(0x7C00)}")
-        self.emit(f"{small} = OpIEqual %bool {ex} {self.cu(0)}")
-        self.emit(f"{mant} = OpBitwiseAnd %uint {h} {self.cu(0x3FF)}")
-        self.emit(f"{mf} = OpConvertUToF %float {mant}")
-        self.emit(f"{den} = OpFMul %float {mf} {self.fconst(2.0 ** -24)}")
-        self.emit(f"{neg} = OpFNegate %float {den}")
-        self.emit(f"{isneg} = OpUGreaterThanEqual %bool {h} {self.cu(0x8000)}")
-        self.emit(f"{sden} = OpSelect %float {isneg} {neg} {den}")
-        self.emit(f"{out} = OpSelect %float {small} {sden} {f}")
-        h_mod = h
-        if apply_mods:
-            if s.get("abs"):
-                ha = self.tmp()
-                self.emit(f"{ha} = OpBitwiseAnd %uint {h_mod} {self.cu(0x7FFF)}")
-                h_mod = ha
-            if s.get("neg"):
-                hn = self.tmp()
-                self.emit(f"{hn} = OpBitwiseXor %uint {h_mod} {self.cu(0x8000)}")
-                h_mod = hn
+        out = self._call_f16_in(u, hi)
+        h_mod = None
+        if need_bits:
+            h_mod = self._f16_half_word(u, hi)
+            if apply_mods:
+                if s.get("abs"):
+                    ha = self.tmp()
+                    self.emit(f"{ha} = OpBitwiseAnd %uint {h_mod} {self.cu(0x7FFF)}")
+                    h_mod = ha
+                if s.get("neg"):
+                    hn = self.tmp()
+                    self.emit(f"{hn} = OpBitwiseXor %uint {h_mod} {self.cu(0x8000)}")
+                    h_mod = hn
         return self.modify_f(out, s), h_mod, self._f16_const_nan(s, hi)
 
     def fma_mix_srcs(self, a, mods):
@@ -756,18 +876,8 @@ class Gen:
         # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
         return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
 
-    def f16_bits(self, f, rtz=False, exact_tiny=False, is_z=None):
-        """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
-
-        GLSL.std.450 PackHalf2x16 leaves the rounding mode to the implementation, and drivers fold a
-        PackHalf2x16 -> UnpackHalf2x16 round trip to a no-op (#513: NVIDIA under --wave64-emulate; #512: RTX
-        5080), so a following f16 op would see the unrounded f32. Integer ops can't be folded through.
-        ``rtz=False``: round to nearest even, |x| >= 65520 -> inf (v_cvt_f16_f32 and every f16 ALU result).
-        ``rtz=True``: round toward zero, finite values above the range -> +-65504 (v_cvt_pkrtz_f16_f32).
-        f16 denormals are produced (RDNA2's default FP16 denorm mode keeps them); f32 denormal inputs give +-0.
-        NaN -> quiet NaN with the top payload bits kept; +-inf -> +-inf.
-        ``exact_tiny``: the caller guarantees that every ``f`` below 2^-14 in magnitude is already an f16 value (a
-        sum of two f16 values, without omod: a multiple of 2^-24), so that range needs no rounding."""
+    def _emit_f16_bits_body(self, f, rtz=False, exact_tiny=False, is_z=None):
+        """Emit the integer-only f32 -> f16 bit-conversion body for ``f`` and return the %uint result ID."""
         t = self.tmp
         x, sgn, sg, a = t(), t(), t(), t()
         self.emit(f"{x} = OpBitcast %uint {f}")
@@ -840,6 +950,57 @@ class Gen:
         self.emit(f"{r5} = OpSelect %uint {isnan} {nanb} {r4}")
         self.emit(f"{res} = OpBitwiseOr %uint {r5} {sg}")
         return res
+
+    def f16_bits(self, f, rtz=False, exact_tiny=False, is_z=None):
+        """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
+
+        GLSL.std.450 PackHalf2x16 leaves the rounding mode to the implementation, and drivers fold a
+        PackHalf2x16 -> UnpackHalf2x16 round trip to a no-op (#513: NVIDIA under --wave64-emulate; #512: RTX
+        5080), so a following f16 op would see the unrounded f32. Integer ops can't be folded through.
+        ``rtz=False``: round to nearest even, |x| >= 65520 -> inf (v_cvt_f16_f32 and every f16 ALU result).
+        ``rtz=True``: round toward zero, finite values above the range -> +-65504 (v_cvt_pkrtz_f16_f32).
+        f16 denormals are produced (RDNA2's default FP16 denorm mode keeps them); f32 denormal inputs give +-0.
+        NaN -> quiet NaN with the top payload bits kept; +-inf -> +-inf.
+        ``exact_tiny``: the caller guarantees that every ``f`` below 2^-14 in magnitude is already an f16 value (a
+        sum of two f16 values, without omod: a multiple of 2^-24), so that range needs no rounding."""
+        if f == "%f0":
+            return self.cu(0)
+        rtz_b = bool(rtz)
+        exact_b = False if rtz_b else bool(exact_tiny)
+        mode_b = (not rtz_b) and (is_z is not None)
+        key = (rtz_b, exact_b, mode_b)
+        tag = ("rtz" if rtz_b else
+               ("mode_exact" if exact_b else "mode") if mode_b else
+               ("exact" if exact_b else "rne"))
+        fn_name = f"%f16_bits_{tag}_fn"
+        if key not in self.f16_bits_fns:
+            saved = (self.body, self._active_ssa, self.bitcast_from)
+            self.body, self._active_ssa, self.bitcast_from = [], None, {}
+            try:
+                p_f = f"%f16_b_{tag}_f"
+                p_z = f"%f16_b_{tag}_z" if mode_b else None
+                res = self._emit_f16_bits_body(p_f, rtz=rtz_b, exact_tiny=exact_b, is_z=p_z)
+                lines = self.body
+            finally:
+                self.body, self._active_ssa, self.bitcast_from = saved
+            fn_ty = "%fn_f16_mode" if mode_b else "%fn_f16_bits"
+            params = [f"{p_f} = OpFunctionParameter %float"]
+            if mode_b:
+                params.append(f"{p_z} = OpFunctionParameter %bool")
+            self.f16_bits_fns[key] = [
+                f"{fn_name} = OpFunction %uint Pure {fn_ty}",
+                *params,
+                f"%f16_b_{tag}_entry = OpLabel",
+                *lines,
+                f"         OpReturnValue {res}",
+                "OpFunctionEnd",
+            ]
+        r = self.tmp()
+        if mode_b:
+            self.emit(f"{r} = OpFunctionCall %uint {fn_name} {f} {is_z}")
+        else:
+            self.emit(f"{r} = OpFunctionCall %uint {fn_name} {f}")
+        return r
 
     def emit_and(self, v, k):
         r = self.tmp()
@@ -1274,30 +1435,50 @@ class Gen:
         s the round-to-odd f32 value of the exact result, and round-to-odd at 24 bits then rounds correctly to any
         format with at most 22 bits, so f16_bits gives the single-rounded f16. The FAdd/FMul carry NoContraction
         (no_contraction), so the driver can't fuse or reorder TwoSum."""
-        t = self.tmp
-        pr, s_, bb, sb, da, db, err = (t() for _ in range(7))
-        self.emit(f"{pr} = OpFMul %float {x} {y}")
-        self.emit(f"{s_} = OpFAdd %float {pr} {z}")
-        self.emit(f"{bb} = OpFSub %float {s_} {pr}")
-        self.emit(f"{sb} = OpFSub %float {s_} {bb}")
-        self.emit(f"{da} = OpFSub %float {pr} {sb}")
-        self.emit(f"{db} = OpFSub %float {z} {bb}")
-        self.emit(f"{err} = OpFAdd %float {da} {db}")
-        sbits, ebits, lsb, even, nz, fin, need, same, xs, up, dn, adj, res, r = (t() for _ in range(14))
-        self.emit(f"{sbits} = OpBitcast %uint {s_}")
-        self.emit(f"{ebits} = OpBitcast %uint {err}")
-        self.emit(f"{lsb} = OpBitwiseAnd %uint {sbits} {self.cu(1)}")
-        self.emit(f"{even} = OpIEqual %bool {lsb} {self.cu(0)}")
-        self.emit(f"{nz} = OpFUnordNotEqual %bool {err} %f0")          # true for a NaN error too...
-        self.emit(f"{fin} = OpFOrdEqual %bool {err} {err}")            # ...so require a non-NaN error
-        self.emit(f"{need} = OpLogicalAnd %bool {even} {self.emit_land(nz, fin)}")
-        self.emit(f"{xs} = OpBitwiseXor %uint {sbits} {ebits}")
-        self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")   # same sign: away from zero
-        self.emit(f"{up} = OpIAdd %uint {sbits} {self.cu(1)}")
-        self.emit(f"{dn} = OpISub %uint {sbits} {self.cu(1)}")
-        self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
-        self.emit(f"{res} = OpSelect %uint {need} {adj} {sbits}")
-        self.emit(f"{r} = OpBitcast %float {res}")
+        if self.fma_f16_odd_fn is None:
+            saved = (self.body, self._active_ssa, self.bitcast_from)
+            self.body, self._active_ssa, self.bitcast_from = [], None, {}
+            try:
+                px, py, pz = "%fma16_x", "%fma16_y", "%fma16_z"
+                t = self.tmp
+                pr, s_, bb, sb, da, db, err = (t() for _ in range(7))
+                self.emit(f"{pr} = OpFMul %float {px} {py}")
+                self.emit(f"{s_} = OpFAdd %float {pr} {pz}")
+                self.emit(f"{bb} = OpFSub %float {s_} {pr}")
+                self.emit(f"{sb} = OpFSub %float {s_} {bb}")
+                self.emit(f"{da} = OpFSub %float {pr} {sb}")
+                self.emit(f"{db} = OpFSub %float {pz} {bb}")
+                self.emit(f"{err} = OpFAdd %float {da} {db}")
+                sbits, ebits, lsb, even, nz, fin, need, same, xs, up, dn, adj, res, out = (t() for _ in range(14))
+                self.emit(f"{sbits} = OpBitcast %uint {s_}")
+                self.emit(f"{ebits} = OpBitcast %uint {err}")
+                self.emit(f"{lsb} = OpBitwiseAnd %uint {sbits} {self.cu(1)}")
+                self.emit(f"{even} = OpIEqual %bool {lsb} {self.cu(0)}")
+                self.emit(f"{nz} = OpFUnordNotEqual %bool {err} %f0")          # true for a NaN error too...
+                self.emit(f"{fin} = OpFOrdEqual %bool {err} {err}")            # ...so require a non-NaN error
+                self.emit(f"{need} = OpLogicalAnd %bool {even} {self.emit_land(nz, fin)}")
+                self.emit(f"{xs} = OpBitwiseXor %uint {sbits} {ebits}")
+                self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")   # same sign: away from zero
+                self.emit(f"{up} = OpIAdd %uint {sbits} {self.cu(1)}")
+                self.emit(f"{dn} = OpISub %uint {sbits} {self.cu(1)}")
+                self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
+                self.emit(f"{res} = OpSelect %uint {need} {adj} {sbits}")
+                self.emit(f"{out} = OpBitcast %float {res}")
+                lines = self.body
+            finally:
+                self.body, self._active_ssa, self.bitcast_from = saved
+            self.fma_f16_odd_fn = [
+                "%fma_f16_odd_fn = OpFunction %float Pure %fn_f32_3",
+                "%fma16_x = OpFunctionParameter %float",
+                "%fma16_y = OpFunctionParameter %float",
+                "%fma16_z = OpFunctionParameter %float",
+                "%fma16_entry = OpLabel",
+                *lines,
+                f"         OpReturnValue {out}",
+                "OpFunctionEnd",
+            ]
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %float %fma_f16_odd_fn {x} {y} {z}")
         return r
 
     def fma_mix_odd(self, x, y, z):
@@ -1311,76 +1492,96 @@ class Gen:
         overflowed to +-inf becomes +-FLT_MAX (toward zero it is 65504 in f16). A tiny product takes the residual
         sign from its operands (below). Sign-exact except where se + pe itself rounds to the opposite side of
         s - r, which needs an f32-ulp-level cancellation, or where x*y overflows while z cancels it."""
-        t = self.tmp
-        r, p, np_, pe, s_, bb, sb, da, db, se = (t() for _ in range(10))
-        self.emit_fma(r, x, y, z)
-        self.emit(f"{p} = OpFMul %float {x} {y}")
-        self.emit(f"{np_} = OpFNegate %float {p}")
-        self.emit_fma(pe, x, y, np_)
-        self.emit(f"{s_} = OpFAdd %float {p} {z}")
-        self.emit(f"{bb} = OpFSub %float {s_} {p}")
-        self.emit(f"{sb} = OpFSub %float {s_} {bb}")
-        self.emit(f"{da} = OpFSub %float {p} {sb}")
-        self.emit(f"{db} = OpFSub %float {z} {bb}")
-        self.emit(f"{se} = OpFAdd %float {da} {db}")
-        tt, d0, res = t(), t(), t()
-        self.emit(f"{tt} = OpFAdd %float {se} {pe}")
-        self.emit(f"{d0} = OpFSub %float {s_} {r}")
-        self.emit(f"{res} = OpFAdd %float {d0} {tt}")
-        rbits, mag, lsb, even, nzr, ok, need = (t() for _ in range(7))
-        self.emit(f"{rbits} = OpBitcast %uint {r}")
-        self.emit(f"{mag} = OpBitwiseAnd %uint {rbits} {self.cu(0x7FFFFFFF)}")
-        self.emit(f"{lsb} = OpBitwiseAnd %uint {rbits} {self.cu(1)}")
-        self.emit(f"{even} = OpIEqual %bool {lsb} {self.cu(0)}")
-        self.emit(f"{nzr} = OpULessThan %bool {self.cu(0)} {mag}")
-        self.emit(f"{ok} = OpULessThan %bool {mag} {self.cu(0x7F800000)}")           # finite
-        rnz, rfin = t(), t()
-        self.emit(f"{rnz} = OpFUnordNotEqual %bool {res} %f0")                       # true for a NaN residual too...
-        self.emit(f"{rfin} = OpFOrdEqual %bool {res} {res}")                         # ...so require a non-NaN one
-        inexact = self.emit_land(rnz, rfin)
-        # A tiny product (|x*y| < 2^-64, or flushed to 0) has its error pe below the f32 normal range (pe's lowest bit is
-        # 2^-47 of p's), so pe and the residual can underflow or be flushed and read as exact. z dominates there
-        # (anything the f16 result can see has an f32 ulp far above 2^-64), so the residual's sign is the
-        # product's: sign(x) xor sign(y), whatever the driver does with denormals.
-        xb, yb, pb, pmag, ptiny, xnz, ynz, tiny, tsign, ebits0 = (t() for _ in range(10))
-        self.emit(f"{pb} = OpBitcast %uint {p}")
-        self.emit(f"{pmag} = OpBitwiseAnd %uint {pb} {self.cu(0x7FFFFFFF)}")
-        self.emit(f"{ptiny} = OpULessThan %bool {pmag} {self.cu(0x1F800000)}")
-        self.emit(f"{xnz} = OpFUnordNotEqual %bool {x} %f0")
-        self.emit(f"{ynz} = OpFUnordNotEqual %bool {y} %f0")
-        self.emit(f"{tiny} = OpLogicalAnd %bool {ptiny} {self.emit_land(xnz, ynz)}")
-        self.emit(f"{xb} = OpBitcast %uint {x}")
-        self.emit(f"{yb} = OpBitcast %uint {y}")
-        self.emit(f"{tsign} = OpBitwiseXor %uint {xb} {yb}")
-        inexact2, ebits = t(), t()
-        self.emit(f"{inexact2} = OpLogicalOr %bool {inexact} {tiny}")
-        self.emit(f"{need} = OpLogicalAnd %bool {self.emit_land(even, inexact2)} {self.emit_land(nzr, ok)}")
-        self.emit(f"{ebits0} = OpBitcast %uint {res}")
-        self.emit(f"{ebits} = OpSelect %uint {tiny} {tsign} {ebits0}")
-        xs, same, up, dn, adj, out, rr = (t() for _ in range(7))
-        self.emit(f"{xs} = OpBitwiseXor %uint {rbits} {ebits}")
-        self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")           # same sign: away from zero
-        self.emit(f"{up} = OpIAdd %uint {rbits} {self.cu(1)}")
-        self.emit(f"{dn} = OpISub %uint {rbits} {self.cu(1)}")
-        self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
-        self.emit(f"{out} = OpSelect %uint {need} {adj} {rbits}")
-        self.emit(f"{rr} = OpBitcast %float {out}")
-        # Fma overflowed to +-inf with finite operands: the exact value is finite, so toward zero it is +-FLT_MAX.
-        ri, xi, yi, zi, anyi, ovf, sg, mx, fin, rfl = (t() for _ in range(10))
-        self.emit(f"{ri} = OpIsInf %bool {r}")
-        self.emit(f"{xi} = OpIsInf %bool {x}")
-        self.emit(f"{yi} = OpIsInf %bool {y}")
-        self.emit(f"{zi} = OpIsInf %bool {z}")
-        xyi, nai = t(), t()
-        self.emit(f"{xyi} = OpLogicalOr %bool {xi} {yi}")
-        self.emit(f"{anyi} = OpLogicalOr %bool {xyi} {zi}")
-        self.emit(f"{nai} = OpLogicalNot %bool {anyi}")
-        self.emit(f"{ovf} = OpLogicalAnd %bool {ri} {nai}")
-        self.emit(f"{sg} = OpBitwiseAnd %uint {rbits} {self.cu(0x80000000)}")
-        self.emit(f"{mx} = OpBitwiseOr %uint {sg} {self.cu(0x7F7FFFFF)}")
-        self.emit(f"{fin} = OpSelect %uint {ovf} {mx} {out}")
-        self.emit(f"{rfl} = OpBitcast %float {fin}")
-        return rfl
+        if self.fma_mix_odd_fn is None:
+            saved = (self.body, self._active_ssa, self.bitcast_from)
+            self.body, self._active_ssa, self.bitcast_from = [], None, {}
+            try:
+                px, py, pz = "%fmamix_x", "%fmamix_y", "%fmamix_z"
+                t = self.tmp
+                r, p, np_, pe, s_, bb, sb, da, db, se = (t() for _ in range(10))
+                self.emit_fma(r, px, py, pz)
+                self.emit(f"{p} = OpFMul %float {px} {py}")
+                self.emit(f"{np_} = OpFNegate %float {p}")
+                self.emit_fma(pe, px, py, np_)
+                self.emit(f"{s_} = OpFAdd %float {p} {pz}")
+                self.emit(f"{bb} = OpFSub %float {s_} {p}")
+                self.emit(f"{sb} = OpFSub %float {s_} {bb}")
+                self.emit(f"{da} = OpFSub %float {p} {sb}")
+                self.emit(f"{db} = OpFSub %float {pz} {bb}")
+                self.emit(f"{se} = OpFAdd %float {da} {db}")
+                tt, d0, res = t(), t(), t()
+                self.emit(f"{tt} = OpFAdd %float {se} {pe}")
+                self.emit(f"{d0} = OpFSub %float {s_} {r}")
+                self.emit(f"{res} = OpFAdd %float {d0} {tt}")
+                rbits, mag, lsb, even, nzr, ok, need = (t() for _ in range(7))
+                self.emit(f"{rbits} = OpBitcast %uint {r}")
+                self.emit(f"{mag} = OpBitwiseAnd %uint {rbits} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{lsb} = OpBitwiseAnd %uint {rbits} {self.cu(1)}")
+                self.emit(f"{even} = OpIEqual %bool {lsb} {self.cu(0)}")
+                self.emit(f"{nzr} = OpULessThan %bool {self.cu(0)} {mag}")
+                self.emit(f"{ok} = OpULessThan %bool {mag} {self.cu(0x7F800000)}")           # finite
+                rnz, rfin = t(), t()
+                self.emit(f"{rnz} = OpFUnordNotEqual %bool {res} %f0")                       # true for a NaN residual too...
+                self.emit(f"{rfin} = OpFOrdEqual %bool {res} {res}")                         # ...so require a non-NaN one
+                inexact = self.emit_land(rnz, rfin)
+                # A tiny product (|x*y| < 2^-64, or flushed to 0) has its error pe below the f32 normal range (pe's lowest bit is
+                # 2^-47 of p's), so pe and the residual can underflow or be flushed and read as exact. z dominates there
+                # (anything the f16 result can see has an f32 ulp far above 2^-64), so the residual's sign is the
+                # product's: sign(x) xor sign(y), whatever the driver does with denormals.
+                xb, yb, pb, pmag, ptiny, xnz, ynz, tiny, tsign, ebits0 = (t() for _ in range(10))
+                self.emit(f"{pb} = OpBitcast %uint {p}")
+                self.emit(f"{pmag} = OpBitwiseAnd %uint {pb} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{ptiny} = OpULessThan %bool {pmag} {self.cu(0x1F800000)}")
+                self.emit(f"{xnz} = OpFUnordNotEqual %bool {px} %f0")
+                self.emit(f"{ynz} = OpFUnordNotEqual %bool {py} %f0")
+                self.emit(f"{tiny} = OpLogicalAnd %bool {ptiny} {self.emit_land(xnz, ynz)}")
+                self.emit(f"{xb} = OpBitcast %uint {px}")
+                self.emit(f"{yb} = OpBitcast %uint {py}")
+                self.emit(f"{tsign} = OpBitwiseXor %uint {xb} {yb}")
+                inexact2, ebits = t(), t()
+                self.emit(f"{inexact2} = OpLogicalOr %bool {inexact} {tiny}")
+                self.emit(f"{need} = OpLogicalAnd %bool {self.emit_land(even, inexact2)} {self.emit_land(nzr, ok)}")
+                self.emit(f"{ebits0} = OpBitcast %uint {res}")
+                self.emit(f"{ebits} = OpSelect %uint {tiny} {tsign} {ebits0}")
+                xs, same, up, dn, adj, out, rr = (t() for _ in range(7))
+                self.emit(f"{xs} = OpBitwiseXor %uint {rbits} {ebits}")
+                self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")           # same sign: away from zero
+                self.emit(f"{up} = OpIAdd %uint {rbits} {self.cu(1)}")
+                self.emit(f"{dn} = OpISub %uint {rbits} {self.cu(1)}")
+                self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
+                self.emit(f"{out} = OpSelect %uint {need} {adj} {rbits}")
+                self.emit(f"{rr} = OpBitcast %float {out}")
+                # Fma overflowed to +-inf with finite operands: the exact value is finite, so toward zero it is +-FLT_MAX.
+                ri, xi, yi, zi, anyi, ovf, sg, mx, fin, rfl = (t() for _ in range(10))
+                self.emit(f"{ri} = OpIsInf %bool {r}")
+                self.emit(f"{xi} = OpIsInf %bool {px}")
+                self.emit(f"{yi} = OpIsInf %bool {py}")
+                self.emit(f"{zi} = OpIsInf %bool {pz}")
+                xyi, nai = t(), t()
+                self.emit(f"{xyi} = OpLogicalOr %bool {xi} {yi}")
+                self.emit(f"{anyi} = OpLogicalOr %bool {xyi} {zi}")
+                self.emit(f"{nai} = OpLogicalNot %bool {anyi}")
+                self.emit(f"{ovf} = OpLogicalAnd %bool {ri} {nai}")
+                self.emit(f"{sg} = OpBitwiseAnd %uint {rbits} {self.cu(0x80000000)}")
+                self.emit(f"{mx} = OpBitwiseOr %uint {sg} {self.cu(0x7F7FFFFF)}")
+                self.emit(f"{fin} = OpSelect %uint {ovf} {mx} {out}")
+                self.emit(f"{rfl} = OpBitcast %float {fin}")
+                lines = self.body
+            finally:
+                self.body, self._active_ssa, self.bitcast_from = saved
+            self.fma_mix_odd_fn = [
+                "%fma_mix_odd_fn = OpFunction %float Pure %fn_f32_3",
+                "%fmamix_x = OpFunctionParameter %float",
+                "%fmamix_y = OpFunctionParameter %float",
+                "%fmamix_z = OpFunctionParameter %float",
+                "%fmamix_entry = OpLabel",
+                *lines,
+                f"         OpReturnValue {rfl}",
+                "OpFunctionEnd",
+            ]
+        out_r = self.tmp()
+        self.emit(f"{out_r} = OpFunctionCall %float %fma_mix_odd_fn {x} {y} {z}")
+        return out_r
 
     def emit_land(self, a, b):
         r = self.tmp()
@@ -1404,6 +1605,8 @@ class Gen:
 
     def f16_pack2(self, lo, hi, exact_tiny=False):
         """Two f32 values -> one %uint of two f16 halves (lo | hi << 16), each rounded as f16_res, without PackHalf2x16."""
+        if not self.round_mode and not exact_tiny:
+            return self.pack_f16_pair_int(lo, hi)
         a, b, sh, r = self.f16_res(lo, exact_tiny), self.f16_res(hi, exact_tiny), self.tmp(), self.tmp()
         self.emit(f"{sh} = OpShiftLeftLogical %uint {b} {self.cu(16)}")
         self.emit(f"{r} = OpBitwiseOr %uint {a} {sh}")
@@ -1654,10 +1857,18 @@ class Gen:
                 or any(x["k"] == "special" and x.get("t", "").startswith("exec") for x in ins["args"]))
 
     # What a lane-local instruction may emit inside an active run: anything but these (other lanes, side effects,
-    # control flow out of the run) and stores to registers other than the VGPR file.
+    # control flow out of the run) and stores to registers other than the VGPR file. Pure lane-local scalar helpers
+    # (PURE_LANE_LOCAL_HELPERS) have no memory, control-flow or subgroup ops and are safe inside active runs.
     RUN_FORBIDDEN = ("OpGroup", "OpControlBarrier", "OpMemoryBarrier", "OpImage", "OpDPd", "OpFwidth", "OpAtomic",
                      "OpKill", "OpTerminateInvocation", "OpDemoteToHelperInvocation", "OpEmit", "OpEndPrimitive",
                      "OpReturn", "OpFunctionCall", "OpLoopMerge")
+    PURE_LANE_LOCAL_HELPERS = frozenset((
+        "%f16_in_lo_fn", "%f16_in_hi_fn",
+        "%f16_bits_rne_fn", "%f16_bits_rtz_fn", "%f16_bits_exact_fn",
+        "%f16_bits_mode_fn", "%f16_bits_mode_exact_fn",
+        "%mem_f16_fn", "%f16_pack2_rne_fn",
+        "%fma_f16_odd_fn", "%fma_mix_odd_fn",
+    ))
 
     def check_lane_local(self, ins, lines):
         """Fail loudly if ins, judged lane-local, emitted something an active run can't hold."""
@@ -1668,7 +1879,10 @@ class Gen:
             words = s.split()
             if len(words) > 4 and words[2] == "OpAccessChain" and words[4] == "%vgpr":
                 vgpr_ptrs.add(words[0])
-            bad = (s.split(" = ")[-1].startswith(self.RUN_FORBIDDEN)
+            rhs = s.split(" = ")[-1]
+            pure_call = (rhs.startswith("OpFunctionCall ") and len(words) > 4
+                         and words[4] in self.PURE_LANE_LOCAL_HELPERS)
+            bad = ((rhs.startswith(self.RUN_FORBIDDEN) and not pure_call)
                    or (s.startswith("OpStore ") and words[1] not in vgpr_ptrs))
             if bad:
                 raise AssertionError(f"{ins['op']} is not lane-local inside an active run: {s}")
@@ -8561,65 +8775,102 @@ class Gen:
             nlo, nhi = bits("neg_lo", [0] * ns), bits("neg_hi", [0] * ns)
             track_pk_nan = op in ("v_pk_min_f16", "v_pk_max_f16") and "clamp" not in mods
             pk_raw, pk_st, pk_h0 = ([], []), ([], []), []
-            srcs = []
+            srcs_scalar = []
             for i in range(ns):
-                u = self.src_h(a[1 + i])
-                v2 = self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+                src = a[1 + i]
+                const_u = None
+                if "sdwa_sel" not in src and src["k"] in ("fimm", "imm"):
+                    if src["k"] == "fimm":
+                        try:
+                            const_u = struct.unpack("<H", struct.pack("<e", src["v"]))[0]
+                        except OverflowError:
+                            raise Unsupported("f16 inline constant out of range") from None
+                    else:
+                        const_u = src["v"] & 0xFFFFFFFF
+                halves_ok = const_u is not None and all(
+                    (((const_u >> (16 if h else 0)) & 0x7FFF) <= 0x7C00)
+                    for h in (sel[i], selhi[i])
+                )
                 comps = []
-                extracted = {}
-                for lane, (half_sel, neg) in enumerate(((sel[i], nlo[i]), (selhi[i], nhi[i]))):
-                    c = self.tmp()
-                    self.emit(f"{c} = OpCompositeExtract %float {v2} {half_sel}")
-                    if neg:
-                        n2 = self.tmp()
-                        self.emit(f"{n2} = OpFNegate %float {c}")
-                        c = n2
-                    comps.append(c)
-                    if track_pk_nan:
-                        if half_sel not in extracted:
-                            extracted[half_sel] = self._f16_half_word(u, half_sel)
-                        h_bits = extracted[half_sel]
-                        pk_raw[i].append(h_bits)
-                        pk_st[i].append(self._f16_const_nan(a[1 + i], half_sel))
-                        if i == 0:
-                            if neg:
-                                hn = self.tmp()
-                                self.emit(f"{hn} = OpBitwiseXor %uint {h_bits} {self.cu(0x8000)}")
-                                pk_h0.append(hn)
-                            else:
-                                pk_h0.append(h_bits)
-                vv = self.tmp()
-                self.emit(f"{vv} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
-                srcs.append(vv)
-            vx, vy = srcs[:2]
-            r = self.tmp()
+                if halves_ok:
+                    for half_sel, neg in ((sel[i], nlo[i]), (selhi[i], nhi[i])):
+                        h_val = (const_u >> 16) if half_sel else (const_u & 0xFFFF)
+                        f32_bits = self._f16_half_to_f32_bits(h_val)
+                        if neg:
+                            f32_bits ^= 0x80000000
+                        if f32_bits == 0x00000000:
+                            c = "%f0"
+                        elif f32_bits == 0x3F800000:
+                            c = "%f1"
+                        else:
+                            c = self.tof(self.cu(f32_bits))
+                        comps.append(c)
+                        if track_pk_nan:
+                            pk_raw[i].append(self.cu(h_val))
+                            pk_st[i].append(False)
+                            if i == 0:
+                                pk_h0.append(self.cu(h_val ^ (0x8000 if neg else 0)))
+                else:
+                    u = self.src_h(src)
+                    v2 = self.tmp()
+                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+                    extracted = {}
+                    for half_sel, neg in ((sel[i], nlo[i]), (selhi[i], nhi[i])):
+                        c = self.tmp()
+                        self.emit(f"{c} = OpCompositeExtract %float {v2} {half_sel}")
+                        if neg:
+                            n2 = self.tmp()
+                            self.emit(f"{n2} = OpFNegate %float {c}")
+                            c = n2
+                        comps.append(c)
+                        if track_pk_nan:
+                            if half_sel not in extracted:
+                                extracted[half_sel] = self._f16_half_word(u, half_sel)
+                            h_bits = extracted[half_sel]
+                            pk_raw[i].append(h_bits)
+                            pk_st[i].append(self._f16_const_nan(src, half_sel))
+                            if i == 0:
+                                if neg:
+                                    hn = self.tmp()
+                                    self.emit(f"{hn} = OpBitwiseXor %uint {h_bits} {self.cu(0x8000)}")
+                                    pk_h0.append(hn)
+                                else:
+                                    pk_h0.append(h_bits)
+                srcs_scalar.append(comps)
             if op == "v_pk_fma_f16":
-                # one rounding per half, to f16 (SHADER-55)
-                comps = []
-                for k in (0, 1):
-                    ex = [self.tmp() for _ in range(3)]
-                    for e_, v_ in zip(ex, (vx, vy, srcs[2])):
-                        self.emit(f"{e_} = OpCompositeExtract %float {v_} {k}")
-                    comps.append(self.fma_f16_odd(*ex))
-                self.emit(f"{r} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
-            elif op in ("v_pk_add_f16", "v_pk_mul_f16"):
-                self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2float {vx} {vy}")
-                if "add" in op:
-                    r = self.sum_toward_zero2(vx, vy, r)
+                # one rounding per half, to f16 (SHADER-55); pass scalar components directly without v2float round-trip
+                c0 = self.fma_f16_odd(srcs_scalar[0][0], srcs_scalar[1][0], srcs_scalar[2][0])
+                c1 = self.fma_f16_odd(srcs_scalar[0][1], srcs_scalar[1][1], srcs_scalar[2][1])
+                if "clamp" in mods:
+                    c0_cl, c1_cl = self.tmp(), self.tmp()
+                    self.emit(f"{c0_cl} = OpExtInst %float %glsl FClamp {c0} %f0 %f1")
+                    self.emit(f"{c1_cl} = OpExtInst %float %glsl FClamp {c1} %f0 %f1")
+                    c0, c1 = c0_cl, c1_cl
             else:
-                self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
-            if "clamp" in mods:
-                c = self.tmp()
-                z2, o2 = self.tmp(), self.tmp()
-                self.emit(f"{z2} = OpCompositeConstruct %v2float %f0 %f0")
-                self.emit(f"{o2} = OpCompositeConstruct %v2float %f1 %f1")
-                self.emit(f"{c} = OpExtInst %v2float %glsl FClamp {r} {z2} {o2}")
-                r = c
+                srcs = []
+                for comps in srcs_scalar:
+                    vv = self.tmp()
+                    self.emit(f"{vv} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
+                    srcs.append(vv)
+                vx, vy = srcs[:2]
+                r = self.tmp()
+                if op in ("v_pk_add_f16", "v_pk_mul_f16"):
+                    self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2float {vx} {vy}")
+                    if "add" in op:
+                        r = self.sum_toward_zero2(vx, vy, r)
+                else:
+                    self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
+                if "clamp" in mods:
+                    c = self.tmp()
+                    z2, o2 = self.tmp(), self.tmp()
+                    self.emit(f"{z2} = OpCompositeConstruct %v2float %f0 %f0")
+                    self.emit(f"{o2} = OpCompositeConstruct %v2float %f1 %f1")
+                    self.emit(f"{c} = OpExtInst %v2float %glsl FClamp {r} {z2} {o2}")
+                    r = c
+                c0, c1 = self.tmp(), self.tmp()
+                self.emit(f"{c0} = OpCompositeExtract %float {r} 0")
+                self.emit(f"{c1} = OpCompositeExtract %float {r} 1")
             p = self.tmp()
-            c0, c1 = self.tmp(), self.tmp()
-            self.emit(f"{c0} = OpCompositeExtract %float {r} 0")
-            self.emit(f"{c1} = OpCompositeExtract %float {r} 1")
             if track_pk_nan:
                 lanes = []
                 for k, c_val in enumerate((c0, c1)):
@@ -14906,6 +15157,16 @@ def assemble(gen):
     written = dict(gen.consts)     # what the module defines; insert_late_constants adds what assemble asks for later
     if gen.desc_fn:
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
+    if gen.f16_in_fns:
+        types.append("%fn_f16_in = OpTypeFunction %float %uint")
+    if any(not mode for _, _, mode in gen.f16_bits_fns) or gen.mem_f16_fn:
+        types.append("%fn_f16_bits = OpTypeFunction %uint %float")
+    if any(mode for _, _, mode in gen.f16_bits_fns):
+        types.append("%fn_f16_mode = OpTypeFunction %uint %float %bool")
+    if gen.f16_pack2_fn:
+        types.append("%fn_f16_pack2 = OpTypeFunction %uint %float %float")
+    if gen.fma_f16_odd_fn or gen.fma_mix_odd_fn:
+        types.append("%fn_f32_3 = OpTypeFunction %float %float %float %float")
     if gen.tbuffer_norm_fns or gen.fmt_enc_fn:
         types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")      # also the element-size function's type
     if gen.fmt_fn or gen.fmt_enc_fn:
@@ -15284,7 +15545,20 @@ def assemble(gen):
         fn.append(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {gen.cu(r)}")
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
+    helpers = []
+    for hi in sorted(gen.f16_in_fns):
+        helpers.extend(gen.f16_in_fns[hi])
+    for key in sorted(gen.f16_bits_fns):
+        helpers.extend(gen.f16_bits_fns[key])
+    if gen.mem_f16_fn:
+        helpers.extend(gen.mem_f16_fn)
+    if gen.f16_pack2_fn:
+        helpers.extend(gen.f16_pack2_fn)
+    if gen.fma_f16_odd_fn:
+        helpers.extend(gen.fma_f16_odd_fn)
+    if gen.fma_mix_odd_fn:
+        helpers.extend(gen.fma_mix_odd_fn)
+    helpers += (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
     for function in gen.x_round_fns.values():
