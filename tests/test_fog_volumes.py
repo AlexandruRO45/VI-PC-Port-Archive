@@ -243,15 +243,21 @@ class FogVolumesTests(unittest.TestCase):
             carved = os.path.join(td, "000000001000.bin")
             with open(carved, "wb") as f:
                 f.write(raw)
-            for out in (carved, os.path.join(td, "alias.bin")):
-                if out != carved:
-                    os.link(carved, out)            # a second name for the same carved input
+            outputs = [carved]
+            alias = os.path.join(td, "alias.bin")
+            try:
+                os.link(carved, alias)              # a second name for the same carved input
+            except OSError:
+                pass                                # a filesystem without hard links: the carved name is checked
+            else:
+                outputs.append(alias)
+            for out in outputs:
                 with self.subTest(out=os.path.basename(out)):
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
                         fv.main([td, "--out", out, "--jobs", "1"])
                     self.assertEqual(cm.exception.code, 2)
-                    self.assertIn("--out would overwrite the input " + carved, err.getvalue())
+                    self.assertIn("--out would overwrite input: " + out, err.getvalue())
                     with open(carved, "rb") as f:
                         self.assertEqual(f.read(), raw)
 

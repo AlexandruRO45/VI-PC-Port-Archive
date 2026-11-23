@@ -432,7 +432,7 @@ def main(argv=None) -> int:
             for name in names:
                 input_file = os.path.join(a.path, name)
                 if os.path.isfile(input_file) and same_report_path(a.out, input_file):
-                    ap.error(f"--out would overwrite the input {input_file}")
+                    ap.error(f"--out would overwrite input: {a.out}")
     try:
         doc = summarize(a.path, jobs=a.jobs)
         if a.out:
