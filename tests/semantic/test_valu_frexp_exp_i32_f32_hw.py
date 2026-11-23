@@ -534,5 +534,54 @@ class TestFrexpExpI32F32IEEE754Handling(unittest.TestCase):
         self.assertEqual(ref_frexp_exp_i32_f32(0x4000_0000), 2)
 
 
+# ==============================================================================
+# Negative Controls, Rejection, and Translator Hardware Execution
+# ==============================================================================
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import support
+import rdna2spirv
+
+
+class TestFrexpExpI32F32RejectionAndHardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection_negative_controls(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 256)
+        with self.assertRaises(ValueError):
+            LiteralOperand(0x1_0000_0000)
+
+    def test_hardware_translator_execution(self):
+        """Validates that tools/rdna2spirv.py translates v_frexp_exp_i32_f32 and matches expected results."""
+        cases = [
+            (f32_to_bits(1.0), 1),
+            (f32_to_bits(0.5), 0),
+            (f32_to_bits(2.0), 2),
+            (f32_to_bits(0.25), 0xFFFF_FFFF),
+            (f32_to_bits(100.0), 7),
+            (f32_to_bits(-1.0), 1),
+            (f32_to_bits(-0.5), 0),
+            (POS_ZERO, 0),
+            (NEG_ZERO, 0),
+            (POS_INF, 0),
+            (NEG_INF, 0),
+            (QNAN, 0),
+            (0x0000_0001, 0),
+            (MIN_NORMAL, 0xFFFF_FF83),
+            (MAX_NORMAL, 128),
+        ]
+        for src_val, expected in cases:
+            prog = [
+                f"v_mov_b32 v1, {src_val:#x}",
+                "v_frexp_exp_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_frexp_exp_i32_f32_hw", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected, f"Failed on input {src_val:#x}: got {words[0]:#x}, expected {expected:#x}")
+
+
 if __name__ == '__main__':
     unittest.main()
