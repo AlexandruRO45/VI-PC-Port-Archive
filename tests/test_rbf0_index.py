@@ -241,8 +241,9 @@ class JoinTest(unittest.TestCase):
         header = bytearray(0x100)
         header[:4] = b"9FPR"
         struct.pack_into("<I", header, 4, len(header))
-        # A short non-RBF0 zlib stream must still be ignored, while a valid short RBF0 stream is kept.
-        body = zlib.compress(b"noise" * 4) + bytes(16) + zlib.compress(blob) + bytes(16)
+        # A short non-RBF0 zlib stream and a truncated 4-byte "RBF0" stub must still be ignored,
+        # while a complete short RBF0 stream is kept.
+        body = zlib.compress(b"noise" * 4) + bytes(16) + zlib.compress(b"RBF0") + bytes(16) + zlib.compress(blob) + bytes(16)
         with open(path, "wb") as f:
             f.write(header + body)
         rows, records, summary = rbf0_index.scan_rpf(path)
@@ -252,6 +253,29 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(records[0]["size"], len(blob))
         self.assertEqual(records[0]["status"], "ok")
         self.assertEqual(records[0]["root"], "TestRoot")
+
+    def test_archive_rejects_short_noise_after_exact_64k_multiple_rbf0(self):
+        # A 128 KiB RBF0 resource that closes right at byte 131072 ends the chain:
+        # a short unrelated zlib stream immediately after it must not be accepted as a continuation.
+        hdr = bytearray(WIDE) + _open(0, b"ExactTwoChunk")
+        text_len = 131072 - len(hdr) - 6 - 2
+        blob = bytes(hdr) + b"\xfd\xff" + struct.pack("<I", text_len) + (b"a" * (text_len - 1) + b"\x00") + b"\xff\xff"
+        self.assertEqual(len(blob), 131072)
+        noise = zlib.compress(b"noise" * 4)
+        path = os.path.join(self.root, "exact_128k_then_noise.rpf")
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        body = zlib.compress(blob[:65536]) + bytes(4) + zlib.compress(blob[65536:]) + bytes(4) + noise
+        with open(path, "wb") as f:
+            f.write(header + body)
+        rows, records, summary = rbf0_index.scan_rpf(path)
+        self.assertEqual(summary["streams"], 2)
+        self.assertEqual(summary["unread_bytes"], 4 + len(noise))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["chunks"], 2)
+        self.assertEqual(records[0]["size"], 131072)
+        self.assertEqual(records[0]["status"], "ok")
 
     def test_archive_join_keeps_short_final_continuation_chunk(self):
         for full_chunks, tail_len in ((1, 18), (2, 10)):
@@ -309,6 +333,22 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(records[0]["chunks"], 1)
         self.assertEqual(records[0]["status"], "truncated")
         self.assertEqual(records[0]["root"], "BigRoot")
+
+    def test_directory_join_stops_before_following_bk2_file(self):
+        trunc_rbf0 = large_blob()[:65536]
+        bink = bytearray(256)
+        bink[0:4] = b"KB2i"
+        struct.pack_into("<I", bink, 4, len(bink) - 8)
+        with open(os.path.join(self.root, "00001000.bin"), "wb") as f:
+            f.write(trunc_rbf0)
+        with open(os.path.join(self.root, "00002000.bk2"), "wb") as f:
+            f.write(bink)
+        rows, records, summary = rbf0_index.scan_dir(self.root)
+        self.assertEqual(summary["streams"], 2)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["chunks"], 1)
+        self.assertEqual(records[0]["size"], 65536)
+        self.assertEqual(records[0]["status"], "truncated")
 
     def test_single_stream_directory(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:

@@ -369,7 +369,8 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
         end = min(size, pos + limit) if limit else size
         span_start = pos
         last, zero, unread = pos, 0, 0
-        in_rbf0_chain = False
+        rbf0_chain = None
+        rbf0_chunks = 0
         while pos < end:
             match = ZHDR.search(mm, pos, end)
             if not match:
@@ -386,7 +387,8 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 unread += gap_unread
                 rows.append({"offset": s, "stored": blen, "size": blen, "head": mm[s:s + 8], "kind": "bink2"})
                 last = pos = s + blen
-                in_rbf0_chain = False
+                rbf0_chain = None
+                rbf0_chunks = 0
                 continue
             d = zlib.decompressobj()
             chunks, p = [], s
@@ -405,15 +407,16 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 pos = s + 1
                 continue
             is_continuation = (
-                in_rbf0_chain
+                rbf0_chain is not None
                 and s <= last + 16
                 and 0 < len(out) <= MAX_CHUNK
                 and out[:4] not in (MAGIC, b"PSIN")
             )
+            # A <64-byte stream cannot have continuations, so require a complete RBF0 resource.
             is_short_rbf0 = (
                 len(out) < 64
                 and out[:4] == MAGIC
-                and parse_rbf0(out, string_limit=0)["status"] != "bad"
+                and parse_rbf0(out, string_limit=0)["complete"]
             )
             if len(out) < 64 and not is_continuation and not is_short_rbf0:
                 pos = s + 1
@@ -424,14 +427,26 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             unread += gap_unread
             rows.append(_row(out, s, used))
             if out[:4] == MAGIC:
-                in_rbf0_chain = (
-                    len(out) == MAX_CHUNK
-                    and parse_rbf0(out, string_limit=0)["status"] == "truncated"
-                )
+                if len(out) == MAX_CHUNK and parse_rbf0(out, string_limit=0)["status"] == "truncated":
+                    rbf0_chain = bytearray(out)
+                    rbf0_chunks = 1
+                else:
+                    rbf0_chain = None
+                    rbf0_chunks = 0
             elif is_continuation:
-                in_rbf0_chain = (len(out) == MAX_CHUNK)
+                if (len(out) == MAX_CHUNK and rbf0_chunks + 1 < MAX_CHUNKS
+                        and len(rbf0_chain) + len(out) < MAX_BYTES):
+                    rbf0_chain.extend(out)
+                    rbf0_chunks += 1
+                    if parse_rbf0(rbf0_chain, string_limit=0)["status"] != "truncated":
+                        rbf0_chain = None
+                        rbf0_chunks = 0
+                else:
+                    rbf0_chain = None
+                    rbf0_chunks = 0
             else:
-                in_rbf0_chain = False
+                rbf0_chain = None
+                rbf0_chunks = 0
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
@@ -461,21 +476,32 @@ def scan_dir(path, string_limit=16):
     for name, full in carved_streams(path):
         with open(full, "rb") as f:
             data = f.read()
+        is_bink = (
+            name.lower().endswith(".bk2")
+            and len(data) >= 4
+            and data[:3] == b"KB2"
+            and ord("a") <= data[3] <= ord("z")
+        )
         match = re.match(r"([0-9a-fA-F]{6,})", name)
         if match:
-            entries.append((int(match.group(1), 16), data))
+            entries.append((int(match.group(1), 16), data, is_bink))
         else:
-            unnamed.append(data)
+            unnamed.append((data, is_bink))
     next_offset = max((e[0] for e in entries), default=-1) + 1
-    for data in unnamed:
-        entries.append((next_offset, data))
+    for data, is_bink in unnamed:
+        entries.append((next_offset, data, is_bink))
         next_offset += 1
     entries.sort(key=lambda e: e[0])
-    rows = [_row(data, offset, len(data)) for offset, data in entries]
-    by_row = {id(row): data for row, (_, data) in zip(rows, entries)}
+    rows = []
+    for offset, data, is_bink in entries:
+        row = _row(data, offset, len(data))
+        if is_bink:
+            row["kind"] = "bink2"
+        rows.append(row)
+    by_row = {id(row): data for row, (_, data, _) in zip(rows, entries)}
     records = resources_from_rows(rows, lambda row: by_row[id(row)], check_gap=False,
                                   string_limit=string_limit)
-    summary = summarise(rows, records, sum(len(d) for _, d in entries), 0, 0, "directory")
+    summary = summarise(rows, records, sum(len(d) for _, d, _ in entries), 0, 0, "directory")
     summary["directory"] = path
     return rows, records, summary
 
