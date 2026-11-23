@@ -5434,9 +5434,14 @@ class Gen:
                 raise Unsupported("gs sendmsg " + t)
             return
         if op == "s_sendmsg" and a and "MSG_GS_ALLOC_REQ" in a[0].get("t", "") and self.stage == "ms":
+            # A scalar instruction: every invocation of a wave that gets here runs it, so the counts are stored by
+            # many invocations with no barrier between them. They all hold the same M0, but unordered plain stores
+            # to one Workgroup word are a data race whatever the values (SHADER-766), so the store is atomic. The
+            # epilogue loads the counts after its barrier. One writer cannot be picked here instead: which waves
+            # send is the program's own control flow (in the corpus, the one wave that holds a chosen thread).
             m = self.tmp()
             self.emit(f"{m} = OpLoad %uint %m0")
-            self.emit(f"OpStore %ms_counts {m}")
+            self.emit(f"OpAtomicStore %ms_counts {self.cu(2)} {self.cu(0)} {m}")
             self.ms_alloc = True
             return
         if op == "s_sendmsg" and a and "MSG_ORDERED_PS_DONE" in a[0].get("t", ""):

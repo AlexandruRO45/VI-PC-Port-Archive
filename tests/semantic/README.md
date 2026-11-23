@@ -103,6 +103,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   no case of the round loop's switch reads or writes buffer memory after a write, or writes after a read, so a
   `buffer_store` and a later `s_load` / `s_buffer_load` of the wave (and a scalar load and a later store) run in
   different rounds (#1587). Loads alone share a round.
+- `test_ms_counts_atomic.py` translates three hand-written wave64 mesh programs (natively and with
+  `--wave64-emulate`, as a mesh stage and with `--mesh-compute`) and checks how the counts of
+  `s_sendmsg(MSG_GS_ALLOC_REQ)` reach the Workgroup variable `%ms_counts`: every send is one `OpAtomicStore` of
+  M0, no plain store names the variable, and its one load comes after a barrier that follows every store
+  (SHADER-766: every invocation of the sending wave runs that scalar instruction).
 - `test_w64x_clear_single_writer.py` translates a wave64 compute program with `--wave64-emulate` at nine workgroup
   sizes and runs the scheduler's head for every invocation: before the first barrier and at the top of each round no
   word of `%x_buf` is stored by two invocations, and the words cleared are exactly the mask words, the counts and
