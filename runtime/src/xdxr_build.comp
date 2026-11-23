@@ -273,6 +273,34 @@ void build_triangle(uint t) {
 }
 
 // ---- MODE_INSTANCES ----
+bool invert_instance(mat3 a, out mat3 inv) {
+    const uint FLOAT_ABS = 0x7fffffffu;
+    const uint FLOAT_MIN_NORMAL = 0x00800000u;
+    const uint FLOAT_INF = 0x7f800000u;
+    const uint ROW_EXP_MIN = 0x20800000u;  // 2^-62
+    const uint ROW_EXP_MAX = 0x5e800000u;  // 2^62
+    uint det_abs = floatBitsToUint(determinant(a)) & FLOAT_ABS;
+    vec3 norm = max(abs(a[0]), max(abs(a[1]), abs(a[2])));
+    uvec3 exponent = floatBitsToUint(norm) & uvec3(FLOAT_INF);
+    // An inverse can also lose its cofactors when the determinant itself is representable.
+    bool rescale = det_abs < FLOAT_MIN_NORMAL || det_abs >= FLOAT_INF ||
+                   any(lessThan(exponent, uvec3(ROW_EXP_MIN))) ||
+                   any(greaterThan(exponent, uvec3(ROW_EXP_MAX)));
+    vec3 scale = vec3(1.0);
+    if (rescale) {
+        // Use powers of two so row normalization A = S * B preserves the input significance.
+        if (any(equal(exponent, uvec3(FLOAT_INF)))) return false;
+        scale = uintBitsToFloat(max(exponent, uvec3(FLOAT_MIN_NORMAL)));
+        a = mat3(a[0] / scale, a[1] / scale, a[2] / scale);
+        det_abs = floatBitsToUint(determinant(a)) & FLOAT_ABS;
+        if (det_abs == 0u || det_abs >= FLOAT_INF) return false;
+    }
+    inv = inverse(a);
+    // A^-1 = B^-1 * S^-1: remove the row scaling by dividing each inverse column.
+    if (rescale) inv = mat3(inv[0] / scale.x, inv[1] / scale.y, inv[2] / scale.z);
+    return true;
+}
+
 void build_instance(uint i) {
     uint d = 64u * i;
     float m[12];
@@ -307,8 +335,9 @@ void build_instance(uint i) {
     store(pc.dst, o + 60u, (blas_va.x >> 8) | (blas_va.y << 24));
     // world-to-object: the inverse of the affine transform
     mat3 a = mat3(m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10]);   // columns
-    float det = determinant(a);
-    mat3 inv = det != 0.0 ? inverse(a) : mat3(0.0);
+    mat3 inv;
+    bool invertible = invert_instance(a, inv);
+    if (!invertible) inv = mat3(0.0);
     vec3 t = vec3(m[3], m[7], m[11]);
     vec3 it = -(inv * t);
     for (uint row = 0u; row < 3u; ++row) {
@@ -321,7 +350,7 @@ void build_instance(uint i) {
     store(pc.dst, o + 116u, INVALID);          // parent node: MODE_PROPAGATE fills it
     store(pc.dst, o + 120u, 0u);
     store(pc.dst, o + 124u, 0u);
-    if (det == 0.0) { lo = vec3(uintBitsToFloat(0x7f800000u)); hi = -lo; }
+    if (!invertible) { lo = vec3(uintBitsToFloat(0x7f800000u)); hi = -lo; }
     store_box(i, lo, hi);
     grow_centroid_bounds(lo, hi);
 }

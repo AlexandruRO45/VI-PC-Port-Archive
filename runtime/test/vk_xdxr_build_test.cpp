@@ -609,6 +609,62 @@ int main(int argc, char** argv) {
         std::printf("copies: blas_clone, blas_compacted (%llu bytes), tlas_refit_clone\n",
                     static_cast<unsigned long long>(compacted));
     }
+    // One instance per TLAS makes its bounds depend only on the tested matrix. Powers of two
+    // keep the expected bounds and reciprocal exact, even when the raw determinant is out of range.
+    {
+        const std::uint64_t one_bias = (one.address - 0x10000) & ~std::uint64_t(0xffff);
+        const std::uint64_t one_va = one.address - one_bias;
+        XdxrLayout single;
+        EXPECT(single.compute(1, true));
+        Buffer instance_desc = make(gpu, 64), as = make(gpu, single.size + 256);
+        Buffer temp = make(gpu, std::size_t(single.scratch));
+        EXPECT(instance_desc.buffer && as.buffer && temp.buffer);
+        const std::uint64_t at = (as.address + 255) & ~std::uint64_t(255);
+        const char* bytes = static_cast<const char*>(as.map) + (at - as.address);
+        const struct ScaleCase {
+            float x, y, z;
+            bool singular;
+        } scales[] = {
+            {1.0f, 1.0f, 1.0f, false},
+            {2.0f, 0.5f, -1.0f, false},
+            {0x1p-60f, 0x1p-60f, 0x1p-60f, false},
+            {0x1p60f, 0x1p54f, 0x1p48f, false},
+            {0x1p100f, 0x1p100f, 0x1p-100f, false}, // a cofactor overflows; the determinant is finite
+            {0x1p-100f, 0x1p-100f, 0x1p100f, false}, // a cofactor underflows; the determinant is normal
+            {0.0f, 0.0f, 0.0f, true},
+            {1.0f, 1.0f, 1.0f, true},  // duplicate rows with no zero row
+        };
+        for (const ScaleCase& s : scales) {
+            Inst scaled{{s.x, 0, 0, 0, 0, s.y, 0, 0, 0, 0, s.z, 0}, 0xff000000u, 0, one_va, 0};
+            if (s.singular && s.x != 0.0f) {
+                scaled.m[4] = s.x;
+                scaled.m[5] = 0.0f;
+            }
+            std::memcpy(instance_desc.map, &scaled, 64);
+            EXPECT(gpu.run([&](VkCommandBuffer cb) {
+                const bool ok = builder.record_tlas(cb, single, instance_desc.address, at, temp.address, one_bias);
+                barrier_to_host(gpu, cb);
+                return ok;
+            }));
+            float bounds[6], inverse[12];
+            std::memcpy(bounds, bytes + 16, sizeof bounds);
+            std::memcpy(inverse, bytes + single.elements_off + 64, sizeof inverse);
+            if (s.singular) {
+                EXPECT(bounds[0] > bounds[3]);
+                EXPECT(std::all_of(std::begin(inverse), std::end(inverse), [](float x) { return x == 0.0f; }));
+                continue;
+            }
+            const float scale[3] = {s.x, s.y, s.z};
+            const Tri& source = one.tris.front();
+            for (int axis = 0; axis < 3; ++axis) {
+                const auto [lo, hi] = std::minmax({source.v[0][axis] * scale[axis], source.v[1][axis] * scale[axis],
+                                                   source.v[2][axis] * scale[axis]});
+                EXPECT(bounds[axis] == lo && bounds[axis + 3] == hi);
+                EXPECT(inverse[5 * axis] == 1.0f / scale[axis]);
+            }
+        }
+        std::printf("tlas instance scales: %zu cases verified\n", sizeof scales / sizeof scales[0]);
+    }
     std::printf("tlas: %u instances, %u bytes\nvk_xdxr_build_test: built every case\n", count, layout.size);
     return 0;
 }

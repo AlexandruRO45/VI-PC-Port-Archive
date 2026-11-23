@@ -1091,7 +1091,11 @@ sizes for that many when the build is recorded, and the same numbers answer
 `GetRaytracingAccelerationStructurePrebuildInfo`. The header's `totalSizeIn64BNodes` counts only the nodes the build
 wrote.
 A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
-no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
+no BLAS and one with a singular transform. The GPU builder scales the rows of an instance matrix by powers of two
+when the raw determinant falls outside the normal float32 range or row magnitudes risk losing inverse cofactors.
+This preserves the bounds and exact inverse for the power-of-two and mixed-scale cases in
+`vk_xdxr_build_test` on MoltenVK. Closely dependent rows and widely varying components within one row remain
+subject to float32 precision. An instance record holds its BLAS address in 256-byte units in 32 bits,
 so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
 host pointers), the builder takes a bias that is added to the addresses read from instance descs.
 
