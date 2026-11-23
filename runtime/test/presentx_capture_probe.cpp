@@ -463,9 +463,11 @@ int main(int argc, char** argv) {
         EXPECT(as_hr(call_slot(d.queue.p, 0, 0, 0)) == S_OK);
         EXPECT(as_hr(call_slot_at(d.queue.p, 41, 0, 0, 0)) == S_OK);
         EXPECT(as_hr(call_slot_at(d.queue.p, 42, 0, 0, 0)) == S_OK);
+        // The alternate PresentX slot: with LEONIDA_CAPTURE set and no explicit ALT, the public HLE's 32 is routed.
+        EXPECT(as_hr(call_slot_at(d.queue.p, 32, 0, 0, 0)) == S_OK);
         EXPECT(files_in(directory) == 2);
         std::printf("presentx_capture_probe: capture 2/2 presents, 2 PPMs (8x8 BGRA, 8x8 R10G10B10A2) checked, "
-                    "blank/SuspendX/ResumeX S_OK\n");
+                    "blank/alt/SuspendX/ResumeX S_OK\n");
         return 0;
     }
 

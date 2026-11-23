@@ -446,12 +446,20 @@ const PresentXRouteConfig& presentx_route_config() {
     static const PresentXRouteConfig config = [] {
         PresentXRouteConfig route;
         route.present_slot = env_queue_slot("LEONIDA_PRESENTX_SLOT");
+        route.present_slot_alt = env_queue_slot("LEONIDA_PRESENTX_SLOT_ALT");
         route.suspend_slot = env_queue_slot("LEONIDA_PRESENTX_SUSPEND_SLOT");
         route.resume_slot = env_queue_slot("LEONIDA_PRESENTX_RESUME_SLOT");
-        if (route.present_slot || route.suspend_slot || route.resume_slot) {
+        // The public HLE reports PresentX at both 30 and 32. A capture run defaults to those two; without a capture
+        // the routing stays opt-in, exactly as before.
+        if (presentx_capture_enabled()) {
+            if (!route.present_slot) route.present_slot = 30;
+            if (!route.present_slot_alt) route.present_slot_alt = 32;
+        }
+        if (route.present_slot || route.present_slot_alt || route.suspend_slot || route.resume_slot) {
             std::fprintf(stderr,
-                         "[rt] presentx: routed queue slots: PresentX=%u SuspendX=%u ResumeX=%u (%s)\n",
-                         route.present_slot, route.suspend_slot, route.resume_slot,
+                         "[rt] presentx: routed queue slots: PresentX=%u (alt %u, public HLE 30/32) SuspendX=%u "
+                         "ResumeX=%u (%s)\n",
+                         route.present_slot, route.present_slot_alt, route.suspend_slot, route.resume_slot,
                          presentx_capture_enabled() ? "windowless capture" : "no LEONIDA_CAPTURE: presents dropped");
         }
         return route;

@@ -90,8 +90,9 @@ out because its return was not measured (**this repo**, `registry.cpp`).
 The COM surface behind the device — queue, command list, fence, `PresentX` — is vtable work, not
 an import problem; it is tracked in [d3d12_vulkan.md](d3d12_vulkan.md) and
 [d3d12_command_objects.md](d3d12_command_objects.md). The presentation core
-(`runtime/shims/xbox_present.h`) is wired to the measured `PresentX` queue slots (30, or 32 on the
-newer layout) in `d3d12_xs_device.cpp`; the plane and parameter struct layouts are still provisional.
+(`runtime/shims/xbox_present.h`) is wired to the `PresentX` queue slots the public HLE reports (30 and 32) by opt-in
+routing, and the device proxy routes the HLE's frame-event slots 78/79/80; the plane and parameter struct layouts are
+still provisional.
 
 ### `xgameruntime.dll`
 

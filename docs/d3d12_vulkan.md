@@ -2937,11 +2937,20 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   image is not done. 2 planes must share one token (see "Plane composition" for what happens to plane 1). More than 2
   planes, null planes, or an empty/outside rectangle give `E_INVALIDARG`. A missing `ALLOW_DISPLAY` heap flag is logged
   once and presented anyway.
-- *Opt-in slot routing and windowless first-frame capture (exe day)*. The console's `PresentX`, `SuspendX` and
-  `ResumeX` slots are unmeasured; the queue proxy refuses every slot past the public 19 with `E_NOTIMPL` and logs its
-  first argument words. `LEONIDA_PRESENTX_SLOT=<n>` (likewise `LEONIDA_PRESENTX_SUSPEND_SLOT` and
-  `LEONIDA_PRESENTX_RESUME_SLOT`) routes just that slot, 19..127, and logs the first call with the slot and the three
-  argument words; every other slot keeps the refusal. With `LEONIDA_CAPTURE=<dir>` a routed `PresentX` creates no
+- *Opt-in slot routing and windowless first-frame capture (exe day)*. The public HLE `Freminet/ScarlettX` reports
+  `PresentX` at queue **30 and 32**, and the device calls at **48** (`CreateCommandQueueX`), **73**
+  (`CreateCommandListX`), **78** (`SetFrameIntervalX`), **79** (`ScheduleFrameEventX`) and **80** (`WaitFrameEventX`);
+  these are third-party observations, not Microsoft documentation. The device proxy routes those five slots itself:
+  queue and list creation go to the existing create paths, and the frame events are a per-device token counter that
+  returns `S_OK` and, for `WaitFrameEventX`, a fresh non-zero token without blocking.
+  `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT`, `LEONIDA_XS_WAIT_EVENT_SLOT`,
+  `LEONIDA_XS_QUEUE_X_SLOT` and `LEONIDA_XS_LIST_X_SLOT` move one route each (3..127; anything else is logged once and
+  ignored). The queue proxy refuses every slot past the
+  public 19 with `E_NOTIMPL` and logs its first argument words. `LEONIDA_PRESENTX_SLOT=<n>` (likewise
+  `LEONIDA_PRESENTX_SLOT_ALT`, `LEONIDA_PRESENTX_SUSPEND_SLOT` and `LEONIDA_PRESENTX_RESUME_SLOT`) routes just that
+  slot, 19..127, and logs the first call with the slot and the three argument words; with `LEONIDA_CAPTURE` set and no
+  explicit slot, the HLE's 30 and 32 are the defaults. Every other slot keeps the refusal. With `LEONIDA_CAPTURE=<dir>`
+  a routed `PresentX` creates no
   window and no swapchain: the plane count (0-2), the plane array, each `ppResources` and each resource's vtable are
   checked with `VirtualQuery` before they are read; the resource must be one of this layer's resources (it must
   answer the private layer `Resource` tag, so a foreign object with an executable vtable is refused before any
