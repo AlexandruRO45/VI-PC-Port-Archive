@@ -203,6 +203,8 @@ NO_BOUNDS = object()
 
 def try_bounds(primitives):
     """``compute_bounds``'s list (``NO_BOUNDS`` for its ``None``), or ``None`` to run Python."""
+    if type(primitives) not in _SEQUENCES:
+        return None  # a one-shot iterable would be half consumed when a later primitive is declined
     if not _enabled():
         return None
     loaded = _load()

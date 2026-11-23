@@ -199,6 +199,22 @@ class NativeParityTests(unittest.TestCase):
         self.assertIs(glb_native.try_bounds([{"positions": [(math.nan, 0.0, 0.0)]}, {}]), glb_native.NO_BOUNDS)
 
     @needs_lib
+    def test_one_shot_iterator_of_primitives_matches_python(self):
+        def prims():
+            return [
+                {"positions": [(5.0, 6.0, 7.0), (-1.0, 2.0, 3.0)]},
+                {"positions": iter([(1.0, 1.0, 1.0)])},  # native declines this one after reading the first
+                {"positions": [(9.0, -9.0, 0.5)]},
+            ]
+
+        native = outcome(lambda: glb_writer.compute_bounds(iter(prims())))
+        with python_only():
+            reference = outcome(lambda: glb_writer.compute_bounds(iter(prims())))
+        self.assertEqual(native[0], "ok")
+        self.assertTrue(same(native, reference), f"native {native!r} != Python {reference!r}")
+        self.assertIsNone(glb_native.try_bounds(iter(prims())))
+
+    @needs_lib
     def test_uint32_indices(self):
         rng = random.Random(5)
         vertices = 70000
