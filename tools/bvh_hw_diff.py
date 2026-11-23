@@ -63,7 +63,7 @@ FMAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 NETWORK = ((0, 2), (1, 3), (0, 1), (2, 3), (1, 2))
 K_BOX, K_TRI, N_T = 4, 16, 16
 U24 = Fr(1, 1 << 24)
-SURROGATE = [0x40, 0x48, 0x50, 0x58]       # in-buffer child ids: node region + 0x200..0x2c0 (tools/bvh_tri_probe layout)
+SURROGATE = [0x40, 0x48, 0x50, 0x58]       # in-buffer child ids (node region + 0x200..0x2c0)
 VSLOTS = {0: (0, 1, 2), 1: (1, 3, 2), 2: (2, 3, 4), 3: (2, 4, 0)}
 TRI_CLASSES = [("INT0", 15), ("INT1", 15), ("SHARED_EDGE", 30), ("SHARED_VERTEX", 10), ("OUTER_VERTEX", 10),
                ("OUTER_EDGE", 15), ("OFF_EDGE", 5)]
@@ -755,7 +755,7 @@ def self_test():
                     classify_box(drop, M, bn, 5, ray), classify_box(drop, M, bn, 5, ray_e),
                     classify_box([0x1234, MISS, MISS, MISS], M, bn, 5, ray)] ==
                    ["B_ORDER_TIE", "B_ORDER_RULE", "B_SET_RULE", "B_SET_EQUAL", "B_OUTSIDE"]))
-    checks.append(("round toward zero: 1/3 truncates", rtz(Fr(1, 3)) == u2f(0x3EAAAAAA) and f32(1 / 3) == u2f(0x3EAAAAAB)))
+    checks.append(("toward zero: 1/3 truncates", rtz(Fr(1, 3)) == u2f(0x3EAAAAAA) and f32(1 / 3) == u2f(0x3EAAAAAB)))
     if P is not None:
         ok = True
         for t in a:
@@ -813,20 +813,22 @@ def main(argv=None):
                 print("error: one runtime root (or dehydrated stream) per structure", file=sys.stderr)
                 return 2
             tabs = sample(bufs, roots, a.tri_kernels, a.box_kernels, a.seed)
-            with open(os.path.join(a.work, "cases.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(a.work, "cases.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(tabs, f)
             n = sum(len(t["cases"]) for t in tabs)
             print(f"{len(tabs)} kernels, {n} cases -> {a.work}")
             if P is not None:
                 os.makedirs(os.path.join(a.work, "kernels"), exist_ok=True)
                 for t in tabs:
-                    with open(os.path.join(a.work, "kernels", t["label"] + ".s"), "w", newline="\n") as f:
+                    path = os.path.join(a.work, "kernels", t["label"] + ".s")
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
                         f.write("\n".join(kernel_of(t).lines()) + "\n")
             return 0
         tabs = _load(a.work)
         if a.cmd == "translate":
             out = translate(tabs, os.path.abspath(a.translator))
-            with open(os.path.join(a.work, f"tr_{a.name}.json"), "w", encoding="utf-8") as f:
+            path = os.path.join(a.work, f"tr_{a.name}.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(out, f)
             print(f"{sum(len(v) for v in out.values())} cases translated -> tr_{a.name}.json")
             return 0
@@ -842,7 +844,7 @@ def main(argv=None):
                 print(f"hardware oracle unavailable: {e}", file=sys.stderr)
                 return 77
             p = os.path.join(a.work, "hw.json")
-            hw = json.load(open(p)) if os.path.isfile(p) else {}
+            hw = json.load(open(p, encoding="utf-8")) if os.path.isfile(p) else {}
             for t in tabs:
                 if (a.kernel and t["label"] not in a.kernel) or t["label"] in hw:
                     continue
@@ -854,11 +856,11 @@ def main(argv=None):
                     print(f"STOP {t['label']}: {why}", file=sys.stderr)
                     return 1
                 hw[t["label"]] = P.results(k, output)[0]
-                with open(p, "w") as f:
+                with open(p, "w", encoding="utf-8", newline="\n") as f:
                     json.dump(hw, f)
             return 0
-        hw = json.load(open(os.path.join(a.work, "hw.json")))
-        other = json.load(open(os.path.join(a.work, f"tr_{a.against}.json")))
+        hw = json.load(open(os.path.join(a.work, "hw.json"), encoding="utf-8"))
+        other = json.load(open(os.path.join(a.work, f"tr_{a.against}.json"), encoding="utf-8"))
         counts, stops = score(tabs, hw, other)
         for (kind, k), n in sorted(counts.items()):
             print(f"{kind:6} {k:16} {n}")
