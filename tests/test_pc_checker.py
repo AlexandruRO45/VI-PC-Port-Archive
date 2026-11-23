@@ -10,6 +10,16 @@ import pc_checker as pc  # noqa: E402
 XBOX = "Xbox Series X"
 
 
+class RamDetection(unittest.TestCase):
+    def test_detected_memory_keeps_capacities_outside_the_spinbox_range(self):
+        from unittest.mock import patch
+
+        for reported, expected in ((1, 1), (2, 2), (31.8, 32), (256, 256)):
+            with self.subTest(gib=reported):
+                with patch.object(pc, "_total_ram_bytes", return_value=int(reported * 2**30)):
+                    self.assertEqual(pc.detect_ram_gb(), expected)
+
+
 class GpuScore(unittest.TestCase):
     def test_exact(self):
         self.assertEqual(pc.gpu_score("NVIDIA GeForce RTX 3070"), 100)
