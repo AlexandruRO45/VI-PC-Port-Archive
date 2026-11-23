@@ -381,9 +381,33 @@ class Gen:
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
+        self.vsharp_cache = {}  # (first SGPR, lit1, lit3) -> cached V# unpacking/bounds parts in this basic block
+        self.lane_cache = None  # cached wave_lane() id at block top level
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
         self.build_meta = {}          # runtime build metadata from tools/shader_meta.py
+
+    def clear_block_caches(self):
+        """Reset all per-basic-block SGPR/SSA caches at CFG block and x_split boundaries."""
+        self.desc_cache.clear()
+        self.vsharp_cache.clear()
+        self.sgpr_imm.clear()
+        self.lane_cache = None
+        self._active_ssa = None
+
+    def and_cond(self, a_b, b_b):
+        """Boolean conjunction, eliding %true operands."""
+        if a_b == "%true":
+            return b_b
+        if b_b == "%true":
+            return a_b
+        return self._emit_op(f"OpLogicalAnd %bool {a_b} {b_b}")
+
+    def _emit_op(self, rhs):
+        """Allocate a fresh temporary id, emit `t = rhs`, and return `t`."""
+        t = self.tmp()
+        self.emit(f"{t} = {rhs}")
+        return t
 
     def tmp(self):
         self.n += 1
@@ -442,6 +466,8 @@ class Gen:
             self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
+            if self.vsharp_cache:
+                self.vsharp_cache = {k: v for k, v in self.vsharp_cache.items() if not (k[0] <= r < k[0] + 4)}
         p = self.reg_ptr(kind, r)
         self.emit(f"OpStore {p} {val}")
 
@@ -2222,15 +2248,13 @@ class Gen:
             return out
 
         if raw_parts is None:               # literal mode 1/2: one check for the whole load
-            cond = self.tmp()
-            self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
+            cond = self.and_cond(act, in_b)
             phis = guarded(cond, range(n))
         else:                               # mode 0/3 (or a run-time V#): each dword checks its own end
-            phis = []
-            for i in range(n):
-                cond = self.tmp()
-                self.emit(f"{cond} = OpLogicalAnd %bool {act} {raw_parts(i)}")
-                phis += guarded(cond, [i])
+            cond0 = self.and_cond(act, in_b)
+            phis = guarded(cond0, [0])
+            for i in range(1, n):
+                phis += guarded(raw_parts(i, cond0), [i])
         for i, v in enumerate(phis):
             self.dst({"k": "vgpr", "r": vd["r"] + i, "n": 1}, v)
 
@@ -3574,12 +3598,36 @@ class Gen:
             self.emit(f"{k} = OpIMul %uint {ix} {q}")
             self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {k}")
             return p
-        o, o64, h = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{o} = OpIMul %uint {ix} {step}")
+        if i == 1:
+            o = step
+        else:
+            o = self.tmp()
+            self.emit(f"{o} = OpIMul %uint {ix} {step}")
+        o64, h = self.tmp(), self.tmp()
         self.emit(f"{o64} = OpUConvert %ulong {o}")
         self.emit(f"{h} = OpIAdd %ulong {host} {o64}")
         self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_uint {h}")
         return p
+
+    def _vsharp_info(self, rsrc, lit1, lit3, top):
+        """Decode and cache invariant V# fields (d0..d3, base, stride, p2, etc.) for one SGPR descriptor in this basic block."""
+        cache_key = (rsrc["r"], lit1, lit3) if rsrc["k"] == "sgpr" else None
+        cached = self.vsharp_cache.get(cache_key) if cache_key is not None else None
+        if cached is not None:
+            return cached if top else dict(cached)
+        d0, d1, d2, d3 = self.sgpr_words(rsrc, 4)
+        hi, stride = self.tmp(), self.tmp()
+        self.emit(f"{hi} = OpBitwiseAnd %uint {d1} {self.cu(0xFFFF)}")
+        self.emit(f"{stride} = OpBitFieldUExtract %uint {d1} {self.cu(16)} {self.cu(14)}")
+        l64, h64, sh, base = (self.tmp() for _ in range(4))
+        self.emit(f"{l64} = OpUConvert %ulong {d0}")
+        self.emit(f"{h64} = OpUConvert %ulong {hi}")
+        self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
+        self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
+        info = {"d0": d0, "d1": d1, "d2": d2, "d3": d3, "hi": hi, "stride": stride, "base": base}
+        if cache_key is not None and top:
+            self.vsharp_cache[cache_key] = info
+        return info
 
     def buffer_address(self, a, mods, parts=False, elem=None, fixed_fmt=None):
         """(64-bit element address id, V# word3 id, in_bounds bool id, ..., step) for a MUBUF/MTBUF instruction:
@@ -3611,10 +3659,34 @@ class Gen:
             lit1 = self.sgpr_imm.get(rsrc["r"][1]) if isinstance(rsrc["r"][1], int) else None
         else:
             raise Unsupported("buffer V#")
-        d0, d1, d2, d3 = self.sgpr_words(rsrc, 4)
-        hi, stride = self.tmp(), self.tmp()
-        self.emit(f"{hi} = OpBitwiseAnd %uint {d1} {self.cu(0xFFFF)}")
-        self.emit(f"{stride} = OpBitFieldUExtract %uint {d1} {self.cu(16)} {self.cu(14)}")
+        top = self.desc_cache_ok()
+        vinfo = self._vsharp_info(rsrc, lit1, lit3, top)
+        d0, d1, d2, d3 = vinfo["d0"], vinfo["d1"], vinfo["d2"], vinfo["d3"]
+        stride, base = vinfo["stride"], vinfo["base"]
+
+        def vlazy(k, build):
+            v = vinfo.get(k)
+            if v is None:
+                v = build()
+                if top:
+                    vinfo[k] = v
+            return v
+
+        def get_p2():
+            return vlazy("p2", lambda: self._emit_op(f"OpINotEqual %bool {d2} {self.cu(0)}"))
+
+        def get_tid_b():
+            return vlazy("tid_b", lambda: self._emit_op(f"OpBitFieldUExtract %uint {d3} {self.cu(23)} {self.cu(1)}"))
+
+        def get_swz_b():
+            return vlazy("swz_b", lambda: self._emit_op(f"OpBitFieldUExtract %uint {d1} {self.cu(31)} {self.cu(1)}"))
+
+        def get_L_base():
+            def _build():
+                f = self._emit_op(f"OpBitFieldUExtract %uint {d3} {self.cu(21)} {self.cu(2)}")
+                return self._emit_op(f"OpIAdd %uint {f} {self.cu(3)}")
+            return vlazy("L_base", _build)
+
         # Swizzled buffers (docs/design.md, Swizzled buffer addressing; native gfx1036 measurement): SWIZZLE_ENABLE is
         # word1[31], INDEX_STRIDE word3[22:21] (IS = 8 << n), ADD_TID_ENABLE word3[23], element_size fixed at 4.
         # A literal word folds its bit (a Python bool); a run-time one is None.
@@ -3628,205 +3700,273 @@ class Gen:
         voff = None
         if "offen" in mods:
             voff = self.load_reg("vgpr", vregs[1] if has_idx else vregs[0])
-        # Effective index: idxen uses vindex alone and ignores ADD_TID_ENABLE; without idxen, ADD_TID_ENABLE supplies
-        # the wave lane (thread_id[5:0]).
-        tid_b = None
-        if has_idx:
-            idx = self.load_reg("vgpr", vregs[0])
-        elif tid is False:
-            idx = None
-        else:
-            lane = self.wave_lane()
-            if tid is None:                   # lane * run-time ADD_TID_ENABLE
-                tid_b, idx = self.tmp(), self.tmp()
-                self.emit(f"{tid_b} = OpBitFieldUExtract %uint {d3} {self.cu(23)} {self.cu(1)}")
-                self.emit(f"{idx} = OpIMul %uint {lane} {tid_b}")
-            else:
-                idx = lane
-        # SWIZZLE_ENABLE activates only with idxen or ADD_TID_ENABLE; scratch-swizzle stepping/suppression applies only
-        # when SWIZZLE_ENABLE=1, idxen=0, ADD_TID_ENABLE=1.
-        swz_u = None
-        if has_idx:
-            swz_active = swz
-            scratch_swz = False
-            if swz_active is None:
-                swz_u = self.tmp()
-                self.emit(f"{swz_u} = OpBitFieldUExtract %uint {d1} {self.cu(31)} {self.cu(1)}")
-        elif swz is False or tid is False:
-            swz_active = False
-            scratch_swz = False
-        elif swz is True and tid is True:
-            swz_active = True
-            scratch_swz = True
-        else:
-            swz_active = None
-            scratch_swz = None
-            if swz is True:
-                swz_u = tid_b
-            else:
-                swz_b = self.tmp()
-                self.emit(f"{swz_b} = OpBitFieldUExtract %uint {d1} {self.cu(31)} {self.cu(1)}")
-                if tid is True:
-                    swz_u = swz_b
-                else:
-                    swz_u = self.tmp()
-                    self.emit(f"{swz_u} = OpBitwiseAnd %uint {swz_b} {tid_b}")
         # off = uint32((offen ? voff : 0) + inst_offset): wraps at 32 bits on RDNA2.
         if voff is not None:
+            off_val = None
             if inst:
                 off = self.tmp()
                 self.emit(f"{off} = OpIAdd %uint {voff} {self.cu(inst)}")
             else:
                 off = voff
         else:
-            off = self.cu(inst)
-        # step: bytes between consecutive dwords of a raw access, None for linear +4 (including all idxen=1 and fmt).
-        step = None
-        if swz_active is False:
-            if soff_zero:
-                total = off
-            else:
-                total = self.tmp()
-                self.emit(f"{total} = OpIAdd %uint {soff_v} {off}")
-            if idx is not None:
-                m, t = self.tmp(), self.tmp()
-                self.emit(f"{m} = OpIMul %uint {idx} {stride}")
-                self.emit(f"{t} = OpIAdd %uint {total} {m}")
-                total = t
-            sw3 = False
-        else:
-            # buffer_offset = (index / IS * stride + (off & ~3)) * IS + (index % IS) * 4 + (off & 3), IS = 2^L;
-            # L = 0 (run-time V# with swz_u == 0) reduces to the linear address index * stride + off.
-            if lit3 is not None:
-                Li = 3 + (lit3 >> 21 & 3)
-                L = self.cu(Li)
-            else:
-                f, L, Li = self.tmp(), self.tmp(), None
-                self.emit(f"{f} = OpBitFieldUExtract %uint {d3} {self.cu(21)} {self.cu(2)}")
-                self.emit(f"{L} = OpIAdd %uint {f} {self.cu(3)}")
-            if swz_active is None:            # L * swz_u: 0 when not swizzled
-                t = self.tmp()
-                self.emit(f"{t} = OpIMul %uint {L} {swz_u}")
-                L, Li = t, None
-            om4, ol, sh = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{om4} = OpBitwiseAnd %uint {off} {self.cu(0xFFFFFFFC)}")
-            self.emit(f"{ol} = OpBitwiseAnd %uint {off} {self.cu(3)}")
-            msb, ms, inner, lsb, l4, im = (self.tmp() for _ in range(6))
-            self.emit(f"{msb} = OpShiftRightLogical %uint {idx} {L}")
-            self.emit(f"{ms} = OpIMul %uint {msb} {stride}")
-            self.emit(f"{inner} = OpIAdd %uint {ms} {om4}")
-            self.emit(f"{sh} = OpShiftLeftLogical %uint {inner} {L}")
-            if Li is not None:
-                self.emit(f"{lsb} = OpBitwiseAnd %uint {idx} {self.cu((1 << Li) - 1)}")
-            else:                             # index - (index >> L << L)
-                hi_part = self.tmp()
-                self.emit(f"{hi_part} = OpShiftLeftLogical %uint {msb} {L}")
-                self.emit(f"{lsb} = OpISub %uint {idx} {hi_part}")
-            self.emit(f"{l4} = OpShiftLeftLogical %uint {lsb} {self.cu(2)}")
-            self.emit(f"{im} = OpIAdd %uint {sh} {l4}")
-            b_off = self.tmp()
-            self.emit(f"{b_off} = OpIAdd %uint {im} {ol}")
-            if soff_zero:
-                total = b_off
-            else:
-                total = self.tmp()
-                self.emit(f"{total} = OpIAdd %uint {soff_v} {b_off}")
-            if elem != "fmt" and scratch_swz is not False:
-                if Li is not None:
-                    step = self.cu(4 << Li)
-                else:
-                    step = self.tmp()
-                    self.emit(f"{step} = OpShiftLeftLogical %uint {self.cu(4)} {L}")
-            # OOB_SELECT 3 with active swizzle and stride != 0 checks (idx + soffset) >= num_records or off + payload > stride.
-            if lit1 is not None and (lit1 >> 16 & 0x3FFF) == 0:
-                sw3 = False
-            elif swz_active is True:
-                if lit1 is not None:
-                    sw3 = True
-                else:
-                    sw3 = self.tmp()
-                    self.emit(f"{sw3} = OpINotEqual %bool {stride} {self.cu(0)}")
-            else:                             # L * stride != 0: swz_u == 1 (L >= 3) and stride != 0 (no overflow)
-                ls, sw3 = self.tmp(), self.tmp()
-                self.emit(f"{ls} = OpIMul %uint {L} {stride}")
-                self.emit(f"{sw3} = OpINotEqual %bool {ls} {self.cu(0)}")
+            off_val = inst & 0xFFFFFFFF
+            off = self.cu(off_val)
+
+        # Effective index, swizzle mode, L, step, and sw3: cached per V# for non-idxen calls, and V#-only
+        # parameters cached for idxen calls too.
         self.uses_psb = True
-        l64, h64, sh, base, o64, addr = (self.tmp() for _ in range(6))
-        self.emit(f"{l64} = OpUConvert %ulong {d0}")
-        self.emit(f"{h64} = OpUConvert %ulong {hi}")
-        self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
-        self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
-        self.emit(f"{o64} = OpUConvert %ulong {total}")
-        self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
+        step = None
         mode = None if lit3 is None else lit3 >> 28 & 3
+        if has_idx:
+            idx = self.load_reg("vgpr", vregs[0])
+            noidx_p1 = None
+            idx_c = vinfo.get("idxen") if top else dict(vinfo.get("idxen", {}))
+            if not idx_c:
+                swz_active = swz
+                scratch_swz = False
+                swz_u = get_swz_b() if swz_active is None else None
+                if swz_active is False:
+                    L = Li = None
+                    sw3 = False
+                else:
+                    if lit3 is not None:
+                        Li = 3 + (lit3 >> 21 & 3)
+                        L = self.cu(Li)
+                    else:
+                        L, Li = get_L_base(), None
+                    if swz_active is None:
+                        L = self._emit_op(f"OpIMul %uint {L} {swz_u}")
+                        Li = None
+                    if lit1 is not None and (lit1 >> 16 & 0x3FFF) == 0:
+                        sw3 = False
+                    elif swz_active is True:
+                        sw3 = True if lit1 is not None else self._emit_op(f"OpINotEqual %bool {stride} {self.cu(0)}")
+                    else:
+                        ls = self._emit_op(f"OpIMul %uint {L} {stride}")
+                        sw3 = self._emit_op(f"OpINotEqual %bool {ls} {self.cu(0)}")
+                idx_c = {"swz_active": swz_active, "scratch_swz": scratch_swz, "swz_u": swz_u, "L": L, "Li": Li, "sw3": sw3}
+                if top:
+                    vinfo["idxen"] = idx_c
+            else:
+                swz_active, scratch_swz, swz_u, L, Li, sw3 = (
+                    idx_c["swz_active"], idx_c["scratch_swz"], idx_c["swz_u"], idx_c["L"], idx_c["Li"], idx_c["sw3"]
+                )
+            if swz_active is False:
+                if idx is not None:
+                    m = self._emit_op(f"OpIMul %uint {idx} {stride}")
+                    base_off = m if soff_zero else self._emit_op(f"OpIAdd %uint {soff_v} {m}")
+                else:
+                    base_off = None if soff_zero else soff_v
+                if base_off is None:
+                    total = off
+                elif off_val == 0:
+                    total = base_off
+                else:
+                    total = self._emit_op(f"OpIAdd %uint {base_off} {off}")
+            else:
+                if off_val is not None:
+                    om4_val, ol_val = off_val & 0xFFFFFFFC, off_val & 3
+                    om4, ol = self.cu(om4_val), self.cu(ol_val)
+                else:
+                    om4_val = ol_val = None
+                    om4 = self._emit_op(f"OpBitwiseAnd %uint {off} {self.cu(0xFFFFFFFC)}")
+                    ol = self._emit_op(f"OpBitwiseAnd %uint {off} {self.cu(3)}")
+                msb = self._emit_op(f"OpShiftRightLogical %uint {idx} {L}")
+                ms = self._emit_op(f"OpIMul %uint {msb} {stride}")
+                inner = ms if om4_val == 0 else self._emit_op(f"OpIAdd %uint {ms} {om4}")
+                sh = self._emit_op(f"OpShiftLeftLogical %uint {inner} {L}")
+                if Li is not None:
+                    lsb = self._emit_op(f"OpBitwiseAnd %uint {idx} {self.cu((1 << Li) - 1)}")
+                else:
+                    hi_part = self._emit_op(f"OpShiftLeftLogical %uint {msb} {L}")
+                    lsb = self._emit_op(f"OpISub %uint {idx} {hi_part}")
+                l4 = self._emit_op(f"OpShiftLeftLogical %uint {lsb} {self.cu(2)}")
+                im = self._emit_op(f"OpIAdd %uint {sh} {l4}")
+                b_off = im if ol_val == 0 else self._emit_op(f"OpIAdd %uint {im} {ol}")
+                total = b_off if soff_zero else self._emit_op(f"OpIAdd %uint {soff_v} {b_off}")
+        else:
+            nx = vinfo.get("noidx") if top else dict(vinfo.get("noidx", {}))
+            if not nx:
+                if tid is False:
+                    idx = None
+                    swz_active = False
+                    scratch_swz = False
+                    swz_u = L = Li = sw_idx_base = None
+                    sw3 = False
+                else:
+                    lane = self.wave_lane()
+                    if tid is None:
+                        tid_b = get_tid_b()
+                        idx = self._emit_op(f"OpIMul %uint {lane} {tid_b}")
+                    else:
+                        tid_b = None
+                        idx = lane
+                    if swz is False:
+                        swz_active, scratch_swz, swz_u = False, False, None
+                    elif swz is True and tid is True:
+                        swz_active, scratch_swz, swz_u = True, True, None
+                    else:
+                        swz_active, scratch_swz = None, None
+                        if swz is True:
+                            swz_u = tid_b
+                        else:
+                            swz_b = get_swz_b()
+                            swz_u = swz_b if tid is True else self._emit_op(f"OpBitwiseAnd %uint {swz_b} {tid_b}")
+                    if swz_active is False:
+                        L = Li = sw_idx_base = None
+                        sw3 = False
+                        m = self._emit_op(f"OpIMul %uint {idx} {stride}")
+                        sw_idx_base = m
+                    else:
+                        if lit3 is not None:
+                            Li = 3 + (lit3 >> 21 & 3)
+                            L = self.cu(Li)
+                        else:
+                            L, Li = get_L_base(), None
+                        if swz_active is None:
+                            L = self._emit_op(f"OpIMul %uint {L} {swz_u}")
+                            Li = None
+                        msb = self._emit_op(f"OpShiftRightLogical %uint {idx} {L}")
+                        ms = self._emit_op(f"OpIMul %uint {msb} {stride}")
+                        if Li is not None:
+                            lsb = self._emit_op(f"OpBitwiseAnd %uint {idx} {self.cu((1 << Li) - 1)}")
+                        else:
+                            hi_part = self._emit_op(f"OpShiftLeftLogical %uint {msb} {L}")
+                            lsb = self._emit_op(f"OpISub %uint {idx} {hi_part}")
+                        l4 = self._emit_op(f"OpShiftLeftLogical %uint {lsb} {self.cu(2)}")
+                        sh_ms = self._emit_op(f"OpShiftLeftLogical %uint {ms} {L}")
+                        sw_idx_base = self._emit_op(f"OpIAdd %uint {sh_ms} {l4}")
+                        if lit1 is not None and (lit1 >> 16 & 0x3FFF) == 0:
+                            sw3 = False
+                        elif swz_active is True:
+                            sw3 = True if lit1 is not None else self._emit_op(f"OpINotEqual %bool {stride} {self.cu(0)}")
+                        else:
+                            ls = self._emit_op(f"OpIMul %uint {L} {stride}")
+                            sw3 = self._emit_op(f"OpINotEqual %bool {ls} {self.cu(0)}")
+                nx = {
+                    "idx": idx, "swz_active": swz_active, "scratch_swz": scratch_swz,
+                    "swz_u": swz_u, "L": L, "Li": Li, "sw_idx_base": sw_idx_base, "sw3": sw3,
+                }
+                if top:
+                    vinfo["noidx"] = nx
+            else:
+                idx, swz_active, scratch_swz, swz_u, L, Li, sw_idx_base, sw3 = (
+                    nx["idx"], nx["swz_active"], nx["scratch_swz"], nx["swz_u"],
+                    nx["L"], nx["Li"], nx["sw_idx_base"], nx["sw3"],
+                )
+            noidx_p1 = nx.get("p1")
+            if swz_active is False:
+                if off_val == 0:
+                    b_off = sw_idx_base
+                elif sw_idx_base is None:
+                    b_off = off
+                else:
+                    b_off = self._emit_op(f"OpIAdd %uint {sw_idx_base} {off}")
+            else:
+                if off_val is not None:
+                    om4_val, ol_val = off_val & 0xFFFFFFFC, off_val & 3
+                    om4, ol = self.cu(om4_val), self.cu(ol_val)
+                else:
+                    om4_val = ol_val = None
+                    om4 = self._emit_op(f"OpBitwiseAnd %uint {off} {self.cu(0xFFFFFFFC)}")
+                    ol = self._emit_op(f"OpBitwiseAnd %uint {off} {self.cu(3)}")
+                if om4_val == 0:
+                    im = sw_idx_base
+                else:
+                    om_sh = self._emit_op(f"OpShiftLeftLogical %uint {om4} {L}")
+                    im = self._emit_op(f"OpIAdd %uint {sw_idx_base} {om_sh}")
+                b_off = im if ol_val == 0 else self._emit_op(f"OpIAdd %uint {im} {ol}")
+            if b_off is None:
+                total = self.cu(0) if soff_zero else soff_v
+            else:
+                total = b_off if soff_zero else self._emit_op(f"OpIAdd %uint {soff_v} {b_off}")
+            if elem != "fmt" and scratch_swz is not False:
+                step = nx.get("step")
+                if step is None:
+                    if Li is not None:
+                        step = self.cu(4 << Li)
+                    else:
+                        step = self._emit_op(f"OpShiftLeftLogical %uint {self.cu(4)} {L}")
+                    if top:
+                        nx["step"] = step
+
+        if not has_idx and idx is None and off_val == 0 and soff_zero:
+            addr = base
+        else:
+            o64 = self._emit_op(f"OpUConvert %ulong {total}")
+            addr = self._emit_op(f"OpIAdd %ulong {base} {o64}")
+
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
         need_raw = mode in (None, 3) and sw3 is not True
         need_p3 = mode in (None, 3) and sw3 is not False
         need_p1 = mode in (None, 0, 1) or (need_p3 and soff_zero)
         p1 = p2 = p3_idx = None
         if need_p1:
-            p1 = self.tmp()
-            if idx is None:
-                self.emit(f"{p1} = OpINotEqual %bool {d2} {self.cu(0)}")
+            if not has_idx:
+                if noidx_p1 is None:
+                    noidx_p1 = get_p2() if idx is None else self._emit_op(f"OpULessThan %bool {idx} {d2}")
+                    if top:
+                        nx["p1"] = noidx_p1
+                p1 = noidx_p1
             else:
-                self.emit(f"{p1} = OpULessThan %bool {idx} {d2}")
+                p1 = self._emit_op(f"OpULessThan %bool {idx} {d2}")
         if mode in (None, 2):
-            p2 = self.tmp()
-            self.emit(f"{p2} = OpINotEqual %bool {d2} {self.cu(0)}")
+            p2 = get_p2()
         off64 = d2_64 = soff64 = None
         if mode0_rule or need_raw:
-            off64 = self.tmp()
-            self.emit(f"{off64} = OpUConvert %ulong {off}")
+            off64 = self.cl(off_val) if off_val is not None else self._emit_op(f"OpUConvert %ulong {off}")
         if need_raw or (need_p3 and not soff_zero and idx is not None):
-            d2_64 = self.tmp()
-            self.emit(f"{d2_64} = OpUConvert %ulong {d2}")
+            d2_64 = vlazy("d2_64", lambda: self._emit_op(f"OpUConvert %ulong {d2}"))
         if not soff_zero and (need_raw or (need_p3 and idx is not None)):
-            soff64 = self.tmp()
-            self.emit(f"{soff64} = OpUConvert %ulong {soff_v}")
+            soff64 = self._emit_op(f"OpUConvert %ulong {soff_v}")
         if need_p3:
             if soff_zero:
                 p3_idx = p1
             elif idx is None:
-                p3_idx = self.tmp()
-                self.emit(f"{p3_idx} = OpULessThan %bool {soff_v} {d2}")
+                p3_idx = self._emit_op(f"OpULessThan %bool {soff_v} {d2}")
             else:
-                idx64, idx_s, p3_idx = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{idx64} = OpUConvert %ulong {idx}")
-                self.emit(f"{idx_s} = OpIAdd %ulong {idx64} {soff64}")
-                self.emit(f"{p3_idx} = OpULessThan %bool {idx_s} {d2_64}")
+                idx64 = self._emit_op(f"OpUConvert %ulong {idx}")
+                idx_s = self._emit_op(f"OpIAdd %ulong {idx64} {soff64}")
+                p3_idx = self._emit_op(f"OpULessThan %bool {idx_s} {d2_64}")
         lim = {}
         if mode0_rule:
-            st64 = self.tmp()
-            self.emit(f"{st64} = OpUConvert %ulong {stride}")
-            lim[0] = (off64, st64)
+            st64 = vlazy("st64", lambda: self._emit_op(f"OpUConvert %ulong {stride}"))
+            lim[0] = (off64, off_val, st64)
         if need_raw:
             if soff_zero:
-                offs64 = off64
+                offs64, offs_val = off64, off_val
             else:
-                offs64 = self.tmp()
-                self.emit(f"{offs64} = OpIAdd %ulong {off64} {soff64}")
-            lim[3] = (offs64, d2_64)
+                offs64 = self._emit_op(f"OpIAdd %ulong {off64} {soff64}")
+                offs_val = None
+            lim[3] = (offs64, offs_val, d2_64)
         sel = None
         if mode is None:
-            md, m1, m2, m3 = (self.tmp() for _ in range(4))
-            self.emit(f"{md} = OpBitFieldUExtract %uint {d3} {self.cu(28)} {self.cu(2)}")
-            self.emit(f"{m1} = OpIEqual %bool {md} {self.cu(1)}")
-            self.emit(f"{m2} = OpIEqual %bool {md} {self.cu(2)}")
-            self.emit(f"{m3} = OpIEqual %bool {md} {self.cu(3)}")
-            sel = (m1, m2, m3)
+            def _build_sel():
+                md = self._emit_op(f"OpBitFieldUExtract %uint {d3} {self.cu(28)} {self.cu(2)}")
+                m1 = self._emit_op(f"OpIEqual %bool {md} {self.cu(1)}")
+                m2 = self._emit_op(f"OpIEqual %bool {md} {self.cu(2)}")
+                m3 = self._emit_op(f"OpIEqual %bool {md} {self.cu(3)}")
+                return (m1, m2, m3)
+            sel = vlazy("sel", _build_sel)
 
         ends = {}   # (offset id, end) -> the ulong sum: modes 0 and 3 share it when soffset is 0
 
-        def end_ok(which, end_bytes):
-            """The access ends inside its limit: offset + end <= stride (mode 0) or <= num_records (mode 3);
-            end_bytes is a Python int or the id of a ulong."""
-            x, limit = lim[which]
+        def end_sum(x, x_val, end_bytes):
+            """offset + end as a ulong, built once per (offset, end)."""
+            if x_val is not None and isinstance(end_bytes, int):
+                return self.cl(x_val + end_bytes)
             end = ends.get((x, end_bytes))
             if end is None:
                 end = ends[(x, end_bytes)] = self.tmp()
                 self.emit(f"{end} = OpIAdd %ulong {x} {self.cl(end_bytes) if isinstance(end_bytes, int) else end_bytes}")
+            return end
+
+        def end_ok(which, end_bytes):
+            """The access ends inside its limit: offset + end <= stride (mode 0) or <= num_records (mode 3);
+            end_bytes is a Python int or the id of a ulong."""
+            x, x_val, limit = lim[which]
             ok = self.tmp()
-            self.emit(f"{ok} = OpULessThanEqual %bool {end} {limit}")
+            self.emit(f"{ok} = OpULessThanEqual %bool {end_sum(x, x_val, end_bytes)} {limit}")
             return ok
 
         def raw_or_swizzled(e3_sw, end_bytes):
@@ -3928,8 +4068,67 @@ class Gen:
             # modes 0 and 3 end-check every dword on its own; 1 and 2 (a literal V#) share the first-byte check.
             # Dword 0's check is in_b itself: computed here, before any of the caller's branches, so it dominates
             # every use (the loads and stores used to compute it a second time).
-            def part(k):
-                return in_b if k == 0 else check(k)
+            # Every per-dword bound has the form x + 4k + 4 <= limit with the same x and limit for all k (mode 0 and
+            # swizzled mode 3: off and stride; raw mode 3: off + soffset and num_records), and the index / num_records
+            # parts do not depend on k. So dword k is in range exactly when dword 0 is and 4k <= limit - (x + 4), the
+            # access's slack: in_b guarantees x + 4 <= limit, so the ulong difference cannot wrap where it matters, and
+            # modes 1 and 2 (first-byte checks only) get an unbounded slack. The slack is built once per access from
+            # dword 0's sums, so dword k > 0 costs one compare instead of re-deriving every mode's check (for a
+            # run-time V#, 9 instructions per dword).
+            slack_box = []
+            rooms = {}
+
+            def room(which):
+                """limit - (x + 4) for lim[which], from dword 0's own sum."""
+                if which not in rooms:
+                    x, x_val, limit = lim[which]
+                    s = rooms[which] = self.tmp()
+                    self.emit(f"{s} = OpISub %ulong {limit} {end_sum(x, x_val, 4)}")
+                return rooms[which]
+
+            def slack():
+                # Built on first use (dword 1's check, in a block every later dword's block is dominated by), so a
+                # single-dword access emits nothing extra.
+                if not slack_box:
+                    if mode == 0:
+                        s = room(0)
+                    else:
+                        if sw3 is True:       # mode 3 swizzled with a stride: the stride bound
+                            s3 = room(0)
+                        elif sw3 is False:    # mode 3 raw: the num_records bound
+                            s3 = room(3)
+                        else:
+                            s3 = self.tmp()
+                            self.emit(f"{s3} = OpSelect %ulong {sw3} {room(0)} {room(3)}")
+                        if mode == 3:
+                            s = s3
+                        else:                 # run-time mode: 0 -> stride, 3 -> s3, 1 and 2 -> unbounded
+                            m12, s03, s = self.tmp(), self.tmp(), self.tmp()
+                            self.emit(f"{m12} = OpLogicalOr %bool {sel[0]} {sel[1]}")
+                            self.emit(f"{s03} = OpSelect %ulong {sel[2]} {s3} {room(0)}")
+                            self.emit(f"{s} = OpSelect %ulong {m12} {self.cl(0xFFFFFFFF)} {s03}")
+                    slack_box.append(s)
+                return slack_box[0]
+
+            dword_ok = {0: in_b}
+            cmp_cache = {}
+
+            def part(k, prefix=None):
+                if k == 0:
+                    return in_b if prefix is None else prefix
+                le = cmp_cache.get(k)
+                if le is None:
+                    le = cmp_cache[k] = self.tmp()
+                    self.emit(f"{le} = OpULessThanEqual %bool {self.cl(4 * k)} {slack()}")
+                if prefix is None:
+                    if k not in dword_ok:
+                        ok = self.tmp()
+                        self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {le}")
+                        dword_ok[k] = ok
+                    return dword_ok[k]
+                ok = self.tmp()
+                self.emit(f"{ok} = OpLogicalAnd %bool {prefix} {le}")
+                return ok
             return addr, d3, in_b, (part if mode in (None, 0, 3) else None), step
         return addr, d3, in_b, step
 
@@ -4057,11 +4256,13 @@ class Gen:
         if words is not None and per is not None and len(words) > 1:
             # modes 0 and 3: every dword is stored only if it ends inside (measured: a store that straddles the edge
             # writes the dwords before it); a store past the end of the buffer is a host-memory hazard otherwise
+            act_b = self.active_b()
+            cond0 = self.and_cond(act_b, in_b)
             ptr, host = self.tmp(), self.host_addr(addr)
             self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
             for i, w in enumerate(words):
-                cond, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {per(i)}")
+                cond = cond0 if i == 0 else per(i, cond0)
+                lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
                 self.emit(f"OpSelectionMerge {lbl_end} None")
                 self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
                 self.emit(f"{lbl_do} = OpLabel")
@@ -4966,6 +5167,9 @@ class Gen:
         """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
         wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane; wave32
         pixel shaders use the lane within either 32-lane half."""
+        top = self.desc_cache_ok()
+        if top and self.lane_cache is not None:
+            return self.lane_cache
         lane = self.tmp()
         if self.stage in ("cs", "ms"):
             self.emit(f"{lane} = OpBitwiseAnd %uint {self.local_index()} {self.cu(63 if self.wave64 else 31)}")
@@ -4975,6 +5179,8 @@ class Gen:
                 self.emit(f"{lane} = OpBitwiseAnd %uint {subgroup_lane} {self.cu(31)}")
             else:
                 self.emit(f"{lane} = OpCopyObject %uint {subgroup_lane}")
+        if top:
+            self.lane_cache = lane
         return lane
 
     def wave_source_lane(self, lane):
@@ -5091,9 +5297,7 @@ class Gen:
         self.x_seg += 1
         self.emit(f"OpStore %pc {self.cu(seg)}")
         self.x_marks.append((len(self.body), seg))
-        self.desc_cache.clear()
-        self.sgpr_imm.clear()
-        self._active_ssa = None
+        self.clear_block_caches()
         self.block_label = f"%blk{seg}"
         self.x_dirty = set()
 
@@ -16852,9 +17056,7 @@ def translate(path):
         if (any((kind, "w") in g.x_dirty for kind in fd["mem_reads"])
                 or any((kind, "r") in g.x_dirty or (kind, "w") in g.x_dirty for kind in fd["mem_writes"])):
             g.x_order_barrier()
-        g.desc_cache.clear()
-        g._active_ssa = None
-        g.sgpr_imm.clear()
+        g.clear_block_caches()
         g.x_tok.clear()
         g.x_mcache.clear()
         act = g.active_b()
@@ -16890,9 +17092,7 @@ def translate(path):
                         blbl = g.tmp()
                         g.emit(f"OpBranch {blbl}")
                         g.emit(f"{blbl} = OpLabel")
-                        g.desc_cache.clear()
-                        g._active_ssa = None
-                        g.sgpr_imm.clear()
+                        g.clear_block_caches()
                         g.x_tok.clear()
                         g.x_mcache.clear()
                         uterm = None
@@ -16966,9 +17166,7 @@ def translate(path):
             g.x_dirty.add((kind, "r"))
         for kind in fd["mem_writes"]:
             g.x_dirty.add((kind, "w"))
-        g.desc_cache.clear()
-        g._active_ssa = None
-        g.sgpr_imm.clear()
+        g.clear_block_caches()
         g.x_tok.clear()
         g.x_mcache.clear()
 
@@ -16988,9 +17186,7 @@ def translate(path):
         g.x_dirty = set(plan["dirty_in"].get(n, ())) if g.emulate_inline else set()
         g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
         g.x_gen += 1
-        g.desc_cache.clear()
-        g._active_ssa = None            # a cached lookup is only good inside the block that made it
-        g.sgpr_imm.clear()
+        g.clear_block_caches()            # a cached lookup is only good inside the block that made it
         cur = n
         while True:
             term, body = None, blocks[cur]
@@ -17007,9 +17203,7 @@ def translate(path):
                 emit_folded_region(folds[cur])
                 if cur in fold_chain:
                     cur = fold_chain[cur]
-                    g.desc_cache.clear()
-                    g._active_ssa = None
-                    g.sgpr_imm.clear()
+                    g.clear_block_caches()
                     g.x_tok.clear()
                     g.x_mcache.clear()
                     continue
