@@ -2096,13 +2096,16 @@ def windows_launcher(out: str, work: str, image: str) -> str:
         relative = literal(os.path.relpath(shaders, out))
         moved_catalog = (f'if /i not "%here%"=="{recorded}" if not defined LEONIDA_SHADERS '
                          f'set "LEONIDA_SHADERS=%here%{relative}"\n')
+    # The generated rem lines must not expand anything: cmd expands %-references before it recognizes rem, so an
+    # argument reference in a comment would put the caller's text (quotes, &, |, >) into the parsed line. The two
+    # second-argument checks below are explained here instead: %~2 is empty both without a second argument and with
+    # an explicit "", and "%2" (quotes kept) tells the two apart, so an explicit "" passes through with the rest.
     return f"""@echo off
 rem Starts gta6rt.exe, as gta6rt.sh does under Wine. --dry-run, --init or --run on its own uses the package in
 rem game_path.txt, the port's overlay for writes and the Vulkan backend; other arguments go to gta6rt.exe as given.
 setlocal EnableExtensions DisableDelayedExpansion
 set "here=%~dp0"
-rem Package mode only for the mode on its own: %~2 is empty both without a second argument and with "", so "%2"
-rem tells the two apart and an explicit "" passes through with the rest.
+rem Package mode only for the mode on its own; an explicitly empty second argument also passes through.
 if not "%~2"=="" goto pass
 if "%2"==\"\"\"\" goto pass
 if "%~1"=="--dry-run" goto package

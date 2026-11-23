@@ -601,14 +601,22 @@ class RuntimeBuildPackagingTest(unittest.TestCase):
             self.assertIn('set "image=100%% game.exe"', text)
             self.assertIn('"%here%gta6rt.exe" %~1 ".\\%image%" --overlay "%here%overlay"', text)
             self.assertIn('"%here%gta6rt.exe" %*', text)
+            # Checks below look at what cmd executes, not at the comments: rem lines and labels are left out.
+            lines = text.splitlines()
+            comments = [line for line in lines if line.lower().startswith("rem ")]
+            commands = [line for line in lines if line and not line.lower().startswith("rem ")
+                        and not line.startswith(":")]
+            # cmd expands %-references before it recognizes rem, so a comment must not reference an argument.
+            for line in comments:
+                self.assertNotRegex(line, r"%~?[0-9*]", line)
             # Package mode needs the mode alone: "%2" tells an explicit "" from no second argument.
-            self.assertIn('if "%2"=="""" goto pass', text)
+            self.assertIn('if "%2"=="""" goto pass', commands)
             # UNC package folders: pushd (not cd /d) enters them, popd drops the temporary drive letter, and the
             # loader's exit code survives popd.
-            self.assertIn('pushd "%game%" || exit /b 1', text)
-            self.assertNotIn("cd /d", text)
-            self.assertLess(text.index('set "rc=%ERRORLEVEL%"'), text.index("popd"))
-            self.assertIn("exit /b %rc%", text)
+            self.assertIn('pushd "%game%" || exit /b 1', commands)
+            self.assertFalse([line for line in commands if line.lower().startswith("cd ")], commands)
+            loader = commands.index('"%here%gta6rt.exe" %~1 ".\\%image%" --overlay "%here%overlay"')
+            self.assertEqual(commands[loader + 1:loader + 4], ['set "rc=%ERRORLEVEL%"', "popd", "exit /b %rc%"])
 
     @unittest.skipUnless(os.name == "nt", "drive letters")
     def test_on_windows_out_and_work_on_different_drives_still_get_a_launcher(self):
