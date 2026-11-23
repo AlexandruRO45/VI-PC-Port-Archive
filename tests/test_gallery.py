@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+import urllib.error
 import urllib.parse
 import urllib.request
 from unittest import mock
@@ -277,6 +278,28 @@ class TestGalleryServer(unittest.TestCase):
             self.assertEqual(r.headers.get("Cache-Control"), "no-cache")
         with urllib.request.urlopen(f"{base}/textures/test_tex.png", timeout=3) as r:
             self.assertEqual(r.headers.get("Cache-Control"), "no-cache")
+
+    def test_a_dds_preview_that_cannot_be_converted_says_so(self) -> None:
+        # The .dds is there, so the answer is not 404 "Texture not found": it is a 500 whose page names the
+        # decoder's error, and a missing decoder is a 501.
+        with open(os.path.join(self.textures_dir, "broken.dds"), "wb") as f:
+            f.write(b"DDS " + bytes(200))
+        base = f"http://127.0.0.1:{self.port}"
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"{base}/textures/broken.png", timeout=3)
+        self.assertEqual(caught.exception.code, 500)
+        self.assertEqual(caught.exception.reason, "DDS preview failed")
+        self.assertIn(b"DdsError", caught.exception.read())
+
+        self.addCleanup(setattr, gallery, "dds_png", gallery.dds_png)
+        gallery.dds_png = None
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"{base}/textures/inside.png", timeout=3)
+        self.assertEqual(caught.exception.code, 501)
+        # A texture with no .dds next to it is still a plain 404.
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"{base}/textures/absent.png", timeout=3)
+        self.assertEqual(caught.exception.code, 404)
 
     def test_traversal_and_sibling_prefix_escapes_are_forbidden(self) -> None:
         host = f"127.0.0.1:{self.port}"

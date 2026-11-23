@@ -212,20 +212,27 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 if dds_cand is None:
                     self.send_error(403, "Forbidden")
                     return
-                if os.path.isfile(dds_cand) and dds_png:
+                if os.path.isfile(dds_cand):
+                    # The .dds exists, so a failed preview is reported as one: falling through used to answer
+                    # 404 "Texture not found" for a texture that is there, and dropped the decoder's reason.
+                    if dds_png is None:
+                        self.send_error(501, "DDS preview unavailable", "tools/dds_png.py could not be imported.")
+                        return
                     try:
                         png_bytes = dds_png.dds_file_to_png_bytes(dds_cand, max_size=1024)
-                        self.send_response(200)
-                        self.send_header("Content-Type", "image/png")
-                        self.send_header("Content-Length", str(len(png_bytes)))
-                        # The preview URL never changes (always <stem>.png), so a cached copy would outlive a
-                        # re-export of the .dds; revalidate like every other response (_send_file).
-                        self.send_header("Cache-Control", "no-cache")
-                        self.end_headers()
-                        self.wfile.write(png_bytes)
+                    except Exception as exc:
+                        # The reason goes in the escaped HTML body, not in the status line.
+                        self.send_error(500, "DDS preview failed", f"{type(exc).__name__}: {exc}")
                         return
-                    except Exception:
-                        pass
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(png_bytes)))
+                    # The preview URL never changes (always <stem>.png), so a cached copy would outlive a
+                    # re-export of the .dds; revalidate like every other response (_send_file).
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self.wfile.write(png_bytes)
+                    return
 
             if os.path.isfile(tpath):
                 mime = mimetypes.guess_type(tpath)[0] or "application/octet-stream"
