@@ -520,5 +520,21 @@ class TestDSDecU32ConditionCodes(unittest.TestCase):
         self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
 
 
+class TestDSDecU32BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_unsigned_high_bit_boundary(self) -> None:
+        # 0x80000000 has sign bit set, but in unsigned comparison 0x80000000 > 1000
+        # So ds_dec_u32(0x80000000, 1000) resets to 1000!
+        self.assertEqual(ds_dec_u32_oracle(0x80000000, 1000), 1000)
+
+        # 0xFFFFFFFF > 1000 -> resets to 1000
+        self.assertEqual(ds_dec_u32_oracle(0xFFFFFFFF, 1000), 1000)
+
+        # But if threshold is 0xFFFFFFFF:
+        # M = 0xFFFFFFFF == DATA -> M is not > DATA, M != 0 -> M - 1 = 0xFFFFFFFE
+        self.assertEqual(ds_dec_u32_oracle(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFE)
+
+
 if __name__ == "__main__":
     unittest.main()
