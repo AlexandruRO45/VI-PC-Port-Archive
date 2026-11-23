@@ -12,7 +12,6 @@ import unittest
 from unittest import mock
 import urllib.parse
 import urllib.request
-from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)

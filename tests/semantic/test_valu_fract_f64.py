@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, field
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from fractions import Fraction
 import math
