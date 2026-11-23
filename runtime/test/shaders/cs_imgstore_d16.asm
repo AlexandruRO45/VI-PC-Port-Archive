@@ -1,4 +1,5 @@
 ; Packed d16 image stores. Same descriptors, coordinates and expected texels as cs_imgstore.
+; Poison the integer upper halfwords: treating the packed operand as a full dword must fail.
 v_and_b32_e32 v1, 7, v0
 v_lshrrev_b32_e32 v2, 3, v0
 v_cvt_f32_u32_e32 v3, v1
@@ -20,6 +21,7 @@ v_cvt_pkrtz_f16_f32_e32 v4, v5, v6
 image_store v[3:4], v[1:2], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16
 v_lshl_add_u32 v7, v2, 3, v1
 v_add_nc_u32_e32 v7, 100, v7
+v_or_b32_e32 v7, 0xbeef0000, v7
 v_mov_b32_e32 v8, 0
 s_mov_b32 s16, 0x2000
 s_mov_b32 s17, 0x1400000
@@ -41,5 +43,6 @@ s_mov_b32 s29, 0x33
 s_mov_b32 s30, 0x33
 s_mov_b32 s31, 0x33
 v_and_b32_e32 v11, 0xffff, v11
+v_or_b32_e32 v11, 0xa55a0000, v11
 image_store v[11:12], v[1:2], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16
 s_endpgm
