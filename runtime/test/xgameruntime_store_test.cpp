@@ -86,6 +86,10 @@ using AssociatedAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, 
 using AsyncResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*);
 
 void CALLBACK on_async(XAsyncBlock* a) { ++*static_cast<int*>(a->context); }
+void CALLBACK release_async(XAsyncBlock* a) {
+    ++*static_cast<int*>(a->context);
+    VirtualFree(a, 0, MEM_RELEASE);
+}
 
 int g_callbacks = 0;
 void CALLBACK on_change(void*) { ++g_callbacks; }
@@ -249,6 +253,24 @@ int main() {
               at<Count>(store, 63)(store, &canceled, &canceled_wrong_count) == E_INVALIDARG && canceled_wrong_count == 99,
           "other offline operations reject a canceled durables block without changing count");
     XTaskQueueCloseHandle(queue);
+    XTaskQueueHandle terminating = nullptr;
+    check(SUCCEEDED(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Immediate,
+                                     &terminating)), "termination queue created");
+    int released_callbacks = 0;
+    auto* released = static_cast<XAsyncBlock*>(VirtualAlloc(nullptr, sizeof(XAsyncBlock),
+                                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    check(released != nullptr, "termination block allocated");
+    if (terminating && released) {
+        *released = XAsyncBlock{};
+        released->queue = terminating;
+        released->context = &released_callbacks;
+        released->callback = release_async;
+        check(at<CtxIdAsync>(store, 71)(store, context, "id", released) == S_OK, "termination request begins");
+        check(SUCCEEDED(XTaskQueueTerminate(terminating, false, nullptr, nullptr)), "termination begins");
+        XTaskQueueDispatch(terminating, XTaskQueuePort::Work, 0);
+        check(released_callbacks == 1, "termination completes and releases block inline");
+    }
+    if (terminating) XTaskQueueCloseHandle(terminating);
     check(at<NoArgs>(store, 46)(store) == E_NOTIMPL, "an undocumented slot answers E_NOTIMPL");
 
     check(at<Register>(store, 66)(store, context, nullptr, nullptr, on_change, &token) == S_OK &&

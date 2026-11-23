@@ -640,13 +640,15 @@ static void CALLBACK WorkerCallback(
         XAsyncCancel(state->userAsyncBlock);
         HRESULT callStatus;
         {
-            AsyncBlockInternalGuard internal{ state->userAsyncBlock };
+            // Cancellation may complete inline and release the caller's block.
+            // The worker owns state, so its provider block remains alive here.
+            AsyncBlockInternalGuard internal{ &state->providerAsyncBlock };
             callStatus = internal.GetStatus();
         }
 
         if (callStatus != E_ABORT)
         {
-            XAsyncComplete(state->userAsyncBlock, E_ABORT, 0);
+            XAsyncComplete(&state->providerAsyncBlock, E_ABORT, 0);
         }
     }
     else
