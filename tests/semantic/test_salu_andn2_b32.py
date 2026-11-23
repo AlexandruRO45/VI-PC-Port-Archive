@@ -256,5 +256,121 @@ class TestSAndn2B32AST(unittest.TestCase):
         with self.assertRaises(TypeError):
             instr.validate()
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Single-Lane Scalar Interpreter
+# -----------------------------------------------------------------------------
+
+class ScalarState:
+    """Models 32-bit RDNA2 scalar execution state."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs = [0] * num_sgprs
+        self.exec_lo: int = ALL32
+        self.vcc_lo: int = 0
+        self.scc: int = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if isinstance(op, ImmOperand):
+            return op.value & MASK32
+        if isinstance(op, RegOperand):
+            if op.kind == RegisterKind.SGPR:
+                return self.sgprs[op.index] & MASK32
+            if op.kind == RegisterKind.SPECIAL:
+                if op.name == "exec_lo":
+                    return self.exec_lo & MASK32
+                if op.name == "vcc_lo":
+                    return self.vcc_lo & MASK32
+                if op.name == "null":
+                    return 0
+                raise ValueError(f"Unknown special register: {op.name}")
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def write_operand(self, op: RegOperand, val: int) -> None:
+        val = val & MASK32
+        if op.kind == RegisterKind.SGPR:
+            self.sgprs[op.index] = val
+        elif op.kind == RegisterKind.SPECIAL:
+            if op.name == "exec_lo":
+                self.exec_lo = val
+            elif op.name == "vcc_lo":
+                self.vcc_lo = val
+            elif op.name == "null":
+                pass
+            else:
+                raise ValueError(f"Unknown special register: {op.name}")
+        else:
+            raise TypeError(f"Cannot write to operand kind: {op.kind}")
+
+
+class ScalarInterpreter:
+    """Executes s_andn2_b32 instructions and manages architectural register state."""
+
+    @staticmethod
+    def step(instr: SAndn2B32Instruction, state: ScalarState) -> int:
+        instr.validate()
+        s0 = state.read_operand(instr.src0)
+        s1 = state.read_operand(instr.src1)
+        d, scc = s_andn2_b32_oracle(s0, s1)
+        state.write_operand(instr.dst, d)
+        state.scc = scc
+        return d
+
+
+class TestSAndn2B32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter execution."""
+
+    def test_interpreter_sgpr_to_sgpr(self):
+        state = ScalarState()
+        state.sgprs[0] = 0x1234_5678
+        state.sgprs[1] = 0x00FF_00FF
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        res = ScalarInterpreter.step(instr, state)
+        expected = (0x1234_5678 & ~0x00FF_00FF) & MASK32
+        self.assertEqual(res, expected)
+        self.assertEqual(state.sgprs[2], expected)
+        self.assertEqual(state.scc, 1)
+
+    def test_interpreter_immediate_source(self):
+        state = ScalarState()
+        state.sgprs[0] = 0xFFFF_0000
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=1),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=ImmOperand(value=0xFF00_0000),
+        )
+        res = ScalarInterpreter.step(instr, state)
+        self.assertEqual(res, 0x00FF_0000)
+        self.assertEqual(state.sgprs[1], 0x00FF_0000)
+        self.assertEqual(state.scc, 1)
+
+    def test_interpreter_special_destinations(self):
+        state = ScalarState()
+        state.sgprs[0] = 0xAAAA_AAAA
+        state.sgprs[1] = 0x5555_5555
+        instr_null = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SPECIAL, name="null"),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        res = ScalarInterpreter.step(instr_null, state)
+        self.assertEqual(res, 0xAAAA_AAAA)
+        self.assertEqual(state.scc, 1)
+
+    def test_interpreter_scc_tracking(self):
+        state = ScalarState()
+        state.sgprs[0] = 0x1111_1111
+        instr_zero = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=1),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=0),
+        )
+        res = ScalarInterpreter.step(instr_zero, state)
+        self.assertEqual(res, 0)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
