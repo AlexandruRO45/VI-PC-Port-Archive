@@ -1,4 +1,5 @@
 """Hand-built SGD5 passes become a link-check manifest: python -I tests/test_sgd5_pass_pipelines.py"""
+import collections
 from contextlib import redirect_stdout
 import io
 import json
@@ -87,6 +88,14 @@ class PassPipelinesTest(unittest.TestCase):
         manifest, _, summary = self.run_tool(["Vert", "Pix", "Geo"])
         self.assertEqual(self.sets(manifest), [{"vs": "Vert", "ps": "Pix"}])
         self.assertIn("1  skipped: no .spv", summary)
+
+    def test_only_stage_sets_the_link_check_takes(self):
+        # An ms+gs+ps set would make `shader_link_check.py batch` refuse the whole manifest, so it is skipped by rule.
+        rows = [{"keys": {"ms": "m", "gs": "g", "ps": "p"}}, {"keys": {"vs": "v", "gs": "g", "ps": "p"}}]
+        counts = collections.Counter()
+        pipes = sgd5_pass_pipelines.pipelines_from(rows, counts)
+        self.assertEqual([sorted(k for k in p if k != "name") for p in pipes], [["gs", "ps", "vs"]])
+        self.assertEqual(counts["skipped: a stage set shader_link_check does not take"], 1)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sgd5_effects as S  # noqa: E402
+from shader_link_check import CHAINS  # noqa: E402  (the stage sets `batch` accepts)
 
 PASS_SIZE = 24
 
@@ -36,11 +37,16 @@ def census(archive, index, databases=None):
     rows = []
     with open(archive, "rb") as stream:
         for database, first_group, end in (S.DATABASES if databases is None else databases):
+            stream.seek(database)
+            if stream.read(4) != b"SGD5":
+                raise ValueError(f"expected an SGD5 database at {database:#x}")
             stream.seek(first_group)
             groups = S.program_groups(stream, end)
             count = S.u32(stream.read(4))
             base = stream.tell()
             data = stream.read(end - base)
+            if len(data) != end - base:
+                raise ValueError("truncated effect region")
             carve = {}
             for effect in S.effect_records(data, groups, count):
                 cursor = effect.first_pass
@@ -84,8 +90,8 @@ def pipelines_from(rows, counts, spirv_dir=None):
             counts["skipped: compute"] += 1
         elif "ps" not in keys:
             counts["skipped: no PS"] += 1
-        elif ("vs" in keys) == ("ms" in keys):
-            counts["skipped: not VS or MS"] += 1
+        elif tuple(s for s in ("vs", "ms", "gs", "ps") if s in keys) not in CHAINS:
+            counts["skipped: a stage set shader_link_check does not take"] += 1
         else:
             sets.add(tuple(sorted(keys.items())))
     out = []
