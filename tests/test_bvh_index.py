@@ -153,6 +153,11 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["kind"], "xml")
         self.assertFalse(row["fragment"])
         self.assertEqual(row["root_element"], "SSetupData")
+        with_enc = b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>\n<CMapData><name>x</name></CMapData>'
+        row_enc = bvh_index.classify(with_enc, len(with_enc))
+        self.assertEqual(row_enc["kind"], "xml")
+        self.assertFalse(row_enc["fragment"])
+        self.assertEqual(row_enc["root_element"], "CMapData")
 
     def test_xml_fragment(self):
         text = b"/americas/map/x_bvh.rpf</filename><Item/>" + b" " * 40
@@ -267,6 +272,21 @@ class ScanTest(unittest.TestCase):
         (archived,), _ = bvh_index.scan_rpf(archive)
         self.assertEqual(archived["kind"], "bvh4-chunk")
         self.assertNotIn("fill", archived)
+
+    def test_folder_name_with_glob_characters_is_a_path(self):
+        # glob read "[v1]" as a character class, so a folder named like this indexed nothing and exited 0.
+        folder = os.path.join(self.dir, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        rows, summary = bvh_index.scan_dir(folder)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+        archives = os.path.join(self.dir, "pack [1]")
+        os.makedirs(archives)
+        with open(os.path.join(archives, "a.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        rows, summary = bvh_index.scan_dir(archives)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
 
     def test_empty_and_short_archives_have_no_streams(self):
         for name, data in (("empty.rpf", b""), ("short.rpf", b"9FPR")):
