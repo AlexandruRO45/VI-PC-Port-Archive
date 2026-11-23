@@ -499,5 +499,25 @@ class TestDsWriteB8ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.lds.read_u8(10), 0xAA)
 
 
+# ------------------------------------------------------------------------------
+# ds_write_b8 SIMD Divergence & Byte Masking
+# ------------------------------------------------------------------------------
+
+class TestDsWriteB8SIMD(unittest.TestCase):
+    def test_simd_independent_byte_stores(self):
+        wave = SIMDWaveDS(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = i * 4  # addr
+            wave.vgprs[2][i] = 0x50 + i  # data
+
+        for i in range(32):
+            addr = wave.vgprs[1][i]
+            val = wave.vgprs[2][i]
+            wave.lds.write_u8(addr, val)
+
+        for i in range(32):
+            self.assertEqual(wave.lds.read_u8(i * 4), 0x50 + i)
+
+
 if __name__ == '__main__':
     unittest.main()
