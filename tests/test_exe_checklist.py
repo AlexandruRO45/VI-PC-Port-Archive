@@ -213,6 +213,47 @@ class ExeChecklist(unittest.TestCase):
         self.assertTrue(any(n["file"] == "docs/d3d12_vulkan.md" and n["kind"] == "ASSUMPTION" for n in notes))
         # so does modding.md's note on the three settings only the executable can confirm
         self.assertTrue(any(n["file"] == "docs/modding.md" and n["kind"] == "ASSUMPTION" for n in notes))
+        # C++ VERIFY notes in the GameInput shim are collected without matching prose like "the VERIFY list"
+        gi_notes = [n for n in notes if n["file"] == "runtime/shims/gameinput.cpp"]
+        self.assertTrue(any(n["kind"] == "VERIFY" and "timeout is not honoured" in n["text"] for n in gi_notes))
+        self.assertFalse(any("VERIFY list" in n["text"] for n in gi_notes))
+        # multi-class shim notes in xgameruntime_offline.cpp belong only to their own class section
+        offline = [n for n in notes if n["file"] == "runtime/shims/xgameruntime_offline.cpp"]
+        self.assertTrue(offline)
+        for n in offline:
+            self.assertEqual(len(n["classes"]), 1, n)
+
+    def test_verify_prose_is_not_matched(self):
+        src = ("// Overview mentioning the VERIFY list in prose (not a note).\n"
+               "//\n"
+               "// VERIFY: standalone abi check.\n"
+               "// Fallback rule (VERIFY against console behavior).\n"
+               "int x = 0;  // trailing (VERIFY: ignored)\n")
+        with open(os.path.join(self.root, "runtime", "shims", "verify_prose.cpp"), "w", encoding="utf-8",
+                  newline="\n") as f:
+            f.write(src)
+        found = [n for n in ec.collect(self.root) if n["file"] == "runtime/shims/verify_prose.cpp"]
+        self.assertEqual([(n["line"], n["kind"]) for n in found], [(3, "VERIFY"), (4, "VERIFY")])
+        self.assertEqual(found[0]["text"], "standalone abi check.")
+        self.assertEqual(found[1]["text"], "VERIFY against console behavior).")
+
+    def test_multi_class_shim_attributes_notes_to_enclosing_class(self):
+        class_a = "11111111-1111-1111-1111-111111111111"
+        class_b = "22222222-2222-2222-2222-222222222222"
+        src = ("// ASSUMPTION: file-level note applies to both classes.\n"
+               "constexpr GUID kFirstClass = {0x11111111, 0x1111, 0x1111, {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}};\n"
+               "// ASSUMPTION: only for first class.\n"
+               "constexpr GUID kSecondClass = {0x22222222, 0x2222, 0x2222, {0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22}};\n"
+               "// ASSUMPTION: only for second class.\n")
+        with open(os.path.join(self.root, "runtime", "shims", "multi.cpp"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(src)
+        notes = [n for n in ec.collect(self.root) if n["file"] == "runtime/shims/multi.cpp"]
+        self.assertEqual([n["classes"] for n in notes], [[class_a, class_b], [class_a], [class_b]])
+        rendered = ec.render(notes, {class_a})
+        lines = [l for l in rendered.split("\n") if l.startswith("- [ ]")]
+        self.assertIn("multi.cpp:1` ASSUMPTION **called**", lines[0])
+        self.assertIn("multi.cpp:3` ASSUMPTION **called**", lines[1])
+        self.assertIn("multi.cpp:5` ASSUMPTION (not called)", lines[2])
 
 
 if __name__ == "__main__":

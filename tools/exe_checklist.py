@@ -2,17 +2,18 @@
 
     python -I tools/exe_checklist.py [--gdk-calls REPORT.json]... [--out checklist.md] [--root DIR]
 
-The runtime and the docs mark what was written without the executable: `// ASSUMPTION ...` or `// ... UNVERIFIED`
-comments in runtime/src and runtime/shims (C++), and `**VERIFY:**`, `**ASSUMPTION:**` or `**UNVERIFIED:**` notes in
-docs/*.md, in any case (the prose spelling `**Assumption**`, `**Unverified:**` counts too; a bold term followed by
-a dash defines it and is not a note, and a marker that does not start its line or that sits in a table row is prose,
-not a note). This collects them with their file and line, the whole comment block or list item each starts, so the
-first look at the executable (scripts/first_look.ps1) has one list to work through.
+The runtime and the docs mark what was written without the executable: `// ASSUMPTION ...`, `// ... UNVERIFIED` or
+`// VERIFY: ...` / `(VERIFY ...)` comments in runtime/src and runtime/shims (C++), and `**VERIFY:**`, `**ASSUMPTION:**`
+or `**UNVERIFIED:**` notes in docs/*.md, in any case (the prose spelling `**Assumption**`, `**Unverified:**` counts too;
+a bold term followed by a dash defines it and is not a note, and a marker that does not start its line or that sits in a
+table row is prose, not a note). This collects them with their file and line, the whole comment block or list item each
+starts, so the first look at the executable (scripts/first_look.ps1) has one list to work through.
 
 --gdk-calls takes gdk_runtime_calls.py's JSON for the executable (its --out file or its --json output, one image or
 several). A shim note then says whether the executable calls a runtime class that file serves: "called" items are
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
-`constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
+`constexpr GUID k...Class` ids, as gdk_runtime_calls reads them; in a file serving several classes, a note after a
+class declaration belongs to that class section, while file-header notes before the first class belong to all of them.
 
 Output: Markdown, to stdout or --out (LF). Exit status 0 on success; 1 when a --gdk-calls file can't be read or
 the checklist cannot be written to --out; 2 when --out refers to an input report.
@@ -28,14 +29,14 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gdk_runtime_calls import served_classes  # noqa: E402
+from gdk_runtime_calls import GUID_CONSTANT, served_classes  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ROOT = os.path.normpath(os.path.join(HERE, ".."))
 SOURCE_DIRS = ("runtime/src", "runtime/shims")
 SOURCE_EXTS = (".cpp", ".h", ".hpp", ".inl")
-CODE_MARK = re.compile(r"\b(ASSUMPTION|UNVERIFIED|VERIFY)\b")
+CODE_MARK = re.compile(r"\b(?:ASSUMPTION|UNVERIFIED)\b|\bVERIFY(?=\s*:)|(?<=\()VERIFY\b")
 # The docs spell the marker in caps (`**VERIFY:**`) and in prose (`**Assumption**`, `**Unverified:**`, `**Assumptions
 # to confirm:**`); all of them are notes.
 DOC_MARK = re.compile(r"\*\*(VERIFY|ASSUMPTION|UNVERIFIED)S?\b[^*]*:?\*\*", re.IGNORECASE)
@@ -56,11 +57,44 @@ def without_marker(text: str) -> str:
     return re.sub(r"^\**\s*(ASSUMPTION|UNVERIFIED|VERIFY)S?\b[^:]*:\**\s*", "", text, count=1, flags=re.IGNORECASE)
 
 
-def code_notes(path: str, rel: str) -> list[dict]:
+def class_positions(source: str) -> list[tuple[int, str]]:
+    """[(1-based line, class id), ...] for each valid `constexpr GUID k...Class` in source, in order."""
+    classes = served_classes(source)
+    if not classes:
+        return []
+    if len(classes) == 1:
+        return [(1, next(iter(classes)))]
+    by_name = {name: guid for guid, name in classes.items()}
+    out = []
+    for m in GUID_CONSTANT.finditer(source):
+        guid = by_name.get(f"k{m.group(1)}Class")
+        if guid is not None:
+            out.append((source.count("\n", 0, m.start()) + 1, guid))
+    return out
+
+
+def classes_for_line(positions: list[tuple[int, str]], line: int) -> list[str]:
+    """The runtime class ids a note at `line` belongs to: the enclosing class section, or all classes for file headers."""
+    if not positions:
+        return []
+    if line < positions[0][0]:
+        return sorted({guid for _, guid in positions})
+    active = positions[0][1]
+    for pos_line, guid in positions:
+        if pos_line <= line:
+            active = guid
+        else:
+            break
+    return [active]
+
+
+def code_notes(path: str, rel: str, source: str | None = None) -> list[dict]:
     """Each whole-line comment run holding a marker, as one note from the run's first line to its last. Trailing
     comments (`x = 18;  // UNVERIFIED, see the header`) point at such a run and are not notes of their own."""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().split("\n")
+    if source is None:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    lines = source.split("\n")
     notes, i = [], 0
     while i < len(lines):
         if comment_text(lines[i]) is None:
@@ -73,12 +107,12 @@ def code_notes(path: str, rel: str) -> list[dict]:
             i += 1
         # A run can hold several notes, and a note starts at its marker (a file's header describes the file first):
         # each one runs from its marker to the next marker or the end of the run.
-        marks = [k for k, p in enumerate(parts) if CODE_MARK.search(p)]
-        for n, at in enumerate(marks):
-            stop = marks[n + 1] if n + 1 < len(marks) else len(parts)
-            first = parts[at][CODE_MARK.search(parts[at]).start():]
+        marks = [(k, m) for k, p in enumerate(parts) if (m := CODE_MARK.search(p))]
+        for n, (at, m) in enumerate(marks):
+            stop = marks[n + 1][0] if n + 1 < len(marks) else len(parts)
+            first = parts[at][m.start():]
             text = " ".join(p for p in [first] + parts[at + 1:stop] if p)
-            notes.append({"file": rel, "line": start + at + 1, "kind": CODE_MARK.search(first).group(1),
+            notes.append({"file": rel, "line": start + at + 1, "kind": m.group(0),
                           "text": without_marker(text)})
     return notes
 
@@ -117,14 +151,14 @@ def collect(root: str) -> list[dict]:
                 if name.endswith(SOURCE_EXTS):
                     path = os.path.join(dirpath, name)
                     rel = os.path.relpath(path, root).replace(os.sep, "/")
-                    found = code_notes(path, rel)
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        source = f.read()
+                    found = code_notes(path, rel, source)
                     if not found:
                         continue
-                    # The classes belong to the file, so parse them once and give every note from it the same list.
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        classes = sorted(served_classes(f.read()))
+                    positions = class_positions(source)
                     for n in found:
-                        n["classes"] = classes
+                        n["classes"] = classes_for_line(positions, n["line"])
                     notes += found
     docs = os.path.join(root, "docs")
     if os.path.isdir(docs):
