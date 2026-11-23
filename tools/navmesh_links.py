@@ -17,17 +17,14 @@ import os
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # as gamedata_index.py and awc_manifest.py do
+
 try:
     from tools import navmesh_decode as nd
     from tools.report_paths import same_report_path
 except ImportError:  # pragma: no cover - direct script execution
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import navmesh_decode as nd
     from report_paths import same_report_path
-
-from report_paths import same_report_path  # noqa: E402
-
-
 CHECK_NAMES = (
     "edges_valid",
     "poly_link_chain",
