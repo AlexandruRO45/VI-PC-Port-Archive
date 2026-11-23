@@ -3,14 +3,13 @@
 
     python -I tools/coverage_dashboard.py [--output docs/coverage/dashboard.svg] [--check]
 
-Extracts deterministic coverage counts across:
-  * RDNA2 (GFX1030) instruction forms (tools/rdna2spirv.py and tests/semantic/)
-  * x64 (Zen 2 user-mode mnemonics)
-  * Runtime & Win32/Vulkan shims (runtime/shims/ and runtime/src/)
-  * CLI tools & test suites (tools/*.py and tests/test_*.py)
+Reports static RDNA2 (GFX1030) and x64 (Zen 2) instruction estimates from
+hard-coded dashboard baselines with no documented measurement source.
+Runtime and shim figures are source-text estimates with fallback counts.
+CLI tool figures count matching test filenames.
 
 Renders a dark-mode SVG treemap for the project README and docs.
-In --check mode, verifies that the existing output file is present and up to date without drift.
+In --check mode, verifies the existing SVG's panel totals and their stated basis.
 """
 import argparse
 import datetime as dt
@@ -36,7 +35,7 @@ def get_git_metadata(repo_root=REPO_ROOT):
 
     try:
         r = subprocess.run(
-            ["git", "log", "-1", "--format=%h %cd", "--date=format:%Y-%m-%d %H:%M UTC"],
+            ["git", "log", "-1", "--format=%h %cI"],
             cwd=repo_root, capture_output=True, text=True, timeout=5
         )
         if r.returncode == 0 and r.stdout.strip():
@@ -51,10 +50,9 @@ def get_git_metadata(repo_root=REPO_ROOT):
 
 
 def get_rdna2_coverage(repo_root=REPO_ROOT):
-    """Collect GFX1030 (RDNA2) instruction-form coverage."""
-    # Standard catalog of GFX1030 forms and their baselines
+    """Return the static GFX1030 baseline independently of the checkout."""
     catalog = [
-        # (Category, Covered, Total)
+        # (Category, Estimated covered, Total)
         ("VOP3", 150, 425),
         ("SDWA", 54, 220),
         ("FLAT", 0, 133),
@@ -80,30 +78,20 @@ def get_rdna2_coverage(repo_root=REPO_ROOT):
         ("EXP", 1, 1),
     ]
 
-    # Dynamically verify semantic test additions
-    semantic_dir = os.path.join(repo_root, "tests", "semantic")
-    if os.path.isdir(semantic_dir):
-        extra_tests = len([f for f in os.listdir(semantic_dir) if f.startswith("test_") and f.endswith(".py")])
-        # Base count was 380 semantic tests; extra tests add to verified rules
-        if extra_tests > 380:
-            bonus = min(extra_tests - 380, 20)
-            # Credit to VOP3
-            catalog[0] = ("VOP3", catalog[0][1] + bonus, catalog[0][2])
-
     tot_cov = sum(c for _, c, _ in catalog) + sum(c for _, c, _ in small_items)
     tot_all = sum(t for _, _, t in catalog) + sum(t for _, _, t in small_items)
     return {
         "title": "gfx1030 (RDNA2) forms",
         "covered": tot_cov,
         "total": tot_all,
-        "skipped": 0,
+        "basis": "static estimate from hard-coded dashboard baseline",
         "categories": catalog,
         "small_items": small_items,
     }
 
 
 def get_x64_coverage(repo_root=REPO_ROOT):
-    """Collect x64 (Zen 2 user-mode mnemonics) coverage."""
+    """Return the static x64 (Zen 2 user-mode mnemonics) baseline."""
     catalog = [
         ("AVX", 208, 256),
         ("Integer", 147, 191),
@@ -128,7 +116,7 @@ def get_x64_coverage(repo_root=REPO_ROOT):
         "title": "x64 (Zen 2 user-mode mnemonics)",
         "covered": tot_cov,
         "total": tot_all,
-        "skipped": 0,
+        "basis": "static estimate from hard-coded dashboard baseline",
         "categories": catalog,
         "small_items": small_items,
     }
@@ -192,7 +180,7 @@ def get_runtime_coverage(repo_root=REPO_ROOT):
         "title": "Runtime & Win32/Vulkan Shims",
         "covered": tot_cov,
         "total": tot_all,
-        "skipped": 0,
+        "basis": "source-text estimate with fallback counts",
         "categories": categories,
         "small_items": small_items,
     }
@@ -239,10 +227,10 @@ def get_tools_coverage(repo_root=REPO_ROOT):
     tot_cov = sum(c for _, c, _ in categories)
     tot_all = sum(t for _, _, t in categories)
     return {
-        "title": "CLI Tools & Regression Coverage",
+        "title": "CLI Tools",
         "covered": tot_cov,
         "total": tot_all,
-        "skipped": 0,
+        "basis": "matching test filenames",
         "categories": categories,
         "small_items": [],
     }
@@ -294,6 +282,11 @@ def render_category_grid(name, covered, total, x, y, width, height):
     return "\n".join(lines)
 
 
+def panel_summary(panel):
+    """Format the counts and their basis for both rendering and drift checks."""
+    return f"{panel['title']}: {panel['covered']} of {panel['total']} ({panel['basis']})"
+
+
 def render_card(panel_data, card_x, card_y, card_w, card_h):
     """Render a section card containing multiple categories in a clean multi-column layout."""
     lines = []
@@ -301,11 +294,7 @@ def render_card(panel_data, card_x, card_y, card_w, card_h):
     lines.append(f'  <rect x="{card_x}" y="{card_y}" width="{card_w}" height="{card_h}" class="card-bg" />')
 
     # Card title
-    title = panel_data["title"]
-    cov = panel_data["covered"]
-    tot = panel_data["total"]
-    skips = panel_data.get("skipped", 0)
-    card_title_text = html.escape(f"{title}: {cov} of {tot} covered, {skips} held back by skips")
+    card_title_text = html.escape(panel_summary(panel_data))
     lines.append(f'  <text x="{card_x + 16}" y="{card_y + 24}" class="card-title">{card_title_text}</text>')
 
     # Arrange categories inside card
@@ -395,8 +384,8 @@ def render_dashboard_svg(panels, commit_sha, commit_date):
         f'  <rect width="{viewbox_w}" height="{total_height}" class="bg" />',
         '  <!-- Header -->',
         '  <text x="20" y="32" class="title">Leonida — Codebase &amp; Instruction Coverage</text>',
-        '  <text x="20" y="52" class="subtitle">Instruction-form coverage of source-built fixtures; not a measure of port completion.</text>',
-        f'  <text x="20" y="68" class="meta">Measured on {html.escape(commit_sha)}, {html.escape(commit_date)}. Green: covered. Amber: held back by skipped tests. Grey: not covered.</text>',
+        '  <text x="20" y="52" class="subtitle">Instruction baselines have no documented measurement source. Green cells represent each panel’s numerator.</text>',
+        f'  <text x="20" y="68" class="meta">Generated from checkout {html.escape(commit_sha)} ({html.escape(commit_date)}).</text>',
     ]
 
     curr_y = header_height
@@ -415,7 +404,7 @@ def render_dashboard_svg(panels, commit_sha, commit_date):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", "-o", default=DEFAULT_OUTPUT, help=f"Output SVG path (default: {DEFAULT_OUTPUT})")
-    parser.add_argument("--check", action="store_true", help="Check that the output file exists and matches current metrics without drift")
+    parser.add_argument("--check", action="store_true", help="Check that the output includes current metric totals and their basis")
     args = parser.parse_args()
 
     commit_sha, commit_date = get_git_metadata()
@@ -450,12 +439,9 @@ def main():
             sys.stderr.write(f"Check failed: could not read {args.output}: {e}\n")
             sys.exit(1)
 
-        # Check metrics parity
+        # Check the displayed totals and their stated basis.
         for p in panels:
-            title = p["title"]
-            cov = p["covered"]
-            tot = p["total"]
-            expected_snippet = html.escape(f"{title}: {cov} of {tot} covered")
+            expected_snippet = html.escape(panel_summary(p))
             if expected_snippet not in existing:
                 sys.stderr.write(f"Check failed: metric drift in {args.output} (expected '{expected_snippet}').\n")
                 sys.exit(1)

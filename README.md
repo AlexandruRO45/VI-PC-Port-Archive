@@ -41,7 +41,9 @@ Discord: https://discord.gg/rexed
 
 ![Leonida Codebase & Instruction Coverage](docs/coverage/dashboard.svg)
 
-*Instruction-form and codebase coverage from repository-owned synthetic tests and translator tables; updates automatically every 20 minutes.*
+*RDNA2 and x64 figures are static estimates from [hard-coded dashboard baselines](tools/coverage_dashboard.py)
+with no documented measurement source. Runtime figures use source-text estimates with fallback counts, and CLI tool
+figures count matching test filenames. The dashboard regenerates automatically every 20 minutes.*
 
 ## Project status
 

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
@@ -46,6 +47,24 @@ class TestCoverageDashboard(unittest.TestCase):
                 self.assertGreaterEqual(cov, 0, f"Category {name} covered must be >= 0")
                 self.assertLessEqual(cov, tot, f"Category {name} covered must be <= total")
 
+    def test_rdna2_estimates_ignore_blank_and_comment_only_tests(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            semantic_dir = Path(tmpdir) / "tests" / "semantic"
+            semantic_dir.mkdir(parents=True)
+            for index in range(380):
+                (semantic_dir / f"test_{index}.py").touch()
+            baseline = coverage_dashboard.get_rdna2_coverage(tmpdir)
+            self.assertEqual(coverage_dashboard.get_rdna2_coverage(tmpdir), baseline)
+
+            for name, content in (("blank", ""), ("comment_only", "# No assertions\n")):
+                with self.subTest(file=name):
+                    extra = semantic_dir / f"test_{name}.py"
+                    extra.write_text(content, encoding="utf-8", newline="\n")
+                    actual = coverage_dashboard.get_rdna2_coverage(tmpdir)
+                    extra.unlink()
+                    self.assertEqual((actual["covered"], actual["total"]), (541, 1865))
+                    self.assertEqual(actual, baseline)
+
     def test_render_category_grid_xml_validity(self):
         # Render a snippet and wrap in valid XML
         snippet = coverage_dashboard.render_category_grid("VOP3", 10, 20, 10, 10, 100, 80)
@@ -58,7 +77,7 @@ class TestCoverageDashboard(unittest.TestCase):
             "title": "Test Panel",
             "covered": 15,
             "total": 30,
-            "skipped": 0,
+            "basis": "example estimate",
             "categories": [("Cat A", 10, 20), ("Cat B", 5, 10)],
             "small_items": [("Small A", 2, 2)],
         }
@@ -100,13 +119,25 @@ class TestCoverageDashboard(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"Check mode failed: {r.stderr}")
             self.assertIn("is up to date", r.stdout)
 
-            # 3. Check mode fails if file is corrupted / drifted
+            # 3. Check mode rejects outdated provenance even with the same counts.
+            out_path = Path(out_svg)
+            svg = out_path.read_text(encoding="utf-8")
+            summary = "gfx1030 (RDNA2) forms: 541 of 1865 (static estimate from hard-coded dashboard baseline)"
+            root = ET.fromstring(svg)
+            self.assertIn(summary, [node.text for node in root if node.get("class") == "card-title"])
+            self.assertIn("VOP3 150/425", [node.text for node in root if node.get("class") == "cat-label"])
+            out_path.write_text(svg.replace(summary, "gfx1030 (RDNA2) forms: 541 of 1865 covered"),
+                                encoding="utf-8", newline="\n")
+            r = subprocess.run([sys.executable, "-I", tool_script, "--output", out_svg, "--check"], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1, r.stdout)
+
+            # 4. Check mode fails if file is corrupted / drifted
             with open(out_svg, "w", encoding="utf-8") as f:
                 f.write("<svg>drifted content</svg>")
             r = subprocess.run([sys.executable, "-I", tool_script, "--output", out_svg, "--check"], capture_output=True, text=True)
             self.assertEqual(r.returncode, 1, "Check mode should fail on drifted file")
 
-            # 4. Check mode fails if file missing
+            # 5. Check mode fails if file missing
             os.remove(out_svg)
             r = subprocess.run([sys.executable, "-I", tool_script, "--output", out_svg, "--check"], capture_output=True, text=True)
             self.assertEqual(r.returncode, 1, "Check mode should fail if file is missing")
