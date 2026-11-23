@@ -328,6 +328,31 @@ class TestValuSubF32AST(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertAlmostEqual(bits_to_f32(words[0]), 0.0, places=6)
 
+class TestValuSubF32ScalarExecution(unittest.TestCase):
+    """Stage 9: Scalar execution tests for v_sub_f32 clamp and omod."""
+
+    def test_sub_self_cancellation(self):
+        # v0 - v0 = 0.0
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_sub_f32_e64 v1, v0, v0 clamp",
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        words = support.mrt0_words(support.translate_lines(next_test_id("ps_sub_self"), lines))
+        self.assertAlmostEqual(bits_to_f32(words[0]), 0.0, places=6)
+
+    def test_sub_inline_literal(self):
+        # v0 - 0.5
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",  # 1.0
+            "v_sub_f32_e64 v1, v0, 0.5 clamp",
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        words = support.mrt0_words(support.translate_lines(next_test_id("ps_sub_inline"), lines))
+        self.assertAlmostEqual(bits_to_f32(words[0]), 0.5, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
