@@ -643,6 +643,18 @@ def hw_words(words, wave):
     return [tuple(words[4 * lane:4 * lane + 4]) for lane in range(wave)]
 
 
+def hw_results(oracle, progs):
+    """Per program the hardware's per-lane words, or a str reason. A program with an instruction the GPU does not have
+    (asm.program_skip_reason: v_cmp_t_u32 / v_cmp_f_i32 and their v_cmpx_ forms on GFX12) is never assembled; it
+    gets that reason, so it is a named skip and not one of the assembler's rejections."""
+    from hw_oracle import asm
+    out = [asm.program_skip_reason(p.lines(), oracle.arch) for p in progs]
+    todo = [i for i, why in enumerate(out) if not why]
+    for i, words in zip(todo, oracle.run([hw_kernel(progs[i]) for i in todo]) if todo else []):
+        out[i] = hw_words(words, progs[i].wave)
+    return out
+
+
 # ---- comparison, shrinking, the run --------------------------------------------------------------------------
 
 def _diff(prog, want, got, label):
@@ -764,8 +776,7 @@ def run_suite(programs, seed, max_ops, ops, waves=(32,), backends=("translator",
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops, waves[i % len(waves)]) for i in range(programs)]
     if "hw" in backends:
-        raw = oracle.run([hw_kernel(p) for p in progs])
-        hw = [hw_words(w, p.wave) for w, p in zip(raw, progs)]
+        hw = hw_results(oracle, progs)
     else:
         hw = [None] * programs
     if "vk" in backends:
@@ -891,8 +902,7 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(prog):
-            return check(prog, backends,
-                         (lambda p: hw_words(oracle.run([hw_kernel(p)])[0], p.wave)) if oracle else None)
+            return check(prog, backends, (lambda p: hw_results(oracle, [p])[0]) if oracle else None)
         for i, problem, prog in failures[: None if a.all_failures else 1]:
             small = shrink(prog, check_fn)
             print(f"MISMATCH program {i} (wave{prog.wave}): {check_fn(small) or problem}")
