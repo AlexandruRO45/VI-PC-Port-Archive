@@ -1014,3 +1014,41 @@ class TestDsPermuteB32SIMDAndProperties(unittest.TestCase):
         res, _ = run_workgroup_lanes("ps_perm_collision", lines, lanes=4)
         # Lane 3 is the highest lane sending to address 0
         self.assertEqual(res[0], 103)
+
+
+# ------------------------------------------------------------------------------
+# ds_permute_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestDsPermuteB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, -10)
+
+    def test_boundary_extremes_hardware(self):
+        # Full word value scatter
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_lshlrev_b32 v1, 2, v0",
+            "v_mov_b32 v2, 0xFFFFFFFF",
+            "ds_permute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_perm_max", lines, lanes=4)
+        self.assertEqual(res, [0xFFFFFFFF] * 4)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_lshlrev_b32 v1, 2, v0",
+            "ds_permute_b32 v4, v1, v0",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        _, spv = run_workgroup_lanes("ps_perm_lowering", lines, lanes=4)
+        self.assertIn("OpGroupNonUniformBallot", spv)
+
+
+if __name__ == "__main__":
+    unittest.main()
