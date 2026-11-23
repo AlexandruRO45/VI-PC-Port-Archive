@@ -1,7 +1,7 @@
 """Parity tests for the precompiled-struct fast path in `tools/ped_catalogues.py`.
 
 `parse_catalogue_blocks`, `read_tag_map` and `read_cull_drawable` decode records with shared `struct.Struct`
-objects, skip calls whose count or pointer is zero, and pause the cyclic collector while a catalogue is built.
+objects and skip calls whose count or pointer is zero.
 These tests pin the exact output (records, warnings, stats, resolved bindings) of well-formed and damaged
 synthetic catalogues, so a later speed-up cannot change what the parser reports. The golden digests were
 produced by the parser as it was before the fast path. Everything is synthesized in memory: no game files, no
@@ -370,19 +370,17 @@ class ParseCatalogueBlocksEdgeCases(unittest.TestCase):
         self.assertEqual((st.tags, st.ext_map_keys, st.cull_ref), ({}, (), None))
         self.assertEqual(cat.presets[0].tags, {})
 
-    def test_collector_setting_is_restored(self):
+    def test_parse_leaves_the_collector_setting_alone(self):
         blocks = as_blocks(build_blocks(4, seed=1))
         was = gc.isenabled()
         try:
-            gc.enable()
-            pc.parse_catalogue_blocks(blocks, 1, framing="0drp")
-            self.assertTrue(gc.isenabled())
-            with self.assertRaises(ValueError):
-                pc.parse_catalogue_blocks(blocks, 99, framing="0drp")  # missing root: still restored
-            self.assertTrue(gc.isenabled())
-            gc.disable()
-            pc.parse_catalogue_blocks(blocks, 1, framing="0drp")
-            self.assertFalse(gc.isenabled())  # a caller that turned it off keeps it off
+            for enabled in (True, False):
+                gc.enable() if enabled else gc.disable()
+                pc.parse_catalogue_blocks(blocks, 1, framing="0drp")
+                self.assertEqual(gc.isenabled(), enabled)
+                with self.assertRaises(ValueError):
+                    pc.parse_catalogue_blocks(blocks, 99, framing="0drp")  # missing root
+                self.assertEqual(gc.isenabled(), enabled)
         finally:
             gc.enable() if was else gc.disable()
 

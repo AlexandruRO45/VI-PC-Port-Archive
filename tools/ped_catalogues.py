@@ -47,7 +47,6 @@ from __future__ import annotations
 import argparse
 import collections
 from dataclasses import dataclass
-import gc
 import json
 import mmap
 import os
@@ -526,25 +525,6 @@ def parse_catalogue_blocks(
     source: str = "",
 ) -> CatalogueContainer:
     """Parse a `0x8dcb4cf5` ped appearance catalogue from a validated 1-based block dictionary."""
-    # The parse allocates one record object per preset and state and creates no reference cycles, so the cyclic
-    # collector only rescans the growing result; pause it for the duration and restore the caller's setting.
-    gc_was_enabled = gc.isenabled()
-    if gc_was_enabled:
-        gc.disable()
-    try:
-        return _parse_catalogue_blocks(blocks, root_block, framing=framing, source=source)
-    finally:
-        if gc_was_enabled:
-            gc.enable()
-
-
-def _parse_catalogue_blocks(
-    blocks: dict[int, tuple[int, memoryview]],
-    root_block: int,
-    *,
-    framing: str,
-    source: str,
-) -> CatalogueContainer:
     if root_block not in blocks:
         raise ValueError(f"root block {root_block} not present in block table")
     root_type, root_data = blocks[root_block]
