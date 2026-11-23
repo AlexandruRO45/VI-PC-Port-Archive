@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "anim_clips.py")
@@ -1332,6 +1333,20 @@ class ClipWindowTest(unittest.TestCase):
         stats = collections.Counter()
         anim_clips.count_clip_windows(clips, stats)
         self.assertEqual(stats, {"clip_windows": 4, "clip_windows_match_duration": 2, "clip_windows_rate_zero": 1})
+
+
+class WriteJsonReportPreserveTest(unittest.TestCase):
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(anim_clips, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    anim_clips.write_json_report(path, {"new": True})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

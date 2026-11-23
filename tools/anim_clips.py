@@ -32,8 +32,10 @@ import json
 import math
 import mmap
 import os
+import stat
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
@@ -41,7 +43,9 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 SYSTEM = 0x50000000
 CHANNEL_NAMES = ("static_quat", "static_vec3", "static_float", "raw_float", "quantize_float",
@@ -1552,11 +1556,7 @@ def main():
     except OSError as e:
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
     try:
-        parent = os.path.dirname(os.path.abspath(a.out))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "dictionaries": rows}, f, indent=1)
+        write_json_report(a.out, {"summary": summary, "dictionaries": rows})
     except OSError as e:
         sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
     c = summary["counts"]
@@ -1564,6 +1564,42 @@ def main():
     print(json.dumps({k: c.get(k, 0) for k in ("dictionaries", "clips", "animations", "animations_decoded",
                                                 "animations_failed", "sequences")}))
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".anim_clips-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
