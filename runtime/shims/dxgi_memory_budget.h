@@ -35,14 +35,17 @@ public:
     }
 
     HRESULT subscribe(const void* owner, HANDLE event, DWORD* cookie) {
-        if (!cookie) return E_INVALIDARG;
+        if (!cookie) return DXGI_ERROR_INVALID_CALL;
         *cookie = 0;
-        if (!event || event == INVALID_HANDLE_VALUE) return E_INVALIDARG;
+        if (!event || event == INVALID_HANDLE_VALUE) return DXGI_ERROR_INVALID_CALL;
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &duplicate, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS))
-            return HRESULT_FROM_WIN32(GetLastError());
+                             DUPLICATE_SAME_ACCESS)) {
+            const DWORD error = GetLastError();
+            return error == ERROR_INVALID_HANDLE ? DXGI_ERROR_INVALID_CALL : HRESULT_FROM_WIN32(error);
+        }
         Event held(duplicate);
+        if (!can_signal_event(held.get())) return DXGI_ERROR_INVALID_CALL;
 
         std::lock_guard lock(mutex_);
         if (closed_) return DXGI_ERROR_DEVICE_REMOVED;
@@ -99,6 +102,8 @@ public:
     }
 
 private:
+    static bool can_signal_event(HANDLE event);
+
     struct CloseEvent {
         void operator()(HANDLE handle) const { CloseHandle(handle); }
     };

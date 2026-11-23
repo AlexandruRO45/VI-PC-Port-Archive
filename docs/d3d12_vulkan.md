@@ -473,9 +473,10 @@ What is implemented (all of it testable without the game):
   measured on the host's `dxgi.dll` (Windows 11, RTX 3070) and are checked in `dxgi_swapchain_test`.
   `IDXGIAdapter3` uses `VK_EXT_memory_budget` for `QueryVideoMemoryInfo` and budget-change events. While events
   are registered, the device samples the local and non-local budgets every 250 ms and signals the events when
-  either budget changes. Usage updates alone leave the events unsignaled. Without the extension the static heap
-  sizes remain available and there is no polling. Releasing an adapter cancels its subscriptions and device teardown
-  stops the monitor before Vulkan objects are destroyed. `dxgi_memory_budget_test` covers budget changes with
+  either budget changes. Registration requires an event handle with `EVENT_MODIFY_STATE`, as on native DXGI.
+  Without the extension, the static heap sizes remain available and the timer stays idle. Releasing an adapter
+  cancels its subscriptions. Device teardown stops the monitor before Vulkan objects are destroyed.
+  `dxgi_memory_budget_test` covers budget changes with
   synthetic heap properties. `dxgi_device_test` checks registration and teardown through the COM interface.
   explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path,
   and exposing exactly the requested `BufferCount` even when Vulkan's native image count differs, in which case the

@@ -82,13 +82,24 @@ int main() {
     int a = 0, b = 0;
     DWORD first = 99, second = 0;
     CHECK(source.reads == 0);
-    CHECK(monitor->subscribe(&a, nullptr, &first) == E_INVALIDARG && first == 0);
-    CHECK(monitor->subscribe(&a, local.handle, nullptr) == E_INVALIDARG);
+    CHECK(monitor->subscribe(&a, nullptr, &first) == DXGI_ERROR_INVALID_CALL && first == 0);
+    CHECK(monitor->subscribe(&a, INVALID_HANDLE_VALUE, &first) == DXGI_ERROR_INVALID_CALL && first == 0);
+    CHECK(monitor->subscribe(&a, local.handle, nullptr) == DXGI_ERROR_INVALID_CALL);
+    HANDLE wait_only = nullptr;
+    CHECK(DuplicateHandle(GetCurrentProcess(), local.handle, GetCurrentProcess(), &wait_only, SYNCHRONIZE, FALSE, 0));
+    const HRESULT insufficient = monitor->subscribe(&a, wait_only, &first);
+    CloseHandle(wait_only);
+    CHECK(insufficient == DXGI_ERROR_INVALID_CALL && first == 0);
+    HANDLE semaphore = CreateSemaphoreW(nullptr, 0, 1, nullptr);
+    CHECK(semaphore);
+    const HRESULT wrong_type = monitor->subscribe(&a, semaphore, &first);
+    CloseHandle(semaphore);
+    CHECK(wrong_type == DXGI_ERROR_INVALID_CALL && first == 0);
 
     // The subscriber may close its copy after registering. The monitor still holds the same event object.
     HANDLE duplicate = nullptr;
-    CHECK(DuplicateHandle(GetCurrentProcess(), local.handle, GetCurrentProcess(), &duplicate, 0, FALSE,
-                          DUPLICATE_SAME_ACCESS));
+    CHECK(DuplicateHandle(GetCurrentProcess(), local.handle, GetCurrentProcess(), &duplicate,
+                          EVENT_MODIFY_STATE, FALSE, 0));
     const HRESULT registered = monitor->subscribe(&a, duplicate, &first);
     CloseHandle(duplicate);
     CHECK(registered == S_OK && first != 0);

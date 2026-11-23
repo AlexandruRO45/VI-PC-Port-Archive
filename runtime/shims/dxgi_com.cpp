@@ -15,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -1646,6 +1647,24 @@ private:
 };
 
 }  // namespace
+
+bool VideoMemoryBudgetMonitor::can_signal_event(HANDLE event) {
+    // Keep the access of the caller's handle. Native DXGI refuses a SYNCHRONIZE-only event and a non-event
+    // handle, even if DuplicateHandle could open the underlying object with additional rights.
+    static const auto query = reinterpret_cast<decltype(&NtQueryObject)>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
+    PUBLIC_OBJECT_BASIC_INFORMATION basic{};
+    if (!query || query(event, ObjectBasicInformation, &basic, sizeof(basic), nullptr) < 0 ||
+        !(basic.GrantedAccess & EVENT_MODIFY_STATE))
+        return false;
+    struct {
+        PUBLIC_OBJECT_TYPE_INFORMATION info;
+        wchar_t name[32];
+    } object{};
+    if (query(event, ObjectTypeInformation, &object, sizeof(object), nullptr) < 0) return false;
+    const auto& name = object.info.TypeName;
+    return name.Buffer && std::wstring_view(name.Buffer, name.Length / sizeof(wchar_t)) == L"Event";
+}
 
 std::shared_ptr<VideoMemoryBudgetMonitor> make_video_memory_budget_monitor(
     PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical) {
