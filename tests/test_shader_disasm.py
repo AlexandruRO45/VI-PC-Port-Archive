@@ -475,7 +475,10 @@ class DisasmOutputCollisionTest(unittest.TestCase):
 
 
 class FailedStateAndReadErrorTests(unittest.TestCase):
-    def test_main_clears_stale_failed_entries_between_calls(self):
+    def setUp(self):
+        self.addCleanup(shader_disasm.FAILED.clear)
+
+    def test_main_ignores_module_failed_state_between_calls(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "fssm")
             out = os.path.join(d, "disasm")
@@ -485,9 +488,9 @@ class FailedStateAndReadErrorTests(unittest.TestCase):
             shader_disasm.FAILED.append(("stale.fssm", "old failure"))
             rc = shader_disasm.main([src, "--out", out, "--backend", "python", "--jobs", "1"])
         self.assertEqual(rc, 0)
-        self.assertEqual(shader_disasm.FAILED, [])
+        self.assertEqual(shader_disasm.FAILED, [("stale.fssm", "old failure")])
 
-    def test_unreadable_fssm_reports_clean_error_via_failed(self):
+    def test_unreadable_fssm_reports_clean_error_without_leaking_failed(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "fssm")
             out = os.path.join(d, "disasm")
@@ -510,7 +513,7 @@ class FailedStateAndReadErrorTests(unittest.TestCase):
         self.assertEqual(stop.exception.code, 1)
         self.assertIn("bad.fssm", err.getvalue())
         self.assertIn("Permission denied", err.getvalue())
-        shader_disasm.FAILED.clear()
+        self.assertEqual(shader_disasm.FAILED, [])
 
 
 if __name__ == "__main__":
