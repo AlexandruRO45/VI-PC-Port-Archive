@@ -117,6 +117,45 @@ bool CALLBACK on_blob(const BlobInfo* info, void* context) {
     return true;
 }
 
+struct CallbackWait {
+    void* save;
+    Handle provider;
+    Seen seen;
+    HRESULT status = E_PENDING;
+};
+void wait_for_quota(CallbackWait* ctx) {
+    XAsyncBlock async{};
+    ctx->status = at<WithAsync>(ctx->save, 8)(ctx->save, ctx->provider, &async);
+    if (ctx->status != S_OK) return;
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE watchdog = CreateThread(nullptr, 0, [](void* p) -> DWORD {
+        if (WaitForSingleObject(static_cast<HANDLE>(p), 3000) == WAIT_TIMEOUT) {
+            std::printf("FAIL callback quota wait timed out after 3000 ms\n");
+            ExitProcess(2);
+        }
+        return 0;
+    }, done, 0, nullptr);
+    ctx->status = XAsyncGetStatus(&async, true);
+    SetEvent(done);
+    WaitForSingleObject(watchdog, INFINITE);
+    CloseHandle(watchdog);
+    CloseHandle(done);
+    int64_t quota = 0;
+    if (ctx->status == S_OK) ctx->status = at<QuotaResult>(ctx->save, 9)(ctx->save, &async, &quota);
+}
+bool CALLBACK waiting_container(const ContainerInfo* info, void* context) {
+    auto* ctx = static_cast<CallbackWait*>(context);
+    on_container(info, &ctx->seen);
+    wait_for_quota(ctx);
+    return true;
+}
+bool CALLBACK waiting_blob(const BlobInfo* info, void* context) {
+    auto* ctx = static_cast<CallbackWait*>(context);
+    on_blob(info, &ctx->seen);
+    wait_for_quota(ctx);
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -210,6 +249,29 @@ int main() {
     check(at<EnumBlobsByName>(save, 19)(save, container, "sto", &prefixed, on_blob) == S_OK &&
               prefixed.names.size() == 1 && prefixed.names[0] == "story",
           "EnumerateBlobInfoByName filters by prefix");
+
+    CallbackWait wc{save, provider};
+    check(at<EnumContainers>(save, 14)(save, provider, &wc, waiting_container) == S_OK &&
+              wc.status == S_OK && wc.seen.names == containers.names && wc.seen.displays == containers.displays &&
+              wc.seen.counts == containers.counts && wc.seen.sizes == containers.sizes,
+          "container enumeration permits async quota and preserves records");
+    CallbackWait wi{save, provider};
+    check(at<GetInfo>(save, 13)(save, provider, "slots/SAVE_00.sav-1", &wi, waiting_container) == S_OK &&
+              wi.status == S_OK && wi.seen.names == info.names,
+          "container info permits async quota and preserves records");
+    using EnumContainersByName = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, void*, ContainerCb);
+    CallbackWait wp{save, provider};
+    check(at<EnumContainersByName>(save, 15)(save, provider, "slots/", &wp, waiting_container) == S_OK &&
+              wp.status == S_OK && wp.seen.names == containers.names,
+          "filtered container enumeration permits async quota and preserves order");
+    CallbackWait wb{save, provider};
+    check(at<EnumBlobs>(save, 18)(save, container, &wb, waiting_blob) == S_OK &&
+              wb.status == S_OK && wb.seen.names == blobs.names && wb.seen.sizes == blobs.sizes,
+          "blob enumeration permits async quota and preserves order");
+    CallbackWait wbp{save, provider};
+    check(at<EnumBlobsByName>(save, 19)(save, container, "sto", &wbp, waiting_blob) == S_OK &&
+              wbp.status == S_OK && wbp.seen.names == prefixed.names && wbp.seen.sizes == prefixed.sizes,
+          "filtered blob enumeration permits async quota and preserves order");
 
     // ---- reading ----
     const char* names[] = {"story", "profile/main"};

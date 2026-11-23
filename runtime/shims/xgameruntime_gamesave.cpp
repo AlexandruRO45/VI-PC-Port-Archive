@@ -306,8 +306,8 @@ uint64_t used_bytes(const fs::path& user_dir) {
     return used;
 }
 
-void enumerate_containers(const fs::path& user_dir, std::string_view prefix, void* context, ContainerInfoCallback cb) {
-    for (const ContainerRecord& c : list_containers(user_dir, prefix)) {
+void enumerate_containers(const std::vector<ContainerRecord>& records, void* context, ContainerInfoCallback cb) {
+    for (const ContainerRecord& c : records) {
         const XGameSaveContainerInfo info{c.name.c_str(), c.display_name.c_str(), c.blob_count, c.total_size,
                                           c.modified, false};
         if (!cb(&info, context)) break;
@@ -664,13 +664,16 @@ HRESULT STDMETHODCALLTYPE save_delete_result(void*, XAsyncBlock* async) {
 HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, const char* name, void* context,
                                               ContainerInfoCallback cb) {
     if (!cb) return E_INVALIDARG;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
-    const fs::path dir = p->user_dir / widen(encode_name(name));
-    std::error_code ec;
-    if (!fs::is_directory(dir, ec)) return S_OK;
-    const ContainerRecord c = describe(name, dir);
+    ContainerRecord c;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
+        if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
+        const fs::path dir = p->user_dir / widen(encode_name(name));
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) return S_OK;
+        c = describe(name, dir);
+    }
     const XGameSaveContainerInfo info{c.name.c_str(), c.display_name.c_str(), c.blob_count, c.total_size, c.modified,
                                       false};
     cb(&info, context);
@@ -680,9 +683,13 @@ HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, 
 // 14: HRESULT XGameSaveEnumerateContainerInfo(XGameSaveProviderHandle, void* context, XGameSaveContainerInfoCallback*)
 HRESULT STDMETHODCALLTYPE save_enum_containers(void*, XGameSaveProviderHandle p, void* context, ContainerInfoCallback cb) {
     if (!cb) return E_INVALIDARG;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    enumerate_containers(p->user_dir, {}, context, cb);
+    std::vector<ContainerRecord> records;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
+        records = list_containers(p->user_dir, {});
+    }
+    enumerate_containers(records, context, cb);
     return S_OK;
 }
 
@@ -691,9 +698,13 @@ HRESULT STDMETHODCALLTYPE save_enum_containers(void*, XGameSaveProviderHandle p,
 HRESULT STDMETHODCALLTYPE save_enum_containers_by_name(void*, XGameSaveProviderHandle p, const char* prefix,
                                                        void* context, ContainerInfoCallback cb) {
     if (!cb) return E_INVALIDARG;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    enumerate_containers(p->user_dir, prefix ? std::string_view(prefix) : std::string_view{}, context, cb);
+    std::vector<ContainerRecord> records;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
+        records = list_containers(p->user_dir, prefix ? std::string_view(prefix) : std::string_view{});
+    }
+    enumerate_containers(records, context, cb);
     return S_OK;
 }
 
@@ -724,9 +735,13 @@ void STDMETHODCALLTYPE save_close_container(void*, XGameSaveContainerHandle c) {
 
 HRESULT enumerate_blobs(XGameSaveContainerHandle c, std::string_view prefix, void* context, BlobInfoCallback cb) {
     if (!cb) return E_INVALIDARG;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
-    for (const BlobFile& b : list_blobs(c->dir())) {
+    std::vector<BlobFile> records;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
+        records = list_blobs(c->dir());
+    }
+    for (const BlobFile& b : records) {
         if (b.name.compare(0, prefix.size(), prefix) != 0) continue;
         const XGameSaveBlobInfo info{b.name.c_str(), static_cast<uint32_t>(b.size)};
         if (!cb(&info, context)) break;
