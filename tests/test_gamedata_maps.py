@@ -465,6 +465,16 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual((row["size"], row["chunks"]), (65536, 1))
         self.assertEqual(row["grid"]["width"], 255)
 
+    def test_stops_mhiu_continuation_at_sps1z_boundary(self):
+        payload = mhiu_payload(300, 1, [(0, 300, [i % 256 for i in range(300)])], pixels=b"\x07" * 90000)
+        self.assertGreater(len(payload), 65536)
+        self.add(payload[:65536])
+        self.add(b"SPS1Z" + b"\x00" * (len(payload) - 65536 - 5))
+        self.finish()
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            gamedata_maps.read_payloads(self.carve)
+
 
 class MalformedCarveIndex(unittest.TestCase):
     """A carve index that parses but has no usable files list names the index, not a bare KeyError."""
