@@ -1098,6 +1098,31 @@ class LocalExecFoldTests(unittest.TestCase):
         for lane in range(64):
             self.assertEqual(mem[lane * 4], 77, f"lane {lane}: wave ran region so m0=1 -> v5=77 everywhere")
 
+    def test_readfirstlane_picks_the_first_active_lane_in_either_half(self):
+        # v_readfirstlane_b32 under --wave64-emulate reads the lowest lane that is on in EXEC; when the low half is
+        # off the answer is 32 + the lowest set bit of the high word. v0 holds the thread id, so the result names
+        # the lane it came from: lanes (of each wave) >= FIRST are on (s_and_saveexec_b64), the rest are off.
+        for first in (3, 32, 40, 63):
+            insns = [
+                ("v_mov_b32_e32 v7, %d" % (first - 1), 8),
+                ("v_and_b32_e32 v8, 63, v0", 4),
+                ("v_cmp_lt_u32_e64 s[6:7], v7, v8", 8),
+                ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+                ("v_readfirstlane_b32 s10, v0", 4),
+                ("s_mov_b64 exec, s[8:9]", 4),
+                ("v_mov_b32_e32 v2, s10", 4),
+                ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+                ("buffer_store_dword v2, v9, s[0:3], 0 offen", 8),
+                ("s_endpgm", 4),
+            ]
+            for local in ((64, 1, 1), (128, 1, 1)):
+                with self.subTest(first=first, local=local):
+                    spv, _ = _translate_encoded("cs_rfl_first_active", insns, local, emulate=True)
+                    mem, _ = run_emulated_workgroup(spv, local, push_constants=VSHARP + [0] * 28)
+                    for lane in range(local[0]):
+                        wave_base = lane & ~63
+                        self.assertEqual(mem[lane * 4], wave_base + first, f"lane {lane}")
+
     def test_single_store_acyclic_fold_orders_war_and_raw(self):
         # Acyclic single-store s_cbranch_execz regions fold inline (0 OpAtomicOr), while uniform pre/post
         # memory ordering protects both WAR (load before folded store) and RAW (folded store before load).
