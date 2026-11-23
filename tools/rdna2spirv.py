@@ -8409,6 +8409,16 @@ class Gen:
             # destination); VOP3-only, so the high half of the destination is kept (RDNA2 ISA; Mesa ACO can_use_opsel).
             # The product and sum are formed in 32 bits (no overflow possible), then the low 16 bits are kept. With
             # `clamp` the full-width result saturates to [0, 0xFFFF] (v_mad_u16) or [-32768, 32767] (v_mad_i16).
+            if len(a) != 4:
+                raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " destination")
+            opsel_mods = [m for m in mods if m.startswith("op_sel:")]
+            if (ins["op"].endswith(("_dpp", "_sdwa")) or
+                    any(s.get("neg") or s.get("abs") or s.get("sext") for s in a) or
+                    len(opsel_mods) > 1 or mods.count("clamp") > 1 or
+                    any(m != "clamp" and not m.startswith("op_sel:") for m in mods)):
+                raise Unsupported(op + " modifiers")
             sb, dhi = self.opsel_bits(mods, 3)
             vals = []
             for k, s_ in enumerate(a[1:4]):
