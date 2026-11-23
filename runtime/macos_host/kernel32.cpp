@@ -322,7 +322,13 @@ HANDLE CreateFileW(const char16_t* name, uint32_t access, uint32_t, void*, uint3
     else if (disposition == 5) mode |= O_TRUNC;            // TRUNCATE_EXISTING
     int fd = open(to_host_path(narrow.c_str()).c_str(), mode, 0644);
     if (fd < 0) {
-        set_last_error(2 /* ERROR_FILE_NOT_FOUND */);
+        // The CRT turns these into errno: a CREATE_NEW on an existing file is ERROR_FILE_EXISTS, which it reports as
+        // EEXIST (an exclusive _wsopen_s, _O_CREAT | _O_EXCL), not ERROR_FILE_NOT_FOUND's ENOENT.
+        const int err = errno;
+        set_last_error(err == EEXIST                  ? 80   // ERROR_FILE_EXISTS
+                       : err == EACCES || err == EPERM ? 5   // ERROR_ACCESS_DENIED
+                       : err == ENOTDIR                ? 3   // ERROR_PATH_NOT_FOUND
+                                                       : 2); // ERROR_FILE_NOT_FOUND
         return kInvalid;
     }
     return new Object{Object::File, fd};
