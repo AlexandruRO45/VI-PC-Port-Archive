@@ -74,12 +74,17 @@ captured PSO):
 
 | Target | `OSG1` mask | Inferred RTV format class (from shader encoding / #1891) | Channel layout and shader-side encoding in `PS_DeferredTextured` |
 |---|---|---|---|
-| `mrt0` (`SV_Target0`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Albedo + alpha/material byte:** `rgb` holds base colour/albedo; in the sampled 6-target variant `a` packs a byte extracted from an integer register (`ubyte0`) and scaled by `1.0 / 255.0` (`0x3b808081`). |
+| `mrt0` (`SV_Target0`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Albedo + alpha:** `rgb` holds base colour/albedo. What `a` holds depends on the variant (all 807, `tools/gbuffer_export_census.py`): in the 371 six-target ones, 98 export a byte (`v_cvt_f32_ubyte0`) scaled by `1.0 / 255.0` (`0x3b808081`), 102 an integer (`v_cvt_f32_u32`) scaled by `1.0 / 255.0`, 161 a float product without that scale and 10 something else; in the 380 five-target ones, 37 a byte and 157 an integer scaled by `1.0 / 255.0`, 186 a select or a move. |
 | `mrt1` (`SV_Target1`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Scalar in `r` + 24-bit octahedral world normal split across `g`, `b`, `a`:** see section 3 below. |
 | `mrt2` (`SV_Target2`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Square-root encoded channels:** producer applies hardware square root (`sqrt(x)` or `sqrt(1.0 - sqrt(x))`) before `v_cvt_pkrtz_f16_f32` export; #1891 notes that the lighting consumer squares `mrt2` back (tentatively specular / $F_0$ material terms, pending lighting-consumer verification). |
 | `mrt3` (`SV_Target3`) | `0xF` (`RGBA`) | `R8G8B8A8_UNORM` | **Flags + byte IDs:** `x` and `y` carry clamped `[0, 1]` values biased by a dither term (`scale = 2.0 / 255.0` = `0x3c008081`, `offset = -1.0 / 255.0` = `0xbb808081`); `z` and `w` carry two 8-bit integer IDs extracted with byte-to-float conversion (`ubyte0`, `ubyte1`) and multiplied by `1.0 / 255.0` (`0x3b808081`). |
-| `mrt4` (`SV_Target4`) | `0x3` (`RG`, 2,113 / 2,109 deferred PS) or `0xF` (`RGBA`, 739 / 737 deferred PS) | Float format (e.g. `R16G16_FLOAT`) | **Motion vectors:** unscaled signed float screen-space motion offset (`xy`; in the sampled 5- and 6-target `PS_DeferredTextured` disassembly with `mask = 0x3`, exported as `exp mrt4, vN, vN, off, off compr`). |
+| `mrt4` (`SV_Target4`) | `0x3` (`RG`, 2,113 / 2,109 deferred PS) or `0xF` (`RGBA`, 739 / 737 deferred PS) | Float format (e.g. `R16G16_FLOAT`) | **Motion vectors:** unscaled signed float screen-space motion offset (`xy`; every `PS_DeferredTextured` with `mask = 0x3`, 380 five-target and 204 six-target, exports `exp mrt4, vN, vN, off, off compr`, and the 167 six-target ones with `mask = 0xF` export all four slots, `compr`). |
 | `mrt5` (`SV_Target5`) | `0xF` (`RGBA`, 1,690 / 1,684 deferred PS) | `R8G8B8A8_UNORM` | **Sixth deferred target** on the 6-target permutations (`rgb` material terms + clamped alpha). |
+
+The `mrt0` and `mrt4` counts come from `python -I tools/gbuffer_export_census.py <work>/shaders/dxbc/disasm`, which
+follows each register back to the nearest earlier instruction that writes it in listing order: it is not a data-flow
+analysis. 31 six-target and 24 five-target `mrt0` alphas have a label or branch on that path (the tool prints them as
+`crosses`), so another path may produce them; among the byte and integer ones, only 12 five-target integer alphas do.
 
 ## 3. The 24-bit octahedral normal in `mrt1.gba` and `UNORM8` vs `FLOAT16` storage
 
