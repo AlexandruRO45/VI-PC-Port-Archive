@@ -199,8 +199,9 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
         events.put(("line", run.label, line))
         if line.startswith("[RUN] "):
             current, started = line[6:], time.monotonic()
-            if current not in run.checks or run.checks[current]["status"] == "NOT RUN":
-                run.set(current, status="RUNNING")
+            # A restart reruns earlier checks. Preserve a recorded hang just as the result handler does.
+            if run.checks.get(current, {}).get("status") != "HANG":
+                run.set(current, status="RUNNING", reason="", seconds=None)
             events.put(("check", run.label, current))
             continue
         if line.startswith("[rt] unimplemented: ") and current:

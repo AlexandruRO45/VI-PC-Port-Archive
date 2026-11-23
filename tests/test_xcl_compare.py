@@ -154,14 +154,13 @@ for name in ("a", "b", "c"):
 class Restart(unittest.TestCase):
     """run_with_restarts: a hung check is recorded as HANG and the title is run again with it skipped."""
 
-    def run_fake(self, honour):
+    def run_fake(self, honour, retry_title=FAKE_TITLE):
         env = dict(os.environ, HONOUR_SKIP="1" if honour else "0")
-        cmd = [sys.executable, "-I", "-c", FAKE_TITLE]
         attempts = []
 
         def cmd_for(attempt):
             attempts.append(attempt)
-            return cmd
+            return [sys.executable, "-I", "-c", retry_title if attempt else FAKE_TITLE]
 
         run = xc.Run("synthetic")
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,6 +182,16 @@ class Restart(unittest.TestCase):
         self.assertEqual(attempts, [0, 1])
         self.assertEqual(run.checks["b"]["status"], "HANG")
         self.assertNotIn("c", run.checks)  # run_all marks it NOT RUN
+
+    def test_exit_during_repeated_check_replaces_previous_pass(self):
+        retry = "print('[RUN] a', flush=True)\nraise SystemExit(7)"
+        run, skip, attempts = self.run_fake(honour=True, retry_title=retry)
+        self.assertEqual(attempts, [0, 1])
+        self.assertEqual(skip, ["b"])
+        self.assertEqual(run.exit_code, 7)
+        self.assertEqual(run.checks["a"]["status"], "FAIL")
+        self.assertIn("exit code 7", run.checks["a"]["reason"])
+        self.assertEqual(run.checks["b"]["status"], "HANG")
 
 
 class RestartTraces(unittest.TestCase):
