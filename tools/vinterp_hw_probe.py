@@ -108,8 +108,8 @@ def fbits_to_fraction(w):
     m = w & 0x7FFFFF
     if e == 0xFF:
         raise ValueError(f"non-finite f32 0x{w:08x}")
-    if e == 0:
-        return Fraction(0)
+    if e == 0:                                   # subnormal: m * 2^-149, not zero (as hbits_to_fraction does)
+        return s * Fraction(m, 1 << 149)
     return s * Fraction(0x800000 | m, 1 << 23) * (Fraction(2) ** (e - 127))
 
 
@@ -150,6 +150,11 @@ def fraction_to_f32_rne(x):
     r = round_rne_fraction(x, 24, -126)
     s = 0x80000000 if x < 0 else 0
     a = abs(r)
+    if a < Fraction(1, 1 << 126):
+        # round_rne_fraction stopped at emin = -126, so it already rounded to nearest-even on the 2^-149 grid:
+        # a is an exact multiple of it and the product below is the mantissa (a conversion, not a truncation).
+        # A value that rounded to zero keeps its sign here and never reaches the a < 2**e loop.
+        return s | int(a * (1 << 149))
     e = 0
     while a >= Fraction(2) ** (e + 1):
         e += 1

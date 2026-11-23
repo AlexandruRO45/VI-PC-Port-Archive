@@ -78,6 +78,45 @@ class VinterpHwProbeTests(unittest.TestCase):
         self.assertEqual(probe.fraction_to_f16_rne(exact_d), 0x0001)
         self.assertEqual(probe.fraction_to_f16_rne(probe.round_rne_fraction(exact_d, 24, -126)), 0x0000)
 
+    def test_f32_subnormals_are_decoded_and_encoded(self):
+        # An f32 subnormal is m * 2^-149. Decoding every one as zero, or encoding one as a negative "word" because
+        # the exponent field cannot hold E < 1, would make the reference wrong for a case with a tiny parameter.
+        self.assertEqual(probe.fbits_to_fraction(0x00000001), Fraction(1, 1 << 149))
+        self.assertEqual(probe.fbits_to_fraction(0x007FFFFF), Fraction(0x7FFFFF, 1 << 149))
+        self.assertEqual(probe.fbits_to_fraction(0x80000001), -Fraction(1, 1 << 149))
+        for value, word in ((Fraction(1, 1 << 149), 0x00000001),
+                            (Fraction(3, 1 << 148), 0x00000006),
+                            (Fraction(1, 1 << 130), 0x00080000),
+                            (-Fraction(1, 1 << 130), 0x80080000)):
+            with self.subTest(value=str(value)):
+                self.assertEqual(probe.fraction_to_f32_rne(value), word)
+                self.assertEqual(probe.fbits_to_fraction(word), value)
+
+    def test_f32_subnormal_encoding_rounds_to_nearest_even(self):
+        # Down here the reference rounds on the 2^-149 grid: ulp ties go to even, 1.75 ulp goes up, and a value
+        # that rounds to zero keeps the sign of the input.
+        for value, word in ((Fraction(3, 1 << 150), 0x00000002),          # 1.5 ulp: tie to even
+                            (Fraction(5, 1 << 150), 0x00000002),          # 2.5 ulp: tie to even
+                            (Fraction(7, 1 << 151), 0x00000002),          # 1.75 ulp
+                            (Fraction((1 << 24) - 1, 1 << 150), 0x00800000),   # just below the smallest normal
+                            (Fraction(1, 1 << 151), 0x00000000),          # 0.25 ulp
+                            (Fraction(1, 1 << 150), 0x00000000),          # 0.5 ulp: tie to even
+                            (-Fraction(3, 1 << 150), 0x80000002),
+                            (-Fraction(1, 1 << 151), 0x80000000)):        # rounds to a negative zero
+            with self.subTest(value=str(value)):
+                self.assertEqual(probe.fraction_to_f32_rne(value), word)
+
+    def test_f32_words_round_trip_through_the_reference(self):
+        # Every finite f32 word decodes to an exact Fraction and encodes back to the same bits.
+        words = [0, 1, 0x007FFFFF, 0x00800000, 0x00800001] + list(range(0, 0x01000000, 65521))
+        for w in words:
+            with self.subTest(word=hex(w)):
+                self.assertEqual(probe.fraction_to_f32_rne(probe.fbits_to_fraction(w)), w)
+                if w:   # a Fraction carries no negative zero: 0x80000000 decodes to 0 and encodes as 0
+                    self.assertEqual(probe.fraction_to_f32_rne(probe.fbits_to_fraction(w | 0x80000000)),
+                                     w | 0x80000000)
+        self.assertEqual(probe.fbits_to_fraction(0x80000000), 0)
+
     def test_translator_cli_and_mocked_hw_oracle(self):
         out = io.StringIO()
         with redirect_stdout(out):
