@@ -168,6 +168,30 @@ class ContainerTests(unittest.TestCase):
             except Exception as e:  # noqa: BLE001 - any exception is the failure being asserted
                 self.fail(f"inspect raised {type(e).__name__}: {e}")
 
+    def test_dxil_and_accc_flags_are_evaluated_independently(self):
+        # Both DXIL and ACCC(FSPX) in one container: DXIL must not mask has_fspx.
+        combined = container(
+            [
+                (b"DXIL", dxil_payload("Both", xbch=True, bitcode=False)),
+                (b"ACCC", b"FSPX" + bytes(12)),
+            ]
+        )
+        found, rejected = psc.inspect(combined, "both.dll")
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["has_xbch"])
+        self.assertTrue(found[0]["has_fspx"])
+        self.assertFalse(found[0]["has_bitcode"])
+
+        # ACCC payload containing LLVM bitcode magic bytes without a DXIL chunk must not set has_bitcode.
+        accc_only = container([(b"ACCC", b"FSPX" + b"BC\xc0\xde" + bytes(8))])
+        found, rejected = psc.inspect(accc_only, "accc_only.dll")
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["has_fspx"])
+        self.assertFalse(found[0]["has_xbch"])
+        self.assertFalse(found[0]["has_bitcode"])
+
 
 class ReportPathTests(unittest.TestCase):
     """--json and --extract must not overwrite an input, each other, or a folder."""
@@ -240,6 +264,19 @@ class ReportPathTests(unittest.TestCase):
         self.assertNotIn("Traceback", err)
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
+
+    def test_extract_index_must_not_overwrite_an_input_image(self):
+        extract = os.path.join(self.dir, "out")
+        os.makedirs(extract)
+        input_as_index = os.path.join(extract, "index.json")
+        payload = container([(b"SFI0", bytes(8))])
+        with open(input_as_index, "wb") as f:
+            f.write(payload)
+        code, _, err = self.run_main([input_as_index, "--extract", extract])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input image", err)
+        with open(input_as_index, "rb") as f:
+            self.assertEqual(f.read(), payload)
 
 
 if __name__ == "__main__":
