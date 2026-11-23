@@ -6042,6 +6042,8 @@ class Gen:
         if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
             return self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
         if src.get("f64_literal"):
+            if not 0 <= src["v"] <= 0xFFFFFFFF:
+                raise Unsupported(op + " literal")
             return self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
         if src["k"] == "fimm":
             bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
@@ -11050,6 +11052,8 @@ class Gen:
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
             elif sv.get("f64_literal"):
+                if not 0 <= sv["v"] <= 0xFFFFFFFF:
+                    raise Unsupported(op + " literal")
                 lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
             elif sv["k"] == "fimm":
                 bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
