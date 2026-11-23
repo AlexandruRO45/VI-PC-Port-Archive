@@ -634,6 +634,15 @@ class TestDsWriteB32AST(unittest.TestCase):
         expr.eval(lds, 0x20, 0xCAFEBABE)
         self.assertEqual(lds.read_u32(0x30), 0xCAFEBABE)
 
+class TestDsWriteB32SIMD(unittest.TestCase):
+    def test_simd_write_b32_divergent_lanes(self) -> None:
+        lds = LdsModel()
+        expr = LdsWriteB32Expr(offset=0)
+        for l in range(32):
+            expr.eval(lds, l * 4, 0x70000000 + l)
+        for l in range(32):
+            self.assertEqual(lds.read_u32(l * 4), 0x70000000 + l)
+
 
 if __name__ == "__main__":
     unittest.main()
