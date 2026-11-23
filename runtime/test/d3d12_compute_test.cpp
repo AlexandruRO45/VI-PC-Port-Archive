@@ -24,6 +24,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 #ifndef LEONIDA_TEST_CS_SPV
@@ -205,8 +206,9 @@ std::vector<HRESULT> cached_pso_cases(Device* device, D3D12_COMPUTE_PIPELINE_STA
 }
 
 // The same cases on the PC runtime, with an empty compute shader from d3dcompiler_47: the default adapter, then WARP.
-// Empty when the host has no D3D12 device or no compiler, or is Wine's, which the caller reports as a skip: vkd3d has
-// both, but its GetCachedBlob is a stub, so every host answered nothing and the comparison failed on each run.
+// Empty when the host has no D3D12 device or no compiler, is Wine's, or answers nothing because its GetCachedBlob
+// fails, which the caller reports as a skip: vkd3d has a device and a compiler, but its GetCachedBlob is a stub, so
+// every host answered nothing and the comparison failed on each run.
 std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::uint8_t>& root_blob,
                                                         const std::vector<std::uint8_t>& other_root_blob) {
     if (hostwine::host_is_wine()) return {};
@@ -242,7 +244,11 @@ std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::u
                 D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
                 desc.pRootSignature = root;
                 desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
-                out.push_back(cached_pso_cases(host, desc, root_blob, other_root_blob));
+                // A host that answered nothing gives no reference: cached_pso_cases returns no cases when the host's
+                // own GetCachedBlob fails (0x8000FFFF on a Windows 10 22H2 host, for the GPU adapter and WARP alike).
+                // Kept, the empty list failed the comparison with the layer's answers on every run.
+                auto answers = cached_pso_cases(host, desc, root_blob, other_root_blob);
+                if (!answers.empty()) out.push_back(std::move(answers));
                 root->Release();
             }
             host->Release();
@@ -391,8 +397,8 @@ int main() {
             EXPECT(layer == expected);
             const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
             if (hosts.empty())
-                std::printf("SKIP: no host D3D12 reference (Wine, or no device or compiler) for the CachedPSO "
-                            "comparison\n");
+                std::printf("SKIP: no host D3D12 reference (Wine, no device or compiler, or a host whose "
+                            "GetCachedBlob fails) for the CachedPSO comparison\n");
             for (const auto& host : hosts) EXPECT(host == layer);
             if (!hosts.empty()) std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(), cached_case_count);
 
