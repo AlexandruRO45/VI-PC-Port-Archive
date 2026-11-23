@@ -51,6 +51,7 @@ struct Event {
 
 constexpr UINT width = 8, height = 6;
 constexpr D3D12_RECT clear_a{1, 1, 5, 4}, clear_b{4, 3, 8, 6}, source_rect{2, 1, 7, 5};
+constexpr float target_clear_depth = 0.125f;  // A zero-filled readback must fail, even for depth-only D32.
 
 struct Case {
     const char* name;
@@ -179,7 +180,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         l->ClearDepthStencilView(source_view, flags, 0.25f, 0x11, 0, nullptr);
         l->ClearDepthStencilView(source_view, flags, 0.75f, 0x22, 1, &clear_a);
         l->ClearDepthStencilView(source_view, flags, 1.0f, 0x33, 1, &clear_b);
-        l->ClearDepthStencilView(target_view, flags, 0.0f, 0x5a, 0, nullptr);
+        l->ClearDepthStencilView(target_view, flags, target_clear_depth, 0x5a, 0, nullptr);
         if (!c.edge) return;
         const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
@@ -298,8 +299,8 @@ Planes expected_planes(const Case& c, bool resolved = true) {
             unsigned char stencil = 0x11;
             if (in(clear_a, x, y)) depth = 0.75f, stencil = 0x22;
             if (in(clear_b, x, y)) depth = 1.0f, stencil = 0x33;
-            if (!resolved || !in(area, x, y)) depth = 0.0f, stencil = 0x5a;
-            if (c.plane == 1) depth = 0.0f;
+            if (!resolved || !in(area, x, y)) depth = target_clear_depth, stencil = 0x5a;
+            if (c.plane == 1) depth = target_clear_depth;
             else stencil = 0x5a;
             std::uint32_t bits = 0;
             if (unorm24(c))
