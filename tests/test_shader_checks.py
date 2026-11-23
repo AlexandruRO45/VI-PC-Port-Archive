@@ -35,9 +35,23 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case),
+         # cs_fmt_all and cs_w32_swap_x2_contend
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
+
+
+def swap_x2_heap(low_order=None, high_order=None):
+    """The heap cs_w32_swap_x2_contend leaves when the invocations' low dwords were exchanged in low_order and their
+    high dwords in high_order (invocation order by default): each gets back what the one before it put in."""
+    n = check.SWAP_X2_INVOCATIONS
+    words = [0] * (2 * n + 8)
+    for half, order in ((0, low_order or range(n)), (1, high_order or range(n))):
+        held = check.SWAP_X2_FILL
+        for i in order:
+            words[2 * i + half], held = held, check.swap_x2_replacement(i)[half]
+        words[2 * n + half] = held
+    return words
 
 
 def words_output(name, flip=None):
@@ -88,6 +102,10 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(check.FMT_ALL_WORDS))))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(check.FMT_ALL_WORDS)}I", *check.FMT_ALL_WORDS))
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
+            if name == "cs_w32_swap_x2_contend":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("64", "dump"), "4104"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<4104I", *swap_x2_heap()))
+                return 0, ""
             if name == "cs_heap_init":
                 # The seeded words come back only if check.py wrote the init file and sized the buffer for it.
                 path = (env or {}).get("VKC_HEAP_INIT")

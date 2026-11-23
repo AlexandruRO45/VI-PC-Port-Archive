@@ -167,6 +167,17 @@ python -I runtime/test/shaders/build.py <out-dir> vs_ids ps_mullit
 python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
 ```
 
+`cs_w32_swap_x2_contend` has 2,048 invocations swap their own pair into one 64-bit element with
+`global_atomic_swap_x2 ... glc`. The suite dispatches it once and requires every dword to be handed out exactly
+once; its PASS line also says how many pairs were torn, which the one-atomic-per-dword translation allows
+(`docs/design.md`, global atomics). To count torn pairs over many dispatches on your GPU, or to fail on them
+(`--strict`):
+
+```sh
+python -I runtime/test/shaders/build.py <out-dir> cs_w32_swap_x2_contend
+python -I runtime/test/shaders/swap_x2_contend.py <out-dir> <folder with vk_compute_test> --runs 200
+```
+
 For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
 
 `vk_compute_test`, `vk_bindless_test` and `vk_image_fuzz` read `LEONIDA_VK_VALIDATION` too (`vk_compute_test`

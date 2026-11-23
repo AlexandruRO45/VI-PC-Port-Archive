@@ -711,6 +711,63 @@ def dump_test(tools, spirv, name, want, words, env=None):
     return ""
 
 
+# cs_w32_swap_x2_contend.asm (TEST-561): every invocation of 64 groups of 32 swaps its own pair into one shared 64-bit
+# element with global_atomic_swap_x2 glc and stores the pair it got back. The heap is the returned pairs, then the
+# element (words 4096 and 4097), which starts as the fill.
+SWAP_X2_GROUPS, SWAP_X2_LOCAL = 64, 32
+SWAP_X2_INVOCATIONS = SWAP_X2_GROUPS * SWAP_X2_LOCAL
+SWAP_X2_PAIRS = SWAP_X2_INVOCATIONS + 1          # the returned pairs and the element's final value
+SWAP_X2_FILL = 0xEEEEEEEE
+
+
+def swap_x2_replacement(i):
+    """The pair invocation i swaps in: the high dword is the low one inverted, so the halves belong together."""
+    low = 0x51000000 | i
+    return low, low ^ 0xFFFFFFFF
+
+
+def swap_x2_contend_words(words, invocations=SWAP_X2_INVOCATIONS):
+    """What one dispatch's heap says: (problem, torn). The 32-bit exchange of each dword is atomic, so whatever order
+    the invocations ran in, the returned low dwords plus the element's final low dword are the fill plus every
+    replacement low, each once, and the same for the high dwords: problem names what is missing otherwise, and is ""
+    when both sets hold. torn counts the pairs, returned or final, whose halves don't belong together: the translator
+    swaps the two dwords with one atomic each (docs/design.md, global atomics), so a pair can tear where the console
+    swaps the element whole. That is reported, not failed."""
+    if len(words) < 2 * invocations + 2:
+        return f"the dump has {len(words)} words, expected at least {2 * invocations + 2}", 0
+    pairs = [(words[2 * i], words[2 * i + 1]) for i in range(invocations + 1)]   # the element itself is last
+    problems = []
+    for half, label in ((0, "low"), (1, "high")):
+        want = collections.Counter([SWAP_X2_FILL] + [swap_x2_replacement(i)[half] for i in range(invocations)])
+        got = collections.Counter(pair[half] for pair in pairs)
+        if got != want:
+            extra = sorted((got - want).keys())[:3]
+            problems.append(f"{label} dwords: {sum((want - got).values())} never handed out, "
+                            f"{sum((got - want).values())} handed out twice or unknown"
+                            + (" (e.g. " + ", ".join(f"{v:#010x}" for v in extra) + ")" if extra else ""))
+    whole = {(SWAP_X2_FILL, SWAP_X2_FILL)} | {swap_x2_replacement(i) for i in range(invocations)}
+    return "; ".join(problems), sum(pair not in whole for pair in pairs)
+
+
+def swap_x2_contend_test(tools, spirv, env=None):
+    """One dispatch of cs_w32_swap_x2_contend: (problem, torn pairs), as swap_x2_contend_words, or a Skip as the
+    problem when vk_compute_test can't run the shader on this device."""
+    words = 2 * SWAP_X2_INVOCATIONS + 8
+    with tempfile.TemporaryDirectory(prefix="leonida-swap-x2-") as tmp:
+        dump = Path(tmp) / "out.bin"
+        child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS=str(words))
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE),
+                        os.path.join(spirv, "cs_w32_swap_x2_contend.spv"), str(SWAP_X2_GROUPS), "dump", env=child)
+        if code == 77:
+            return Skip("SKIP (" + (out.strip().splitlines() or ["unsupported"])[-1] + ")"), 0
+        if code:
+            return failure(code, out, 3), 0
+        if not dump.is_file():
+            return "no VKC_DUMP file written", 0
+        data = dump.read_bytes()
+    return swap_x2_contend_words(list(struct.unpack(f"<{len(data) // 4}I", data[:len(data) // 4 * 4])))
+
+
 def fmt_1010102_test(tools, spirv, env=None):
     """Check both packed stores and the untouched tail of a single group's 64 words."""
     return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, 64, env)
@@ -1796,6 +1853,7 @@ def main():
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
+    results.append(("cs_w32_swap_x2_contend", swap_x2_contend_test(tools, spirv)[0]))   # torn pairs: swap_x2_contend.py
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
