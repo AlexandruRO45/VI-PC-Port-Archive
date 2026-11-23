@@ -30,6 +30,19 @@
 #include <iterator>
 #include <vector>
 
+// Set 0 descriptor counts: binding 0 holds 5 sampled images (fallback + 3 2D images + 16x4 mip-chain image at index 4).
+// Each storage-image binding is sized through the highest bindless index its fixtures address (index 0 fallback plus
+// the image's hash-table slot: 1 for float 2D, 2 for uint 2D and 2D atomics, 3 for sint 2D, 1 for the 3D volume).
+// Total: 14 storage-image descriptors instead of 25 (5 * 5), keeping the layout within the 16-descriptor
+// maxPerStageDescriptorStorageImages limit of Intel GPUs (VUID-VkPipelineLayoutCreateInfo-descriptorType-03020).
+constexpr uint32_t kSampledCount = 5;
+constexpr uint32_t kStorage2DCounts[3] = {2, 3, 4};  // bindings 8 (float), 9 (uint), 10 (sint)
+constexpr uint32_t kAtomic2DCount = 3;               // binding 4 (2D r32ui atomics)
+constexpr uint32_t kAtomic3DCount = 2;               // binding 7 (3D r32ui atomics)
+constexpr uint32_t kTotalStorageImages =
+    kStorage2DCounts[0] + kStorage2DCounts[1] + kStorage2DCounts[2] + kAtomic2DCount + kAtomic3DCount;
+static_assert(kTotalStorageImages == 14);
+
 static PFN_vkGetInstanceProcAddr gipa;
 #define CHECK(x)                                                                         \
     do {                                                                                 \
@@ -103,6 +116,11 @@ int main(int argc, char** argv) {
     vkGetPhysicalDeviceFeatures(pd, &have);
     if (!have.shaderStorageImageWriteWithoutFormat) {
         std::printf("unsupported: shaderStorageImageWriteWithoutFormat=0\n");
+        return 77;
+    }
+    if (props.limits.maxPerStageDescriptorStorageImages < kTotalStorageImages) {
+        std::printf("unsupported: need %u per-stage storage images, device has %u\n", kTotalStorageImages,
+                    props.limits.maxPerStageDescriptorStorageImages);
         return 77;
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -289,28 +307,28 @@ int main(int argc, char** argv) {
     }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     VkSampler sampler; CHECK(vkCreateSampler(dev, &sci, nullptr, &sampler));
-    // Set 0: binding 0 = sampled images, 1 = samplers, 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays.
-    // Five elements each: index 0 stands for the runtime's fallback, image k is at index k + 1 and the 16x4 image at
-    // index 4. Binding 0 holds each image's view in its own format (typed image_load reads the uint and sint ones
-    // through integer aliases); every element of a storage array holds the image of its class, so all of them are
-    // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
-    // and the volume, in every element.
-    constexpr uint32_t N = 5;
+    // Set 0: binding 0 = sampled images (5 slots: fallback, images 0..2 at 1..3, 16x4 mip-chain image at 4),
+    // 1 = samplers, 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays (2/3/4 slots), 4/7 = 2D and 3D
+    // r32ui storage images for image atomics (3/2 slots). Every slot of a storage array holds the image of its class
+    // so every declared descriptor is valid.
     VkDescriptorSetLayoutBinding b[8]{};
-    b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSampledCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    for (int k = 0; k < 3; k++) b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    b[6] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    b[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    for (int k = 0; k < 3; k++) {
+        b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kStorage2DCounts[k], VK_SHADER_STAGE_COMPUTE_BIT,
+                    nullptr};
+    }
+    b[6] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kAtomic2DCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kAtomic3DCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = 8; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
     VkDescriptorPoolSize ps[4] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSampledCount},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * N},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kTotalStorageImages},
     };
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps;
@@ -319,31 +337,32 @@ int main(int argc, char** argv) {
     dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
     VkDescriptorSet ds; CHECK(vkAllocateDescriptorSets(dev, &dai, &ds));
     VkDescriptorBufferInfo tbi{tb, 0, VK_WHOLE_SIZE};
-    VkDescriptorImageInfo sii[N] = {{VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, view[2], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorImageInfo sii[kSampledCount] = {{VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
+                                                {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
+                                                {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL},
+                                                {VK_NULL_HANDLE, view[2], VK_IMAGE_LAYOUT_GENERAL},
+                                                {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    VkDescriptorImageInfo dii[3][N];
-    VkDescriptorImageInfo r32ui[N], r32ui_3d[N];
+    VkDescriptorImageInfo dii[3][4];
+    VkDescriptorImageInfo r32ui[kAtomic2DCount], r32ui_3d[kAtomic3DCount];
     VkWriteDescriptorSet wr[8]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; w.descriptorCount = 1; }
     wr[0].dstBinding = 0; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = sii;
-    wr[0].descriptorCount = N;
+    wr[0].descriptorCount = kSampledCount;
     wr[1].dstBinding = 1; wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[1].pImageInfo = &smpi;
     wr[2].dstBinding = 2; wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &tbi;
     for (int k = 0; k < 3; k++) {
-        for (uint32_t e = 0; e < N; e++) dii[k][e] = {VK_NULL_HANDLE, view[k], VK_IMAGE_LAYOUT_GENERAL};
+        for (uint32_t e = 0; e < kStorage2DCounts[k]; e++)
+            dii[k][e] = {VK_NULL_HANDLE, view[k], VK_IMAGE_LAYOUT_GENERAL};
         wr[3 + k].dstBinding = 8 + k; wr[3 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        wr[3 + k].pImageInfo = dii[k]; wr[3 + k].descriptorCount = N;
+        wr[3 + k].pImageInfo = dii[k]; wr[3 + k].descriptorCount = kStorage2DCounts[k];
     }
-    for (uint32_t e = 0; e < N; e++) r32ui[e] = {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL};
+    for (uint32_t e = 0; e < kAtomic2DCount; e++) r32ui[e] = {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL};
     wr[6].dstBinding = 4; wr[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    wr[6].pImageInfo = r32ui; wr[6].descriptorCount = N;
-    for (uint32_t e = 0; e < N; e++) r32ui_3d[e] = {VK_NULL_HANDLE, vol_view, VK_IMAGE_LAYOUT_GENERAL};
+    wr[6].pImageInfo = r32ui; wr[6].descriptorCount = kAtomic2DCount;
+    for (uint32_t e = 0; e < kAtomic3DCount; e++) r32ui_3d[e] = {VK_NULL_HANDLE, vol_view, VK_IMAGE_LAYOUT_GENERAL};
     wr[7].dstBinding = 7; wr[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = N;
+    wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = kAtomic3DCount;
     vkUpdateDescriptorSets(dev, 8, wr, 0, nullptr);
 
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
