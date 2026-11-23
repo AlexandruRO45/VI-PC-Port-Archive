@@ -1129,6 +1129,11 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game_console_paths COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_console_paths.cmake")
+    # The overlay is where a title's writes land: a path that is a file, or the game folder itself, is the usage error
+    # (exit 2) before anything is mapped, not a run whose first write fails or lands in the package.
+    add_test(NAME gta6rt_overlay_folder COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_overlay_folder.cmake")
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     add_test(NAME run_tiny_game_abort_exit_codes COMMAND tiny_game_abort_test

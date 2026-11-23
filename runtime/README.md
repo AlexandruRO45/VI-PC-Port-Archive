@@ -34,6 +34,8 @@ gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>] [--overlay <dir>]
 
 `--overlay` is where a mapped title's writes go (default `<game-dir>\overlay`); `GAME:` paths read from
 `--game-dir`. See [Console paths and the write overlay](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
+An `--overlay` that names a file, or the game folder itself, is `error: --overlay ...` and exit 2 before anything is
+mapped: a file cannot hold the title's writes, and the game folder would put them inside the package.
 
 The dry run maps the image and the bundled modules it imports, applies base relocations, binds every
 import through the shim registry, a host DLL, or another bundled module, parses exports, installs static

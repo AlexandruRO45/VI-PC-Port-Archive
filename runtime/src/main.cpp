@@ -117,6 +117,22 @@ int wmain(int argc, wchar_t** argv) {
         if (const auto range = rt::base_reservation::needed(image)) return rt::base_reservation::relaunch(*range);
     // GAME: paths read under --game-dir; whatever a title writes lands in the overlay, never in the package.
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
+    // The overlay is the one folder a title writes to, and it is never the package: a path that is a file cannot hold
+    // the writes, and the game folder itself would put them (and the copy-ups) inside the package the loader promises
+    // to leave as installed. The default <game-dir>/overlay is a separate folder beside it and stays allowed. Either
+    // mistake is the usage error here, before anything is mapped, instead of a first write that fails later.
+    if (std::error_code ec;
+        std::filesystem::exists(overlay_dir, ec) && !std::filesystem::is_directory(overlay_dir, ec)) {
+        const auto path = overlay_dir.u8string();
+        std::fprintf(stderr, "error: --overlay is not a folder: %s\n", reinterpret_cast<const char*>(path.c_str()));
+        return 2;
+    }
+    if (std::error_code ec; std::filesystem::equivalent(overlay_dir, game_dir, ec)) {
+        const auto path = overlay_dir.u8string();
+        std::fprintf(stderr, "error: --overlay is the game folder, so a title's writes would land in the package: %s\n",
+                     reinterpret_cast<const char*>(path.c_str()));
+        return 2;
+    }
     rt::fs::configure(game_dir, overlay_dir);
     // Mods (docs/modding.md): <folder of gta6rt.exe>\mods unless --mods names another. Loaded and reported here;
     // the archetype swaps take effect once the game's archetype lookup is hooked for this executable version.
