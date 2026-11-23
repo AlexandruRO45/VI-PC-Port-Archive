@@ -650,6 +650,36 @@ class TestDSMinF32ConditionCodesAndStatusFlags(unittest.TestCase):
 
         self.assertEqual(state.lgkm_cnt, 4)
 
+class TestDSMinF32BoundaryExtremes(unittest.TestCase):
+    """Part 7: Boundary extremes, signed zeros, infinities, and subnormals."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = ScalarDSInterpreter(self.lds)
+        self.state = ScalarThreadState(self.lds)
+
+    def test_infinities_and_zeros(self) -> None:
+        # -inf is smallest
+        self.assertEqual(ref_ds_min_f32(NEG_INF, ONE_F32), NEG_INF)
+        self.assertEqual(ref_ds_min_f32(POS_INF, ONE_F32), ONE_F32)
+        self.assertEqual(ref_ds_min_f32(NEG_INF, POS_INF), NEG_INF)
+
+        # -0.0 < +0.0
+        self.assertEqual(ref_ds_min_f32(POS_ZERO, NEG_ZERO), NEG_ZERO)
+        self.assertEqual(ref_ds_min_f32(NEG_ZERO, POS_ZERO), NEG_ZERO)
+
+    def test_subnormals(self) -> None:
+        subnorm_min = 0x00000001
+        subnorm_max = 0x007FFFFF
+        self.assertEqual(ref_ds_min_f32(subnorm_min, subnorm_max), subnorm_min)
+        self.assertEqual(ref_ds_min_f32(subnorm_max, ONE_F32), subnorm_max)
+
+    def test_memory_address_wrapping_boundaries(self) -> None:
+        idx = self.lds.resolve_dword_index(0xFFFFFFFC, offset=4)
+        self.assertEqual(idx, 0)
+        idx2 = self.lds.resolve_dword_index(4096)
+        self.assertEqual(idx2, 0)
+
 
 if __name__ == '__main__':
     unittest.main()
