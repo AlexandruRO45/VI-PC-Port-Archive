@@ -409,5 +409,24 @@ class VSubrevCoU32SimdBoundaryTests(unittest.TestCase):
         self.assertEqual(out_noborrow[1], 0)
 
 
+class VSubrevCoU32TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution, operand modes, and negative mutation controls for v_subrev_co_u32."""
+
+    def test_sgpr_and_inline_operands(self):
+        out = run_prog([
+            "s_mov_b32 s0, 35",
+            "v_mov_b32 v1, 90",
+            "v_subrev_co_u32 v0, vcc, s0, v1",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 55)
+        self.assertEqual(out[1], 0)
+
+    def test_negative_mutation_rejection(self):
+        prog = ["v_subrev_co_u32 v0, vcc, v1, v2 omod:2", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_lines("ps_neg_subrev_co", prog)
+
+
 if __name__ == "__main__":
     unittest.main()
