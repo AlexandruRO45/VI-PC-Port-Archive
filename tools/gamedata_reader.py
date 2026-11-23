@@ -279,76 +279,130 @@ def _trailing_root_span(body: bytes, root_hint: str) -> tuple[str, int]:
     return "", len(body)
 
 
-def _trailing_siblings(body: bytes, body_end: int, tokens: list, reader: Reader) -> tuple[dict, int]:
+def _trailing_siblings(body: bytes, body_end: int, tokens: list, reader: Reader, root_tag: str = "") -> tuple[dict, int]:
     """Recover complete top-level sibling elements immediately preceding ``</Root>``."""
+    root_bytes = root_tag.encode("ascii", "replace") if root_tag else b""
     stack = []
-    first_complete = body_end
-    for tok in reversed(tokens):
+    counts = Counter()
+    trailing_start = None
+    prev_end = 0
+    saw_root_open = False
+
+    for tok in tokens:
+        if b"<" in body[prev_end:tok.start()]:
+            if stack:
+                stack[-1][2] = True
+            else:
+                trailing_start = None
+        prev_end = tok.end()
         name = tok.group(2)
         if name is None:
             continue
         slash, rest = tok.group(1), tok.group(3)
-        if slash:
-            stack.append(name)
-        elif rest.rstrip().endswith(b"/"):
-            if not stack:
-                first_complete = tok.start()
+        if rest.rstrip().endswith(b"/"):
+            if not stack and trailing_start is None:
+                trailing_start = tok.start()
+        elif not slash:
+            if not stack and not saw_root_open and root_bytes and name == root_bytes and trailing_start is None:
+                saw_root_open = True
+                continue
+            if not stack and trailing_start is None:
+                trailing_start = tok.start()
+            stack.append([name, tok.start(), False])
+            counts[name] += 1
         else:
-            if not stack or stack[-1] != name:
-                break
-            stack.pop()
-            if not stack:
-                first_complete = tok.start()
-    if first_complete >= body_end:
+            if counts[name] > 0:
+                tainted = False
+                while stack:
+                    top_name, _, top_tainted = stack.pop()
+                    counts[top_name] -= 1
+                    tainted = tainted or top_tainted
+                    if top_name == name:
+                        break
+                    tainted = True
+                if tainted:
+                    if stack:
+                        stack[-1][2] = True
+                    else:
+                        trailing_start = None
+            else:
+                stack.clear()
+                counts.clear()
+                trailing_start = None
+
+    if b"<" in body[prev_end:body_end] or stack or trailing_start is None or trailing_start >= body_end:
         return {}, body_end
-    span = body[first_complete:body_end]
+    span = body[trailing_start:body_end]
     try:
         wrap = ET.fromstring(b"<_recover>" + span + b"</_recover>")
     except ET.ParseError:
         return {}, body_end
     sections = reader.children(list(wrap))
-    return (sections if isinstance(sections, dict) else {"$items": sections}), first_complete
+    return (sections if isinstance(sections, dict) else {"$items": sections}), trailing_start
 
 
-def _recover_prefix_items(body: bytes, prefix_end: int, tokens: list, reader: Reader) -> list:
-    """Recover outermost well-formed ``<Item>...</Item>`` subtrees within ``body[:prefix_end]``."""
-    items = []
-    tag_tokens = [tok for tok in tokens if tok.end() <= prefix_end and tok.group(2) is not None]
-    i = 0
-    while i < len(tag_tokens):
-        tok = tag_tokens[i]
-        slash, name, rest = tok.group(1), tok.group(2), tok.group(3)
-        if name != b"Item" or slash:
-            i += 1
+def _recover_prefix_items(body: bytes, prefix_end: int, tokens: list, reader: Reader, root_tag: str = "") -> list:
+    """Recover outermost well-formed ``<Item>...</Item>`` subtrees within ``body[:prefix_end]`` in linear time."""
+    root_bytes = root_tag.encode("ascii", "replace") if root_tag else b""
+    stack = []
+    counts = Counter()
+    non_item_depth = 0
+    candidates = []
+    prev_end = 0
+    saw_root_open = False
+
+    for tok in tokens:
+        if tok.end() > prefix_end:
+            break
+        if b"<" in body[prev_end:tok.start()] and stack:
+            stack[-1][2] = True
+        prev_end = tok.end()
+        name = tok.group(2)
+        if name is None:
             continue
+        slash, rest = tok.group(1), tok.group(3)
         if rest.rstrip().endswith(b"/"):
-            try:
-                items.append(reader.convert(ET.fromstring(tok.group(0))))
-            except ET.ParseError:
-                pass
-            i += 1
-            continue
-        depth = 1
-        j = i + 1
-        while j < len(tag_tokens) and depth > 0:
-            nxt = tag_tokens[j]
-            if nxt.group(2) == b"Item":
-                if nxt.group(1):
-                    depth -= 1
-                elif not nxt.group(3).rstrip().endswith(b"/"):
-                    depth += 1
-            if depth == 0:
-                break
-            j += 1
-        if depth == 0:
-            try:
-                items.append(reader.convert(ET.fromstring(body[tok.start():tag_tokens[j].end()])))
-                i = j + 1
+            if name == b"Item" and non_item_depth == 0:
+                candidates.append((tok.start(), tok.end()))
+        elif not slash:
+            if not stack and not saw_root_open and root_bytes and name == root_bytes and not candidates:
+                saw_root_open = True
                 continue
-            except ET.ParseError:
-                pass
-        # Unclosed or gap-corrupted <Item>: step past this opener so inner/subsequent intact items survive.
-        i += 1
+            stack.append([name, tok.start(), False])
+            counts[name] += 1
+            if name != b"Item":
+                non_item_depth += 1
+        else:
+            if counts[name] > 0:
+                tainted = False
+                start_pos = 0
+                while stack:
+                    top_name, top_start, top_tainted = stack.pop()
+                    counts[top_name] -= 1
+                    if top_name != b"Item":
+                        non_item_depth -= 1
+                    tainted = tainted or top_tainted
+                    if top_name == name:
+                        start_pos = top_start
+                        break
+                    tainted = True
+                if name == b"Item" and non_item_depth == 0 and not tainted:
+                    while candidates and candidates[-1][0] >= start_pos:
+                        candidates.pop()
+                    candidates.append((start_pos, tok.end()))
+                elif tainted and stack:
+                    stack[-1][2] = True
+            else:
+                stack.clear()
+                counts.clear()
+                non_item_depth = 0
+
+    items = []
+    for start_pos, end_pos in candidates:
+        try:
+            items.append(reader.convert(ET.fromstring(body[start_pos:end_pos])))
+        except ET.ParseError:
+            pass
     return items
 
 
@@ -360,8 +414,8 @@ def recover_fragments(data: bytes, reader: Reader | None = None, root_hint: str 
     tokens = list(_XML_TOKEN_RE.finditer(body, 0, body_end))
     sections, prefix_end = ({}, body_end)
     if body_end < len(body):
-        sections, prefix_end = _trailing_siblings(body, body_end, tokens, reader)
-    items = _recover_prefix_items(body, prefix_end, tokens, reader)
+        sections, prefix_end = _trailing_siblings(body, body_end, tokens, reader, root_tag)
+    items = _recover_prefix_items(body, prefix_end, tokens, reader, root_tag)
     return root_tag, sections, items
 
 

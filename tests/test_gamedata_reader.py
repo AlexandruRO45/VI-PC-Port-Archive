@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
@@ -449,6 +450,40 @@ class Run(unittest.TestCase):
         self.assertTrue(os.path.isfile(rec_path))
         with open(rec_path, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"$recovered": True, "root": None, "sections": {}, "items": [{"v": 7}, {"v": 8}]})
+
+    def test_recover_fragments_respects_ancestry_and_runs_linear_time(self):
+        # Nested <Item>s inside an unclosed or balanced non-Item parent must not be promoted to outermost items.
+        _, _, cut_items = R.recover_fragments(b'<CutParent><Item><id value="1"/></Item><Item><id value="2"/></Item>')
+        self.assertEqual(cut_items, [])
+
+        _, _, outer_items = R.recover_fragments(
+            b'<Outer><Item><id value="1"/></Item></Outer><Item><id value="2"/></Item>'
+        )
+        self.assertEqual(outer_items, [{"id": 2}])
+
+        # Nested <Item> inside a cut <Item>'s child element must not be promoted either.
+        _, _, nested_cut = R.recover_fragments(b'<Item><Sub><Item><id value="99"/></Item><broken')
+        self.assertEqual(nested_cut, [])
+
+        # Balanced elements under an unclosed ancestor before </Root> must not become top-level sections.
+        tag, secs, items = R.recover_fragments(b'<A><B value="1"/><C value="2"/></Root>')
+        self.assertEqual((tag, secs, items), ("Root", {}, []))
+
+        tag2, secs2, items2 = R.recover_fragments(
+            b'<Root><A><B value="1"/><C value="2"/></Root>',
+            root_hint="Root",
+        )
+        self.assertEqual((tag2, secs2, items2), ("Root", {}, []))
+
+        # Adversarial 4,000 unclosed <Item> openers must complete in linear time.
+        t0 = time.monotonic()
+        r_unclosed = R.recover_fragments(b"<Item>" * 4000)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(r_unclosed, ("", {}, []))
+        self.assertLess(elapsed, 0.5)
+
+        r_nested = R.recover_fragments(b"<Item>" * 50 + b"</Item>" * 50)
+        self.assertEqual((r_nested[0], r_nested[1], len(r_nested[2])), ("", {}, 1))
 
 
 if __name__ == "__main__":

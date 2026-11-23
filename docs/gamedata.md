@@ -1445,21 +1445,21 @@ python -I tools/gamedata_reader.py <work>/common --recover   # also extract inta
 The 8 payloads that fail whole-document parsing (7 start-truncated tail-only documents plus 1 unattributed 64 KiB
 fragment) still hold complete trailing sibling sections and `<Item>` subtrees. `recover_fragments` (and
 `--recover`) recovers complete sibling sections immediately preceding `</Root>` and outermost well-formed `<Item>`
-records from the remaining prefix without guessing or repairing cut bounds (skipping comments, CDATA, and
-gap-corrupted `<Item>` spans). Measured over the 1.0.2.1 `common.rpf` carve (`8` payloads recovered: `16`
-trailing sections and `1,054` prefix `<Item>`s, raising observed `type` classes from `317` to `323` over `8,012`
-typed elements):
+records from the remaining prefix without guessing or repairing cut bounds (skipping comments, CDATA,
+gap-corrupted `<Item>` spans, and `<Item>` elements nested under visible non-`Item` parents). Measured over the 1.0.2.1
+`common.rpf` carve (`8` payloads recovered: `16` trailing sections and `1,047` prefix `<Item>`s, raising observed `type`
+classes from `317` to `323` over `8,011` typed elements):
 
 | Root / payload | Inflated B (streams) | Complete trailing sections | Recovered prefix `<Item>`s | Measured schema notes |
 |---|---:|---:|---:|---|
 | `CAimUpperBodyDataBlock` | 1,813 (1) | 0 | 2 | `AimIkData` entries (13 scalar fields each: yaw/pitch limits, scales, weights) |
-| `CFiringPatternInfoManager` | 208,240 (4) | 1 (`FiringPatternSets`, 76 keyed entries) | 77 | `Infos` firing-pattern entries (62 with `Name`) plus nested burst/timeline items inside the cut leading entry |
-| `CSceneTerrainAnalyzerMgrDataInstance` | 45,187 (1) | 0 | 57 | `TerrainAnalyzerData` entries: 52 probe-set items plus 5 nested `Groups`/`GroupTolerances` items |
+| `CFiringPatternInfoManager` | 208,240 (4) | 1 (`FiringPatternSets`, 76 keyed entries) | 76 | `Infos` firing-pattern entries (62 with `Name`) plus 14 leading pre-truncation items before `</Bursts>`; nested items under opened sub-containers are skipped |
+| `CSceneTerrainAnalyzerMgrDataInstance` | 45,187 (1) | 0 | 52 | `TerrainAnalyzerData` probe-set entries (nested `Groups`/`GroupTolerances` items under visible parents skipped) |
 | `CDrivingStyleCollection` | 16,793 (1) | 1 (`AircraftPIDMap`, 22 keyed entries) | 2 | 2 trailing `ModelMatchMap` entries before `AircraftPIDMap` |
 | `Witnesses__Informations` | 13,500 (1) | 14 (`ScoringData` + 13 scalar config fields) | 5 | 4 `Personalities` (`OnFoot`/`InVehicle`) items + 1 entry before `</Personalities>` |
 | `rage__fragTuneStruct` | 92,990 (2) | 0 | 80 | `BreakPresets` items (57 distinct fields, 91 XML comments) |
 | `MaterialDataList` | 264,139 (5) | 0 | 402 | Material items (31 distinct child fields; 1 entry spans an unread gap at stream boundary `131,072`). 99 entries set `vehicleDirtControl` (99/99 resolve to 4 of 5 `VehDirtControls` keys) and 13 of 24 `CSnowTrackData` `PhysicsMaterials` match `name` |
-| unattributed 64 KiB fragment | 65,536 (1) | 0 | 429 | 428 `{modelName, tags}` records + 1 leading nested tag `<Item>` |
+| unattributed 64 KiB fragment | 65,536 (1) | 0 | 428 | 428 `{modelName, tags}` records |
 
 ## Next step
 
