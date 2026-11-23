@@ -82,6 +82,13 @@ def pick_sample(ms, sizes, n, seed, floor=6):
         if alloc[big] <= min(floor, len(groups[big])):
             break
         alloc[big] -= 1
+    # Rounding each group's share can leave the total short of n; give each missing slot to the group furthest below
+    # its proportional share that still has candidates, the sorted stratum key breaking a tie, so n shaders come out
+    # whenever the population holds n.
+    order = sorted(groups, key=str)
+    while sum(alloc.values()) < min(n, total):
+        room = [s for s in order if alloc[s] < len(groups[s])]
+        alloc[max(room, key=lambda s: n * len(groups[s]) / total - alloc[s])] += 1
     rng = random.Random(seed)
     picked = []
     for s in sorted(groups, key=str):
@@ -312,9 +319,16 @@ def classify(rec_n, rec_c, raw_n, raw_c, lay):
         kind = lambda c: "missing device feature" if c == 77 else ("pipeline creation" if c == 5 else f"exit {c}")
         return "fails in one mode", ("native: " + kind(cn)) if cn else ("fallback: " + kind(cc)), {}
     with open(raw_n, "rb") as f:
-        img_n = floats(f.read())
+        data_n = f.read()
     with open(raw_c, "rb") as f:
         data = f.read()
+    # A capture shorter than the image would be compared only over the pixels it holds, so a missing or empty native
+    # file read as "agree, empty"; either capture being short is a failure of that mode instead.
+    if len(data_n) < W * H * 16:
+        return "fails in one mode", "native: short output", {}
+    if len(data) < W * H * 16:
+        return "fails in one mode", "fallback: short output", {}
+    img_n = floats(data_n[: W * H * 16])
     img_c = floats(data[: W * H * 16])
     slots = analyse_slots(data[W * H * 16:], lay)
     if slots is None:

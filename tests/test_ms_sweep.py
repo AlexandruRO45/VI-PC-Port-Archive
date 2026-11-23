@@ -75,6 +75,21 @@ class Sampling(unittest.TestCase):
         # a stratum of one kind of shader (reads buffers, clip distances) is represented
         self.assertTrue(any(s[2] and s[3] for s in per))
 
+    def test_the_sample_has_n_shaders_when_the_population_holds_n(self):
+        # 60 candidates in three groups of 20: 19 * 20 / 60 rounds down to 6 in each group, 18 in all, so the
+        # nineteenth must be handed out; the strata here are size terciles of one kind of shader.
+        index = {f"m{i:02}": meta() for i in range(60)}
+        ms = dict(index)
+        for n in (18, 19, 20, 21, 59, 60):
+            picked, per = ms_sweep.pick_sample(ms, sizes_for(index), n, 3)
+            self.assertEqual((n, len(picked), len(set(picked))), (n, n, n))
+            self.assertEqual(sum(sampled for _, sampled in per.values()), n)
+        # more than the population is the whole population
+        self.assertEqual(len(ms_sweep.pick_sample(ms, sizes_for(index), 99, 3)[0]), 60)
+        # the same inputs give the same allocation
+        self.assertEqual(ms_sweep.pick_sample(ms, sizes_for(index), 19, 3)[1],
+                         ms_sweep.pick_sample(ms, sizes_for(index), 19, 3)[1])
+
     def test_fixed_seed_is_stable_and_seed_matters(self):
         index = synthetic_index()
         ms = {k: v for k, v in index.items() if v["stage"] == "ms"}
@@ -200,6 +215,23 @@ class Classify(unittest.TestCase):
                 (self.rec(), self.rec(5), ("fails in one mode", "fallback: pipeline creation")),
                 (self.rec(5), self.rec(77), ("fails in both modes", "5/77"))):
             self.assertEqual(ms_sweep.classify(rn, rc, "x", "y", LAY)[:2], expect)
+
+    def test_a_short_capture_is_a_failure_not_an_agreement(self):
+        empty = slot(0, 0) * ms_sweep.GROUPS
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self.write(tmp, "c.raw", image([1]), empty)
+            native = os.path.join(tmp, "n.raw")
+            for size, expect in ((0, "native: short output"), (NPX * 16 - 4, "native: short output")):
+                with open(native, "wb") as f:
+                    f.write(bytes(size))
+                self.assertEqual(ms_sweep.classify(self.rec(prims=0), self.rec(), native, good, LAY)[:2],
+                                 ("fails in one mode", expect))
+            whole = self.write(tmp, "n2.raw", image([1]))
+            short = os.path.join(tmp, "c2.raw")
+            with open(short, "wb") as f:
+                f.write(bytes(NPX * 16 - 4))
+            self.assertEqual(ms_sweep.classify(self.rec(prims=0), self.rec(), whole, short, LAY)[:2],
+                             ("fails in one mode", "fallback: short output"))
 
     def test_agree_with_and_without_geometry(self):
         empty = slot(0, 0) * ms_sweep.GROUPS
