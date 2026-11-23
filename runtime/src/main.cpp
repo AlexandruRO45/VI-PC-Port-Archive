@@ -171,6 +171,28 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
     // The retail frame path reads the per-thread context pointer at 0x100000000 (4 GiB): its TLS block is laid out
     // so the pointer field lands exactly at 4 GiB. This thread's own TLS block already holds that pointer at
     // +0x12a8, so put it in the slot the title reads, then let the faulting instruction run again against it.
+    // Diagnostic: the A8 render-target format assert (title RVA 0xCC2936). The format is supported by the layer but
+    // the title's own info switch still traps; step over the int3 so the next real stop is visible.
+    if (r.ExceptionCode == 0x80000003 && info->ContextRecord &&
+        info->ContextRecord->Rip == 0x140CC2936ull) {
+        static std::atomic<int> skipped_format{0};
+        if (skipped_format.fetch_add(1) < 64) {
+            std::fprintf(stderr, "[rt] format-int3: rbp=%p r13=%p r14=%p\n",
+                         reinterpret_cast<void*>(info->ContextRecord->Rbp),
+                         reinterpret_cast<void*>(info->ContextRecord->R13),
+                         reinterpret_cast<void*>(info->ContextRecord->R14));
+            __try {
+                const auto* d = reinterpret_cast<const std::uint64_t*>(info->ContextRecord->R14);
+                std::fprintf(stderr, "[rt] format-desc: %016llx %016llx %016llx %016llx\n",
+                             static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]),
+                             static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[3]));
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                std::fprintf(stderr, "[rt] format-desc: unreadable\n");
+            }
+            info->ContextRecord->Rip += 1;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     // An unknown console method reached through a vtable with no entry at the called offset: skip the call and
     // answer S_OK (RAX = 0), popping its return address. Bounded and logged, so the next real stop is visible.
     if (r.ExceptionCode == 0xC0000005 && info->ContextRecord && info->ContextRecord->Rip == 0) {
