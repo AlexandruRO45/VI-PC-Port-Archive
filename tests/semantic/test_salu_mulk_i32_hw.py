@@ -323,5 +323,40 @@ class TestMulkConditionCodesAndSCC(unittest.TestCase):
         self.assertEqual(words_false[1], 0xBBBB)
 
 
+class TestMulkBoundaryAndExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for s_mulk_i32."""
+
+    def test_ieee754_bit_patterns_as_integers(self):
+        patterns = [
+            0x00000000,
+            0x80000000,
+            0x3F800000,
+            0xBF800000,
+            0x00000001,
+            0x007FFFFF,
+            0x7F800000,
+            0xFF800000,
+            0x7FC00000,
+            0x7FA00000,
+            0x7FFFFFFF,
+            0xFFFFFFFF,
+        ]
+        multipliers = [0, 1, -1, 2, -2, 32767, -32768]
+        for pat in patterns:
+            for k in multipliers:
+                with self.subTest(pat=hex(pat), k=k):
+                    expected = s_mulk_i32_oracle(pat, k)
+                    lines = [
+                        f"s_mov_b32 s0, {pat:#x}",
+                        f"s_mulk_i32 s0, {k}",
+                        "v_mov_b32 v0, s0",
+                        "v_mov_b32 v1, 0",
+                        "v_mov_b32 v2, 0",
+                        "v_mov_b32 v3, 0",
+                    ]
+                    words = run_mulk_ps(lines, f"ps_mulk_ext_{pat:08x}_{abs(k)}")
+                    self.assertEqual(words[0], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
