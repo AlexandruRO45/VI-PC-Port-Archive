@@ -644,3 +644,27 @@ class TestCmpClassF64NegativeAndTranslator(unittest.TestCase):
         _, spv = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_POS_NORMAL, is_cmpx=False, test_id="lowering")
         self.assertIn("OpBitwiseAnd", spv)
         self.assertIn("OpShiftRightLogical", spv)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f16 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+class TestCmpxClassF16Oracle(unittest.TestCase):
+    def test_oracle_cmpx_matches_hardware(self):
+        # Match keeps lane active -> returns 1
+        val_match, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=True, test_id="cmpx_match")
+        self.assertEqual(val_match, 1)
+
+        # Mismatch narrows EXEC (lane becomes inactive) -> returns 0
+        val_mismatch, _ = run_cmp_shader("f16", 0x3C00, CLASS_NEG_INF, is_cmpx=True, test_id="cmpx_mismatch")
+        self.assertEqual(val_mismatch, 0)
+
+    def test_cmpx_identity_hardware(self):
+        # CLASS_ALL preserves active status
+        val_all, _ = run_cmp_shader("f16", 0x7C00, CLASS_ALL, is_cmpx=True, test_id="cmpx_id_all")
+        self.assertEqual(val_all, 1)
+
+        # Zero mask deactivates lane
+        val_zero, _ = run_cmp_shader("f16", 0x7C00, 0, is_cmpx=True, test_id="cmpx_id_zero")
+        self.assertEqual(val_zero, 0)
