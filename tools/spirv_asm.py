@@ -20,13 +20,17 @@ import argparse
 import array
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
+from contextlib import suppress
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from file_mode import published_mode  # noqa: E402
 from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
 
 SPIRV_MAGIC = 0x07230203
@@ -545,6 +549,39 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     return words.tobytes()
 
 
+def _write_output(path: str, data: bytes) -> None:
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    # Devices and pipes consume the bytes directly and cannot be replaced by a file.
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return
+
+    if mode is not None:
+        # Rename checks the directory's permissions. Check that the current file allows writing as well.
+        fd = os.open(destination, os.O_WRONLY)
+        os.close(fd)
+    directory = os.path.dirname(destination)
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=directory, prefix=".spirv-asm-", delete=False) as handle:
+            staged = handle.name
+            handle.write(data)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
+        staged = None
+    finally:
+        if staged is not None:
+            with suppress(OSError):
+                os.chmod(staged, 0o600)
+            with suppress(OSError):
+                os.unlink(staged)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Pure-Python SPIR-V binary assembler (no spirv-as required).")
     ap.add_argument("src", help="input .spvasm file")
@@ -556,8 +593,7 @@ def main(argv=None) -> int:
         with open(args.src, encoding="utf-8") as f:
             text = f.read()
         data = assemble(text, target_env=args.target_env)
-        with open(args.out, "wb") as f:
-            f.write(data)
+        _write_output(args.out, data)
     except (OSError, ValueError, SpirvAsmError) as exc:    # ValueError: a source file that is not UTF-8
         print(f"ERROR: {args.src}: {exc}" if isinstance(exc, UnicodeDecodeError) else f"ERROR: {exc}", file=sys.stderr)
         return 1
