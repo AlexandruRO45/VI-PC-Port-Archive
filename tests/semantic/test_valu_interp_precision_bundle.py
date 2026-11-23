@@ -229,6 +229,18 @@ class TestInterpP1LLF16Pairing(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP1LLF16High(unittest.TestCase):
+    def test_p1ll_f16_high_modifier(self):
+        code = [
+            "v_interp_p1ll_f16 v4, v0, attr2.x high",
+            "v_interp_p2_f16 v4, v1, attr2.x, v4 high",
+            "exp mrt0, v4, v4, v4, v4 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p1ll_high", code)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
