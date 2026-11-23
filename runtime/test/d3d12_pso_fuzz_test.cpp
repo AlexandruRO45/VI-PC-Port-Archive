@@ -16,7 +16,8 @@
 // GPU (by LUID), or WARP with --warp;
 // --reduce SEED drops draws and triangles while the layer still differs and prints the smallest program left;
 // --all also generates a nonzero DepthBias, which the default leaves out until D3D-325 (#2718) lands.
-// --stream creates every PSO through ID3D12Device2::CreatePipelineState instead (see use_stream).
+// --stream creates every PSO through ID3D12Device2::CreatePipelineState instead (see use_stream); --render-pass
+// draws inside BeginRenderPass/EndRenderPass (see use_render_pass).
 // --verbose prints every program. The layer is the device the runtime makes (create_vulkan_device_standalone);
 // LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation. Needs a Vulkan GPU (exit 77 otherwise, and
 // under Wine). No game data.
@@ -201,6 +202,11 @@ bool with_depth_bias = false;
 // depth-stencil state is DEPTH_STENCIL or DEPTH_STENCIL1 (depth bounds off). The layout comes from its own generator,
 // so --stream draws the same programs as the default.
 bool use_stream = false;
+
+// --render-pass: the draws run inside ID3D12GraphicsCommandList4::BeginRenderPass/EndRenderPass instead of
+// OMSetRenderTargets. Each program's targets start either with the pass's CLEAR beginning access (the clear values
+// travel with the pass) or with ordinary clears before a PRESERVE pass, chosen from the seed; every pass ends PRESERVE.
+bool use_render_pass = false;
 
 struct Stream {
     std::vector<std::uint8_t> bytes;
@@ -605,15 +611,46 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr, IID_PPV_ARGS(&list.p))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return fail("queue");
-    list->ClearRenderTargetView(rtv, p.clear_color, 0, nullptr);
-    if (p.color2) list->ClearRenderTargetView(rtv2, p.clear_color2, 0, nullptr);
-    if (has_depth)
-        list->ClearDepthStencilView(dsv, p.depth->stencil ? D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL
-                                                          : D3D12_CLEAR_FLAG_DEPTH,
-                                    p.clear_depth, p.clear_stencil, 0, nullptr);
+    const bool pass_clears = use_render_pass && (p.seed % 2 == 0);
+    if (!pass_clears) {
+        list->ClearRenderTargetView(rtv, p.clear_color, 0, nullptr);
+        if (p.color2) list->ClearRenderTargetView(rtv2, p.clear_color2, 0, nullptr);
+        if (has_depth)
+            list->ClearDepthStencilView(dsv, p.depth->stencil ? D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL
+                                                              : D3D12_CLEAR_FLAG_DEPTH,
+                                        p.clear_depth, p.clear_stencil, 0, nullptr);
+    }
     list->SetGraphicsRootSignature(root.p);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {rtv, rtv2};
-    list->OMSetRenderTargets(p.color2 ? 2 : 1, rtvs, FALSE, has_depth ? &dsv : nullptr);
+    Ref<ID3D12GraphicsCommandList4> list4;
+    if (use_render_pass) {
+        if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list4.p)))) return fail("no ID3D12GraphicsCommandList4");
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC targets[2]{};
+        const DXGI_FORMAT formats[2] = {p.color->format, p.color2 ? p.color2->format : p.color->format};
+        const float* clears[2] = {p.clear_color, p.clear_color2};
+        for (UINT i = 0; i < 2; ++i) {
+            targets[i].cpuDescriptor = rtvs[i];
+            targets[i].BeginningAccess.Type = pass_clears ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
+                                                          : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+            targets[i].BeginningAccess.Clear.ClearValue.Format = formats[i];
+            std::memcpy(targets[i].BeginningAccess.Clear.ClearValue.Color, clears[i], 4 * sizeof(float));
+            targets[i].EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+        }
+        D3D12_RENDER_PASS_DEPTH_STENCIL_DESC ds{};
+        ds.cpuDescriptor = dsv;
+        ds.DepthBeginningAccess.Type = pass_clears ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
+                                                   : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+        ds.DepthBeginningAccess.Clear.ClearValue.Format = p.depth->format;
+        ds.DepthBeginningAccess.Clear.ClearValue.DepthStencil = {p.clear_depth, p.clear_stencil};
+        ds.StencilBeginningAccess = ds.DepthBeginningAccess;
+        if (!p.depth->stencil) ds.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS;
+        ds.DepthEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+        ds.StencilEndingAccess.Type = p.depth->stencil ? D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
+                                                       : D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
+        list4->BeginRenderPass(p.color2 ? 2 : 1, targets, has_depth ? &ds : nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+    } else {
+        list->OMSetRenderTargets(p.color2 ? 2 : 1, rtvs, FALSE, has_depth ? &dsv : nullptr);
+    }
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     const D3D12_VERTEX_BUFFER_VIEW vbv{vertices->GetGPUVirtualAddress(), UINT(vb_bytes), sizeof(Vertex)};
     list->IASetVertexBuffers(0, 1, &vbv);
@@ -629,6 +666,7 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         list->DrawInstanced(count, 1, first, 0);
         first += count;
     }
+    if (list4.p) list4->EndRenderPass();
     // Read back the colour target and every depth-stencil plane.
     D3D12_RESOURCE_BARRIER barriers[3] = {
         d3d12test::transition(color.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)};
@@ -842,6 +880,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--warp")) warp = true;
         else if (!std::strcmp(argv[i], "--all")) with_depth_bias = true;
         else if (!std::strcmp(argv[i], "--stream")) use_stream = true;
+        else if (!std::strcmp(argv[i], "--render-pass")) use_render_pass = true;
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
