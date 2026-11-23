@@ -22,6 +22,10 @@ sys.path.insert(0, str(TOOLS))
 import glb_writer
 
 GIB = 1024 ** 3
+MIB = 1024 ** 2
+STATE_NAME = ".window-state.json"
+# Measured: a 256 MiB window of levels.rpf exported about 1.0 GiB of OBJ.
+WINDOW_OBJ_FACTOR = 4
 # make_game.MODEL_ARCHIVES, with conservative free-space estimates for staged OBJ exports.
 ARCHIVES = {
     "common.rpf": 1, "textures.rpf": 1, "data.rpf": 4,
@@ -201,9 +205,13 @@ def local_exporter(explicit: Path | None, work: Path) -> list[str]:
     raise OSError("local rpf9dump not found. Build tools/rpf9dump or provide --rpf9dump")
 
 
-def export_models(command: list[str], source: Path, exports: Path, reserve: int) -> None:
-    """Use the documented exporter; stop the child if free space falls below the reserve."""
-    with subprocess.Popen([*command, "models", str(source), str(exports)]) as child:
+def export_models(command: list[str], source: Path, exports: Path, reserve: int,
+                  window: tuple[int, int] | None = None) -> None:
+    """Use the documented exporter; stop the child if free space falls below the reserve.
+
+    `window` is a (start, length) byte range passed as the exporter's own --start/--length."""
+    extra = ["--start", str(window[0]), "--length", str(window[1])] if window else []
+    with subprocess.Popen([*command, "models", str(source), str(exports), *extra]) as child:
         try:
             while True:
                 try:
@@ -312,6 +320,34 @@ class Catalog:
         self.failed: set[Path] = set()
         self.new = 0
         self.attempts = 0
+        self.skip: set[Path] = set()
+        self.windows: dict[str, dict] = {}
+        self.prior = self.prior_assets()
+
+    def prior_assets(self) -> dict[str, tuple[str, str]]:
+        """Names and categories of the last catalog, so GLBs whose OBJ was released keep them."""
+        try:
+            document = json.loads((self.out / "catalog.json").read_text(encoding="utf-8"))
+            return {a["model"]: (a["name"], a["category"]) for a in document["assets"]
+                    if isinstance(a["name"], str) and a["category"] in CATEGORY_DIRS}
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+
+    def load_windows(self) -> None:
+        try:
+            document = json.loads((self.out / STATE_NAME).read_text(encoding="utf-8"))
+            for name, record in document["archives"].items():
+                done = sorted({n for n in record["completed"] if type(n) is int and n >= 0})
+                if type(record["size"]) is int and type(record["window"]) is int and record["window"] > 0:
+                    self.windows[name] = {"size": record["size"], "window": record["window"], "completed": done}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            self.windows = {}
+
+    def save_windows(self) -> None:
+        document = {"version": 1, "archives": self.windows}
+        target = self.out / STATE_NAME
+        safe_destination(target, self.out)
+        atomic_write(target, lambda f: f.write((json.dumps(document, sort_keys=True) + "\n").encode()))
 
     def issue(self, kind: str, detail, *, failed: bool = True, count: int = 1) -> None:
         if self.notes[kind] < 5:
@@ -326,6 +362,10 @@ class Catalog:
         notes = ", ".join(f"{count} {kind}" for kind, count in sorted(self.notes.items()) if count)
         unscanned = [Path(path).stem for path in ARCHIVES if Path(path).stem not in self.archives]
         coverage = f" Export manifests unavailable for {', '.join(unscanned)}." if unscanned else ""
+        for name, record in sorted(self.windows.items()):
+            total = -(-record["size"] // record["window"])
+            if len(record["completed"]) < total:
+                coverage += f" {Path(name).stem} windows complete: {len(record['completed'])}/{total}."
         message = f"{activity} {summary}. {notes + '. ' if notes else ''}{COVERAGE}{coverage}"
         processed = len((self.entries.keys() | self.failed) - self.pending.keys())
         total = processed + len(self.pending)
@@ -370,7 +410,8 @@ class Catalog:
             root, onerror=lambda exc: self.issue("unreadable folders", exc),
         ):
             folder = Path(directory)
-            subdirs[:] = sorted(name for name in subdirs if segment(name) and not linked(folder / name))
+            subdirs[:] = sorted(name for name in subdirs if segment(name) and not linked(folder / name)
+                                and folder / name not in self.skip)
             if not in_place and folder.name.casefold() == "models" and "manifest.json" in names:
                 self.manifest(folder / "manifest.json", root)
             for name in sorted(names):
@@ -389,11 +430,12 @@ class Catalog:
                     self.issue("unsupported GLB filenames", source)
                     continue
                 archive = "packs" if "packs" in (part.casefold() for part in rel.parts[:-1]) else ""
-                self.models.setdefault(destination, Model(
-                    source, destination, source.stem, category(source.stem, rel, archive, self.vehicles),
-                ))
+                name, group = source.stem, category(source.stem, rel, archive, self.vehicles)
+                if in_place:
+                    name, group = self.prior.get(relative_url(destination, self.out), (name, group))
+                self.models.setdefault(destination, Model(source, destination, name, group))
 
-    def manifest(self, path: Path, root: Path) -> None:
+    def manifest(self, path: Path, root: Path, *, windowed: bool = False) -> None:
         if linked(path):
             self.issue("linked manifests skipped", path)
             return
@@ -417,7 +459,10 @@ class Catalog:
         if whole:
             self.archives.add(archive)
         unavailable = scan.get("NotRecovered")
-        if type(unavailable) is int and unavailable > 0:
+        if type(unavailable) is int and unavailable > 0 and windowed:
+            # A raw window can cut a resource at its edge; these are counted, not treated as failures.
+            self.issue("window candidates not recovered", path, failed=False, count=unavailable)
+        elif type(unavailable) is int and unavailable > 0:
             self.issue("unrecovered candidates", path, count=unavailable)
         elif unavailable is None:
             self.issue("manifests with unknown scan coverage", path, failed=False)
@@ -541,6 +586,71 @@ class Catalog:
         self.attempts += 1
 
 
+def release(folder: Path, root: Path) -> None:
+    """Delete an owned window staging folder, refusing anything that is not a plain directory under its root."""
+    if not folder.exists():
+        return
+    safe_destination(folder, root)
+    for directory, subdirs, files in os.walk(folder):
+        if any(linked(Path(directory) / name) for name in subdirs + files):
+            raise OSError(f"refusing linked entry in window staging: {folder}")
+    shutil.rmtree(folder)
+
+
+def export_windows(catalog: Catalog, args, relative: str, source: Path, work: Path, exports: Path) -> bool:
+    """Export, convert and release one bounded window at a time; return False to stop the whole run.
+
+    A window counts as complete only after its rows were converted without failure and the catalog and the
+    checkpoint were written; only then is its OBJ staging deleted. Anything else leaves the window partial, and
+    the next run exports it again (converted GLBs are reused, since their paths depend only on the window)."""
+    size, window = source.stat().st_size, args.window_mib * MIB
+    record = catalog.windows.get(relative)
+    if not record or record["size"] != size or record["window"] != window:
+        record = catalog.windows[relative] = {"size": size, "window": window, "completed": []}
+    stem, reserve = Path(relative).stem, args.reserve_gib * GIB
+    root = exports / "windows" / stem
+    command = None
+    for start in range(0, size, window):
+        length = min(window, size - start)
+        folder = root / f"{start}-{length}"
+        if start in record["completed"]:
+            release(folder, root)
+            continue
+        if args.max_new is not None and catalog.new >= args.max_new:
+            return False
+        catalog.publish(f"Exporting {relative} window {start}+{length}.")
+        failures = catalog.errors
+        try:
+            command = command or local_exporter(args.rpf9dump, work)
+            exports.mkdir(parents=True, exist_ok=True)
+            free_space(exports, reserve, length * WINDOW_OBJ_FACTOR)
+            release(folder, root)
+            folder.mkdir(parents=True, exist_ok=True)
+            export_models(command, source, folder, reserve, window=(start, length))
+            manifest = folder / stem / "models" / "manifest.json"
+            if not manifest.is_file():
+                raise OSError(f"rpf9dump did not publish a manifest for {source.name} window {start}")
+            catalog.manifest(manifest, folder, windowed=True)
+        except SpaceError as exc:
+            catalog.issue("archives deferred for free space", f"{relative} window {start}: {exc}")
+            return True
+        except OSError as exc:
+            catalog.issue("archives unavailable or export failed", f"{source.name} window {start}: {exc}")
+            continue
+        catalog.discover_ready()
+        if not catalog.drained():
+            return False
+        if catalog.errors != failures:
+            continue
+        record["completed"] = sorted({*record["completed"], start})
+        catalog.publish(f"Window {start}+{length} of {relative} converted.")
+        catalog.save_windows()
+        release(folder, root)
+    if len(record["completed"]) == -(-size // window):
+        catalog.archives.add(stem)
+    return True
+
+
 def build(args) -> int:
     out = args.out.resolve()
     work = args.work.resolve() if args.work else out.with_name(out.name + ".work")
@@ -566,6 +676,8 @@ def build(args) -> int:
         if not (out / "catalog.json").is_file():
             catalog.publish("Discovering local models.")
         catalog.names([out, *roots])
+        catalog.load_windows()
+        catalog.skip.add(exports / "windows")
         catalog.scan(out, in_place=True)
         for root in [*roots, exports]:
             catalog.scan(root)
@@ -585,6 +697,12 @@ def build(args) -> int:
                 try:
                     if source.resolve() != source or linked(source) or not source.is_file():
                         raise OSError(f"{relative} is missing or linked")
+                    if args.window_mib and relative in (args.window_archive or ["levels.rpf"]) \
+                            and source.stat().st_size > args.window_mib * MIB:
+                        if not export_windows(catalog, args, relative, source, work, exports):
+                            exhausted = False
+                            break
+                        continue
                     command = local_exporter(args.rpf9dump, work)
                     exports.mkdir(parents=True, exist_ok=True)
                     free_space(exports, args.reserve_gib * GIB, ARCHIVES[relative] * GIB)
@@ -625,6 +743,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game", type=Path, help="local package root for missing documented model exports")
     ap.add_argument("--archive", choices=ARCHIVES, action="append",
                     help="documented package-relative archive for --game; repeatable, default: all")
+    ap.add_argument("--window-mib", type=int,
+                    help="export large archives as consecutive windows of this many MiB, converting and "
+                         "releasing each before the next (needs --game; default: whole archives)")
+    ap.add_argument("--window-archive", choices=ARCHIVES, action="append",
+                    help="archive to export in windows; repeatable, default: levels.rpf")
     ap.add_argument("--rpf9dump", type=Path, help="local rpf9dump executable or DLL")
     ap.add_argument("--vehicle-names", type=Path, help="optional local list of verified vehicle names, one per line")
     ap.add_argument("--batch-size", type=int, default=256, help="publish a checkpoint every N attempted models")
@@ -633,6 +756,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.archive and not args.game:
         ap.error("--archive requires --game")
+    if (args.window_mib or args.window_archive) and not args.game:
+        ap.error("--window-mib and --window-archive require --game")
+    if args.window_archive and not args.window_mib:
+        ap.error("--window-archive requires --window-mib")
+    if args.window_mib is not None and args.window_mib < 1:
+        ap.error("--window-mib must be positive")
     if args.batch_size < 1 or (args.max_new is not None and args.max_new < 1) or args.reserve_gib < 0:
         ap.error("--batch-size and --max-new must be positive and --reserve-gib must be nonnegative")
     try:

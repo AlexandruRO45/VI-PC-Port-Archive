@@ -37,6 +37,37 @@ Rerunning the command reuses valid output files. The default free-space reserve 
 preflights require additional headroom for their OBJ exports, including 24 GiB for `packs.rpf` and
 200 GiB for `levels.rpf`. An export also stops if free space falls below the reserve during the run.
 
+### Windowed import of large archives
+
+A whole `levels.rpf` (about 71 GiB) needs more than 200 GiB of temporary OBJ. Add `--window-mib N` to export
+it, and any archive named with a repeatable `--window-archive` (default `levels.rpf`), as consecutive
+`rpf9dump models <src> <out> --start BYTES --length BYTES` windows. The flag is opt-in and needs `--game`.
+Archives not larger than the window, and every run without the flag, use the whole-file path above.
+
+```powershell
+python -I tools/viewer_catalog.py --game "<package>" --archive levels.rpf --window-mib 256 --out "<work>/catalog" --work "<work>"
+```
+
+A 256 MiB window of `levels.rpf` recovered 1833 records in about 9 s and wrote about 1.0 GiB of OBJ, so
+each window preflights four times its length plus the reserve. The windows run in order. Each one is
+converted into the catalog, which is published after every window. Its staging folder under
+`<work>/rpf9dump-models/.../windows/<archive>/<start>-<length>` is deleted only once all its rows converted without a
+failure, the catalog is written and the checkpoint `<out>/.window-state.json` records the window. The window folder name goes
+into each converted GLB's path, so identical filenames in different windows stay apart.
+
+Anything else leaves the window partial: a full disk, a `--max-new` pause, an exporter failure or a row that
+failed. The ready models stay in the catalog, the exit code is nonzero unless the run only paused, and the status
+message says `levels windows complete: N/M`. The next run exports every incomplete window again from scratch and
+reuses GLBs it already wrote, so an interruption at any point is safe. If a crash happens between the checkpoint and
+the cleanup, the leftover staging folder is removed on the next run. Changing `--window-mib` or the archive size
+discards the checkpoint. A window that cannot be exported is reported and the others still run.
+
+Coverage limits: a window is a raw slice of the archive, so a resource that straddles a window edge may not be
+recovered. Those candidates are counted in the status message as `window candidates not recovered` and are not
+treated as failures, so `complete` means that every window finished, not that no resource was lost at an edge.
+This slice only decodes ordinary static models; placing them in the world needs joins outside it. After a window's
+OBJ is released, its models keep the name and category of the previous `catalog.json`.
+
 The builder uses `packs.rpf` provenance and recognized part-name markers for Ped parts. It uses
 existing `vehicles/` directories or verified names from an export root's `vehicle-names.txt` to
 identify Vehicles. The file takes one verified model name per line and can also be supplied via

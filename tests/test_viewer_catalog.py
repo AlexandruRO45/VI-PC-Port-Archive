@@ -154,6 +154,94 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("levels", result["status"]["message"])
         self.assertEqual([asset["name"] for asset in result["assets"]], ["ready"])
 
+    def window_setup(self, windows=3):
+        game = self.root / "synthetic-package"
+        source = game / "levels.rpf"
+        source.parent.mkdir(parents=True)
+        with source.open("wb") as f:
+            f.truncate(windows * viewer_catalog.MIB - 5)
+        calls = []
+
+        def export(command, src, exports, reserve, window=None):
+            calls.append(window)
+            start = window[0] // viewer_catalog.MIB
+            rows = [{"File": f"{name}.obj", "Name": name} for name in (f"w{start}_a", f"w{start}_same")]
+            folder = self.write_export("levels", rows, root=exports)
+            # Same filename in every window: the window must keep the converted paths apart.
+            (folder / "w_same.obj").write_text(OBJ, encoding="utf-8")
+            self.assertEqual(window[1], min(viewer_catalog.MIB, src.stat().st_size - window[0]))
+
+        patcher = patch.multiple(viewer_catalog, free_space=lambda *args: None,
+                                 local_exporter=lambda *args: ["fake"], export_models=export)
+        return game, calls, patcher
+
+    def windowed(self, game, *extra):
+        return self.build("--game", str(game), "--archive", "levels.rpf", "--window-mib", "1", *extra)
+
+    def test_windowed_import_releases_each_window_and_resumes_from_checkpoint(self):
+        game, calls, patcher = self.window_setup()
+        with patcher:
+            self.assertEqual(self.windowed(game), 0)
+            result = self.catalog()
+            self.assertTrue(result["status"]["complete"])
+            self.assertEqual(len(result["assets"]), 6)
+            self.assertEqual(len({asset["model"] for asset in result["assets"]}), 6)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual([c[0] for c in calls], [0, 1048576, 2097152])
+            state = json.loads((self.out / ".window-state.json").read_text())
+            self.assertEqual(state["archives"]["levels.rpf"]["completed"], [0, 1048576, 2097152])
+            staging = self.work / "rpf9dump-models"
+            self.assertEqual([p for p in staging.rglob("*.obj")], [])
+            self.assertEqual(self.windowed(game), 0)
+        self.assertEqual(len(calls), 3)
+        again = self.catalog()
+        self.assertEqual(sorted(a["name"] for a in again["assets"]), sorted(a["name"] for a in result["assets"]))
+
+    def test_windowed_import_keeps_finished_windows_when_storage_runs_out(self):
+        game, calls, patcher = self.window_setup()
+        budget = iter([True, False])
+
+        def space(folder, reserve, extra=0):
+            if extra >= viewer_catalog.MIB * viewer_catalog.WINDOW_OBJ_FACTOR - 20 and not next(budget, False):
+                raise viewer_catalog.SpaceError("synthetic full disk")
+
+        with patcher, patch.object(viewer_catalog, "free_space", space):
+            self.assertEqual(self.windowed(game), 1)
+            partial = self.catalog()
+            self.assertFalse(partial["status"]["complete"])
+            self.assertEqual(len(partial["assets"]), 2)
+            self.assertIn("levels windows complete: 1/3", partial["status"]["message"])
+            self.assertIn("archives deferred for free space", partial["status"]["message"])
+        self.assertEqual(len(calls), 1)
+        with patcher:
+            self.assertEqual(self.windowed(game), 0)
+        self.assertEqual([c[0] for c in calls], [0, 1048576, 2097152])
+        self.assertTrue(self.catalog()["status"]["complete"])
+        self.assertEqual(len(self.catalog()["assets"]), 6)
+
+    def test_windowed_pause_keeps_window_partial_until_converted(self):
+        game, calls, patcher = self.window_setup(2)
+        with patcher:
+            self.assertEqual(self.windowed(game, "--max-new", "1"), 0)
+            paused = self.catalog()
+            self.assertFalse(paused["status"]["complete"])
+            self.assertEqual(len(paused["assets"]), 1)
+            self.assertFalse((self.out / ".window-state.json").exists())
+            self.assertEqual(self.windowed(game), 0)
+        self.assertTrue(self.catalog()["status"]["complete"])
+        self.assertEqual(len(self.catalog()["assets"]), 4)
+
+    def test_window_options_need_game_and_default_stays_whole_file(self):
+        with self.assertRaises(SystemExit), patch("sys.stderr", new=StringIO()):
+            self.build("--window-mib", "1")
+        command = []
+        with patch.object(viewer_catalog.subprocess, "Popen") as popen:
+            popen.return_value.__enter__.return_value.wait.return_value = 0
+            viewer_catalog.export_models(["x"], Path("s.rpf"), Path("o"), 0)
+            viewer_catalog.export_models(["x"], Path("s.rpf"), Path("o"), 0, window=(5, 7))
+        self.assertEqual(popen.call_args_list[0].args[0], ["x", "models", "s.rpf", "o"])
+        self.assertEqual(popen.call_args_list[1].args[0][-4:], ["--start", "5", "--length", "7"])
+
     def test_streamed_manifest_reads_rows_and_trailing_metadata_across_chunks(self):
         rows = [{"File": f"{i}.obj", "metadata": "m" * 20000} for i in range(10)]
         document = {"Count": len(rows), "Items": rows, "ModelDecodeFailures": {"unreadable": 4}}
