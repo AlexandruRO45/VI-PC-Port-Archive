@@ -378,5 +378,83 @@ class TestVCubeidF32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(res[i], 0xCAFEBABE)
 
 
+class TestVCubeidF32RegisterAliasing(unittest.TestCase):
+    """Register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_dst_aliases_src0(self):
+        self.rf.write_vgpr(1, f32_to_bits(4.0))
+        self.rf.write_vgpr(2, f32_to_bits(-1.5))
+        self.rf.write_vgpr(3, f32_to_bits(0.75))
+        inst = VCubeidF32Instruction(
+            dst=Operand(RegType.VGPR, 1),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = f32_to_bits(0.0)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[1], expected)
+
+    def test_dst_aliases_src1(self):
+        self.rf.write_vgpr(1, f32_to_bits(4.0))
+        self.rf.write_vgpr(2, f32_to_bits(-1.5))
+        self.rf.write_vgpr(3, f32_to_bits(0.75))
+        inst = VCubeidF32Instruction(
+            dst=Operand(RegType.VGPR, 2),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = f32_to_bits(0.0)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[2], expected)
+
+    def test_dst_aliases_src2(self):
+        self.rf.write_vgpr(1, f32_to_bits(4.0))
+        self.rf.write_vgpr(2, f32_to_bits(-1.5))
+        self.rf.write_vgpr(3, f32_to_bits(0.75))
+        inst = VCubeidF32Instruction(
+            dst=Operand(RegType.VGPR, 3),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = f32_to_bits(0.0)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[3], expected)
+
+    def test_dst_aliases_all_operands(self):
+        self.rf.write_vgpr(1, f32_to_bits(2.0))
+        inst = VCubeidF32Instruction(
+            dst=Operand(RegType.VGPR, 1),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 1),
+            src2=Operand(RegType.VGPR, 1),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        # For x == y == z == 2.0, Z wins (+Z face = 4.0)
+        expected = f32_to_bits(4.0)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[1], expected)
+
+    def test_hw_translator_aliasing(self):
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(4.0):#x}",
+            f"v_mov_b32 v2, {f32_to_bits(-1.5):#x}",
+            f"v_mov_b32 v3, {f32_to_bits(0.75):#x}",
+            "v_cubeid_f32 v1, v1, v2, v3",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubeid_alias", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], f32_to_bits(0.0))
+
+
 if __name__ == "__main__":
     unittest.main()
