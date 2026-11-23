@@ -261,7 +261,11 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stderr);
         // Not `return`: a normal host exit runs the CRT's atexit table, which the game shares with gta6rt (its
         // handlers would run against a game that has stopped) and whose last word decides the exit status.
-        // ExitProcess also skips atexit, so the TLS clone cleanup registered there is run here instead.
+        // ExitProcess also skips ~Loader() and atexit, so deliver PE TLS/DllMain process-detach notifications
+        // while mappings and TLS clones are still live, then clean up TLS clones before ExitProcess.
+        loader.detach_initialised_modules();
+        std::fflush(stdout);
+        std::fflush(stderr);
         rt::cleanup_tls_clones();
         ExitProcess(static_cast<UINT>(code));
     } catch (const std::exception& e) {
