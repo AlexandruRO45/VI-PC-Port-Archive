@@ -5,6 +5,10 @@ Launches a lightweight local HTTP server and opens a modern WebGL/glTF
 
 Usage:
     python -I tools/gallery.py [--port 8080] [--models-dir <path>] [--textures-dir <path>]
+
+Without an option the gallery looks for exported assets under and beside the checkout (models/, textures/, the
+sibling export folders) and lists nothing when it finds none: it never creates an asset folder inside the
+repository. An option that does not name an existing folder is refused instead of being replaced by a candidate.
 """
 from __future__ import annotations
 
@@ -370,11 +374,8 @@ def start_server(
                 if c > max_count:
                     max_count = c
                     best_cand = cand
-        if best_cand:
-            models_dir = best_cand
-        if not models_dir or not os.path.isdir(models_dir):
-            models_dir = os.path.join(root, "models")
-            os.makedirs(models_dir, exist_ok=True)
+        # None when nothing was found: no folder is created inside the checkout.
+        models_dir = best_cand
 
     if not textures_dir or not os.path.isdir(textures_dir):
         candidates = [
@@ -391,14 +392,13 @@ def start_server(
                 if c > max_count:
                     max_count = c
                     best_cand = cand
-        if best_cand:
-            textures_dir = best_cand
-        if not textures_dir or not os.path.isdir(textures_dir):
-            textures_dir = os.path.join(root, "textures")
-            os.makedirs(textures_dir, exist_ok=True)
+        # None when nothing was found: no folder is created inside the checkout.
+        textures_dir = best_cand
 
-    StudioHandler.models_dir = os.path.abspath(models_dir)
-    StudioHandler.textures_dir = os.path.abspath(textures_dir)
+    # "" is "no folder configured": the handlers then list nothing and refuse every /models/ and /textures/ name.
+    # os.path.abspath("") is the current directory, i.e. the whole working directory would be served as assets.
+    StudioHandler.models_dir = os.path.abspath(models_dir) if models_dir else ""
+    StudioHandler.textures_dir = os.path.abspath(textures_dir) if textures_dir else ""
     StudioHandler.viewer_dir = viewer_dir
 
     addr = ("127.0.0.1", port)
@@ -421,8 +421,8 @@ def start_server(
     print(f"       LEONIDA 3D ASSET STUDIO (VICE CITY EDITION)    ")
     print(f"======================================================")
     print(f"Web Studio URL:     {url}")
-    print(f"Models Directory:   {StudioHandler.models_dir}")
-    print(f"Textures Directory: {StudioHandler.textures_dir}")
+    print(f"Models Directory:   {StudioHandler.models_dir or '(none: pass --models-dir)'}")
+    print(f"Textures Directory: {StudioHandler.textures_dir or '(none: pass --textures-dir)'}")
     print(f"Viewer Directory:   {StudioHandler.viewer_dir}")
     print(f"Press Ctrl+C to stop.")
 
