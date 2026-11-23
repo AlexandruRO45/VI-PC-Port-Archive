@@ -1266,6 +1266,10 @@ void test_packaged_loader_directories() {
     HMODULE expected = load(L"testshim.dll");
     if (expected && packaged(L"testshim.dll", 0) == expected) pass("packaged loader returns owned shim");
     else failed("packaged loader returns owned shim", "wrong handle");
+    SetLastError(0);
+    if (!packaged(L"version.dll", 0) && GetLastError() == ERROR_MOD_NOT_FOUND)
+        pass("packaged loader refuses host module");
+    else failed("packaged loader refuses host module", "host module loaded or wrong error");
     auto game = g_dir / L"dll_game";
     auto overlay = g_dir / L"dll_overlay";
     std::filesystem::create_directories(game / L"x");

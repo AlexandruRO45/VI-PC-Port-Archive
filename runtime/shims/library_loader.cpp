@@ -206,7 +206,14 @@ HMODULE WINAPI load_packaged_library(LPCWSTR name, DWORD reserved) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    return load_library_ex_w(name, nullptr, 0);
+    if (name) {
+        bool handled = false;
+        HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), 0, handled)
+                                         : load_bundled_w(name, 0, handled);
+        if (handled) return h;
+    }
+    SetLastError(ERROR_MOD_NOT_FOUND);
+    return nullptr;
 }
 
 std::map<DLL_DIRECTORY_COOKIE, std::filesystem::path>& dll_directories() {
