@@ -305,8 +305,8 @@ differences** (plus `tools/salu_diff.py --oracle hw,translator --bfe-any --progr
   `v_cvt_pknorm_i16/u16_f32` (±qNaN → 0, ±inf saturation, RNE ties at ±0.5).
 - **Translator divergences found on gfx1035:** five (VOP3 `clamp` on the six carry-out add/sub ops ignored;
   `v_cvt_rpi_i32_f32` rounding `x + 0.5` in binary32; `v_cvt_flr/rpi_i32_f32` returning `0` for NaN instead of
-  saturating by its sign). All are fixed (#1831, #1856), so `KNOWN_DIVERGENCES` is empty and all 87 cases
-  match.
+  saturating by its sign). All are fixed (#1831, #1856), so `KNOWN_DIVERGENCES` is empty and every case in that run
+  matches.
 
 #### RDNA2 swizzled buffer addressing (`tools/buffer_swizzle_probe.py`, SHADER-343)
 
