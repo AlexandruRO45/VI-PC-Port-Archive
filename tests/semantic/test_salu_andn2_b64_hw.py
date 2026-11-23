@@ -379,3 +379,42 @@ class TestSaluAndn2B64ConditionCodes(unittest.TestCase):
         sdst, scc = ref_andn2_b64(0, 0x5555555555555555)
         self.assertEqual(sdst, 0)
         self.assertEqual(scc, 0)
+
+
+class TestSaluAndn2B64BitwiseEdgeCases(unittest.TestCase):
+    """Test suite for 64-bit IEEE-754 bit representations and boundary bitmasks."""
+
+    def test_ieee754_double_precision_bit_patterns(self):
+        cases = [
+            0x7FF0000000000000,  # +inf
+            0xFFF0000000000000,  # -inf
+            0x7FF8000000000000,  # Quiet NaN
+            0x7FF0000000000001,  # Signaling NaN
+            0x0000000000000000,  # +0.0
+            0x8000000000000000,  # -0.0
+            0x0000000000000001,  # Minimum subnormal
+            0x000FFFFFFFFFFFFF,  # Maximum subnormal
+        ]
+        for pattern0 in cases:
+            for pattern1 in cases:
+                with self.subTest(p0=hex(pattern0), p1=hex(pattern1)):
+                    sdst, scc = ref_andn2_b64(pattern0, pattern1)
+                    expected = pattern0 & (~pattern1 & MASK64)
+                    self.assertEqual(sdst, expected)
+                    self.assertEqual(scc, int(expected != 0))
+
+    def test_boundary_alternating_bitmasks(self):
+        checkerboards = [
+            0x5555555555555555,
+            0xAAAAAAAAAAAAAAAA,
+            0x3333333333333333,
+            0xCCCCCCCCCCCCCCCC,
+            0x0F0F0F0F0F0F0F0F,
+            0xF0F0F0F0F0F0F0F0,
+            0x00FF00FF00FF00FF,
+            0xFF00FF00FF00FF00,
+        ]
+        for cb0 in checkerboards:
+            for cb1 in checkerboards:
+                sdst, scc = ref_andn2_b64(cb0, cb1)
+                self.assertEqual(sdst, cb0 & (~cb1 & MASK64))
