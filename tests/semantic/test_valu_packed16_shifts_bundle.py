@@ -848,5 +848,39 @@ class TestVPkMadU16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x00010002)
 
+def ref_v_pk_sub_u16(s0: int, s1: int) -> int:
+    """Unsigned 16-bit integer subtraction on packed values.
+    Each half: (src0 - src1) wrapping to 16 bits.
+    """
+    a_lo, a_hi = s0 & MASK16, (s0 >> 16) & MASK16
+    b_lo, b_hi = s1 & MASK16, (s1 >> 16) & MASK16
+    res_lo = (a_lo - b_lo) & MASK16
+    res_hi = (a_hi - b_hi) & MASK16
+    return pack16(res_lo, res_hi)
+
+
+class TestVPkSubU16Oracle(unittest.TestCase):
+    def test_oracle_basic_sub(self) -> None:
+        s0 = pack16(10, 5)
+        s1 = pack16(3, 2)
+        # 10 - 3 = 7; 5 - 2 = 3
+        self.assertEqual(ref_v_pk_sub_u16(s0, s1), pack16(7, 3))
+
+    def test_oracle_unsigned_underflow_wrap(self) -> None:
+        s0 = pack16(3, 2)
+        s1 = pack16(10, 5)
+        # 3 - 10 = -7 & 0xFFFF = 0xFFF9
+        # 2 - 5 = -3 & 0xFFFF = 0xFFFD
+        self.assertEqual(ref_v_pk_sub_u16(s0, s1), pack16(0xFFF9, 0xFFFD))
+
+    def test_oracle_zero_difference(self) -> None:
+        s0 = pack16(1234, 5678)
+        self.assertEqual(ref_v_pk_sub_u16(s0, s0), 0)
+
+    def test_oracle_max_values(self) -> None:
+        s0 = pack16(0xFFFF, 0xFFFF)
+        s1 = pack16(1, 0xFFFF)
+        self.assertEqual(ref_v_pk_sub_u16(s0, s1), pack16(0xFFFE, 0x0000))
+
 if __name__ == "__main__":
     unittest.main()
