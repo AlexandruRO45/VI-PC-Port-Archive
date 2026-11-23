@@ -681,6 +681,17 @@ HRESULT D3D12GetInterface(
 their GUID words and maps each to an interface. It creates no device.
 Source: <https://docs.xbox.com/reference/graphics/d3d12/functions/d3d12getinterface_public.md>
 
+The retail executable's own call, measured from the file on 2026-11-23 ([runtime_imports.md](runtime_imports.md)
+names the image, and its SHA-256 matches): `D3D12XboxCreateDevice` is called once, at startup, with a null adapter and
+`IID_ID3D12Device11` (`5405c344-d457-444e-b4dd-2366e45aee39`, a public GUID in the Windows SDK's `d3d12.h`), plus a
+24-word parameter block the title builds on its stack: the block's first 48 bytes are zeroed, then six words are
+written in that span — the constants `0x00020004` (+0x00), `0x00100000` (+0x08), `0x1` (+0x28) and `0x20` (+0x3C),
+and two bytes the title sets at runtime (+0x20, +0x24; zero in the image). The other eight words of the 96 bytes the
+layer logs are the function's stack frame (its saved registers), so a traced run prints frame contents, not title
+values, in the upper words. The caller is the function that creates the title's `sgaWindowClass` window.
+`tools/import_call_sites.py` counts the one direct call; the block's construction was read from the disassembly.
+What the six written words mean is still open (§6).
+
 ### 5.2 Command queue
 
 ```cpp
@@ -825,7 +836,7 @@ means the code is absent, not that the API is undocumented.
 | Draws and dispatch | `DrawInstanced`, `DrawIndexedInstanced`, `Dispatch`, root-argument setters (interfaces index) | Present and GPU-tested ([first_light.md](first_light.md)) | Nothing to change from the documentation side |
 | Shader cache | Session desc with its three documented defaults, `StoreValue`/`FindValue` two-call pattern, `ShaderCacheControl` in developer mode, library gate (§4) | Implemented with `ID3D12Device9::CreateShaderCacheSession`, the session object and `ShaderCacheControl` (D3D-34, `runtime/test/d3d12_shader_cache_test.cpp`) | The defaults (1 KB / 128 entries / 128 MB) are the numbers the layer must reproduce for a host-parity answer |
 | Present | No page (§5.5) | `runtime/shims/xbox_present.cpp` plus a DXGI swapchain fallback | The layer's presenter is built on measurement; there is no document to check it against |
-| Device creation | No `D3D12CreateDevice` page; `D3D12GetInterface` only (§5.1) | `D3D12XboxCreateDevice` with an unmeasured 24-word params block | Params and flags stay open; nothing in the public reference narrows them |
+| Device creation | No `D3D12CreateDevice` page; `D3D12GetInterface` only (§5.1) | `D3D12XboxCreateDevice`; the executable's call is measured (§5.1) | the six written words' meaning stays open; the public reference names none of them |
 
 Two consequences follow for how this documentation is used. First, the parts a replay layer needs most precisely
 (the enum values) are the parts this reference publishes worst: three enums in this page print colliding or all-zero
