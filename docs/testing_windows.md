@@ -4,9 +4,16 @@ The checklist from "I have my own copy" to "I know what works and what doesn't",
 prerequisites and the build itself are in the README's [How to build](../README.md#how-to-build); the GPU test
 programs, their setup per OS and the skips and driver problems each GPU has are in [testing.md](testing.md).
 
-Everything runs locally: the tools read your package in place and write only to your `--out` and `--work` folders.
-Nothing in this repository is the game, and nothing produced here should be shared — no archives, executables,
-carved shaders, textures or logs that quote them.
+Everything runs locally. The tools read your package in place; they write to the `--out` and `--work` folders, to the
+runtime build tree under `runtime\build`, and to whatever folder you pass to a translator slice (`--out C:\scratch`
+below). Nothing in this repository is the game, and nothing produced here should be shared — no archives,
+executables, carved shaders, textures or logs that quote them.
+
+Read the commands before running them, and keep a build you do not trust isolated: no signed-in accounts, no shared
+folders and no credentials in its environment. Cloning and the dependency fetches (the `rpf9-explorer` submodule,
+the pinned Vulkan headers or SDL3 when CMake downloads them) use the network; after that the tools and the tests run
+locally. The one step that can reach a game service is `--run`: it binds the title's `ws2_32.dll` imports to the
+host, so run it with the network off (step 5).
 
 If a step fails, read [what to send](#when-something-fails) before reporting it.
 
@@ -15,7 +22,7 @@ If a step fails, read [what to send](#when-something-fails) before reporting it.
 ```powershell
 python -I make_game.py --find                 # copies found in Downloads, Desktop, Documents, Games, home, drive roots
 python -I make_game.py --check                # sizes and names against the known 1.0.2.1 tables
-python -I make_game.py --check --full-check   # the same plus the SHA-256 of every file (slow, a few hours)
+python -I make_game.py --check --full-check   # the same plus the SHA-256 of every file (reads every byte; slow)
 ```
 
 `--check` is the fast signal: it recognises the version from file names and sizes without reading anything large.
@@ -52,7 +59,8 @@ python -I tools/rdna2spirv.py "E:\leonida-work\shaders\dxbc\disasm" --out C:\scr
 ```
 
 `--limit 200` takes the first 200 shaders; `--shard 0/8` takes one of eight interleaved slices, so eight runs cover
-everything. A change that lowers either count is a regression.
+everything. Shard runs write `index.part<n>.json` instead of `index.json`; publish the merged index with
+`python -I tools/rdna2spirv.py --out C:\scratch --merge`. A change that lowers either count is a regression.
 
 ## 4. CPU, GPU and pipeline tests, no game files needed
 
@@ -111,11 +119,12 @@ the host's.
 
 ## When something fails
 
-Send the message, not the file. Useful reports contain:
+Send the message, not the file. Redact before posting: user and folder names, drive letters, host names, and any
+token or credential that a command line or log excerpt may contain. Useful reports contain:
 
-- the exact command line and the last 30 lines of output;
+- the exact command line and the last 30 lines of output, with paths and names redacted;
 - counts: how many shaders translated, how many passed `spirv-val`, how many `unimplemented` imports;
-- the shader name and the offset `Unsupported` names, if a particular shader was rejected;
+- the rejection message or error class when a particular shader is refused, not the shader's bytes or a disassembly;
 - your GPU and driver version for anything GPU-related.
 
 Never attach a `.rpf`, `.ttpf`, `.dxbc`, `.fssm`, `.spv`, texture, model or audio file, and never paste a
