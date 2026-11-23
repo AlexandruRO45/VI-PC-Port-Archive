@@ -283,9 +283,12 @@ vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs 
 
 Test hook, not for normal use: `VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL]` makes the
 process raise `SIGNAL` (default `SIGFPE`; `SEGV`, `ABRT`, `KILL`, ... also accepted) just before the pipeline of a
-matching module is created. `tests/test_vk_pipeline_check_isolate.py` uses it with five hand-assembled compute
-shaders to check `--isolate` without a crashing driver; it skips when the tool isn't built or there is no
-Vulkan device.
+matching module is created. Like a driver crash, it doesn't flush stdio first; on Windows the process ends with
+`0xC0000005` for `SEGV` and `0xC0000094` otherwise, since the CRT's `raise` would flush.
+`tests/test_vk_pipeline_check_isolate.py` uses it with five hand-assembled compute shaders to check `--isolate`
+without a crashing driver; it skips when the tool isn't built or there is no Vulkan device.
+`tests/test_vk_pipeline_check_crash_log.py` checks that the result lines printed before a crash are in a redirected
+log: stdout is line-buffered, and unbuffered on Windows, where the CRT has no line buffering.
 
 ## Application pipeline-cache feedback
 

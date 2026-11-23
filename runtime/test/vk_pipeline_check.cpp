@@ -43,8 +43,9 @@
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
 //                 after a crash, so the next run checks everything else instead of dying on the same module.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] raises SIGNAL (default SIGFPE)
-//                 just before the pipeline of a matching module is created. For testing --isolate and the
-//                 pipelines stage's retry.
+//                 just before the pipeline of a matching module is created, without flushing stdio, as a driver
+//                 crash would (on Windows the process ends with 0xC0000005 for SEGV, else 0xC0000094). For testing
+//                 --isolate, the pipelines stage's retry and what a crashed run's log keeps.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
@@ -85,6 +86,11 @@
 #include <unistd.h>
 #include <cerrno>
 #include <filesystem>
+#else
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // TerminateProcess for the simulated crash
 #endif
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -649,7 +655,13 @@ int main(int argc, char** argv) {
             "[--skip-file F]\n");
         return 2;
     }
-    std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
+    // Failures reach a redirected log as they happen, so a driver crash doesn't take the last results with it. The
+    // MSVC CRT has no line buffering (_IOLBF is full buffering there), so stdout is unbuffered on Windows.
+#ifdef _WIN32
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+    std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);
+#endif
     std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path;
     bool cache_given = false;   // an empty cache_path alone can't tell "not given" from an empty argument
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
@@ -1367,9 +1379,14 @@ int main(int argc, char** argv) {
     const SimulatedCrash sim_crash = read_simulated_crash();
     auto maybe_simulate_crash = [&](const std::string& name) {   // test hook, see the header
         if (sim_crash.enabled && name.find(sim_crash.pattern) != std::string::npos) {
+            // No fflush: a driver that crashes doesn't flush stdio either, so the test sees what a real crash leaves.
             std::fprintf(stderr, "simulating signal %d before the pipeline of %s\n", sim_crash.sig, name.c_str());
-            std::fflush(nullptr);
+#ifdef _WIN32
+            // The CRT's raise() flushes stdio on its way out; a crash in the driver ends the process without that.
+            TerminateProcess(GetCurrentProcess(), sim_crash.sig == SIGSEGV ? 0xc0000005u : 0xc0000094u);
+#else
             std::raise(sim_crash.sig);
+#endif
         }
     };
 
