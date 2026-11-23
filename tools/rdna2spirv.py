@@ -17603,6 +17603,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
         m["wave64_exchange"] = "workgroup"
         m["subgroup_size"] = None
+    elif g.wave64 and g.stage in ("vs", "ps", "gs"):
+        # SHADER-10: wave64 graphics shaders have no cross-half exchange (wave64_emulated=true) and work at any
+        # subgroup size.  Leaving subgroup_size=64 makes the runtime request 64-wide, which fails on devices whose
+        # maxSubgroupSize < 64 (Intel, NVIDIA).  None lets the runtime fall back to the device default.
+        m["subgroup_size"] = None
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if "SignedZeroInfNanPreserve" in caps:

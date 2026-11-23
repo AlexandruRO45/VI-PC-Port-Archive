@@ -44,6 +44,17 @@ def test_wave64_graphics_is_emulated():
     assert shader_meta(_gen("ms", wave64=True), "OpCapability MeshShadingEXT")["wave64_emulated"] is False
 
 
+def test_wave64_graphics_subgroup_size_is_none():
+    # SHADER-10: wave64 VS/PS/GS have no cross-half exchange and work at any subgroup size.
+    # subgroup_size must be None so the runtime does not request 64-wide on devices that
+    # cannot provide it (Intel, NVIDIA).
+    for stage in ("vs", "ps", "gs"):
+        m = shader_meta(_gen(stage, wave64=True), "")
+        assert m["subgroup_size"] is None, f"{stage} wave64 should have subgroup_size=None"
+        assert m["wave64"] is True
+        assert m["wave64_emulated"] is True
+
+
 def test_vertex_signature_passthrough(tmp_path):
     g = _gen("vs")
     g.vertex_inputs = [(0, 3)]
