@@ -5,6 +5,7 @@ Each mutation is an exact-text replacement that must match exactly once (so a re
 this test fail loudly instead of silently mutating nothing). The repository's own tools/ is never modified.
 Each baseline run on the unmutated copy must pass first.
 """
+import concurrent.futures
 import os
 import re
 import shutil
@@ -109,24 +110,63 @@ def apply_mutation(path, old, new):
         f.write(text.replace(old, new).replace("\n", sep))
 
 
+def make_copy(tmp, mutated=()):
+    """Copy tools/ into tmp. Every file but the ones in `mutated` is hard-linked (copied if linking fails), so a
+    copy costs a few dozen directory entries instead of 6 MB of writes that a virus scanner then reads back; the
+    mutated files are real copies, since apply_mutation rewrites them and must never reach the repository's file."""
+    src = os.path.join(ROOT, "tools")
+    dst = os.path.join(tmp, "tools")
+    skip = shutil.ignore_patterns("__pycache__", "rpf9dump")
+
+    def link_or_copy(s, d):
+        if os.path.basename(s) not in mutated:
+            try:
+                os.link(s, d)
+                return d
+            except OSError:
+                pass
+        return shutil.copy2(s, d)
+
+    shutil.copytree(src, dst, ignore=skip, copy_function=link_or_copy)
+    return dst
+
+
+def run_mutation(fname, old, new):
+    """One mutation on a private copy of tools/: returns (return code, output) of the semantic run."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tools = make_copy(tmp, (fname,))
+        apply_mutation(os.path.join(tools, fname), old, new)
+        return run_semantics(tools)
+
+
+def run_baseline():
+    with tempfile.TemporaryDirectory() as tmp:
+        return run_semantics(make_copy(tmp))
+
+
 class MutationTests(unittest.TestCase):
-    def make_copy(self, tmp):
-        dst = os.path.join(tmp, "tools")
-        shutil.copytree(os.path.join(ROOT, "tools"), dst, ignore=shutil.ignore_patterns("__pycache__", "rpf9dump"))
-        return dst
+    # Each run is a fresh interpreter that recompiles the 16 000-line translator, a second or more of CPU, and the
+    # runs are independent, so they start together (setUpClass) and the tests only read the results. The results
+    # are the same ones the sequential loop produced; only their wall time overlaps.
+    @classmethod
+    def setUpClass(cls):
+        workers = max(1, min(len(MUTATIONS) + 1, os.cpu_count() or 1))
+        cls._pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        cls._baseline = cls._pool.submit(run_baseline)
+        cls._mutated = [cls._pool.submit(run_mutation, fname, old, new) for _, fname, old, new, _ in MUTATIONS]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._pool.shutdown(wait=True, cancel_futures=True)
 
     def test_baseline_copy_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            rc, out = run_semantics(self.make_copy(tmp))
-            self.assertEqual(rc, 0, out)
+        rc, out = self._baseline.result()
+        self.assertEqual(rc, 0, out)
 
     def test_each_mutation_is_caught(self):
-        for label, fname, old, new, expect in MUTATIONS:
-            with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
-                tools = self.make_copy(tmp)
-                path = os.path.join(tools, fname)
-                apply_mutation(path, old, new)
-                rc, out = run_semantics(tools)
+        for (label, fname, old, new, expect), future in zip(MUTATIONS, self._mutated):
+            with self.subTest(mutation=label):
+                rc, out = future.result()
                 self.assertNotEqual(rc, 0, f"mutation not detected: {label}\n{out}")
                 self.assertIn(expect, failed_tests(out), f"{label}: expected {expect} to fail\n{out}")
 
