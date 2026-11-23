@@ -99,7 +99,8 @@ gta6rt.exe --dry-run game_scarlett_master.exe --archetype-lookup 1A2B3C0
 ```
 
 `--archetype-lookup RVA[,ARG]` (hex RVA; `ARG` 0 when the hash is the first argument, 1 when it is the
-second, as in a member function) hooks the function right after the image is mapped, before any of its
+second, as in a member function; any other `ARG` is the usage error, exit 2, before the image is opened) hooks the
+function right after the image is mapped, before any of its
 code runs (`runtime/src/code_hooks.h`). It does not patch the function: every direct `call` and `jmp`
 to it in the image's code is pointed at a thunk that passes the hash through
 `leonida::mods::active().remap()` and continues into the original with every other argument as it was.

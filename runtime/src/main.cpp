@@ -93,7 +93,14 @@ int wmain(int argc, wchar_t** argv) {
             const unsigned long rva = std::wcstoul(v.substr(0, comma).c_str(), &end, 16);
             if (!end || *end || rva == 0) return usage();
             archetype_lookup_rva = static_cast<uint32_t>(rva);
-            if (comma != std::wstring::npos) archetype_lookup_arg = v.substr(comma + 1) == L"1" ? 1 : 0;
+            // ARG is 0 (the hash is the first argument) or 1 (the second). Any other text used to be read as 0, so
+            // `--archetype-lookup 1A2B3C0,2` hooked the first argument and exited 0: a typo read as a clean hook of the
+            // wrong call sites.
+            if (comma != std::wstring::npos) {
+                const std::wstring arg = v.substr(comma + 1);
+                if (arg != L"0" && arg != L"1") return usage();
+                archetype_lookup_arg = arg == L"1" ? 1 : 0;
+            }
         }
         else if (image.empty()) image = a;
         else return usage();

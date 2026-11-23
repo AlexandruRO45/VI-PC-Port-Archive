@@ -1161,6 +1161,11 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_game_dir.cmake")
+    # The ARG of --archetype-lookup is 0 or 1: any other value used to be taken as 0, so a typo hooked the wrong
+    # argument and exited 0.
+    add_test(NAME gta6rt_archetype_lookup_arg COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_archetype_arg.cmake")
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
