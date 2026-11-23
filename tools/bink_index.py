@@ -31,6 +31,10 @@ import subprocess
 import sys
 import tempfile
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 SIG = re.compile(rb"KB2[a-z]")
 HDR = 0x2C
 MAX_FRAMES = 1_000_000
@@ -203,7 +207,7 @@ def scan_target(target, skip_report=None):
         for root, _dirs, files in os.walk(target, onerror=scan_failed):
             for name in files:
                 path = os.path.join(root, name)
-                if skip_report is not None and same_output_path(path, skip_report):
+                if skip_report is not None and same_report_path(path, skip_report):
                     continue
                 # "/" in the source and the sort key, so the report is the same on every platform
                 paths.append((os.path.relpath(path, base).replace(os.sep, "/"), path))
@@ -305,16 +309,6 @@ def write_json(path, target, rows, summary, probe):
                   fh, indent=1)
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="an .rpf archive, a .bk2 file, or a directory")
@@ -322,21 +316,21 @@ def main(argv=None):
     ap.add_argument("--format", choices=["csv", "json"], help="inferred from --out if omitted")
     ap.add_argument("--probe", action="store_true", help="run ffprobe on each stream")
     a = ap.parse_args(argv)
-    if a.out and same_output_path(a.target, a.out):
+    if a.out and same_report_path(a.target, a.out):
         ap.error("--out must not overwrite the source")
     if a.out and os.path.isdir(a.out):
         ap.error(f"--out is a folder, not a report file: {a.out}")
     if a.out and os.path.isdir(a.target):
         manifest = os.path.join(a.target, "index.json")
         # Reserved even before the carve writes it: other tools read <target>/index.json as the carve manifest.
-        if same_output_path(a.out, manifest):
+        if same_report_path(a.out, manifest):
             ap.error(f"--out would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
             for root, _dirs, names in os.walk(a.target):
                 for name in names:
                     if name.lower().endswith((".json", ".csv")):
                         continue
-                    if same_output_path(os.path.join(root, name), a.out):
+                    if same_report_path(os.path.join(root, name), a.out):
                         ap.error(f"--out would overwrite an input file: {a.out}")
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
