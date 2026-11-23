@@ -3,7 +3,8 @@ AND actual VK_SHARING_MODE_CONCURRENT on *every* sparse VkBuffer created by the 
 
 Runs the original synthetic `d3d12_sparse_queue_family_test` target.
 Invokes the SDK's VK_LAYER_LUNARG_api_dump in a short-lived isolated directory, then reruns the test
-under VK_LAYER_KHRONOS_validation alone (with both loaded, api_dump's vkDestroyDevice crashes on AMD Windows);
+under VK_LAYER_KHRONOS_validation alone (api_dump's vkDestroyDevice can crash on AMD Windows, with both loaded
+more often than alone: see died_in_vk_destroy_device);
 no private-game files, asset paths, device memory dumps, or committed logs.
 
   python -I check_sparse_queue_family.py path/to/d3d12_sparse_queue_family_test.exe
@@ -30,6 +31,8 @@ COUNT = re.compile(r"queueFamilyIndexCount:\s+uint32_t = (\d+)")
 INDICES = re.compile(r"pQueueFamilyIndices\[(\d+)\]:\s+const uint32_t = (\d+)")
 # Each of the two runs gets 30 s, so both together stay inside the CTest TIMEOUT of 65 s (runtime/CMakeLists.txt).
 RUN_TIMEOUT = 30
+ACCESS_VIOLATION = 0xC0000005   # STATUS_ACCESS_VIOLATION, as Windows reports it in the exit code
+CALL_HEAD = re.compile(r"^(vk\w+)\(", re.M)
 CASE = re.compile(r"^RESULT (LAYER_MAP_(?:DIRECT|COPY|COMPUTE)_COPY_COMPUTE) PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536$", re.M)
 
 
@@ -79,10 +82,11 @@ def main() -> int:
             encoding="utf-8",
         )
         dump_env, validation_env = pass_envs(os.environ, path)
-        # Two runs, one layer each. With api_dump above Khronos validation, the AMD Windows driver crashes
-        # (0xC0000005) in api_dump's vkDestroyDevice: the SDK 1.4.363 layer reads the VkDevice's dispatch key
-        # after the call down the chain has freed the device. Each layer alone passes, so they run apart.
-        dump_out, skip = run_pass(exe, dump_env, path)
+        # Two runs, one layer each. SDK 1.4.363's api_dump reads the VkDevice's dispatch key after the call down the
+        # chain has freed the device (fix: LunarG/VulkanTools#2754), so on the AMD Windows driver its vkDestroyDevice
+        # can crash with 0xC0000005. Validation below it makes that likelier (every run on some RDNA2 iGPUs), and an
+        # RX 9070 crashes now and then with api_dump alone, so this run allows exactly that crash.
+        dump_out, skip = run_pass(exe, dump_env, path, trace_dir=path)
         if skip:
             return skip
         # Check the trace before the validation run: a skip there must not hide a contract the trace has broken.
@@ -118,8 +122,24 @@ def pass_envs(base: Mapping[str, str], settings_dir: Path) -> tuple[dict[str, st
     return dump, validation
 
 
-def run_pass(exe: Path, env: Mapping[str, str], cwd: Path) -> tuple[str, int]:
-    """Run the GPU test once: (output, 77) for a skip, (output, 0) when all three cases passed."""
+def died_in_vk_destroy_device(trace_dir: Path) -> bool:
+    """True when the last call in the api_dump trace is vkDestroyDevice (pre_dump writes it before the call).
+
+    The trace can't tell api_dump's own read of the freed device from a driver crash in the same call. The validation
+    run can: it destroys the device without api_dump and has to exit 0.
+    """
+    traces = list(trace_dir.glob("sparse_create_info.log*"))
+    if len(traces) != 1:
+        return False
+    calls = CALL_HEAD.findall(traces[0].read_text(encoding="utf-8", errors="replace"))
+    return bool(calls) and calls[-1] == "vkDestroyDevice"
+
+
+def run_pass(exe: Path, env: Mapping[str, str], cwd: Path, trace_dir: Path | None = None) -> tuple[str, int]:
+    """Run the GPU test once: (output, 77) for a skip, (output, 0) when all three cases passed.
+
+    trace_dir (the api_dump run only) allows an access violation in vkDestroyDevice, once every result is printed.
+    """
     run = subprocess.run([str(exe)], cwd=cwd, env=dict(env), capture_output=True,
                          text=True, encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
     out = run.stdout + "\n" + run.stderr
@@ -131,12 +151,17 @@ def run_pass(exe: Path, env: Mapping[str, str], cwd: Path) -> tuple[str, int]:
     if run.returncode != 0 and "vkCreateInstance" in out and "failed" in out:
         print("SKIP 77: VK_LAYER_LUNARG_api_dump or VK_LAYER_KHRONOS_validation unavailable (vkCreateInstance failed)")
         return out, 77
-    if run.returncode != 0:
+    teardown_crash = (trace_dir is not None and run.returncode == ACCESS_VIOLATION
+                      and died_in_vk_destroy_device(trace_dir))
+    if run.returncode != 0 and not teardown_crash:
         print(out[-7000:], file=sys.stderr)
         raise AssertionError(f"Leonida GPU test failed exit={run.returncode}")
     kinds = sorted(CASE.findall(out))
     if len(kinds) != 3 or "LAYER_FINAL PASS" not in out:
         raise AssertionError(f"GPU byte verification missing: cases={kinds}; tail={out[-2000:]}")
+    if teardown_crash:
+        print("NOTE: the api_dump run crashed in vkDestroyDevice (0xC0000005) after every case passed; "
+              "the validation run still has to exit 0")
     return out, 0
 
 

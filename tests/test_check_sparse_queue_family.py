@@ -1,9 +1,9 @@
 """Synthetic tests for runtime/test/check_sparse_queue_family.py (TEST-1089).
 
 The contract checker runs the GPU test twice, once under VK_LAYER_LUNARG_api_dump and once under
-VK_LAYER_KHRONOS_validation, because the two together crash in api_dump's vkDestroyDevice on the AMD
-Windows driver. These tests check that each run loads exactly one of the two layers and that a crash,
-a skip or a missing case is still reported. No GPU or game data: the "GPU test" is a stub script.
+VK_LAYER_KHRONOS_validation, because api_dump's vkDestroyDevice can crash on the AMD Windows driver. These
+tests check that each run loads exactly one of the two layers, that only that crash is allowed and only in
+the api_dump run, and that any other crash, a skip or a missing case is still reported. No GPU or game data: the "GPU test" is a stub script.
 
 Run:
     python -I tests/test_check_sparse_queue_family.py
@@ -28,6 +28,11 @@ SPEC.loader.exec_module(checker)
 
 PASS_OUT = "".join(f"RESULT LAYER_MAP_{kind}_COPY_COMPUTE PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536\n"
                    for kind in ("DIRECT", "COPY", "COMPUTE")) + "LAYER_FINAL PASS\n"
+
+
+DESTROY_TRACE = ("vkDestroyPipelineLayout(device, pipelineLayout, pAllocator) returns void:\n"
+                 "    device:                         VkDevice = 0000000000000000\n"
+                 "vkDestroyDevice(device, pAllocator) returns void\n")
 
 
 class Completed:
@@ -71,6 +76,38 @@ class RunPassTest(unittest.TestCase):
         with self.assertRaises(AssertionError), contextlib.redirect_stderr(io.StringIO()):
             self.run_with(Completed(0xC0000005, PASS_OUT))
 
+    def run_dump_with(self, result: Completed, *traces: str) -> int:
+        with tempfile.TemporaryDirectory() as td:
+            for i, trace in enumerate(traces):
+                (Path(td) / f"sparse_create_info.log{i or ''}").write_text(trace, encoding="utf-8")
+            with mock.patch.object(checker.subprocess, "run", return_value=result), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return checker.run_pass(Path("t.exe"), {}, Path("."), trace_dir=Path(td))[1]
+
+    def test_api_dump_crash_in_destroy_device_after_the_results_is_allowed(self) -> None:
+        self.assertEqual(self.run_dump_with(Completed(0xC0000005, PASS_OUT), DESTROY_TRACE), 0)
+
+    def test_api_dump_crash_in_another_call_fails(self) -> None:
+        for trace in (DESTROY_TRACE + "vkDestroyInstance(instance, pAllocator) returns void:\n",
+                      "vkQueueSubmit2(queue, submitCount, pSubmits, fence) returns VkResult:\n", ""):
+            with self.subTest(trace=trace), self.assertRaises(AssertionError):
+                self.run_dump_with(Completed(0xC0000005, PASS_OUT), trace)
+
+    def test_api_dump_crash_without_exactly_one_trace_fails(self) -> None:
+        for traces in ((), (DESTROY_TRACE, DESTROY_TRACE)):
+            with self.subTest(traces=len(traces)), self.assertRaises(AssertionError):
+                self.run_dump_with(Completed(0xC0000005, PASS_OUT), *traces)
+
+    def test_api_dump_crash_before_every_result_fails(self) -> None:
+        for out in (PASS_OUT.replace("LAYER_FINAL PASS", ""), PASS_OUT.replace("LAYER_MAP_COPY", "LAYER_MAP_OTHER")):
+            with self.subTest(out=out), self.assertRaises(AssertionError):
+                self.run_dump_with(Completed(0xC0000005, out), DESTROY_TRACE)
+
+    def test_api_dump_other_exit_codes_fail(self) -> None:
+        for code in (1, 2, 0xC0000374, 0xC0000409):
+            with self.subTest(code=hex(code)), self.assertRaises(AssertionError):
+                self.run_dump_with(Completed(code, PASS_OUT), DESTROY_TRACE)
+
     def test_missing_case_fails(self) -> None:
         with self.assertRaises(AssertionError):
             self.run_with(Completed(0, PASS_OUT.replace("LAYER_MAP_COPY", "LAYER_MAP_OTHER")))
@@ -108,6 +145,25 @@ class MainTest(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             self.run_main(fake_run)
+
+    def test_a_crash_in_the_validation_run_fails(self) -> None:
+        # The api_dump trace on disk ends in vkDestroyDevice, but only the api_dump run may crash there.
+        def fake_run(argv, cwd, env, **kwargs):
+            if env.get("VK_INSTANCE_LAYERS") == "VK_LAYER_LUNARG_api_dump":
+                (Path(cwd) / "sparse_create_info.log").write_text(CONCURRENT_TRACE + DESTROY_TRACE, encoding="utf-8")
+            return Completed(0xC0000005, PASS_OUT)
+
+        with self.assertRaises(AssertionError), contextlib.redirect_stderr(io.StringIO()):
+            self.run_main(fake_run)
+
+    def test_an_allowed_crash_still_passes_the_whole_check(self) -> None:
+        def fake_run(argv, cwd, env, **kwargs):
+            if env.get("VK_INSTANCE_LAYERS") == "VK_LAYER_LUNARG_api_dump":
+                (Path(cwd) / "sparse_create_info.log").write_text(CONCURRENT_TRACE + DESTROY_TRACE, encoding="utf-8")
+                return Completed(0xC0000005, PASS_OUT)
+            return Completed(0, PASS_OUT)
+
+        self.assertEqual(self.run_main(fake_run), 0)
 
     def test_both_runs_fit_the_ctest_timeout(self) -> None:
         cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
