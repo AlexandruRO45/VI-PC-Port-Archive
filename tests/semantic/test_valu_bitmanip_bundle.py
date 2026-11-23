@@ -330,6 +330,16 @@ class TestVBfmB32Oracle(unittest.TestCase):
         res = ref_v_bfm_b32(8, 4)
         self.assertEqual(res, 0xff0)
 
+class TestVBfmB32ASTAndInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 8)
+        state.write_vgpr(1, 4)
+        inst = ASTInstruction(Opcode.V_BFM_B32, ASTOperand.vgpr(2), ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0xff0)
+        self.assertEqual(state.vgprs[2], 0xff0)
+
 
 if __name__ == "__main__":
     unittest.main()
