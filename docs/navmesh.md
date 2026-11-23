@@ -546,6 +546,7 @@ python -I tests/test_navmesh_links.py -v
 python -I tools/navmesh_nodes.py <package>\navmeshes.rpf <package>\levels.rpf --jobs 8 --out <temp>/navmesh-nodes.json
 python -I tests/test_navmesh_nodes.py
 python -I tests/test_navmesh_index.py
+python -I tests/test_navmesh_cell_fit.py
 ```
 
 For both tools, `--start` must be 0 or more and `--limit` at least 1; anything else is refused with exit code 2 before the scan.
