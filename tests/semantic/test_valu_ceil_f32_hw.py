@@ -187,5 +187,55 @@ class TestCeilASTAndTypes(unittest.TestCase):
         self.assertEqual(words[0], 0x40000000)
 
 
+class VectorInterpreter:
+    """Deterministic vector instruction interpreter for unary float math."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 64
+
+    def exec_line(self, line: str) -> None:
+        tokens = line.strip().replace(",", " ").split()
+        if not tokens:
+            return
+        op = tokens[0]
+        if op == "v_mov_b32":
+            dst = int(tokens[1].lstrip("v"))
+            val = int(tokens[2], 0)
+            self.vgprs[dst] = val & MASK32
+        elif op == "v_ceil_f32":
+            dst = int(tokens[1].lstrip("v"))
+            src0 = self.resolve_src(tokens[2])
+            self.vgprs[dst] = v_ceil_f32_oracle(src0)
+
+    def resolve_src(self, tok: str) -> int:
+        if tok.startswith("v"):
+            return self.vgprs[int(tok.lstrip("v"))]
+        return int(tok, 0) & MASK32
+
+
+class TestCeilScalarInterpreter(unittest.TestCase):
+    """Commit 3: deterministic scalar instruction interpreter for v_ceil_f32."""
+
+    def test_sequential_chained_ceil(self):
+        interp = VectorInterpreter()
+        lines = [
+            "v_mov_b32 v1, 0x3E800000",   # 0.25 -> ceil = 1.0 (0x3F800000)
+            "v_ceil_f32 v0, v1",
+            "v_ceil_f32 v2, v0",          # ceil(1.0) = 1.0
+        ]
+        for ln in lines:
+            interp.exec_line(ln)
+        self.assertEqual(interp.vgprs[0], 0x3F800000)
+        self.assertEqual(interp.vgprs[2], 0x3F800000)
+
+        prog = lines + [
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_ceil_ps(prog, "ps_ceil_chained")
+        self.assertEqual(words[0], 0x3F800000)
+        self.assertEqual(words[2], 0x3F800000)
+
+
 if __name__ == '__main__':
     unittest.main()
