@@ -29,13 +29,14 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
                    fmt_xy_xyz_test, tbuffer_store_test)
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, MIP_LOAD_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
+from check import mip_load_test   # the packed 2D mip-load draws on vk_texture_test's two-mip texture
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import run_readback
@@ -585,6 +586,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               SIGNED_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
+DRAWN_WITH.update({name: "vs_ids.asm" for name in MIP_LOAD_TESTS})
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -862,6 +864,12 @@ def run_suite(a, work: str) -> int:
                 problem = store_words_problem(msg, name)
                 results.append((name, not problem, problem or "all 64 words of the uint image, the sint image and "
                                 "the volume exact"))
+        elif name in MIP_LOAD_TESTS:
+            # TEST-184: image_load_mip with a16 on vk_texture_test's two-mip texture, once per numeric class.
+            problem = mip_load_test(a.build, spirv_dir, name)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or f"4096 pixels in each of {len(MIP_LOAD_TESTS[name])} draw(s): "
+                            "every word the fixture derives from the packed address"))
         elif name in GET_LOD_TESTS:
             # TEST-184: image_get_lod on vk_texture_test's two-mip texture (two sampler LOD ranges) and on its 2D array.
             problem = get_lod_test(a.build, spirv_dir, name)

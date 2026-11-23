@@ -34,7 +34,7 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
+         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS) + len(check.MIP_LOAD_TESTS)
          + len(check.TEXTURE_CONSTANTS) + 13)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
          # ps_ssharp, vs_base_ids and the standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case)
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
@@ -175,6 +175,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "texture_constant_test", return_value=""),
                   patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
+                  patch.object(check, "mip_load_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()

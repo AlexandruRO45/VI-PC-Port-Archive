@@ -476,6 +476,13 @@ GET_LOD_TESTS = {
     "ps_get_lod_array": (("c00000", False, (0.0, 2.0, 0.0, -3.0)),),
 }
 GET_LOD_TOLERANCE = 1 / 16
+# TEST-184: the packed 2D mip-load row on vk_texture_test's two-mip texture, whose mip 1 is one solid colour. Every
+# pixel of a fixture carries the same four words (its address is a constant), so the reference is one RGBA tuple per
+# draw: the texture with the UNORM view, then the same texture as SINT (--two-mip-sint; the fixture reads each
+# component as zero or nonzero, which is the same 4-bit mask in both classes). Derivation in the .asm header.
+MIP_LOAD_TESTS = {
+    "ps_imgload_mip_a16": (("--two-mip", (3.0, 7.0, 9.0, 7.0)), ("--two-mip-sint", (3.0, 7.0, 9.0, 7.0))),
+}
 
 
 # Windows error codes for a program the system refuses to start, and who refused it.
@@ -1255,6 +1262,32 @@ def get_lod_test(tools, spirv, name):
     return ""
 
 
+def mip_load_test(tools, spirv, name):
+    """A MIP_LOAD_TESTS fixture on vk_texture_test's two-mip texture (it binds the texture and the descriptor table),
+    once per draw. Every pixel is compared with the fixture's reference words."""
+    tool = os.path.join(tools, "vk_texture_test" + EXE)
+    shaders = [os.path.join(spirv, shader + ".spv") for shader in ("vs_ids", name)]
+    for path in (tool, *shaders):
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    with tempfile.TemporaryDirectory(prefix="leonida-miploAd-") as tmp:
+        for mode, want in MIP_LOAD_TESTS[name]:
+            raw = Path(tmp) / "pixels.raw"
+            code, out = run(tool, *shaders, raw, "0", "92", "c00000", "14500000", "0", mode)
+            if code == UNSUPPORTED:   # vk_texture_test: e.g. fewer push constant bytes than the texture tests need
+                m = re.search(r"unsupported: .*", out)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"{mode}: {failure(code, out, 4)}"
+            data = raw.read_bytes()
+            if len(data) != 64 * 64 * 16:
+                return f"{mode}: {failure(code, out, 3)}"
+            wrong = sum(p != want for p in struct.iter_unpack("<4f", data))
+            if wrong:
+                return f"{mode}: {wrong} of 4096 pixels differ from {want}"
+    return ""
+
+
 def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
     width = 64
     if len(data) != width**2 * 16:
@@ -1577,6 +1610,8 @@ def main():
         results.append((name, store_words_test(tools, spirv, name)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array
         results.append((name, get_lod_test(tools, spirv, name)))
+    for name in MIP_LOAD_TESTS:  # TEST-184: image_load_mip with a16, the packed address in two VGPRs
+        results.append((name, mip_load_test(tools, spirv, name)))
     for name in CLIP_TESTS:
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
