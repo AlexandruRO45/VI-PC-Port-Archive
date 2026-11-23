@@ -144,21 +144,22 @@ def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript=
     env = dict(env)
     if skip:
         env["XCL_TESTTITLE_SKIP"] = ";".join(skip)
-    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
-    lines = queue.Queue()
-
-    def pump():
-        with proc.stdout:
-            for line in proc.stdout:
-                lines.put(line.rstrip("\r\n"))
-        lines.put(None)
-
-    threading.Thread(target=pump, daemon=True).start()
+    # Open the log first so a failure cannot leave the title running unattended.
     out = open(transcript, "a", encoding="utf-8", newline="\n") if transcript else None
-    if out:
-        out.write("--- %s\n" % " ".join(str(c) for c in cmd))
     try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+        lines = queue.Queue()
+
+        def pump():
+            with proc.stdout:
+                for line in proc.stdout:
+                    lines.put(line.rstrip("\r\n"))
+            lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+        if out:
+            out.write("--- %s\n" % " ".join(str(c) for c in cmd))
         return _follow(proc, lines, run, known, timeout, cdb, events, out, cmd)
     finally:
         if out:
