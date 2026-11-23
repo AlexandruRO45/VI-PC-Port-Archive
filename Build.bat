@@ -58,7 +58,8 @@ if "%OUTDIR:~1%"=="" set "OUTDIR=%OUTDIR%:\Leonida"
 if "%OUTDIR:~1%"==":" set "OUTDIR=%OUTDIR%\Leonida"
 if "%OUTDIR:~1%"==":\" set "OUTDIR=%OUTDIR%Leonida"
 if not exist "%LOCALAPPDATA%\Leonida" mkdir "%LOCALAPPDATA%\Leonida" >nul 2>nul
->"%SAVED%" (echo(%OUTDIR%)
+rem No ( ) block here: a ")" in the folder name, as in "Program Files (x86)", would close it early.
+>"%SAVED%" echo(%OUTDIR%
 set "OUTARG=--out "%OUTDIR%""
 echo.
 exit /b 0
