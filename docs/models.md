@@ -182,6 +182,49 @@ single-threaded scan on `packs.rpf` (`26,389 == 26,389`), and `tools/rpf9dump mo
 OBJ + manifest export was spot-checked on `story000_restofworld.rpf` (`ok=3 fail=0 skip=0`) and
 `data.rpf` (`ok=3175 fail=0 skip=0`).
 
+##### Fragment child drawables are not exported
+
+`tools/rpf9dump models` exports only a fragment's main drawable. The child drawable records are
+omitted. `docs/character_models.md` counts 734 such fragments in `levels.rpf` (733 with one child,
+1 with two), 735 child records in all. The OBJ files and `manifest.json` therefore leave this
+geometry out, and so do `tools/batch_glb.py` and `tools/world_build.py`, which read them.
+
+This is the decoder API, not a Leonida filter. `Export()` calls
+`RageModelDecoder.Decode(sys, gfx, ResourceDrawableOffset)`. For a fragment, the decoder fixes the
+drawable to the `+0x18` pointer and rejects any other selected offset
+(`Require(selectedOffset == drawable)`). `DecodeModels` splits only drawable dictionaries. This is
+the same at `e293917`, `16134b0` and upstream main `4eee1e6`, so no Leonida tool can request record
+`main + 0x110 * i`.
+
+The counts below come from a scratch harness that repeats `Export()` at `e293917`: it runs
+`RecoverAtOffsets` over all 235,330 candidates and then calls `Decode` with the entry's drawable
+offset. It reproduces the `levels.rpf` export exactly: 343,327 models, 0 decode failures,
+3,854,587 meshes, 2,364,218,711 vertices and 2,509,947,536 triangles. Each child record was then
+decoded at LOD0 with a scratch copy of the decoder.
+
+| 734 child-array fragments | Meshes | Vertices | Triangles |
+|---|---:|---:|---:|
+| Exported (724 fragments; 10 have no model at `e293917`) | 2,791 | 6,677,822 | 6,277,108 |
+| Child records, LOD0 (735 of 735 decode) | 3,520 | 2,065,882 | 1,992,588 |
+| Child records, excluding byte-identical copies of an exported mesh | 3,479 | 2,060,291 | 1,985,528 |
+
+- **Not shared:** no child mesh shares a geometry object, a vertex or index buffer, or a data range
+  with an exported mesh.
+- **Copies:** 41 child meshes in 30 fragments are separately stored byte-for-byte copies of an
+  exported mesh.
+- **Share of the export:** the missing geometry is about 31% of these fragments' exported vertices
+  and triangles, but only 0.087% of the vertices and 0.079% of the triangles of the whole
+  `levels.rpf` export.
+- **Fragments with no model:** of the 10 without an exported model, 6 are the empty-primary
+  fragments above, whose child is their only geometry (9 meshes, 6,592 vertices, 7,406 triangles).
+  The other 4 are large-mesh rejects that `16134b0` recovers.
+- **Matching counts:** 143 child records match their fragment's exported mesh, vertex and triangle
+  counts. Only 10 of them are byte-identical in every mesh. Reading them as damage or variant
+  states is a hypothesis.
+
+Exporting the child records needs a decoder API that can select them. That request is tracked
+upstream in [rpf9-explorer#29](https://github.com/breadbbbb/rpf9-explorer/issues/29).
+
 ### Other archives at `917e9b9`
 
 A fresh scan/recover at `917e9b9` (no cache; `models/3`) shows the same pattern in every
