@@ -7,8 +7,9 @@ for AMD RDNA2 VALU Normalized Float16/Float32 Conversion operations (Bundle 42):
   - v_cvt_pknorm_i16_f32: Packed Float32 to signed Norm16 pair (D = {snorm16(S1.f32), snorm16(S0.f32)})
   - v_cvt_pknorm_u16_f32: Packed Float32 to unsigned Norm16 pair (D = {unorm16(S1.f32), unorm16(S0.f32)})
 
-Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
-Exercises tools/rdna2spirv.py via support.translate_lines(...) and support.mrt0_words for hardware-accurate translation.
+All test methods compile assembly listings directly through tools/rdna2spirv.py
+via support.translate_lines(...) and execute in spirv_mini_interp via support.mrt0_words.
+Standard library Python only; zero third-party dependencies; zero game data.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import math
 import os
 import struct
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Optional
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,14 +28,8 @@ TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS_DIR)
 sys.path.insert(0, HERE)
 
-try:
-    import rdna2spirv
-    import support
-except Exception:
-    rdna2spirv = None  # type: ignore
-    support = None  # type: ignore
-
-_TRANSLATOR_READY = support is not None and rdna2spirv is not None
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
 
 MASK16: int = 0xFFFF
 MASK32: int = 0xFFFFFFFF
@@ -81,6 +76,46 @@ def norm_u16(v: float) -> int:
         return 0
     cl = min(max(v, 0.0), 1.0)
     return int(round(cl * 65535.0)) & 0xFFFF
+
+
+def ref_v_cvt_norm_i16_f16(s0: int, old_dst: int = 0) -> int:
+    if is_nan_f16(s0):
+        res_i16 = 0
+    else:
+        res_i16 = norm_i16(bits_to_f16(s0 & 0xFFFF))
+    return ((old_dst & 0xFFFF0000) | (res_i16 & 0xFFFF)) & MASK32
+
+
+def ref_v_cvt_norm_u16_f16(s0: int, old_dst: int = 0) -> int:
+    if is_nan_f16(s0):
+        res_u16 = 0
+    else:
+        res_u16 = norm_u16(bits_to_f16(s0 & 0xFFFF))
+    return ((old_dst & 0xFFFF0000) | (res_u16 & 0xFFFF)) & MASK32
+
+
+def ref_v_cvt_pknorm_i16_f16(s0: int, s1: int) -> int:
+    lo = 0 if is_nan_f16(s0) else norm_i16(bits_to_f16(s0 & 0xFFFF))
+    hi = 0 if is_nan_f16(s1) else norm_i16(bits_to_f16(s1 & 0xFFFF))
+    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
+
+
+def ref_v_cvt_pknorm_u16_f16(s0: int, s1: int) -> int:
+    lo = 0 if is_nan_f16(s0) else norm_u16(bits_to_f16(s0 & 0xFFFF))
+    hi = 0 if is_nan_f16(s1) else norm_u16(bits_to_f16(s1 & 0xFFFF))
+    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
+
+
+def ref_v_cvt_pknorm_i16_f32(s0: int, s1: int) -> int:
+    lo = 0 if is_nan_f32(s0) else norm_i16(bits_to_f32(s0))
+    hi = 0 if is_nan_f32(s1) else norm_i16(bits_to_f32(s1))
+    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
+
+
+def ref_v_cvt_pknorm_u16_f32(s0: int, s1: int) -> int:
+    lo = 0 if is_nan_f32(s0) else norm_u16(bits_to_f32(s0))
+    hi = 0 if is_nan_f32(s1) else norm_u16(bits_to_f32(s1))
+    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
 
 
 class Opcode(Enum):
@@ -137,73 +172,74 @@ class ASTInstruction:
         return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}"
 
 
-class ScalarMachineState:
-    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
-        self.vgprs: list[int] = [0] * num_vgprs
-        self.sgprs: list[int] = [0] * num_sgprs
-        self.scc: int = 0
-        self.vcc: int = 0
-
-    def read_operand(self, op: ASTOperand) -> int:
-        if op.kind == OperandKind.VGPR:
-            return self.vgprs[op.index] & MASK32
-        if op.kind == OperandKind.SGPR:
-            return self.sgprs[op.index] & MASK32
-        return op.value & MASK32
-
-    def write_vgpr(self, idx: int, val: int) -> None:
-        self.vgprs[idx] = val & MASK32
-
-
-GLOBAL_ORACLE_MAP: dict[Opcode, Callable[..., int]] = {}
-
-
-class ScalarInterpreter:
-    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> int:
-        s0 = state.read_operand(instr.src0)
-        old_dst = state.read_operand(instr.dst)
-        if instr.src1 is not None:
-            s1 = state.read_operand(instr.src1)
-            res = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1)
-        else:
-            res = GLOBAL_ORACLE_MAP[instr.opcode](s0, old_dst=old_dst)
-
-        if instr.dst.kind == OperandKind.VGPR:
-            state.write_vgpr(instr.dst.index, res)
-        return res
-
-def ref_v_cvt_norm_i16_f16(s0: int, old_dst: int = 0) -> int:
-    if is_nan_f16(s0):
-        res_i16 = 0
-    else:
-        res_i16 = norm_i16(bits_to_f16(s0 & 0xFFFF))
-    return ((old_dst & 0xFFFF0000) | (res_i16 & 0xFFFF)) & MASK32
-
-GLOBAL_ORACLE_MAP[Opcode.V_CVT_NORM_I16_F16] = ref_v_cvt_norm_i16_f16
-
+# =============================================================================
+# 1. v_cvt_norm_i16_f16
+# =============================================================================
 
 class TestVCvtNormI16F16Oracle(unittest.TestCase):
+    """Reference mathematical oracle tests for v_cvt_norm_i16_f16 backed by translator."""
+
     def test_basic_conversion(self) -> None:
         # 1.0 -> 0x7FFF (32767)
-        res = ref_v_cvt_norm_i16_f16(0x3C00, old_dst=0xDEAD0000)
-        self.assertEqual(res & 0xFFFF, 0x7FFF)
-        self.assertEqual(res >> 16, 0xDEAD)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xdead0000",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_i16_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0x7FFF)
+        self.assertEqual(words[0] >> 16, 0xDEAD)
+        self.assertEqual(words[0] & 0xFFFF, ref_v_cvt_norm_i16_f16(0x3C00) & 0xFFFF)
 
     def test_negative_conversion(self) -> None:
         # -1.0 -> 0x8001 (-32767)
-        res = ref_v_cvt_norm_i16_f16(0xBC00, old_dst=0xBEEF0000)
-        self.assertEqual(res & 0xFFFF, 0x8001)
-        self.assertEqual(res >> 16, 0xBEEF)
+        lines = [
+            "v_mov_b32 v0, 0xbc00",
+            "v_mov_b32 v1, 0xbeef0000",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_i16_neg", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0x8001)
+        self.assertEqual(words[0] >> 16, 0xBEEF)
+        self.assertEqual(words[0] & 0xFFFF, ref_v_cvt_norm_i16_f16(0xBC00) & 0xFFFF)
 
     def test_zero_and_clamp(self) -> None:
         # 0.0 -> 0
-        res_zero = ref_v_cvt_norm_i16_f16(0x0000, old_dst=0x11110000)
-        self.assertEqual(res_zero & 0xFFFF, 0x0000)
+        lines0 = [
+            "v_mov_b32 v0, 0x0000",
+            "v_mov_b32 v1, 0x11110000",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv0 = support.translate_lines("ps_norm_i16_zero", lines0)
+        words0 = support.mrt0_words(spv0)
+        self.assertEqual(words0[0] & 0xFFFF, 0x0000)
+        self.assertEqual(words0[0] >> 16, 0x1111)
+
         # 2.0 -> clamped to 1.0 -> 0x7FFF
-        res_clamp = ref_v_cvt_norm_i16_f16(0x4000, old_dst=0x22220000)
-        self.assertEqual(res_clamp & 0xFFFF, 0x7FFF)
+        lines1 = [
+            "v_mov_b32 v0, 0x4000",
+            "v_mov_b32 v1, 0x22220000",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv1 = support.translate_lines("ps_norm_i16_clamp", lines1)
+        words1 = support.mrt0_words(spv1)
+        self.assertEqual(words1[0] & 0xFFFF, 0x7FFF)
+        self.assertEqual(words1[0] >> 16, 0x2222)
+
 
 class TestVCvtNormI16F16ASTAndInterpreter(unittest.TestCase):
+    """AST disassembly and interpreter step verification for v_cvt_norm_i16_f16."""
+
     def test_ast_disassembly(self) -> None:
         inst = ASTInstruction(
             Opcode.V_CVT_NORM_I16_F16,
@@ -211,67 +247,102 @@ class TestVCvtNormI16F16ASTAndInterpreter(unittest.TestCase):
             ASTOperand.vgpr(0),
         )
         self.assertEqual(inst.disasm(), "v_cvt_norm_i16_f16 v1, v0")
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            inst.disasm(),
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_i16_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0x7FFF)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0xCAFE0000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_NORM_I16_F16,
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(0),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res & 0xFFFF, 0x7FFF)
-        self.assertEqual(res >> 16, 0xCAFE)
-        self.assertEqual(state.vgprs[1], res)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xcafe0000",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_i16_step", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0x7FFF)
+        self.assertEqual(words[0] >> 16, 0xCAFE)
+
 
 class TestVCvtNormI16F16SIMDAndIEEE(unittest.TestCase):
+    """SIMD execution and IEEE boundary handling for v_cvt_norm_i16_f16."""
+
     def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xFFFFFFFFFFFFFFFF
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0x12340000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_NORM_I16_F16,
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(0),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xFFFFFFFFFFFFFFFF)
+        lines = [
+            "v_cmp_ne_u32 vcc, 1, 0",
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x12340000",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "v_cndmask_b32 v2, 0, 1, vcc",
+            "exp mrt0, v1, v2, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_i16_cc", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0x7FFF)
+        self.assertEqual(words[1], 1)
 
     def test_register_aliasing(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        inst = ASTInstruction(
-            Opcode.V_CVT_NORM_I16_F16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(0),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res & 0xFFFF, 0x7FFF)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_cvt_norm_i16_f16 v0, v0",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_i16_alias", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0x7FFF)
 
     def test_ieee754_nan_and_inf(self) -> None:
         # NaN -> 0
-        res_nan = ref_v_cvt_norm_i16_f16(0x7E00)
-        self.assertEqual(res_nan & 0xFFFF, 0)
+        lines_nan = [
+            "v_mov_b32 v0, 0x7e00",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_nan = support.translate_lines("ps_norm_i16_nan", lines_nan)
+        words_nan = support.mrt0_words(spv_nan)
+        self.assertEqual(words_nan[0] & 0xFFFF, 0)
+
         # +Inf clamped to 1.0 -> 0x7FFF
-        res_inf = ref_v_cvt_norm_i16_f16(0x7C00)
-        self.assertEqual(res_inf & 0xFFFF, 0x7FFF)
+        lines_inf = [
+            "v_mov_b32 v0, 0x7c00",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_inf = support.translate_lines("ps_norm_i16_inf", lines_inf)
+        words_inf = support.mrt0_words(spv_inf)
+        self.assertEqual(words_inf[0] & 0xFFFF, 0x7FFF)
+
         # -Inf clamped to -1.0 -> 0x8001
-        res_neginf = ref_v_cvt_norm_i16_f16(0xFC00)
-        self.assertEqual(res_neginf & 0xFFFF, 0x8001)
+        lines_ninf = [
+            "v_mov_b32 v0, 0xfc00",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_ninf = support.translate_lines("ps_norm_i16_ninf", lines_ninf)
+        words_ninf = support.mrt0_words(spv_ninf)
+        self.assertEqual(words_ninf[0] & 0xFFFF, 0x8001)
+
 
 class TestVCvtNormI16F16Translation(unittest.TestCase):
+    """Hardware translator verification for v_cvt_norm_i16_f16."""
+
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x3c00",
             "v_cvt_norm_i16_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0, v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_cvt_norm_i16_f16", lines)
@@ -279,32 +350,60 @@ class TestVCvtNormI16F16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & 0xFFFF, 0x7FFF)
 
-def ref_v_cvt_norm_u16_f16(s0: int, old_dst: int = 0) -> int:
-    if is_nan_f16(s0):
-        res_u16 = 0
-    else:
-        res_u16 = norm_u16(bits_to_f16(s0 & 0xFFFF))
-    return ((old_dst & 0xFFFF0000) | (res_u16 & 0xFFFF)) & MASK32
 
-GLOBAL_ORACLE_MAP[Opcode.V_CVT_NORM_U16_F16] = ref_v_cvt_norm_u16_f16
-
+# =============================================================================
+# 2. v_cvt_norm_u16_f16
+# =============================================================================
 
 class TestVCvtNormU16F16Oracle(unittest.TestCase):
+    """Reference mathematical oracle tests for v_cvt_norm_u16_f16 backed by translator."""
+
     def test_basic_conversion(self) -> None:
         # 1.0 -> 0xFFFF (65535)
-        res = ref_v_cvt_norm_u16_f16(0x3C00, old_dst=0xFEED0000)
-        self.assertEqual(res & 0xFFFF, 0xFFFF)
-        self.assertEqual(res >> 16, 0xFEED)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xfeed0000",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_u16_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
+        self.assertEqual(words[0] >> 16, 0xFEED)
+        self.assertEqual(words[0] & 0xFFFF, ref_v_cvt_norm_u16_f16(0x3C00) & 0xFFFF)
 
     def test_fractional_and_clamp(self) -> None:
         # 0.5 -> 0x8000 (32768)
-        res_half = ref_v_cvt_norm_u16_f16(0x3800, old_dst=0x43210000)
-        self.assertEqual(res_half & 0xFFFF, 0x8000)
+        lines0 = [
+            "v_mov_b32 v0, 0x3800",
+            "v_mov_b32 v1, 0x43210000",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv0 = support.translate_lines("ps_norm_u16_half", lines0)
+        words0 = support.mrt0_words(spv0)
+        self.assertEqual(words0[0] & 0xFFFF, 0x8000)
+        self.assertEqual(words0[0] >> 16, 0x4321)
+
         # Negative -> clamped to 0.0 -> 0
-        res_neg = ref_v_cvt_norm_u16_f16(0xBC00, old_dst=0x55550000)
-        self.assertEqual(res_neg & 0xFFFF, 0)
+        lines1 = [
+            "v_mov_b32 v0, 0xbc00",
+            "v_mov_b32 v1, 0x55550000",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv1 = support.translate_lines("ps_norm_u16_clamp", lines1)
+        words1 = support.mrt0_words(spv1)
+        self.assertEqual(words1[0] & 0xFFFF, 0)
+        self.assertEqual(words1[0] >> 16, 0x5555)
+
 
 class TestVCvtNormU16F16ASTAndInterpreter(unittest.TestCase):
+    """AST disassembly and interpreter step verification for v_cvt_norm_u16_f16."""
+
     def test_ast_disassembly(self) -> None:
         inst = ASTInstruction(
             Opcode.V_CVT_NORM_U16_F16,
@@ -312,67 +411,102 @@ class TestVCvtNormU16F16ASTAndInterpreter(unittest.TestCase):
             ASTOperand.vgpr(0),
         )
         self.assertEqual(inst.disasm(), "v_cvt_norm_u16_f16 v1, v0")
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            inst.disasm(),
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_u16_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0x99990000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_NORM_U16_F16,
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(0),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res & 0xFFFF, 0xFFFF)
-        self.assertEqual(res >> 16, 0x9999)
-        self.assertEqual(state.vgprs[1], res)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x99990000",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_u16_step", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
+        self.assertEqual(words[0] >> 16, 0x9999)
+
 
 class TestVCvtNormU16F16SIMDAndIEEE(unittest.TestCase):
+    """SIMD execution and IEEE boundary handling for v_cvt_norm_u16_f16."""
+
     def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0x88880000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_NORM_U16_F16,
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(0),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_cmp_ne_u32 vcc, 1, 0",
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x88880000",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "v_cndmask_b32 v2, 0, 1, vcc",
+            "exp mrt0, v1, v2, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_u16_cc", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
+        self.assertEqual(words[1], 1)
 
     def test_register_aliasing(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        inst = ASTInstruction(
-            Opcode.V_CVT_NORM_U16_F16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(0),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res & 0xFFFF, 0xFFFF)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_cvt_norm_u16_f16 v0, v0",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_norm_u16_alias", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
 
     def test_ieee754_nan_and_inf(self) -> None:
         # NaN -> 0
-        res_nan = ref_v_cvt_norm_u16_f16(0x7E00)
-        self.assertEqual(res_nan & 0xFFFF, 0)
+        lines_nan = [
+            "v_mov_b32 v0, 0x7e00",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_nan = support.translate_lines("ps_norm_u16_nan", lines_nan)
+        words_nan = support.mrt0_words(spv_nan)
+        self.assertEqual(words_nan[0] & 0xFFFF, 0)
+
         # +Inf clamped to 1.0 -> 0xFFFF
-        res_inf = ref_v_cvt_norm_u16_f16(0x7C00)
-        self.assertEqual(res_inf & 0xFFFF, 0xFFFF)
+        lines_inf = [
+            "v_mov_b32 v0, 0x7c00",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_inf = support.translate_lines("ps_norm_u16_inf", lines_inf)
+        words_inf = support.mrt0_words(spv_inf)
+        self.assertEqual(words_inf[0] & 0xFFFF, 0xFFFF)
+
         # -Inf clamped to 0.0 -> 0
-        res_neginf = ref_v_cvt_norm_u16_f16(0xFC00)
-        self.assertEqual(res_neginf & 0xFFFF, 0)
+        lines_ninf = [
+            "v_mov_b32 v0, 0xfc00",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_ninf = support.translate_lines("ps_norm_u16_ninf", lines_ninf)
+        words_ninf = support.mrt0_words(spv_ninf)
+        self.assertEqual(words_ninf[0] & 0xFFFF, 0)
+
 
 class TestVCvtNormU16F16Translation(unittest.TestCase):
+    """Hardware translator verification for v_cvt_norm_u16_f16."""
+
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x3c00",
             "v_cvt_norm_u16_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0, v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_cvt_norm_u16_f16", lines)
@@ -380,26 +514,45 @@ class TestVCvtNormU16F16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
 
-def ref_v_cvt_pknorm_i16_f16(s0: int, s1: int) -> int:
-    lo = 0 if is_nan_f16(s0) else norm_i16(bits_to_f16(s0 & 0xFFFF))
-    hi = 0 if is_nan_f16(s1) else norm_i16(bits_to_f16(s1 & 0xFFFF))
-    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
 
-GLOBAL_ORACLE_MAP[Opcode.V_CVT_PKNORM_I16_F16] = ref_v_cvt_pknorm_i16_f16
-
+# =============================================================================
+# 3. v_cvt_pknorm_i16_f16
+# =============================================================================
 
 class TestVCvtPknormI16F16Oracle(unittest.TestCase):
+    """Reference mathematical oracle tests for v_cvt_pknorm_i16_f16 backed by translator."""
+
     def test_basic_packing(self) -> None:
         # lo: 1.0 -> 0x7FFF; hi: -1.0 -> 0x8001
-        res = ref_v_cvt_pknorm_i16_f16(0x3C00, 0xBC00)
-        self.assertEqual(res, 0x80017FFF)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xbc00",
+            "v_cvt_pknorm_i16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f16_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+        self.assertEqual(words[0], ref_v_cvt_pknorm_i16_f16(0x3C00, 0xBC00))
 
     def test_zero_and_clamp(self) -> None:
         # lo: 0.0 -> 0x0000; hi: 2.0 -> clamped to 1.0 (0x7FFF)
-        res = ref_v_cvt_pknorm_i16_f16(0x0000, 0x4000)
-        self.assertEqual(res, 0x7FFF0000)
+        lines = [
+            "v_mov_b32 v0, 0x0000",
+            "v_mov_b32 v1, 0x4000",
+            "v_cvt_pknorm_i16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f16_clamp", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x7FFF0000)
+
 
 class TestVCvtPknormI16F16ASTAndInterpreter(unittest.TestCase):
+    """AST disassembly and interpreter step verification for v_cvt_pknorm_i16_f16."""
+
     def test_ast_disassembly(self) -> None:
         inst = ASTInstruction(
             Opcode.V_CVT_PKNORM_I16_F16,
@@ -408,65 +561,83 @@ class TestVCvtPknormI16F16ASTAndInterpreter(unittest.TestCase):
             ASTOperand.vgpr(1),
         )
         self.assertEqual(inst.disasm(), "v_cvt_pknorm_i16_f16 v2, v0, v1")
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xbc00",
+            inst.disasm(),
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f16_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0xBC00)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_I16_F16,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x80017FFF)
-        self.assertEqual(state.vgprs[2], 0x80017FFF)
-
-class TestVCvtPknormI16F16SIMDAndIEEE(unittest.TestCase):
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0x5555555555555555
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0xBC00)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_I16_F16,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0x5555555555555555)
-
-    def test_register_aliasing(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0xBC00)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_I16_F16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x80017FFF)
-
-    def test_ieee754_nan_and_inf(self) -> None:
-        # lo: NaN -> 0; hi: Inf -> 0x7FFF
-        res = ref_v_cvt_pknorm_i16_f16(0x7E00, 0x7C00)
-        self.assertEqual(res, 0x7FFF0000)
-
-class TestVCvtPknormI16F16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x3c00",
             "v_mov_b32 v1, 0xbc00",
             "v_cvt_pknorm_i16_f16 v2, v0, v1",
-            "exp mrt0, v2, v2, v2, v2 done",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f16_step", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+
+
+class TestVCvtPknormI16F16SIMDAndIEEE(unittest.TestCase):
+    """SIMD execution and IEEE boundary handling for v_cvt_pknorm_i16_f16."""
+
+    def test_condition_code_neutrality(self) -> None:
+        lines = [
+            "v_cmp_ne_u32 vcc, 1, 0",
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xbc00",
+            "v_cvt_pknorm_i16_f16 v2, v0, v1",
+            "v_cndmask_b32 v3, 0, 1, vcc",
+            "exp mrt0, v2, v3, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f16_cc", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+        self.assertEqual(words[1], 1)
+
+    def test_register_aliasing(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xbc00",
+            "v_cvt_pknorm_i16_f16 v0, v0, v1",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f16_alias", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        # lo: NaN -> 0; hi: Inf -> 0x7FFF
+        lines = [
+            "v_mov_b32 v0, 0x7e00",
+            "v_mov_b32 v1, 0x7c00",
+            "v_cvt_pknorm_i16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f16_ieee", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x7FFF0000)
+
+
+class TestVCvtPknormI16F16Translation(unittest.TestCase):
+    """Hardware translator verification for v_cvt_pknorm_i16_f16."""
+
+    def test_spirv_emission(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0xbc00",
+            "v_cvt_pknorm_i16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_cvt_pknorm_i16_f16", lines)
@@ -474,26 +645,45 @@ class TestVCvtPknormI16F16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x80017FFF)
 
-def ref_v_cvt_pknorm_u16_f16(s0: int, s1: int) -> int:
-    lo = 0 if is_nan_f16(s0) else norm_u16(bits_to_f16(s0 & 0xFFFF))
-    hi = 0 if is_nan_f16(s1) else norm_u16(bits_to_f16(s1 & 0xFFFF))
-    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
 
-GLOBAL_ORACLE_MAP[Opcode.V_CVT_PKNORM_U16_F16] = ref_v_cvt_pknorm_u16_f16
-
+# =============================================================================
+# 4. v_cvt_pknorm_u16_f16
+# =============================================================================
 
 class TestVCvtPknormU16F16Oracle(unittest.TestCase):
+    """Reference mathematical oracle tests for v_cvt_pknorm_u16_f16 backed by translator."""
+
     def test_basic_packing(self) -> None:
         # lo: 1.0 -> 0xFFFF; hi: 0.5 -> 0x8000
-        res = ref_v_cvt_pknorm_u16_f16(0x3C00, 0x3800)
-        self.assertEqual(res, 0x8000FFFF)
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x3800",
+            "v_cvt_pknorm_u16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f16_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+        self.assertEqual(words[0], ref_v_cvt_pknorm_u16_f16(0x3C00, 0x3800))
 
     def test_zero_and_clamp(self) -> None:
         # lo: -1.0 -> clamped to 0 -> 0x0000; hi: 2.0 -> clamped to 1.0 -> 0xFFFF
-        res = ref_v_cvt_pknorm_u16_f16(0xBC00, 0x4000)
-        self.assertEqual(res, 0xFFFF0000)
+        lines = [
+            "v_mov_b32 v0, 0xbc00",
+            "v_mov_b32 v1, 0x4000",
+            "v_cvt_pknorm_u16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f16_clamp", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFF0000)
+
 
 class TestVCvtPknormU16F16ASTAndInterpreter(unittest.TestCase):
+    """AST disassembly and interpreter step verification for v_cvt_pknorm_u16_f16."""
+
     def test_ast_disassembly(self) -> None:
         inst = ASTInstruction(
             Opcode.V_CVT_PKNORM_U16_F16,
@@ -502,65 +692,83 @@ class TestVCvtPknormU16F16ASTAndInterpreter(unittest.TestCase):
             ASTOperand.vgpr(1),
         )
         self.assertEqual(inst.disasm(), "v_cvt_pknorm_u16_f16 v2, v0, v1")
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x3800",
+            inst.disasm(),
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f16_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0x3800)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_U16_F16,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x8000FFFF)
-        self.assertEqual(state.vgprs[2], 0x8000FFFF)
-
-class TestVCvtPknormU16F16SIMDAndIEEE(unittest.TestCase):
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0x3800)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_U16_F16,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
-
-    def test_register_aliasing(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3C00)
-        state.write_vgpr(1, 0x3800)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_U16_F16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x8000FFFF)
-
-    def test_ieee754_nan_and_inf(self) -> None:
-        # lo: NaN -> 0; hi: Inf -> 0xFFFF
-        res = ref_v_cvt_pknorm_u16_f16(0x7E00, 0x7C00)
-        self.assertEqual(res, 0xFFFF0000)
-
-class TestVCvtPknormU16F16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x3c00",
             "v_mov_b32 v1, 0x3800",
             "v_cvt_pknorm_u16_f16 v2, v0, v1",
-            "exp mrt0, v2, v2, v2, v2 done",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f16_step", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+
+
+class TestVCvtPknormU16F16SIMDAndIEEE(unittest.TestCase):
+    """SIMD execution and IEEE boundary handling for v_cvt_pknorm_u16_f16."""
+
+    def test_condition_code_neutrality(self) -> None:
+        lines = [
+            "v_cmp_ne_u32 vcc, 1, 0",
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x3800",
+            "v_cvt_pknorm_u16_f16 v2, v0, v1",
+            "v_cndmask_b32 v3, 0, 1, vcc",
+            "exp mrt0, v2, v3, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f16_cc", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+        self.assertEqual(words[1], 1)
+
+    def test_register_aliasing(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x3800",
+            "v_cvt_pknorm_u16_f16 v0, v0, v1",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f16_alias", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        # lo: NaN -> 0; hi: Inf -> 0xFFFF
+        lines = [
+            "v_mov_b32 v0, 0x7e00",
+            "v_mov_b32 v1, 0x7c00",
+            "v_cvt_pknorm_u16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f16_ieee", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFF0000)
+
+
+class TestVCvtPknormU16F16Translation(unittest.TestCase):
+    """Hardware translator verification for v_cvt_pknorm_u16_f16."""
+
+    def test_spirv_emission(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_mov_b32 v1, 0x3800",
+            "v_cvt_pknorm_u16_f16 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_cvt_pknorm_u16_f16", lines)
@@ -568,26 +776,45 @@ class TestVCvtPknormU16F16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x8000FFFF)
 
-def ref_v_cvt_pknorm_i16_f32(s0: int, s1: int) -> int:
-    lo = 0 if is_nan_f32(s0) else norm_i16(bits_to_f32(s0))
-    hi = 0 if is_nan_f32(s1) else norm_i16(bits_to_f32(s1))
-    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
 
-GLOBAL_ORACLE_MAP[Opcode.V_CVT_PKNORM_I16_F32] = ref_v_cvt_pknorm_i16_f32
-
+# =============================================================================
+# 5. v_cvt_pknorm_i16_f32
+# =============================================================================
 
 class TestVCvtPknormI16F32Oracle(unittest.TestCase):
+    """Reference mathematical oracle tests for v_cvt_pknorm_i16_f32 backed by translator."""
+
     def test_basic_packing(self) -> None:
         # lo: 1.0f -> 0x7FFF; hi: -1.0f -> 0x8001
-        res = ref_v_cvt_pknorm_i16_f32(0x3F800000, 0xBF800000)
-        self.assertEqual(res, 0x80017FFF)
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0xbf800000",
+            "v_cvt_pknorm_i16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f32_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+        self.assertEqual(words[0], ref_v_cvt_pknorm_i16_f32(0x3F800000, 0xBF800000))
 
     def test_zero_and_clamp(self) -> None:
         # lo: 0.0f -> 0x0000; hi: 3.0f -> clamped to 1.0 -> 0x7FFF
-        res = ref_v_cvt_pknorm_i16_f32(0x00000000, 0x40400000)
-        self.assertEqual(res, 0x7FFF0000)
+        lines = [
+            "v_mov_b32 v0, 0x00000000",
+            "v_mov_b32 v1, 0x40400000",
+            "v_cvt_pknorm_i16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f32_clamp", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x7FFF0000)
+
 
 class TestVCvtPknormI16F32ASTAndInterpreter(unittest.TestCase):
+    """AST disassembly and interpreter step verification for v_cvt_pknorm_i16_f32."""
+
     def test_ast_disassembly(self) -> None:
         inst = ASTInstruction(
             Opcode.V_CVT_PKNORM_I16_F32,
@@ -596,65 +823,83 @@ class TestVCvtPknormI16F32ASTAndInterpreter(unittest.TestCase):
             ASTOperand.vgpr(1),
         )
         self.assertEqual(inst.disasm(), "v_cvt_pknorm_i16_f32 v2, v0, v1")
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0xbf800000",
+            inst.disasm(),
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f32_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3F800000)
-        state.write_vgpr(1, 0xBF800000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_I16_F32,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x80017FFF)
-        self.assertEqual(state.vgprs[2], 0x80017FFF)
-
-class TestVCvtPknormI16F32SIMDAndIEEE(unittest.TestCase):
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0x1234567890ABCDEF
-        state.write_vgpr(0, 0x3F800000)
-        state.write_vgpr(1, 0xBF800000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_I16_F32,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0x1234567890ABCDEF)
-
-    def test_register_aliasing(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3F800000)
-        state.write_vgpr(1, 0xBF800000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_I16_F32,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x80017FFF)
-
-    def test_ieee754_nan_and_inf(self) -> None:
-        # lo: NaN -> 0; hi: Inf -> 0x7FFF
-        res = ref_v_cvt_pknorm_i16_f32(0x7FC00000, 0x7F800000)
-        self.assertEqual(res, 0x7FFF0000)
-
-class TestVCvtPknormI16F32Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x3f800000",
             "v_mov_b32 v1, 0xbf800000",
             "v_cvt_pknorm_i16_f32 v2, v0, v1",
-            "exp mrt0, v2, v2, v2, v2 done",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f32_step", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+
+
+class TestVCvtPknormI16F32SIMDAndIEEE(unittest.TestCase):
+    """SIMD execution and IEEE boundary handling for v_cvt_pknorm_i16_f32."""
+
+    def test_condition_code_neutrality(self) -> None:
+        lines = [
+            "v_cmp_ne_u32 vcc, 1, 0",
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0xbf800000",
+            "v_cvt_pknorm_i16_f32 v2, v0, v1",
+            "v_cndmask_b32 v3, 0, 1, vcc",
+            "exp mrt0, v2, v3, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f32_cc", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+        self.assertEqual(words[1], 1)
+
+    def test_register_aliasing(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0xbf800000",
+            "v_cvt_pknorm_i16_f32 v0, v0, v1",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f32_alias", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80017FFF)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        # lo: NaN -> 0; hi: Inf -> 0x7FFF
+        lines = [
+            "v_mov_b32 v0, 0x7fc00000",
+            "v_mov_b32 v1, 0x7f800000",
+            "v_cvt_pknorm_i16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_i16_f32_ieee", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x7FFF0000)
+
+
+class TestVCvtPknormI16F32Translation(unittest.TestCase):
+    """Hardware translator verification for v_cvt_pknorm_i16_f32."""
+
+    def test_spirv_emission(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0xbf800000",
+            "v_cvt_pknorm_i16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_cvt_pknorm_i16_f32", lines)
@@ -662,26 +907,45 @@ class TestVCvtPknormI16F32Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x80017FFF)
 
-def ref_v_cvt_pknorm_u16_f32(s0: int, s1: int) -> int:
-    lo = 0 if is_nan_f32(s0) else norm_u16(bits_to_f32(s0))
-    hi = 0 if is_nan_f32(s1) else norm_u16(bits_to_f32(s1))
-    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
 
-GLOBAL_ORACLE_MAP[Opcode.V_CVT_PKNORM_U16_F32] = ref_v_cvt_pknorm_u16_f32
-
+# =============================================================================
+# 6. v_cvt_pknorm_u16_f32
+# =============================================================================
 
 class TestVCvtPknormU16F32Oracle(unittest.TestCase):
+    """Reference mathematical oracle tests for v_cvt_pknorm_u16_f32 backed by translator."""
+
     def test_basic_packing(self) -> None:
         # lo: 1.0f -> 0xFFFF; hi: 0.5f -> 0x8000
-        res = ref_v_cvt_pknorm_u16_f32(0x3F800000, 0x3F000000)
-        self.assertEqual(res, 0x8000FFFF)
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_cvt_pknorm_u16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f32_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+        self.assertEqual(words[0], ref_v_cvt_pknorm_u16_f32(0x3F800000, 0x3F000000))
 
     def test_zero_and_clamp(self) -> None:
         # lo: -2.0f -> clamped to 0 -> 0x0000; hi: 5.0f -> clamped to 1.0 -> 0xFFFF
-        res = ref_v_cvt_pknorm_u16_f32(0xC0000000, 0x40A00000)
-        self.assertEqual(res, 0xFFFF0000)
+        lines = [
+            "v_mov_b32 v0, 0xc0000000",
+            "v_mov_b32 v1, 0x40a00000",
+            "v_cvt_pknorm_u16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f32_clamp", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFF0000)
+
 
 class TestVCvtPknormU16F32ASTAndInterpreter(unittest.TestCase):
+    """AST disassembly and interpreter step verification for v_cvt_pknorm_u16_f32."""
+
     def test_ast_disassembly(self) -> None:
         inst = ASTInstruction(
             Opcode.V_CVT_PKNORM_U16_F32,
@@ -690,71 +954,133 @@ class TestVCvtPknormU16F32ASTAndInterpreter(unittest.TestCase):
             ASTOperand.vgpr(1),
         )
         self.assertEqual(inst.disasm(), "v_cvt_pknorm_u16_f32 v2, v0, v1")
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0x3f000000",
+            inst.disasm(),
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f32_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3F800000)
-        state.write_vgpr(1, 0x3F000000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_U16_F32,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x8000FFFF)
-        self.assertEqual(state.vgprs[2], 0x8000FFFF)
-
-class TestVCvtPknormU16F32SIMDAndIEEE(unittest.TestCase):
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xFEDCBA9876543210
-        state.write_vgpr(0, 0x3F800000)
-        state.write_vgpr(1, 0x3F000000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_U16_F32,
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xFEDCBA9876543210)
-
-    def test_register_aliasing(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(0, 0x3F800000)
-        state.write_vgpr(1, 0x3F000000)
-        inst = ASTInstruction(
-            Opcode.V_CVT_PKNORM_U16_F32,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x8000FFFF)
-
-    def test_ieee754_nan_and_inf(self) -> None:
-        # lo: NaN -> 0; hi: Inf -> 0xFFFF
-        res = ref_v_cvt_pknorm_u16_f32(0x7FC00000, 0x7F800000)
-        self.assertEqual(res, 0xFFFF0000)
-
-class TestVCvtPknormU16F32Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x3f800000",
             "v_mov_b32 v1, 0x3f000000",
             "v_cvt_pknorm_u16_f32 v2, v0, v1",
-            "exp mrt0, v2, v2, v2, v2 done",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f32_step", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+
+
+class TestVCvtPknormU16F32SIMDAndIEEE(unittest.TestCase):
+    """SIMD execution and IEEE boundary handling for v_cvt_pknorm_u16_f32."""
+
+    def test_condition_code_neutrality(self) -> None:
+        lines = [
+            "v_cmp_ne_u32 vcc, 1, 0",
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_cvt_pknorm_u16_f32 v2, v0, v1",
+            "v_cndmask_b32 v3, 0, 1, vcc",
+            "exp mrt0, v2, v3, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f32_cc", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+        self.assertEqual(words[1], 1)
+
+    def test_register_aliasing(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_cvt_pknorm_u16_f32 v0, v0, v1",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f32_alias", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x8000FFFF)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        # lo: NaN -> 0; hi: Inf -> 0xFFFF
+        lines = [
+            "v_mov_b32 v0, 0x7fc00000",
+            "v_mov_b32 v1, 0x7f800000",
+            "v_cvt_pknorm_u16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pknorm_u16_f32_ieee", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFF0000)
+
+
+class TestVCvtPknormU16F32Translation(unittest.TestCase):
+    """Hardware translator verification for v_cvt_pknorm_u16_f32."""
+
+    def test_spirv_emission(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_cvt_pknorm_u16_f32 v2, v0, v1",
+            "exp mrt0, v2, v2, v2, v2 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_cvt_pknorm_u16_f32", lines)
         self.assertIn("OpEntryPoint", spv)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x8000FFFF)
+
+
+# =============================================================================
+# 7. Negative Controls and Mutation Detection
+# =============================================================================
+
+class TestVCvtNormNegativeControls(unittest.TestCase):
+    """Negative controls and mutation detection for normalized conversions."""
+
+    def test_syntax_rejection_missing_operand(self) -> None:
+        lines = [
+            "v_cvt_norm_i16_f16 v0",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_norm_bad", lines)
+
+    def test_mutation_detection_signed_vs_unsigned_norm(self) -> None:
+        # Negative half float -1.0h (0xBC00):
+        # v_cvt_norm_i16_f16 gives 0x8001 (-32767)
+        # v_cvt_norm_u16_f16 gives 0 (saturated clamp to 0)
+        lines_i16 = [
+            "v_mov_b32 v0, 0xbc00",
+            "v_cvt_norm_i16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_i16 = support.translate_lines("ps_mut_norm_i16", lines_i16)
+        words_i16 = support.mrt0_words(spv_i16)
+
+        lines_u16 = [
+            "v_mov_b32 v0, 0xbc00",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_u16 = support.translate_lines("ps_mut_norm_u16", lines_u16)
+        words_u16 = support.mrt0_words(spv_u16)
+
+        self.assertEqual(words_i16[0] & 0xFFFF, 0x8001)
+        self.assertEqual(words_u16[0] & 0xFFFF, 0x0000)
+        self.assertNotEqual(words_i16[0] & 0xFFFF, words_u16[0] & 0xFFFF)
+
 
 if __name__ == "__main__":
     unittest.main()
