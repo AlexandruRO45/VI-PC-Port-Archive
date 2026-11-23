@@ -590,6 +590,31 @@ class GlbInspectTests(unittest.TestCase):
             self.assertIsNone(animation["duration"])
             self.assertIsNone(animation["samplers"][0]["duration"])
 
+    def test_large_json_exponent_max_is_missing_not_infinite(self):
+        # 1e400 is a valid JSON number, but json.loads() converts it to
+        # Python infinity. It must not leak into the report or --json fails.
+        gltf = animated_gltf()
+        gltf["accessors"][2]["max"] = ["__EXPONENT__"]
+        raw = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+        token = b'"__EXPONENT__"'
+        self.assertEqual(raw.count(token), 1)
+        for exponent in (b"1e400", b"-1e400"):
+            with self.subTest(exponent=exponent), tempfile.TemporaryDirectory() as folder:
+                payload = raw.replace(token, exponent)
+                payload += b" " * ((-len(payload)) % 4)
+                path = os.path.join(folder, "large_exponent.glb")
+                out = os.path.join(folder, "report.json")
+                with open(path, "wb") as handle:
+                    handle.write(container(payload, triangle_bin()))
+                result = self.run_tool(path, "--json", out)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("duration=(missing)", result.stdout)
+                with open(out, encoding="utf-8") as handle:
+                    animation = json.load(handle)["animations"][0]
+                self.assertIsNone(animation["duration"])
+                self.assertIsNone(animation["samplers"][0]["duration"])
+
     def test_zero_keyframes_has_no_duration(self):
         gltf = animated_gltf()
         gltf["accessors"][2]["count"] = 0
