@@ -492,6 +492,38 @@ def _read_carved(path, max_inflate):
     return data if len(data) <= max_inflate else None
 
 
+def _read_carved_resource(path, max_inflate, listed, successors):
+    """Read a capped carved resource and return (bytes, joined paths), using the scan's file membership/cache."""
+    data = _read_carved(path, max_inflate)
+    if data is None:
+        return None, []
+    root = os.path.dirname(path)
+    if root not in successors:
+        successors[root] = _carve_successors(root)
+    nxt = successors[root]
+    current = os.path.basename(path)
+    joined = []
+    # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
+    # carve's index.json shows that stream started right after this one.
+    for _ in range(2):
+        if data[0x10:0x15] != b"0DRPz" or (parse_resource(data) is not None and not _needs_continuation(data)):
+            break
+        follow = nxt.get(current)
+        q = os.path.join(root, follow) if follow is not None else None
+        if q is None or q not in listed:
+            break
+        if len(data) + os.path.getsize(q) > max_inflate:
+            break
+        with open(q, "rb") as f:
+            more = f.read()
+        if more[0x10:0x15] == b"0DRPz":
+            break
+        data += more
+        joined.append(q)
+        current = follow
+    return data, joined
+
+
 def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
     if directory_files is not None or os.path.isdir(path):
@@ -513,36 +545,12 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                 stats["files"] += 1
                 stats["scanned_bytes"] += sub["scanned_bytes"]
                 continue
-            b = _read_carved(p, max_inflate)
+            b, joined = _read_carved_resource(p, max_inflate, listed, successors)
             if b is None:
                 continue
-            stats["files"] += 1
+            consumed.update(joined)
+            stats["files"] += 1 + len(joined)
             stats["scanned_bytes"] += len(b)
-            # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
-            # carve's index.json shows that stream started right after this one.
-            root = os.path.dirname(p)
-            if root not in successors:
-                successors[root] = _carve_successors(root)
-            nxt = successors[root]
-            current = os.path.basename(p)
-            for _ in range(2):
-                if b[0x10:0x15] != b"0DRPz" or (parse_resource(b) is not None and not _needs_continuation(b)):
-                    break
-                follow = nxt.get(current)
-                q = os.path.join(root, follow) if follow is not None else None
-                if q is None or q not in listed:
-                    break
-                if len(b) + os.path.getsize(q) > max_inflate:
-                    break
-                with open(q, "rb") as f:
-                    more = f.read()
-                if more[0x10:0x15] == b"0DRPz":
-                    break
-                b += more
-                consumed.add(q)
-                stats["files"] += 1
-                stats["scanned_bytes"] += len(more)
-                current = follow
             row = parse_resource(b, collect)   # collect once, on the joined resource
             if row is not None:
                 row["offset"] = 0

@@ -129,11 +129,18 @@ def iter_resources(path, start=None, limit=None):
                 if res and res.get("complete"):
                     yield r, res["data"]
         return
-    rows, _ = WI.scan_path(path, start, limit)
+    directory_files = list(WI._directory_files(path)) if os.path.isdir(path) else None
+    rows, _ = WI.scan_path(path, start, limit, directory_files=directory_files)
+    listed = set(directory_files or ())
+    successors = {}
     for r in rows:
         p = os.path.join(path, r["file"]) if os.path.isdir(path) else path
-        with open(p, "rb") as f:
-            yield r, f.read(WI.CAP + 1)
+        if directory_files is None:
+            data = WI._read_carved(p, WI.CAP)
+        else:
+            data, _ = WI._read_carved_resource(p, WI.CAP, listed, successors)
+        if data is not None:
+            yield r, data
 
 
 # ---- transforms (source axes: RAGE world, Z up, metres)
