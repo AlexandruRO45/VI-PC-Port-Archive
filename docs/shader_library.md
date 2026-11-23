@@ -114,7 +114,9 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   reads (`native_blob`, `cs_dispatch_state`). It also writes `index.json` with each program's stage, and
   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
   `lib_<stage>_<index>`.
-* `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
+* `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does. If
+  `llvm-mc` reports invalid instructions, the unpacker retries with the built-in RDNA2 decoder (`--backend python`),
+  passing the program's `wave32` flag, and uses its listing after a complete decode.
 * `--carve` names each program's source shaders. It copies the first source container to `<name>.dxbc`, because
   the translator reads the stage's signatures and `PSV0` from there. Pipeline compilation keeps the D3D12 stage
   interface.

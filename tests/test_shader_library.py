@@ -297,6 +297,69 @@ class Main(unittest.TestCase):
             finally:
                 rdna2spirv._STAGES = None
 
+    def test_disasm_python_backend_passes_wave32_from_kind0(self):
+        """--disasm --backend python decodes without llvm-mc and passes the compute record's wave32 flag."""
+        # v_cmp_class_f16_e64 sdst=10, 0x7c01, v13: s10 in wave32, s[10:11] in wave64.
+        vcmp_e64 = bytes.fromhex("0a008fd4ff1a0200017c0000")
+        code = prologue(0x77778888) + vcmp_e64 + ENDPGM
+        code += CODE_END * ((-len(code)) % 256 // 4)
+        for wave32, expected in ((False, "s[10:11]"), (True, "s10,")):
+            rsrc_z = 1 | (0x10 << 16 if wave32 else 0)
+            k0 = struct.pack("<7I", 0x4005CF00, 0x6C090102, 0, 8 | 8 << 16, rsrc_z, 0x402C0343, 0xB8A)
+            lib_bytes = build([], [(0, 1, 0, 2)], [k0, b"\x01" * 20, layout_blob(3, D_CS)], [code])
+            with tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "lib.bin")
+                with open(src, "wb") as f:
+                    f.write(lib_bytes)
+                out = os.path.join(tmp, "out")
+                rc, _ = self.run_main(src, "--out", out, "--stages", "cs", "--disasm", "--backend", "python")
+                self.assertEqual(rc, 0)
+                with open(os.path.join(out, "disasm", "lib_cs_00000.s"), encoding="utf-8") as f:
+                    listing = f.read()
+                self.assertIn("0 invalid words", listing)
+                self.assertIn(expected, listing)
+                with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                    idx = json.load(f)
+                self.assertEqual(idx[0]["invalid_words"], 0)
+                self.assertEqual(idx[0]["wave32"], wave32)
+
+    def test_disasm_retries_invalid_words_with_python_decoder_and_rejects_empty_output(self):
+        """When llvm-mc reports invalid words, --disasm retries with the Python decoder; empty output raises LibraryError."""
+        import shader_disasm
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            calls = []
+            real_disasm = shader_disasm.disasm
+
+            def fake_invalid(code, mcpu, backend="llvm-mc", wave32=True):
+                calls.append((backend, wave32))
+                if backend == "llvm-mc":
+                    return "\ts_endpgm\n", 2, "warning: invalid instruction encoding\n"
+                return real_disasm(code, mcpu, backend="python", wave32=wave32)
+
+            old = shader_disasm.disasm
+            shader_disasm.disasm = fake_invalid
+            try:
+                out = os.path.join(tmp, "out_retry")
+                rc, _ = self.run_main(src, "--out", out, "--stages", "cs", "--disasm", "--jobs", "1")
+                self.assertEqual(rc, 0)
+                self.assertEqual(calls, [("llvm-mc", False), ("python", False)])
+                with open(os.path.join(out, "disasm", "lib_cs_00003.s"), encoding="utf-8") as f:
+                    listing = f.read()
+                self.assertIn("0 invalid words", listing)
+                self.assertIn("v_mov_b32", listing)
+                self.assertNotIn("warning: invalid instruction encoding", listing)
+
+                shader_disasm.disasm = lambda code, mcpu, backend="llvm-mc", wave32=True: ("   ", 0, "llvm-mc failed\n")
+                out_fail = os.path.join(tmp, "out_fail")
+                with self.assertRaisesRegex(sl.LibraryError, "lib_cs_00003: llvm-mc failed"):
+                    self.run_main(src, "--out", out_fail, "--stages", "cs", "--disasm", "--jobs", "1")
+                self.assertEqual(os.listdir(os.path.join(out_fail, "disasm")), [])
+            finally:
+                shader_disasm.disasm = old
+
 
 if __name__ == "__main__":
     unittest.main()

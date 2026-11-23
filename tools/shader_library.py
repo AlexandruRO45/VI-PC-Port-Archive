@@ -254,6 +254,8 @@ def main(argv=None) -> int:
                     help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
+                    help="disassembler backend for --disasm: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
                                     "digest its resource-layout blob ends with (the container's HASH part), and "
                                     "copy that container to <name>.dxbc for the translator's signature reads")
@@ -334,7 +336,15 @@ def main(argv=None) -> int:
 
     def one(job):
         entry, name, code, start, end = job
-        asm, invalid, err = disasm.disasm(code, a.mcpu)
+        wave32 = entry.get("wave32", True)
+        asm, invalid, err = disasm.disasm(code, a.mcpu, backend=a.backend, wave32=wave32)
+        if a.backend == "llvm-mc" and asm.strip() and invalid:
+            decoded, remaining, _ = disasm.disasm(code, a.mcpu, backend="python", wave32=wave32)
+            if decoded.strip() and remaining == 0:
+                asm, invalid, err = decoded, 0, ""
+        if not asm.strip():
+            reason = (err.strip().splitlines() or ["no output"])[0]
+            raise LibraryError(f"{name}: {reason}")
         entry["invalid_words"] = invalid
         with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
