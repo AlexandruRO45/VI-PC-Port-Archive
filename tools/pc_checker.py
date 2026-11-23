@@ -384,7 +384,7 @@ def evaluate(profile_name: str, cpu: str, gpu: str, ram, cpu_cores: int | None =
         ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], f"{ram} GB" if ram else "", False),
     ]
     weak = [r[0] for r in rows if r[1] == BELOW]
-    unknown = [d for d, s in (("CPU", cpu_s), ("GPU", gpu_s), ("RAM", ram_s)) if s is None]
+    unknown = [name for name, s in ((cpu.strip(), cpu_s), (gpu.strip(), gpu_s), ("RAM", ram)) if s is None]
     if weak:
         verb = "is" if len(weak) == 1 else "are"
         return ("Probably not enough",
