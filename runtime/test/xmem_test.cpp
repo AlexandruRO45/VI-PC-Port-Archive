@@ -272,6 +272,62 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     DeleteFileW(path.c_str());
 }
 
+// XMemAllocDefault / XMemFreeDefault share XMemAlloc's heap: the same alignment, and a block from one family can be
+// released by the other. The trace records each API under its own name, also for a word the other API already used.
+void test_default_family(XMemAllocFn alloc, XMemFreeFn free_mem, XMemAllocFn alloc_default,
+                         XMemFreeFn free_default) {
+    void* zero = alloc_default(0, 0);
+    check(zero != nullptr && aligned_64(zero), "XMemAllocDefault(0, 0) returns a non-null 64-byte aligned block");
+    free_default(zero, 0);
+
+    auto* big = static_cast<unsigned char*>(alloc_default(4096, 0x5e50000));
+    check(big != nullptr && aligned_64(big), "XMemAllocDefault(4096, 0x5e50000) returns a 64-byte aligned block");
+    bool pattern_ok = big != nullptr;
+    if (big) {
+        for (size_t i = 0; i < 4096; ++i) big[i] = static_cast<unsigned char>(i * 7);
+        for (size_t i = 0; i < 4096; ++i) pattern_ok = pattern_ok && big[i] == static_cast<unsigned char>(i * 7);
+    }
+    check(pattern_ok, "XMemAllocDefault(4096, 0x5e50000) block holds a write/read pattern");
+    free_mem(big, 0x5e50000);  // XMemAllocDefault's block, released by XMemFree
+    void* other = alloc(256, 0);
+    check(other != nullptr, "XMemAlloc(256, 0) allocates");
+    free_default(other, 0);  // XMemAlloc's block, released by XMemFreeDefault
+    free_default(nullptr, 0);
+    check(true, "XMemFree and XMemFreeDefault release each other's blocks and null (no crash)");
+
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring path =
+        std::wstring(temp) + L"xmem_default_trace_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
+    DeleteFileW(path.c_str());
+    check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
+    void* a = alloc(32, 0x4242);  // a word no earlier test used, through both APIs
+    void* b = alloc_default(48, 0x4242);
+    void* c = alloc_default(64, 0x4242);  // same API and word again: no second event
+    free_mem(a, 0x4242);
+    free_default(b, 0x4242);
+    free_default(c, 0x4242);
+    rt::startup_trace::close();
+
+    std::ifstream in(path);
+    std::stringstream text;
+    text << in.rdbuf();
+    const std::string log = text.str();
+    auto count = [&](const std::string& needle) {
+        int n = 0;
+        for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
+        return n;
+    };
+    check(count("\"kind\":\"xmem_attributes\"") == 4, "four events: one per API for the shared word");
+    check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x4242\",\"size\":32") == 1, "XMemAlloc 0x4242 is recorded");
+    check(count("\"api\":\"XMemAllocDefault\",\"attributes\":\"0x4242\",\"size\":48") == 1,
+          "XMemAllocDefault 0x4242 is recorded once, with the size of its first call");
+    check(count("\"api\":\"XMemFree\",\"attributes\":\"0x4242\"") == 1, "XMemFree 0x4242 is recorded");
+    check(count("\"api\":\"XMemFreeDefault\",\"attributes\":\"0x4242\"") == 1,
+          "XMemFreeDefault 0x4242 is recorded once");
+    DeleteFileW(path.c_str());
+}
+
 // XMemTransferMemory moves budget between the console's title and system partitions; a PC has neither, so the shim
 // succeeds for every direction and size and moves (allocates) nothing. The XMEM_TRANSFER_TYPE values are not public,
 // so the directions here are just the first few enum values and one far outside any plausible range.
@@ -409,6 +465,8 @@ int main() {
         reinterpret_cast<XMemResetWriteWatchFn>(rt::shims::find("xmem.dll", "XMemResetWriteWatch"));
     const auto transfer =
         reinterpret_cast<XMemTransferMemoryFn>(rt::shims::find("xmem.dll", "XMemTransferMemory"));
+    const auto alloc_default = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAllocDefault"));
+    const auto free_default = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFreeDefault"));
 
     check(alloc != nullptr, "registry exposes xmem.dll!XMemAlloc");
     check(free_mem != nullptr, "registry exposes xmem.dll!XMemFree");
@@ -418,6 +476,8 @@ int main() {
     check(get_write_watch != nullptr, "registry exposes xmem.dll!XMemGetWriteWatch");
     check(reset_write_watch != nullptr, "registry exposes xmem.dll!XMemResetWriteWatch");
     check(transfer != nullptr, "registry exposes xmem.dll!XMemTransferMemory");
+    check(alloc_default != nullptr, "registry exposes xmem.dll!XMemAllocDefault");
+    check(free_default != nullptr, "registry exposes xmem.dll!XMemFreeDefault");
 
     if (!alloc || !free_mem || !query || !get_stats) {
         print_result();
@@ -431,6 +491,7 @@ int main() {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
     test_attribute_trace(alloc, free_mem);
+    if (alloc_default && free_default) test_default_family(alloc, free_mem, alloc_default, free_default);
     if (transfer) {
         test_transfer_memory(transfer);
         test_transfer_trace(transfer);

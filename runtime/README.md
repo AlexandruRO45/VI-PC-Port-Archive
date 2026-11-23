@@ -157,7 +157,8 @@ Current limits, by design:
 
 `shims/registry.cpp` holds the static tables. The current shims are:
 
-- `xmem.dll` — `XMemAlloc`, `XMemFree`, the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
+- `xmem.dll` — `XMemAlloc`, `XMemFree`, `XMemAllocDefault` and `XMemFreeDefault` (one heap: a block from either pair
+  can be freed by the other), the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
   measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
@@ -351,7 +352,7 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
+| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault` and `XMemFreeDefault` call for each distinct raw attribute word, per API (not every allocation) | `api`, `attributes`, `size` (the two allocating APIs only), `caller` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |

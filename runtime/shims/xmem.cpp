@@ -31,19 +31,19 @@ namespace {
 
 constexpr size_t kAlign = 64;
 
-// gta6rt --trace FILE: the first XMemAlloc and the first XMemFree for each distinct raw attribute word go to the
-// startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
-// bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
-// which would fill the file. Off: one relaxed load per call.
-void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+// gta6rt --trace FILE: the first call of each API for each distinct raw attribute word goes to the startup trace as an
+// "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The bits of the
+// attribute word are not known yet; this records them from a real run without logging every allocation, which would
+// fill the file. Off: one relaxed load per call. The set is keyed by API name and word.
+void note_attributes(const char* api, bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<bool, uint64_t>> seen;
+    static std::set<std::pair<std::string, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({is_alloc, attributes}).second) return;
+        if (!seen.insert({api, attributes}).second) return;
     }
-    std::string fields = std::string("\"api\":\"") + (is_alloc ? "XMemAlloc" : "XMemFree") +
+    std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
     if (is_alloc) fields += ",\"size\":" + std::to_string(size);
     fields += ",\"caller\":" +
@@ -51,13 +51,30 @@ void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
+void* allocate(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
+
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
-    return _aligned_malloc(size ? size : 1, kAlign);
+    note_attributes("XMemAlloc", true, attributes, size, _ReturnAddress());
+    return allocate(size);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes(false, attributes, 0, _ReturnAddress());
+    note_attributes("XMemFree", false, attributes, 0, _ReturnAddress());
+    _aligned_free(p);
+}
+
+// XMemAllocDefault / XMemFreeDefault: the GDK's built-in allocator, the one XMemAlloc and XMemFree reach when the title
+// installed no allocation hooks. A title calls them directly from hooks of its own, so a block from either family may be
+// released by the other. Same signatures as XMemAlloc and XMemFree (the GDK's public xmem reference), so they share
+// the heap and the 64-byte alignment above, and the trace names each API on its own. The retail executable imports both
+// (RT-5: two of its seven unimplemented xmem.dll imports).
+void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
+    note_attributes("XMemAllocDefault", true, attributes, size, _ReturnAddress());
+    return allocate(size);
+}
+
+void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
+    note_attributes("XMemFreeDefault", false, attributes, 0, _ReturnAddress());
     _aligned_free(p);
 }
 
@@ -300,6 +317,8 @@ SHIM_TABLE(title_memory,
 SHIM_TABLE(xmem,
     {"xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&XMemAlloc)},
     {"xmem.dll", "XMemFree", reinterpret_cast<void*>(&XMemFree)},
+    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
+    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
     {"xmem.dll", "XMemVirtualQuery", reinterpret_cast<void*>(&XMemVirtualQuery)},
     {"xmem.dll", "XMemGetWorkingSetStatistics", reinterpret_cast<void*>(&XMemGetWorkingSetStatistics)},
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
