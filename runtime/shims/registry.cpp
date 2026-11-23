@@ -288,13 +288,13 @@ void* make_common_stub() {
 
 UnimplementedPolicy parse_unimplemented_policy(const char* text, bool* valid) {
     if (valid) *valid = true;
-    if (!text || !*text) return UnimplementedPolicy::Log;
+    if (!text || !*text) return UnimplementedPolicy::Fail;
     const std::string v = lower_ascii(text);
     if (v == "log") return UnimplementedPolicy::Log;
     if (v == "fail") return UnimplementedPolicy::Fail;
     if (v == "stop") return UnimplementedPolicy::Stop;
     if (valid) *valid = false;
-    return UnimplementedPolicy::Log;
+    return UnimplementedPolicy::Fail;
 }
 
 UnimplementedPolicy unimplemented_policy() {
@@ -304,7 +304,7 @@ UnimplementedPolicy unimplemented_policy() {
         const DWORD n = GetEnvironmentVariableA("LEONIDA_UNIMPLEMENTED", buf, sizeof buf);
         bool valid = true;
         const UnimplementedPolicy parsed = parse_unimplemented_policy(n < sizeof buf ? buf : "?", &valid);
-        if (!valid) std::fprintf(stderr, "[rt] LEONIDA_UNIMPLEMENTED: expected log, fail or stop; using log\n");
+        if (!valid) std::fprintf(stderr, "[rt] LEONIDA_UNIMPLEMENTED: expected log, fail or stop; using fail\n");
         int expected = -1;
         g_policy.compare_exchange_strong(expected, static_cast<int>(parsed));
         p = g_policy.load();
