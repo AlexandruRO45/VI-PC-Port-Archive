@@ -395,6 +395,18 @@ class TestSAshrI64AST(unittest.TestCase):
         expr = SAshrI64Expr(0x8000000000000000, 1)
         self.assertEqual(expr.eval(), (0xC000000000000000, 1))
 
+class TestSAshrI64SignAndSCC(unittest.TestCase):
+    def test_64bit_sign_propagation(self) -> None:
+        val = 0x8000000000000000
+        for sh in range(64):
+            res, scc = ref_s_ashr_i64(val, sh)
+            self.assertEqual(res & (1 << 63), 1 << 63)
+            self.assertEqual(scc, 1)
+
+    def test_zero_result(self) -> None:
+        res, scc = ref_s_ashr_i64(0, 10)
+        self.assertEqual((res, scc), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
