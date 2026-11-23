@@ -305,6 +305,12 @@ class TestSPackLhB32B16AST(unittest.TestCase):
         expr = SPackLhB32B16Expr(0xAAAA5555, 0x3333CCCC)
         self.assertEqual(expr.eval(), 0x33335555)
 
+class TestSPackLhB32B16HalfWords(unittest.TestCase):
+    def test_halfword_patterns(self) -> None:
+        for val in (0, 1, 0x7FFF, 0x8000, 0xFFFF):
+            res = ref_s_pack_lh_b32_b16(val, val << 16)
+            self.assertEqual(res, (val << 16) | val)
+
 
 if __name__ == "__main__":
     unittest.main()
