@@ -6,10 +6,13 @@ change at all.
 """
 import os
 import re
+import sys
 import unittest
 
-import support
-import rdna2spirv
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 H = bytes(0x138) + (0x8090).to_bytes(4, "little") + (64).to_bytes(4, "little") + (1).to_bytes(4, "little") * 2
 EXIT = ["buffer_store_dword v1, v0, s[0:3], 0 offen", "s_endpgm"]
@@ -58,6 +61,17 @@ class NativeF16Tests(unittest.TestCase):
         spv, meta = translate(lines, fma_khr=True)
         self.assertEqual(half_ops(spv), ["OpFmaKHR", "OpFmaKHR", "OpFmaKHR"])
         self.assertIn("shaderFmaFloat16", meta["features"])
+
+    def test_fma_features_follow_the_widths_used(self):
+        # One VK_KHR_shader_fma feature per width an OpFmaKHR is on: a 16-bit add needs no 16-bit fma.
+        for lines, want in ((["v_fma_f16 v1, v2, v3, v4"], ["shaderFmaFloat16"]),
+                            (["v_add_f16_e32 v1, v2, v3", "v_fma_f32 v5, v2, v3, v4"], ["shaderFmaFloat32"]),
+                            (["v_fma_f16 v1, v2, v3, v4", "v_fma_f32 v5, v2, v3, v4"],
+                             ["shaderFmaFloat16", "shaderFmaFloat32"])):
+            _, meta = translate(lines, fma_khr=True)
+            self.assertEqual([f for f in meta["features"] if f.startswith("shaderFma")], want, lines)
+        _, meta = translate(["v_fma_f32 v5, v2, v3, v4"], native=False, fma_khr=True)
+        self.assertEqual([f for f in meta["features"] if f.startswith("shaderFma")], ["shaderFmaFloat32"])
 
     def test_integer_path_where_native_is_not_exact(self):
         for line in ("v_add_f16_e64 v1, v2, v3 clamp", "v_mul_f16_e64 v1, v2, v3 mul:2", "v_max_f16_e32 v1, v2, v3"):
