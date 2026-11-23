@@ -326,6 +326,13 @@ class TestPermLaneX16Distinguisher(unittest.TestCase):
         self.assertNotIn("OpBitwiseXor", spv_p16)
         self.assertIn("OpBitwiseXor", spv_px16)
 
+class TestPermLaneX16Translator(unittest.TestCase):
+    def test_execution_matrix(self):
+        for s1, s2 in ((0, 0), (0x76543210, 0xFEDCBA98), (0xAAAAAAAA, 0x55555555)):
+            spv = run_cs_permlane("v_permlanex16_b32", s1, s2, name=f"cs_px16_mat_{s1:x}")
+            self.assertIn("OpBitwiseXor", spv)
+            self.assertIn("OpGroupNonUniformShuffle", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
