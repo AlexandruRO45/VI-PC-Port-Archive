@@ -31,6 +31,7 @@ Nothing from the package is written outside --work. The report holds module name
 import argparse
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -228,6 +229,14 @@ def translate(game_dir, work, max_shared_memory):
     if not dll.is_file():
         raise SystemExit(f"error: {dll} not found")
     dxbc, spirv = Path(work) / "dxbc", Path(work) / "spirv"
+    # Reset only our translation subdirectories when reusing --work: otherwise pe_shader_containers suffixes new extracts
+    # (_00, _01, ...) alongside existing ones, bypassing exact REHYDRATION names and keeping stale .spv outputs.
+    for folder in (dxbc, spirv):
+        if folder.is_dir() and not folder.is_symlink():
+            try:
+                shutil.rmtree(folder)
+            except OSError as e:
+                raise SystemExit(f"error: cannot reset work folder {folder}: {e.strerror or e}")
     steps = [
         [HERE / "pe_shader_containers.py", str(dll), "--extract", str(dxbc)],
         [HERE / "fssm_unpack.py", str(dxbc)],

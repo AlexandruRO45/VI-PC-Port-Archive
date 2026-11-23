@@ -164,6 +164,72 @@ class Checked(unittest.TestCase):
             self.assertEqual({r["status"] for r in results}, {"missing"})
 
 
+class Translate(unittest.TestCase):
+    def _make_fake_pipeline(self):
+        """Mock subprocess.run for translate() using real pe_shader_containers.extract suffixing."""
+        import pe_shader_containers as psc
+        records = [{"name": "RadixReset", "offset": 0, "size": 4, "stage": "cs"},
+                   {"name": "Box16Rehydration", "offset": 0, "size": 4, "stage": "cs"}]
+
+        def fake_run(cmd, **_kwargs):
+            tool = Path(cmd[2]).name
+            if tool == "pe_shader_containers.py":
+                out_dir = Path(cmd[cmd.index("--extract") + 1])
+                psc.extract(b"DXBC", records, str(out_dir))
+            elif tool == "fssm_unpack.py":
+                dxbc = Path(cmd[3])
+                fssm = dxbc / "fssm"
+                fssm.mkdir(parents=True, exist_ok=True)
+                for p in sorted(dxbc.glob("*.dxbc")):
+                    (fssm / f"{p.stem}.fssm").write_bytes(b"FSSM")
+            elif tool == "shader_disasm.py":
+                fssm = Path(cmd[3])
+                disasm = Path(cmd[cmd.index("--out") + 1])
+                disasm.mkdir(parents=True, exist_ok=True)
+                for p in sorted(fssm.glob("*.fssm")):
+                    (disasm / f"{p.stem}.s").write_text("// stub\n", encoding="utf-8", newline="\n")
+            elif tool == "rdna2spirv.py":
+                disasm = Path(cmd[3])
+                spirv = Path(cmd[cmd.index("--out") + 1])
+                spirv.mkdir(parents=True, exist_ok=True)
+                for p in sorted(disasm.glob("*.s")):
+                    (spirv / f"{p.stem}.spv").write_bytes(b"\x03\x02\x23\x07")
+            return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        return fake_run
+
+    def test_reusing_work_clears_stale_dxbc_and_spirv_without_touching_siblings(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "XboxBvhBuilder.dll").write_bytes(b"MZ")
+            work = root / "work"
+            work.mkdir()
+            (work / "report.json").write_bytes(b"keep")
+            (work / "spirv").mkdir()
+            (work / "spirv" / "stale.spv").write_bytes(b"\x03\x02\x23\x07")
+            with mock.patch.object(smoke.subprocess, "run", side_effect=self._make_fake_pipeline()):
+                smoke.translate(root, work, 32768)
+                spirv = smoke.translate(root, work, 32768)
+            self.assertEqual(sorted(p.name for p in (work / "dxbc").glob("*.dxbc")),
+                             ["Box16Rehydration.dxbc", "RadixReset.dxbc"])
+            self.assertEqual(sorted(p.stem for p in spirv.glob("*.spv")),
+                             ["Box16Rehydration", "RadixReset"])
+            self.assertEqual((work / "report.json").read_bytes(), b"keep")
+
+    def test_unremovable_work_subdir_reports_system_exit(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "XboxBvhBuilder.dll").write_bytes(b"MZ")
+            work = root / "work"
+            (work / "dxbc").mkdir(parents=True)
+            with mock.patch.object(smoke.shutil, "rmtree", side_effect=PermissionError("locked")):
+                with self.assertRaises(SystemExit) as e:
+                    smoke.translate(root, work, 32768)
+            self.assertIn("cannot reset work folder", str(e.exception))
+
+
 class Cli(unittest.TestCase):
     def test_missing_vk_compute_test(self):
         with tempfile.TemporaryDirectory() as d:
