@@ -82,3 +82,34 @@ complete vehicle assemblies and animated pedestrian assembly remain outside the 
 Status names archives whose manifests are unavailable and counts known decode, recovery and file
 failures. `complete` describes the selected run's scope. A pause or an error leaves it false and
 preserves the ready entries. A deliberate pause exits zero. A reported build failure exits one.
+
+### Retained window parts index
+
+For later map assembly, each windowed import keeps the exporter's manifest and a map from its rows to catalog
+GLBs. They live under `<work>/window-manifests/<archive stem>/<start:020d>-<length:020d>/` (zero-padded decimal
+byte offsets, so a directory listing sorts in archive order), outside the served catalog folder. They are
+written before the window's checkpoint is saved and its OBJ staging is deleted. If writing them fails, the window
+stays partial and is exported again. Rewriting a window replaces the same two files, so reruns leave no duplicates.
+
+- `manifest.json`: the exporter's manifest copied verbatim (`Items` rows with `File`, `Name`, and so on).
+- `catalog-map.json`: written last by atomic replace. A folder without it is unfinished and must be ignored.
+
+```json
+{
+  "version": 1,
+  "kind": "leonida-window-parts",
+  "source": {"archive": "levels.rpf", "size": 76000000000, "mtime_ns": 0},
+  "window": {"start": 0, "length": 268435456},
+  "manifest": {"file": "manifest.json", "sha256": "<hex of manifest.json>"},
+  "models": [
+    {"file": "<manifest File>", "name": "<manifest Name>", "category": "props|ped-parts|vehicles",
+     "status": "ready|skipped|duplicate|failed", "glb": "<catalog-relative URL path or null>"}
+  ]
+}
+```
+
+`glb` is set only for `ready` and is the same URL-encoded relative path that `catalog.json` uses for `model`.
+`skipped` is a fragment bounds grid, placeholder or empty row, and `duplicate` is a later row sharing an earlier
+row's `File` in the same window. A consumer should check `source` against the archive and `manifest.sha256`
+against the file. Rows that fail conversion keep the window out of the checkpoint, so every checkpointed window's
+map has no `failed` rows. These files describe drawable models only; placement joins come from other data.

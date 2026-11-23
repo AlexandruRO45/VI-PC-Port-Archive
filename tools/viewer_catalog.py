@@ -321,6 +321,7 @@ class Catalog:
         self.new = 0
         self.attempts = 0
         self.skip: set[Path] = set()
+        self.capture: list | None = None
         self.windows: dict[str, dict] = {}
         self.prior = self.prior_assets()
 
@@ -494,23 +495,32 @@ class Catalog:
         if bounds_grid or placeholder(name) or row.get("Verts") == 0 or row.get("Tris") == 0:
             self.blocked.update((converted, imported, *legacy_paths))
             self.notes["fragment or empty rows skipped"] += 1
+            self.note_row(filename, name, group, "skipped", None)
             return
         model_key = os.path.normcase(filename)
         if model_key in seen:
             self.notes["rows sharing an exported filename"] += 1
+            self.note_row(filename, name, group, "duplicate", None)
             return
         seen.add(model_key)
         legacy = next((candidate for candidate in legacy_paths if candidate in self.models and maybe_glb(candidate)), None)
         if legacy is not None:
             self.models[legacy] = Model(source, legacy, name, group)
+            self.note_row(filename, name, group, "row", legacy)
             self.blocked.update((converted, imported))
         elif glb.is_file() and not linked(glb) and maybe_glb(glb):
             self.models[imported] = Model(glb, imported, name, group)
+            self.note_row(filename, name, group, "row", imported)
             self.blocked.add(converted)
         else:
             self.models[converted] = Model(source, converted, name, group)
+            self.note_row(filename, name, group, "row", converted)
             if glb.is_file():
                 self.blocked.add(imported)
+
+    def note_row(self, filename: str, name: str, group: str, status: str, destination: Path | None) -> None:
+        if self.capture is not None:
+            self.capture.append((filename, name, group, status, destination))
 
     def register(self, model: Model) -> None:
         entry = {
@@ -606,6 +616,58 @@ def check_window_manifest(manifest: Path, source: Path, start: int, length: int)
                       f"manifest says {found} for {named!r}")
 
 
+INDEX_DIR = "window-manifests"
+INDEX_NAME = re.compile(r"\d{20}-\d{20}")
+
+
+def retain_window(catalog: Catalog, work: Path, relative: str, identity: dict, start: int, length: int,
+                  manifest: Path, rows: list) -> None:
+    """Publish the exporter manifest and the model -> catalog GLB map under <work>/window-manifests.
+
+    The folder is `<work>/window-manifests/<archive stem>/<start:020d>-<length:020d>/`, outside the served catalog.
+    `manifest.json` goes first and `catalog-map.json`, which carries its SHA-256, last, each by atomic replace: a
+    folder without `catalog-map.json` is unfinished and a rerun overwrites the same files, so there are no duplicates.
+    See docs/viewer_catalog.md for the schema."""
+    base = work / INDEX_DIR
+    folder = base / Path(relative).stem / f"{start:020d}-{length:020d}"
+    for parent in (base, base / Path(relative).stem):
+        if parent.exists() and (linked(parent) or parent.resolve() != parent):
+            raise OSError(f"refusing linked window index folder {parent}")
+    if not INDEX_NAME.fullmatch(folder.name) or not folder.resolve().is_relative_to(work.resolve()):
+        raise OSError(f"refusing window index folder {folder}")
+    folder.mkdir(parents=True, exist_ok=True)
+    safe_destination(folder, base)
+    digest = hashlib.sha256()
+
+    def copy(f):
+        with manifest.open("rb") as data:
+            for block in iter(lambda: data.read(1 << 20), b""):
+                digest.update(block)
+                f.write(block)
+
+    free_space(folder, 0, manifest.stat().st_size * 3)
+    for name in ("manifest.json", "catalog-map.json"):
+        safe_destination(folder / name, folder)
+    atomic_write(folder / "manifest.json", copy)
+    models = []
+    for filename, name, group, status, destination in rows:
+        if status == "row":
+            status = "ready" if destination in catalog.entries else "failed"
+        models.append({
+            "file": filename, "name": name, "category": group, "status": status,
+            "glb": relative_url(destination, catalog.out) if status == "ready" else None,
+        })
+    document = {
+        "version": 1, "kind": "leonida-window-parts",
+        "source": {"archive": relative, "size": identity["size"], "mtime_ns": identity["mtime_ns"]},
+        "window": {"start": start, "length": length},
+        "manifest": {"file": "manifest.json", "sha256": digest.hexdigest()},
+        "models": models,
+    }
+    atomic_write(folder / "catalog-map.json",
+                 lambda f: f.write((json.dumps(document, ensure_ascii=True, indent=1) + "\n").encode()))
+
+
 def release(folder: Path, root: Path) -> None:
     """Delete one owned window staging folder: exactly <root>/<start>-<length>, root = <exports>/windows/<stem>."""
     if (folder.parent != root or not re.fullmatch(r"\d+-\d+", folder.name) or root.parent.name != "windows"
@@ -661,6 +723,7 @@ def export_windows(catalog: Catalog, args, relative: str, source: Path, work: Pa
             if not manifest.is_file():
                 raise OSError(f"rpf9dump did not publish a manifest for {source.name} window {start}")
             check_window_manifest(manifest, source, start, length)
+            catalog.capture = []
             catalog.manifest(manifest, folder, windowed=True)
         except SpaceError as exc:
             catalog.issue("archives deferred for free space", f"{relative} window {start}: {exc}")
@@ -673,6 +736,13 @@ def export_windows(catalog: Catalog, args, relative: str, source: Path, work: Pa
             return False
         if catalog.errors != failures:
             continue
+        try:
+            retain_window(catalog, work, relative, identity, start, length, manifest, catalog.capture)
+        except OSError as exc:
+            catalog.issue("window index not retained", f"{relative} window {start}: {exc}")
+            continue
+        finally:
+            catalog.capture = None
         record["completed"] = sorted({*record["completed"], start})
         catalog.publish(f"Window {start}+{length} of {relative} converted.")
         catalog.save_windows()

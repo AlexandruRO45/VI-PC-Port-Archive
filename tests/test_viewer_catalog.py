@@ -236,6 +236,40 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(self.catalog()["status"]["complete"])
         self.assertEqual(len(self.catalog()["assets"]), 4)
 
+    def test_windowed_import_retains_manifest_and_glb_map_without_duplicates(self):
+        game, calls, patcher = self.window_setup()
+        index = self.work / "window-manifests" / "levels"
+        with patcher:
+            self.assertEqual(self.windowed(game), 0)
+            names = sorted(p.name for p in index.iterdir())
+            self.assertEqual(names, [f"{n:020d}-{min(2**20, 3 * 2**20 - 5 - n):020d}" for n in (0, 2**20, 2 * 2**20)])
+            document = json.loads((index / names[1] / "catalog-map.json").read_text())
+            self.assertEqual(document["window"], {"start": 2**20, "length": 2**20})
+            self.assertEqual(document["source"]["archive"], "levels.rpf")
+            self.assertEqual(document["source"]["size"], 3 * 2**20 - 5)
+            import hashlib
+            raw = (index / names[1] / "manifest.json").read_bytes()
+            self.assertEqual(document["manifest"]["sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(json.loads(raw)["Scan"]["Start"], 2**20)
+            self.assertEqual({m["status"] for m in document["models"]}, {"ready"})
+            self.assertTrue(all((self.out / unquote(m["glb"])).is_file() for m in document["models"]))
+            self.assertFalse(list(self.out.rglob("catalog-map.json")))
+            before = {p: p.read_bytes() for p in index.rglob("*") if p.is_file()}
+            (self.out / ".window-state.json").unlink()  # force every window to be processed again
+            self.assertEqual(self.windowed(game), 0)
+        self.assertEqual({p: p.read_bytes() for p in index.rglob("*") if p.is_file()}, before)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(self.catalog()["assets"]), 6)
+
+    def test_failed_retention_blocks_checkpoint_and_release(self):
+        game, calls, patcher = self.window_setup(2)
+        with patcher, patch.object(viewer_catalog, "retain_window", side_effect=OSError("synthetic")):
+            self.assertEqual(self.windowed(game), 1)
+        self.assertFalse((self.out / ".window-state.json").exists())
+        self.assertTrue(list((self.work / "rpf9dump-models").rglob("*.obj")))
+        self.assertFalse((self.work / "window-manifests").exists())
+        self.assertIn("window index not retained", self.catalog()["status"]["message"])
+
     def test_exporter_ignoring_window_is_rejected_before_models_or_checkpoint(self):
         game, calls, patcher = self.window_setup(2, ignore=True)
         with patcher:
