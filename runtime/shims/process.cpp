@@ -12,8 +12,8 @@
 //     quick_exit(), ExitProcess() and abort() do not. _cexit() runs it and returns, _c_exit() returns. A second
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
 //     CRT's exit lock. at_quick_exit() registrations have a separate table, run only by quick_exit(), newest first.
-//     Not covered yet: the thread-local destructor callback (_register_thread_local_exe_atexit_callback), which
-//     still reaches the host CRT.
+//     The EXE's thread-local destructor callback runs on the exiting thread before atexit during full cleanup
+//     (exit and _cexit). Not covered yet: PE TLS process-detach callbacks during immediate termination.
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
@@ -100,9 +100,11 @@ std::string narrow(const std::wstring& w) {
 // ---- the game's normal and quick-exit tables
 using AtexitFn = void(__cdecl*)();
 using OnexitFn = int(__cdecl*)();
+using TlsExitFn = void(__stdcall*)(void*, unsigned long, void*);
 std::mutex g_atexit_lock;
 std::vector<AtexitFn> g_atexit;
 std::vector<AtexitFn> g_at_quick_exit;
+std::atomic<TlsExitFn> g_thread_local_exit_callback{nullptr};
 std::atomic<DWORD> g_exiting_thread{0};
 
 bool register_exit_handler(std::vector<AtexitFn>& handlers, AtexitFn fn) {
@@ -157,9 +159,15 @@ bool take_exit_lock() {
     }
     return false;
 }
-// exit(): the game's handlers and static destructors, then the end of the run.
+// Full CRT cleanup destroys this thread's thread_local objects before atexit/static destructors. Keep the callback
+// registered: after _cexit returns, newly initialized thread_local objects still need destruction at the next cleanup.
+void run_full_exit_handlers() {
+    if (const auto callback = g_thread_local_exit_callback.load()) callback(nullptr, DLL_PROCESS_DETACH, nullptr);
+    run_exit_handlers(g_atexit);
+}
+// exit(): the game's thread-local objects, handlers and static destructors, then the end of the run.
 void __cdecl game_exit(int code) {
-    if (take_exit_lock()) run_exit_handlers(g_atexit);
+    if (take_exit_lock()) run_full_exit_handlers();
     end_run(code);
 }
 // quick_exit(): only the quick-exit table, without static destructors or the normal atexit table.
@@ -174,7 +182,7 @@ void __cdecl game_immediate_exit(int code) {
 }
 // _cexit() runs the handlers and flushes the streams, then returns; _c_exit() only returns.
 void __cdecl game_cexit() {
-    run_exit_handlers(g_atexit);
+    run_full_exit_handlers();
     std::fflush(nullptr);
 }
 void __cdecl game_c_exit() {}
@@ -191,6 +199,12 @@ void __cdecl game_abort() {
         if (previous != SIG_DFL && previous != SIG_IGN) std::raise(SIGABRT);
     }
     end_run(3);  // the CRT's abort exit code
+}
+
+void __cdecl game_register_thread_local_exit(TlsExitFn callback) {
+    TlsExitFn expected = nullptr;
+    // The UCRT permits one non-null registration per EXE and terminates on a second one.
+    if (!g_thread_local_exit_callback.compare_exchange_strong(expected, callback)) game_abort();
 }
 
 // ---- arguments
@@ -309,6 +323,7 @@ int run_entry(void* entry, size_t stack_bytes) {
         g_atexit.clear();  // a run never sees the handlers of an earlier one
         g_at_quick_exit.clear();
     }
+    g_thread_local_exit_callback = nullptr;
     g_exiting_thread = 0;
     g_exited = false;
     g_exit_code = 0;
@@ -354,6 +369,7 @@ using namespace rt::process;
     {dll, "quick_exit", reinterpret_cast<void*>(&game_quick_exit)}, \
     {dll, "_crt_atexit", reinterpret_cast<void*>(&game_crt_atexit)}, \
     {dll, "_crt_at_quick_exit", reinterpret_cast<void*>(&game_crt_at_quick_exit)}, \
+    {dll, "_register_thread_local_exe_atexit_callback", reinterpret_cast<void*>(&game_register_thread_local_exit)}, \
     {dll, "_cexit", reinterpret_cast<void*>(&game_cexit)}, {dll, "_c_exit", reinterpret_cast<void*>(&game_c_exit)}, \
     {dll, "abort", reinterpret_cast<void*>(&game_abort)}, {dll, "__p___argc", reinterpret_cast<void*>(&game_p_argc)}, \
     {dll, "__p___argv", reinterpret_cast<void*>(&game_p_argv)}, \

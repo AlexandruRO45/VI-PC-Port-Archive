@@ -280,8 +280,12 @@ have a separate table, run only by `quick_exit`, newest first; both tables are c
 `run_tiny_atexit` runs a stand-in
 program natively and through `--run` for each of those paths (and for `_exit` from a second thread during `exit`) and
 holds both to the Windows sequence, including quick-exit handlers and `_cexit` followed by `quick_exit` (under Wine,
-whose CRT differs, a native difference is only reported). Not covered yet: the thread-local destructor callback
-(`_register_thread_local_exe_atexit_callback`), which still reaches the host CRT.
+whose CRT differs, a native difference is only reported).
+The EXE's thread-local destructor callback (`_register_thread_local_exe_atexit_callback`) belongs to the run too:
+`exit` and `_cexit` invoke it on the calling thread before `atexit` and static destructors. `run_tiny_tls_exit` compares
+genuine C++ `thread_local` destruction with native Windows, including a worker calling `exit` and new objects after
+`_cexit`. Not covered yet: PE TLS process-detach callbacks during immediate termination (`_exit`, `_Exit`,
+`quick_exit`, `ExitProcess`).
 `run_tiny_frame` does it with a stand-in that imports `d3d12_xs.dll!D3D12XboxCreateDevice` and, with
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks

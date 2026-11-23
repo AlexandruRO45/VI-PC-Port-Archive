@@ -17,6 +17,39 @@
 
 namespace {
 int failures = 0;
+int tls_exit_calls = 0;
+DWORD tls_exit_owner = 0;
+
+void __stdcall tls_exit_callback(void* module, unsigned long reason, void* reserved) {
+    if (module || reason != DLL_PROCESS_DETACH || reserved || GetCurrentThreadId() != tls_exit_owner) {
+        std::fprintf(stderr, "FAIL TLS exit callback arguments or calling thread\n");
+        ++failures;
+    }
+    ++tls_exit_calls;
+}
+
+void check_tls_exit_callback() {
+    using Register = void(__cdecl*)(void(__stdcall*)(void*, unsigned long, void*));
+    using Cleanup = void(__cdecl*)();
+    const auto registration = reinterpret_cast<Register>(
+        rt::shims::find("ucrtbase.dll", "_register_thread_local_exe_atexit_callback"));
+    const auto cleanup = reinterpret_cast<Cleanup>(rt::shims::find("ucrtbase.dll", "_cexit"));
+    const auto no_cleanup = reinterpret_cast<Cleanup>(rt::shims::find("ucrtbase.dll", "_c_exit"));
+    if (!registration || !cleanup || !no_cleanup) return;  // import checks report a missing shim
+    tls_exit_owner = GetCurrentThreadId();
+    registration(tls_exit_callback);
+    no_cleanup();
+    if (tls_exit_calls != 0) {
+        std::fprintf(stderr, "FAIL _c_exit invoked the TLS exit callback\n");
+        ++failures;
+    }
+    cleanup();
+    cleanup();
+    if (tls_exit_calls != 2) {
+        std::fprintf(stderr, "FAIL _cexit must retain the TLS exit callback for later cleanup\n");
+        ++failures;
+    }
+}
 
 wchar_t** wargv() {
     using Fn = wchar_t*** (__cdecl*)();
@@ -79,7 +112,7 @@ void check_import_names() {
     }
     for (const char* dll : {"api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll", "ucrtbased.dll"})
         for (const char* name : {"_get_narrow_winmain_command_line", "_get_wide_winmain_command_line",
-                                 "_crt_at_quick_exit", "quick_exit"})
+                                 "_crt_at_quick_exit", "quick_exit", "_register_thread_local_exe_atexit_callback"})
             if (!rt::shims::find(dll, name)) {
                 std::fprintf(stderr, "FAIL %s!%s is not shimmed\n", dll, name);
                 ++failures;
@@ -207,11 +240,28 @@ int main() {
             using Register = int(__cdecl*)(void(__cdecl*)());
             const auto reg = reinterpret_cast<Register>(rt::shims::find("ucrtbase.dll", "_crt_at_quick_exit"));
             if (!reg || reg(stale_quick_exit_handler) != 0) ExitThread(1);
+            check_tls_exit_callback();
             ExitThread(42);
         };
         const int code = rt::process::run_entry(reinterpret_cast<void*>(exit_thread_entry), 0);
         if (code != 42) {
             std::fprintf(stderr, "FAIL run_entry with ExitThread(42) returned %d, want 42\n", code);
+            ++failures;
+        }
+    }
+
+    // A later run must not inherit the first EXE's TLS destructor callback. ExitThread ends these synthetic entry
+    // points without parking a thread in end_run, so both run_entry calls can be checked in this process.
+    {
+        const int previous_calls = tls_exit_calls;
+        auto cleanup_entry = +[](void*) -> DWORD {
+            using Cleanup = void(__cdecl*)();
+            reinterpret_cast<Cleanup>(rt::shims::find("ucrtbase.dll", "_cexit"))();
+            ExitThread(43);
+        };
+        const int code = rt::process::run_entry(reinterpret_cast<void*>(cleanup_entry), 0);
+        if (code != 43 || tls_exit_calls != previous_calls) {
+            std::fprintf(stderr, "FAIL a later run inherited the previous TLS exit callback\n");
             ++failures;
         }
     }
