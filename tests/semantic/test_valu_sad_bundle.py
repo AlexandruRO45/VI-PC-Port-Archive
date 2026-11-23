@@ -665,5 +665,30 @@ class TestVMqsadU32U8SIMD(unittest.TestCase):
                 self.assertEqual([wave.vgprs[lane][8 + k] for k in range(4)], [0, 0, 0, 0])
 
 
+def run_hw_mqsad_u32_u8(s0_lo: int, s0_hi: int, s1: int, s2_quad: list[int]) -> list[int]:
+    lines = [
+        f"v_mov_b32 v0, {s0_lo & MASK32:#x}",
+        f"v_mov_b32 v1, {s0_hi & MASK32:#x}",
+        f"v_mov_b32 v2, {s1 & MASK32:#x}",
+        f"v_mov_b32 v4, {s2_quad[0] & MASK32:#x}",
+        f"v_mov_b32 v5, {s2_quad[1] & MASK32:#x}",
+        f"v_mov_b32 v6, {s2_quad[2] & MASK32:#x}",
+        f"v_mov_b32 v7, {s2_quad[3] & MASK32:#x}",
+        "v_mqsad_u32_u8 v[8:11], v[0:1], v2, v[4:7]",
+        "exp mrt0 v8, v9, v10, v11 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_mqsad_hw", lines)
+    return support.mrt0_words(spv)
+
+
+class TestVMqsadU32U8HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for v_mqsad_u32_u8."""
+
+    def test_translator_hardware_cases(self):
+        outs = run_hw_mqsad_u32_u8(0x04030201, 0x08070605, 0x01010101, [0, 0, 0, 0])
+        self.assertEqual(outs, [6, 10, 14, 18])
+
+
 if __name__ == "__main__":
     unittest.main()
