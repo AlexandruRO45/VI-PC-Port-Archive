@@ -32,6 +32,9 @@ docs/design.md): the fragmentShaderBarycentric feature, and a driver other than 
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
+driver_name and driver_info are VkPhysicalDeviceDriverProperties.driverName / driverInfo, so a row from a
+hybrid machine (e.g. Mesa ANV's generic 'Intel(R) Graphics (RPL-S)') can say which GPU it was.
+
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
@@ -66,6 +69,9 @@ RDNA1_DEVICE_IDS = (0x7310, 0x7312, 0x7318, 0x7319, 0x731A, 0x731B, 0x731E, 0x73
 RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x1435, 0x1435), (0x1681, 0x1681),
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
+DRIVER_NAME_OFFSET = 20     # driverID (u32 at 16), then driverName[256]
+DRIVER_INFO_OFFSET = 276    # ... and driverInfo[256] after it
+DRIVER_TEXT_SIZE = 256
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
@@ -247,6 +253,11 @@ def query(*, stage_caps=False) -> dict:
             vk.vkGetPhysicalDeviceProperties2(d, props)
             raw = bytes(props)[16:]
             dev_name = raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace")
+            drv_raw = bytes(drv)
+            driver_name = (drv_raw[DRIVER_NAME_OFFSET:DRIVER_NAME_OFFSET + DRIVER_TEXT_SIZE]
+                           .split(b"\0")[0].decode("utf-8", "replace"))
+            driver_info = (drv_raw[DRIVER_INFO_OFFSET:DRIVER_INFO_OFFSET + DRIVER_TEXT_SIZE]
+                           .split(b"\0")[0].decode("utf-8", "replace"))
             version = int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little")
             if version < VK_API_VERSION_1_2 or (wanted and wanted not in dev_name.lower()):
                 continue
@@ -293,7 +304,8 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          driver_name, driver_info)
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -302,7 +314,8 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver,
+         driver_name, driver_info) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -328,6 +341,8 @@ def query(*, stage_caps=False) -> dict:
             "vendor_id": vendor,
             "device_id": device,
             "driver_id": driver,
+            "driver_name": driver_name,
+            "driver_info": driver_info,
             "rdna1_amd_windows": (vendor == AMD_VENDOR_ID and driver == VK_DRIVER_ID_AMD_PROPRIETARY
                                   and device in RDNA1_DEVICE_IDS),
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),

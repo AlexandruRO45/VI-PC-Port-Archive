@@ -71,6 +71,8 @@ class FakeDevice:
     fragment_shader_barycentric: bool = True
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
+    driver_name: str = "NVIDIA"
+    driver_info: str = "621.24"
     vendor_id: int = 0
     device_id: int = 0
 
@@ -208,6 +210,14 @@ class FakeVulkan:
                 sg.requiredSubgroupSizeStages = dev.required_subgroup_size_stages
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES:
                 ctypes.c_uint32.from_address(node_addr + 16).value = dev.driver_id
+                name = dev.driver_name.encode("utf-8") if isinstance(dev.driver_name, str) else dev.driver_name
+                info = dev.driver_info.encode("utf-8") if isinstance(dev.driver_info, str) else dev.driver_info
+                ctypes.memmove(node_addr + vk_info.DRIVER_NAME_OFFSET,
+                               name[:vk_info.DRIVER_TEXT_SIZE].ljust(vk_info.DRIVER_TEXT_SIZE, b"\x00"),
+                               vk_info.DRIVER_TEXT_SIZE)
+                ctypes.memmove(node_addr + vk_info.DRIVER_INFO_OFFSET,
+                               info[:vk_info.DRIVER_TEXT_SIZE].ljust(vk_info.DRIVER_TEXT_SIZE, b"\x00"),
+                               vk_info.DRIVER_TEXT_SIZE)
         if not found_subgroup:
             raise AssertionError("SubgroupProperties missing from vkGetPhysicalDeviceProperties2 pNext chain")
         if not found_sg:
@@ -801,9 +811,24 @@ class QueryTest(unittest.TestCase):
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
+                    "driver_name": "NVIDIA",
+                    "driver_info": "621.24",
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_driver_properties_disambiguate_a_generic_device_name(self):
+        """BUILD-1370: hybrid machines can report the same generic deviceName; driverName/driverInfo tell them apart."""
+        anv = FakeDevice(name="Intel(R) Graphics (RPL-S)", device_type=1, driver_name="Intel Corporation",
+                         driver_info="Mesa 26.2.5 (ANV)")
+        nv = FakeDevice(name="Intel(R) Graphics (RPL-S)", device_type=2, driver_name="NVIDIA",
+                        driver_info="621.24")
+        res, _vk = self._run_query(anv, nv)
+        self.assertEqual(res["device"], "Intel(R) Graphics (RPL-S)")
+        self.assertEqual((res["driver_name"], res["driver_info"]), ("NVIDIA", "621.24"))
+        res, _vk = self._run_query(anv)
+        self.assertEqual((res["driver_name"], res["driver_info"]),
+                         ("Intel Corporation", "Mesa 26.2.5 (ANV)"))
 
     def test_max_push_constants_size(self):
         """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""
