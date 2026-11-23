@@ -522,6 +522,9 @@ def gen_div_sources(rng, op, allow_literal):
     sources = []
     for idx in range(3):
         source = gen_source(rng, idx, allow_literal)
+        # LLVM encodes these hex operands as inline integers. Use decimal so the reference does too.
+        if source.startswith("0x") and (word := int(source, 16)) <= 64:
+            source = str(word)
         # These decimal operands also encode as a literal dword, unlike the other generated floats.
         literal = source.startswith("0x") or source in ("-0.0", "1.5", "3.25")
         if (literal or source.startswith("s[")) and source not in bus_sources:
