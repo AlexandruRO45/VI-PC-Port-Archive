@@ -11,16 +11,34 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <string>
 
 #include "shims.h"
 #include "startup_trace.h"
+
+namespace {
+// Count every allocation made while the test has armed a failure, including during rollback.
+thread_local int fail_at_allocation = -1;
+thread_local int allocation_calls = 0;
+}
+
+_NODISCARD _Ret_notnull_ _Post_writable_byte_size_(size) _VCRT_ALLOCATOR
+void* __CRTDECL operator new(std::size_t size) {
+    if (fail_at_allocation >= 0 && allocation_calls++ == fail_at_allocation) throw std::bad_alloc();
+    if (void* ptr = std::malloc(size ? size : 1)) return ptr;
+    throw std::bad_alloc();
+}
+void __CRTDECL operator delete(void* ptr) noexcept { std::free(ptr); }
+void __CRTDECL operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
 
 namespace {
 
@@ -338,6 +356,66 @@ struct PhysicalApi {
     XMemMapPhysicalPagesScatterFn scatter;
 };
 
+void test_physical_allocation_failure(const PhysicalApi& api) {
+    // Keep one existing page live; return the two after it to the free list. The next batch has to use
+    // both recycled numbers and fresh ones. No other physical-page allocation precedes this test.
+    std::array<uint64_t, 3> seed{};
+    uint64_t count = seed.size();
+    if (!api.allocate(0x280, &count, seed.data()) || !api.free_pages(2, seed.data() + 1)) {
+        check(false, "set up live and recycled physical page numbers");
+        return;
+    }
+
+    using PageBatch = std::array<uint64_t, 12>;
+    PageBatch expected{seed[2], seed[1]};
+    for (size_t i = 2; i < expected.size(); ++i) expected[i] = seed[2] + (i - 1) * 16;
+    PageBatch untouched;
+    untouched.fill(UINT64_MAX);
+    // Try each allocation boundary until the same call succeeds. This also exercises hash-table growth
+    // if the STL needs it, without relying on the order or number of the STL's allocations.
+    for (int after = 0; ; ++after) {
+        auto output = untouched;
+        count = output.size();
+        DWORD handles_before = 0, handles_after = 0;
+        if (!GetProcessHandleCount(GetCurrentProcess(), &handles_before)) {
+            check(false, "can measure section handle lifetime");
+            break;
+        }
+        BOOL ok = FALSE;
+        bool escaped = false;
+        SetLastError(ERROR_SUCCESS);
+        allocation_calls = 0;
+        fail_at_allocation = after;
+        try {
+            ok = api.allocate(0x280, &count, output.data());
+        } catch (const std::bad_alloc&) {
+            escaped = true;
+        }
+        const DWORD error = GetLastError();
+        fail_at_allocation = -1;
+        if (allocation_calls <= after) {
+            check(after > 0 && ok && count == output.size(), "allocation succeeds after sweeping metadata failures");
+            check(output == expected, "retry preserves recycled and fresh page numbering");
+            if (ok) check(api.free_pages(count, output.data()), "can free the entire retried allocation");
+            break;
+        }
+
+        check(!escaped && !ok && error == ERROR_NOT_ENOUGH_MEMORY, "metadata failure returns FALSE and out of memory");
+        check(allocation_calls == after + 1, "rolling back a failed batch needs no further allocation");
+        check(count == 0 && output == untouched, "metadata failure clears the count and preserves every output element");
+        check(GetProcessHandleCount(GetCurrentProcess(), &handles_after) && handles_before == handles_after,
+              "metadata failure leaves no extra section handle");
+        if (escaped || ok) break;
+        bool all_absent = true;
+        for (uint64_t page : expected) {
+            if (api.free_pages(1, &page) || GetLastError() != ERROR_INVALID_PARAMETER) all_absent = false;
+        }
+        check(all_absent, "failed batch leaves no page registered");
+        if (!all_absent) break;
+    }
+    check(api.free_pages(1, seed.data()), "page allocated before a failed batch remains live");
+}
+
 // Physical pages in a 64 KiB-page window, as the measured callers use them: reserve a window, allocate pages, map them,
 // remap them elsewhere and in another order, unmap, free.
 void test_physical_pages(const PhysicalApi& api) {
@@ -475,7 +553,8 @@ void test_placeholders(const PhysicalApi& api) {
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
-void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
+void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc,
+                          XMemAllocatePhysicalPagesFn allocate_pages) {
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
     const std::wstring path =
@@ -487,6 +566,15 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     free_mem(untraced, 0x1111);
 
     check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
+    if (allocate_pages) {
+        // A zero-page request needs no page metadata. Only the first-use trace can allocate here.
+        uint64_t zero = 0;
+        allocation_calls = 0;
+        fail_at_allocation = 0;
+        const BOOL ok = allocate_pages(0x280, &zero, nullptr);
+        fail_at_allocation = -1;
+        check(allocation_calls > 0 && ok && zero == 0, "an exhausted trace allocation still allows a zero-page request");
+    }
     void* a = alloc(4096, 0x5e50000);
     void* b = alloc(8192, 0x5e50000);  // same word again: no second event
     void* c = alloc(16, 0x99);
@@ -706,7 +794,7 @@ int main() {
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
-    test_attribute_trace(alloc, free_mem, virtual_alloc);
+    test_attribute_trace(alloc, free_mem, virtual_alloc, physical.allocate);
     if (transfer) {
         test_transfer_memory(transfer);
         test_transfer_trace(transfer);
@@ -717,6 +805,7 @@ int main() {
     if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
+        test_physical_allocation_failure(physical);
         test_physical_pages(physical);
         test_placeholders(physical);
     }

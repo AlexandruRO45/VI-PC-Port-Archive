@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -236,16 +238,8 @@ struct Window {
     DWORD protect;
 };
 
-struct Section {
-    HANDLE handle;
-    explicit Section(HANDLE h) : handle(h) {}
-    Section(const Section&) = delete;
-    Section& operator=(const Section&) = delete;
-    ~Section() { CloseHandle(handle); }
-};
-
 struct PhysicalPage {
-    std::shared_ptr<Section> section;  // a mapped view holds its own reference to the section
+    std::shared_ptr<void> section;  // owns the section HANDLE; a mapped view holds its own reference
     uint64_t offset;
 };
 
@@ -449,7 +443,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     }
     void* const target = reinterpret_cast<void*>(address);
     if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
-    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
+    void* const view = placeholder_api().map_view3(it->second.section.get(), GetCurrentProcess(), target,
                                                    it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
                                                    protect, nullptr, 0);
     if (!view) return false;
@@ -467,7 +461,7 @@ bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageS
 
 // gta6rt --trace FILE: the first XMemAllocatePhysicalPages for each distinct attribute word goes to the startup trace
 // as an "xmem_physical_pages" event with the page count and the caller.
-void note_physical_attributes(uint64_t attributes, uint64_t count, const void* caller) {
+void note_physical_attributes(uint64_t attributes, uint64_t count, const void* caller) try {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
     static std::set<uint64_t> seen;
@@ -479,6 +473,8 @@ void note_physical_attributes(uint64_t attributes, uint64_t count, const void* c
                              "\"api\":\"XMemAllocatePhysicalPages\",\"attributes\":" +
                                  rt::startup_trace::quote(rt::startup_trace::hex(attributes)) +
                                  ",\"pages\":" + std::to_string(count) + caller_field(caller));
+} catch (const std::bad_alloc&) {
+    // A diagnostic allocation failure can drop the event without changing the result of the page request.
 }
 
 // BOOL XMemAllocatePhysicalPages(attributes, UINT64* pageCount, UINT64* pageArray). Measured at four call sites: RCX is
@@ -513,19 +509,31 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         *page_count = 0;
         return FALSE;
     }
-    const auto section = std::make_shared<Section>(handle);
-    for (uint64_t i = 0; i < count; ++i) {
-        uint64_t slot;
-        if (!g_free_slots.empty()) {
-            slot = g_free_slots.back();
-            g_free_slots.pop_back();
-        } else {
-            slot = g_next_slot++;
+
+    // Keep both slot sources unchanged until every insertion succeeds. Under the mutex the same index
+    // always gives the same page number, including when undoing a partially inserted batch.
+    const uint64_t reused = std::min<uint64_t>(count, g_free_slots.size());
+    const auto page_at = [reused](uint64_t i) {
+        const uint64_t slot = i < reused ? g_free_slots[g_free_slots.size() - 1 - i] : g_next_slot + (i - reused);
+        return slot * kFramesPerPage;
+    };
+    uint64_t inserted = 0;
+    try {
+        // shared_ptr also calls the deleter if it cannot allocate its own control block.
+        const std::shared_ptr<void> section(handle, CloseHandle);
+        for (; inserted < count; ++inserted) {
+            g_pages.emplace(page_at(inserted), PhysicalPage{section, inserted * kPhysicalPageSize});
         }
-        const uint64_t page = slot * kFramesPerPage;
-        g_pages[page] = PhysicalPage{section, i * kPhysicalPageSize};
-        page_array[i] = page;
+    } catch (const std::bad_alloc&) {
+        for (uint64_t i = 0; i < inserted; ++i) g_pages.erase(page_at(i));
+        *page_count = 0;
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
     }
+
+    for (uint64_t i = 0; i < count; ++i) page_array[i] = page_at(i);
+    g_free_slots.resize(g_free_slots.size() - reused);
+    g_next_slot += count - reused;
     return TRUE;
 }
 
