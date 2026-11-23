@@ -361,6 +361,21 @@ class TestSSubbU32Oracle(unittest.TestCase):
         self.assertEqual(ref_s_subb_u32(50, 20, 1), (29, 0))
         self.assertEqual(ref_s_subb_u32(0, 0, 1), (0xFFFFFFFF, 1))
 
+class SSubbU32Expr(ASTNode):
+    def __init__(self, src0: int, src1: int, bin_borrow: int) -> None:
+        self.src0 = src0
+        self.src1 = src1
+        self.bin_borrow = bin_borrow
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_subb_u32(self.src0, self.src1, self.bin_borrow)
+
+
+class TestSSubbU32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SSubbU32Expr(10, 5, 1)
+        self.assertEqual(expr.eval(), (4, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
