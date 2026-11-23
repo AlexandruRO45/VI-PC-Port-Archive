@@ -2343,6 +2343,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         return query_ours_raw(tag_feature.first, tag_feature.second, &init, &out, sizeof(T));
     };
 
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4{};
@@ -2359,6 +2360,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     rt::d3d12::compat::FeatureDataOptions20 o20{};
     rt::d3d12::compat::FeatureDataOptions21 o21{};
 
+    query_ours(std::pair{"OPTIONS", D3D12_FEATURE_D3D12_OPTIONS}, options);
     query_ours(std::pair{"OPTIONS2", D3D12_FEATURE_D3D12_OPTIONS2}, o2);
     query_ours(std::pair{"OPTIONS3", D3D12_FEATURE_D3D12_OPTIONS3}, o3);
     query_ours(std::pair{"OPTIONS4", D3D12_FEATURE_D3D12_OPTIONS4}, o4);
@@ -2419,6 +2421,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         fail("unknown feature unexpectedly answered");
 
     // Local invariants for what this layer actually implements.
+    if (options.PSSpecifiedStencilRefSupported != (info.shader_stencil_export ? TRUE : FALSE))
+        fail("OPTIONS.PSSpecifiedStencilRefSupported did not follow shader_stencil_export");
     if (o2.DepthBoundsTestSupported ||
         o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
         fail("OPTIONS2 unexpected support");
@@ -2480,6 +2484,22 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
             if (FAILED(toggled->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &toggled19, sizeof(toggled19))) ||
                 toggled19.AnisoFilterWithPointMipSupported != (toggled_info.sampler_anisotropy ? TRUE : FALSE))
                 fail("OPTIONS19.AnisoFilterWithPointMipSupported did not follow sampler_anisotropy");
+        }
+    }
+
+    // Verify OPTIONS.PSSpecifiedStencilRefSupported follows VulkanDeviceInfo::shader_stencil_export.
+    {
+        rt::d3d12::VulkanDeviceInfo toggled_info = info;
+        toggled_info.shader_stencil_export = !info.shader_stencil_export;
+        Ref<ID3D12Device> toggled;
+        if (FAILED(rt::d3d12::create_vulkan_device(toggled_info, IID_PPV_ARGS(&toggled.p)))) {
+            fail("failed to create toggled shader_stencil_export device");
+        } else {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS toggled_options{};
+            if (FAILED(toggled->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &toggled_options,
+                                                    sizeof(toggled_options))) ||
+                toggled_options.PSSpecifiedStencilRefSupported != (toggled_info.shader_stencil_export ? TRUE : FALSE))
+                fail("OPTIONS.PSSpecifiedStencilRefSupported did not follow shader_stencil_export");
         }
     }
 
