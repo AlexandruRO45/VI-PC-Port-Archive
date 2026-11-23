@@ -43,7 +43,7 @@ This page collects the setup steps and the problems testers have run into so far
   conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
-  - Windows: the full runtime needs Visual Studio 2022 with "Desktop development with C++" and Windows SDK
+  - Windows: the full runtime needs Visual Studio 2022 or 2026 with "Desktop development with C++" and Windows SDK
     10.0.26100 or newer. Install the Vulkan SDK for the backend headers. The standalone tools also compile with llvm-mingw and the Vulkan headers alone.
     Running the GPU tests needs a Vulkan loader and a compatible driver.
   - Linux: CMake 3.24+, GCC or Clang, and the Vulkan headers and loader. The headers should be recent enough
@@ -53,7 +53,7 @@ This page collects the setup steps and the problems testers have run into so far
 
 ## Build the test programs
 
-Windows, from a "Developer PowerShell for VS 2022" or a plain shell:
+Windows, from a "Developer PowerShell for VS 2022" (or VS 2026) or a plain shell:
 
 ```powershell
 scripts\build_runtime.ps1            # CMake + Ninja into runtime\build
