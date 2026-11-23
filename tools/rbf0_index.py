@@ -245,7 +245,9 @@ def join_resource(rows, index, read, check_gap=True):
     j = index + 1
     while j < len(rows) and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES:
         nxt = rows[j]
-        if rows[j - 1]["size"] != MAX_CHUNK or nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
+        if (rows[j - 1]["size"] != MAX_CHUNK or nxt["size"] > MAX_CHUNK
+                or nxt.get("kind") == "bink2"
+                or nxt["head"][:4] in (MAGIC, b"PSIN")):
             break
         if check_gap and nxt["offset"] > rows[j - 1]["offset"] + rows[j - 1]["stored"] + 16:
             break
@@ -367,6 +369,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
         end = min(size, pos + limit) if limit else size
         span_start = pos
         last, zero, unread = pos, 0, 0
+        in_rbf0_chain = False
         while pos < end:
             match = ZHDR.search(mm, pos, end)
             if not match:
@@ -381,8 +384,9 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 gap_zero, gap_unread = gap_split(mm, last, s)
                 zero += gap_zero
                 unread += gap_unread
-                rows.append({"offset": s, "stored": blen, "size": blen, "head": mm[s:s + 8]})
+                rows.append({"offset": s, "stored": blen, "size": blen, "head": mm[s:s + 8], "kind": "bink2"})
                 last = pos = s + blen
+                in_rbf0_chain = False
                 continue
             d = zlib.decompressobj()
             chunks, p = [], s
@@ -397,7 +401,21 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             except zlib.error:
                 pos = s + 1
                 continue
-            if not d.eof or len(out) < 64:
+            if not d.eof:
+                pos = s + 1
+                continue
+            is_continuation = (
+                in_rbf0_chain
+                and s <= last + 16
+                and 0 < len(out) <= MAX_CHUNK
+                and out[:4] not in (MAGIC, b"PSIN")
+            )
+            is_short_rbf0 = (
+                len(out) < 64
+                and out[:4] == MAGIC
+                and parse_rbf0(out, string_limit=0)["status"] != "bad"
+            )
+            if len(out) < 64 and not is_continuation and not is_short_rbf0:
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
@@ -405,6 +423,15 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             zero += gap_zero
             unread += gap_unread
             rows.append(_row(out, s, used))
+            if out[:4] == MAGIC:
+                in_rbf0_chain = (
+                    len(out) == MAX_CHUNK
+                    and parse_rbf0(out, string_limit=0)["status"] == "truncated"
+                )
+            elif is_continuation:
+                in_rbf0_chain = (len(out) == MAX_CHUNK)
+            else:
+                in_rbf0_chain = False
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)

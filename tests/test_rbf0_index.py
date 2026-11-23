@@ -234,6 +234,82 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(summary["streams"], 2)
         self.assertGreater(summary["readable_fraction"], 0.5)
 
+    def test_archive_keeps_short_standalone_rbf0_below_64_bytes(self):
+        blob = narrow_blob()
+        self.assertLess(len(blob), 64)
+        path = os.path.join(self.root, "short_rbf0.rpf")
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        # A short non-RBF0 zlib stream must still be ignored, while a valid short RBF0 stream is kept.
+        body = zlib.compress(b"noise" * 4) + bytes(16) + zlib.compress(blob) + bytes(16)
+        with open(path, "wb") as f:
+            f.write(header + body)
+        rows, records, summary = rbf0_index.scan_rpf(path)
+        self.assertEqual(summary["streams"], 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["chunks"], 1)
+        self.assertEqual(records[0]["size"], len(blob))
+        self.assertEqual(records[0]["status"], "ok")
+        self.assertEqual(records[0]["root"], "TestRoot")
+
+    def test_archive_join_keeps_short_final_continuation_chunk(self):
+        for full_chunks, tail_len in ((1, 18), (2, 10)):
+            with self.subTest(full_chunks=full_chunks, tail_len=tail_len):
+                hdr = bytearray(WIDE)
+                hdr += _open(0, b"ShortTailRoot")
+                target_total = full_chunks * 65536 + tail_len
+                # Text record header is 6 bytes (\xfd\xff + u32 len), closing tag is 2 bytes (\xff\xff).
+                text_len = target_total - len(hdr) - 6 - 2
+                blob = bytes(hdr) + b"\xfd\xff" + struct.pack("<I", text_len) + (b"a" * (text_len - 1) + b"\x00") + b"\xff\xff"
+                self.assertEqual(len(blob), target_total)
+                parts = [blob[i:i + 65536] for i in range(0, len(blob), 65536)]
+                self.assertEqual(len(parts), full_chunks + 1)
+                self.assertEqual(len(parts[-1]), tail_len)
+
+                path = os.path.join(self.root, f"short_tail_{full_chunks}.rpf")
+                header = bytearray(0x100)
+                header[:4] = b"9FPR"
+                struct.pack_into("<I", header, 4, len(header))
+                body = bytearray()
+                for part in parts:
+                    body += zlib.compress(part)
+                    body += bytes(4)  # within the 16-byte alignment gap
+                with open(path, "wb") as f:
+                    f.write(header + body)
+                rows, records, summary = rbf0_index.scan_rpf(path)
+                self.assertEqual(summary["streams"], full_chunks + 1)
+                self.assertEqual(summary["unread_bytes"], 0)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["chunks"], full_chunks + 1)
+                self.assertEqual(records[0]["size"], len(blob))
+                self.assertEqual(records[0]["status"], "ok")
+                self.assertEqual(records[0]["root"], "ShortTailRoot")
+
+    def test_archive_join_stops_before_following_bink2_stream(self):
+        # A truncated 64 KiB RBF0 chunk immediately followed by a <= 64 KiB Bink2 video stream
+        # must not pass raw Bink2 bytes to ArchiveReader.read() / zlib.decompress().
+        trunc_rbf0 = large_blob()[:65536]
+        bink_len = 256
+        bink = bytearray(bink_len)
+        bink[0:4] = b"KB2i"
+        struct.pack_into("<I", bink, 4, bink_len - 8)
+        struct.pack_into("<II", bink, 0x14, 640, 360)
+
+        path = os.path.join(self.root, "rbf0_then_bink2.rpf")
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        body = zlib.compress(trunc_rbf0) + bytes(4) + bytes(bink) + bytes(16)
+        with open(path, "wb") as f:
+            f.write(header + body)
+        rows, records, summary = rbf0_index.scan_rpf(path)
+        self.assertEqual(summary["streams"], 2)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["chunks"], 1)
+        self.assertEqual(records[0]["status"], "truncated")
+        self.assertEqual(records[0]["root"], "BigRoot")
+
     def test_single_stream_directory(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
