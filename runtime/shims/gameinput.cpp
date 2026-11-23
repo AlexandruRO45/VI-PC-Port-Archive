@@ -2160,7 +2160,7 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     }
     // An effect that played the length GameInput gave it is over, as the API says of a finished effect. The run is
     // forgotten so that a second SetState(Running) starts it again instead of expiring at once.
-    if (!endless_ && run_for_ && now >= run_at_ + run_for_) {
+    if (!endless_ && run_for_ && now - run_at_ >= run_for_) {
         if (sdl_running_) {
             haptics().stop_effect(d->haptic, sdl_effect_);
             sdl_running_ = false;
@@ -2192,8 +2192,13 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
         note_effect(d, sdl_effect_, false);
         return;
     }
-    // GameInput's playCount 0 means "until stopped", which is what SDL's 0 iterations means.
-    const uint32_t iterations = endless ? 0 : play_count(params);
+    // SDL counts plays: SDL_RunHapticEffect documents SDL_HAPTIC_INFINITY, not 0, as "repeat forever", and SDL's
+    // Linux backend writes the count as the EV_FF value, where 0 stops the effect. SDL 3.4 maps SDL_HAPTIC_INFINITY
+    // to DirectInput's INFINITE and macOS's FF_INFINITE and clamps it to INT_MAX on evdev. So an effect with no
+    // duration is one kHapticHoldMs play that the poll thread re-runs every kRumbleRefreshUs, and GameInput's
+    // playCount 0 ("until stopped") is SDL_HAPTIC_INFINITY.
+    const uint32_t count = play_count(params);
+    const uint32_t iterations = endless ? 1u : count ? count : SDL_HAPTIC_INFINITY;
     if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
         note_effect(d, sdl_effect_, false);
         return;
@@ -2203,7 +2208,12 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     applied_ = version;
     endless_ = endless;
     run_at_ = now;
-    run_for_ = endless || iterations == 0 ? 0 : static_cast<uint64_t>(length_ms) * 1000ull * iterations;
+    // length_ms is 1..86,400,000 here, so the product overflows past about 2.1e8 plays: saturate it rather than let
+    // it wrap to a short run that expires early.
+    const uint64_t length_us = static_cast<uint64_t>(length_ms) * 1000ull;
+    run_for_ = endless || iterations == SDL_HAPTIC_INFINITY ? 0
+               : iterations > UINT64_MAX / length_us    ? UINT64_MAX
+                                                        : length_us * iterations;
 }
 
 // ---- IGameInputDispatcher ----

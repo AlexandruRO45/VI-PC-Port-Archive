@@ -1375,8 +1375,10 @@ void test_force_feedback(IGameInput* input) {
           "force feedback: the output state reports the effect SDL created and is running");
     check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.level == 16384,
           "force feedback: a constant 0.5 becomes SDL_HAPTIC_CONSTANT level 16384");
-    check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == 0,
-          "force feedback: no duration in GameInput is SDL's 60 s hold, run until stopped");
+    // SDL counts plays and documents SDL_HAPTIC_INFINITY, not 0, as "repeat forever" (0 is a stop on evdev), so the
+    // hold is one 60 s play that the poll thread re-runs every 20 s.
+    check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == 1,
+          "force feedback: no duration in GameInput is SDL's 60 s hold, played once and re-run by the poll thread");
     rt::gameinput::poll();
     check(g_fake.runs == runs0 + 1, "force feedback: an unchanged effect is not re-sent every poll");
 
@@ -1441,6 +1443,20 @@ void test_force_feedback(IGameInput* input) {
     rt::gameinput::poll();
     check(effect->GetState() == GameInputFeedbackStopped && g_fake.stops >= 1,
           "force feedback: an effect that ran its duration reports stopped");
+
+    // playCount 0 is GameInput's "until stopped": SDL_HAPTIC_INFINITY, never SDL's 0 plays, and the effect does not
+    // expire after one length.
+    wave.data.sineWave.envelope.playCount = 0;
+    effect->SetState(GameInputFeedbackRunning);
+    check(effect->SetParams(&wave), "force feedback: SetParams for a wave played until stopped");
+    rt::gameinput::poll();
+    check(g_fake.last.periodic.length == 100 && g_fake.last_iterations == SDL_HAPTIC_INFINITY,
+          "force feedback: playCount 0 is SDL_HAPTIC_INFINITY iterations");
+    const int runs_forever = g_fake.runs, stops_forever = g_fake.stops;
+    Sleep(130);
+    rt::gameinput::poll();
+    check(effect->GetState() == GameInputFeedbackRunning && g_fake.stops == stops_forever && g_fake.runs == runs_forever,
+          "force feedback: an effect played until stopped is still running after its length, and not re-sent");
 
     // A condition effect: coefficients, saturations, dead zone and centre.
     GameInputForceFeedbackParams spring{};

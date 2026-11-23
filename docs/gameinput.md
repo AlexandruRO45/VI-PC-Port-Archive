@@ -195,9 +195,14 @@ effect for another axis is played on this one, not dropped.
 `IGameInputForceFeedbackEffect::SetGain` scales that one effect's levels. Both are clamped to 0..1.
 - The envelope: attack and release become SDL's `attack_length` and `fade_length` with the gains as their levels,
 `sustainGain` scales the magnitude, attack + sustain + release is SDL's `length`, and `playCount` is the iteration count,
-where 0 is "until stopped". No duration at all is a 60 s SDL length re-run every 20 s — the same refresh the rumble
-motors get — so an effect with no end keeps playing without being restarted every poll. An effect that plays its
-length reports `GameInputFeedbackStopped` afterwards.
+where 0 ("until stopped") is `SDL_HAPTIC_INFINITY`. SDL counts plays, and its `SDL_RunHapticEffect` documentation
+names `SDL_HAPTIC_INFINITY`, not 0, as "repeat forever": in SDL 3.4 the DirectInput backend turns only that value into
+`INFINITE` and passes any other count to `Start` as it is (DirectInput defines only 1 and `INFINITE`; what `Start(0)`
+does is not measured), macOS turns it into `FF_INFINITE`, and the Linux backend writes the count as the `EV_FF`
+value, where 0 stops the effect (it clamps `SDL_HAPTIC_INFINITY` to `INT_MAX`). No duration at all is one 60 s SDL
+play (1 iteration) re-run every 20 s — the same refresh the rumble motors get — so an effect with no end keeps
+playing without being restarted every poll. An effect that plays its length reports `GameInputFeedbackStopped`
+afterwards.
 - An all-zero envelope (what a title that only sets a magnitude leaves behind) means "no envelope", not silence, so
 the effect plays at its own magnitude rather than at gain 0.
 - A new effect starts `GameInputFeedbackRunning`: `CreateForceFeedbackEffect` already carried its parameters, and the
