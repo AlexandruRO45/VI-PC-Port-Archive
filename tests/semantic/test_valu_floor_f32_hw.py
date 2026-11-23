@@ -352,5 +352,40 @@ class TestVFloorF32SIMDDivergence(unittest.TestCase):
             expected = to_u32(-float(i) - 1.0)
             self.assertEqual(lane.vgprs[2], expected)
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestVFloorF32Aliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self):
+        """v_floor_f32 v1, v1: in-place floor modification."""
+        state = LaneRegisterState()
+        # +3.9 -> +3.0
+        state.vgprs[1] = to_u32(3.9)
+
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=1),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.vgprs[1], to_u32(3.0))
+
+    def test_unrelated_registers_unaffected(self):
+        state = LaneRegisterState()
+        state.vgprs[1] = to_u32(5.5)
+        state.vgprs[2] = 0x1234_5678
+        state.vgprs[3] = 0x8765_4321
+
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=2),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.vgprs[2], to_u32(5.0))
+        self.assertEqual(state.vgprs[1], to_u32(5.5))  # source unchanged
+        self.assertEqual(state.vgprs[3], 0x8765_4321) # unrelated unchanged
+
 if __name__ == "__main__":
     unittest.main()
