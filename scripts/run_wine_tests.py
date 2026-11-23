@@ -265,7 +265,9 @@ def main() -> int:
             results[name] = status
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":
-                for line in detail.rstrip().splitlines()[-40:]:
+                # Keep the runner's diagnostic above the capped child output.
+                lines = detail.rstrip().splitlines()
+                for line in lines[:1] + lines[1:][-40:]:
                     print(f"    {line}")
 
     missing = [n for n in args.require if n not in results]

@@ -418,6 +418,20 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("[FAIL] bad", out)
 
+    def test_failure_reason_survives_a_long_output_tail(self) -> None:
+        (self.artifact / "long.py").write_text(
+            "for i in range(42):\n    print(f'child {i:02d}')\nraise SystemExit(7)\n",
+            encoding="utf-8",
+        )
+        entries = [ctest_entry("long", self.command("long.py"))]
+        for args, expected in (((), 0), (("--require", "long"), 1)):
+            with self.subTest(args=args):
+                code, out, _ = self.run_main(entries, *args)
+                self.assertEqual(code, expected)
+                self.assertIn("[FAIL] long\n    exit 7 in ", out)
+                child_lines = [line.strip() for line in out.splitlines() if line.startswith("    child ")]
+                self.assertEqual(child_lines, [f"child {i:02d}" for i in range(2, 42)])
+
     def test_the_summary_table_is_appended(self):
         summary = self.root / "summary.md"
         code, _, _ = self.run_main([ctest_entry("ok", self.command("ok.py")), ctest_entry("bad", self.command("bad.py"))],
