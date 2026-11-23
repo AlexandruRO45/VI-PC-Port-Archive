@@ -930,11 +930,11 @@ void test_headers_and_reloc_tail_bounds() {
 }
 
 void test_oversized_file_is_rejected() {
-    std::printf("\\n--- PE file size limit ---\\n");
+    std::printf("\n--- PE file size limit ---\n");
     const auto path = g_temp_dir / "oversized_pe.bin";
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
-        check_condition(false, "create oversized sparse PE fixture");
+        check_condition(false, "create oversized PE fixture");
         return;
     }
     LARGE_INTEGER size{};
