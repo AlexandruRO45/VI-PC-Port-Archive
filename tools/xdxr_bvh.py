@@ -26,6 +26,7 @@ Usage: `python -I tools/xdxr_bvh.py --help` lists the options.
 """
 import argparse
 import math
+import os
 import random
 import struct
 import sys
@@ -1042,6 +1043,11 @@ def main(argv=None):
     if a.cmd == "check-build":
         if a.rays < 1:
             ap.error("--rays must be at least 1")
+        if not os.path.isdir(a.dir):
+            # A folder that is not there is a mistyped or removed path, not a build that wrote no cases: the 77 skip
+            # below would report it as the build step's own decision.
+            print(f"ERROR: {a.dir} is not a folder", file=sys.stderr)
+            return 2
         if not _case_names(a.dir):
             print(f"no cases in {a.dir}: skipped (the build step skipped or did not run)")
             return 77                                   # ctest SKIP_RETURN_CODE
