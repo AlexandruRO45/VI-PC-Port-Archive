@@ -46,5 +46,39 @@ class BufferFormatFuzzFormatsTests(unittest.TestCase):
             tool.select_formats("not_a_format")
 
 
+class BufferFormatFuzzBlankSlotsTests(unittest.TestCase):
+    """A blank slot between commas names no format: like every other comma-list parser in tools/
+    (bcpack_history_calib.parse_codecs, buffer_store_probe.parse_waves) it is dropped, and a spec
+    that held nothing but commas is a usage error -- not "unknown format ''"."""
+
+    def test_blank_slots_give_the_same_selection_as_the_plain_list(self):
+        tool = load_tool()
+        want = tool.select_formats("56")
+        for spec in ("56,", ",56", "56,,", " 56 ", "56, ,"):
+            self.assertEqual(tool.select_formats(spec), want, spec)
+
+    def test_a_trailing_comma_is_not_a_usage_error(self):
+        proc = run("--oracle", "hw", "--formats", "8_8_8_8_UNORM,")
+        self.assertNotEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertNotIn("unknown format", proc.stderr)
+
+    def test_a_spec_of_only_commas_is_a_usage_error_before_the_oracle(self):
+        proc = run("--oracle", "hw", "--formats", ",,")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--formats must not be empty", proc.stderr)
+        self.assertNotIn("hardware oracle", proc.stdout + proc.stderr)
+
+    def test_the_empty_default_and_a_bad_neighbour_still_behave(self):
+        tool = load_tool()
+        # "" is the default: every code the family has (gfx10: all 77, gfx11: the 63 with a GFX11 spelling)
+        self.assertEqual(len(tool.select_formats("")), 63)
+        self.assertEqual(len(tool.select_formats("", "gfx10")), 77)
+        self.assertEqual(tool.select_formats("56,"), [(56, tool.GFX10_NAMES[56])])
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            tool.select_formats(" , ")
+        with self.assertRaisesRegex(ValueError, "unknown format 'nope'"):
+            tool.select_formats("56,nope,")
+
+
 if __name__ == "__main__":
     unittest.main()

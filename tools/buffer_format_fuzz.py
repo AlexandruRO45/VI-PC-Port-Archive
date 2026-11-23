@@ -502,9 +502,14 @@ def select_formats(spec, family="gfx11"):
     codes = {n: c for c, n in GFX10_NAMES.items()}
     if not spec:
         return [(c, n) for c, n in GFX10_NAMES.items() if family == "gfx10" or n in GFX11_CODES]
+    # A blank slot between commas is not a format the user meant to name: drop the empty tokens, as every
+    # other comma-list parser in tools/ does (bcpack_history_calib.parse_codecs, buffer_store_probe.parse_waves),
+    # and refuse a list that held nothing but commas instead of reporting the empty token as an unknown format.
+    tokens = [tok.strip() for tok in spec.split(",") if tok.strip()]
+    if not tokens:
+        raise ValueError("--formats must not be empty; give a GFX10 code (1..77) or name such as 8_8_8_8_UNORM")
     out = []
-    for tok in spec.split(","):
-        tok = tok.strip()
+    for tok in tokens:
         code = int(tok) if tok.isdigit() else codes.get(tok)
         if code not in GFX10_NAMES:
             raise ValueError(f"unknown format {tok!r}; give a GFX10 code (1..77) or name such as 8_8_8_8_UNORM")
