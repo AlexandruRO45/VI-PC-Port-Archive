@@ -190,6 +190,19 @@ class TestCli(unittest.TestCase):
         self.assertEqual(document["blobs"][0]["payload"], "xdat0")
         self.assertEqual(document["blobs"][0]["hardware_stage"], "ngg")
 
+    def test_limit_below_one_is_refused(self):
+        """--limit 0 used to select no file and report an empty run as '0 blobs, errors 0' with exit 0;
+        a negative value cut files off the end of the listing. Both are a usage error now."""
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(2, 3)]))
+            for value in ("0", "-1"):
+                result = subprocess.run([sys.executable, "-I", TOOL, folder, "--limit", value],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, f"--limit {value}: {result.stdout}")
+                self.assertIn("--limit", result.stderr)
+                self.assertIn("at least 1", result.stderr)
+
 
     def test_nothing_readable_is_one_error_line_and_exit_2(self):
         # `0 blobs, errors 1` on its own reads like a successful run, so nothing decoded is a failure.
