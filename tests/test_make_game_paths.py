@@ -18,10 +18,11 @@ sys.path.insert(0, ROOT)
 import make_game
 
 # Fake version manifest with the keys main() reads: its drive-root check uses expected_exe and the file names.
+# The executable's folder (Bin) is in no file name, so only expected_exe makes it one of the dump's top-level entries.
 FAKE_VERSION = {
     "title": "Fake Game",
     "version": "0.0.0.0",
-    "expected_exe": "Content/fake.exe",
+    "expected_exe": "Bin/fake.exe",
     "files": {
         "Content/fake.exe": {"size": 0, "sha256": "0" * 64},
         "MountedContent/fake.rpf": {"size": 0, "sha256": "0" * 64},
@@ -110,6 +111,8 @@ class BuildDestinationTest(unittest.TestCase):
             self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"), rejected=False)
             # Rejected: destination is inside the game dump's own top-level entry
             self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True)
+            # Rejected: destination is inside the executable's folder, known only from expected_exe
+            self.run_build(drive, os.path.join(drive, "Bin", "out"), os.path.join(self.root, "work"), rejected=True)
             # Rejected: destination is the drive root itself
             self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True)
 
