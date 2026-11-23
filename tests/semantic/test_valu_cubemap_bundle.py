@@ -362,5 +362,19 @@ class VCubeTcEdgeCasesTests(unittest.TestCase):
         tc = oracle_cubetc_f32(0.0, 0.0, 1.0)
         self.assertEqual(tc, 0.0)
 
+class VCubeTcTranslatorTests(unittest.TestCase):
+    def test_cubetc_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 1.0",
+            "v_mov_b32 v1, 2.5",
+            "v_mov_b32 v2, 5.0",
+            "v_cubetc_f32 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cubetc_exec", lines)
+        val = u32_to_f32(mrt0_words(spv)[0])
+        self.assertEqual(val, -2.5)  # +Z major: tc = -y = -2.5
+
 if __name__ == "__main__":
     unittest.main()
