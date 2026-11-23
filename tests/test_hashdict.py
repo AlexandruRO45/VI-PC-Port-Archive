@@ -322,6 +322,24 @@ class CarveAndExtraCLITest(unittest.TestCase):
 
         self.out_json = os.path.join(self.dir, "out_hashes.json")
 
+    def test_output_inside_extra_directory_is_not_harvested_on_rerun(self):
+        out = os.path.join(self.extra_dir, "reports", "dictionary.json")
+        args = (self.carve_dir, "--extra", self.extra_dir, "--out", out)
+
+        def generate():
+            result = self.run_tool(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, "rb") as fh:
+                return fh.read()
+
+        first = generate()
+        self.assertIn("model_prop", json.loads(first).values())
+        self.assertEqual(generate(), first)
+        # A legitimate input of the same name in another folder still contributes its stem.
+        with open(os.path.join(self.extra_dir, "dictionary.json"), "wb") as f:
+            f.write(b"")
+        self.assertIn("dictionary", json.loads(generate()).values())
+
     def tearDown(self):
         self.tmp.cleanup()
 

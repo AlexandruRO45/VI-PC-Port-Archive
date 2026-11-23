@@ -4,6 +4,7 @@ Sources: printable runs in carved blobs (selected archives fully; PSO/RBF blobs 
 any extra text/binary files given (e.g. the exe once it arrives: run with --extra path\\to\\exe).
 When multiple names share a hash, the dictionary keeps the lexicographically first spelling.
 The output cannot overwrite an input index, extra file, or harvested blob (including hard-link aliases).
+When --out is inside an --extra directory, its own filename is not a source of names on later runs.
 
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
@@ -167,10 +168,18 @@ def main():
     if missing:
         print(f"WARNING: {len(missing)} carved blobs listed in an index.json could not be read and were skipped "
               f"(first: {missing[0]}). Re-run the carve to get their strings.", file=sys.stderr)
+    output_name = os.path.basename(a.out).casefold()
     for x in a.extra:
         if os.path.isdir(x):
             for root, _, files in os.walk(x):
                 for fn in files:
+                    if output_stat is not None and fn.casefold() == output_name:
+                        # Only stat a matching name; other directories may have a genuine asset named this.
+                        try:
+                            if os.path.samestat(os.stat(os.path.join(root, fn)), output_stat):
+                                continue
+                        except FileNotFoundError:
+                            pass  # a dangling link still contributes its filename
                     strings.add(os.path.splitext(fn)[0])
         elif os.path.isfile(x):
             with open(x, "rb") as f:
