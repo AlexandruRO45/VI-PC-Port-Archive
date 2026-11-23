@@ -409,5 +409,33 @@ class TestVFloorF32ConditionCodes(unittest.TestCase):
         res = v_floor_f32_oracle(to_u32(-10.2))
         self.assertTrue(bool(res & SIGN_BIT32))
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestVFloorF32IEEE754Bitwise(unittest.TestCase):
+    """Unit tests for IEEE 754 edge cases, subnormals, and NaNs."""
+
+    def test_all_denormals_flushed_to_signed_zero(self):
+        # Positive denormals flush to +0.0
+        for mant in (1, 2, 0x400000, 0x7FFFFF):
+            with self.subTest(pos_denorm=hex(mant)):
+                self.assertEqual(v_floor_f32_oracle(mant), 0x0000_0000)
+
+        # Negative denormals flush to -0.0
+        for mant in (1, 2, 0x400000, 0x7FFFFF):
+            with self.subTest(neg_denorm=hex(mant)):
+                self.assertEqual(v_floor_f32_oracle(SIGN_BIT32 | mant), SIGN_BIT32)
+
+    def test_infinities_pass_through(self):
+        self.assertEqual(v_floor_f32_oracle(0x7F80_0000), 0x7F80_0000)
+        self.assertEqual(v_floor_f32_oracle(0xFF80_0000), 0xFF80_0000)
+
+    def test_nans_pass_through_exact_payload(self):
+        qnan = 0x7FC0_1234
+        snan = 0x7F80_0042
+        self.assertEqual(v_floor_f32_oracle(qnan), qnan)
+        self.assertEqual(v_floor_f32_oracle(snan), snan)
+
 if __name__ == "__main__":
     unittest.main()
