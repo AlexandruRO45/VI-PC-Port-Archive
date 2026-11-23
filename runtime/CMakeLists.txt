@@ -125,7 +125,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # GTA6RT_HOST_BASE keeps the loader's own image off the default x64 EXE base (0x140000000), where a mapped EXE
   # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
   set(GTA6RT_HOST_BASE /BASE:0x10000000000)
-  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
+  # BUILD-1457: a thread that asks for no stack size gets the reserve in this program's PE header, 1 MB by default:
+  # a thread the game starts with dwStackSize 0, a thread-pool thread, a std::thread of the shims. The D3D12 shim
+  # creates Vulkan pipelines on the calling thread, the driver compiles there, and AMD's Windows compiler (26.11.2)
+  # overflows 1 MB on some of the game's shaders (docs/pipeline_check.md, "Stack reserve"). run_entry already gives
+  # the entry thread 8 MB (shims/process_shim.h); this is the same number for the others. Keep it in step with
+  # scripts/build_runtime.ps1.
+  set(GTA6RT_STACK 8388608)
+  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
@@ -1051,6 +1058,12 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    # BUILD-1457: the stack a game thread gets. gta6rt_stack reads SizeOfStackReserve from the built loader (nothing
+    # is run); run_tiny_game_stack asks Windows, on the entry thread and on a thread created with dwStackSize 0.
+    add_test(NAME gta6rt_stack COMMAND "${CMAKE_COMMAND}"
+             "-DTOOL=$<TARGET_FILE:gta6rt>" "-DWANT=${GTA6RT_STACK}"
+             -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
+    add_test(NAME run_tiny_game_stack COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 stack)
     # GAME: is the game folder, absolute, when gta6rt is given a bare image name or `--game-dir .`.
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
@@ -1129,6 +1142,19 @@ if(TARGET Vulkan::Headers)
     set_property(TARGET vk_pipeline_check PROPERTY
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   endif()
+  # BUILD-1457: a driver compiles on the thread that creates the pipeline, and its compiler can recurse with the
+  # shader's nesting. On Windows a thread that asks for no size gets the reserve in the PE header, 1 MB by default:
+  # the main thread and every std::thread worker of the checker. AMD's Windows compiler (26.11.2) overflows that
+  # on 26 of the corpus's mesh shaders, and 2 MB is still too little for compute shaders nested deeper than 16
+  # (docs/pipeline_check.md, "Stack reserve"). Keep the number in step with scripts/build_runtime.ps1.
+  set(LEONIDA_PIPELINE_CHECK_STACK 8388608)
+  if(WIN32)
+    if(MSVC)
+      target_link_options(vk_pipeline_check PRIVATE /STACK:${LEONIDA_PIPELINE_CHECK_STACK})
+    else()
+      target_link_options(vk_pipeline_check PRIVATE -Wl,--stack,${LEONIDA_PIPELINE_CHECK_STACK})
+    endif()
+  endif()
   if(BUILD_TESTING)
     if(WIN32)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
@@ -1146,6 +1172,13 @@ if(TARGET Vulkan::Headers)
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
+    if(WIN32)
+      # Reads SizeOfStackReserve from the built file; the program is not run, so it needs no emulator.
+      add_test(NAME vk_pipeline_check_stack COMMAND "${CMAKE_COMMAND}"
+               "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
+               "-DWANT=${LEONIDA_PIPELINE_CHECK_STACK}"
+               -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
+    endif()
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).
@@ -1418,6 +1451,31 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_queue_handover_shared_queue COMMAND d3d12_queue_handover_test --shared-queue)
     set_tests_properties(d3d12_queue_handover_two_queues d3d12_queue_handover_shared_queue PROPERTIES
                          SKIP_RETURN_CODE 77 TIMEOUT 400 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # More D3D12 queues than Vulkan queues: they share VkQueues, keeping fences and Wait-before-Signal (section 4.4).
+    # The _one_queue runs make every GPU look like the Intel UHD 770 (one family, one VkQueue): every queue shares it.
+    add_executable(d3d12_queue_share_test test/d3d12_queue_share_test.cpp)
+    target_link_libraries(d3d12_queue_share_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_queue_share_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_queue_share_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_queue_share COMMAND d3d12_queue_share_test)
+    add_test(NAME d3d12_queue_share_one_queue COMMAND d3d12_queue_share_test)
+    set_tests_properties(d3d12_queue_share d3d12_queue_share_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    add_test(NAME d3d12_queue_wait_one_queue COMMAND d3d12_queue_wait_test)
+    set_tests_properties(d3d12_queue_wait_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(d3d12_queue_share_one_queue d3d12_queue_wait_one_queue PROPERTIES
+                         ENVIRONMENT "LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1;LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1")
+    # A misspelt case or count is refused with the usage line (exit code 2) before a device exists, instead of
+    # passing with nothing run. No GPU needed.
+    set(_share_bad_arguments "case_typo|--case|typo" "iterations_zero|--iterations|0"
+        "iterations_word|--iterations|banana" "iterations_too_many|--iterations|99999999999")
+    foreach(_bad IN LISTS _share_bad_arguments)
+      string(REPLACE "|" ";" _bad "${_bad}")
+      list(POP_FRONT _bad _bad_name)
+      add_test(NAME d3d12_queue_share_rejects_${_bad_name} COMMAND d3d12_queue_share_test ${_bad})
+      set_tests_properties(d3d12_queue_share_rejects_${_bad_name} PROPERTIES TIMEOUT 60
+                           PASS_REGULAR_EXPRESSION "\nusage: d3d12_queue_share_test ")
+    endforeach()
 
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.
@@ -2595,6 +2653,12 @@ if(TARGET Vulkan::Headers)
                  "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" ${_trace_runner})
         set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
+        # The queue test settings are for the tests only: left set, they must not shrink the game's device.
+        add_test(NAME run_tiny_frame_queue_test_settings COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" --queue-test-settings
+                 ${_trace_runner})
+        set_tests_properties(run_tiny_frame_queue_test_settings PROPERTIES SKIP_RETURN_CODE 77)
       endif()
     endif()
 

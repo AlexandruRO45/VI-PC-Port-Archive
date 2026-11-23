@@ -563,11 +563,13 @@ What is implemented (all of it testable without the game):
   submission ends with a barrier to the host, so a readback buffer holds the GPU's writes once the fence wait
   returns. Children hold a reference to the proxy, not
   the inner device, so `GetDevice` always returns the Xbox-ABI object. Each live D3D12 queue leases a distinct
-  graphics-family `VkQueue`; the standalone device requests up to 16. The queues still share a submit lock for
+  `VkQueue` while one is free (its own type's family first, then the graphics family); the standalone device
+  requests up to 16 per family. The queues still share a submit lock for
   replay state, but Wait-before-Signal between them can make progress (D3D-97), and a batch that waits for a Signal
   not yet submitted is held on the CPU so layouts follow dependency order (section 4.4). Caller-owned Vulkan devices can
   supply additional handles through `VulkanDeviceInfo::command_queues`; without them they retain legacy single-queue
-  behavior. When supplied handles are exhausted, `CreateCommandQueue` fails instead of silently sharing a queue.
+  behavior. When every handle is in use, the new D3D12 queue shares the `VkQueue` that has the fewest D3D12 queues
+  (section 4.4, "More D3D12 queues than Vulkan queues"); it used to fail with `E_OUTOFMEMORY`.
   Dedicated compute/transfer
   *families* would also require resource queue-family ownership handling and remain future work.
 
@@ -2664,6 +2666,32 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   The pipeline-state and root-signature pins are covered end to end by `d3d12_m4_compute_test`: the compute list is
   executed while held, its two PSOs and root signature are released and the list is Reset, the copy that releases
   it is submitted, and the output is compared with the CPU (it reads zeros without the pins).
+- **More D3D12 queues than Vulkan queues** (`pick_queue_slot` in `src/queue_families.h`, `CreateCommandQueue`;
+  test `d3d12_queue_share_test`). A GPU can expose fewer `VkQueue`s than a title creates D3D12 queues: the Intel
+  UHD 770 on Windows and lavapipe have one family with `queueCount` 1, so the second D3D12 queue of any type was
+  refused with `E_OUTOFMEMORY` ("no independent Vulkan queue available") and a title with a DIRECT and a COMPUTE
+  queue stopped at boot (PingasMech, #4863). A new D3D12 queue takes an unused `VkQueue` of its own type's family,
+  then of the graphics family, as before (D3D-97: one `VkQueue` per live D3D12 queue while there are enough, so
+  nothing changes on a GPU with enough queues; an RTX 5080 gives 16 graphics, 8 compute and 2 transfer queues); when
+  every one is in use it shares the one with the fewest D3D12 queues (its own family's first on a tie) and logs that
+  once per type. D3D12 queues on one `VkQueue` stay separate objects: each keeps its own batches in order, its own
+  progress timeline and its own held operations. A Wait holds a batch until the target value is satisfied,
+  so a batch cannot block a shared `VkQueue` ahead of the Signal it needs. `vkQueueSubmit`, `vkQueueBindSparse`, `vkQueuePresentKHR`, `vkQueueWaitIdle` and the queue labels
+  need the `VkQueue` externally synchronised; every call the layer makes holds the device's one submit lock
+  (`VulkanContext::submit_mutex`), which covers shared `VkQueue`s as it covers the staging queue the first DIRECT
+  queue already shares. A per-`VkQueue` lock (#3841) must key on the `VkQueue` handle, not the D3D12 queue. Costs on
+  a shared `VkQueue`: `GetClockCalibration` without calibrated timestamps and the destruction of a D3D12 queue wait
+  for the other D3D12 queues' submitted work too, and queue debug labels (`BeginEvent`/`EndEvent`) of the D3D12
+  queues interleave on it. Two test settings make the standalone device look like such a GPU, so the sharing path
+  runs anywhere: `LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N` (at most N `VkQueue`s per family) and
+  `LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1` (COMPUTE and COPY in the graphics family); both together are one family with
+  one queue (`docs/testing.md`, "Choosing the GPU"). Only the test executables apply them: the game's device
+  (`d3d12_xs`, `LEONIDA_D3D12=vulkan`) ignores them and says so, so a variable left in the environment cannot put
+  every queue of the game on one `VkQueue` (`run_tiny_frame_queue_test_settings`).
+  The original queue-sharing tests ran on an RTX 5080 (driver 580.65.06, Wine 11) and on lavapipe with
+  synchronization validation. They passed with the default setup, one queue per family and one shared
+  queue, with a buffer copied through 36 queues in both submission orders and concurrent signals
+  across nine queues. The handover tests cover producer/consumer order, queue teardown and CPU signals.
 - `SetEventOnCompletion` and `SetEventOnMultipleFenceCompletion` track the logical fence value. A null event
   blocks the caller. The device's fence dispatcher handles GPU signals for all fences. A multiple-fence wait
   counts down a shared waiter (1 for `ANY`, the fence count for `ALL`), and the hit that reaches zero completes it.
