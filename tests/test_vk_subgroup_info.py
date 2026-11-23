@@ -49,7 +49,10 @@ class FakeDevice:
 
     name: str | bytes = "Synthetic GPU"
     api_version: int = vk_info.VK_API_VERSION_1_3
-    extension_names: tuple[bytes, ...] = ()
+    extension_names: tuple[bytes, ...] = (
+        vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXT,
+        vk_info.MAINTENANCE_8_EXT,
+    )
     device_type: int = vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
     dynamic_rendering: bool = True
     synchronization2: bool = True
@@ -69,6 +72,7 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    maintenance8: bool = True
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
@@ -250,11 +254,16 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.synchronization2)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR:
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.maintenance8)
         expected = {
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
         }
+        if vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXT in dev.extension_names:
+            expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
+        if vk_info.MAINTENANCE_8_EXT in dev.extension_names:
+            expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR)
         if dev.api_version >= vk_info.VK_API_VERSION_1_3:
             expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
         else:
@@ -329,6 +338,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, 1000225000)
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, 1000196000)
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR, 1000203000)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR, 1000574000)
 
     def test_shader_stage_bits(self):
         self.assertEqual(vk_info.VK_SHADER_STAGE_COMPUTE_BIT, 0x20)
@@ -356,6 +366,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.F12_SIZE, 208)
         self.assertEqual(vk_info.F13_SIZE, 80)
         self.assertEqual(vk_info.BARY_FEATURES_SIZE, 24)
+        self.assertEqual(vk_info.MAINTENANCE8_FEATURES_SIZE, 24)
         self.assertEqual(vk_info.DRIVER_PROPS_SIZE, 536)
         self.assertEqual(vk_info.QUEUE_FAMILY_SIZE, 24)
 
@@ -797,6 +808,7 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "maintenance8": True,
                     "barycentric_fallback": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
@@ -814,12 +826,31 @@ class QueryTest(unittest.TestCase):
                 self.assertEqual(res["max_push_constants_size"], limit)
 
     def test_per_vertex_inputs(self):
-        """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""
-        for label, bary, driver, want in (("amd", True, 1, True), ("no_barycentrics", False, 1, False),
-                                          ("moltenvk", True, vk_info.VK_DRIVER_ID_MOLTENVK, False)):
+        """PerVertexKHR needs the extension and fragmentShaderBarycentric, and MoltenVK can't compile it to MSL."""
+        with_ext = (vk_info.FRAGMENT_SHADER_BARYCENTRIC_EXT,)
+        for label, exts, bary, driver, want in (
+            ("amd", with_ext, True, 1, True),
+            ("no_barycentrics_feature", with_ext, False, 1, False),
+            ("no_barycentrics_extension", (), True, 1, False),
+            ("moltenvk", with_ext, True, vk_info.VK_DRIVER_ID_MOLTENVK, False),
+        ):
             with self.subTest(case=label):
-                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
+                res, _vk = self._run_query(
+                    FakeDevice(extension_names=exts, fragment_shader_barycentric=bary, driver_id=driver)
+                )
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_maintenance8(self):
+        """maintenance8 needs both VK_KHR_maintenance8 in device extensions and its feature bit."""
+        with_ext = (vk_info.MAINTENANCE_8_EXT,)
+        for label, exts, feature, want in (
+            ("supported", with_ext, True, True),
+            ("extension_without_feature", with_ext, False, False),
+            ("missing_extension", (), True, False),
+        ):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(extension_names=exts, maintenance8=feature))
+                self.assertIs(res["maintenance8"], want)
 
     def test_barycentric_fallback(self):
         for label, driver, want in (("anv", vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, True),

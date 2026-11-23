@@ -28,9 +28,12 @@ driver. Its shader compiler can crash in vkCreateComputePipelines on emulated wa
 (#857, reported on RX 5000, RX 6000 and RDNA2 iGPUs). make_game.py prefers native wave64 when the GPU can run it.
 
 per_vertex_inputs says whether the device can run a pixel shader with PerVertexKHR inputs (16-bit interpolation,
-docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
-conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
-false, the shaders are translated with --f16-interp-fallback.
+docs/design.md): the VK_KHR_fragment_shader_barycentric extension and its fragmentShaderBarycentric feature, and a
+driver other than MoltenVK, whose SPIR-V to MSL conversion rejects the decoration ("PerVertexKHR decoration is not
+supported in MSL", MoltenVK 1.4.2). Where it is false, the shaders are translated with --f16-interp-fallback.
+
+maintenance8 says whether the device offers VK_KHR_maintenance8 and its maintenance8 feature (needed for non-constant
+texel offsets on image_sample*_o). Where it is false, make_game.py translates with --texel-offset-fallback.
 
 barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
 advertises fragmentShaderBarycentric but returns a zero BaryCoordKHR.i for translated pixel shaders on Intel Arc B580;
@@ -65,6 +68,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR = 1000314007
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR = 1000574000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
@@ -83,6 +87,7 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
 GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
+MAINTENANCE8_FEATURES_SIZE = 24  # sizeof(VkPhysicalDeviceMaintenance8FeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
@@ -91,6 +96,8 @@ VK_API_VERSION_1_2 = (1 << 22) | (2 << 12)
 VK_API_VERSION_1_3 = (1 << 22) | (3 << 12)
 VK_INCOMPLETE = 5
 VULKAN_12_REQUIRED_EXTENSIONS = frozenset((b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2"))
+FRAGMENT_SHADER_BARYCENTRIC_EXT = b"VK_KHR_fragment_shader_barycentric"
+MAINTENANCE_8_EXT = b"VK_KHR_maintenance8"
 
 PROPS_SIZE = 824            # sizeof(VkPhysicalDeviceProperties) on 64-bit
 FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool32, padded to 8
@@ -281,20 +288,30 @@ def query(*, stage_caps=False) -> dict:
             if version < VK_API_VERSION_1_2 or (wanted and wanted not in dev_name.lower()):
                 continue
             core13 = version >= VK_API_VERSION_1_3
-            if not core13 and not VULKAN_12_REQUIRED_EXTENSIONS.issubset(device_extensions(vk, d)):
+            exts = device_extensions(vk, d)
+            if not core13 and not VULKAN_12_REQUIRED_EXTENSIONS.issubset(exts):
                 continue
             f13 = block(F13_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
             f12 = block(F12_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
-            bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
+            bary = None
+            m8 = None
             if core13:
                 set_next(f12, f13)
-                set_next(f13, bary)
+                tail = f13
             else:
                 rendering = block(24, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR)
                 sync2 = block(24, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR)
                 set_next(f12, rendering)
                 set_next(rendering, sync2)
-                set_next(sync2, bary)
+                tail = sync2
+            if FRAGMENT_SHADER_BARYCENTRIC_EXT in exts:
+                bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
+                set_next(tail, bary)
+                tail = bary
+            if MAINTENANCE_8_EXT in exts:
+                m8 = block(MAINTENANCE8_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR)
+                set_next(tail, m8)
+                tail = m8
             f2 = block(FEATURES2_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
             set_next(f2, f12)
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
@@ -320,7 +337,8 @@ def query(*, stage_caps=False) -> dict:
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
                           bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
-                          bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
+                          bary is not None and bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
+                          m8 is not None and bool(u32(m8, 16)),
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
@@ -332,7 +350,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, maintenance8, max_push_constants_size, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -354,6 +372,7 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            "maintenance8": maintenance8,
             "barycentric_fallback": barycentric_fallback(vendor, device, driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,

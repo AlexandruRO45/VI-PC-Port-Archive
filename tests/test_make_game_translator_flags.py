@@ -184,7 +184,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, maintenance8=None):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -199,6 +199,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
+                mock.patch("make_game.runtime_gpu_maintenance8", return_value=maintenance8), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -292,6 +293,15 @@ class MainWiringTest(unittest.TestCase):
             with mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertEqual(make_game.runtime_gpu_mesh_draws_crash(), want, raw)
 
+    def test_texel_offset_fallback_follows_the_device(self):
+        """On by itself where vk_subgroup_info says the GPU lacks VK_KHR_maintenance8, not where it has it or
+        can't tell; asked for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(maintenance8=False), (("--texel-offset-fallback",),) * 2)
+        self.assertEqual(self.run_main(maintenance8=True), ((), ()))
+        self.assertEqual(self.run_main(maintenance8=None), ((), ()))
+        self.assertEqual(self.run_main("--texel-offset-fallback", maintenance8=True),
+                         (("--texel-offset-fallback",),) * 2)
+
     def test_runtime_gpu_max_push_constants_parses_probe(self):
         for raw, want in (({"max_push_constants_size": 128}, 128),
                           ({"max_push_constants_size": 256}, 256),
@@ -303,15 +313,24 @@ class MainWiringTest(unittest.TestCase):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertEqual(make_game.runtime_gpu_max_push_constants(), want)
 
+    def test_runtime_gpu_maintenance8_parses_probe(self):
+        for raw, want in (({"maintenance8": True}, True),
+                          ({"maintenance8": False}, False),
+                          ({}, None),
+                          ({"maintenance8": 1}, None),
+                          ({"maintenance8": "true"}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertEqual(make_game.runtime_gpu_maintenance8(), want)
+
 
 class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
     """A GPU probe that can't tell must not change the flags a finished translation was made with: one failed or
     timed-out probe used to translate the whole corpus without the automatic flags, and the next run that could
     ask translated it a third time. This runs the real main() and shaders() on one work folder."""
 
-    AUTOMATIC = ("--f16-interp-fallback", "--pc-tail-ubo")
+    AUTOMATIC = ("--texel-offset-fallback", "--f16-interp-fallback", "--pc-tail-ubo")
 
-    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_crash=False):
+    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_crash=False, maintenance8=True):
         """One `make_game.py --stages shaders` run: (the fallbacks of each translation it started, its log)."""
         translations, lines = [], []
 
@@ -338,6 +357,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
+                mock.patch("make_game.runtime_gpu_maintenance8", return_value=maintenance8), \
                 mock.patch("make_game.preflight"), \
                 mock.patch.object(make_game, "py", fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \
@@ -351,44 +371,46 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
         with open(os.path.join(self.spirv, "translator_flags.txt"), encoding="utf-8") as f:
             return f.read().strip()
 
-    def test_a_probe_that_cannot_tell_keeps_both_automatic_flags(self):
-        self.assertEqual(self.build(per_vertex=False, max_push_constants=128)[0], [self.AUTOMATIC])
-        translations, log = self.build(per_vertex=None, max_push_constants=None)
+    def test_a_probe_that_cannot_tell_keeps_all_automatic_flags(self):
+        self.assertEqual(self.build(per_vertex=False, max_push_constants=128, maintenance8=False)[0],
+                         [self.AUTOMATIC])
+        translations, log = self.build(per_vertex=None, max_push_constants=None, maintenance8=None)
         self.assertEqual(translations, [])
         self.assertEqual(self.recorded(), " ".join(self.AUTOMATIC))
         for flag in self.AUTOMATIC:                # it says what it did, once per flag
             self.assertIn(f"whether it needs {flag}; the shaders were translated with it and it stays on", log)
         self.assertNotIn("translating again", log)
         # The probe answers again: the same flags, so nothing is translated a third time.
-        self.assertEqual(self.build(per_vertex=False, max_push_constants=128)[0], [])
+        self.assertEqual(self.build(per_vertex=False, max_push_constants=128, maintenance8=False)[0], [])
 
     def test_each_probe_is_kept_on_its_own(self):
-        self.build(per_vertex=False, max_push_constants=128)
-        self.assertEqual(self.build(per_vertex=None, max_push_constants=128)[0], [])
-        self.assertEqual(self.build(per_vertex=False, max_push_constants=None)[0], [])
+        self.build(per_vertex=False, max_push_constants=128, maintenance8=False)
+        self.assertEqual(self.build(per_vertex=None, max_push_constants=128, maintenance8=False)[0], [])
+        self.assertEqual(self.build(per_vertex=False, max_push_constants=None, maintenance8=False)[0], [])
+        self.assertEqual(self.build(per_vertex=False, max_push_constants=128, maintenance8=None)[0], [])
         self.assertEqual(self.recorded(), " ".join(self.AUTOMATIC))
 
     def test_a_probe_that_answers_still_decides(self):
-        # Another GPU, or a driver that now takes PerVertexKHR inputs and 144 bytes: translating again is right.
-        self.build(per_vertex=False, max_push_constants=128)
-        translations, log = self.build(per_vertex=True, max_push_constants=256)
+        # Another GPU, or a driver that now takes PerVertexKHR inputs, maintenance8 and 144 bytes: translating again is right.
+        self.build(per_vertex=False, max_push_constants=128, maintenance8=False)
+        translations, log = self.build(per_vertex=True, max_push_constants=256, maintenance8=True)
         self.assertEqual(translations, [()])
         self.assertIn("the fallback flags are now none", log)
         self.assertEqual(self.recorded(), "")
 
     def test_a_failed_probe_adds_no_flag_to_a_folder_translated_without_it(self):
-        self.assertEqual(self.build(per_vertex=True, max_push_constants=256)[0], [()])
-        translations, log = self.build(per_vertex=None, max_push_constants=None)
+        self.assertEqual(self.build(per_vertex=True, max_push_constants=256, maintenance8=True)[0], [()])
+        translations, log = self.build(per_vertex=None, max_push_constants=None, maintenance8=None)
         self.assertEqual(translations, [])
         self.assertNotIn("stays on", log)
         # A first build with no probe answer and no folder: no automatic flag, as before.
         self.assertEqual(make_game.recorded_fallback_flags(os.path.join(self.work, "elsewhere")), ())
 
     def test_the_other_flags_are_not_kept_by_a_failed_probe(self):
-        # Only the two flags the probe decides are kept; one the user stops passing is dropped as before.
-        self.build("--no-float-controls", per_vertex=False, max_push_constants=256)
+        # Only the flags the probe decides are kept; one the user stops passing is dropped as before.
+        self.build("--no-float-controls", per_vertex=False, max_push_constants=256, maintenance8=True)
         self.assertEqual(self.recorded(), "--no-float-controls --f16-interp-fallback")
-        translations, _ = self.build(per_vertex=None, max_push_constants=None)
+        translations, _ = self.build(per_vertex=None, max_push_constants=None, maintenance8=None)
         self.assertEqual(translations, [("--f16-interp-fallback",)])
 
 

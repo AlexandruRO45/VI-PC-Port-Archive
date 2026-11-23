@@ -184,6 +184,30 @@ class DetectionGapsTest(unittest.TestCase):
         self.assertFalse(self.decide(real_format(("A", 64, ALL)), "not json"))
         self.assertTrue(self.decide(real_format(("A", 32, ALL)), '{"native64": true}'))     # vulkaninfo wins: on
 
+    def test_without_vulkaninfo_falls_back_to_vk_subgroup_info(self):
+        cases = (
+            ("native64_gpu", {"device": "AMD Radeon RX 7900 XTX", "native64": True, "max_subgroup_size": 64},
+             False, (False, True)),
+            ("pascal_32_wide", {"device": "NVIDIA GeForce GTX 1070", "native64": False, "max_subgroup_size": 32},
+             False, (True, True)),
+            ("compute_only_with_mesh_compute",
+             {"device": "Compute-64 GPU", "native64": False, "native64_compute": True, "max_subgroup_size": 64},
+             True, (False, True)),
+            ("max_subgroup_only_64", {"max_subgroup_size": 64}, False, (False, True)),
+            ("max_subgroup_only_32", {"max_subgroup_size": 32}, False, (True, True)),
+            ("probe_failed", {}, False, (True, True)),
+        )
+        for label, gpu, mesh_compute, expected in cases:
+            for which in (None, "vulkaninfo"):
+                with self.subTest(case=label, vulkaninfo=which), \
+                        mock.patch.object(make_game.shutil, "which", return_value=which), \
+                        mock.patch.object(make_game, "runtime_gpu_info", return_value=gpu), \
+                        mock.patch.object(make_game.subprocess, "run", side_effect=OSError("cannot start")), \
+                        mock.patch.object(make_game, "log") as log_fn:
+                    self.assertEqual(make_game.wave64_settings("auto", mesh_compute=mesh_compute), expected)
+                    if gpu.get("device"):
+                        self.assertIn(gpu["device"], log_fn.call_args.args[0])
+
 
 class Rdna2AmdWindowsTest(unittest.TestCase):
     """#857: AMD's Windows compiler for RDNA2 crashes on emulated LDS compute shaders. When the runtime's GPU is one
@@ -262,6 +286,7 @@ class KeepEmulatedFlagTest(unittest.TestCase):
                     mock.patch.object(make_game, "runtime_gpu_per_vertex", return_value=True), \
                     mock.patch.object(make_game, "runtime_gpu_max_push_constants", return_value=256), \
                     mock.patch.object(make_game, "runtime_gpu_mesh_draws_crash", return_value=False), \
+                    mock.patch.object(make_game, "runtime_gpu_maintenance8", return_value=True), \
                     mock.patch.object(make_game, "shaders") as sh:
                 make_game.main()
             keys = ("emulate", "keep_emulated", "fallbacks")

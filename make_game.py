@@ -1586,8 +1586,10 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
     size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA1/2
-    under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
-    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
+    under the AMD Windows driver. Elsewhere, when vulkaninfo is available, it turns emulation on unless every
+    Vulkan device reports maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64; when
+    vulkaninfo is unavailable, it falls back to tools/vk_subgroup_info.py for the runtime's selected GPU (turning
+    emulation on when neither probe can confirm 64-wide support)."""
     if mode == "on":
         return True, False
     if mode == "off":
@@ -1616,6 +1618,21 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
         except (OSError, subprocess.SubprocessError):
             size = None
     if size is None:
+        stages = "compute" if compute_only else "both compute and mesh"
+        if isinstance(native64, bool):
+            if native64:
+                log(f"shaders: vulkaninfo unavailable, but the Vulkan query reports {gpu.get('device', '?')} "
+                    f"runs wave64 natively for {stages}: wave64 emulation off")
+                return False, True
+            log(f"shaders: vulkaninfo unavailable; the Vulkan query reports {gpu.get('device', '?')} "
+                f"lacks a 64-wide path for {stages}: wave64 emulation on")
+            return True, True
+        max_sg = gpu.get("max_subgroup_size")
+        if isinstance(max_sg, int) and not isinstance(max_sg, bool) and max_sg > 0:
+            on = max_sg < 64
+            log(f"shaders: vulkaninfo unavailable; the Vulkan query reports max subgroup size {max_sg}: "
+                f"wave64 emulation {'on' if on else 'off'}")
+            return on, True
         log("shaders: couldn't read the GPU's subgroup size from vulkaninfo: wave64 emulation on "
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True, True
@@ -1698,6 +1715,13 @@ def runtime_gpu_max_push_constants():
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
+def runtime_gpu_maintenance8():
+    """maintenance8 as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
+    device lacks VK_KHR_maintenance8, None when it can't tell."""
+    v = runtime_gpu_info().get("maintenance8")
+    return v if isinstance(v, bool) else None
 
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
@@ -2697,8 +2721,8 @@ def main() -> int:
                          "geometry shader the runtime draws), for devices without "
                          "VK_KHR_fragment_shader_barycentric")
     ap.add_argument("--texel-offset-fallback", action="store_true",
-                    help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
-                         "without VK_KHR_maintenance8")
+                    help="fold the run-time texel offset of image_sample*_o into the coordinate; on by itself "
+                         "when the runtime's GPU lacks VK_KHR_maintenance8")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
@@ -2823,6 +2847,14 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.texel_offset_fallback:
+        m8 = runtime_gpu_maintenance8()
+        if m8 is False:
+            log("shaders: the GPU the runtime would use lacks VK_KHR_maintenance8: "
+                "translating with --texel-offset-fallback")
+            a.texel_offset_fallback = True
+        elif m8 is None:
+            a.texel_offset_fallback = keep_recorded_fallback("--texel-offset-fallback", work)
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
     a.jobs = leonida_tui.clamp_jobs(a.jobs)
