@@ -353,5 +353,60 @@ class TestSNorB64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.vcc, expected)
         self.assertEqual(self.state.scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 64-Bit Lane Masking
+# -----------------------------------------------------------------------------
+
+class SIMDMultiLaneDivergenceModel:
+    """Models multi-lane execution in Wave64 environments using s_nor_b64."""
+
+    @staticmethod
+    def active_lanes_from_mask(mask: int) -> Set[int]:
+        return {lane for lane in range(64) if (mask & (1 << lane)) != 0}
+
+    @staticmethod
+    def nor_lane_mask(s0_mask: int, s1_mask: int) -> Tuple[int, int]:
+        """In Wave64 flow control, s_nor_b64 computes lane activation masks:
+
+        Lanes are ON ONLY if they are inactive in BOTH S0 and S1.
+        """
+        return s_nor_b64_oracle(s0_mask, s1_mask)
+
+
+class TestSNorB64SIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD Wave64 multi-lane divergence and mask calculation."""
+
+    def test_nor_lane_activation(self):
+        # S0 covers lanes 0..15
+        s0 = 0x0000_0000_0000_FFFF
+        # S1 covers lanes 16..31
+        s1 = 0x0000_0000_FFFF_0000
+
+        # NOR activates lanes 32..63
+        d, scc = SIMDMultiLaneDivergenceModel.nor_lane_mask(s0, s1)
+        self.assertEqual(d, 0xFFFF_FFFF_0000_0000)
+        self.assertEqual(scc, 1)
+
+        active = SIMDMultiLaneDivergenceModel.active_lanes_from_mask(d)
+        self.assertEqual(active, set(range(32, 64)))
+
+    def test_complete_deactivation(self):
+        # S0 and S1 together cover all lanes
+        s0 = 0x5555_5555_5555_5555
+        s1 = 0xAAAA_AAAA_AAAA_AAAA
+        d, scc = s_nor_b64_oracle(s0, s1)
+        self.assertEqual(d, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(len(SIMDMultiLaneDivergenceModel.active_lanes_from_mask(d)), 0)
+
+    def test_boundary_lane_nor(self):
+        # S0 has lane 0, S1 has lane 63
+        s0 = 1 << 0
+        s1 = 1 << 63
+        d, scc = s_nor_b64_oracle(s0, s1)
+        expected = ALL64 & ~((1 << 0) | (1 << 63))
+        self.assertEqual(d, expected)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
