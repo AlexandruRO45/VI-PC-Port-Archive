@@ -283,11 +283,18 @@ class ValidatedOutput(unittest.TestCase):
     def test_existing_single_s_file_still_translates(self):
         self.assertIn("1 pass spirv-val", self.translate())
 
+    @staticmethod
+    def missing_tool():
+        """What a CreateProcess failure raises from subprocess.run, with no tool name in it.
+
+        Windows: FileNotFoundError(2, "The system cannot find the file specified", None, 2).
+        """
+        return FileNotFoundError(2, "The system cannot find the file specified", None, 2)
+
     def test_missing_assembler_is_one_setup_error(self):
         err = io.StringIO()
         with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
-                mock.patch.object(rdna2spirv.subprocess, "run",
-                                  side_effect=FileNotFoundError(2, "No such file or directory", "spirv-as")), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=self.missing_tool()), \
                 redirect_stdout(io.StringIO()), redirect_stderr(err):
             code = rdna2spirv.main()
         message = err.getvalue()
@@ -299,12 +306,12 @@ class ValidatedOutput(unittest.TestCase):
         self.assertFalse(self.module.exists())
         self.assertEqual(list(self.out.glob("*.tmp")), [])
 
-    def test_missing_validator_does_not_publish_the_module(self):
+    def test_missing_validator_names_the_validator(self):
         def spirv_tool(cmd, **_kwargs):
             if cmd[0] == "spirv-as":
                 Path(cmd[3]).write_bytes(b"new module")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
-            raise FileNotFoundError(2, "No such file or directory", "spirv-val")
+            raise self.missing_tool()
 
         err = io.StringIO()
         with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
@@ -319,6 +326,15 @@ class ValidatedOutput(unittest.TestCase):
         self.assertEqual(len(message.strip().splitlines()), 1, message)
         self.assertFalse(self.module.exists())
         self.assertFalse(self.index.exists())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_spirv_tool_missing_names_the_tool_that_failed(self):
+        with mock.patch.object(rdna2spirv.subprocess, "run", side_effect=self.missing_tool()):
+            with self.assertRaises(rdna2spirv.SpirvToolMissing) as caught:
+                rdna2spirv.assemble_spirv(str(self.src), str(self.module))
+        self.assertEqual(caught.exception.tool, "spirv-as")
+        self.assertNotIsInstance(caught.exception, OSError)
+        self.assertFalse(self.module.exists())
         self.assertEqual(list(self.out.glob("*.tmp")), [])
 
     def test_validator_rejection_does_not_publish_binary(self):

@@ -13582,12 +13582,33 @@ def merge_shard_parts(out):
     return merged
 
 
+class SpirvToolMissing(RuntimeError):
+    """spirv-as or spirv-val is not on PATH.
+
+    Raised where the command is built, not read back off the exception: a Windows CreateProcess
+    failure is `FileNotFoundError(2, ..., None, 2)`, so `OSError.filename` is None there.
+    """
+
+    def __init__(self, tool):
+        super().__init__(f"{tool} is not on PATH")
+        self.tool = tool
+
+
+def _run_spirv_tool(cmd, **kwargs):
+    """subprocess.run for a SPIR-V tool, naming the tool when the executable cannot be started."""
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except FileNotFoundError as exc:
+        raise SpirvToolMissing(cmd[0]) from exc
+
+
 def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
     """Keep the assembled module out of the final path until validation succeeds.
 
     `assembler="spirv-as"` invokes the external spirv-as binary on `sa` (default);
     `assembler="python"` encodes `asm_text` (or reads `sa`) directly in memory with
     tools/spirv_asm.py, avoiding the spirv-as subprocess and temporary .spvasm I/O.
+    Raises SpirvToolMissing when the tool is not on PATH.
     """
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
@@ -13601,12 +13622,12 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
             except (OSError, spirv_asm.SpirvAsmError) as exc:
                 result = subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
         else:
-            result = subprocess.run(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
-                                    capture_output=True, text=True)
+            result = _run_spirv_tool(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
+                                     capture_output=True, text=True)
         if result.returncode == 0:
             # Offset on non-gather: VK_KHR_maintenance8
-            result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
-                                     str(tmp)], capture_output=True, text=True)
+            result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
+                                      str(tmp)], capture_output=True, text=True)
         if result.returncode == 0:
             tmp.replace(sv)
         else:
@@ -13787,12 +13808,10 @@ def main():
                 f.write(asm)
         try:
             r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler)
-        except OSError as e:
+        except SpirvToolMissing as e:
             # A missing spirv-as/spirv-val fails every shader the same way; report it once as a setup
             # error (exit 2) instead of a FileNotFoundError traceback from the first one.
-            if e.filename not in ("spirv-as", "spirv-val"):
-                raise
-            print(f"ERROR: {e.filename} not found; install SPIRV-Tools (spirv-as, spirv-val) "
+            print(f"ERROR: {e.tool} not found; install SPIRV-Tools (spirv-as, spirv-val) "
                   "and put it on PATH", file=sys.stderr)
             return 2
         if r.returncode == 0:
