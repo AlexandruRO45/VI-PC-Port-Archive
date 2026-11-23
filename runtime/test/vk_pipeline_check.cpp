@@ -784,6 +784,40 @@ ChildRun run_child(const std::filesystem::path& exe, const std::string& dir,
 
 }  // namespace
 
+static bool same_output_path(const std::string& first, const std::string& second) {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    const bool same_file = fs::equivalent(first, second, error);
+    if (!error) return same_file;
+
+    // A new filename may have no existing components in its relative spelling.
+    const auto resolve = [&error](const std::string& path) -> fs::path {
+        const auto absolute = fs::absolute(path, error);
+        if (error) return {};
+        return fs::weakly_canonical(absolute, error);
+    };
+    const auto left = resolve(first);
+    if (error) return false;
+    const auto right = resolve(second);
+    if (error) return false;
+    if (left == right) return true;
+#ifdef _WIN32
+    if (CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) != CSTR_EQUAL) return false;
+    // NTFS directories can opt in to case-sensitive names even when their files do not yet exist.
+    const HANDLE parent = CreateFileW(left.parent_path().c_str(), FILE_READ_ATTRIBUTES,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (parent == INVALID_HANDLE_VALUE) return false;
+    DWORD flags = 0;  // FILE_CASE_SENSITIVE_INFO holds a single ULONG Flags field.
+    const bool has_flags = GetFileInformationByHandleEx(parent, FileCaseSensitiveInfo, &flags, sizeof(flags));
+    CloseHandle(parent);
+    constexpr DWORD case_sensitive_directory = 1;
+    return !has_flags || !(flags & case_sensitive_directory);
+#else
+    return false;
+#endif
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
@@ -887,9 +921,9 @@ int main(int argc, char** argv) {
         return std::filesystem::equivalent(a, b, error);
     };
     // These inputs already exist on a valid invocation. Compare file identity so aliases are also protected.
-    for (const auto& [option, output] : {std::pair{"cache path", &cache_path},
-                                        std::pair{"--stats", &stats_path},
-                                        std::pair{"--inflight-file", &inflight_path}}) {
+    const auto outputs = {std::pair{"cache path", &cache_path}, std::pair{"--stats", &stats_path},
+                          std::pair{"--inflight-file", &inflight_path}};
+    for (const auto& [option, output] : outputs) {
         if (output->empty()) continue;
         const char* input = nullptr;
         if (same_file(*output, index_path)) input = "index.json";
@@ -897,6 +931,17 @@ int main(int argc, char** argv) {
         if (input) {
             std::fprintf(stderr, "error: %s must not overwrite %s\n", option, input);
             return 2;
+        }
+    }
+    for (auto current = outputs.begin(); current != outputs.end(); ++current) {
+        const auto& [option, output] = *current;
+        if (output->empty()) continue;
+        for (auto previous = outputs.begin(); previous != current; ++previous) {
+            const auto& [other_option, other_output] = *previous;
+            if (!other_output->empty() && same_output_path(*output, *other_output)) {
+                std::fprintf(stderr, "error: %s must not overwrite %s\n", option, other_option);
+                return 2;
+            }
         }
     }
 

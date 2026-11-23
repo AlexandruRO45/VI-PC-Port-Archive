@@ -27,10 +27,11 @@ check_invalid(--stats)
 
 function(check_protected_input name)
   execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}
+                  WORKING_DIRECTORY "${TEST_DIR}"
                   RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
   string(FIND "${log}" "must not overwrite ${name}" found)
   if(NOT code STREQUAL "2" OR found EQUAL -1)
-    message(FATAL_ERROR "${ARGN}: expected input/output path conflict, got ${code}\n${log}")
+    message(FATAL_ERROR "${ARGN}: expected path conflict, got ${code}\n${log}")
   endif()
 endfunction()
 
@@ -87,3 +88,29 @@ foreach(bytes -1 1.5 4294967296)
     message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
   endif()
 endforeach()
+
+# Malformed JSON is a control: path conflicts must be diagnosed before the index is parsed.
+file(WRITE "${TEST_DIR}/index.json" "not JSON\n")
+set(shared_output "${TEST_DIR}/shared.out")
+check_protected_input("cache path" "${shared_output}" --stats "${TEST_DIR}/./shared.out")
+check_protected_input("cache path" shared.out --stats "${shared_output}")
+check_protected_input("cache path" "${shared_output}" --inflight-file "${shared_output}")
+check_protected_input("--stats" --stats "${shared_output}" --inflight-file "${shared_output}")
+
+if(CMAKE_HOST_WIN32 AND EXISTS "${TEST_DIR}/SKIP.TXT")
+  check_protected_input("cache path" "${shared_output}" --stats "${TEST_DIR}/SHARED.OUT")
+endif()
+
+file(WRITE "${TEST_DIR}/alias-target.out" "synthetic output\n")
+file(CREATE_LINK "${TEST_DIR}/alias-target.out" "${TEST_DIR}/alias-link.out" RESULT output_link)
+if(output_link STREQUAL "0")
+  check_protected_input("cache path" "${TEST_DIR}/alias-target.out" --stats "${TEST_DIR}/alias-link.out")
+  file(REMOVE "${TEST_DIR}/alias-link.out")
+endif()
+
+execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" "${TEST_DIR}/cache.bin"
+                --stats "${TEST_DIR}/report.csv" --inflight-file "${TEST_DIR}/inflight.txt"
+                RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: ")
+  message(FATAL_ERROR "Expected distinct outputs to reach the malformed index, got ${code}\n${log}")
+endif()
