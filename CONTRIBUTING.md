@@ -61,7 +61,6 @@ methods are still open.
 - Run the translator tests with `python -I scripts/run_semantic_tests.py tests/semantic` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.
 
-
 ## Documentation-only contributions
 
 You can make documentation changes without a game copy or local development setup. On GitHub, use **Edit this file** to edit the documentation in your fork, commit the change to a branch, and open a pull request. Before editing, claim the work in the coordination issue above.
