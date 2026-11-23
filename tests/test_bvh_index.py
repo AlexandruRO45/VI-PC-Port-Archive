@@ -601,6 +601,22 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self.read(self.out), self.OLD_JSON)
         self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".bvh_index-")], [])
 
+    def test_denied_chmod_does_not_skip_the_staging_unlink(self):
+        # chmod and unlink used to share one suppress block, so a refused chmod skipped the unlink.
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".bvh_index-") and mode == 0o600:
+                raise PermissionError("chmod denied")
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(bvh_index.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(bvh_index.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                bvh_index.write_outputs([], [{"streams": 0}], self.out, None)
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".bvh_index-")], [])
+
     @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
     def test_replaced_report_keeps_its_permission_bits(self):
         os.chmod(self.out, 0o640)

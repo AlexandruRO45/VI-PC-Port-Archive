@@ -614,6 +614,22 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self.read(self.out), self.OLD_JSON)
         self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".navmesh_index-")], [])
 
+    def test_denied_chmod_does_not_skip_the_staging_unlink(self):
+        # chmod and unlink used to share one suppress block, so a refused chmod skipped the unlink.
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".navmesh_index-") and mode == 0o600:
+                raise PermissionError("chmod denied")
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(self.tool.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(self.tool.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                self.tool.write_outputs([], {"streams": 0}, self.out, None)
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".navmesh_index-")], [])
+
 
 class OutputPathTest(unittest.TestCase):
     """A report path that is already a folder is a usage error, not a PermissionError traceback."""

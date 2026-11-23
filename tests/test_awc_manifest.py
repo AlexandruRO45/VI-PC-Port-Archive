@@ -341,7 +341,7 @@ class ManifestTest(unittest.TestCase):
 
     def test_failed_write_keeps_the_previous_manifest(self):
         out = os.path.join(self.tmp.name, "manifest.json")
-        with open(out, "w", encoding="utf-8") as f:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             f.write('{"previous": true}\n')
 
         def full_disk(_doc, f, **_kwargs):
@@ -358,7 +358,7 @@ class ManifestTest(unittest.TestCase):
     def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
         out = os.path.join(self.tmp.name, "manifest.json")
         previous = '{"previous": true}\n'
-        with open(out, "w", encoding="utf-8") as f:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             f.write(previous)
         os.chmod(out, 0o444)
         self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))

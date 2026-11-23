@@ -73,6 +73,14 @@ class NoUmaskFlipTests(unittest.TestCase):
             self.assertEqual(os.listdir(directory), [".mode-aaaa.probe"])
             self.assertEqual(Path(taken).read_bytes(), b"someone else's")
 
+    def test_discard_staged_unlinks_even_when_chmod_is_denied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staged = os.path.join(directory, ".report.tmp")
+            Path(staged).write_bytes(b"staged")
+            with mock.patch.object(file_mode.os, "chmod", side_effect=PermissionError("chmod denied")):
+                file_mode.discard_staged(staged)
+            self.assertEqual(os.listdir(directory), [])
+
     @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
     def test_new_file_mode_follows_the_current_umask(self):
         with tempfile.TemporaryDirectory() as directory:

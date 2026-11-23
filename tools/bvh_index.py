@@ -40,10 +40,9 @@ import tempfile
 import time
 import unicodedata
 import zlib
-from contextlib import suppress
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import discard_staged, published_mode  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -400,11 +399,9 @@ def _publish(dest, write, newline):
         os.replace(temp, dest)
     except BaseException:
         if temp is not None:
-            with suppress(OSError):
-                # The staging file may have inherited a read-only destination's mode; make it deletable
-                # first, or Windows strands it beside the report when the replace fails.
-                os.chmod(temp, 0o600)
-                os.unlink(temp)
+            # The staging file may have inherited a read-only destination's mode; make it deletable
+            # first, or Windows strands it beside the report when the replace fails.
+            discard_staged(temp)
         raise
 
 
