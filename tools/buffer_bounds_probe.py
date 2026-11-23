@@ -14,6 +14,11 @@ Usage:
     python -I tools/buffer_bounds_probe.py --self-test
     python -I tools/buffer_bounds_probe.py [--waves 32,64] [--json report.json]
 
+`--json` is checked before the hardware oracle is opened: an empty path, a NUL
+byte, a directory, or a parent component that is not a directory is refused with
+one `ERROR:` line and exit 2. Missing parent directories are created when the
+report is written, and a write failure is likewise one `ERROR:` line and exit 2.
+
 Exit codes:
     0   every case matches the measured RDNA2/GFX11 column
     1   at least one case disagrees (or a wave32/wave64 result differs)
