@@ -77,13 +77,22 @@ class Generator(unittest.TestCase):
                     self.assertIn(op["op"], f.SHARED_ATOMICS)
 
     def test_no_exec_keeps_the_rest_of_the_program(self):
-        a, b = f.Program(1, 32, 32), f.Program(1, 32, 32, no_exec=("bpermute",))
-        self.assertEqual(len(a.ops), len(b.ops))
-        for x, y in zip(a.ops, b.ops):
-            if x["kind"] == "bpermute":
-                self.assertIsNone(y["exec"])
-            else:
-                self.assertEqual(x, y)
+        # Several programs, and a count: every op added to the mix moves the draws, and Program(1, 32, 32), the one
+        # program this test used to look at, has drawn no ds_bpermute since ds_wrxchg2 joined the mix.
+        masked = 0
+        for wave in (32, 64):
+            for idx in range(16):
+                a, b = f.Program(1, idx, wave), f.Program(1, idx, wave, no_exec=("bpermute",))
+                self.assertEqual(len(a.ops), len(b.ops))
+                for x, y in zip(a.ops, b.ops):
+                    if x["kind"] == "bpermute":
+                        masked += x["exec"] is not None
+                        self.assertIsNone(y["exec"])
+                        self.assertEqual({k: v for k, v in x.items() if k not in ("exec", "hyp")},
+                                         {k: v for k, v in y.items() if k not in ("exec", "hyp")})
+                    else:
+                        self.assertEqual(x, y)
+        self.assertGreater(masked, 0, "no ds_bpermute under an EXEC mask was drawn: --no-exec bpermute went unchecked")
 
     def test_permute_is_generated_and_no_exec_clears_only_permute(self):
         self.assertIn("permute", f.EXEC_KINDS)
