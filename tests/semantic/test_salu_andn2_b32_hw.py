@@ -279,3 +279,60 @@ class TestSaluAndn2B32SimdDivergence(unittest.TestCase):
         sdst_zero, scc_zero = ref_andn2_b32(even_lanes, even_lanes)
         self.assertEqual(sdst_zero, 0)
         self.assertEqual(scc_zero, 0)
+
+
+class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        # s0 = s0 & ~s2
+        state = ScalarRegisterState()
+        s0_val = 0x12345678
+        s1_val = 0x000000FF
+        state.write_sgpr_u32(0, s0_val)
+        state.write_sgpr_u32(2, s1_val)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B32,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.sgpr(2),
+        )
+        sdst, scc = state.execute(inst)
+        self.assertEqual(sdst, 0x12345600)
+        self.assertEqual(state.sgpr[0], 0x12345600)
+        self.assertEqual(scc, 1)
+
+    def test_dst_aliases_src1(self):
+        # s2 = s0 & ~s2
+        state = ScalarRegisterState()
+        s0_val = 0x12345678
+        s1_val = 0x000000FF
+        state.write_sgpr_u32(0, s0_val)
+        state.write_sgpr_u32(2, s1_val)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B32,
+            dst=ASTOperand.sgpr(2),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.sgpr(2),
+        )
+        sdst, scc = state.execute(inst)
+        self.assertEqual(sdst, 0x12345600)
+        self.assertEqual(state.sgpr[2], 0x12345600)
+        self.assertEqual(scc, 1)
+
+    def test_self_cancellation_aliasing(self):
+        # s0 = s0 & ~s0 = 0
+        state = ScalarRegisterState()
+        state.write_sgpr_u32(0, 0x12345678)
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B32,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.sgpr(0),
+        )
+        sdst, scc = state.execute(inst)
+        self.assertEqual(sdst, 0)
+        self.assertEqual(state.sgpr[0], 0)
+        self.assertEqual(scc, 0)
