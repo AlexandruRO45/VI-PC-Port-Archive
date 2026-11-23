@@ -130,9 +130,15 @@ def thread_stacks(cdb, pid):
 def kill_tree(proc):
     """Stop the title, trying to stop its whole process tree on Windows."""
     if os.name == "nt":
-        result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-        if result.returncode == 0:
-            return
+        try:
+            result = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True
+            )
+        except OSError:
+            pass
+        else:
+            if result.returncode == 0:
+                return
     if proc.poll() is None:
         proc.kill()
 
