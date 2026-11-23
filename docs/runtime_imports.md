@@ -205,6 +205,44 @@ connectivity (level None), the port and URL security-information queries fail wi
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
+`XAppCaptureImpl` (`IXAppCaptureImpl` .. `IXAppCaptureImpl4`, slots 3-17) and `XAppCaptureMetadataImpl`
+(`IXAppCaptureMetadataImpl`, slots 3-18) follow xgameruntime-docs' ids and "Layout" lists, with the signatures of
+Microsoft's XAppCapture and XAppBroadcast reference pages. No package DLL calls them through a thunk, so the slot
+order is the documented one. Their answers were measured on a PC's own Gaming Services runtime
+(`C:\Windows\System32\xgameruntime.dll` 10.0.26100.9656, initialized with `InitializeApiImplEx2(0x2410, 0, 2)`),
+which serves both classes, and every probe call that has no side effect is matched:
+
+| Slot | Function | PC runtime (measured) | Offline |
+|---|---|---|---|
+| capture 3 | `XAppCaptureTakeDiagnosticScreenshot` | not called (takes a screenshot) | `E_INVALIDARG` without a result, else `E_NOINTERFACE` |
+| capture 4 | `XAppCaptureRecordDiagnosticClip` | not called (records) | `E_INVALIDARG` without a result, else `E_NOINTERFACE` |
+| capture 5 | `XAppCaptureTakeScreenshot` | not called (takes a screenshot) | `E_INVALIDARG` without a user or result, else `E_NOINTERFACE` |
+| capture 6 | `XAppCaptureOpenScreenshotStream` | null id `E_INVALIDARG`, unknown id `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`, outputs untouched | the same, for every id |
+| capture 7, 8 | `XAppCaptureRead/CloseScreenshotStream` | `CloseScreenshotStream(nullptr)` dereferences the handle and faults | `E_INVALIDARG`, the handle is never dereferenced |
+| capture 9, 10 | `XAppCaptureEnableRecord` / `DisableRecord` | not called (changes the capture setting) | `S_OK`, nothing records |
+| capture 11 | `XAppCaptureGetVideoCaptureSettings` | `E_NOINTERFACE`, settings untouched, null `E_INVALIDARG` | the same |
+| capture 12 | `XAppCaptureRecordTimespan` | not called (records) | `E_INVALIDARG` without a start time or result, else `E_NOINTERFACE` |
+| capture 13, 14 | `XAppCaptureRead/CloseLocalStream` | not called | `E_INVALIDARG` |
+| capture 15 | `XAppCaptureStartUserRecord` | null user `E_INVALIDARG` | the same, else `E_NOINTERFACE` |
+| capture 16, 17 | `XAppCaptureStopUserRecord` / `CancelUserRecord` | null id `E_INVALIDARG`, unknown id `E_NOINTERFACE` | the same, for every id |
+| metadata 3 | `XAppBroadcastIsAppBroadcasting` | `false` | `false` |
+| metadata 4 | `XAppBroadcastShowUI` | not called (opens system UI) | `E_INVALIDARG` without a user, else `E_NOINTERFACE` |
+| metadata 5 | `XAppBroadcastGetStatus` | null user `E_INVALIDARG`, status untouched | the same, and with a user `S_OK` with only `isDisabledBySystem` set |
+| metadata 6, 17 | `XAppBroadcastRegisterIsAppBroadcastingChanged` / `XAppCaptureRegisterMetadataPurged` | `S_OK` with a nonzero token, null token or callback `E_POINTER` | the same, the callbacks never fire |
+| metadata 7, 18 | the two unregister calls | `true`, an unknown token too | `true` |
+| metadata 8-13 | `XAppCaptureMetadataAdd*Event` / `Start*State` | `S_OK`, null or empty name `E_INVALIDARG`, null string value and any priority accepted | the same, the metadata is dropped |
+| metadata 14, 15 | `XAppCaptureMetadataStopState` / `StopAllStates` | `S_OK`, for a null, empty or unknown name too | the same |
+| metadata 16 | `XAppCaptureMetadataRemainingStorageBytesAvailable` | `S_OK` with 10240 before any metadata (10194 after a few events), null `E_POINTER` | `S_OK` with 10240, as nothing is stored |
+
+`E_NOINTERFACE` is what the PC runtime returns for a capture request it cannot serve, so a capture call fails the
+same way offline. The opaque handles (`XUserHandle`, the two stream handles) and the result structs a call never
+writes are declared as incomplete types in `xgameruntime.cpp`. `XAppBroadcastStatus`, the one result the shim fills,
+is in `runtime/shims/xappbroadcast_status.h`.
+
+The PC runtime reads `InitializeApiImplEx2`'s `mode` wider than the `char` xgameruntime-docs gives it: a caller that
+sets only the low byte of `r8` and leaves the upper bits undefined gets `E_INVALIDARG` on some builds and `S_OK` on
+others, and passing `mode` as a 32-bit value succeeds every time. The offline initializer reads only the low byte.
+
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
 

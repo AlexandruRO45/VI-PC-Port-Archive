@@ -12,8 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <string>
 #include <system_error>
 
@@ -464,6 +466,188 @@ void check_run_time_load() {
         release(pls);
     }
     std::filesystem::remove_all(scratch, scratch_ec);
+
+    const GUID capture_cls = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+    const GUID capture2 = {0x3a949778, 0x772e, 0x4799, {0xbd, 0xea, 0x0a, 0x66, 0x39, 0xe9, 0x6b, 0xaa}};
+    const GUID capture3 = {0x2bbca60a, 0x619c, 0x4fe1, {0x81, 0x2e, 0xfb, 0x5c, 0x1d, 0xbd, 0xcf, 0x51}};
+    const GUID capture4 = {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}};
+    void* const fake_user = reinterpret_cast<void*>(0x1000);
+    void* capture = nullptr;
+    check(query(&capture_cls, capture4, &capture) == S_OK && capture,
+          "QueryApiImpl hands out XAppCaptureImpl for IXAppCaptureImpl4");
+    if (capture) {
+        bool every_capture_interface = true;
+        for (const GUID* capture_iid : {&capture_cls, &capture2, &capture3}) {
+            void* same = nullptr;
+            const HRESULT capture_query = query(&capture_cls, *capture_iid, &same);
+            every_capture_interface = every_capture_interface && capture_query == S_OK && same == capture;
+            if (same) release(same);
+        }
+        check(every_capture_interface, "XAppCaptureImpl answers for IXAppCaptureImpl .. IXAppCaptureImpl3 with the same object");
+
+        using DiagnosticScreenshot = HRESULT(STDMETHODCALLTYPE*)(void*, bool, uint16_t, const char*, void*);
+        using DiagnosticClip = HRESULT(STDMETHODCALLTYPE*)(void*, time_t, uint32_t, const char*, void*);
+        using TakeScreenshot = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
+        using OpenScreenshotStream = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint16_t, void**, uint64_t*);
+        using ReadScreenshotStream = HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint64_t, uint32_t, uint8_t*, uint32_t*);
+        using CloseStream = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
+        using NoArguments = HRESULT(STDMETHODCALLTYPE*)(void*);
+        using VideoCaptureSettings = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
+        using RecordTimespan = HRESULT(STDMETHODCALLTYPE*)(void*, const SYSTEMTIME*, uint64_t, void*);
+        using ReadLocalStream = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t, uint32_t, uint8_t*, uint32_t*);
+        using StartUserRecord = HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint32_t, char*);
+        using StopUserRecord = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, void*);
+        using CancelUserRecord = HRESULT(STDMETHODCALLTYPE*)(void*, const char*);
+
+        uint8_t untouched[64];
+        std::memset(untouched, 0xA5, sizeof(untouched));
+        uint8_t result_bytes[64];
+        std::memset(result_bytes, 0xA5, sizeof(result_bytes));
+
+        DiagnosticScreenshot diagnostic_screenshot = reinterpret_cast<DiagnosticScreenshot>(slot(capture, 3));
+        check(diagnostic_screenshot(capture, false, 1, "shot", result_bytes) == E_NOINTERFACE &&
+                  diagnostic_screenshot(capture, false, 1, "shot", nullptr) == E_INVALIDARG,
+              "slot 3 (TakeDiagnosticScreenshot) is E_NOINTERFACE, and E_INVALIDARG without a result");
+        DiagnosticClip diagnostic_clip = reinterpret_cast<DiagnosticClip>(slot(capture, 4));
+        check(diagnostic_clip(capture, 0, 1000, "clip", result_bytes) == E_NOINTERFACE &&
+                  diagnostic_clip(capture, 0, 1000, "clip", nullptr) == E_INVALIDARG,
+              "slot 4 (RecordDiagnosticClip) is E_NOINTERFACE, and E_INVALIDARG without a result");
+        TakeScreenshot take_screenshot = reinterpret_cast<TakeScreenshot>(slot(capture, 5));
+        check(take_screenshot(capture, fake_user, result_bytes) == E_NOINTERFACE &&
+                  take_screenshot(capture, nullptr, result_bytes) == E_INVALIDARG &&
+                  take_screenshot(capture, fake_user, nullptr) == E_INVALIDARG,
+              "slot 5 (TakeScreenshot) is E_NOINTERFACE, and E_INVALIDARG without a user or a result");
+
+        OpenScreenshotStream open_screenshot_stream = reinterpret_cast<OpenScreenshotStream>(slot(capture, 6));
+        void* stream_handle = reinterpret_cast<void*>(0x1);
+        uint64_t total_bytes = 0xA5A5A5A5A5A5A5A5ull;
+        check(open_screenshot_stream(capture, "shot", 1, &stream_handle, &total_bytes) == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
+                  stream_handle == reinterpret_cast<void*>(0x1) && total_bytes == 0xA5A5A5A5A5A5A5A5ull,
+              "slot 6 (OpenScreenshotStream) finds no screenshot and leaves the handle and size alone");
+        check(open_screenshot_stream(capture, nullptr, 1, &stream_handle, &total_bytes) == E_INVALIDARG,
+              "slot 6 refuses a missing local id");
+        uint8_t stream_buffer[16] = {};
+        uint32_t bytes_written = 7;
+        check(reinterpret_cast<ReadScreenshotStream>(slot(capture, 7))(capture, nullptr, 0, 16, stream_buffer, &bytes_written) == E_INVALIDARG &&
+                  bytes_written == 7,
+              "slot 7 (ReadScreenshotStream) refuses a handle no open call returned");
+        check(reinterpret_cast<CloseStream>(slot(capture, 8))(capture, nullptr) == E_INVALIDARG,
+              "slot 8 (CloseScreenshotStream) refuses a handle no open call returned, without dereferencing it");
+
+        check(reinterpret_cast<NoArguments>(slot(capture, 9))(capture) == S_OK &&
+                  reinterpret_cast<NoArguments>(slot(capture, 10))(capture) == S_OK,
+              "slots 9/10 (EnableRecord/DisableRecord) succeed, as nothing records offline");
+        VideoCaptureSettings video_capture_settings = reinterpret_cast<VideoCaptureSettings>(slot(capture, 11));
+        check(video_capture_settings(capture, result_bytes) == E_NOINTERFACE &&
+                  video_capture_settings(capture, nullptr) == E_INVALIDARG,
+              "slot 11 (GetVideoCaptureSettings) is E_NOINTERFACE, and E_INVALIDARG without settings");
+        RecordTimespan record_timespan = reinterpret_cast<RecordTimespan>(slot(capture, 12));
+        SYSTEMTIME start_timestamp{};
+        check(record_timespan(capture, &start_timestamp, 1000, result_bytes) == E_NOINTERFACE &&
+                  record_timespan(capture, nullptr, 1000, result_bytes) == E_INVALIDARG,
+              "slot 12 (RecordTimespan) is E_NOINTERFACE, and E_INVALIDARG without a start time");
+        check(reinterpret_cast<ReadLocalStream>(slot(capture, 13))(capture, nullptr, 0, 16, stream_buffer, &bytes_written) == E_INVALIDARG &&
+                  reinterpret_cast<CloseStream>(slot(capture, 14))(capture, nullptr) == E_INVALIDARG,
+              "slots 13/14 (ReadLocalStream/CloseLocalStream) refuse a handle no recording returned");
+
+        StartUserRecord start_user_record = reinterpret_cast<StartUserRecord>(slot(capture, 15));
+        char local_id[32];
+        std::memset(local_id, 'x', sizeof(local_id));
+        check(start_user_record(capture, fake_user, sizeof(local_id), local_id) == E_NOINTERFACE &&
+                  start_user_record(capture, nullptr, sizeof(local_id), local_id) == E_INVALIDARG && local_id[0] == 'x',
+              "slot 15 (StartUserRecord) is E_NOINTERFACE, and E_INVALIDARG without a user");
+        StopUserRecord stop_user_record = reinterpret_cast<StopUserRecord>(slot(capture, 16));
+        check(stop_user_record(capture, "clip", result_bytes) == E_NOINTERFACE &&
+                  stop_user_record(capture, nullptr, result_bytes) == E_INVALIDARG,
+              "slot 16 (StopUserRecord) is E_NOINTERFACE, and E_INVALIDARG without a local id");
+        CancelUserRecord cancel_user_record = reinterpret_cast<CancelUserRecord>(slot(capture, 17));
+        check(cancel_user_record(capture, "clip") == E_NOINTERFACE && cancel_user_record(capture, nullptr) == E_INVALIDARG,
+              "slot 17 (CancelUserRecord) is E_NOINTERFACE, and E_INVALIDARG without a local id");
+        check(std::memcmp(result_bytes, untouched, sizeof(untouched)) == 0,
+              "no XAppCaptureImpl slot writes into the result a title passes");
+        release(capture);
+    }
+
+    const GUID capture_metadata_cls = {0x186d5592, 0xa72d, 0x45fb, {0x95, 0x60, 0x11, 0xae, 0xd0, 0xe6, 0x64, 0x7a}};
+    void* metadata = nullptr;
+    check(query(&capture_metadata_cls, capture_metadata_cls, &metadata) == S_OK && metadata,
+          "QueryApiImpl hands out XAppCaptureMetadataImpl for its class id");
+    if (metadata) {
+        using IsAppBroadcasting = bool(STDMETHODCALLTYPE*)(void*);
+        using ShowUi = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
+        using GetStatus = HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint8_t*);
+        using ChangeCallback = void(CALLBACK*)(void*);
+        using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, ChangeCallback, XTaskQueueRegistrationToken*);
+        using Unregister = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
+        using StringValue = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, const char*, uint8_t);
+        using Int32Value = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, int32_t, uint8_t);
+        using DoubleValue = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, double, uint8_t);
+        using StopState = HRESULT(STDMETHODCALLTYPE*)(void*, const char*);
+        using NoArguments = HRESULT(STDMETHODCALLTYPE*)(void*);
+        using RemainingBytes = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t*);
+
+        check(!reinterpret_cast<IsAppBroadcasting>(slot(metadata, 3))(metadata),
+              "slot 3 (XAppBroadcastIsAppBroadcasting) says nothing is broadcasting");
+        ShowUi show_ui = reinterpret_cast<ShowUi>(slot(metadata, 4));
+        check(show_ui(metadata, fake_user) == E_NOINTERFACE && show_ui(metadata, nullptr) == E_INVALIDARG,
+              "slot 4 (XAppBroadcastShowUI) is E_NOINTERFACE, and E_INVALIDARG without a user");
+
+        GetStatus get_status = reinterpret_cast<GetStatus>(slot(metadata, 5));
+        uint8_t status[16];
+        std::memset(status, 0xA5, sizeof(status));
+        const HRESULT status_result = get_status(metadata, fake_user, status);
+        bool only_disabled_by_system = status[8] == 1 && status[9] == 0xA5;
+        for (int field_index = 0; field_index < 8; ++field_index) only_disabled_by_system = only_disabled_by_system && status[field_index] == 0;
+        check(status_result == S_OK && only_disabled_by_system,
+              "slot 5 (XAppBroadcastGetStatus) fills the nine flags with only isDisabledBySystem set");
+        check(get_status(metadata, nullptr, status) == E_INVALIDARG && get_status(metadata, fake_user, nullptr) == E_INVALIDARG,
+              "slot 5 refuses a missing user or status");
+
+        ChangeCallback on_change = [](void*) {};
+        Register register_broadcast = reinterpret_cast<Register>(slot(metadata, 6));
+        Register register_purged = reinterpret_cast<Register>(slot(metadata, 17));
+        Unregister unregister_broadcast = reinterpret_cast<Unregister>(slot(metadata, 7));
+        Unregister unregister_purged = reinterpret_cast<Unregister>(slot(metadata, 18));
+        XTaskQueueRegistrationToken first_token{};
+        XTaskQueueRegistrationToken second_token{};
+        check(register_broadcast(metadata, nullptr, nullptr, on_change, &first_token) == S_OK &&
+                  register_purged(metadata, nullptr, nullptr, on_change, &second_token) == S_OK && first_token.token != 0 &&
+                  second_token.token != 0 && first_token.token != second_token.token,
+              "slots 6/17 (broadcasting-changed and metadata-purged registration) hand out distinct tokens");
+        check(unregister_broadcast(metadata, first_token, true) && unregister_purged(metadata, second_token, false),
+              "slots 7/18 unregister the tokens");
+        check(register_broadcast(metadata, nullptr, nullptr, on_change, nullptr) == E_POINTER &&
+                  register_purged(metadata, nullptr, nullptr, nullptr, &second_token) == E_POINTER,
+              "slots 6/17 refuse a missing token or callback with E_POINTER");
+
+        StringValue add_string_event = reinterpret_cast<StringValue>(slot(metadata, 8));
+        Int32Value add_int32_event = reinterpret_cast<Int32Value>(slot(metadata, 9));
+        DoubleValue add_double_event = reinterpret_cast<DoubleValue>(slot(metadata, 10));
+        check(add_string_event(metadata, "mission", "started", 1) == S_OK && add_string_event(metadata, "mission", nullptr, 0) == S_OK &&
+                  add_int32_event(metadata, "wanted_level", 3, 1) == S_OK && add_double_event(metadata, "speed", 88.5, 0) == S_OK,
+              "slots 8-10 (AddStringEvent/AddInt32Event/AddDoubleEvent) accept named events, a missing string value too");
+        check(add_string_event(metadata, nullptr, "v", 0) == E_INVALIDARG && add_string_event(metadata, "", "v", 0) == E_INVALIDARG &&
+                  add_int32_event(metadata, nullptr, 1, 0) == E_INVALIDARG && add_double_event(metadata, "", 1.0, 0) == E_INVALIDARG,
+              "slots 8-10 refuse a missing or empty event name");
+        StringValue start_string_state = reinterpret_cast<StringValue>(slot(metadata, 11));
+        Int32Value start_int32_state = reinterpret_cast<Int32Value>(slot(metadata, 12));
+        DoubleValue start_double_state = reinterpret_cast<DoubleValue>(slot(metadata, 13));
+        check(start_string_state(metadata, "area", "city", 0) == S_OK && start_int32_state(metadata, "health", 100, 0) == S_OK &&
+                  start_double_state(metadata, "altitude", 12.5, 0) == S_OK,
+              "slots 11-13 (StartStringState/StartInt32State/StartDoubleState) accept named states");
+        check(start_string_state(metadata, nullptr, "city", 0) == E_INVALIDARG && start_int32_state(metadata, "", 1, 0) == E_INVALIDARG,
+              "slots 11-13 refuse a missing or empty state name");
+        StopState stop_state = reinterpret_cast<StopState>(slot(metadata, 14));
+        check(stop_state(metadata, "area") == S_OK && stop_state(metadata, nullptr) == S_OK && stop_state(metadata, "never_started") == S_OK,
+              "slot 14 (StopState) succeeds for any name, as the PC runtime does");
+        check(reinterpret_cast<NoArguments>(slot(metadata, 15))(metadata) == S_OK, "slot 15 (StopAllStates) succeeds");
+
+        RemainingBytes remaining_bytes = reinterpret_cast<RemainingBytes>(slot(metadata, 16));
+        uint64_t remaining = 0;
+        check(remaining_bytes(metadata, &remaining) == S_OK && remaining == 10240 && remaining_bytes(metadata, nullptr) == E_POINTER,
+              "slot 16 (RemainingStorageBytesAvailable) reports the 10240-byte budget, and E_POINTER without an output");
+        release(metadata);
+    }
 
     // XSystemImpl, asked for as libHttpClient.GDK.dll does: the class id with IXSystemImpl5's interface id.
     const GUID system_cls = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};

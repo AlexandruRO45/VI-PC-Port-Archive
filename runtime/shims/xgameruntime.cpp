@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <iterator>
 #include <mutex>
@@ -30,6 +31,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "xappbroadcast_status.h"
 
 namespace {
 
@@ -474,6 +476,206 @@ const void* const kPersistentStorageVtable[] = {
 #undef PLS
 static_assert(std::size(kPersistentStorageVtable) == 9, "IUnknown + IXPersistentLocalStorageImpl's 5 + Impl3's 1");
 
+constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+constexpr GUID kAppCapture2 = {0x3a949778, 0x772e, 0x4799, {0xbd, 0xea, 0x0a, 0x66, 0x39, 0xe9, 0x6b, 0xaa}};
+constexpr GUID kAppCapture3 = {0x2bbca60a, 0x619c, 0x4fe1, {0x81, 0x2e, 0xfb, 0x5c, 0x1d, 0xbd, 0xcf, 0x51}};
+constexpr GUID kAppCapture4 = {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}};
+constexpr GUID kAppCaptureMetadataClass = {0x186d5592, 0xa72d, 0x45fb, {0x95, 0x60, 0x11, 0xae, 0xd0, 0xe6, 0x64, 0x7a}};
+
+struct XUser;
+using XUserHandle = XUser*;
+struct XAppCaptureScreenshotStream;
+using XAppCaptureScreenshotStreamHandle = XAppCaptureScreenshotStream*;
+struct XAppCaptureLocalStream;
+using XAppCaptureLocalStreamHandle = XAppCaptureLocalStream*;
+struct XAppCaptureDiagnosticScreenshotResult;
+struct XAppCaptureRecordClipResult;
+struct XAppCaptureTakeScreenshotResult;
+struct XAppCaptureVideoCaptureSettings;
+struct XAppCaptureLocalResult;
+struct XAppCaptureUserRecordingResult;
+using XAppBroadcastMonitorCallback = void CALLBACK(void* context);
+using XAppCaptureMetadataPurgedCallback = void CALLBACK(void* context);
+
+HRESULT STDMETHODCALLTYPE capture_take_diagnostic_screenshot(void*, bool, uint16_t, const char*,
+                                                              XAppCaptureDiagnosticScreenshotResult* result) {
+    if (!result) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE capture_record_diagnostic_clip(void*, time_t, uint32_t, const char*,
+                                                          XAppCaptureRecordClipResult* result) {
+    if (!result) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE capture_take_screenshot(void*, XUserHandle requesting_user,
+                                                   XAppCaptureTakeScreenshotResult* result) {
+    if (!requesting_user || !result) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE capture_open_screenshot_stream(void*, const char* local_id, uint16_t,
+                                                          XAppCaptureScreenshotStreamHandle* handle,
+                                                          uint64_t* total_bytes) {
+    if (!local_id || !handle || !total_bytes) return E_INVALIDARG;
+    return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+}
+
+HRESULT STDMETHODCALLTYPE capture_read_screenshot_stream(void*, XAppCaptureScreenshotStreamHandle, uint64_t, uint32_t,
+                                                          uint8_t*, uint32_t*) {
+    return E_INVALIDARG;
+}
+
+HRESULT STDMETHODCALLTYPE capture_close_screenshot_stream(void*, XAppCaptureScreenshotStreamHandle) {
+    return E_INVALIDARG;
+}
+
+HRESULT STDMETHODCALLTYPE capture_enable_record(void*) { return S_OK; }
+
+HRESULT STDMETHODCALLTYPE capture_disable_record(void*) { return S_OK; }
+
+HRESULT STDMETHODCALLTYPE capture_get_video_capture_settings(void*, XAppCaptureVideoCaptureSettings* settings) {
+    if (!settings) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE capture_record_timespan(void*, const SYSTEMTIME* start_timestamp, uint64_t,
+                                                   XAppCaptureLocalResult* result) {
+    if (!start_timestamp || !result) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE capture_read_local_stream(void*, XAppCaptureLocalStreamHandle, size_t, uint32_t, uint8_t*,
+                                                     uint32_t*) {
+    return E_INVALIDARG;
+}
+
+HRESULT STDMETHODCALLTYPE capture_close_local_stream(void*, XAppCaptureLocalStreamHandle) { return E_INVALIDARG; }
+
+HRESULT STDMETHODCALLTYPE capture_start_user_record(void*, XUserHandle requesting_user, uint32_t,
+                                                     char* local_id_buffer) {
+    if (!requesting_user || !local_id_buffer) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE capture_stop_user_record(void*, const char* local_id,
+                                                    XAppCaptureUserRecordingResult* result) {
+    if (!local_id || !result) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE capture_cancel_user_record(void*, const char* local_id) {
+    if (!local_id) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+#define CAP(fn) reinterpret_cast<const void*>(&fn)
+const void* const kAppCaptureVtable[] = {
+    CAP(object_query_interface), CAP(object_add_ref), CAP(object_release),
+    CAP(capture_take_diagnostic_screenshot),
+    CAP(capture_record_diagnostic_clip),
+    CAP(capture_take_screenshot),
+    CAP(capture_open_screenshot_stream),
+    CAP(capture_read_screenshot_stream),
+    CAP(capture_close_screenshot_stream),
+    CAP(capture_enable_record),
+    CAP(capture_disable_record),
+    CAP(capture_get_video_capture_settings),
+    CAP(capture_record_timespan),
+    CAP(capture_read_local_stream),
+    CAP(capture_close_local_stream),
+    CAP(capture_start_user_record),
+    CAP(capture_stop_user_record),
+    CAP(capture_cancel_user_record),
+};
+static_assert(std::size(kAppCaptureVtable) == 18, "IUnknown + IXAppCaptureImpl's 8 + Impl2's 4 + Impl3's 2 + Impl4's 1");
+
+std::atomic<uint64_t> g_app_capture_tokens{0};
+
+HRESULT issue_app_capture_token(bool has_callback, XTaskQueueRegistrationToken* token) {
+    if (!has_callback || !token) return E_POINTER;
+    token->token = g_app_capture_tokens.fetch_add(1) + 1;
+    return S_OK;
+}
+
+bool is_metadata_name_valid(const char* name) { return name && name[0] != '\0'; }
+
+bool STDMETHODCALLTYPE broadcast_is_app_broadcasting(void*) { return false; }
+
+HRESULT STDMETHODCALLTYPE broadcast_show_ui(void*, XUserHandle requesting_user) {
+    if (!requesting_user) return E_INVALIDARG;
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE broadcast_get_status(void*, XUserHandle requesting_user, XAppBroadcastStatus* status) {
+    if (!requesting_user || !status) return E_INVALIDARG;
+    *status = {};
+    status->isDisabledBySystem = true;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE broadcast_register_changed(void*, XTaskQueueHandle, void*,
+                                                      XAppBroadcastMonitorCallback* callback,
+                                                      XTaskQueueRegistrationToken* token) {
+    return issue_app_capture_token(callback != nullptr, token);
+}
+
+bool STDMETHODCALLTYPE app_capture_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+
+HRESULT STDMETHODCALLTYPE metadata_accept_string(void*, const char* name, const char*, uint8_t) {
+    if (!is_metadata_name_valid(name)) return E_INVALIDARG;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE metadata_accept_int32(void*, const char* name, int32_t, uint8_t) {
+    if (!is_metadata_name_valid(name)) return E_INVALIDARG;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE metadata_accept_double(void*, const char* name, double, uint8_t) {
+    if (!is_metadata_name_valid(name)) return E_INVALIDARG;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE metadata_stop_state(void*, const char*) { return S_OK; }
+
+HRESULT STDMETHODCALLTYPE metadata_stop_all_states(void*) { return S_OK; }
+
+HRESULT STDMETHODCALLTYPE metadata_remaining_storage_bytes_available(void*, uint64_t* value) {
+    if (!value) return E_POINTER;
+    *value = 10240;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE metadata_register_purged(void*, XTaskQueueHandle, void*,
+                                                    XAppCaptureMetadataPurgedCallback* callback,
+                                                    XTaskQueueRegistrationToken* token) {
+    return issue_app_capture_token(callback != nullptr, token);
+}
+
+const void* const kAppCaptureMetadataVtable[] = {
+    CAP(object_query_interface), CAP(object_add_ref), CAP(object_release),
+    CAP(broadcast_is_app_broadcasting),
+    CAP(broadcast_show_ui),
+    CAP(broadcast_get_status),
+    CAP(broadcast_register_changed),
+    CAP(app_capture_unregister),
+    CAP(metadata_accept_string),
+    CAP(metadata_accept_int32),
+    CAP(metadata_accept_double),
+    CAP(metadata_accept_string),
+    CAP(metadata_accept_int32),
+    CAP(metadata_accept_double),
+    CAP(metadata_stop_state),
+    CAP(metadata_stop_all_states),
+    CAP(metadata_remaining_storage_bytes_available),
+    CAP(metadata_register_purged),
+    CAP(app_capture_unregister),
+};
+#undef CAP
+static_assert(std::size(kAppCaptureMetadataVtable) == 19, "IUnknown + IXAppCaptureMetadataImpl's 16");
+
 // The ids xgameruntime-docs and the xgameruntime IDL give: XThreadingImpl's and XErrorImpl's class id is also their
 // one interface's; IXNetworkingImpl's id is the class id, and IXNetworkingImpl2 derives from it.
 const GUID* const kNetworkingIids[] = {&kNetworking2, nullptr};
@@ -482,13 +684,17 @@ RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
 RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
 const GUID* const kPersistentStorageIids[] = {&kPersistentStorage2, &kPersistentStorage3, nullptr};
 RuntimeObject g_persistent_storage{kPersistentStorageVtable, &kPersistentStorageClass, kPersistentStorageIids};
+const GUID* const kAppCaptureIids[] = {&kAppCapture2, &kAppCapture3, &kAppCapture4, nullptr};
+RuntimeObject g_app_capture{kAppCaptureVtable, &kAppCaptureClass, kAppCaptureIids};
+RuntimeObject g_app_capture_metadata{kAppCaptureMetadataVtable, &kAppCaptureMetadataClass, nullptr};
 
 RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object()})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &g_app_capture,
+                                 &g_app_capture_metadata, &system_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];
