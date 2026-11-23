@@ -86,6 +86,11 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)
                 continue
+            except RecursionError:
+                trace["bad_lines"] += 1
+                if len(trace["bad_line_numbers"]) < limit:
+                    trace["bad_line_numbers"].append(number)
+                continue
             if not isinstance(event, dict) or "kind" not in event:
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
