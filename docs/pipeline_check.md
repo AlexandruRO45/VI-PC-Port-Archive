@@ -24,6 +24,11 @@ For an index entry with `lds_bytes`, the checker compares the reported workgroup
 limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the
 normal driver check. Mesh pipelines on devices without mesh shader support still use the existing feature skip.
 
+The `make_game.py` pipelines stage checks the root shader index first, then `shaders/spirv/bvh/index.json`
+if present. Both passes use the same output `pipeline_cache.bin`. BVH crash and in-flight reports use
+`pipeline_bvh_crashes.txt` and `pipeline_bvh_inflight.txt`. A checker that lacks crash recovery still
+checks both directories in order when both passes succeed.
+
 ## Options
 
 `vk_pipeline_check <spirv dir> [cache.bin] [options]`

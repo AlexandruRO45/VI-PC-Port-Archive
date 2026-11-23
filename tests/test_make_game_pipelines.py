@@ -115,13 +115,13 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.skip = os.path.join(self.out, "pipeline_crashes.txt")
         self.calls = []
 
-    def stage(self, script, supports=True):
+    def stage(self, script, supports=True, reports=True):
         """script(args, call_number) -> exit code; it may write the in-flight file first."""
         def fake_run(args, hint="", check=True, **kw):
             args = [str(a) for a in args]
             self.calls.append(args)
             code = script(args, len(self.calls))
-            if code in (0, 1) and "--inflight-file" in args:
+            if reports and code in (0, 1) and "--inflight-file" in args:
                 # A native checker that finishes its shader pass clears this report, even on validation failure.
                 with open(args[args.index("--inflight-file") + 1], "w", encoding="utf-8", newline="\n") as f:
                     f.write("")
@@ -240,6 +240,110 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.skip))
         self.assertIn("pipelines: done", logs)
 
+    def test_root_only_run_removes_stale_bvh_reports(self):
+        os.makedirs(self.out)
+        reports = [os.path.join(self.out, "pipeline_bvh_" + suffix + ".txt")
+                   for suffix in ("inflight", "crashes")]
+        for report in reports:
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write("b_mod\n")
+
+        failed, logs = self.stage(lambda args, n: 0)
+
+        self.assertIsNone(failed)
+        self.assertEqual([args[1] for args in self.calls], [self.spirv])
+        self.assertFalse(any(os.path.exists(report) for report in reports))
+        self.assertEqual(logs[-1], "pipelines: done")
+
+    def add_bvh_index(self):
+        bvh = os.path.join(self.spirv, "bvh")
+        os.makedirs(bvh)
+        with open(os.path.join(bvh, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"b_mod": {}}, f)
+        return bvh
+
+    def test_bvh_crashes_use_raw_names_in_separate_reports(self):
+        bvh = self.add_bvh_index()
+        cache = os.path.join(self.out, "pipeline_cache.bin")
+        bvh_inflight = os.path.join(self.out, "pipeline_bvh_inflight.txt")
+        bvh_skip = os.path.join(self.out, "pipeline_bvh_crashes.txt")
+
+        def script(args, n):
+            directory = args[1]
+            is_bvh = directory == bvh
+            inflight = bvh_inflight if is_bvh else self.inflight
+            skip = bvh_skip if is_bvh else self.skip
+            self.assertEqual(args[2], cache)
+            self.assertEqual(args[args.index("--inflight-file") + 1], inflight)
+            if self.skipped(args):
+                self.assertEqual(self.skipped(args), skip)
+                with open(skip, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "b_mod\n")
+                return 0
+            start = args[args.index("--start") + 1]
+            count = args[args.index("--count") + 1]
+            self.assertEqual((start, count), ("0", "1") if is_bvh else
+                             ("1", "1") if self.is_probe(args) else ("0", "3"))
+            with open(inflight, "w", encoding="utf-8", newline="\n") as f:
+                f.write("b_mod\tpipeline\n")
+            return ABORT
+
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, logs = self.stage(script)
+        self.assertIsNotNone(failed)
+        self.assertEqual([args[1] for args in self.calls], [self.spirv] * 3 + [bvh] * 3)
+        self.assertIn("2 module(s) took the driver down and were counted as failed: b_mod, bvh/b_mod", err.getvalue())
+        self.assertNotIn("pipelines: done", logs)
+
+    def test_validation_failure_does_not_prevent_checking_the_other_index(self):
+        bvh = self.add_bvh_index()
+        for failing in (self.spirv, bvh):
+            with self.subTest(failing=failing), mock.patch("sys.stderr", io.StringIO()) as err:
+                self.calls.clear()
+                failed, logs = self.stage(lambda args, n: int(args[1] == failing))
+                self.assertIsNotNone(failed)
+                self.assertEqual([args[1] for args in self.calls], [self.spirv, bvh])
+                self.assertIn("exited with 1", err.getvalue())
+                self.assertNotIn("pipelines: done", logs)
+
+    def test_fatal_root_exit_stops_before_bvh(self):
+        self.add_bvh_index()
+        for code in (2, 0xC000013A):
+            with self.subTest(code=code), mock.patch("sys.stderr", io.StringIO()):
+                self.calls.clear()
+                failed, logs = self.stage(lambda args, n: code)
+                self.assertIsNotNone(failed)
+                self.assertEqual([args[1] for args in self.calls], [self.spirv])
+                self.assertNotIn("pipelines: done", logs)
+
+    def test_root_setup_exit_one_stops_before_bvh(self):
+        self.add_bvh_index()
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            failed, logs = self.stage(lambda args, n: 1, reports=False)
+        self.assertIsNotNone(failed)
+        self.assertEqual([args[1] for args in self.calls], [self.spirv])
+        self.assertIn("before writing its work report", err.getvalue())
+        self.assertNotIn("pipelines: done", logs)
+
+    def test_older_checker_runs_both_indexes_with_legacy_arguments(self):
+        bvh = self.add_bvh_index()
+        cache = os.path.join(self.out, "pipeline_cache.bin")
+
+        def script(args, n):
+            self.assertEqual(args, ["vk_pipeline_check.exe", (self.spirv, bvh)[n - 1], cache])
+            if n == 1:
+                with open(cache, "wb") as f:
+                    f.write(b"root cache")
+            else:
+                with open(cache, "rb") as f:
+                    self.assertEqual(f.read(), b"root cache")
+            return 0
+
+        failed, logs = self.stage(script, supports=False)
+        self.assertIsNone(failed)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(logs[-1], "pipelines: done")
 
     def test_an_older_checker_gets_the_old_invocation(self):
         # Before --inflight-file the checker took unknown arguments as the cache path (it would write the cache into
