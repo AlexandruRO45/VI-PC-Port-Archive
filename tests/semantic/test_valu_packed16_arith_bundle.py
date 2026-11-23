@@ -546,5 +546,28 @@ class TestVPkMulLoU16ReferenceOracle(unittest.TestCase):
         res = eval_pk16("v_pk_mul_lo_u16", a, a)
         self.assertEqual(res & MASK32, eval_pk16("v_pk_mul_lo_u16", a, a))
 
+class TestVPkMulLoU16ASTAndInterpreter(unittest.TestCase):
+    """Symbolic AST definitions and scalar interpreter execution for v_pk_mul_lo_u16."""
+
+    def test_ast_to_asm(self) -> None:
+        inst = VOP3PInstruction(Packed16Opcode.V_PK_MUL_LO_U16, VGPR(0), VGPR(1), VGPR(2))
+        self.assertEqual(inst.to_asm(), "v_pk_mul_lo_u16 v0, v1, v2")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = Packed16MachineState()
+        state.write_vgpr(VGPR(1), 0x0005_000A)
+        state.write_vgpr(VGPR(2), 0x0002_0003)
+        inst = VOP3PInstruction(Packed16Opcode.V_PK_MUL_LO_U16, VGPR(0), VGPR(1), VGPR(2))
+        res = state.step(inst)
+        self.assertEqual(res, state.read_operand(VGPR(0)))
+
+    def test_register_aliasing_dst_src0(self) -> None:
+        state = Packed16MachineState()
+        state.write_vgpr(VGPR(1), 0x0005_000A)
+        state.write_vgpr(VGPR(2), 0x0002_0003)
+        inst = VOP3PInstruction(Packed16Opcode.V_PK_MUL_LO_U16, VGPR(1), VGPR(1), VGPR(2))
+        res = state.step(inst)
+        self.assertEqual(res, state.read_operand(VGPR(1)))
+
 if __name__ == "__main__":
     unittest.main()
