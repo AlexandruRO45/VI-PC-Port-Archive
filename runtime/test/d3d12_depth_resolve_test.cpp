@@ -8,7 +8,8 @@
 // Edge cases (TEST-848) then draw one triangle over the cleared source with a depth-only PSO (depth 0.5, stencil
 // 0x44, test ALWAYS): its diagonal edge leaves the pixels it crosses with samples that differ, so MIN, MAX and
 // AVERAGE reduce over different values. No CPU model of the coverage: the layer must match the host byte for byte,
-// and MIN and MAX must differ somewhere. The layer's VS is a GLSL stand-in (test/glsl/vs_depth_edge.vert, found by
+// except for the measured host quirks below, and MIN and MAX must differ somewhere. WARP is the exact AVERAGE reference
+// where AMD's hardware host differs (TEST-1470). The layer's VS is a GLSL stand-in (test/glsl/vs_depth_edge.vert, found by
 // the FSSM hash of its container), the host's HLSL compiled by d3dcompiler_47; without glslangValidator at build
 // time the edge cases are skipped.
 // Refused resolves must fail Close and leave the destination as it was. AVERAGE by the depth format or of stencil,
@@ -488,6 +489,8 @@ int main() {
             std::string adapter_name;
             if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
+            DXGI_ADAPTER_DESC adapter_desc{};
+            const bool amd_host = !warp && SUCCEEDED(adapter->GetDesc(&adapter_desc)) && adapter_desc.VendorId == 0x1002;
             const char* name = adapter_name.c_str();
             unsigned same = 0, compared = 0, refused_alike = 0, quirks = 0;
             std::vector<const Case*> quirks_seen;  // cases without the edge where this host differs from the clears
@@ -507,14 +510,20 @@ int main() {
                 // host quirk, not a layer bug: report, don't fail. Which D24S8 resolves is the driver's: with stencil
                 // MIN/MAX on both, an RTX 3070 (NVIDIA 610.74) adds "stencil as X24_G8" and "depth as R24_X8" AVERAGE,
                 // a Ryzen 7 9700X iGPU (AMD 32.0.21042.62) depth MIN/MAX; whole subresources and rectangles alike.
-                // Edge cases have no clear model: on WARP, or where the host had a quirk on the same case without the
-                // edge, a difference from the layer is only reported.
-                if (c.edge && (warp || quirky(c))) {
-                    if (FAILED(expected.close) || !same_planes(expected, results[i], true, c.plane))
-                        std::printf("edge %s %s rect %d: %s differs from the layer (information)\n", c.name,
-                                    mode_name(c.mode), int(c.rect), name);
-                    else
+                // Edge cases have no clear model: MIN/MAX differences on WARP, or differences where the host had a
+                // quirk on the same case without the edge, are only reported. AMD's D3D12 AVERAGE depth resolve can
+                // also differ from the layer over differing samples (RX 9060 XT, AMD 26.10.44). Report that as a host
+                // quirk too, but require WARP's AVERAGE to match so an actual layer regression still fails (TEST-1470).
+                const bool amd_average_quirk = c.edge && amd_host && c.mode == average && SUCCEEDED(expected.close) &&
+                                               !same_planes(expected, results[i], false, c.plane);
+                if (c.edge && ((warp && c.mode != average) || quirky(c) || amd_average_quirk)) {
+                    if (FAILED(expected.close) || !same_planes(expected, results[i], true, c.plane)) {
+                        std::printf("edge %s %s rect %d: %s differs from the layer (%s)\n", c.name, mode_name(c.mode),
+                                    int(c.rect), name, amd_average_quirk ? "AMD host quirk" : "information");
+                        if (amd_average_quirk) ++quirks;
+                    } else {
                         ++same;
+                    }
                     continue;
                 }
                 if (!c.edge && SUCCEEDED(expected.close) && !same_planes(expected, expected_planes(c), warp, c.plane)) {
