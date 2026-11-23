@@ -86,7 +86,10 @@ class LodExportTest(unittest.TestCase):
             self.assertLessEqual(set(second), set(first))
             # Every drawable that decodes at LOD 0 either decodes at LOD 1 or is counted as lod-unavailable.
             self.assertEqual(len(second) + unavailable, len(first))
-            self.assertTrue(all(second[k]["Tris"] < first[k]["Tris"] for k in second))
+            # LOD 1 is a coarser list, not LOD 0 again: never more triangles, and fewer for some drawable (a
+            # drawable whose LOD 1 keeps every triangle would still pass).
+            self.assertTrue(all(second[k]["Tris"] <= first[k]["Tris"] for k in second))
+            self.assertTrue(any(second[k]["Tris"] < first[k]["Tris"] for k in second))
             self.assertFalse(any(Path(tmp, "levels", "models_lod1").glob("*_tex")))
 
 
