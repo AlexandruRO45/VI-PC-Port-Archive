@@ -197,7 +197,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1) std::memcpy(&m->queue_desc, reinterpret_cast<const void*>(a1), sizeof(m->queue_desc));
                 return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
-            case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));      // CreateDescriptorHeap
+            case 14:                                                                             // CreateDescriptorHeap
+                if (a1) m->array[14][0] = reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1)->NumDescriptors;
+                return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));
             case 15: return kMockDescriptorInc;                                                  // GetDescriptorHandleIncrementSize
             case 23:                                                                             // CopyDescriptors
                 copy_array(m, 23, a2, a1);                                                       // dest starts
@@ -247,9 +249,6 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (info1 && count > 0) info1[0] = {0, 0x10000, 0x40000};
                 return a1;
             }
-            case 14:                                                         // CreateDescriptorHeap(desc, riid, out)
-                if (a1) m->array[14][0] = reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1)->NumDescriptors;
-                break;
             default: break;
         }
         return S_OK;
@@ -1444,12 +1443,17 @@ int check_view_heap_cap() {
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
     EXPECT(mock->calls[14] == 1 && mock->array[14][0] == D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2);
     EXPECT(heap.NumDescriptors == 1245184);   // the title's description is left as it was
+    EXPECT(made != nullptr && release(made) == 0);
+    made = nullptr;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
     EXPECT(mock->calls[14] == 2 && mock->array[14][0] == 1245184);
+    EXPECT(made != nullptr && release(made) == 0);
+    made = nullptr;
     heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
     EXPECT(mock->calls[14] == 3 && mock->array[14][0] == 4096);   // within the limit: unchanged
+    EXPECT(made != nullptr && release(made) == 0);
     EXPECT(release(device) == 0);
     std::printf("%s: a shader-visible view heap past the PC limit is made at the limit; others pass as asked\n",
                 g_label);
