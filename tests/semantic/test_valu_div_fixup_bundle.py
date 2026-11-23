@@ -539,5 +539,28 @@ class TestVDivFixupF16HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_div_fixup_f16(0x4000, 0x3C00, 0x4000), 0x4000)
 
 
+def ref_div_fixup_f64(s0: float, s1: float, s2: float) -> float:
+    """Reference mathematical oracle for RDNA2 v_div_fixup_f64."""
+    if math.isnan(s2):
+        return s2
+    if math.isnan(s1):
+        return s1
+    sign_out = -1.0 if math.copysign(1.0, s1) != math.copysign(1.0, s2) else 1.0
+    if (s1 == 0.0 and s2 == 0.0) or (math.isinf(s1) and math.isinf(s2)):
+        return bits_to_f64(0xFFF8000000000000)
+    if s2 == 0.0 or math.isinf(s1):
+        return math.copysign(0.0, sign_out)
+    if s1 == 0.0 or math.isinf(s2) or math.isnan(s0):
+        return math.copysign(float("inf"), sign_out)
+    return math.copysign(s0, sign_out)
+
+
+class TestVDivFixupF64Reference(unittest.TestCase):
+    """Reference oracle unit tests for v_div_fixup_f64."""
+
+    def test_reference_finite(self):
+        self.assertEqual(ref_div_fixup_f64(2.5, 2.0, 5.0), 2.5)
+
+
 if __name__ == "__main__":
     unittest.main()
