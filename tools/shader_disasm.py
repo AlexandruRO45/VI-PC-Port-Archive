@@ -43,6 +43,30 @@ def output_path(path: str, out: str) -> str:
     return os.path.join(out, os.path.splitext(os.path.basename(path))[0] + ".s")
 
 
+def same_listing_spelling(path: str, planned: str) -> bool:
+    """Check a possible case alias without following a listing symlink."""
+    if os.path.islink(path) or os.path.islink(planned):
+        return False
+    try:
+        return os.path.samefile(path, planned)
+    except FileNotFoundError:
+        return False
+
+
+def stale_listings(out: str, expected: set[str]) -> list[str]:
+    with os.scandir(out) as entries:
+        listings = {e.name: e.path for e in entries if e.name.endswith(".s") and e.is_file()}
+
+    # An exact name wins even if an obsolete name is a hard link to that listing.
+    # Only ask the filesystem about planned names without an exact directory entry.
+    alternate_spellings = {}
+    for name in expected - listings.keys():
+        alternate_spellings.setdefault(name.casefold(), []).append(os.path.join(out, name))
+    return sorted(path for name, path in listings.items() if name not in expected and not any(
+        same_listing_spelling(path, planned) for planned in alternate_spellings.get(name.casefold(), ())
+    ))
+
+
 def validate_output(out: str, files: list) -> None:
     """Refuse a planned <out>/<stem>.s that is a folder or names an input, before probing llvm-mc or creating --out.
     A single `foo.s` given with --out at its own folder (or the default ../disasm of a file already in disasm/) was
@@ -233,7 +257,7 @@ def main():
     from collections import Counter
     res = Counter()
     total = len(files)
-    every_stem = {os.path.splitext(os.path.basename(p))[0] for p in files}   # before --skip-existing narrows files
+    expected_listings = {os.path.basename(output_path(path, out)) for path in files}
     if a.skip_existing:
         pending = []
         for path in files:
@@ -259,14 +283,10 @@ def main():
         # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune only
         # after a successful decode, so a missing llvm-mc or a failed shader never deletes a usable listing. --limit
         # is a partial run on purpose and leaves the rest of the folder alone.
-        # Every input's stem, not just this run's `files`: --skip-existing leaves the reused listings out of `files`,
+        # Every input's destination, not just this run's `files`: --skip-existing leaves reused listings out of `files`,
         # and pruning against that list deleted every listing a resumed run had just reused.
-        stems = every_stem
-        stale = []
         try:
-            with os.scandir(out) as entries:
-                stale = sorted(e.path for e in entries
-                               if e.name.endswith(".s") and e.is_file() and e.name[:-2] not in stems)
+            stale = stale_listings(out, expected_listings)
             for path in stale:
                 os.remove(path)
         except OSError as e:
