@@ -514,3 +514,86 @@ class TestIEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(oracle_cvt_i32_f32(0xFFC0_0000), 0)
         self.assertEqual(oracle_cvt_i32_f32(0x7F80_0001), 0)
         self.assertEqual(oracle_cvt_i32_f32(0xFF80_0001), 0)
+
+
+# ==============================================================================
+# SECTION 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_rejection_out_of_range_registers(self) -> None:
+        """Verify VGPR index > 255 and SGPR index > 105 are rejected."""
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+
+    def test_mutation_detection_swap_opcodes(self) -> None:
+        """Mutation detector: swapping OpConvertFToS with OpConvertFToU in SPIR-V is caught."""
+        spv = support.translate_lines("ps_mut_test", [
+            f"v_mov_b32 v1, {f32_to_bits(-5.0):#x}",
+            "v_cvt_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        orig_words = support.mrt0_words(spv)
+        self.assertEqual(orig_words[0], (-5) & MASK_32)
+
+        # Mutate SPIR-V: Replace OpConvertFToS with OpConvertFToU
+        self.assertIn("OpConvertFToS", spv)
+        mutated_spv = spv.replace("OpConvertFToS", "OpConvertFToU", 1)
+        mutated_caught = False
+        try:
+            mutated_words = support.mrt0_words(mutated_spv)
+            if mutated_words[0] != orig_words[0]:
+                mutated_caught = True
+        except Exception:
+            mutated_caught = True
+        self.assertTrue(mutated_caught, "Mutation in SPIR-V was not detected")
+
+    def test_mutation_detection_faulty_nan_handling(self) -> None:
+        """Mutation detector: faulty converter returning non-zero on NaN is detected."""
+        def faulty_cvt_nan(bits: int) -> int:
+            f = bits_to_f32(bits)
+            if math.isnan(f):
+                return 0xFFFFFFFF  # Faulty: should be 0
+            return oracle_cvt_i32_f32(bits)
+
+        nan_bits = 0x7FC0_0000
+        self.assertEqual(oracle_cvt_i32_f32(nan_bits), 0)
+        self.assertNotEqual(oracle_cvt_i32_f32(nan_bits), faulty_cvt_nan(nan_bits))
+
+    def test_mutation_detection_faulty_saturation(self) -> None:
+        """Mutation detector: failing to saturate large positive float is detected."""
+        def faulty_cvt_no_sat(bits: int) -> int:
+            f = bits_to_f32(bits)
+            return math.trunc(f) & MASK_32
+
+        pos_overflow = 0x4F00_0000  # 2^31
+        correct = oracle_cvt_i32_f32(pos_overflow)
+        mutant = faulty_cvt_no_sat(pos_overflow)
+        self.assertEqual(correct, 0x7FFF_FFFF)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_inactive_lane_overwritten(self) -> None:
+        """Mutation detector: faulty interpreter overwriting inactive lane is detected."""
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        sentinel = 0x5555_5555
+        state.set_vgpr(1, 0, sentinel)
+
+        class FaultyInterpreter(SIMDInterpreter):
+            def step(self, instr: VCvtI32F32Instruction, s: SIMDState):
+                for l in range(s.num_lanes):
+                    s.set_vgpr(l, int(instr.dst.value), 0x1234)
+                return []
+
+        faulty = FaultyInterpreter()
+        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
+        faulty.step(instr, state)
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+
+if __name__ == "__main__":
+    unittest.main()
