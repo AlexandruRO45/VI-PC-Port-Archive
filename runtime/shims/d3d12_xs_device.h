@@ -15,6 +15,14 @@
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
+//   slot 70   (texture words, view desc, destination handle), no return value: a shader-resource view from raw words
+//             and a GPU address, with no resource (retail boot chain stop 14). The PC slot 70 is CreatePlacedResource1.
+//             The words are not measured, so the destination gets the PC null view (PC CreateShaderResourceView
+//             with no resource) and the call returns.
+//   slot 70   (texture words, view desc, destination handle), no return value: a shader-resource view from raw words
+//             and a GPU address, with no resource (retail boot chain stop 14). The PC slot 70 is CreatePlacedResource1.
+//             The words are not measured, so the destination gets the PC null view (PC CreateShaderResourceView
+//             with no resource) and the call returns.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
@@ -164,11 +172,11 @@ void set_device_presentation_window(void* device, std::uint64_t window);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 13 (console-sized D3D12_OPTIONS), 14 (descriptor heap proxy), 17-24 (CPU
-// descriptor handle translation), 26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
+// descriptor handle translation), 25/26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
 // 32 and 36 (fence proxies), 41 (CreateCommandSignature with the console signature IID), 48/73 and 78/79/80 (the
-// Xbox slots above, at their configured indices), 62, 67, 76, 86, 101, 108 and 133. Slot 10 is intentionally false:
-// the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the
-// proxy handles for the allocator proxy.
+// Xbox slots above, at their configured indices), 56 (GetResourceAllocationInfo1), 62, 67, 70, 76, 86, 101, 108 and
+// 133. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
+// CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
