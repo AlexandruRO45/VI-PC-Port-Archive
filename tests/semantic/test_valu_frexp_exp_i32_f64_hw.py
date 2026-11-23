@@ -148,5 +148,20 @@ class TestFrexpExpF64AstAndTypes(unittest.TestCase):
         self.assertEqual(s32(words[0]), 3)
 
 
+class TestFrexpExpF64DeterministicExecution(unittest.TestCase):
+    def test_normal_range_extremes(self):
+        dbl_min = 2.0**-1022
+        dbl_max = (2.0 - 2.0**-52) * (2.0**1023)
+        self.assertEqual(run_frexp_exp(f64_to_bits(dbl_min)), -1021)
+        self.assertEqual(run_frexp_exp(f64_to_bits(dbl_max)), 1024)
+
+    def test_wide_exponent_spectrum(self):
+        for p in (-1000, -500, -100, -10, 0, 10, 100, 500, 1000):
+            with self.subTest(p=p):
+                val = 2.0**p
+                got = run_frexp_exp(f64_to_bits(val))
+                self.assertEqual(got, p + 1)
+
+
 if __name__ == "__main__":
     unittest.main()
