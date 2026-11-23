@@ -83,7 +83,7 @@ OpBranch %loop
 %loop = OpLabel
 %i = OpPhi %uint %zero %entry %next %cont
 %test = OpULessThan %bool %i %four
-OpLoopMerge %merge %cont {flags} 4 4 2
+OpLoopMerge %merge %cont {flags} 1 8 2
 OpBranchConditional %test %body %merge
 %body = OpLabel
 OpBranch %cont
