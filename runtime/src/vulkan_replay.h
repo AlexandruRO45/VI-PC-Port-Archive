@@ -2839,7 +2839,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 const bool compute = ind->kind == IndirectKind::dispatch;
                 if (!vk.indirect_prepare || !vk.indirect_execute || (compute ? !ind->pipeline : !ind->state))
                     return ReplayResult::unsupported;
-                const GraphicsPipeline* gfx = compute ? nullptr : &out.draws[p.draw].graphics;
+                const GraphicsPipeline* gfx = compute ? nullptr : out.draws[p.draw].graphics;
                 IndirectExpander::Request request;
                 request.signature = &ind->signature;
                 request.pipeline_layout = compute ? p.pipeline.layout : gfx->layout;
