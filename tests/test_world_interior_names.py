@@ -307,6 +307,24 @@ class CliTest(unittest.TestCase):
         with open(os.path.join(folder, "a.bin"), "rb") as f:
             self.assertEqual(f.read(), interiors())
 
+    def test_names_file_that_is_not_the_expected_json_is_one_error(self):
+        # Not JSON, JSON that is not an object, and an InteriorNames that is not one: a JSONDecodeError traceback or
+        # an AttributeError before, one usage error now.
+        folder = self.carved_folder()
+        bad = os.path.join(self.tmp.name, "bad.json")
+        cases = (("not json\n", "cannot be read as JSON"),
+                 ("[1, 2]\n", "expected a JSON object with InteriorNames, found list"),
+                 ('{"InteriorNames": 3}\n', "InteriorNames must be an object, found int"))
+        for content, message in cases:
+            with self.subTest(content=content):
+                with open(bad, "w", encoding="utf-8") as f:
+                    f.write(content)
+                code, err = self.cli_exit([folder, "--names", bad, "--out",
+                                           os.path.join(self.tmp.name, "o.json")])
+                self.assertEqual(code, 2)
+                self.assertIn(message, err)
+                self.assertNotIn("Traceback", err)
+
     def test_out_naming_a_folder_or_under_a_file_is_one_error(self):
         folder = self.carved_folder()
         code, err = self.cli_exit([folder, "--names", self.names, "--out", self.tmp.name])

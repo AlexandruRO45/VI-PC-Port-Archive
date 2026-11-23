@@ -176,9 +176,16 @@ def scan(path, start=None, limit=None, jobs=1):
 
 
 def load_names(path):
-    with open(path, encoding="utf-8") as f:
-        doc = json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except ValueError as e:      # json.JSONDecodeError and UnicodeDecodeError are both ValueErrors
+        raise ValueError("cannot be read as JSON: %s" % e) from None
+    if not isinstance(doc, dict):
+        raise ValueError("expected a JSON object with InteriorNames, found %s" % type(doc).__name__)
     section = doc.get("InteriorNames", doc)
+    if not isinstance(section, dict):
+        raise ValueError("InteriorNames must be an object, found %s" % type(section).__name__)
     out = {}
     for key, items in section.items():
         items = items if isinstance(items, list) else [items]
@@ -302,7 +309,12 @@ def main(argv=None):
         os.makedirs(out_dir, exist_ok=True)
     except OSError as e:
         ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
-    names = load_names(a.names)
+    try:
+        names = load_names(a.names)
+    except OSError as e:
+        ap.error("%s: %s" % (a.names, e.strerror or e))
+    except ValueError as e:
+        ap.error("%s %s" % (a.names, e))
     try:
         found = scan(a.path, a.start, a.limit, a.jobs)
     except ValueError as exc:
