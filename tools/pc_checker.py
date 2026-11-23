@@ -848,7 +848,7 @@ class App:
         try:
             v = int(float(self.ram_var.get()))
             return v if v > 0 else None
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
 
     def refresh(self, *_):
@@ -928,6 +928,13 @@ def _pick_profile(n: int) -> str:
     return names[max(1, min(n, len(names))) - 1]
 
 
+def _positive_ram(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("RAM must be at least 1 GB")
+    return value
+
+
 def run_check(args) -> int:
     """No window. Exit code: 0 good, 1 weak, 2 unknown, 3 player declined (--warn)."""
     checker = SpecChecker(_pick_profile(args.profile))
@@ -955,7 +962,7 @@ def main():
                     help="1 = Xbox Series X, 2 = community 1080p Low estimate")
     ap.add_argument("--cpu", help="override the detected CPU")
     ap.add_argument("--gpu", help="override the detected GPU")
-    ap.add_argument("--ram", type=int, help="override the detected RAM, in GB")
+    ap.add_argument("--ram", type=_positive_ram, help="override the detected RAM, in GB")
     ap.add_argument("--check", action="store_true",
                     help="no window; exit code 0 good, 1 weak, 2 unknown (3 with --warn if declined)")
     ap.add_argument("--json", action="store_true", help="with --check: print JSON")
