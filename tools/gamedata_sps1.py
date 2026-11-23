@@ -17,6 +17,7 @@ Format measured on the Xbox Series 1.0.2.1 common.rpf (offset 0x650000, 43,791 B
 Only header fields, aggregate counts, bucket distributions and hashed queries are
 printed or written; preset and effect names stay on the local machine. Standard
 library only.
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 Usage: `python -I tools/gamedata_sps1.py --help` lists the options.
 """
 from __future__ import annotations
@@ -27,8 +28,10 @@ import json
 import os
 import posixpath
 import re
+import stat
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
 TOOLS = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +40,9 @@ if TOOLS not in sys.path:
 
 import gamedata_index as gi  # noqa: E402
 import gamedata_maps as gm  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from hashdict import joaat  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import sgd5_effects as se  # noqa: E402
 
@@ -387,14 +392,45 @@ def main(argv=None) -> int:
         if matches is not None:
             out["hash_matches"] = matches
         try:
-            gm._make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            write_json(a.json, out)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 1
         print("wrote", a.json)
     return 0
+
+
+def write_json(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    gm._make_parent(path)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".gamedata_sps1-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

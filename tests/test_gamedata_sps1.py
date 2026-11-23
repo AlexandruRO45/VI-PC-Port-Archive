@@ -302,6 +302,17 @@ class GamedataSps1Test(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("neither an SPS1 payload nor an RPF9 archive", p.stderr)
 
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}'
+        path = os.path.join(self.root, "out.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(gamedata_sps1, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                gamedata_sps1.write_json(path, {"payloads": []})
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()
