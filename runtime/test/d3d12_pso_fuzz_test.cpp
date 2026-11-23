@@ -16,6 +16,7 @@
 // GPU (by LUID), or WARP with --warp;
 // --reduce SEED drops draws and triangles while the layer still differs and prints the smallest program left;
 // --all also generates a nonzero DepthBias, which the default leaves out until D3D-325 (#2718) lands.
+// --stream creates every PSO through ID3D12Device2::CreatePipelineState instead (see use_stream).
 // --verbose prints every program. The layer is the device the runtime makes (create_vulkan_device_standalone);
 // LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation. Needs a Vulkan GPU (exit 77 otherwise, and
 // under Wine). No game data.
@@ -36,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -135,6 +137,7 @@ struct Draw {
 };
 
 struct Program {
+    std::uint64_t seed = 0;  // what --stream lays the pipeline-state streams out from
     const ColorFormat* color = nullptr;
     const ColorFormat* color2 = nullptr;  // a second render target, or none
     const DepthFormat* depth = nullptr;
@@ -192,15 +195,113 @@ float color_value(std::mt19937_64& rng) {
 //   VK_EXT_depth_bias_control). Without it every PSO gets DepthBias 0. The random draws are the same either way.
 bool with_depth_bias = false;
 
+// --stream: every PSO through ID3D12Device2::CreatePipelineState, from a pipeline-state stream in d3dx12.h's layout
+// (each subobject pointer-aligned: its type, then its value at the value's own alignment). The subobjects come in a
+// random order; one equal to its default is left out half the time (the runtime then uses the default); the
+// depth-stencil state is DEPTH_STENCIL or DEPTH_STENCIL1 (depth bounds off). The layout comes from its own generator,
+// so --stream draws the same programs as the default.
+bool use_stream = false;
+
+struct Stream {
+    std::vector<std::uint8_t> bytes;
+    template<class T>
+    void add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const T& value) {
+        constexpr size_t align = alignof(void*);
+        const size_t start = (bytes.size() + align - 1) / align * align;
+        const size_t inner = (start + sizeof type + alignof(T) - 1) / alignof(T) * alignof(T);
+        const size_t end = (inner + sizeof(T) + align - 1) / align * align;
+        bytes.resize(end, 0);
+        std::memcpy(bytes.data() + start, &type, sizeof type);
+        std::memcpy(bytes.data() + inner, &value, sizeof(T));
+    }
+};
+
+D3D12_BLEND_DESC default_blend() {
+    D3D12_BLEND_DESC b{};
+    for (D3D12_RENDER_TARGET_BLEND_DESC& rt : b.RenderTarget)
+        rt = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
+              D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+    return b;
+}
+D3D12_RASTERIZER_DESC default_raster() {
+    return {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_BACK, FALSE, 0, 0.0f, 0.0f, TRUE, FALSE, FALSE, 0,
+            D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+}
+D3D12_DEPTH_STENCIL_DESC default_depth() {
+    const D3D12_DEPTH_STENCILOP_DESC keep{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                         D3D12_COMPARISON_FUNC_ALWAYS};
+    return {TRUE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS, FALSE, 0xff, 0xff, keep, keep};
+}
+
+template<class T>
+bool same_bytes(const T& a, const T& b) { return std::memcmp(&a, &b, sizeof(T)) == 0; }
+
+HRESULT create_from_stream(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, std::uint64_t seed,
+                           ID3D12PipelineState** out) {
+    Ref<ID3D12Device2> device2;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device2.p)))) return E_NOINTERFACE;
+    std::mt19937_64 rng(seed * 0xd1342543de82ef95ull + 0x2545f4914f6cdd1dull);
+    std::vector<std::function<void(Stream&)>> parts;
+    const auto optional = [&](bool is_default, std::function<void(Stream&)> f) {
+        if (!is_default || rng() % 2) parts.push_back(std::move(f));
+    };
+    parts.push_back([&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, d.pRootSignature); });
+    parts.push_back([&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, d.VS); });
+    parts.push_back([&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, d.PS); });
+    parts.push_back([&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, d.InputLayout); });
+    parts.push_back([&](Stream& s) {
+        s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, d.PrimitiveTopologyType);
+    });
+    D3D12_RT_FORMAT_ARRAY formats{};
+    formats.NumRenderTargets = d.NumRenderTargets;
+    for (UINT i = 0; i < 8; ++i) formats.RTFormats[i] = d.RTVFormats[i];
+    parts.push_back([formats](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, formats); });
+    optional(same_bytes(d.BlendState, default_blend()),
+             [&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, d.BlendState); });
+    optional(d.SampleMask == UINT_MAX, [&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, d.SampleMask); });
+    optional(same_bytes(d.RasterizerState, default_raster()),
+             [&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, d.RasterizerState); });
+    const bool ds1 = rng() % 2;
+    optional(same_bytes(d.DepthStencilState, default_depth()), [&, ds1](Stream& s) {
+        if (!ds1) {
+            s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, d.DepthStencilState);
+            return;
+        }
+        const D3D12_DEPTH_STENCIL_DESC& a = d.DepthStencilState;
+        const D3D12_DEPTH_STENCIL_DESC1 b{a.DepthEnable, a.DepthWriteMask, a.DepthFunc, a.StencilEnable,
+                                          a.StencilReadMask, a.StencilWriteMask, a.FrontFace, a.BackFace, FALSE};
+        s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, b);
+    });
+    optional(d.DSVFormat == DXGI_FORMAT_UNKNOWN,
+             [&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, d.DSVFormat); });
+    optional(d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0,
+             [&](Stream& s) { s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, d.SampleDesc); });
+    std::shuffle(parts.begin(), parts.end(), rng);
+    Stream stream;
+    for (const auto& part : parts) part(stream);
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{stream.bytes.size(), stream.bytes.data()};
+    return device2->CreatePipelineState(&desc, IID_PPV_ARGS(out));
+}
+
+// A UNORM target is cleared to 0 or 1 per channel, codes every driver writes exactly: a clear value between two codes
+// rounds by the clear's own rules (d3d12_clear_fuzz_test's subject), which a GPU's D3D12 and the layer may break
+// differently (NVIDIA writes a 2-bit alpha of 0.5 as 1, D3D12's ties-to-even 2). The draws are what this test checks.
+void exact_clear(float (&color)[4], const ColorFormat& format) {
+    if (format.kind == ColorFormat::unorm8 || format.kind == ColorFormat::unorm10_2)
+        for (float& v : color) v = v >= 0.5f ? 1.0f : 0.0f;
+}
+
 Program generate(std::uint64_t seed, const Support& sup) {
     std::mt19937_64 rng(seed * 0x9e3779b97f4a7c15ull + 0x5bd1e995);
     const auto pick = [&](UINT n) { return UINT(rng() % n); };
     Program p;
+    p.seed = seed;
     const UINT c = pick(UINT(sup.colors.size()));
     p.color = sup.colors[c];
     p.blendable = sup.blendable[c];
     p.depth = sup.depths[pick(UINT(sup.depths.size()))];
     for (float& v : p.clear_color) v = color_value(rng);
+    exact_clear(p.clear_color, *p.color);
     const bool uint_target = p.color->kind == ColorFormat::uint;
     if (!uint_target && pick(3) == 0) {  // two render targets (float, UNORM; a UINT one needs its own shader)
         UINT c2 = pick(UINT(sup.colors.size()));
@@ -208,6 +309,7 @@ Program generate(std::uint64_t seed, const Support& sup) {
         p.color2 = sup.colors[c2];
         p.blendable2 = sup.blendable[c2];
         for (float& v : p.clear_color2) v = color_value(rng);
+        exact_clear(p.clear_color2, *p.color2);
     }
     p.clear_depth = float(pick(65)) / 64.0f;
     p.clear_stencil = UINT8(rng());
@@ -440,7 +542,9 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         if (p.color2) desc.RTVFormats[1] = p.color2->format;
         desc.DSVFormat = p.depth->format;
         desc.SampleDesc = {1, 0};
-        if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&psos[i].p)))) return fail("PSO refused");
+        const HRESULT hr = use_stream ? create_from_stream(device, desc, p.seed * 64 + i, &psos[i].p)
+                                      : device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&psos[i].p));
+        if (FAILED(hr)) return fail(use_stream ? "CreatePipelineState refused" : "PSO refused");
     }
     D3D12_HEAP_PROPERTIES def{D3D12_HEAP_TYPE_DEFAULT}, up{D3D12_HEAP_TYPE_UPLOAD}, rb{D3D12_HEAP_TYPE_READBACK};
     Ref<ID3D12Resource> color, color2, depth, vertices, readback;
@@ -737,6 +841,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--reduce")) { number(reduce); reducing = true; }
         else if (!std::strcmp(argv[i], "--warp")) warp = true;
         else if (!std::strcmp(argv[i], "--all")) with_depth_bias = true;
+        else if (!std::strcmp(argv[i], "--stream")) use_stream = true;
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
