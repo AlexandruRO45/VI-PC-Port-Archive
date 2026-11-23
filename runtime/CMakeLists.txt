@@ -58,6 +58,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h).
   add_library(gta6rt_root_signature STATIC
     src/root_signature.cpp
+    src/pso_user_signature.cpp
   )
   target_include_directories(gta6rt_root_signature PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_definitions(gta6rt_root_signature PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -455,6 +456,18 @@ if(BUILD_TESTING)
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 
+  # PSO-cache graphics user data -> root signature (#4358): mapping and 32-dword packing, no
+  # GPU, no game data. One record is one stage's user-data block.
+  add_executable(pso_user_signature_test
+    test/pso_user_signature_test.cpp
+    src/root_signature.cpp
+    src/pso_user_signature.cpp
+  )
+  target_include_directories(pso_user_signature_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  if(MSVC)
+    target_compile_options(pso_user_signature_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  add_test(NAME pso_user_signature COMMAND pso_user_signature_test)
   # vk_pipeline_check's memory budget for large modules: pure stdlib, no Vulkan device.
   add_executable(large_module_gate_test test/large_module_gate_test.cpp)
   find_package(Threads REQUIRED)
