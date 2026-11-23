@@ -63,7 +63,7 @@ int wmain(int argc, wchar_t** argv) {
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
-    bool dry_run = false, init = false, run = false, trace_d3d12 = false;
+    bool dry_run = false, init = false, run = false, trace_d3d12 = false, game_dir_given = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     std::wstring trace_file;
     for (int i = 1; i < argc; ++i) {
@@ -77,7 +77,10 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--run") run = true;
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
         else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
-        else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
+        else if (a == L"--game-dir" && i + 1 < argc) {
+            game_dir = argv[++i];
+            game_dir_given = true;
+        }
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
         else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
         else if (a == L"--view-mode-getter" && i + 1 < argc) {
@@ -111,14 +114,17 @@ int wmain(int argc, wchar_t** argv) {
     };
     game_dir = game_dir.empty() ? absolute_or_same(image).parent_path() : absolute_or_same(game_dir);
     if (!overlay_dir.empty()) overlay_dir = absolute_or_same(overlay_dir);
-    // A --game-dir that is not a folder (a file, or a path that does not exist) cannot serve GAME:. Left alone, the
-    // loader maps only the image, the package's imports stay unimplemented, and --dry-run still exits 0, so a mistyped
-    // path reads as a clean dry run.
-    if (std::error_code error; !std::filesystem::is_directory(game_dir, error)) {
-        const auto folder = game_dir.u8string();
-        std::fprintf(stderr, "error: --game-dir is not a folder: %s\n",
-                     reinterpret_cast<const char*>(folder.c_str()));
-        return 2;
+    // An explicit --game-dir that is not a folder (a file, or a path that does not exist) cannot serve GAME:. Left
+    // alone, the loader maps only the image, the package's imports stay unimplemented, and --dry-run still exits 0, so a
+    // mistyped path reads as a clean dry run. The default (the image's folder) is not checked: a mistyped image path is
+    // the loader's "cannot open <image>" (exit 1), not a complaint about an option the user never passed.
+    if (game_dir_given) {
+        if (std::error_code error; !std::filesystem::is_directory(game_dir, error)) {
+            const auto folder = game_dir.u8string();
+            std::fprintf(stderr, "error: --game-dir is not a folder: %s\n",
+                         reinterpret_cast<const char*>(folder.c_str()));
+            return 2;
+        }
     }
     // An image without relocations whose range this process already uses (arm64 Wine on macOS) runs in a new
     // process that has the range reserved from the start (base_reservation.h); that process does not do this again.

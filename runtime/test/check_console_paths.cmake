@@ -1,4 +1,6 @@
-# Redirect the loader's stdout so both console paths must survive as UTF-8.
+# Redirect the loader's stdout so both console paths must survive as UTF-8. The game folder the command names must exist
+# (gta6rt refuses a --game-dir that is not a folder); only its UTF-8 path is checked here.
+file(MAKE_DIRECTORY "game-Игра")
 execute_process(
   COMMAND ${RUNNER} "${LOADER}" --game-dir "game-Игра" --overlay "overlay-保存"
           --run "${GUEST}" -- hello 42

@@ -29,6 +29,16 @@ string(REPLACE "\r\n" "\n" error "${error}")
 if(code STREQUAL "2" AND error MATCHES "--game-dir is not a folder")
   string(APPEND failures "--- an existing folder was refused\n${output}${error}\n")
 endif()
+# Without --game-dir the folder is the image's, and an image path that does not exist is the loader's "cannot open
+# <image>" (exit 1), never a complaint about an option the user did not pass.
+execute_process(
+  COMMAND ${RUNNER} "${LOADER}" --dry-run "${root}/nosuchdir/image.exe"
+  TIMEOUT 60
+  RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
+string(REPLACE "\r\n" "\n" error "${error}")
+if(NOT code STREQUAL "1" OR error MATCHES "--game-dir is not a folder")
+  string(APPEND failures "--- a mistyped image path, no --game-dir: returned ${code}\n${output}${error}\n")
+endif()
 if(failures)
-  message(FATAL_ERROR "gta6rt accepted a --game-dir that is not a folder\n${failures}")
+  message(FATAL_ERROR "gta6rt did not handle --game-dir as it should\n${failures}")
 endif()
