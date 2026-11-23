@@ -985,7 +985,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             else:
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
-            values[res] = f32(-val(a[1]))
+            x = val(a[1])
+            values[res] = -x if types.t[a[0]] == ("float", 64) else f32(-x)
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
