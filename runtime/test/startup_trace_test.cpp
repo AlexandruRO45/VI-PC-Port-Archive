@@ -169,11 +169,11 @@ LONG CALLBACK catch_unhandled_name(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-bool call_thread_name(void* fn, const char* name, DWORD thread_id, ULONG_PTR type = 0x1000) {
+bool call_thread_name(void* fn, const char* name, DWORD thread_id, ULONG_PTR type = 0x1000, DWORD count = 3) {
     // The MSVC sample packs the DWORD thread ID and zero flags in one ULONG_PTR on x64.
-    const ULONG_PTR args[] = {type, reinterpret_cast<ULONG_PTR>(name), thread_id};
+    const ULONG_PTR args[] = {type, reinterpret_cast<ULONG_PTR>(name), thread_id, 0, 0, 0};
     g_unhandled_name = false;
-    reinterpret_cast<decltype(&RaiseException)>(fn)(kThreadNameCode, 0, 3, args);
+    reinterpret_cast<decltype(&RaiseException)>(fn)(kThreadNameCode, 0, count, args);
     return !g_unhandled_name;
 }
 
@@ -274,9 +274,12 @@ void test_legacy_name_without_trace(const fs::path& dir, const fs::path& image) 
     if (!fallback) throw std::runtime_error("cannot install the test's fallback handler");
     check(call_thread_name(raise, "quiet worker", GetCurrentThreadId()), "legacy naming resumes with tracing off");
     check(current_thread_has_name(L"quiet worker"), "an explicit thread ID works with tracing off");
+    check(call_thread_name(raise, "six slot worker", GetCurrentThreadId(), 0x1000, 6),
+          "the six-slot legacy form resumes with tracing off");
+    check(current_thread_has_name(L"six slot worker"), "the six-slot legacy form applies the name");
     check(!call_thread_name(raise, "wrong name", GetCurrentThreadId(), 0x1001),
           "a legacy name with an invalid type reaches the fallback handler");
-    check(current_thread_has_name(L"quiet worker"), "the invalid payload leaves the thread description unchanged");
+    check(current_thread_has_name(L"six slot worker"), "the invalid payload leaves the thread description unchanged");
     RemoveVectoredExceptionHandler(fallback);
 }
 

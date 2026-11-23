@@ -167,8 +167,8 @@ inline bool name_thread(const EXCEPTION_RECORD& r) {
     const auto& args = r.ExceptionInformation;
     // The MSVC x64 sample packs the ID and flags in slot 2. Also accept the four-slot form.
     if (r.ExceptionCode != kThreadNameCode || (r.ExceptionFlags & EXCEPTION_NONCONTINUABLE) ||
-        (r.NumberParameters != 3 && r.NumberParameters != 4) || static_cast<DWORD>(args[0]) != 0x1000 ||
-        !args[1] || (r.NumberParameters == 3 ? args[2] >> 32 : args[3])) return false;
+        (r.NumberParameters != 3 && r.NumberParameters != 4 && r.NumberParameters != 6) || static_cast<DWORD>(args[0]) != 0x1000 ||
+        !args[1] || (r.NumberParameters == 4 ? args[3] : args[2] >> 32)) return false;
 
     const auto* text = reinterpret_cast<const char*>(args[1]);
     constexpr size_t max_name = 32767;  // bound the scan to the native description's UTF-16 size limit
