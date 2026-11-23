@@ -12,8 +12,12 @@ OPENING characters are equal. Reads tracked Markdown only; no game files.
 """
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WINDOW = 3     # lines between the two (1 = neighbours)
@@ -40,8 +44,8 @@ def repeated_lines(text):
 
 def markdown_files():
     try:
-        out = subprocess.run(["git", "ls-files", "*.md"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
-        files = out.split()
+        out = subprocess.run(["git", "ls-files", "-z", "*.md"], cwd=ROOT, capture_output=True, check=True).stdout
+        files = [os.fsdecode(path) for path in out.split(b"\0") if path]
     except (OSError, subprocess.CalledProcessError):
         files = [os.path.relpath(os.path.join(r, f), ROOT).replace(os.sep, "/")
                  for r, d, fs in os.walk(ROOT) if ".git" not in r.split(os.sep) for f in fs if f.endswith(".md")]
@@ -49,6 +53,24 @@ def markdown_files():
 
 
 class RepeatedLines(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "requires git")
+    def test_reads_tracked_markdown_with_spaces_and_unicode(self):
+        names = ["space name.md", "café.md"]
+        line = "A synthetic sentence long enough to trigger the repeated prose check."
+        with tempfile.TemporaryDirectory() as root, patch.dict(globals(), ROOT=root):
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "core.quotePath", "true"], cwd=root, check=True)
+            for name in names:
+                (Path(root) / name).write_bytes((line + "\n" + line).encode("utf-8"))
+            (Path(root) / "untracked.md").touch()
+            subprocess.run(["git", "-c", "core.autocrlf=false", "add", "--", *names], cwd=root, check=True)
+
+            paths = markdown_files()
+            self.assertCountEqual(paths, names)
+            for path in paths:
+                with self.subTest(path=path):
+                    self.assertEqual(repeated_lines((Path(root) / path).read_text(encoding="utf-8")), [(1, 2)])
+
     def test_checker_flags_neighbouring_repeats_only(self):
         a = "The disassembly count is unchanged: the same 42 programs have no invalid word, and"
         text = "\n".join([
