@@ -696,5 +696,38 @@ class TestCeilF16SIMDAndIEEE(unittest.TestCase):
         self.assertEqual(ref_ceil_f16(SNAN16), SNAN16)
 
 
+# ------------------------------------------------------------------------------
+# v_ceil_f16 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+class TestCeilF16HardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(TypeError):
+            VCeilF16Instruction(dst=RegisterOperand(OperandType.SGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
+
+    def test_hardware_translator_execution(self):
+        cases = [
+            (f16_to_bits(1.2), f16_to_bits(2.0)),
+            (f16_to_bits(-1.8), f16_to_bits(-1.0)),
+            (f16_to_bits(4.0), f16_to_bits(4.0)),
+            (POS_ZERO16, POS_ZERO16),
+            (NEG_ZERO16, NEG_ZERO16),
+            (POS_INF16, POS_INF16),
+            (NEG_INF16, NEG_INF16),
+            (QNAN16, QNAN16),
+        ]
+        for src_val, expected in cases:
+            prog = [
+                "v_mov_b32 v0, 0",
+                f"v_mov_b32 v1, {src_val:#x}",
+                "v_ceil_f16 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_ceil_f16_hw", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on ceil_f16({src_val:#x})")
+
+
 if __name__ == '__main__':
     unittest.main()
