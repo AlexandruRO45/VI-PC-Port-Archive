@@ -1836,8 +1836,11 @@ sets them, and it does so twice.
   bits into the copy's v1.1 `Flags` (`+0x28`): `or dword ptr [rsp+68h],3000000h` at `0xc30e`.
 
 `amd_fidelityfx_upscaler_xbox.dll` does neither. Its 29 `RTS0` parts carry `Flags = 0`, and no instruction in it uses
-the constant `0x3000000`. So the bits are not a property of every console root signature; this builder adds them. The
-game executable is not in the package, so whether its root signatures carry them is open.
+the constant `0x3000000`. So the bits are not a property of every console root signature; this builder adds them.
+
+**Measured: retail executable root signatures.** The game executable's own root signatures also carry no `0x03000000` flag bits:
+- **Call site 1** builds a `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` directly with `Flags = 0x80` (`D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT`), with no `0x03xxxxxx` bits.
+- **Call site 2** decodes a compact byte stream using a 16-bit zero-extended read (`movzx`), so `Flags` is bounded to `[0x0000, 0xFFFF]` and cannot represent `0x03000000`. The decoder contains no `0x03xxxxxx` constant.
 
 **Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the
 Agility SDK) and of Windows 11 23H2 (#361) serializes root signatures only up to 1.1. On Windows 10 it rejects even an
