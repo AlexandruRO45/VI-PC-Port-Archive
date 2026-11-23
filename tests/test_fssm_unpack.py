@@ -685,6 +685,47 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.src)),
                          ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
 
+    def test_carve_index_aliasing_fssm_index_is_refused(self):
+        fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1)}))]))
+        idx = os.path.join(self.src, "fssm_index.json")
+        original = '[{"file": "shader_a.dxbc"}]\n'
+        with open(idx, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original)
+
+        aliases = [idx]
+        if os.name == "nt":
+            aliases.append(os.path.join(self.src, "FSSM_INDEX.JSON"))
+        for alias in aliases:
+            with self.subTest(carve_index=os.path.basename(alias)):
+                res = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", alias],
+                                     capture_output=True, text=True, errors="replace")
+                self.assertEqual(res.returncode, 2)
+                self.assertIn("ERROR:", res.stderr)
+                self.assertIn("must not overwrite --carve-index", res.stderr)
+                with open(idx, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_carve_index_aliasing_output_fssm_is_refused(self):
+        fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1)}))]))
+        out_dir = os.path.join(self.src, "fssm")
+        os.makedirs(out_dir)
+        idx = os.path.join(out_dir, "shader_a.fssm")
+        original = '[{"file": "shader_a.dxbc"}]\n'
+        with open(idx, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original)
+
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", idx],
+                             capture_output=True, text=True, errors="replace")
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("ERROR:", res.stderr)
+        self.assertIn("must not overwrite --carve-index", res.stderr)
+        with open(idx, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

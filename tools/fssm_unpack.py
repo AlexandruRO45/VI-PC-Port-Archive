@@ -39,6 +39,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 # Defensive per-blob ceiling, not a maximum defined by the XBCH format.
 # 64 MiB matches the repository's existing per-resource cap in tools/world_index.py.
@@ -180,6 +181,16 @@ def main(argv=None) -> int:
         print(f"ERROR: cannot list shaders in {src}: {e}", file=sys.stderr)
         return 2
     out = os.path.join(src, "fssm")
+    index_out = os.path.join(src, "fssm_index.json")
+    if a.carve_index:
+        if same_report_path(index_out, a.carve_index):
+            print(f"ERROR: output {index_out} must not overwrite --carve-index {a.carve_index}", file=sys.stderr)
+            return 2
+        for shader in shaders:
+            dst = os.path.join(out, os.path.basename(shader)[:-5] + ".fssm")
+            if same_report_path(dst, a.carve_index):
+                print(f"ERROR: output {dst} must not overwrite --carve-index {a.carve_index}", file=sys.stderr)
+                return 2
     try:
         os.makedirs(out, exist_ok=True)
     except OSError as e:
