@@ -286,5 +286,50 @@ class TestSNotB64RegisterAliasing(unittest.TestCase):
         self.assertEqual(hw_res, ref_not_b64(val))
 
 
+@dataclasses.dataclass(frozen=True)
+class Not64StatusFlags:
+    is_zero: bool
+    scc: int
+    all_ones: bool
+    high_bit: int
+
+
+def compute_status_flags(val64: int) -> Not64StatusFlags:
+    res, scc = ref_not_b64_scc(val64)
+    return Not64StatusFlags(
+        is_zero=(res == 0),
+        scc=scc,
+        all_ones=(res == MASK64),
+        high_bit=(res >> 63) & 1,
+    )
+
+
+class TestSNotB64ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and classification."""
+
+    def test_zero_result_flags(self):
+        flags = compute_status_flags(MASK64)
+        self.assertTrue(flags.is_zero)
+        self.assertEqual(flags.scc, 0)
+        self.assertFalse(flags.all_ones)
+        self.assertEqual(flags.high_bit, 0)
+
+    def test_all_ones_flags(self):
+        flags = compute_status_flags(0)
+        self.assertFalse(flags.is_zero)
+        self.assertEqual(flags.scc, 1)
+        self.assertTrue(flags.all_ones)
+        self.assertEqual(flags.high_bit, 1)
+
+    def test_high_bit_flags(self):
+        flags = compute_status_flags(0x7FFFFFFFFFFFFFFF)
+        self.assertEqual(flags.high_bit, 1)
+        self.assertEqual(flags.scc, 1)
+
+        flags = compute_status_flags(0x8000000000000000)
+        self.assertEqual(flags.high_bit, 0)
+        self.assertEqual(flags.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
