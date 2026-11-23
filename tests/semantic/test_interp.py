@@ -3,6 +3,7 @@ and GLSL.std.450 specifications (not from the translator)."""
 import math
 import struct
 import unittest
+from fractions import Fraction
 
 import spirv_mini_interp as si
 import spirv_wave_interp
@@ -324,6 +325,29 @@ OpStore %f32_control %control
                 with self.assertRaisesRegex(si.UnsupportedConstruct, "64-bit"):
                     si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n"
                                     "%res = OpUConvert %uint %r\nOpStore %out %res\n" + FOOTER)
+
+    def test_binary64_fma_sqrt_inverse_sqrt_stay_binary64(self):
+        # A %double result keeps binary64 (v_fma_f64, v_sqrt_f64, v_rsq_f64). Fma rounds once: with
+        # x = 1 + 2**-26, y = 1 + 2**-27 the product's tail is exactly half an ulp, and z = 2**-100 breaks the tie
+        # upward; rounding the product first would lose it.
+        x, y, z = 1 + 2 ** -26, 1 + 2 ** -27, 2 ** -100
+        cases = (("Sqrt %d3", math.sqrt(3.0)), ("InverseSqrt %d3", 1.0 / math.sqrt(3.0)),
+                 ("Fma %dx %dy %dz", float(Fraction(x) * Fraction(y) + Fraction(z))))
+        for inst, want in cases:
+            with self.subTest(inst=inst):
+                lo, hi = struct.unpack("<II", struct.pack("<d", want))
+                types = (f"%double = OpTypeFloat 64\n%v2uint = OpTypeVector %uint 2\n%d3 = OpConstant %double 3\n"
+                         f"%dx = OpConstant %double {x!r}\n%dy = OpConstant %double {y!r}\n"
+                         f"%dz = OpConstant %double {z!r}\n"
+                         f"%wlo = OpConstant %uint {lo}\n%whi = OpConstant %uint {hi}\n")
+                text = (HEADER.replace("%main = OpFunction", types + "%main = OpFunction") +
+                        f"%r = OpExtInst %double %glsl {inst}\n%w = OpBitcast %v2uint %r\n"
+                        "%lo = OpCompositeExtract %uint %w 0\n%hi = OpCompositeExtract %uint %w 1\n"
+                        "%e1 = OpIEqual %bool %lo %wlo\n%e2 = OpIEqual %bool %hi %whi\n"
+                        "%e = OpLogicalAnd %bool %e1 %e2\n"
+                        "%res = OpSelect %uint %e %c1 %c0\nOpStore %out %res\n" + FOOTER)
+                self.assertEqual(si.run_fragment(text)["%out"][0], 1)
+        self.assertNotEqual(float(Fraction(x) * Fraction(y) + Fraction(z)), x * y + z)   # the tie case is one
 
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.

@@ -177,6 +177,22 @@ def fma_f32(x, y, z):
     return f32(math.copysign(r, exact))
 
 
+def fma_f64(x, y, z):
+    """x * y + z with one rounding to binary64, as GLSL.std.450 Fma on a %double. float() of the exact rational is
+    one int / int division, which Python rounds to nearest even once (subnormals included)."""
+    if not all(math.isfinite(v) for v in (x, y, z)):
+        return x * y + z
+    exact = Fraction(x) * Fraction(y) + Fraction(z)
+    if exact == 0:
+        product_zero = x == 0.0 or y == 0.0
+        negative = product_zero and math.copysign(1.0, x) * math.copysign(1.0, y) < 0 and math.copysign(1.0, z) < 0
+        return -0.0 if negative else 0.0
+    try:
+        return float(exact)
+    except OverflowError:
+        return math.copysign(math.inf, exact)
+
+
 def f32_bits(x):
     if isinstance(x, _F32):
         return x.bits
@@ -1114,12 +1130,13 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             elif name == "PackHalf2x16":
                 values[res] = float_to_half(args[0][0]) | (float_to_half(args[0][1]) << 16)
             elif name == "Fma":
-                # Exact product and sum, one rounding to binary32 (fma_f32).
+                # Exact product and sum, one rounding to the result type (fma_f32, or fma_f64 for v_fma_f64).
                 x, y, z = args
+                fma = fma_f64 if types.t[a[0]] == ("float", 64) else fma_f32
                 if isinstance(x, tuple):
-                    values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
+                    values[res] = tuple(fma(p, q, s) for p, q, s in zip(x, y, z))
                 else:
-                    values[res] = fma_f32(x, y, z)
+                    values[res] = fma(x, y, z)
             elif name in ("Sin", "Cos"):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
@@ -1174,10 +1191,10 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                     values[res] = {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
                 elif name == "Log2":
                     values[res] = f32(math.log2(x))
-                elif name == "Sqrt":
-                    values[res] = f32(math.sqrt(x))         # sqrt(-0.0) is -0.0
-                else:
-                    values[res] = f32(1.0 / math.sqrt(x))
+                elif name in ("Sqrt", "InverseSqrt"):
+                    # sqrt(-0.0) is -0.0. A %double result (v_sqrt_f64, v_rsq_f64) stays binary64.
+                    r = math.sqrt(x) if name == "Sqrt" else 1.0 / math.sqrt(x)
+                    values[res] = r if types.t[a[0]] == ("float", 64) else f32(r)
             elif name == "FMin":
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
