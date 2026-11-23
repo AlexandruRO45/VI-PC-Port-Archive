@@ -1084,6 +1084,65 @@ void test_failed_runtime_init_rollback() {
     reset_notifications();
 }
 
+rt::Loader* g_reentrant_loader = nullptr;
+bool g_nested_load_failed = false;
+
+BOOL NTAPI reentrant_dllmain(void* base, DWORD reason, void* reserved) {
+    observe_notification(base, reason, reserved, false);
+    if (reason != DLL_PROCESS_ATTACH) return TRUE;
+    bool handled = false;
+    g_fail_attach = true;
+    void* nested = g_reentrant_loader->load_runtime_module("rt_nested_pending.dll", 0, handled);
+    g_nested_load_failed = !nested && handled && GetLastError() == ERROR_DLL_INIT_FAILED;
+    g_fail_attach = false;
+    return FALSE;
+}
+
+void test_reentrant_runtime_rollback() {
+    const char* what = "nested rollback preserves the remaining initialisation order";
+    reset_notifications();
+    g_nested_load_failed = false;
+    auto fixture = [](uint64_t base, auto entry) {
+        auto img = make_image();
+        nt_of(img)->OptionalHeader.ImageBase = leonida_test::free_image_base(base);
+        nt_of(img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+        nt_of(img)->OptionalHeader.AddressOfEntryPoint = 0x1000;
+        emit_jump_stub(img, 0x200, reinterpret_cast<uint64_t>(entry));
+        return img;
+    };
+    rt::Loader loader(g_dir);
+    loader.load(write_image_as(fixture(0x18A000000, reentrant_dllmain), "rt_outer.dll"));
+    loader.load(write_image_as(fixture(0x18B000000, observe_dllmain), "rt_nested_fail.dll"));
+    loader.load(write_image_as(fixture(0x18C000000, observe_dllmain), "rt_nested_pending.dll"));
+    g_reentrant_loader = &loader;
+    bool handled = false;
+    void* outer = loader.load_runtime_module("rt_outer.dll", 0, handled);
+    const bool outer_failed = !outer && handled && GetLastError() == ERROR_DLL_INIT_FAILED;
+    g_reentrant_loader = nullptr;
+    if (!outer_failed || !g_nested_load_failed || loader.find_loaded_module("rt_nested_pending.dll") ||
+        loader.initialisation_order().size() != 2 || g_notifications.size() != 2) {
+        failed(what, "unexpected nested load result, attach count, or initialisation order");
+        return;
+    }
+
+    write_image_as(fixture(0x18D000000, observe_dllmain), "rt_nested_fail.dll");
+    void* retry = loader.load_runtime_module("rt_nested_fail.dll", 0, handled);
+    write_image_as(fixture(0x18E000000, observe_dllmain), "rt_unrelated_fail.dll");
+    g_fail_attach = true;
+    void* unrelated = loader.load_runtime_module("rt_unrelated_fail.dll", 0, handled);
+    const bool unrelated_failed = !unrelated && handled && GetLastError() == ERROR_DLL_INIT_FAILED;
+    g_fail_attach = false;
+    const auto attach_count = g_notifications.size();
+    const bool kept_retry = loader.find_loaded_module("rt_nested_fail.dll") == retry;
+    if (!retry || !unrelated_failed || !kept_retry ||
+        loader.load_runtime_module("rt_nested_fail.dll", 0, handled) != retry ||
+        g_notifications.size() != attach_count)
+        failed("later rollback preserves a successful retry", "the successful retry was lost or attached twice");
+    else
+        pass("later rollback preserves a successful retry");
+    pass(what);
+}
+
 void test_forwarded_exports() {
     {
         const char* what = "a forwarded export binds to its target instead of into the string";
@@ -1477,6 +1536,7 @@ int main() {
         test_process_detach_dependencies();
         test_failed_dependency_not_registered();
         test_failed_runtime_init_rollback();
+        test_reentrant_runtime_rollback();
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_export_bounds();

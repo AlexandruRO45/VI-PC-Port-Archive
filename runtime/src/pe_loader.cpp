@@ -945,6 +945,7 @@ Module& Loader::load(const std::filesystem::path& image) {
         throw;
     }
     Module& m = *mapped;
+    m.init_sequence = ++init_sequence_;
     init_order_.push_back(&m);
     if (startup_trace::enabled())
         startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
@@ -983,59 +984,45 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     }
 
     if (existing != by_name_.end()) {
-        const size_t init_before = init_order_.size();
+        const size_t init_before = init_sequence_;
         Module* requested = existing->second;
         try {
             initialise();
             return static_cast<void*>(requested->base);
         } catch (const std::exception& e) {
-            rollback_failed_init(init_before, dll_lower, requested);
+            rollback_failed_init(init_before, requested);
             std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
             SetLastError(ERROR_DLL_INIT_FAILED);
             return nullptr;
         }
     }
 
-    const size_t init_before = init_order_.size();
+    const size_t init_before = init_sequence_;
     try {
         Module& m = load(candidate);
         initialise();
         std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
         return static_cast<void*>(m.base);
     } catch (const std::exception& e) {
-        rollback_failed_init(init_before, dll_lower, nullptr);
+        rollback_failed_init(init_before, nullptr);
         std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
     }
 }
 
-void Loader::rollback_failed_init(size_t init_before, const std::string& dll_lower, Module* requested) {
-    // A module whose DllMain returned FALSE must not stay findable by name (a later GetModuleHandle or LoadLibrary
-    // would otherwise hand back the failed DLL). Keep it in init_order_ with initialised=true so later initialise()
-    // calls skip it and ~Loader() detaches it once.
-    for (Module* mod : init_order_) {
-        if (mod->init_failed) by_name_.erase(lower(mod->name));
-    }
-    // Modules newly mapped by this failed load that never ran DllMain (an importer whose dependency failed DllMain,
-    // or a module whose TLS callback validation threw before DllMain) leave both by_name_ and init_order_, so a
-    // later unrelated LoadLibrary neither runs them nor keeps failing on them. ~Loader() still frees them via order_.
-    size_t write = init_before;
-    for (size_t i = init_before; i < init_order_.size(); ++i) {
-        Module* mod = init_order_[i];
-        if (!mod->initialised) {
-            by_name_.erase(lower(mod->name));
-            continue;
+void Loader::rollback_failed_init(size_t init_before, Module* requested) {
+    // Failed DllMain records stay in dependency order for process detach. Unattached modules from
+    // this load leave that order but remain owned by order_ until teardown.
+    std::erase_if(init_order_, [&](Module* mod) {
+        const bool remove = !mod->initialised && !mod->initialising &&
+                            (mod == requested || mod->init_sequence > init_before);
+        if (remove || mod->init_failed) {
+            auto it = by_name_.find(lower(mod->name));
+            if (it != by_name_.end() && it->second == mod) by_name_.erase(it);
         }
-        init_order_[write++] = mod;
-    }
-    init_order_.resize(write);
-    if (requested && !requested->initialised) {
-        by_name_.erase(lower(requested->name));
-        init_order_.erase(std::remove(init_order_.begin(), init_order_.end(), requested), init_order_.end());
-    }
-    if (!dll_lower.empty() && (!requested || !requested->initialised || requested->init_failed))
-        by_name_.erase(dll_lower);
+        return remove;
+    });
 }
 
 void* Loader::resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle) {
@@ -1053,14 +1040,14 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
     owns_handle = true;
     if (auto it = target->exports.find(sym); it != target->exports.end()) return it->second;
     if (auto it = target->forwarders.find(sym); it != target->forwarders.end()) {
-        const size_t init_before = init_order_.size();
+        const size_t init_before = init_sequence_;
         try {
             Binding binding = Binding::Unimplemented;
             void* fn = resolve_forwarder(it->second, binding, 0);
-            if (binding == Binding::Module || init_order_.size() > init_before) initialise();
+            if (binding == Binding::Module || init_sequence_ > init_before) initialise();
             return fn;
         } catch (const std::exception& e) {
-            rollback_failed_init(init_before, {}, nullptr);
+            rollback_failed_init(init_before, nullptr);
             std::fprintf(stderr, "[rt] loader: forwarder %s from %s failed: %s\n", it->second.c_str(),
                          target->name.c_str(), e.what());
             return nullptr;
@@ -1129,12 +1116,32 @@ void Loader::register_unwind(Module& m) {
 void Loader::initialise() {
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
-    for (auto* m : init_order_) initialise(*m);
+    std::lock_guard lock(mutex_);
+    const size_t last = init_sequence_;
+    size_t previous = 0;
+    // An attach callback can recursively load or roll back modules. Look up the next entry
+    // by sequence so no iterator or vector index survives the callback.
+    for (;;) {
+        const auto it = std::upper_bound(init_order_.begin(), init_order_.end(), previous,
+                                         [](size_t sequence, const Module* mod) {
+                                             return sequence < mod->init_sequence;
+                                         });
+        if (it == init_order_.end() || (*it)->init_sequence > last) break;
+        Module& m = **it;
+        previous = m.init_sequence;
+        if (m.initialised || m.initialising) continue;
+        m.initialising = true;
+        try {
+            initialise(m);
+        } catch (...) {
+            m.initialising = false;
+            throw;
+        }
+        m.initialising = false;
+    }
 }
 
 void Loader::initialise(Module& m) {
-    if (m.initialised) return;
-
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
 
