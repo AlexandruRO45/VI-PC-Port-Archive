@@ -106,6 +106,12 @@ Measured (3 light directions, 2,304 pixels each, fp16 readback):
 
 So no CPU BRDF reaches the 1 % needed for a value-for-value check, and `tools/lighting_pass.py` has no such mode.
 
+Which input darkens the direct light only: with this setup, of all T# slots only three scale the direct term, and
+only one of them leaves the ambient alone. A + 0xbe0 r multiplies the direct light by its square (0, 128, 255 give 0,
+7.52, 29.85; its g, b, a and the ambient are unaffected), the behaviour expected of a sun shadow or visibility mask
+stored as a square root; this is the likeliest shadow input, not the A + 0x1400 mask of §3. A + 0xca0 (rgb,
+channel-selective) and A + 0x900 scale it linearly.
+
 HAIR, with the same camera (and A + 0x13c0 at alpha 128, §6), is not zero. It reads two dwords that STANDARD does
 not, B + 0x160 dword 0x158 and B + 0x80 dword 0x4. With either at 0 its output no longer depends on the light (mean
 8.94, the paired difference 0.0013). With both non-zero (0.25, 1 and 4 give identical outputs) the side that faces
