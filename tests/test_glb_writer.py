@@ -884,6 +884,69 @@ f 1//1 2//2 3//3
                     for actual, target in zip(normals[position, uv], expected_normal):
                         self.assertAlmostEqual(actual, target)
 
+    def _material_seam_glb_normals(self, face_blocks):
+        # The two triangles share an edge, have different UVs there, and contribute
+        # +Z and +2Y respectively. Read both material primitives from the final GLB.
+        obj = "\n".join([
+            "v 0 0 0", "v 1 0 0", "v 0 1 0", "v 0 0 2",
+            "vt 0 0", "vt 1 0", "vt 0 1", "vt .75 0", "vt .25 0", "vt .25 1",
+            "vn 1 0 0", *face_blocks,
+        ])
+        prims = glb_writer.parse_obj(obj, is_path=False, up_axis="y")
+        self.assertEqual(len(prims), 2)
+        data = glb_writer.build_glb(prims, materials={"first": {}, "second": {}})
+        gltf = glb_writer.read_glb_summary(data)["json"]
+        json_length, = struct.unpack_from("<I", data, 12)
+        bin_start = 28 + json_length
+
+        def vectors(mesh_primitive, attribute):
+            accessor = gltf["accessors"][mesh_primitive["attributes"][attribute]]
+            self.assertEqual((accessor["componentType"], accessor["type"]), (5126, "VEC3"))
+            view = gltf["bufferViews"][accessor["bufferView"]]
+            start = bin_start + view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+            stride = view.get("byteStride", 12)
+            return [struct.unpack_from("<3f", data, start + i * stride) for i in range(accessor["count"])]
+
+        mesh_primitives = gltf["meshes"][0]["primitives"]
+        self.assertEqual(len(mesh_primitives), 2)
+        result = {}
+        for mesh_primitive in mesh_primitives:
+            name = gltf["materials"][mesh_primitive["material"]]["name"]
+            result[name] = dict(zip(vectors(mesh_primitive, "POSITION"), vectors(mesh_primitive, "NORMAL")))
+        self.assertEqual(set(result), {"first", "second"})
+        return result
+
+    def test_glb_generated_normals_cross_material_seams_in_same_smoothing_group(self):
+        expected = (0.0, 2 / math.sqrt(5), 1 / math.sqrt(5))
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                blocks = ["s 7\nusemtl first\nf 1/1 2/2 3/3", "s 7\nusemtl second\nf 2/4 1/5 4/6"]
+                normals = self._material_seam_glb_normals(blocks[::-1] if reverse else blocks)
+                for material in ("first", "second"):
+                    for position in ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)):
+                        for actual, target in zip(normals[material][position], expected):
+                            self.assertAlmostEqual(actual, target, places=7)
+                self.assertEqual(normals["first"][(0.0, 1.0, 0.0)], (0.0, 0.0, 1.0))
+                self.assertEqual(normals["second"][(0.0, 0.0, 2.0)], (0.0, 1.0, 0.0))
+
+    def test_glb_material_seams_preserve_hard_edges_and_explicit_normals(self):
+        for first_s, second_s, second_face, second_normal in (
+            ("", "", "f 2/4 1/5 4/6", (0.0, 1.0, 0.0)),
+            ("s off", "s off", "f 2/4 1/5 4/6", (0.0, 1.0, 0.0)),
+            ("s 0", "s 0", "f 2/4 1/5 4/6", (0.0, 1.0, 0.0)),
+            ("s 7", "s 8", "f 2/4 1/5 4/6", (0.0, 1.0, 0.0)),
+            ("s 7", "g other", "f 2/4 1/5 4/6", (0.0, 1.0, 0.0)),
+            ("s 7", "o other", "f 2/4 1/5 4/6", (0.0, 1.0, 0.0)),
+            ("s 7", "s 7", "f 2/4/1 1/5/1 4/6/1", (1.0, 0.0, 0.0)),
+        ):
+            with self.subTest(first_s=first_s, second_s=second_s, second_face=second_face):
+                normals = self._material_seam_glb_normals([
+                    f"{first_s}\nusemtl first\nf 1/1 2/2 3/3",
+                    f"{second_s}\nusemtl second\n{second_face}",
+                ])
+                self.assertEqual(set(normals["first"].values()), {(0.0, 0.0, 1.0)})
+                self.assertEqual(set(normals["second"].values()), {second_normal})
+
     def test_parse_obj_explicit_faces_preserve_generated_hard_edge(self):
         # A top face without normals shares two positions with a fully normaled side.
         vertices = ["v 0 1 0", "v 1 1 0", "v 1 1 1", "v 0 1 1", "v 0 0 1", "v 1 0 1"]

@@ -127,6 +127,45 @@ def _compute_smooth_normals(
     return normals
 
 
+def _fill_obj_normals(builders: list[dict]) -> None:
+    """Generate normals for the material primitives of one OBJ object/group."""
+    normal_positions: list[tuple[float, float, float]] = []
+    normal_vertices: list[list[int]] = []
+    first_vertex: dict[tuple[int, int | None, int | None], int] = {}
+    for builder_index, builder in enumerate(builders):
+        vertices = []
+        for (vi, _, _, normal_group), vertex in builder["vert_map"].items():
+            # Positive smoothing groups span materials. With no s directive
+            # or with flat shading, keep the primitive's scope.
+            scope = None if normal_group is not None and normal_group > 0 else builder_index
+            key = (vi, normal_group, scope)
+            normal_vertex = first_vertex.get(key)
+            if normal_vertex is None:
+                normal_vertex = len(normal_positions)
+                first_vertex[key] = normal_vertex
+                normal_positions.append(builder["positions"][vertex])
+            vertices.append(normal_vertex)
+        normal_vertices.append(vertices)
+
+    def normal_indices() -> Iterator[int]:
+        for builder, vertices in zip(builders, normal_vertices):
+            raw_normals = builder["normals"]
+            index_iter = iter(builder["indices"])
+            for a, b, c in zip(index_iter, index_iter, index_iter):
+                # Fully authored triangles do not bend generated normals.
+                if None in (raw_normals[a], raw_normals[b], raw_normals[c]):
+                    yield vertices[a]
+                    yield vertices[b]
+                    yield vertices[c]
+
+    computed = _compute_smooth_normals(normal_positions, normal_indices())
+    for builder, vertices in zip(builders, normal_vertices):
+        normals = builder["normals"]
+        for i, vertex in enumerate(vertices):
+            if normals[i] is None:
+                normals[i] = computed[vertex]
+
+
 def _resolve_obj_index(token: str, count: int) -> int | None:
     if not token:
         return None
@@ -229,8 +268,8 @@ def parse_obj(
 
     Groups primitives in order of appearance by (group_index, material_name),
     converts coordinates to glTF Y-up, flips V for top-left UV origin,
-    deduplicates vertices per primitive, and synthesizes smooth area-weighted
-    normals within the primitive and OBJ smoothing group when explicit normals are missing.
+    deduplicates vertices per primitive, and synthesizes area-weighted normals when explicit
+    normals are missing. Positive smoothing groups span materials within one OBJ object/group.
     """
     up = up_axis.lower()
     if up not in ("z", "y"):
@@ -443,6 +482,7 @@ def parse_obj(
                     "indices": [],
                     "has_any_uv": False,
                     "has_missing_normal": False,
+                    "has_numbered_smoothing": False,
                 }
                 builders[key] = builder
 
@@ -452,6 +492,8 @@ def parse_obj(
                 if smoothing_group == 0:
                     flat_face_id -= 1
                     normal_group = flat_face_id
+                else:
+                    builder["has_numbered_smoothing"] = True
 
             vert_map: dict[tuple[int, int | None, int | None, int | None], int] = builder["vert_map"]
             b_pos: list[tuple[float, float, float]] = builder["positions"]
@@ -482,37 +524,21 @@ def parse_obj(
                             b_nrm.append(None)
                     b_idx.append(local_idx)
 
+    normal_groups: dict[int, list[dict]] = {}
+    for builder in builders.values():
+        if builder["has_numbered_smoothing"]:
+            normal_groups.setdefault(builder["group_index"], []).append(builder)
+        elif builder["has_missing_normal"]:
+            _fill_obj_normals([builder])
+    for group_builders in normal_groups.values():
+        _fill_obj_normals(group_builders)
+
     primitives: list[dict] = []
     for builder in builders.values():
         indices = builder["indices"]
         positions = builder["positions"]
         if not indices or not positions:
             continue
-
-        if builder["has_missing_normal"]:
-            # UVs and explicit normals split render vertices. Generated normals
-            # share an accumulator for each position within the same smoothing group.
-            first_vertex: dict[tuple[int, int | None], int] = {}
-            normal_vertices = [
-                first_vertex.setdefault((vi, normal_group), vertex)
-                for (vi, _, _, normal_group), vertex in builder["vert_map"].items()
-            ]
-            raw_normals = builder["normals"]
-            index_iter = iter(indices)
-            # Fully explicit triangles should not smooth neighboring generated normals.
-            normal_indices = (
-                normal_vertices[i]
-                for a, b, c in zip(index_iter, index_iter, index_iter)
-                if None in (raw_normals[a], raw_normals[b], raw_normals[c])
-                for i in (a, b, c)
-            )
-            computed = _compute_smooth_normals(positions, normal_indices)
-            normals = [
-                normal if normal is not None else computed[normal_vertex]
-                for normal, normal_vertex in zip(raw_normals, normal_vertices)
-            ]
-        else:
-            normals = builder["normals"]
 
         if builder["has_any_uv"]:
             uvs = [uv if uv is not None else (0.0, 0.0) for uv in builder["uvs"]]
@@ -524,7 +550,7 @@ def parse_obj(
             "material": builder["material"],
             "group_index": builder["group_index"],
             "positions": positions,
-            "normals": normals,
+            "normals": builder["normals"],
             "uvs": uvs,
             "indices": indices,
         })
