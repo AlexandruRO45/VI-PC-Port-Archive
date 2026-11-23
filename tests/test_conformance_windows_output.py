@@ -75,6 +75,36 @@ class RedirectedOutput(unittest.TestCase):
         self.assertIn(b"missing_", run.stderr)
         self.assertNotIn(b"Traceback", run.stderr)
 
+    def test_help_with_missing_or_captured_stdout(self):
+        control = self.run_python("utf-8", str(COMPARE), "--help")
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertIn(b"usage:", control.stdout)
+        self.assertEqual(control.stderr, b"")
+        code = (
+            "import io, runpy, sys\n"
+            "from pathlib import Path\n"
+            "path, mode = sys.argv[1:]\n"
+            "capture = io.StringIO() if mode == 'captured' else None\n"
+            "sys.stdout = capture\n"
+            "sys.argv = [path, '--help']\n"
+            "try:\n"
+            "    runpy.run_path(path, run_name='__main__')\n"
+            "finally:\n"
+            "    if capture is not None:\n"
+            "        Path('captured.txt').write_bytes(capture.getvalue().encode('utf-8'))\n"
+        )
+        for mode in ("missing", "captured"):
+            with self.subTest(mode=mode):
+                run = self.run_python("utf-8", "-c", code, str(COMPARE), mode)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout, b"")
+                if mode == "missing":
+                    self.assertEqual(run.stderr.splitlines(), control.stdout.splitlines())
+                else:
+                    self.assertEqual(run.stderr, b"")
+                    captured = (self.root / "captured.txt").read_bytes()
+                    self.assertEqual(captured.splitlines(), control.stdout.splitlines())
+
     def test_import_preserves_stdout(self):
         code = (
             "import runpy, sys\n"
