@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -250,6 +251,38 @@ class NativeTests(unittest.TestCase):
             expected = mp.summarise_page(src, "radius", **ALL)
         self.assertEqual(expected["checks"]["centres_4240_radius_covers_within_rounding"], 1)
         self.assertEqual(json_bytes(expected), json_bytes(mp.summarise_page(src, "radius", **ALL)))
+
+    def test_shared_block_sparse_groups_decode_only_referenced_vertices(self):
+        # One 65,536-vertex block shared by 1,024 one-triangle groups that reference only its last
+        # three vertices: the work per group must follow the group, not the block.
+        n, groups = 65536, 1024
+        packed = [(v & 255, (v >> 8) & 255, (v * 37) & 0xffff) for v in range(n)]
+        q = other_block(n, TAGS, packed=packed, scale=(0.25, 0.25, 0.125))
+        group = mesh_group([([n - 3, n - 2, n - 1], [(0, 1, 2)], 0x4c00, 0x7ff7ff, 0x700007ff)])
+        src = page(q, *([group] * groups))
+        block_record, *records = mp.parse_page(src)
+        self.assertEqual(len(records), groups)
+        self.assertEqual({r["vertex_span"] for r in records}, {n})
+        flags = dict(faces=True, centres=True, normals=False, cones=True)
+        for record in records[:8]:
+            for options in (flags, ALL):
+                self.assertIsNotNone(native.geometry(src, record, block_record, **options))
+
+        def run(option, **options):
+            with patch.object(mp, "_native", option):
+                start = time.perf_counter()
+                result = mp.summarise_page(src, "shared", **options)
+                return json_bytes(result), time.perf_counter() - start
+
+        expected, python_time = run(None, **flags)
+        actual, native_time = run(native, **flags)
+        self.assertEqual(expected, actual)
+        self.assertLess(native_time, python_time, f"native {native_time:.3f}s, Python {python_time:.3f}s")
+        # Normals make the Python reference decode the whole block per group; compare a prefix of the groups.
+        short = page(q, *([group] * 8))
+        with patch.object(mp, "_native", None):
+            expected = mp.summarise_page(short, "shared", **ALL)
+        self.assertEqual(json_bytes(expected), json_bytes(mp.summarise_page(short, "shared", **ALL)))
 
     def test_isolated_cli_json(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -279,9 +279,16 @@ fn face_counts(edges: HashMap<u32, Edge>, normals: &[Option<Vec3>], compensated:
     result
 }
 
-fn normal_counts(stored: &[u8], mode: u32, accum: &[Vec3], compensated: bool) -> [u32; 4] {
+fn normal_counts(
+    stored: &[u8],
+    ids: &[usize],
+    mode: u32,
+    accum: &[Vec3],
+    compensated: bool,
+) -> [u32; 4] {
     let mut result = [0; 4];
-    for (s, word) in accum.iter().zip(stored.chunks_exact(4)) {
+    for (s, &id) in accum.iter().zip(ids) {
+        let word = &stored[4 * id..4 * id + 4];
         let norm = length(*s);
         if norm == 0.0 || !norm.is_finite() {
             continue;
@@ -425,13 +432,33 @@ fn geometry(
     }
     let positions = region(src, block.position_at, block.vertices, 8)?;
     let transform = PositionTransform::read(src, block.header)?;
-    let mut points = allocated(block.vertices)?;
-    points.extend(positions.chunks_exact(8).map(|word| transform.decode(word)));
     let stored_normals = if flags & NORMALS != 0 && matches!(block.normal_mode, 1 | 7) {
         region(src, block.normal_at, block.vertices, 4)?
     } else {
         &[]
     };
+    // Decode only the vertices this group's meshlets reference: a block shared by many
+    // sparse groups must not cost O(block vertices) per group.
+    let mut unique = allocated(group.refs.len() / 2)?;
+    for meshlet in group.meshlets() {
+        let meshlet = meshlet?;
+        let refs = region(group.refs, meshlet.vertex_base * 2, meshlet.vertices, 2)?;
+        for word in refs.chunks_exact(2) {
+            let index = u16_at(word, 0) as usize;
+            if index >= block.vertices {
+                return None;
+            }
+            unique.push(index);
+        }
+    }
+    unique.sort_unstable();
+    unique.dedup();
+    let mut points = allocated(unique.len())?;
+    points.extend(
+        unique
+            .iter()
+            .map(|&i| transform.decode(&positions[8 * i..8 * i + 8])),
+    );
 
     let face_check = flags & FACES != 0;
     let triangle_count = group.triangles.len() / 4;
@@ -440,8 +467,9 @@ fn geometry(
     if face_check {
         edges.try_reserve(3 * triangle_count).ok()?;
     }
-    let mut accum = allocated(stored_normals.len() / 4)?;
-    accum.resize(stored_normals.len() / 4, [0.0; 3]);
+    let accum_len = if stored_normals.is_empty() { 0 } else { unique.len() };
+    let mut accum = allocated(accum_len)?;
+    accum.resize(accum_len, [0.0; 3]);
     let mut out = [0u32; RESULT_LEN];
     out[3] = (group.records.len() / 16) as u32;
     out[6] = 3 * out[3];
@@ -451,10 +479,7 @@ fn geometry(
         let refs = region(group.refs, meshlet.vertex_base * 2, meshlet.vertices, 2)?;
         let mut vertex = [0; 128];
         for (i, word) in refs.chunks_exact(2).enumerate() {
-            vertex[i] = u16_at(word, 0) as usize;
-            if vertex[i] >= points.len() {
-                return None;
-            }
+            vertex[i] = unique.binary_search(&(u16_at(word, 0) as usize)).ok()?;
         }
         if flags & CENTRES != 0 {
             let mut local = [[0.0; 3]; 128];
@@ -514,6 +539,7 @@ fn geometry(
     if !accum.is_empty() {
         out[17..].copy_from_slice(&normal_counts(
             stored_normals,
+            &unique,
             block.normal_mode,
             &accum,
             compensated,
