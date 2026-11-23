@@ -242,8 +242,26 @@ void test_downgrade_1_2_to_1_1(bool supports_1_2) {
         const bool rewritten = rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(f.desc, kept, untouched);
         check(!rewritten && kept.size() == 1 && untouched.Version == D3D_ROOT_SIGNATURE_VERSION_1_0,
               flag == D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR
-                  ? "1.2 with a UINT border colour sampler flag is not rewritten, outputs untouched"
+                  ? "1.2 with the UINT border colour flag on a float border colour is not rewritten, outputs untouched"
                   : "1.2 with a non-normalized coordinates sampler flag is not rewritten, outputs untouched");
+    }
+
+    for (D3D12_STATIC_BORDER_COLOR colour : {D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT,
+                                            D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT}) {
+        Desc12 u;
+        u.samplers[1].BorderColor = colour;
+        u.samplers[1].Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+        std::vector<D3D12_STATIC_SAMPLER_DESC> converted;
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC rewritten{};
+        check(rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(u.desc, converted, rewritten) &&
+                  rewritten.Version == D3D_ROOT_SIGNATURE_VERSION_1_1 && converted.size() == 2 &&
+                  same_sampler(converted[0], u.samplers[0]) && same_sampler(converted[1], u.samplers[1]),
+              colour == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT
+                  ? "1.2 with the UINT border colour flag on OPAQUE_BLACK_UINT is rewritten as 1.1, the colour kept"
+                  : "1.2 with the UINT border colour flag on OPAQUE_WHITE_UINT is rewritten as 1.1, the colour kept");
+        Blobs b;
+        check(SUCCEEDED(D3D12SerializeVersionedRootSignature(&rewritten, &b.blob, &b.error)),
+              "the 1.1 rewrite with a UINT border colour is accepted by the PC serializer");
     }
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC v11in{};
@@ -365,17 +383,32 @@ void test_registered_shim(bool supports_1_2) {
         }
     }
 
-    // Sampler flags have no 1.1 form: the host's own answer where it takes 1.2, a refusal where it doesn't.
+    // The UINT border colour flag next to a UINT border colour changes nothing, so it serializes on every runtime.
     Desc12 flagged;
     flagged.samplers[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;
     flagged.samplers[0].Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
     Blobs fb;
-    const HRESULT hr_flagged = fn(&flagged.desc, &fb.blob, &fb.error);
-    if (supports_1_2)
-        check(SUCCEEDED(hr_flagged), "registered shim forwards 1.2 with sampler flags to a runtime that takes 1.2");
-    else
-        check(hr_flagged == E_INVALIDARG && !fb.blob,
-              "registered shim refuses 1.2 with sampler flags when the runtime stops at 1.1");
+    check(SUCCEEDED(fn(&flagged.desc, &fb.blob, &fb.error)),
+          "registered shim serializes 1.2 with the UINT border colour flag on a UINT border colour");
+    if (fb.blob && !supports_1_2) {
+        ID3D12VersionedRootSignatureDeserializer* de = nullptr;
+        check(SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(
+                  fb.blob->GetBufferPointer(), fb.blob->GetBufferSize(), IID_PPV_ARGS(&de))) &&
+                  de && de->GetUnconvertedRootSignatureDesc()->Version == D3D_ROOT_SIGNATURE_VERSION_1_1 &&
+                  de->GetUnconvertedRootSignatureDesc()->Desc_1_1.NumStaticSamplers == 2 &&
+                  same_sampler(de->GetUnconvertedRootSignatureDesc()->Desc_1_1.pStaticSamplers[0],
+                               flagged.samplers[0]),
+              "the shim's 1.1 blob keeps the OPAQUE_WHITE_UINT border colour");
+        if (de) de->Release();
+    }
+
+    if (!supports_1_2) {
+        Desc12 unnormalized;
+        unnormalized.samplers[0].Flags = D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+        Blobs ub;
+        check(fn(&unnormalized.desc, &ub.blob, &ub.error) == E_INVALIDARG && !ub.blob,
+              "registered shim refuses 1.2 with non-normalized coordinates when the runtime stops at 1.1");
+    }
 }
 
 void test_deserializer() {

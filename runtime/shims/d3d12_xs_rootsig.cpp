@@ -9,6 +9,13 @@ D3D12_ROOT_SIGNATURE_FLAGS clear_high_byte(D3D12_ROOT_SIGNATURE_FLAGS flags) {
     return static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<uint32_t>(flags) & ~kXboxRootSignatureFlagHighByte);
 }
 
+bool expressible_in_1_1(const D3D12_STATIC_SAMPLER_DESC1& s) {
+    if (s.Flags == D3D12_SAMPLER_FLAG_NONE) return true;
+    return s.Flags == D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR &&
+           (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT ||
+            s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT);
+}
+
 uint32_t rotl(uint32_t x, int c) { return (x << c) | (x >> (32 - c)); }
 
 void md5_block(uint32_t state[4], const uint32_t m[16]) {
@@ -99,7 +106,7 @@ bool downgrade_root_signature_1_2_to_1_1(const D3D12_VERSIONED_ROOT_SIGNATURE_DE
     const D3D12_ROOT_SIGNATURE_DESC2& desc = in.Desc_1_2;
     if (desc.NumStaticSamplers != 0 && !desc.pStaticSamplers) return false;
     for (UINT i = 0; i < desc.NumStaticSamplers; ++i)
-        if (desc.pStaticSamplers[i].Flags != D3D12_SAMPLER_FLAG_NONE) return false;
+        if (!expressible_in_1_1(desc.pStaticSamplers[i])) return false;
 
     samplers.resize(desc.NumStaticSamplers);
     for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
