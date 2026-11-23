@@ -70,6 +70,35 @@ class RegenFixturesTest(unittest.TestCase):
             self.assertTrue(f.read().startswith("; written by hand"))
         self.assertEqual(self.run_main("--check")[0], 0)
 
+    def test_named_generation_keeps_a_hand_written_collision(self):
+        manual = os.path.join(self.fix, "cs_a.s")
+        original = "; hand-written fixture\n\ts_endpgm\n"
+        self.write(manual, original)
+        code, out, err = self.run_main("cs_a", "cs_b")
+        self.assertEqual(code, 1)
+        self.assertIn("cs_a.s", err)
+        self.assertIn("refusing to overwrite", err)
+        with open(manual, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(rf.marked_names(), ["cs_b"])
+        self.assertIn("cs_b.s", out)
+        self.assertEqual(self.run_main("--check", "cs_b")[0], 0)
+
+    def test_bulk_generation_keeps_a_hand_written_collision(self):
+        rf.mark("cs_a")
+        rf.mark("cs_b")
+        manual = os.path.join(self.fix, "cs_a.s")
+        original = "; hand-written fixture\n\ts_endpgm\n"
+        self.write(manual, original)
+        code, out, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("cs_a.s", err)
+        self.assertIn("refusing to overwrite", err)
+        with open(manual, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(rf.generated_names(), ["cs_b"])
+        self.assertIn("cs_b.s", out)
+
     def test_check_reports_a_stale_fixture(self):
         self.run_main("cs_a")
         self.write(os.path.join(self.asm, "cs_a.asm"), rf.ASM_MARK + "\nv_mov_b32 v0, 2\ns_endpgm\n")

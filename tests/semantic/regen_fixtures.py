@@ -14,7 +14,8 @@ There is no list to edit. A source opts in with the comment line `ASM_MARK` in i
 the fixture), so adding a fixture touches only that .asm and the new .s, and two PRs that add different fixtures no
 longer edit the same lines. `--check` compares every marked source with its fixture (a missing fixture is reported)
 and also reports a generated fixture whose source is no longer marked. Hand-written fixtures in the same folder
-(another first line) are left alone.
+(another first line) are left alone. If a selected source has the same name, regeneration reports the collision
+and continues with the other sources, then exits 1.
 """
 import os
 import sys
@@ -44,11 +45,16 @@ def generated_names(directory=None):
     directory = directory or FIXTURE_DIR
     names = []
     for fname in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
-        if fname.endswith(".s"):
-            with open(os.path.join(directory, fname), encoding="utf-8") as f:
-                if HEADER_MARK in f.readline():
-                    names.append(fname[:-2])
+        if fname.endswith(".s") and has_generated_header(os.path.join(directory, fname)):
+            names.append(fname[:-2])
     return names
+
+
+def has_generated_header(path):
+    if not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        return HEADER_MARK in f.readline()
 
 
 SHADERS = tuple(marked_names())
@@ -87,12 +93,17 @@ def main(argv):
     if missing:
         print(f"no runtime/test/shaders/{missing[0]}.asm", file=sys.stderr)
         return 2
-    if named and not check:
-        for name in named:
-            mark(name)
     bad = 0
     for name in named or marked_names():
         path = os.path.join(FIXTURE_DIR, name + ".s")
+        if not check:
+            if os.path.lexists(path) and not has_generated_header(path):
+                print(f"{name}: refusing to overwrite {shown(path)} without the generated fixture header",
+                      file=sys.stderr)
+                bad += 1
+                continue
+            if named:
+                mark(name)
         want = render(name)
         if check:
             have = ""
