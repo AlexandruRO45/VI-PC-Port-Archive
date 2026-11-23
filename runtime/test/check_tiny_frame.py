@@ -11,8 +11,10 @@ there is no usable Vulkan device on this machine.
 import argparse
 import os
 import re
-import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I leaves the script's folder out
+import wine_session  # noqa: E402
 
 SKIP = 77
 
@@ -99,18 +101,23 @@ def main():
     options = parser.parse_args()
     timeout = 180 if options.runner else 90  # a first start of Wine in a fresh prefix can take tens of seconds
 
+    # wine_session.run: output through a file, the wait on the process, and with an xvfb-run runner the prefix's
+    # Wine stopped around each run, since Wine left on another X server can hang the next Vulkan call.
     if options.probe:
-        probe = subprocess.run([*options.runner, options.probe], capture_output=True, timeout=timeout)
-        if probe.returncode == SKIP:
+        code, _ = wine_session.run([*options.runner, options.probe], timeout)
+        if code == SKIP:
             print("SKIP: no usable Vulkan device (the probe test skipped)")
             return SKIP
 
     environment = dict(os.environ, LEONIDA_D3D12="vulkan")
-    run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
-                         cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=timeout)
-    output = run.stdout + run.stderr
-    problems = check_output(run.returncode, output)
+    code, output = wine_session.run([*options.runner, options.loader, "--run", os.path.basename(options.guest),
+                                     "--trace-d3d12"], timeout, cwd=os.path.dirname(os.path.abspath(options.guest)),
+                                    env=environment)
+    if code is None:
+        print(output)
+        print(f"FAIL: no exit after {timeout} s; the run was killed")
+        return 1
+    problems = check_output(code, output)
     if problems:
         print(output)
         for problem in problems:

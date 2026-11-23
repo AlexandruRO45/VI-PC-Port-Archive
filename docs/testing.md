@@ -177,6 +177,17 @@ Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (
 as CI does: `WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a ctest --test-dir runtime/build/windows`
 (packages `xvfb` and `xauth`, which `xvfb-run` needs). With Mesa installed, the tests then run on llvmpipe.
 
+Run everything that shares a prefix under one `xvfb-run`, or stop the prefix between runs. `xvfb-run -a` closes its
+X display when its run ends, while the prefix's `wineserver` and `explorer.exe` stay a few seconds longer on it; a Wine
+program started then under a new display can block in its first Vulkan call (`wine_vk_init`) and never return, and
+the prefix stays stuck after that (Wine 11.0: 20 `d3d12_com_test` runs back to back, each under its own `xvfb-run
+-a`: the first passed, the other 19 hung; with `wineserver -k` before each, all 20 passed). So
+`scripts/run_wine_tests.py` stops the prefix's `wineserver` (`-k`, then `-w`, each bounded) before its tests, and
+before each test when `--wine` is an `xvfb-run` command; `check_tiny_frame.py` and `check_d3d12_trace.py` do it before
+and after each run when their `--runner` is, and read a run's output from a file, not a pipe, which a leftover
+`wineserver` would keep open (`runtime/test/wine_session.py`). That ends every Wine program of the prefix, so
+don't run two of them in one prefix at once. By hand: `WINEPREFIX=... wineserver -k` before each `xvfb-run`.
+
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
 runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are

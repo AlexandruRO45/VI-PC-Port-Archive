@@ -1,8 +1,12 @@
 """Check the trace on the CPU command-list fixture, or on d3d12_com_test with --queue."""
 
 import argparse
+import os
 import re
-import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I leaves the script's folder out
+import wine_session  # noqa: E402
 
 
 RUNNER = []  # the command that runs a Windows executable here: empty on Windows, ["wine"] for a cross build
@@ -10,11 +14,15 @@ RUNNER = []  # the command that runs a Windows executable here: empty on Windows
 
 def run_fixture(exe, *args):
     # A first start of Wine in a fresh prefix can take tens of seconds, hence the longer limit through a runner.
-    process = subprocess.run([*RUNNER, exe, *args], capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=120 if RUNNER else 30)
-    if process.returncode:
-        raise SystemExit(f"{exe} exited with {process.returncode}\n{process.stdout}{process.stderr}")
-    return [line for line in process.stderr.splitlines() if line.startswith("[d3d12-trace]")]
+    # wine_session.run: output through a file, the wait on the process, and with an xvfb-run runner the prefix's Wine
+    # stopped around the run, since Wine left on another X server can hang the next Vulkan call.
+    timeout = 120 if RUNNER else 30
+    code, output = wine_session.run([*RUNNER, exe, *args], timeout)
+    if code is None:
+        raise SystemExit(f"{exe} did not exit within {timeout} s\n{output}")
+    if code:
+        raise SystemExit(f"{exe} exited with {code}\n{output}")
+    return [line for line in output.splitlines() if line.startswith("[d3d12-trace]")]
 
 
 def main():

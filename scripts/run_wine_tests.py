@@ -12,6 +12,10 @@ Some tests open files through absolute paths compiled into them (the GLSL test s
 runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
 ($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
 
+Before the tests, and before each one when --wine starts its own X server (xvfb-run), the prefix's wineserver is
+stopped (wineserver -k, then -w, each bounded): Wine left from a run under another X server can make the next
+program's first Vulkan call hang (runtime/test/wine_session.py). So no other Wine program may use the prefix meanwhile.
+
 Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
@@ -31,6 +35,8 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "runtime", "test"))
+import wine_session  # noqa: E402
 
 
 def _make_parent(path: str) -> None:
@@ -153,6 +159,8 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         return "fail", f"executable not in the artifact: {command[0]}"
     if failed_setups:
         return "fail", "failed fixture setup: " + ", ".join(failed_setups)
+    if wine_session.starts_x_server(wine):  # each test gets an X server of its own: the last one's Wine must go first
+        print(wine_session.stop_wineserver(wine), flush=True)
     argv = list(wine) + [exe]
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
@@ -299,6 +307,9 @@ def main() -> int:
     results = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
     names = [test.get("name", "?") for test in tests]
+    if wine_session.wine_binary(wine):
+        # Wine left from a run under another X server can make the first Vulkan call of every test here hang.
+        print(wine_session.stop_wineserver(wine), flush=True)
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
         for index in order:
