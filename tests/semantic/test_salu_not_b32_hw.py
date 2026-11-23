@@ -526,5 +526,41 @@ class TestSaluNotB32ConditionCodes(unittest.TestCase):
         _, scc0 = run_salu_not_ps(0xFFFFFFFF)
         self.assertEqual(scc0, 0)
 
+# --- Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling ---
+
+class TestSaluNotB32IEEE754BitPatterns(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling tests."""
+
+    def test_ieee754_boundary_patterns(self) -> None:
+        cases = {
+            "pos_zero (+0.0f)": 0x00000000,
+            "neg_zero (-0.0f)": 0x80000000,
+            "pos_one (+1.0f)": 0x3F800000,
+            "neg_one (-1.0f)": 0xBF800000,
+            "pos_inf (+inf)": 0x7F800000,
+            "neg_inf (-inf)": 0xFF800000,
+            "quiet_nan (qNaN)": 0x7FC00000,
+            "neg_quiet_nan (-qNaN)": 0xFFC00000,
+            "signaling_nan (sNaN)": 0x7F800001,
+            "min_subnormal": 0x00000001,
+            "max_subnormal": 0x007FFFFF,
+            "min_normal": 0x00800000,
+            "max_normal": 0x7F7FFFFF,
+        }
+        for name, bits in cases.items():
+            with self.subTest(case=name):
+                expected = ref_s_not_b32(bits)
+                hw_res, hw_scc = run_salu_not_ps(bits)
+                self.assertEqual(hw_res, expected)
+                self.assertEqual(hw_scc, ref_s_not_b32_scc(bits))
+
+    def test_float_roundtrip_bit_integrity(self) -> None:
+        nan_payloads = [0x7FC00001, 0x7FC0ABCD, 0xFFC00001, 0x7FFFFFFF]
+        for nan in nan_payloads:
+            with self.subTest(nan=hex(nan)):
+                res, scc = run_salu_not_ps(nan)
+                self.assertEqual(res, ref_s_not_b32(nan))
+                self.assertEqual(scc, ref_s_not_b32_scc(nan))
+
 if __name__ == "__main__":
     unittest.main()
