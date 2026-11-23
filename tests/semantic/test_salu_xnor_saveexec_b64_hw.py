@@ -282,5 +282,103 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(instr.disassemble(), "s_xnor_saveexec_b64 s[0:1], 0x123456789abcdef0")
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachineState:
+    """Deterministic architectural scalar machine state."""
+
+    def __init__(self) -> None:
+        self.sgprs: List[int] = [0] * 106
+        self.exec_mask: int = ALL64
+        self.vcc: int = 0
+        self.scc: int = 0
+
+    def get_sgpr_pair(self, index: int) -> int:
+        lo = self.sgprs[index] & MASK32
+        hi = self.sgprs[index + 1] & MASK32
+        return (hi << 32) | lo
+
+    def set_sgpr_pair(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+        self.sgprs[index + 1] = (val >> 32) & MASK32
+
+    def get_operand_val(self, op: Operand64) -> int:
+        if isinstance(op, Immediate64):
+            return op.val
+        if op.kind == RegKind.SGPR_PAIR:
+            return self.get_sgpr_pair(op.index)
+        if op.kind == RegKind.VCC:
+            return self.vcc & ALL64
+        if op.kind == RegKind.EXEC:
+            return self.exec_mask & ALL64
+        raise ValueError(f"Unknown operand: {op}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for s_xnor_saveexec_b64."""
+
+    def execute(
+        self,
+        instr: SXnorSaveexecInstruction,
+        state: ScalarMachineState,
+    ) -> Tuple[int, int, int]:
+        """Execute a single s_xnor_saveexec_b64 instruction on scalar machine state."""
+        s0_val = state.get_operand_val(instr.src0)
+        old_exec = state.exec_mask
+
+        new_exec, d_saved, scc = ref_s_xnor_saveexec_b64(s0_val, old_exec)
+
+        state.set_sgpr_pair(instr.dst.index, d_saved)
+        state.exec_mask = new_exec
+        state.scc = scc
+
+        return new_exec, d_saved, scc
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_single_step_execution(self) -> None:
+        self.state.set_sgpr_pair(12, 0x55555555_55555555)
+        self.state.exec_mask = 0x00000000_FFFFFFFF
+
+        instr = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 6),
+            src0=Register64(RegKind.SGPR_PAIR, 12),
+        )
+
+        new_exec, d_saved, scc = self.interp.execute(instr, self.state)
+
+        self.assertEqual(new_exec, 0xAAAAAAAA_55555555)
+        self.assertEqual(d_saved, 0x00000000_FFFFFFFF)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.get_sgpr_pair(6), 0x00000000_FFFFFFFF)
+        self.assertEqual(self.state.exec_mask, 0xAAAAAAAA_55555555)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_multi_instruction_trace(self) -> None:
+        self.state.exec_mask = 0x00000000_FFFFFFFF
+        instr1 = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 2),
+            src0=Immediate64(0),
+        )
+        self.interp.execute(instr1, self.state)
+        self.assertEqual(self.state.exec_mask, 0xFFFFFFFF_00000000)
+
+        instr2 = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 4),
+            src0=Immediate64(ALL64),
+        )
+        self.interp.execute(instr2, self.state)
+        self.assertEqual(self.state.exec_mask, 0xFFFFFFFF_00000000)
+        self.assertEqual(self.state.get_sgpr_pair(4), 0xFFFFFFFF_00000000)
+
+
 if __name__ == "__main__":
     unittest.main()
