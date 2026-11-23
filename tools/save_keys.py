@@ -23,12 +23,16 @@ Resolved names are game strings. Only counts belong in issues and pull requests.
 """
 import argparse
 import collections
+import errno
 import json
 import os
 import re
 import struct
 import sys
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 KEY = re.compile(rb'"\$0x([0-9a-fA-F]{8})"')
 # A whole run of identifier characters. With a bound inside the pattern ({1,80}) a longer name was cut after 81
@@ -186,14 +190,17 @@ def iter_inputs(paths):
 
 
 def out_problem(out, inputs, dicts):
-    """Why --out can't be written, checked before any work: it is one of the files read (the report would replace
-    the user's dictionary or a save), or its folder does not exist. "" when it is fine."""
+    """Why --out can't be written, checked before any work: it is empty, a folder, one of the files read (the
+    report would replace the user's dictionary or a save), or its folder does not exist. "" when it is fine."""
+    if not out or not out.strip():
+        return "--out path must not be empty"
+    if os.path.isdir(out) or out.endswith((os.sep, os.altsep or os.sep)):
+        return f"--out {out} is a folder, not a file"
     if not os.path.isdir(os.path.dirname(os.path.abspath(out))):
         return f"the folder for --out {out} does not exist"
-    if os.path.exists(out):
-        for p in list(input_files(inputs)) + list(dicts):
-            if os.path.exists(p) and os.path.samefile(out, p):   # samefile: a hard link or another spelling counts
-                return f"--out {out} is also an input ({p}); refusing to overwrite it"
+    for p in list(inputs) + list(input_files(inputs)) + list(dicts):
+        if same_report_path(out, p):
+            return f"--out {out} is also an input ({p}); refusing to overwrite it"
     return ""
 
 
@@ -230,6 +237,8 @@ def harvest(paths):
     out = set()
     zhdr = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
     for p in paths:
+        if os.path.isdir(p):
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), p)
         d = read(p)
         out.update(identifiers(d))
         pos = 0
@@ -287,7 +296,7 @@ def cmd_collect(a):
 
 
 def cmd_resolve(a):
-    if a.out and (problem := out_problem(a.out, a.inputs, a.dict)):
+    if a.out is not None and (problem := out_problem(a.out, a.inputs, a.dict)):
         print("error:", problem, file=sys.stderr)
         return 1
     keys = set(collect_keys(a.inputs))
@@ -317,7 +326,7 @@ def cmd_resolve(a):
         for k in new:
             resolved[k] |= hits[k]
     print(f"  total (joaat)    {len(resolved):6} of {len(keys)} keys ({100 * len(resolved) / max(1, len(keys)):.1f}%)")
-    if a.out:
+    if a.out is not None:
         try:
             with open(a.out, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},

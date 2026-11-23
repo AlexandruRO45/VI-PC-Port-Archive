@@ -153,6 +153,29 @@ class Resolve(unittest.TestCase):
         self.assertIn("joaat, composed       1 more keys", text)       # SprocketCount from Sprocket + Count
         self.assertIn("total (joaat)         6 of 7 keys", text)
 
+    def test_out_is_a_directory_or_empty_is_refused_before_resolving(self):
+        folder = os.path.join(self.dir, "out_dir")
+        os.makedirs(folder)
+        for out in (folder, folder + os.sep, ""):
+            with self.subTest(out=out):
+                r = self.resolve_cli(self.jsav, "--dict", self.dict, "--out", out)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn("error:", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.stdout, "")      # refused before key collection and hashing ran
+
+    def test_out_aliasing_a_nonexistent_input_or_dict_is_refused_before_reading(self):
+        missing_in = os.path.join(self.dir, "not_created_yet.jsav")
+        for args in (
+            (missing_in, "--dict", self.dict, "--out", missing_in),
+            (self.jsav, "--dict", missing_in, "--out", missing_in),
+        ):
+            with self.subTest(args=args):
+                r = self.resolve_cli(*args)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn("refusing to overwrite", r.stderr)
+                self.assertEqual(r.stdout, "")
+
 
 class MalformedJsavTest(unittest.TestCase):
     """A lying JSAV entry count must warn and skip the table, not abort a whole batch."""
@@ -266,6 +289,11 @@ class MissingFilesTest(unittest.TestCase):
         r = self.cli("resolve", self.save, "--dict", self.words)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("1 distinct keys", r.stdout)
+
+    def test_resolve_rejects_a_directory_passed_to_dict_with_is_a_directory(self):
+        r = self.cli("resolve", self.save, "--dict", self.tmp.name)
+        self.assert_one_error_line(r, self.tmp.name)
+        self.assertIn(os.strerror(21).lower(), r.stderr.lower())
 
 
 class DirectoryScanTest(unittest.TestCase):
