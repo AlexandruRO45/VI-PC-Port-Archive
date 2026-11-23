@@ -100,6 +100,31 @@ foreach(bary "true" "0" "[]" "{}" "{\"location\":null}" "{\"location\":true}"
   endif()
 endforeach()
 
+# PS inputs are a JSON array of integer locations, never a string to iterate
+# or floating-point values to truncate. Match the Python stub generator.
+foreach(inputs "\"10\"" "\"\"" "1" "true" "null" "{\"1\":0}"
+               "[1.9]" "[1.0]" "[1e0]" "[true]" "[null]" "[\"1\"]" "[[1]]" "[{}]" "[-1]" "[4294967296]")
+  file(WRITE "${TEST_DIR}/index.json"
+       "{\"example\":{\"stage\":\"ps\",\"inputs\":${inputs},\"bary_fallback_input\":{\"location\":2},\"lds_bytes\":-1}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "inputs.*at byte [0-9]+")
+    message(FATAL_ERROR "inputs=${inputs}: expected a malformed input array, got ${code}\n${log}")
+  endif()
+endforeach()
+
+# Empty, duplicate, sparse and uint32 boundary locations are valid index values.
+# A later invalid byte count keeps these parsing controls independent of a GPU.
+foreach(inputs "[]" "[0]" "[-0]" "[7,1,7]" "[4294967295]")
+  file(WRITE "${TEST_DIR}/index.json"
+       "{\"example\":{\"stage\":\"ps\",\"inputs\":${inputs},\"bary_fallback_input\":{\"location\":2},\"lds_bytes\":-1}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "expected unsigned 32-bit lds_bytes at byte [0-9]+")
+    message(FATAL_ERROR "inputs=${inputs}: expected to reach lds_bytes, got ${code}\n${log}")
+  endif()
+endforeach()
+
 # Valid objects (and a null optional input) must reach a later field.
 # Deliberately invalid lds_bytes keeps these parsing controls independent of a GPU.
 foreach(bary "null" "{\"location\":0}" "{\"location\":2}" "{\"location\":4294967295}"

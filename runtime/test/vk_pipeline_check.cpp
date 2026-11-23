@@ -227,13 +227,29 @@ struct JsonParser {
                !std::isspace(static_cast<unsigned char>(s[i]))) i++;
         if (i == before) fail("unexpected token in value");
     }
-    std::vector<uint32_t> parse_u32_array() {
+    std::vector<uint32_t> parse_u32_array(bool strict_inputs = false) {
         std::vector<uint32_t> out;
-        if (!consume('[')) { skip_value(); return out; }
+        if (!consume('[')) {
+            if (strict_inputs) fail("expected array of unsigned 32-bit inputs locations");
+            else skip_value();
+            return out;
+        }
         while (!error && i < s.size()) {
             if (consume(']')) return out;
             const size_t before = i;
-            out.push_back(parse_u32());
+            if (strict_inputs) {
+                // JSON -0 is integer zero, as in the Python index reader.
+                ws();
+                const bool negative = i < s.size() && s[i] == '-';
+                if (negative) {
+                    ++i;
+                    if (i == s.size() || s[i] < '0' || s[i] > '9')
+                        fail("expected unsigned 32-bit inputs location");
+                }
+                uint32_t value = parse_strict_u32("expected unsigned 32-bit inputs location");
+                if (negative && value != 0) fail("expected unsigned 32-bit inputs location");
+                out.push_back(value);
+            } else out.push_back(parse_u32());
             if (error) return out;
             if (consume(']')) return out;
             if (!consume(',') || i == before) { fail("expected ',' or ']' in u32 array"); return out; }
@@ -400,7 +416,7 @@ struct JsonParser {
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
             else if (k == "features") m.features = parse_str_array();
             else if (k == "float_controls") m.float_controls = parse_str_array();
-            else if (k == "inputs") m.inputs = parse_u32_array();
+            else if (k == "inputs") m.inputs = parse_u32_array(true);
             else if (k == "bary_fallback_input") m.bary_fallback_location = parse_bary_fallback_location();
             else if (k == "outputs") m.outputs = parse_u32_array();
             else if (k == "params") m.params = parse_u32_array();

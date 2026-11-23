@@ -237,7 +237,12 @@ def required_stubs_for_meta(meta):
     """Return (kind, sorted ordinary locations, optional barycentric location) partner stubs."""
     stage = meta.get("stage", "")
     if stage == "ps":
+        inputs = meta.get("inputs", [])
+        if not isinstance(inputs, list):
+            raise ValueError("inputs must be an array of unsigned 32-bit integer locations")
         locs = _interface_locations(meta, "inputs")
+        if any(not 0 <= loc <= 0xFFFFFFFF for loc in locs):
+            raise ValueError("inputs must be an array of unsigned 32-bit integer locations")
         bary = meta.get("bary_fallback_input")
         bary_location = None
         if bary is not None:

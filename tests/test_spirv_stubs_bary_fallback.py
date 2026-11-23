@@ -3,6 +3,7 @@
 All shaders are hand-written. No GPU is required; spirv-val validates both
 partners when available. The pipeline checker only compiles these stubs.
 """
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,6 +20,10 @@ import shader_link_check  # noqa: E402
 import spirv_asm  # noqa: E402
 import spirv_interface  # noqa: E402
 import spirv_stubs  # noqa: E402
+
+
+BAD_INPUTS = ["10", "", 1, True, None, {"1": 0}, [1.9], [1.0], [True],
+              [None], ["1"], [[1]], [{}], [-1], [1 << 32]]
 
 
 def translate(fallback, ordinary_location=0):
@@ -133,6 +138,59 @@ class BaryFallbackStubTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "bad:.*bary"):
                     spirv_stubs.generate_for_index(folder, index)
                 self.assertFalse(Path(folder, "stubs").exists())
+
+    def test_inputs_require_an_array_of_exact_uint32_integers(self):
+        for value in BAD_INPUTS:
+            for bary in (None, {"location": 2}):
+                with self.subTest(value=value, bary=bary), tempfile.TemporaryDirectory() as folder:
+                    index = {
+                        "ordinary": {"stage": "ps", "inputs": []},
+                        "bad": {"stage": "ps", "inputs": value, "bary_fallback_input": bary},
+                    }
+                    with self.assertRaisesRegex(ValueError, "bad:.*inputs"):
+                        spirv_stubs.generate_for_index(folder, index)
+                    self.assertFalse(Path(folder, "stubs").exists())
+
+    def test_invalid_inputs_cli_preserves_existing_stubs(self):
+        for value in BAD_INPUTS:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as folder:
+                directory = Path(folder)
+                index = {
+                    "ordinary": {"stage": "ps", "inputs": []},
+                    "bad": {"stage": "ps", "inputs": value, "bary_fallback_input": {"location": 2}},
+                }
+                (directory / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+                stubs = directory / "stubs"
+                stubs.mkdir()
+                sentinel = stubs / "vs_empty.spv"
+                sentinel.write_bytes(b"existing stub must stay untouched")
+                result = subprocess.run([sys.executable, "-I", str(ROOT / "tools" / "spirv_stubs.py"), folder],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("bad: invalid graphics interface locations: inputs", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(list(stubs.iterdir()), [sentinel])
+                self.assertEqual(sentinel.read_bytes(), b"existing stub must stay untouched")
+
+    def test_missing_and_empty_inputs_share_the_same_fallback_partner(self):
+        with tempfile.TemporaryDirectory() as folder:
+            names = spirv_stubs.generate_for_index(folder, {
+                "missing": {"stage": "ps", "bary_fallback_input": {"location": 2}},
+                "empty": {"stage": "ps", "inputs": [], "bary_fallback_input": {"location": 2}},
+            })
+            self.assertEqual(names, ["vs_empty_bary2.spv"])
+            self.validate(Path(folder, "stubs", names[0]).read_bytes())
+
+    def test_json_integer_spellings_match_canonical_locations(self):
+        for text, want in (("[0]", (0,)), ("[-0]", (0,)), ("[7,1,7]", (1, 7)),
+                           ("[4294967295]", (0xFFFFFFFF,))):
+            with self.subTest(text=text):
+                meta = {"stage": "ps", "inputs": json.loads(text), "bary_fallback_input": {"location": 2}}
+                self.assertEqual(spirv_stubs.required_stubs_for_meta(meta), [("vs", want, 2)])
+        for text in ("[1.0]", "[1e0]", "[1E+0]"):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "inputs"):
+                spirv_stubs.required_stubs_for_meta({"stage": "ps", "inputs": json.loads(text)})
 
 
 if __name__ == "__main__":
