@@ -371,6 +371,17 @@ class PeInspectTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), "keep me")
 
+    def test_cli_requires_an_output_directory(self):
+        # The default used __file__, so a run from anywhere wrote <checkout>/reports/pe.
+        default = os.path.join(os.path.dirname(pe_inspect.__file__), os.pardir, "reports", "pe")
+        existed = os.path.isdir(default)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(pe_inspect.main([self.image]), 2)
+        self.assertIn("ERROR: --out is required", stderr.getvalue())
+        if not existed:
+            self.assertFalse(os.path.exists(default), "a run without --out writes nothing into the checkout")
+
     def test_cli_writes_json_and_markdown(self):
         out = os.path.join(self.dir, "reports")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
