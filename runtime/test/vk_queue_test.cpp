@@ -123,8 +123,9 @@ std::uint8_t pattern(std::uint32_t i, std::uint8_t seed) { return std::uint8_t(i
 
 }  // namespace
 
-int main() {
-    if (check_picker()) return 1;
+int main(int argc, char** argv) {
+    const bool present_order_only = argc == 2 && std::strcmp(argv[1], "--present-order") == 0;
+    if (!present_order_only && check_picker()) return 1;
 
     vktest::Device d;
     d.all_queue_types = true;
@@ -142,6 +143,39 @@ int main() {
     VulkanQueue compute(context, d.compute_queue, d.compute_family, Kind::compute);
     VulkanQueue copy(context, d.copy_queue, d.copy_family, Kind::copy);
     EXPECT(direct.ok() && compute.ok() && copy.ok());
+
+    // A Present must take the queue's Wait even without an intervening command list. It must run
+    // before later work on this queue, and the blocked frame must not stall an independent queue.
+    if (present_order_only) {
+        VulkanFence gate(context, 0);
+        VulkanFence after_first(context, 0);
+        EXPECT(gate.semaphore() && after_first.semaphore());
+        VkSemaphore present_timeline = VK_NULL_HANDLE;
+        std::vector<std::uint64_t> present_values;
+        const auto present = [&](VkSemaphore timeline, std::uint64_t value) {
+            present_timeline = timeline;
+            present_values.push_back(value);
+            return true;
+        };
+        direct.wait(gate.semaphore(), 1);
+        EXPECT(direct.enqueue_present(present));
+        EXPECT(direct.signal(after_first.semaphore(), 1));
+        EXPECT(direct.enqueue_present(present));
+        EXPECT(present_values.empty());
+        bool independent_presented = false;
+        EXPECT(copy.enqueue_present([&](VkSemaphore, std::uint64_t) {
+            independent_presented = true;
+            return true;
+        }));
+        EXPECT(independent_presented);
+        EXPECT(gate.signal(1));
+        EXPECT(present_values.size() == 2);
+        EXPECT(present_timeline && present_values[0] > 0 && present_values[1] == present_values[0] + 1);
+        EXPECT(after_first.wait(1, 5'000'000'000ull));
+        EXPECT(d.validation_errors() == 0);
+        std::puts("Present waits for its queue, preserves its place, and leaves unrelated queues unblocked");
+        return 0;
+    }
 
     // Buffers: an upload source, a GPU-side destination and a readback, all host-visible for the test.
     void *upload_map = nullptr, *mid_map = nullptr, *readback_map = nullptr, *tex_readback_map = nullptr;

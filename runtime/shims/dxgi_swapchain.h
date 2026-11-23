@@ -115,9 +115,9 @@ class VulkanSwapchain {
 public:
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex, bool maintenance1)
+                    std::mutex& submit_mutex, bool maintenance1, bool stable_backbuffers = false)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
-          submit_mutex_(submit_mutex), maintenance1_(maintenance1) {
+          submit_mutex_(submit_mutex), maintenance1_(maintenance1), stable_backbuffers_(stable_backbuffers) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
         if (loaded_) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -218,11 +218,12 @@ public:
         return true;
     }
 
-    bool present(std::uint32_t back_buffer_index) {
+    bool present(std::uint32_t back_buffer_index, VkSemaphore progress = VK_NULL_HANDLE,
+                 std::uint64_t progress_value = 0) {
         if (!swapchain_ || back_buffer_index >= exposed_count_ || acquired_index_ >= images_.size()) return false;
         std::uint32_t image_index = back_buffer_index;
         if (is_offscreen()) {
-            if (!blit_to_swapchain(back_buffer_index)) return false;
+            if (!blit_to_swapchain(back_buffer_index, progress, progress_value)) return false;
             image_index = acquired_index_;
         }
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -458,7 +459,7 @@ private:
         return true;
     }
 
-    bool blit_to_swapchain(std::uint32_t image_index) {
+    bool blit_to_swapchain(std::uint32_t image_index, VkSemaphore progress, std::uint64_t progress_value) {
         if (!blit_cmd_ || !blit_fence_ || image_index >= offscreen_images_.size() ||
             acquired_index_ >= images_.size())
             return false;
@@ -529,6 +530,16 @@ private:
 
         if (fn_.end_cmd_buf(blit_cmd_) != VK_SUCCESS) return false;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        if (progress && progress_value) {
+            timeline.waitSemaphoreValueCount = 1;
+            timeline.pWaitSemaphoreValues = &progress_value;
+            si.pNext = &timeline;
+            si.waitSemaphoreCount = 1;
+            si.pWaitSemaphores = &progress;
+            si.pWaitDstStageMask = &wait_stage;
+        }
         si.commandBufferCount = 1;
         si.pCommandBuffers = &blit_cmd_;
         if (fn_.queue_submit(queue_, 1, &si, blit_fence_) != VK_SUCCESS) return false;
@@ -620,11 +631,10 @@ private:
         const std::uint32_t requested = buffer_count ? buffer_count : 2u;
         const bool blit_needed = extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
                                  format_ != chosen.format;
-        if (blit_needed || img_count != requested) {
-            // A varying native count (Vulkan may return more images than minImageCount, and minImageCount may
-            // exceed the app's request) cannot be mapped one-to-one onto DXGI backbuffers: the app owns one
-            // persistent resource per BufferCount index. Expose the requested count as offscreen images and
-            // blit the presented slot into the acquired native image instead.
+        if (stable_backbuffers_ || blit_needed || img_count != requested) {
+            // DXGI can accept another frame before the previous native image is released. Its backbuffers
+            // have stable identities and may also differ from the native images in count, size, or format.
+            // Keep the DXGI ring independent and blit each accepted slot into the acquired native image.
             if (!create_offscreen_backbuffers(requested)) return false;
             exposed_count_ = requested;
         } else {
@@ -645,6 +655,7 @@ private:
     std::uint32_t queue_family_ = 0;
     std::mutex& submit_mutex_;
     bool maintenance1_ = false;
+    bool stable_backbuffers_ = false;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFence acquire_fence_ = VK_NULL_HANDLE;

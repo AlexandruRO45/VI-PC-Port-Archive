@@ -1348,10 +1348,11 @@ public:
     }
 
     bool ok() const { return queue_.ok(); }
-    bool direct_vulkan_queue(VkQueue& handle, std::uint32_t& family) const {
+    bool direct_vulkan_queue(VkQueue& handle, std::uint32_t& family, leonida::VulkanQueue** backend) {
         if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
         handle = vk_queue_;
         family = family_;
+        if (backend) *backend = &queue_;
         return true;
     }
     leonida::ReplayResult last_result() {
@@ -1785,10 +1786,11 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     return q && q->uses_calibrated_timestamps();
 }
 
-bool get_direct_vulkan_queue(ID3D12CommandQueue* queue, VkQueue& handle, std::uint32_t& family) {
+bool get_direct_vulkan_queue(ID3D12CommandQueue* queue, VkQueue& handle, std::uint32_t& family,
+                             leonida::VulkanQueue** backend) {
     if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;
-    const CommandQueue* q = CommandQueue::from(queue);
-    return q && q->direct_vulkan_queue(handle, family);
+    auto* q = CommandQueue::from(queue);
+    return q && q->direct_vulkan_queue(handle, family, backend);
 }
 
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,

@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +25,8 @@ namespace {
 
 // Native DXGI accepts up to 40 queued frames on a waitable swapchain.
 constexpr UINT max_waitable_frame_latency = 40;
+// Default device frame latency for swapchains without a frame-latency waitable object.
+constexpr UINT default_device_frame_latency = 3;
 
 void stub(const char* method) {
     static std::mutex mutex;
@@ -210,15 +214,40 @@ struct ReleaseCom {
 };
 
 class SwapChain final : public IDXGISwapChain3 {
+    // Queue callbacks share this state without retaining the swapchain (which itself retains the queue).
+    struct PresentState {
+        std::mutex mutex;
+        std::condition_variable available;
+        SwapChain* owner = nullptr;
+        UINT pending = 0;
+        bool failed = false;
+    };
+
+    struct PendingPresent {
+        explicit PendingPresent(std::shared_ptr<PresentState> state) : state(std::move(state)) {}
+        ~PendingPresent() {
+            std::lock_guard lock(state->mutex);
+            --state->pending;
+            // Both the queue and the caller have finished with this slot. In particular the caller has
+            // already published the accepted backbuffer index before waking a frame-latency waiter.
+            if (presented && state->owner && state->owner->waitable_)
+                ReleaseSemaphore(state->owner->waitable_, 1, nullptr);
+            state->available.notify_one();
+        }
+        std::shared_ptr<PresentState> state;
+        bool presented = false;
+    };
+
 public:
-    SwapChain(IDXGIFactory4* parent, IUnknown* device, leonida::VulkanContext& context,
-              PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
-              PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family, bool maintenance1)
+    SwapChain(IDXGIFactory4* parent, IUnknown* device, const d3d12::PresentationQueue& presentation)
         : parent_(parent),
           device_(device),
-          context_(context),
-          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex(),
-                     maintenance1) {
+          context_(*presentation.context),
+          present_queue_(*presentation.backend),
+          swapchain_(presentation.get_instance_proc, presentation.instance, presentation.physical,
+                     presentation.get_device_proc, context_.device(), presentation.queue, presentation.family,
+                     context_.submit_mutex(), presentation.swapchain_maintenance1, /*stable_backbuffers=*/true) {
+        present_state_->owner = this;
         if (parent_) parent_->AddRef();
         if (device_) device_->AddRef();
     }
@@ -254,7 +283,14 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
         const ULONG left = --refs_;
-        if (!left) delete this;
+        if (!left) {
+            {
+                std::unique_lock lock(present_state_->mutex);
+                wait_present_state(lock, [&] { return present_state_->pending == 0; });
+                present_state_->owner = nullptr;
+            }
+            delete this;
+        }
         return left;
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -304,19 +340,38 @@ public:
 
     // IDXGISwapChain
     HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
+        std::lock_guard calls(present_calls_mutex_);
         if (sync > 4) return DXGI_ERROR_INVALID_CALL;
         if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
             (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
             return DXGI_ERROR_INVALID_CALL;
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
-        const std::uint32_t cur = swapchain_.current_back_buffer_index();
-        if (!swapchain_.present(cur)) return E_FAIL;
+        std::shared_ptr<PendingPresent> pending;
+        {
+            std::unique_lock lock(present_state_->mutex);
+            const auto available = [&] {
+                return present_state_->failed || waitable_ || present_state_->pending < default_device_frame_latency;
+            };
+            if ((flags & DXGI_PRESENT_DO_NOT_WAIT) && !available()) return DXGI_ERROR_WAS_STILL_DRAWING;
+            if (!wait_present_state(lock, available)) return DXGI_ERROR_DEVICE_REMOVED;
+            if (present_state_->failed) return E_FAIL;
+            pending = std::make_shared<PendingPresent>(present_state_);
+            ++present_state_->pending;
+        }
+        const UINT cur = back_buffer_index_.load(std::memory_order_relaxed);
+        if (!present_queue_.enqueue_present([pending, cur](VkSemaphore progress, std::uint64_t value) {
+                auto& state = *pending->state;
+                std::lock_guard lock(state.mutex);
+                if (!state.owner) return true;
+                if (state.failed) return false;
+                pending->presented = state.owner->present_frame(cur, progress, value);
+                state.failed = !pending->presented;
+                return pending->presented;
+            })) return E_FAIL;
+        back_buffer_index_.store((cur + 1) % static_cast<UINT>(buffers_.size()), std::memory_order_relaxed);
         ++present_count_;
         LARGE_INTEGER qpc{};
         if (QueryPerformanceCounter(&qpc)) last_present_qpc_.store(qpc.QuadPart, std::memory_order_relaxed);
-        std::uint32_t next = 0;
-        if (!swapchain_.acquire_next_image(next)) return E_FAIL;
-        if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
         return S_OK;
     }
 
@@ -356,6 +411,7 @@ public:
 
     HRESULT resize_buffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags,
                            const UINT* node_masks, IUnknown* const* present_queues) {
+        std::lock_guard calls(present_calls_mutex_);
         if (count != 0 && !valid_flip_buffer_count(count)) return E_INVALIDARG;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (fmt != DXGI_FORMAT_UNKNOWN) {
@@ -373,6 +429,9 @@ public:
             return DXGI_ERROR_INVALID_CALL;
         if (present_queues && !std::all_of(present_queues, present_queues + target_count, is_direct_present_queue))
             return DXGI_ERROR_INVALID_CALL;
+        std::unique_lock state(present_state_->mutex);
+        if (!wait_present_state(state, [&] { return present_state_->pending == 0; }))
+            return DXGI_ERROR_DEVICE_REMOVED;
         unregister_buffers();
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
@@ -385,7 +444,10 @@ public:
         flags_ = next_flags;
         register_buffers();
         std::uint32_t next = 0;
-        return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
+        if (!swapchain_.acquire_next_image(next)) return E_FAIL;
+        back_buffer_index_.store(0, std::memory_order_relaxed);
+        present_state_->failed = false;
+        return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* mode) override {
@@ -563,7 +625,9 @@ public:
     HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return DXGI_ERROR_INVALID_CALL; }
 
     // IDXGISwapChain3
-    UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return swapchain_.current_back_buffer_index(); }
+    UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override {
+        return back_buffer_index_.load(std::memory_order_relaxed);
+    }
     HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE, UINT* s) override {
         if (s) *s = DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
         return S_OK;
@@ -575,6 +639,19 @@ public:
     }
 
 private:
+    bool wait_present_state(std::unique_lock<std::mutex>& lock, const auto& ready) {
+        // Device loss can come from an unrelated queue without retiring this queue's held calls.
+        while (!ready() && !context_.is_device_lost())
+            present_state_->available.wait_for(lock, std::chrono::milliseconds(100));
+        return !context_.is_device_lost();
+    }
+
+    bool present_frame(UINT index, VkSemaphore progress, std::uint64_t value) {
+        if (!swapchain_.present(index, progress, value)) return false;
+        std::uint32_t next = 0;
+        return swapchain_.acquire_next_image(next);
+    }
+
     // DXGI: a zero width or height takes the whole size from the window's client area (host-measured).
     VkExtent2D size_or_client(UINT width, UINT height, VkExtent2D fallback) const {
         if (width && height) return {width, height};
@@ -620,7 +697,11 @@ private:
     // Release the queue after the Vulkan swapchain destroys its objects.
     std::unique_ptr<IUnknown, ReleaseCom> device_;
     leonida::VulkanContext& context_;
+    leonida::VulkanQueue& present_queue_;
     leonida::VulkanSwapchain swapchain_;
+    std::mutex present_calls_mutex_;
+    std::shared_ptr<PresentState> present_state_ = std::make_shared<PresentState>();
+    std::atomic<UINT> back_buffer_index_{0};
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
@@ -1508,9 +1589,7 @@ public:
         const std::unique_ptr<ID3D12CommandQueue, ReleaseCom> queue_ref(queue);
         d3d12::PresentationQueue presentation;
         if (!d3d12::get_presentation_queue(queue, presentation)) return DXGI_ERROR_INVALID_CALL;
-        auto* sc = new SwapChain(this, queue, *presentation.context, presentation.get_instance_proc,
-                                 presentation.instance, presentation.physical, presentation.get_device_proc,
-                                 presentation.queue, presentation.family, presentation.swapchain_maintenance1);
+        auto* sc = new SwapChain(this, queue, presentation);
         if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
         if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();

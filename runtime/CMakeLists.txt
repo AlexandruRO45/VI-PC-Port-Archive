@@ -1153,6 +1153,8 @@ if(TARGET Vulkan::Headers)
       add_test(NAME ${test} COMMAND ${test}_test)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME vk_queue_present_order COMMAND vk_queue_test --present-order)
+    set_tests_properties(vk_queue_present_order PROPERTIES SKIP_RETURN_CODE 77)
     # The XDXR BVH builder: the GPU writes every case, then tools/xdxr_bvh.py validates and traces them.
     set(LEONIDA_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_build_cases")
     file(MAKE_DIRECTORY "${LEONIDA_XDXR_OUT}")

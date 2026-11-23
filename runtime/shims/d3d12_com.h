@@ -49,10 +49,12 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
                              IUnknown* device = nullptr, const QueueClock& clock = {},
                              std::shared_ptr<void> queue_lease = {});
-bool get_direct_vulkan_queue(ID3D12CommandQueue* queue, VkQueue& handle, std::uint32_t& family);
+bool get_direct_vulkan_queue(ID3D12CommandQueue* queue, VkQueue& handle, std::uint32_t& family,
+                             leonida::VulkanQueue** backend = nullptr);
 
 struct PresentationQueue {
     leonida::VulkanContext* context = nullptr;
+    leonida::VulkanQueue* backend = nullptr;
     PFN_vkGetInstanceProcAddr get_instance_proc = nullptr;
     PFN_vkGetDeviceProcAddr get_device_proc = nullptr;
     VkInstance instance = VK_NULL_HANDLE;

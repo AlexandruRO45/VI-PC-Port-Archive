@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -630,7 +631,7 @@ int main() {
 
     UINT64 fence_val = 0;
     auto run_clear_readback_present = [&](UINT exp_w, UINT exp_h, const float rgba[4], std::uint8_t exp_r,
-                                          std::uint8_t exp_g, std::uint8_t exp_b) -> int {
+                                          std::uint8_t exp_g, std::uint8_t exp_b, bool hold_frame = false) -> int {
         DXGI_SWAP_CHAIN_DESC1 cur_desc{};
         if (FAILED(sc->GetDesc1(&cur_desc)) || cur_desc.Width != exp_w || cur_desc.Height != exp_h) {
             std::fprintf(stderr, "FAIL: GetDesc1 (%ux%u) != expected (%ux%u)\n", cur_desc.Width, cur_desc.Height,
@@ -697,9 +698,32 @@ int main() {
         cl->Close();
 
         ID3D12CommandList* lists[1] = {cl};
+        ID3D12Fence* gate = nullptr;
+        UINT count_before = 0;
+        if (hold_frame && (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))) ||
+                           FAILED(sc->GetLastPresentCount(&count_before)) || FAILED(queue->Wait(gate, 1))))
+            return fail("gate for held Present");
         queue->ExecuteCommandLists(1, lists);
         // As in a frame loop, the app can present immediately after submitting its rendering.
         const HRESULT presented = sc->Present(0, 0);
+        if (gate) {
+            const UINT after_first = sc->GetCurrentBackBufferIndex();
+            const HRESULT second = sc->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+            const UINT after_second = sc->GetCurrentBackBufferIndex();
+            const HRESULT third = sc->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+            const HRESULT fourth = sc->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+            UINT count_after = 0;
+            const bool accepted = presented == S_OK && second == S_OK && gate->GetCompletedValue() == 0 &&
+                                  third == S_OK && fourth == DXGI_ERROR_WAS_STILL_DRAWING &&
+                                  after_first == (idx + 1) % cur_desc.BufferCount &&
+                                  after_second == (idx + 2) % cur_desc.BufferCount &&
+                                  sc->GetCurrentBackBufferIndex() == (idx + 3) % cur_desc.BufferCount &&
+                                  SUCCEEDED(sc->GetLastPresentCount(&count_after)) && count_after == count_before + 3;
+            const HRESULT released = gate->Signal(1);
+            gate->Release();
+            if (!accepted || FAILED(released)) return fail("three Presents should rotate before the gate is signalled");
+            std::puts("three Presents accepted before their rendering gate; the fourth returned WAS_STILL_DRAWING");
+        }
         queue->Signal(fence, ++fence_val);
         if (!wait_fence(fence, fence_val)) {
             rb->Release();
@@ -829,7 +853,7 @@ int main() {
 
     // Frame 1: 128x128 clear to (64, 128, 255, 255), read back all 16,384 pixels, Present.
     const float blue_ish[4] = {64.0f / 255.0f, 128.0f / 255.0f, 1.0f, 1.0f};
-    if (run_clear_readback_present(128, 128, blue_ish, 64, 128, 255) != 0) return 1;
+    if (run_clear_readback_present(128, 128, blue_ish, 64, 128, 255, /*hold_frame=*/true) != 0) return 1;
 
     // Frame 2: ResizeBuffers to explicit 37x19 on the unchanged 128x128 HWND, clear to green, read back all 703 pixels, Present.
     if (FAILED(sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers");
@@ -1715,7 +1739,37 @@ int main() {
             FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 40)
             return fail("Waitable SetMaximumFrameLatency(41) should return INVALID_CALL and preserve latency");
         CloseHandle(waitable);
-        wsc->Release();
+        // Both operations wait for accepted frames. The watchdog releases the queue even when testing an
+        // implementation that blocks here; it also distinguishes an early return from draining the frame.
+        const auto drain_held_frame = [&](const auto& operation) {
+            ID3D12Fence* gate = nullptr;
+            if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)))) return false;
+            HANDLE returned = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!returned) {
+                gate->Release();
+                return false;
+            }
+            std::thread watchdog([&] {
+                WaitForSingleObject(returned, 200);
+                gate->Signal(1);
+            });
+            const bool queued = SUCCEEDED(queue->Wait(gate, 1)) && SUCCEEDED(wsc->Present(0, 0)) &&
+                                gate->GetCompletedValue() == 0;
+            const bool done = queued && operation() && gate->GetCompletedValue() == 1;
+            SetEvent(returned);
+            watchdog.join();
+            CloseHandle(returned);
+            gate->Release();
+            return done;
+        };
+        if (!drain_held_frame([&] {
+                return SUCCEEDED(wsc->ResizeBuffers(0, wdesc.Width + 2, wdesc.Height, DXGI_FORMAT_UNKNOWN, both_flags)) &&
+                       SUCCEEDED(wsc->GetDesc1(&got_desc)) && got_desc.Width == wdesc.Width + 2 &&
+                       wsc->GetCurrentBackBufferIndex() == 0;
+            })) return fail("ResizeBuffers should drain held frames before changing the buffers");
+        if (!drain_held_frame([&] { return wsc->Release() == 0; }))
+            return fail("Final Release should drain held frames");
+        std::puts("ResizeBuffers and final Release both drained an accepted frame after its gate was signalled");
         DestroyWindow(hwnd3);
     }
 

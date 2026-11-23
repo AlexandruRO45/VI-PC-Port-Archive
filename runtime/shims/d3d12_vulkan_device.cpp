@@ -8337,7 +8337,7 @@ HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::
 }
 
 bool get_presentation_queue(ID3D12CommandQueue* queue, PresentationQueue& out) {
-    if (!get_direct_vulkan_queue(queue, out.queue, out.family)) return false;
+    if (!get_direct_vulkan_queue(queue, out.queue, out.family, &out.backend)) return false;
     ID3D12Device* device = nullptr;
     if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || !device) return false;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);

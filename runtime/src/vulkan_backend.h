@@ -1992,6 +1992,28 @@ public:
         }
     }
 
+    // Insert a present after older operations on this queue. The callback runs with state_mutex_ held and
+    // must not call back into the queue. Its Vulkan work may wait on the supplied timeline value to cover
+    // both released command lists and a Wait that was followed directly by Present.
+    using PresentFn = std::function<bool(VkSemaphore, std::uint64_t)>;
+    bool enqueue_present(PresentFn present) {
+        std::vector<std::shared_ptr<void>> retired;
+        {
+            std::lock_guard state(state_mutex_);
+            if (context_.is_device_lost()) return false;
+            drain_pins(retired);
+            if (!must_hold()) return present_now(present);
+
+            Deferred op;
+            op.kind = Deferred::Kind::present;
+            op.present = std::move(present);
+            hold(std::move(op));
+        }
+        retired.clear();
+        context_.holds().pump_ready();
+        return true;
+    }
+
     // The first failure of a held ExecuteCommandLists since the last call (what the call would have returned had it
     // not been held), or success. A Signal behind a failed batch still signals, as when the failure is not held: the
     // work did not run, the application is told here and on stderr, and nothing waits forever.
@@ -2561,7 +2583,7 @@ private:
 
     // One held operation, with the waits that were pending when it was asked for.
     struct Deferred {
-        enum class Kind : std::uint8_t { batch, signal, marker };
+        enum class Kind : std::uint8_t { batch, signal, marker, present };
         Kind kind = Kind::batch;
         std::uint64_t seq = 0;  // QueueHolds::next_seq(): the order operations were held in, across queues
         std::vector<VkSemaphore> waits;
@@ -2571,6 +2593,7 @@ private:
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
+        PresentFn present;
         // Alive until the operation has run: the fences it waits on and signals, the pipeline states and root
         // signatures of the lists (the application may release them right after the call).
         std::vector<std::shared_ptr<void>> pins;
@@ -2665,6 +2688,10 @@ private:
         case Deferred::Kind::marker:
             marker_now(op.marker_kind, op.label.c_str());
             break;
+        case Deferred::Kind::present:
+            if (!present_now(op.present))
+                std::fprintf(stderr, "[rt] dxgi: a held Present failed when it was released\n");
+            break;
         }
         retire_pins(op.pins, submitted_);  // the fence it signals, the pipeline states: until its submission is done
         waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
@@ -2673,6 +2700,11 @@ private:
     }
 
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
+
+    bool present_now(const PresentFn& present) {
+        if (!waits_.empty() && !submit(VK_NULL_HANDLE, VK_NULL_HANDLE, 0)) return false;
+        return present(progress_, submitted_);
+    }
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
     bool release_ready() override {
