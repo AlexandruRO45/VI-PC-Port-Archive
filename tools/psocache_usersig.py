@@ -130,8 +130,8 @@ def describe_record(index, chunks):
     }
 
 
-def stage_record_refs(m, meta_off, meta_index, chunk_records, stage):
-    """(stage offset, chunk record index) for every stage field that names a chunk record, deduplicated."""
+def stage_record_refs(m, meta_off, meta_index, resolve_chunks, stage):
+    """Resolve each distinct chunk record named by a stage field."""
     if not 0 <= stage < len(meta_index):
         return []
     a, b = meta_index[stage]
@@ -140,19 +140,22 @@ def stage_record_refs(m, meta_off, meta_index, chunk_records, stage):
     for p in STAGE_REFS:
         if p + 4 <= b:
             value = pi.u32(m, meta_off + a + p)
-            if chunk_records.get(value) is not None and value not in seen:
-                seen.add(value)
-                out.append((p, value))
+            if value >= len(meta_index) or value in seen:
+                continue
+            seen.add(value)
+            chunks = resolve_chunks(value)
+            if chunks:
+                out.append((p, value, chunks))
     return out
 
 
-def describe_pso(m, region, meta_off, meta_index, chunk_records, index):
+def describe_pso(m, region, meta_off, meta_index, resolve_chunks, index):
     """Decode one graphics PSO and the chunk records its stage record names."""
     offset = region + index * pi.GRAPHICS_STRIDE
     stage = pi.u32(m, offset + 8)
     layout = pi.u32(m, offset + 0xC)
-    refs = stage_record_refs(m, meta_off, meta_index, chunk_records, stage)
-    records = [describe_record(record, chunk_records[record]) for _, record in refs]
+    refs = stage_record_refs(m, meta_off, meta_index, resolve_chunks, stage)
+    records = [describe_record(record, chunks) for _, record, chunks in refs]
     fits_two = all(r["fits_two_per_table"] for r in records)
     fits_one = all(r["fits_one_per_table"] for r in records)
     return {
@@ -167,7 +170,7 @@ def describe_pso(m, region, meta_off, meta_index, chunk_records, index):
                 "size": meta_index[record][1],
                 "decode": decode,
             }
-            for (p, record), decode in zip(refs, records)
+            for (p, record, _), decode in zip(refs, records)
         ],
         "fits_two_per_table": fits_two,
         "fits_one_per_table": fits_one,
@@ -202,7 +205,7 @@ def summarise(m, report, limit=None):
     failing = []
     for index in range(sampled):
         pso = describe_pso(
-            m, graphics_region["offset"], meta_off, meta_index, chunk_records, index
+            m, graphics_region["offset"], meta_off, meta_index, chunk_records.get, index
         )
         fit_two += pso["fits_two_per_table"]
         fit_one += pso["fits_one_per_table"]
@@ -411,6 +414,13 @@ def main(argv=None):
         for problem in report["problems"]:
             print("  %s" % problem, file=sys.stderr)
         return 2
+    if a.entry is not None and not 0 <= a.entry < report["counts"]["graphics"]:
+        print(
+            "--entry %d is outside the %d graphics records"
+            % (a.entry, report["counts"]["graphics"]),
+            file=sys.stderr,
+        )
+        return 2
     with open(a.cache, "rb") as fh:
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
             if a.entry is not None:
@@ -422,24 +432,16 @@ def main(argv=None):
                     )
                     for i in range(report["counts"]["meta_index"])
                 ]
-                chunk_records = {
-                    i: pi.entry_chunks(m, meta_off, off, size)
-                    for i, (off, size) in enumerate(meta_index)
-                }
-                chunk_records = {i: c for i, c in chunk_records.items() if c}
-                if not 0 <= a.entry < report["counts"]["graphics"]:
-                    print(
-                        "--entry %d is outside the %d graphics records"
-                        % (a.entry, report["counts"]["graphics"]),
-                        file=sys.stderr,
-                    )
-                    return 2
+
+                def read_chunks(record):
+                    return pi.entry_chunks(m, meta_off, *meta_index[record])
+
                 pso = describe_pso(
                     m,
                     report["regions"]["graphics"]["offset"],
                     meta_off,
                     meta_index,
-                    chunk_records,
+                    read_chunks,
                     a.entry,
                 )
                 result = {"summary": None, "pso": pso}

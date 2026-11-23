@@ -4,6 +4,8 @@ The cache has two graphics PSOs. Their stage records name three chunk records: o
 entries and constants (fits), one with extra slots (fits), and one with 40 constant dwords (does not fit).
 """
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 import struct
@@ -11,9 +13,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "psocache_usersig.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+import psocache_usersig  # noqa: E402
 
 HEADER = 0x80
 GRAPHICS = 2
@@ -337,6 +343,40 @@ class UsersigTest(unittest.TestCase):
         self.assertIn("extra slot table(SS)=14 range(II)=3 width(RR)=2", p.stdout)
         self.assertIn("PSO fits: True", p.stdout)
         self.assertNotIn("DEADBEEF", p.stdout)
+
+    def test_entry_decodes_only_distinct_in_range_references(self):
+        meta_offset = HEADER + GRAPHICS * 0x70 + COMPUTE * 0x18 + (META_INDEX + SHADER_INDEX) * 8
+        cases = (
+            ("two records", 0, 3, [1, 3], 2),
+            ("duplicate", 0, 1, [1], 1),
+            ("out-of-range reference", 0, META_INDEX, [1], 1),
+            ("empty chunk list", 0, 4, [1], 2),
+            ("no stage record", 0xFFFFFFFF, 3, [], 0),
+        )
+        for label, stage, second_ref, expected, calls in cases:
+            with self.subTest(label=label):
+                data = bytearray(build())
+                struct.pack_into("<I", data, HEADER + 8, stage)
+                struct.pack_into("<I", data, meta_offset + 0x2C, second_ref)
+                with open(self.path, "wb") as f:
+                    f.write(data)
+
+                pi = psocache_usersig.pi
+                with patch.object(pi, "entry_chunks", wraps=pi.entry_chunks) as decode, redirect_stdout(io.StringIO()) as output:
+                    rc = psocache_usersig.main([self.path, "--entry", "0", "--json"])
+
+                self.assertEqual(rc, 0)
+                records = json.loads(output.getvalue())["pso"]["records"]
+                self.assertEqual([record["index"] for record in records], expected)
+                self.assertEqual(decode.call_count, calls)
+
+    def test_bad_entry_does_not_decode_chunks(self):
+        pi = psocache_usersig.pi
+        with patch.object(pi, "entry_chunks", wraps=pi.entry_chunks) as decode, redirect_stderr(io.StringIO()) as error:
+            rc = psocache_usersig.main([self.path, "--entry", str(GRAPHICS)])
+        self.assertEqual(rc, 2)
+        self.assertIn("outside the 2 graphics records", error.getvalue())
+        decode.assert_not_called()
 
     def test_entry_reports_a_non_fitting_record(self):
         p = run(self.path, "--entry", "1")
