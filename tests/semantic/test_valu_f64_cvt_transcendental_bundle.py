@@ -360,6 +360,26 @@ class VCvtF64U32AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 0, res)
         self.assertEqual(wave.get_f64(0, 0), f64_to_u64(3000000000.0))
 
+class VCvtF64U32SimdIeeeTests(unittest.TestCase):
+    def test_cvt_f64_u32_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0xF0F0F0F0
+        for i in range(32):
+            wave.set_f64(i, 0, 0xAAAAAAAA55555555)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 0, oracle_cvt_f64_u32(i * 1000000))
+        for i in range(32):
+            if (0xF0F0F0F0 >> i) & 1:
+                self.assertEqual(wave.get_f64(i, 0), f64_to_u64(float(i * 1000000)))
+            else:
+                self.assertEqual(wave.get_f64(i, 0), 0xAAAAAAAA55555555)
+
+    def test_cvt_f64_u32_zero_sign(self):
+        # 0 u32 converts to +0.0, never -0.0
+        res = oracle_cvt_f64_u32(0)
+        self.assertEqual(res, F64_POS_ZERO)
+        self.assertNotEqual(res, F64_NEG_ZERO)
+
 
 if __name__ == "__main__":
     unittest.main()
