@@ -107,7 +107,10 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        sys.stdout.reconfigure(encoding="utf-8")
+        try:  # a captured stdout or a non-TextIOWrapper stream has no reconfigure()
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
         print("Paths and help commands are relative to the Leonida checkout root.")
         for tool in result["tools"]:
             status = "present" if tool["present"] else "missing"
