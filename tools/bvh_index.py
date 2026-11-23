@@ -38,12 +38,12 @@ import struct
 import sys
 import tempfile
 import time
-import unicodedata
 import zlib
 from contextlib import suppress
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -471,42 +471,6 @@ def offset(text):
     return value
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_output_path(first, second):
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -517,11 +481,11 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
-    if a.out and a.csv and same_output_path(a.out, a.csv):
+    if a.out and a.csv and same_report_path(a.out, a.csv):
         ap.error("--out and --csv must use different paths")
-    if a.out and same_output_path(a.target, a.out):
+    if a.out and same_report_path(a.target, a.out):
         ap.error("--out must not overwrite the source")
-    if a.csv and same_output_path(a.target, a.csv):
+    if a.csv and same_report_path(a.target, a.csv):
         ap.error("--csv must not overwrite the source")
     for flag, path in (("--out", a.out), ("--csv", a.csv)):
         if path and os.path.isdir(path):
@@ -531,14 +495,14 @@ def main(argv=None):
         for flag, path in (("--out", a.out), ("--csv", a.csv)):
             if not path:
                 continue
-            if os.path.isfile(manifest) and same_output_path(path, manifest):
+            if os.path.isfile(manifest) and same_report_path(path, manifest):
                 ap.error(f"{flag} would overwrite the carve manifest: {path}")
             if os.path.isfile(path):
                 for root, _dirs, names in os.walk(a.target):
                     for name in names:
                         if name.lower().endswith((".json", ".csv")):
                             continue
-                        if same_output_path(os.path.join(root, name), path):
+                        if same_report_path(os.path.join(root, name), path):
                             ap.error(f"{flag} would overwrite an input file: {path}")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
