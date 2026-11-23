@@ -5,8 +5,9 @@ with multi-core parallelism and progress reporting. Can optionally link
 and embed textures (.png or .dds) directly into glTF materials. A texture
 that cannot be read or decoded is left out of that model and reported (one
 line each, counted in the summary), never dropped silently; a model that
-fails to convert is named with its error. Exit status is 1 only when a
-model failed.
+fails to convert is named with its error. A --textures path that is not a
+folder is refused before any model is converted. Exit status is 1 only when
+a model failed or a folder argument is unusable.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
@@ -145,6 +146,9 @@ def batch_convert(
 ) -> dict[str, int]:
     if not os.path.isdir(in_dir):
         raise ValueError(f"Input directory does not exist: {in_dir}")
+    if texture_dir and not os.path.isdir(texture_dir):
+        problem = "is not a folder" if os.path.exists(texture_dir) else "does not exist"
+        raise ValueError(f"Texture directory {problem}: {texture_dir}")
 
     os.makedirs(out_dir, exist_ok=True)
     obj_files = [
