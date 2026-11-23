@@ -37,13 +37,24 @@
 namespace rt::startup_trace {
 
 namespace detail {
-inline std::atomic<bool> on{false};
-// Intentionally immortal: vectored exception handlers or late teardown paths can still run after normal statics would
-// have been destroyed.
-inline std::mutex& mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+// What the exception handler touches lives at namespace scope and is constant-initialized: it exists before any code
+// runs, on every thread, and is never destroyed. A block-scope static is initialized on its first use, and that can be
+// on a title thread, where under Wine the MSVC thread-safe-static guard has been seen to pass while the object was
+// still zero (#7599): LEONIDA_SKIP_INT3 stayed off and the int3 set and the trace lock were never constructed.
+inline constinit std::atomic<bool> on{false};
+
+// The trace lock. An SRW lock needs no constructor or destructor, so vectored exception handlers and late teardown
+// paths can take it at any time, also after normal statics have been destroyed.
+class Lock {
+public:
+    void lock() noexcept { AcquireSRWLockExclusive(&srw_); }
+    void unlock() noexcept { ReleaseSRWLockExclusive(&srw_); }
+
+private:
+    SRWLOCK srw_ = SRWLOCK_INIT;
+};
+inline constinit Lock trace_lock{};
+inline Lock& mutex() noexcept { return trace_lock; }
 inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
@@ -194,20 +205,56 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 // LEONIDA_SKIP_INT3 (diagnostic, with --trace): an int3 in guest code is logged once per address and stepped over,
 // so a boot can be followed past the title's soft asserts (an int3 followed by code that carries on). Off by default:
 // a console title never reaches one in a correct run, so each skipped address is a finding, not a fix.
-inline bool skip_int3(EXCEPTION_POINTERS* info) {
-    static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
-    if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
-    const auto* at = static_cast<const unsigned char*>(info->ExceptionRecord->ExceptionAddress);
-    if (!at || *at != 0xCC || info->ContextRecord->Rip != reinterpret_cast<DWORD64>(at)) return false;
-    static std::mutex m;
-    static std::set<const void*> seen;
-    bool first = false;
-    {
-        const std::lock_guard lock(m);
-        first = seen.insert(at).second;
+//
+// open() reads the variable, on the thread that opens the trace and before any guest code runs.
+inline constinit std::atomic<bool> skip_int3_on{false};
+inline bool skip_int3_requested() { return GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0; }
+
+// The addresses already logged: an open-addressing table of atomics, so the handler needs no constructor, lock or
+// allocation for it. When it is full, a site is logged again rather than lost.
+constexpr size_t kInt3Sites = 4096;  // a power of two: 12 bits of the hash below
+inline constinit std::atomic<const void*> int3_sites[kInt3Sites]{};
+
+inline bool first_int3_at(const void* at) {
+    const auto key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(at));
+    size_t i = static_cast<size_t>((key * 0x9E3779B97F4A7C15ull) >> 52);
+    for (size_t probe = 0; probe < kInt3Sites; ++probe, i = (i + 1) & (kInt3Sites - 1)) {
+        const void* seen = int3_sites[i].load(std::memory_order_acquire);
+        if (!seen && int3_sites[i].compare_exchange_strong(seen, at, std::memory_order_acq_rel)) return true;
+        if (seen == at) return false;  // also when another thread has just claimed this slot for the same site
     }
-    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
-    info->ContextRecord->Rip += 1;
+    return true;
+}
+
+inline bool readable_byte(const unsigned char* p) {
+    MEMORY_BASIC_INFORMATION m{};
+    if (!p || VirtualQuery(p, &m, sizeof m) != sizeof m || m.State != MEM_COMMIT) return false;
+    return (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+}
+
+// The int3 (0xCC) a breakpoint stopped at, or null. Windows reports Rip and ExceptionAddress on the 0xCC byte, and so
+// did Wine 11.22 (Staging) in a probe here; Spacecer2's Wine 11.22 boot reported both one byte past it (#7599). The
+// byte at Rip is tried first, so the Windows form is handled as before. In a run of 0xCC bytes the second form can
+// name the next int3, which is then stepped over with it.
+inline const unsigned char* int3_from(const EXCEPTION_RECORD& r, const CONTEXT& c) {
+    const auto* rip = reinterpret_cast<const unsigned char*>(c.Rip);
+    const auto* address = static_cast<const unsigned char*>(r.ExceptionAddress);
+    const unsigned char* at = nullptr;
+    if (readable_byte(rip) && *rip == 0xCC) at = rip;
+    else if (rip && readable_byte(rip - 1) && rip[-1] == 0xCC) at = rip - 1;
+    if (!at || (address != at && address != at + 1)) return nullptr;
+    return at;
+}
+
+// With LEONIDA_SKIP_INT3, steps over an int3: Rip ends one byte past the 0xCC in either form.
+inline bool skip_int3(EXCEPTION_POINTERS* info) {
+    if (!skip_int3_on.load(std::memory_order_relaxed)) return false;
+    if (!info || !info->ExceptionRecord || !info->ContextRecord) return false;
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return false;
+    const unsigned char* at = int3_from(*info->ExceptionRecord, *info->ContextRecord);
+    if (!at) return false;
+    if (first_int3_at(at)) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
+    info->ContextRecord->Rip = reinterpret_cast<DWORD64>(at) + 1;
     return true;
 }
 
@@ -250,6 +297,7 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
         }
         detail::start = std::chrono::steady_clock::now();
         detail::seq = 0;
+        detail::skip_int3_on.store(detail::skip_int3_requested(), std::memory_order_relaxed);
         static const int atexit_registered = std::atexit(&close);
         (void)atexit_registered;
     }

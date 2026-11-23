@@ -236,7 +236,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
   target_link_libraries(file_system_test PRIVATE advapi32)  # the ACL calls of the unlistable-marker-folder check
 
-  # LEONIDA_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
+  # LEONIDA_SKIP_INT3 (shims/startup_trace.h): each case runs in a child process with its own environment.
   add_executable(int3_skip_test
     test/int3_skip_test.cpp
     shims/registry.cpp

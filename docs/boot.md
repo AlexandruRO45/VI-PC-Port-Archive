@@ -73,7 +73,8 @@ Useful switches:
   with `log`, then use `stop` to pin the first blocker and `fail` to see how the game's own failure path reacts.
   This switch covers imports only; it does not affect the D3D12 outcomes.
 * `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
-  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
+  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on). It is
+  read when the trace opens.
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
