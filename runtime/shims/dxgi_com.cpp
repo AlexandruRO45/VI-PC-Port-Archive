@@ -9,9 +9,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace rt::dxgi {
@@ -36,14 +38,9 @@ public:
     PrivateDataStore() = default;
     PrivateDataStore(const PrivateDataStore&) = delete;
     PrivateDataStore& operator=(const PrivateDataStore&) = delete;
-    ~PrivateDataStore() {
-        for (auto& entry : data_)
-            if (entry.object) entry.object->Release();
-    }
-
     HRESULT get(REFGUID guid, UINT* size, void* data) {
         if (!size) return E_INVALIDARG;
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         for (const auto& entry : data_) {
             if (entry.key != guid) continue;
             const UINT bytes = entry.object ? UINT(sizeof(IUnknown*)) : UINT(entry.bytes.size());
@@ -53,8 +50,14 @@ public:
             }
             if (data) {
                 if (entry.object) {
-                    entry.object->AddRef();
-                    std::memcpy(data, &entry.object, sizeof(IUnknown*));
+                    // Pin the stored reference while AddRef can reenter and remove or replace the entry.
+                    auto held = entry.object;
+                    IUnknown* object = held.get();
+                    lock.unlock();
+                    object->AddRef();
+                    std::memcpy(data, &object, sizeof(object));
+                    *size = bytes;
+                    return S_OK;
                 } else {
                     std::memcpy(data, entry.bytes.data(), bytes);
                 }
@@ -68,43 +71,56 @@ public:
 
     HRESULT set(REFGUID guid, UINT size, const void* data) {
         if (size && !data) return E_INVALIDARG;
-        Entry entry{guid, {}, nullptr};
-        if (size) {
-            const auto* bytes = static_cast<const std::uint8_t*>(data);
-            entry.bytes.assign(bytes, bytes + size);
+        try {
+            Entry entry{guid, {}, nullptr};
+            if (size) {
+                const auto* bytes = static_cast<const std::uint8_t*>(data);
+                entry.bytes.assign(bytes, bytes + size);
+            }
+            store(std::move(entry), size != 0);
+            return S_OK;
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
         }
-        store(std::move(entry), size != 0);
-        return S_OK;
     }
 
     HRESULT set_interface(REFGUID guid, const IUnknown* object) {
-        IUnknown* held = const_cast<IUnknown*>(object);
-        if (held) held->AddRef();
-        store(Entry{guid, {}, held}, held != nullptr);
-        return S_OK;
+        try {
+            auto* held = const_cast<IUnknown*>(object);
+            std::shared_ptr<IUnknown> reference;
+            if (held) {
+                held->AddRef();
+                // The deleter balances AddRef even if the control-block allocation fails.
+                reference = std::shared_ptr<IUnknown>(held, [](IUnknown* p) { p->Release(); });
+            }
+            store(Entry{guid, {}, std::move(reference)}, held != nullptr);
+            return S_OK;
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
     }
 
 private:
     struct Entry {
         GUID key;
         std::vector<std::uint8_t> bytes;
-        IUnknown* object;
+        std::shared_ptr<IUnknown> object;  // owns one COM reference
     };
 
     // The replaced interface is released after the lock is dropped, since its Release may run arbitrary code.
     void store(Entry entry, bool keep) {
-        IUnknown* released = nullptr;
+        std::shared_ptr<IUnknown> released;
         {
             std::lock_guard lock(mutex_);
             for (auto it = data_.begin(); it != data_.end(); ++it) {
                 if (it->key != entry.key) continue;
-                released = it->object;
-                data_.erase(it);
-                break;
+                released = std::move(it->object);
+                if (keep) *it = std::move(entry);
+                else data_.erase(it);
+                return;
             }
             if (keep) data_.push_back(std::move(entry));
         }
-        if (released) released->Release();
     }
 
     std::mutex mutex_;

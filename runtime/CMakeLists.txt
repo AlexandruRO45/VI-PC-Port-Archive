@@ -1874,6 +1874,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_query_rules COMMAND d3d12_query_rules_test)
     set_tests_properties(d3d12_query_rules PROPERTIES SKIP_RETURN_CODE 77)
 
+    # IDXGIObject private data on the layer's factory, without a GPU.
+    add_executable(dxgi_private_data_reentry_test test/dxgi_private_data_reentry_test.cpp)
+    target_link_libraries(dxgi_private_data_reentry_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(dxgi_private_data_reentry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_private_data_reentry_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_private_data_reentry COMMAND dxgi_private_data_reentry_test)
+    set_tests_properties(dxgi_private_data_reentry PROPERTIES TIMEOUT 30)
+
     # Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 presentation over a Win32 HWND.
     add_executable(dxgi_swapchain_test test/dxgi_swapchain_test.cpp)
     target_link_libraries(dxgi_swapchain_test PRIVATE gta6rt_d3d12_com)
