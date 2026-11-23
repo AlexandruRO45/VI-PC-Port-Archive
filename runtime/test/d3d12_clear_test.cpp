@@ -4,6 +4,7 @@
 // through castable-format lists in the other channel order.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <array>
@@ -413,16 +414,22 @@ int main(int argc, char** argv) {
             }
             return check_shared_exponent_target(ours.p) ? 0 : 1;
         }
+        // Under Wine the "WARP" adapter is vkd3d on the GPU, not Microsoft's WARP, so its readbacks follow the GPU's
+        // driver where WARP's are defined (UNORM/SNORM and D16 0.5 ties, out-of-range integer clears, a stencil plane
+        // cleared through a rectangle), and the layer has matched WARP there since #521. Run every clear on the layer
+        // and compare nothing, as the other host comparisons under Wine do.
+        const bool wine = hostwine::host_is_wine();
+        unsigned unchecked = 0;
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
-            FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        if (!wine && (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+                      FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+                      FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))) {
             std::fprintf(stderr, "WARP reference unavailable: differential test cannot run\n");
             return 1;
         }
-        if (!check_volume_rtvs(host.p, ours.p)) return 1;
-        if (volume_only) return 0;
+        if (!wine && !check_volume_rtvs(host.p, ours.p)) return 1;
+        if (volume_only) return wine ? 77 : 0;
         if (!check_unlisted_rtvs(ours.p)) return 1;
         const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
         // Integer-format values: negatives, fractions, NaN and overflow exercise the numeric float->int conversion.
@@ -475,9 +482,13 @@ int main(int argc, char** argv) {
                 const auto& part = cf.values[(i + 1) % cf.count];
                 std::vector<unsigned char> actual, expected;
                 if (!clear_and_read(ours.p, cf.format, cf.bytes, full.data(), part.data(), actual) ||
-                    !clear_and_read(host.p, cf.format, cf.bytes, full.data(), part.data(), expected)) {
+                    (!wine && !clear_and_read(host.p, cf.format, cf.bytes, full.data(), part.data(), expected))) {
                     std::fprintf(stderr, "%s case %u: clear or readback failed\n", cf.name, i);
                     return 1;
+                }
+                if (wine) {
+                    ++unchecked;
+                    continue;
                 }
                 if (actual != expected) {
                     for (std::size_t b = 0; b < actual.size(); ++b) {
@@ -507,12 +518,12 @@ int main(int argc, char** argv) {
         {
             Ref<ID3D12Device10> host10;
             D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
-            host_casts = SUCCEEDED(host.p->QueryInterface(IID_PPV_ARGS(&host10.p))) &&
+            host_casts = !wine && SUCCEEDED(host.p->QueryInterface(IID_PPV_ARGS(&host10.p))) &&
                          SUCCEEDED(host.p->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
                                                              sizeof(options12))) &&
                          options12.RelaxedFormatCastingSupported;
         }
-        if (!host_casts)
+        if (!wine && !host_casts)
             std::printf("castable-format clears: host has no relaxed format casting; WARP clears the view's format\n");
         struct CastFormat { DXGI_FORMAT resource, view; const char* name; };
         const CastFormat cast_formats[] = {
@@ -531,12 +542,17 @@ int main(int argc, char** argv) {
                 const auto& part = float_values[(i + 1) % nf];
                 std::vector<unsigned char> actual, expected;
                 if (!clear_and_read(ours.p, cf.resource, 4, full.data(), part.data(), actual, false, cf.view) ||
-                    !(host_casts
-                          ? clear_and_read(host.p, cf.resource, 4, full.data(), part.data(), expected, false, cf.view)
-                          : clear_and_read(host.p, cf.view, 4, full.data(), part.data(), expected))) {
+                    (!wine &&
+                     !(host_casts
+                           ? clear_and_read(host.p, cf.resource, 4, full.data(), part.data(), expected, false, cf.view)
+                           : clear_and_read(host.p, cf.view, 4, full.data(), part.data(), expected)))) {
                     std::fprintf(stderr, "%s case %u: clear or readback failed\n", cf.name, i);
                     ++format_failures;
                     break;
+                }
+                if (wine) {
+                    ++unchecked;
+                    continue;
                 }
                 if (cf.view == DXGI_FORMAT_B8G8R8X8_UNORM) {
                     for (std::size_t b = 3; b < actual.size() && b < expected.size(); b += 4) actual[b] = expected[b] = 0;
@@ -574,9 +590,13 @@ int main(int argc, char** argv) {
                 std::vector<unsigned char> actual, expected, actual_stencil, expected_stencil;
                 if (!clear_depth_and_read(ours.p, df.format, df.depth_bytes, df.has_stencil, full, stencil_full, part,
                                           stencil_part, actual, actual_stencil) ||
-                    !clear_depth_and_read(host.p, df.format, df.depth_bytes, df.has_stencil, full, stencil_full, part,
-                                          stencil_part, expected, expected_stencil))
+                    (!wine && !clear_depth_and_read(host.p, df.format, df.depth_bytes, df.has_stencil, full,
+                                                    stencil_full, part, stencil_part, expected, expected_stencil)))
                     return 1;
+                if (wine) {
+                    ++unchecked;
+                    continue;
+                }
                 if (actual != expected || actual_stencil != expected_stencil) {
                     std::size_t b = 0;
                     while (b < actual.size() && b < expected.size() && actual[b] == expected[b]) ++b;
@@ -604,9 +624,13 @@ int main(int argc, char** argv) {
             std::vector<unsigned char> actual, expected, no_stencil_a, no_stencil_e;
             if (!clear_depth_and_read(ours.p, DXGI_FORMAT_D32_FLOAT, 4, false, pc.depth_full, 0x11, pc.depth_part, 0x22,
                                       actual, no_stencil_a, pc.full, pc.part) ||
-                !clear_depth_and_read(host.p, DXGI_FORMAT_D32_FLOAT, 4, false, pc.depth_full, 0x11, pc.depth_part, 0x22,
-                                      expected, no_stencil_e, pc.full, pc.part))
+                (!wine && !clear_depth_and_read(host.p, DXGI_FORMAT_D32_FLOAT, 4, false, pc.depth_full, 0x11,
+                                                pc.depth_part, 0x22, expected, no_stencil_e, pc.full, pc.part)))
                 return 1;
+            if (wine) {
+                ++unchecked;
+                continue;
+            }
             if (actual != expected) {
                 std::fprintf(stderr, "D32_FLOAT stencil-flag case %u: depth readback differs from WARP\n", i);
                 ++format_failures;
@@ -617,6 +641,10 @@ int main(int argc, char** argv) {
         if (format_failures) {
             std::fprintf(stderr, "d3d12_clear_test: %u color/depth format(s) differ from WARP\n", format_failures);
             return 1;
+        }
+        if (wine) {
+            std::printf("%u clears ran on the layer without a WARP reference (host D3D12 is Wine's)\n", unchecked);
+            return 77;
         }
         return 0;
     }; // Destroy the D3D12 objects before checking the Vulkan validation counter.
