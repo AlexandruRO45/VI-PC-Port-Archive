@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -403,6 +404,9 @@ private:
         if (literal("null")) return out.kind = Json::Kind::null, true;
         // Numbers through strtod: Apple's libc++ does not provide the floating-point from_chars overload. The
         // token is already limited to JSON number characters, and the end check requires all of it to be consumed.
+        // ERANGE is refused only for an overflow (a HUGE_VAL result). strtod also sets it for an underflow, a value
+        // under the smallest normal double that it rounds to a subnormal or to zero (glibc does for 5e-324, which
+        // Python's json.dump writes as it is): that is only precision lost, as for any other number, so it is kept.
         const std::size_t start = pos_;
         while (pos_ < text_.size() && std::strchr("+-0123456789.eE", text_[pos_])) ++pos_;
         if (pos_ == start) return false;
@@ -411,7 +415,7 @@ private:
         char* end = nullptr;
         errno = 0;
         out.number = std::strtod(token.c_str(), &end);
-        return errno != ERANGE && end == token.c_str() + token.size();
+        return !(errno == ERANGE && std::isinf(out.number)) && end == token.c_str() + token.size();
     }
 
     static int hex_digit(char c) {
