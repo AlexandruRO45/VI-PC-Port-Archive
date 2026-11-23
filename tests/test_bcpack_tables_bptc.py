@@ -694,6 +694,9 @@ class TestLoadBcHistory(unittest.TestCase):
             (3, {"confirmed": {"2": [0, 0, 0, 0, 0, 0, 0, {}]}}),
             (4, {"provisional": {"3": [None, None]}}),
             (5, {"confirmed": {"4": [0, 0, [0], 0]}}),
+            # JSON reads 1e400 as infinity, which int() refuses with OverflowError.
+            (1, {"confirmed": {"1": [json.loads("1e400"), 0, 0, 0, 0, 0]}}),
+            (4, {"provisional": {"3": [float("-inf"), 0]}}),
         ):
             key = f"bc{codec}"
             with self.subTest(codec=codec, sec=sec):

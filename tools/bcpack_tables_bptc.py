@@ -141,10 +141,11 @@ def _bc7_static():
 
 
 def _int_field(value, where):
-    """`int(value)` for one history JSON value; a null, list or object is a `ValueError` naming `where`."""
+    """`int(value)` for one history JSON value; a null, list, object or infinite number (JSON `1e400`,
+    `Infinity`) is a `ValueError` naming `where`."""
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{where}: expected an integer, got {value!r}") from None
 
 

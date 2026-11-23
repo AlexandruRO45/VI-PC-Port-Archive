@@ -257,6 +257,8 @@ class TestCliErrorPaths(unittest.TestCase):
              {"bc7": {"historyEndpoints": {"0": [None] * 24}}}),
             ("bc7_last_resort", 7, bc7_stream, 16,
              {"bc7": {"historyEndpointLastResort": [5]}}),
+            ("bc1_infinite", 1, self.compressed_stream, 32,   # written as Infinity, read as inf
+             {"bc1": {"confirmed": {"1": [float("inf"), 0, 0, 0, 0, 0]}}}),
         ]
         for name, codec, stream, size, doc in cases:
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp_dir:
