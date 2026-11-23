@@ -48,6 +48,36 @@ class FrametimeStatsTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["avg_fps"], 59.03, places=1)
         self.assertEqual(metrics["stutter_count"], 1)
 
+    def test_mangohud_system_info_preamble(self):
+        for preamble in ([], [
+            "v1", "0.8.3", "---------------------SYSTEM INFO---------------------",
+        ]):
+            with self.subTest(versioned=bool(preamble)):
+                lines = preamble + [
+                    "os,cpu,gpu,ram,kernel,driver,cpuscheduler",
+                    "Linux,Test CPU,Test GPU,32768,6.12,Test driver,default",
+                ]
+                if preamble:
+                    lines.append("--------------------FRAME METRICS--------------------")
+                lines += [
+                    "fps,frametime,cpu_load,cpu_power,gpu_load",
+                    "60,16,30,25,70",
+                    "60,24,32,27,75",
+                ]
+                csv_path = self._create_csv("mangohud.csv", lines[0], lines[1:])
+                parsed = frametime_stats.parse_frametimes_ms(csv_path)
+                self.assertEqual(parsed, [16.0, 24.0])
+
+    def test_unlabeled_numbers_and_unknown_headers(self):
+        raw_path = self._create_csv("raw.csv", "16", ["24000000"])
+        self.assertEqual(frametime_stats.parse_frametimes_ms(raw_path), [16.0, 24.0])
+
+        csv_path = self._create_csv("unknown.csv", "label,value", ["a,16", "b,24"])
+        self.assertEqual(frametime_stats.parse_frametimes_ms(csv_path), [16.0, 24.0])
+
+        unit_path = self._create_csv("unit.csv", "unit,value", ["ms,16", "ms,24"])
+        self.assertEqual(frametime_stats.parse_frametimes_ms(unit_path), [16.0, 24.0])
+
     def test_generic_ms_parsing(self):
         ms_values = [16.6] * 100
         csv_path = self._create_csv("generic.csv", "frametime_ms", ms_values)

@@ -20,6 +20,15 @@ import os
 import sys
 
 
+def _find_numeric_cell(cells: list[str]) -> tuple[int, float] | None:
+    for idx, cell in enumerate(cells):
+        try:
+            return idx, float(cell)
+        except ValueError:
+            continue
+    return None
+
+
 def parse_frametimes_ms(path: str) -> list[float]:
     """Extract a list of frame times in milliseconds from a CSV or text log."""
     if not os.path.isfile(path):
@@ -27,20 +36,7 @@ def parse_frametimes_ms(path: str) -> list[float]:
 
     frametimes: list[float] = []
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        # Check first line to detect CSV headers vs bare numbers
-        first_line = f.readline()
-        if not first_line:
-            return []
-
-        # Reset and use csv.reader
-        f.seek(0)
-        reader = csv.reader(f)
-
-        header_row = next(reader, None)
-        if not header_row:
-            return []
-
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
         col_idx = None
         mode = "auto"  # "ns", "ms", "fps", or "auto" (magnitude heuristic)
 
@@ -76,72 +72,43 @@ def parse_frametimes_ms(path: str) -> list[float]:
             "instant_fps",
         }
 
-        lower_headers = [h.strip().lower() for h in header_row]
-
-        # Prioritize explicit frametimes over FPS columns regardless of column ordering
-        for idx, h in enumerate(lower_headers):
-            if h in ms_synonyms:
-                col_idx = idx
-                mode = "ms"
-                break
-
-        if col_idx is None:
-            for idx, h in enumerate(lower_headers):
-                if h in ns_synonyms:
-                    col_idx = idx
-                    mode = "ns"
-                    break
-
-        if col_idx is None:
-            for idx, h in enumerate(lower_headers):
-                if h in fps_synonyms:
-                    col_idx = idx
-                    mode = "fps"
-                    break
-
-        if col_idx is None:
-            # Maybe there are no headers and it's just raw numbers
-            try:
-                val = float(header_row[0].strip())
-                col_idx = 0
-                mode = "auto"
-                if val > 100000.0:
-                    frametimes.append(val / 1_000_000.0)
-                else:
-                    frametimes.append(val)
-            except ValueError:
-                # First row was a header we didn't recognize, find first numeric column in next row
-                pass
-
-        for row in reader:
+        column_modes = (("ms", ms_synonyms), ("ns", ns_synonyms), ("fps", fps_synonyms))
+        for row_idx, row in enumerate(csv.reader(f)):
             if not row:
                 continue
-            if col_idx is None:
-                # Try to locate the first numeric column
-                for idx, cell in enumerate(row):
-                    try:
-                        v = float(cell.strip())
-                        col_idx = idx
-                        mode = "auto"
-                        if v > 100000.0:
-                            frametimes.append(v / 1_000_000.0)
-                        else:
-                            frametimes.append(v)
-                        break
-                    except ValueError:
+
+            # MangoHud can write system information, including numeric values,
+            # before its frame metrics header. Keep fallback values only until
+            # a recognized header gives us the actual timing column.
+            if mode == "auto":
+                headers = [cell.strip().lower() for cell in row]
+                for header_mode, synonyms in column_modes:
+                    header_idx = next((idx for idx, name in enumerate(headers) if name in synonyms), None)
+                    if header_idx is None:
                         continue
-                continue
+                    # A later row such as "ms,16" is data, not a header.
+                    if row_idx and _find_numeric_cell(row) is not None:
+                        break
+                    col_idx = header_idx
+                    mode = header_mode
+                    frametimes.clear()
+                    break
+                if mode != "auto":
+                    continue
 
-            if col_idx >= len(row):
-                continue
-
-            cell = row[col_idx].strip()
-            if not cell:
-                continue
-            try:
-                val = float(cell)
-            except ValueError:
-                continue
+            if col_idx is None:
+                # On the first row, only a leading number indicates raw data.
+                numeric_cell = _find_numeric_cell(row[:1] if row_idx == 0 else row)
+                if numeric_cell is None:
+                    continue
+                col_idx, val = numeric_cell
+            else:
+                if col_idx >= len(row):
+                    continue
+                try:
+                    val = float(row[col_idx])
+                except ValueError:
+                    continue
 
             if mode == "ns":
                 frametimes.append(val / 1_000_000.0)
