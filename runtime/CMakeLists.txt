@@ -433,6 +433,9 @@ if(BUILD_TESTING)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
+  # VulkanContext::view's attachment-view cache (runtime/src/image_view_cache.h): pure stdlib, no Vulkan instance.
+  add_executable(image_view_cache_test test/image_view_cache_test.cpp)
+  add_test(NAME image_view_cache COMMAND image_view_cache_test)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
