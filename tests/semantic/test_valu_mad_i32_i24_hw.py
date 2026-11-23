@@ -212,5 +212,66 @@ class TestMadI32I24AST(unittest.TestCase):
             LiteralOperand(-0x8000_0001)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachine:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.scc: int = 0
+
+    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value & MASK32
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise TypeError(f"Unknown operand type: {type(op)}")
+
+    def write_vgpr(self, index: int, val32: int):
+        self.vgprs[index] = val32 & MASK32
+
+    def step(self, insn: VMadI32I24Instruction):
+        val_s0 = self.read_operand(insn.src0)
+        val_s1 = self.read_operand(insn.src1)
+        val_s2 = self.read_operand(insn.src2)
+        result = ref_mad_i32_i24(val_s0, val_s1, val_s2, clamp=insn.clamp)
+        self.write_vgpr(insn.dst.index, result)
+
+
+class TestMadI32I24ScalarInterpreter(unittest.TestCase):
+    def setUp(self):
+        self.machine = ScalarMachine()
+
+    def test_scalar_execution_basic(self):
+        self.machine.vgprs[1] = 2
+        self.machine.vgprs[2] = 3
+        self.machine.vgprs[3] = 4
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[0], 10)
+
+    def test_scalar_with_sgpr_and_literal(self):
+        self.machine.sgprs[4] = 0x00FFFFFE  # -2 in 24 bits
+        self.machine.vgprs[2] = 3
+        lit = LiteralOperand(4)
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 5),
+            src0=RegisterOperand(OperandType.SGPR, 4),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=lit,
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[5], 0xFFFF_FFFE)
+
+
 if __name__ == '__main__':
     unittest.main()
