@@ -42,6 +42,8 @@ INPUTS: tuple[tuple[str, int], ...] = (
     ("-2^-24", _f32_bits(-(2.0 ** -24))),
     ("+2^-15", _f32_bits(2.0 ** -15)),
     ("-2^-15", _f32_bits(-(2.0 ** -15))),
+    ("+rne_to_min_normal", 0x387FF000),      # RNE -> f16 0x0400 if denormals flush after rounding
+    ("-rne_to_min_normal", 0xB87FF000),
     ("+2^-14", _f32_bits(2.0 ** -14)),
     ("-2^-14", _f32_bits(-(2.0 ** -14))),
     ("+1.5*2^-14", _f32_bits(1.5 * (2.0 ** -14))),
@@ -161,9 +163,6 @@ def f32_to_f16_bits(f32_bits: int, *, rtz: bool, denorm_keep: bool) -> int:
             return sg16 | (0x7BFF if rtz else 0x7C00)
         return sg16 | ((e + 15) << 10) | (q & 0x3FF)
 
-    if not denorm_keep:
-        return sg16
-
     sh = -1 - e
     if sh > 25:
         return sg16
@@ -172,6 +171,9 @@ def f32_to_f16_bits(f32_bits: int, *, rtz: bool, denorm_keep: bool) -> int:
     half = 1 << (sh - 1)
     if not rtz and (rem > half or (rem == half and (q & 1))):
         q += 1
+    # With denormals flushed, RNE can still round up into the smallest normal.
+    if not denorm_keep and q < 0x400:
+        return sg16
     return sg16 | q
 
 

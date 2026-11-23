@@ -169,6 +169,20 @@ class ReferenceModelTests(unittest.TestCase):
             0xAAAA3A00,
         )
 
+    def test_denormals_flush_after_rounding_to_smallest_normal(self):
+        for bits, sign in ((0x387FF000, 0), (0xB87FF000, 0x8000)):
+            with self.subTest(bits=f"{bits:#010x}", mode="rne"):
+                self.assertEqual(
+                    pr.f32_to_f16_bits(bits, rtz=False, denorm_keep=False),
+                    sign | 0x0400,
+                )
+                self.assertEqual(
+                    pr.expected_cvt_f16_omod(bits, "mul:2", rtz=False, denorm_keep=False, ieee=False),
+                    0xAAAA0000 | sign | 0x0800,
+                )
+            with self.subTest(bits=f"{bits:#010x}", mode="rtz"):
+                self.assertEqual(pr.f32_to_f16_bits(bits, rtz=True, denorm_keep=False), sign)
+
 
 class KernelTests(unittest.TestCase):
     def test_kernel_structure(self):
