@@ -569,8 +569,68 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertTrue(s_nan.nan)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    def test_signed_zero_returns_positive_zero(self):
+        # RDNA2 ISA: v_cubema_f32 returns +0.0 (never -0.0) whenever the selected major axis is +/-0.0
+        r_pos = ref_cubema_f32(POS_ZERO, POS_ZERO, POS_ZERO)
+        self.assertEqual(r_pos, POS_ZERO)
+
+        r_neg = ref_cubema_f32(NEG_ZERO, NEG_ZERO, NEG_ZERO)
+        self.assertEqual(r_neg, POS_ZERO)
+
+        words = run_ps_cubema([
+            f"v_mov_b32 v0, {NEG_ZERO:#x}",
+            f"v_mov_b32 v1, {NEG_ZERO:#x}",
+            f"v_mov_b32 v2, {NEG_ZERO:#x}",
+            "v_cubema_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], POS_ZERO)
+
+    def test_infinities(self):
+        # +inf major axis -> +inf
+        words_pos = run_ps_cubema([
+            f"v_mov_b32 v0, {POS_INF:#x}",
+            f"v_mov_b32 v1, {ONE_F32:#x}",
+            f"v_mov_b32 v2, {TWO_F32:#x}",
+            "v_cubema_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words_pos[0], POS_INF)
+
+        # -inf major axis -> -inf
+        words_neg = run_ps_cubema([
+            f"v_mov_b32 v0, {NEG_INF:#x}",
+            f"v_mov_b32 v1, {ONE_F32:#x}",
+            f"v_mov_b32 v2, {TWO_F32:#x}",
+            "v_cubema_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words_neg[0], NEG_INF)
+
+    def test_nan_propagation(self):
+        # NaN operand propagation: when major candidate is NaN
+        words = run_ps_cubema([
+            f"v_mov_b32 v0, {QNAN:#x}",
+            f"v_mov_b32 v1, {ONE_F32:#x}",
+            f"v_mov_b32 v2, {TWO_F32:#x}",
+            "v_cubema_f32 v3, v0, v1, v2",
+        ])
+        self.assertTrue(is_nan_u32(words[0]))
+
+    def test_subnormals(self):
+        # Scale subnormal by 2.0
+        subnorm = SUBNORM_MIN
+        subnorm_scaled = subnorm * 2
+        words = run_ps_cubema([
+            f"v_mov_b32 v0, {subnorm:#x}",
+            f"v_mov_b32 v1, {POS_ZERO:#x}",
+            f"v_mov_b32 v2, {POS_ZERO:#x}",
+            "v_cubema_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], subnorm_scaled)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
