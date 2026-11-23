@@ -490,6 +490,18 @@ class MalformedCarveIndex(unittest.TestCase):
         self.assertIn("row 0 needs an 'off'", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = os.path.join(tmp, "out.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(gamedata_maps, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    gamedata_maps.write_json(path, {"payloads": []})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()

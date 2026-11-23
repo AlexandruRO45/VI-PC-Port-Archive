@@ -52,6 +52,7 @@ Both formats scale a u8 value into the header's Z box:
 <carve_dir> is an rpf9_carve.py output directory (index.json plus <offset>.bin
 files). Only header fields, dimensions, row counts and value ranges are
 printed or written; the height bytes are not. Standard library only.
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 Usage: `python -I tools/gamedata_maps.py --help` lists the options.
 """
 from __future__ import annotations
@@ -60,12 +61,16 @@ import argparse
 import json
 import math
 import os
+import stat
 import struct
 import sys
+import tempfile
 import unicodedata
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MAGIC = (b"MHIU", b"PAMH")
@@ -549,14 +554,45 @@ def main() -> int:
         if census:
             out["pamh_census"] = census
         try:
-            _make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            write_json(a.json, out)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 1
         print("wrote", a.json)
     return 0
+
+
+def write_json(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    _make_parent(path)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".gamedata_maps-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
