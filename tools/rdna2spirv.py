@@ -5913,44 +5913,78 @@ class Gen:
 
     def wqm(self, op, a):
         """s_wqm_b32 / s_wqm_b64: D = every quad (4 consecutive bits) of S0 that has a bit set becomes 1111;
-        SCC = D != 0. A lane mask is one bit per lane here (this lane's), so the quad's bits are gathered with
-        quad_any and SCC is the wave-wide any. Anything else is data and is computed on the bits. A 32-bit form
-        in wave64 (exec_lo / exec_hi, vcc_lo / vcc_hi, a half-mask SGPR) only changes, and only votes over, its own
-        half: it is the half of the source, or of the destination when that is one of the halves."""
-        half = None
-        if self.wave64 and op.endswith("b32"):
-            half = self.mask_half(a[1]) or self.mask_half(a[0])
-        if self.holds_lane_mask(a[1]):
-            r = self.quad_any(self.mask_src(a[1]))
-            self.put_mask(a[0], r, half)
+        SCC = D != 0. A lane mask is one bit per lane here (this lane's), so a canonical mask (same half for
+        b32, or full wave64 mask for b64) gathers its quad with quad_any and votes SCC. Opposite-half b32
+        mask copies, mixed or non-canonical b64 SGPR pairs, and plain data materialize 32-bit words and apply
+        wqm_word word by word."""
+        d, src = a[0], a[1]
+        is_64 = op.endswith("b64")
+        src_half = self.mask_half(src) if (self.wave64 and not is_64) else None
+        dst_is_special_half = (
+            self.wave64 and not is_64
+            and d["k"] == "special" and d.get("t") in ("exec_lo", "exec_hi", "vcc_lo", "vcc_hi")
+        )
+        dst_half = self.mask_half(d) if dst_is_special_half else None
+
+        canonical_mask = False
+        if not is_64:
+            if self.holds_lane_mask(src):
+                canonical_mask = not dst_is_special_half or src_half is None or src_half == dst_half
+        elif src["k"] == "special":
+            t = src.get("t", "")
+            canonical_mask = t == "exec" or (t == "vcc" and "vcc" in self.cur_masks)
+        elif self.wave64 and src["k"] == "sgpr" and src.get("n") == 2:
+            r = src["r"]
+            canonical_mask = (
+                self.cur_masks.get(r) == lane_masks.MASK_LO
+                and self.cur_masks.get(r + 1) == lane_masks.MASK_HI
+            )
+
+        if canonical_mask:
+            half = src_half or dst_half
+            r = self.quad_any(self.mask_src(src))
+            self.put_mask(d, r, half)
             self.scc_any_half(r, half)
             return
-        src = a[1]
-        if op.endswith("b64") and src["k"] == "sgpr" and src.get("n") == 2:
-            words = [self.load_reg("sgpr", src["r"]), self.load_reg("sgpr", src["r"] + 1)]
-        elif op.endswith("b64") and src["k"] == "imm":
+
+        if is_64 and src["k"] == "sgpr" and src.get("n") == 2:
+            words = [
+                self.lane_mask_word({"k": "sgpr", "r": reg, "n": 1}) if reg in self.cur_masks
+                else self.load_reg("sgpr", reg)
+                for reg in (src["r"], src["r"] + 1)
+            ]
+        elif is_64 and src["k"] == "imm":
             words = [self.cu(src["v"] & 0xFFFFFFFF), self.cu((src["v"] >> 32) & 0xFFFFFFFF)]
+        elif is_64 and src["k"] == "special" and src.get("t") == "vcc":
+            lo, hi = self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpLoad %uint %vcc")
+            self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            words = [lo, hi]
+        elif not is_64 and self.holds_lane_mask(src):
+            words = [self.lane_mask_word(src)]
         else:
-            words = [self.src_u(src)] + ([self.cu(0)] if op.endswith("b64") else [])
+            words = [self.src_u(src)] + ([self.cu(0)] if is_64 else [])
+
         res = [self.wqm_word(w) for w in words]
-        d = a[0]
-        if d["k"] == "sgpr":
+        if d["k"] == "sgpr" and not (is_64 and self.holds_lane_mask(src)):
             self.store_reg("sgpr", d["r"], res[0])
             if len(res) == 2:
                 self.store_reg("sgpr", d["r"] + 1, res[1])
-        else:
-            # EXEC / VCC filled from data: this lane takes its own bit of the result.
+        elif not (d["k"] == "special" and d.get("t") == "null"):
+            # Mask destination (EXEC / VCC, or a b64 SGPR pair lane_masks tracks as a mask): each lane takes
+            # its own bit via shift and mask (not OpBitFieldUExtract, avoiding Intel's 16-bit offset bug).
             lane = self.wave_lane()
-            sh, b, pick = self.tmp(), self.tmp(), self.tmp()
+            sh, shr, b, pick = (self.tmp() for _ in range(4))
             self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
             word = res[0]
             if len(res) == 2:
                 hi, word = self.tmp(), self.tmp()
                 self.emit(f"{hi} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
                 self.emit(f"{word} = OpSelect %uint {hi} {res[1]} {res[0]}")
-            self.emit(f"{b} = OpBitFieldUExtract %uint {word} {sh} {self.cu(1)}")
+            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+            self.emit(f"{b} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
             self.emit(f"{pick} = OpSelect %uint {self.tmp_bool_nz(b)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
-            self.put_mask(d, pick, half)
+            self.put_mask(d, pick, dst_half)
         nz = res[0]
         if len(res) == 2:
             nz = self.tmp()
