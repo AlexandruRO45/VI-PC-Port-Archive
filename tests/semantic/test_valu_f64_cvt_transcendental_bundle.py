@@ -634,6 +634,24 @@ class VSqrtF64OracleTests(unittest.TestCase):
         self.assertTrue(is_nan_u64(oracle_sqrt_f64(F64_NEG_INF)))
         self.assertTrue(is_nan_u64(oracle_sqrt_f64(F64_QNAN)))
 
+class VSqrtF64AstInterpreterTests(unittest.TestCase):
+    def test_sqrt_f64_ast_construction(self):
+        ast = Instruction64AST(
+            "v_sqrt_f64",
+            Operand64(RegKind.VGPR_PAIR, 0),
+            Operand64(RegKind.VGPR_PAIR, 2),
+        )
+        self.assertEqual(ast.mnemonic, "v_sqrt_f64")
+        self.assertEqual(ast.dst.index, 0)
+        self.assertEqual(ast.src0.index, 2)
+
+    def test_sqrt_f64_scalar_execution(self):
+        wave = SimdWaveState64(lane_count=1)
+        wave.set_f64(0, 2, f64_to_u64(144.0))
+        res = oracle_sqrt_f64(wave.get_f64(0, 2))
+        wave.set_f64(0, 0, res)
+        self.assertEqual(wave.get_f64(0, 0), f64_to_u64(12.0))
+
 
 if __name__ == "__main__":
     unittest.main()
