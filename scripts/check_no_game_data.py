@@ -48,6 +48,7 @@ MAGICS = (
     ("XBCH shader container", 0, b"XBCH"),
     ("FSSM shader", 0, b"FSSM"),
     ("DXBC container", 0, b"DXBC"),
+    ("FSPX shader payload", 0, b"FSPX"),  # docs/fspx.md: the ACCC part, also read as a bare payload
     ("SPIR-V module", 0, b"\x03\x02\x23\x07"),
     ("SPIR-V module", 0, b"\x07\x23\x02\x03"),
     ("DDS texture", 0, b"DDS "),
