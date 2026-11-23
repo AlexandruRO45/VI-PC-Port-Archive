@@ -221,6 +221,21 @@ with a blob holding the dword 0, so the DLL creates no compute scratch buffer; w
 Not done here: using kind 0 at run time beyond what the translated module already carries (its thread-group size
 and `RSRC2`).
 
+## Measuring translation coverage
+
+Run `python -I tools/fspx_coverage.py <work>/shaders/fspx <work>/shaders/spirv/fspx`
+on matching unpacked and translated directories. The JSON counts each unpacked index entry once,
+including bare payloads. A program is eligible when its disassembly listing exists. A translated
+program has a listing, a translator index entry and a published module. The report reads metadata
+and checks file presence. It does not revalidate modules.
+
+The FSPX build passes `--record-refusals` to the translator. Its private `refusals.json` lists the
+names that raised `Unsupported` during that invocation. For a manual run, use the same flag with
+an unsharded translation. Another translation in the same output directory clears the previous
+refusal list. Older outputs can still establish successes. Missing listings, missing evidence,
+and contradictory or incomplete outputs count as unaccounted, with a breakdown by reason.
+Assembler or validator failures and internal translator errors do not establish an explicit refusal.
+
 ## Translation status
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs (`main` at `aa2988cc` with the

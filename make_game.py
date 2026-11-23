@@ -1146,7 +1146,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
     if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
         return
     log(f"shaders: unpacking and translating the FSPX programs of {FSPX_DLL}")
-    drop(translated, settings_file)
+    drop(translated, settings_file, os.path.join(spirv, "refusals.json"))
     # A program that no longer translates must not keep a module from the run before.
     for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
         if os.path.isdir(folder):
@@ -1156,7 +1156,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
                         os.unlink(entry.path)
     py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
-    py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
+    py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", "--record-refusals", *extra)
     clash = fspx_key_clash(spirv)
     if clash:
         drop(translated)   # the runtime must not load an index whose keys pick between different modules

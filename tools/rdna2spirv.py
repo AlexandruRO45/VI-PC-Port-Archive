@@ -17248,7 +17248,11 @@ def main():
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
+    ap.add_argument("--record-refusals", action="store_true",
+                    help="write names rejected as Unsupported to refusals.json (unsharded runs)")
     a = ap.parse_args()
+    if a.record_refusals and (a.shard or a.merge):
+        ap.error("--record-refusals requires an unsharded run")
     # A file at --out (or one above it) can never become a folder. Refuse it here, before
     # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
     # shader_disasm.py and #1632's tex_export.py.
@@ -17282,7 +17286,9 @@ def main():
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
     OPT_SPIRV = a.opt
+    refusal_path = Path(a.out, "refusals.json")
     if a.merge:
+        refusal_path.unlink(missing_ok=True)
         try:
             merged = merge_shard_parts(a.out)
         except ShardSetError as e:
@@ -17327,6 +17333,8 @@ def main():
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:  # a trailing separator on a file, or a symlink changed since the check above
         ap.error(f"cannot create {a.out}: {e.strerror or e}")
+    refusal_path.unlink(missing_ok=True)
+    refused = []
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
@@ -17343,6 +17351,8 @@ def main():
         try:
             asm = translate(p)
         except Unsupported as e:
+            if a.record_refusals:
+                refused.append(name)
             why[str(e)] += 1
             drop_stale(name)
             continue
@@ -17394,6 +17404,8 @@ def main():
     if shard is not None:   # a marker beside the part, so --merge can tell a complete set from a partial one
         write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
     write_index(idx_path, old)
+    if a.record_refusals:
+        write_index(str(refusal_path), refused)
     if shard is None:
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)

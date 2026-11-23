@@ -177,7 +177,7 @@ class FspxStage(unittest.TestCase):
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         (_, unpack), (_, translate) = self.calls
         self.assertEqual(unpack, (self.dll, "--out", self.unpacked, "--disasm"))
-        self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
+        self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm", "--record-refusals"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
 

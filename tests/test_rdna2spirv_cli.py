@@ -330,7 +330,7 @@ class ValidatedOutput(unittest.TestCase):
         self.module = self.out / "ps_fixture.spv"
         self.index = self.out / "index.json"
 
-    def translate(self, *, reject_at=None):
+    def translate(self, *args, reject_at=None):
         def spirv_tool(cmd, **kwargs):
             tool = cmd[0]
             if tool == "spirv-as":
@@ -345,7 +345,7 @@ class ValidatedOutput(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, int(rejected), "", "synthetic rejection" if rejected else "")
 
         output = io.StringIO()
-        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out), *args]), \
                 mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
             rdna2spirv.main()
         return output.getvalue()
@@ -420,7 +420,11 @@ class ValidatedOutput(unittest.TestCase):
         previous = {"cs_other": {"stage": "cs"}}
         self.module.write_bytes(b"old module")
         self.index.write_text(json.dumps({**previous, "ps_fixture": {"stage": "ps"}}), encoding="utf-8")
-        output = self.translate()
+        output = self.translate("--record-refusals")
+        refusals = self.out / "refusals.json"
+        self.assertEqual(json.loads(refusals.read_text(encoding="utf-8")), ["ps_fixture"])
+        self.translate()
+        self.assertFalse(refusals.exists())
         self.assertIn("s_barrier outside compute", output)
         self.assertFalse(self.module.exists())
         self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), previous)
