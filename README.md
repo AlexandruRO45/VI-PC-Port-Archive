@@ -1,4 +1,4 @@
-<h1 align="center">
+﻿<h1 align="center">
   <br>
   <a>
   <img src="assets/logo.png" alt="Leonida" width="200">
@@ -165,13 +165,17 @@ The mode is saved next to the translated shaders, and changing it translates the
 reuse previously emulated shaders. The AMD Windows workaround rebuilds those shaders in native mode.
 Use `--wave64-emulate on` to force emulation or `--wave64-emulate off` to force native wave64.
 
-Four fallback flags are forwarded to the translator the same way, saved next to the translated shaders, and changing
+Six fallback flags are forwarded to the translator the same way, saved next to the translated shaders, and changing
 them translates them again: `--no-float-controls` (drop `SignedZeroInfNanPreserve`, for devices whose pipeline check
 skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's translator flag), `--bary-fallback`
 (read raw barycentrics from an interpolated input, for devices without `VK_KHR_fragment_shader_barycentric`),
 `--texel-offset-fallback` (fold `image_sample*_o` offsets into the coordinate, for devices without
-`VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`).
-Each is documented in [docs/design.md](docs/design.md).
+`VK_KHR_maintenance8`), `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`),
+`--f16-interp-fallback` (16-bit interpolation from halves the vertex or mesh shader exports, for devices whose
+pipelines reject `PerVertexKHR` inputs, such as MoltenVK) and `--pc-tail-ubo` (keep s0–s31 in 128 push-constant bytes
+and move the tail to a set-1 uniform block, for devices with `maxPushConstantsSize` 128). The last two are also
+chosen on their own when the GPU the runtime would use needs them. Each is documented in
+[docs/design.md](docs/design.md).
 
 The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
 folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.
