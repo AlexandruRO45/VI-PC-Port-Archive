@@ -128,7 +128,14 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
 
 `game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`) is a PE32+ x86-64 image with no resource
-section. `gta6rt --dry-run` maps it at its preferred base together with the four package DLLs it imports, and
+section. Its ten sections include two named `.xbld`, which carry the linker's build-edition records:
+`_xbld_edition_<key>=<GRDK|GXDK>,<value>` lines keyed `name`, `full_productbuild`, `sdktype`, `mscver`, `build`
+and `clientbldtype`. The 31 records keep the incremental link's history: `April 2025 Update 2` (productbuild
+`10.0.26100.4061`, sdktype `250402`), `October 2025` (`10.0.26100.6151`, the one block compiled with the MSVC
+toolset) and `April 2026 Update 1` (`10.0.26100.7839`, sdktype `260401`), the rest with
+`clang.19.1.7_rsg-llvm`; the final block is the edition in force, `April 2026 Update 5`
+(`10.0.26100.7901`, sdktype `260405`, `RSG-LLVM 0.0.105`), and the records close with `clientbldtype=profile`.
+`gta6rt --dry-run` maps it at its preferred base together with the four package DLLs it imports, and
 exits 0 with nothing on stderr:
 
 ```powershell
