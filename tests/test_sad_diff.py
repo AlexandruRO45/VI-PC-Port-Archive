@@ -146,5 +146,25 @@ class EverythingSkipped(unittest.TestCase):
         self.assertEqual(rc, 2, out.getvalue())
         self.assertIn("no program ran: every one was skipped", out.getvalue())
 
+class ArgumentValidation(unittest.TestCase):
+    def test_zero_or_negative_programs_and_max_ops_are_usage_errors(self):
+        # FUZZ: --max-ops 0 reached random.randint(1, 0) as a ValueError traceback (exit 1) and
+        # --programs 0 ran an empty suite; mem_diff/pk16_diff/fmisc_diff reject both up front.
+        import contextlib
+        import io
+        from unittest import mock
+
+        for extra in (["--programs", "0"], ["--programs", "-2"],
+                      ["--max-ops", "0"], ["--max-ops", "-1"]):
+            with self.subTest(args=extra):
+                err = io.StringIO()
+                with (mock.patch.object(sys, "argv", ["sad_diff.py", "--no-sweep"] + extra),
+                      contextlib.redirect_stderr(err)):
+                    with self.assertRaises(SystemExit) as cm:
+                        d.main()
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--programs and --max-ops must be at least 1", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+
 if __name__ == "__main__":
     unittest.main()
