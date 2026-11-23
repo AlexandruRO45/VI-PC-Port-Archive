@@ -160,5 +160,47 @@ class TestDSWriteB16AST(unittest.TestCase):
             DSWriteB16Instruction(vaddr=VGPR(0), vdata=VGPR(1), offset=65536)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState:
+    def __init__(self, lds: Optional[LDSMemory] = None):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.scc: int = 0
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+
+class ScalarDSInterpreter:
+    def execute(self, state: ScalarThreadState, inst: DSWriteB16Instruction) -> None:
+        vaddr = state.vgprs[inst.vaddr.index] & MASK32
+        vdata = state.vgprs[inst.vdata.index] & MASK32
+        ref_ds_write_b16(state.lds, vaddr, vdata, inst.offset)
+
+
+class TestDSWriteB16ScalarInterpreter(unittest.TestCase):
+    def setUp(self):
+        self.state = ScalarThreadState()
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution_step(self):
+        self.state.lds.write_u32(0x100, 0x0000_0000)
+        self.state.vgprs[1] = 0x100
+        self.state.vgprs[2] = 0xBEEF
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=0)
+        self.interp.execute(self.state, inst)
+        self.assertEqual(self.state.lds.read_u16(0x100), 0xBEEF)
+
+    def test_scalar_execution_with_offset(self):
+        self.state.lds.write_u32(0x100, 0x0000_0000)
+        self.state.vgprs[1] = 0x100
+        self.state.vgprs[2] = 0xCAFE
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=2)
+        self.interp.execute(self.state, inst)
+        self.assertEqual(self.state.lds.read_u16(0x102), 0xCAFE)
+        self.assertEqual(self.state.lds.read_u32(0x100), 0xCAFE_0000)
+
+
 if __name__ == '__main__':
     unittest.main()
