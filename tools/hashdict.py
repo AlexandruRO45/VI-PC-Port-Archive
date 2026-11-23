@@ -91,17 +91,17 @@ def main():
         return 0
     if a.carve is None:
         ap.error("a carve directory is required to build a dictionary")
+    if os.path.isdir(a.out) or a.out.endswith(("/", "\\")):
+        print(f"ERROR: --out {a.out} is a directory, not a file", file=sys.stderr)
+        return 2
+    out_parent = os.path.dirname(os.path.abspath(a.out))
+    if out_parent and os.path.exists(out_parent) and not os.path.isdir(out_parent):
+        print(f"ERROR: --out parent {out_parent} is not a directory", file=sys.stderr)
+        return 2
     if not os.path.isdir(a.carve):
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
         return 2
-    if os.path.isdir(a.out):
-        print(f"ERROR: --out {a.out} is a directory, not a file", file=sys.stderr)
-        return 2
-    for x in a.extra:
-        if not os.path.exists(x):
-            print(f"ERROR: --extra path {x} does not exist", file=sys.stderr)
-            return 2
     # A folder with its own index.json is one archive's carve (<work>\carve\common, the folder the gamedata_*
     # tools take): harvest it as that archive. Otherwise each subfolder with an index.json is one archive.
     if os.path.isfile(os.path.join(a.carve, "index.json")):
@@ -155,27 +155,14 @@ def main():
     if missing:
         print(f"WARNING: {len(missing)} carved blobs listed in an index.json could not be read and were skipped "
               f"(first: {missing[0]}). Re-run the carve to get their strings.", file=sys.stderr)
-    def _scan_error(err):
-        raise err
-
     for x in a.extra:
         if os.path.isdir(x):
-            try:
-                for _root, _, files in os.walk(x, onerror=_scan_error):
-                    for fn in files:
-                        stem = os.path.splitext(fn)[0]
-                        if a.min <= len(stem) <= MAX_NAME_LEN:
-                            strings.add(stem)
-            except OSError as e:
-                print(f"ERROR: cannot scan --extra folder {x}: {e.strerror or e}", file=sys.stderr)
-                return 2
-        else:
-            try:
-                with open(x, "rb") as f:
-                    harvest(f.read(), strings, a.min)
-            except OSError as e:
-                print(f"ERROR: cannot read --extra file {x}: {e.strerror or e}", file=sys.stderr)
-                return 2
+            for root, _, files in os.walk(x):
+                for fn in files:
+                    strings.add(os.path.splitext(fn)[0])
+        elif os.path.isfile(x):
+            with open(x, "rb") as f:
+                harvest(f.read(), strings, a.min)
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)

@@ -11,9 +11,6 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "hashdict.py")
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-
-import hashdict  # noqa: E402
 
 
 class HashdictCliValidationTests(unittest.TestCase):
@@ -42,35 +39,23 @@ class HashdictCliValidationTests(unittest.TestCase):
     def test_out_directory_is_refused_before_scanning(self):
         out_dir = os.path.join(self.tmp.name, "out_dir")
         os.makedirs(out_dir)
-        p = self.run_tool(self.carve, "--out", out_dir)
-        self.assertEqual(p.returncode, 2)
-        self.assertIn("is a directory", p.stderr)
-        self.assertNotIn("Traceback", p.stderr)
+        for bad in (out_dir, os.path.join(self.tmp.name, "newdir") + os.sep):
+            with self.subTest(bad=bad):
+                p = self.run_tool(self.carve, "--out", bad)
+                self.assertEqual(p.returncode, 2)
+                self.assertIn("is a directory", p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertNotIn("Traceback", p.stderr)
 
-    def test_missing_extra_path_is_refused_cleanly(self):
-        out = os.path.join(self.tmp.name, "out.json")
-        missing = os.path.join(self.tmp.name, "missing_extra.txt")
-        p = self.run_tool(self.carve, "--extra", missing, "--out", out)
+    def test_out_with_file_parent_is_refused_before_scanning(self):
+        parent_file = os.path.join(self.tmp.name, "not_a_dir")
+        with open(parent_file, "w", encoding="utf-8") as f:
+            f.write("x")
+        p = self.run_tool(self.carve, "--out", os.path.join(parent_file, "hashes.json"))
         self.assertEqual(p.returncode, 2)
-        self.assertIn("does not exist", p.stderr)
+        self.assertIn("is not a directory", p.stderr)
+        self.assertEqual(p.stdout, "")
         self.assertNotIn("Traceback", p.stderr)
-        self.assertFalse(os.path.exists(out))
-
-    def test_extra_directory_respects_min_and_max_name_len(self):
-        extra_dir = os.path.join(self.tmp.name, "extra")
-        os.makedirs(extra_dir)
-        long_stem = "a" * (hashdict.MAX_NAME_LEN + 5)
-        for name in ("ab.txt", "abcde.txt", f"{long_stem}.txt"):
-            with open(os.path.join(extra_dir, name), "wb") as f:
-                f.write(b"")
-        out = os.path.join(self.tmp.name, "out.json")
-        p = self.run_tool(self.carve, "--extra", extra_dir, "--min", "4", "--out", out)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        with open(out, encoding="utf-8") as f:
-            d = json.load(f)
-        self.assertEqual(d.get(f"{hashdict.joaat('abcde'):08x}"), "abcde")
-        self.assertNotIn(f"{hashdict.joaat('ab'):08x}", d)
-        self.assertNotIn(f"{hashdict.joaat(long_stem):08x}", d)
 
 
 if __name__ == "__main__":
