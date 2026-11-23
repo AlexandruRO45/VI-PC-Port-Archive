@@ -29,6 +29,7 @@ if not defined PY (
   pause
   exit /b 1
 )
+call :resolve_python
 %PY% -I "%~dp0make_game.py" %*
 set "RC=%ERRORLEVEL%"
 echo.
@@ -48,6 +49,15 @@ exit /b 0
 if defined PY exit /b 0
 if not exist %1 exit /b 0
 %1 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set PY="%~1"
+exit /b 0
+
+rem The Python install manager's `py` and `python` are app execution aliases in WindowsApps. A Python started through
+rem either one, and every program it starts, does not see folders that other programs create under %LOCALAPPDATA% or
+rem %APPDATA%, so a tool installed there looks missing. Start the same python.exe by its full path (sys.executable)
+rem instead. It is printed in the console's code page so that for /f reads a non-ASCII path back intact; when nothing
+rem usable comes back, PY stays as it is. tests/test_build_bat_python.py runs this block.
+:resolve_python
+for /f "delims=" %%E in ('call %PY% -I -c "import sys, ctypes; cp = ctypes.windll.kernel32.GetConsoleOutputCP(); sys.stdout.reconfigure(encoding=f'cp{cp}' if cp else 'oem'); print(sys.executable)" 2^>nul') do if exist "%%E" set PY="%%E"
 exit /b 0
 
 rem Ask first, then install Python 3.12 for this user only (no admin): winget if present, else the pinned

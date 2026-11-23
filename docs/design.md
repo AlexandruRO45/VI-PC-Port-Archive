@@ -537,8 +537,11 @@ don't always include), checks it disassembles an `s_endpgm` for `gfx1013`, keeps
 x64 tools, about 2 GB of temporary space and 20-40 minutes. `-Dest`, `-NoEnv`, `-Keep` and `-Version` change the
 defaults. Keep `-Dest` out of AppData: `python` from the Python install manager (the `WindowsApps` alias) doesn't see
 folders that other programs create under `%LOCALAPPDATA%` or `%APPDATA%`, so `make_game.py` reports `llvm-mc` missing
-and the fuzzers stop with `WinError 2`, although `LLVM_MC` names the file; `py`, or the same `python.exe` started by
-its full path, sees it (measured with Python 3.14.7 on Windows 11).
+and the fuzzers stop with `WinError 2`, although `LLVM_MC` names the file; the same `python.exe` started by its full
+path sees it (measured with Python 3.14.7 on Windows 11). `py` saw it in that measurement, but the install manager's
+own `py`, also an alias in `WindowsApps`, does not, and neither does a program that an alias-started Python starts
+(measured with Python 3.14.4 and PythonManager 26.4.240.0 on Windows 11 26200). `Build.bat` therefore starts
+`make_game.py` with the interpreter's full path (`sys.executable`).
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1

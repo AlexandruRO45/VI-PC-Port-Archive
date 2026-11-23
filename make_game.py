@@ -281,19 +281,20 @@ def tool_available(cmd: str) -> bool:
 def appdata_hint(cmd: str) -> str:
     """Why a tool under AppData may look missing on Windows, or "".
 
-    `python` from the Python install manager (the app execution alias in WindowsApps) doesn't see folders that other
-    programs create under %LOCALAPPDATA% or %APPDATA%; `py`, or the same python.exe started by its full path, does.
-    scripts\\build_llvm_mc.ps1 used to install llvm-mc.exe to %LOCALAPPDATA%\\Leonida\\llvm-mc."""
+    `python` and `py` from the Python install manager (app execution aliases in WindowsApps) don't see folders that
+    other programs create under %LOCALAPPDATA% or %APPDATA%; the same python.exe started by its full path does, and
+    Build.bat starts it that way. scripts\\build_llvm_mc.ps1 used to install llvm-mc.exe to
+    %LOCALAPPDATA%\\Leonida\\llvm-mc."""
     if os.name != "nt":
         return ""
     path = ntpath.normcase(cmd.strip().strip('"'))
     for var in ("LOCALAPPDATA", "APPDATA"):
         base = os.environ.get(var, "").strip()
         if base and path.startswith(ntpath.normcase(ntpath.join(base, ""))):
-            return (f" LLVM_MC points into %{var}%, which `python` from the Python install manager can't see: copy "
-                    "llvm-mc.exe out of AppData (scripts\\build_llvm_mc.ps1 now installs it to "
+            return (f" LLVM_MC points into %{var}%, which `python` and `py` from the Python install manager can't "
+                    "see: copy llvm-mc.exe out of AppData (scripts\\build_llvm_mc.ps1 now installs it to "
                     "%USERPROFILE%\\.leonida\\llvm-mc), set LLVM_MC to the new path and reopen the terminal, or start "
-                    "make_game.py with `py`.")
+                    f'make_game.py with this python.exe by its full path, "{sys.executable}", as Build.bat does.')
     return ""
 
 

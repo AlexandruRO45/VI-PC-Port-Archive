@@ -337,6 +337,16 @@ class ToolchainDetectionTest(PreflightTestBase):
                     self.assertIn(f"LLVM_MC points into %{var}%", hint)
                     self.assertIn(r"%USERPROFILE%\.leonida\llvm-mc", hint)
 
+    def test_appdata_hint_names_this_python_by_its_full_path(self):
+        # The install manager's `py` is an alias in WindowsApps too and hides those folders as well; the same
+        # python.exe started by its full path sees them (Build.bat starts it that way).
+        exe = r"C:\Users\u\AppData\Local\Python\pythoncore-3.14-64\python.exe"
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV), \
+                mock.patch("sys.executable", exe):
+            hint = make_game.appdata_hint(r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe")
+        self.assertIn(f'"{exe}"', hint)
+        self.assertNotIn("with `py`", hint)
+
     def test_appdata_hint_is_empty_outside_appdata(self):
         with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV):
             for cmd in ("llvm-mc", r"D:\Tools\llvm-mc\llvm-mc.exe", r"C:\Users\u\.leonida\llvm-mc\llvm-mc.exe",
