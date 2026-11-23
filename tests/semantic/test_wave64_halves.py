@@ -468,6 +468,24 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "C")
         self.assertNotEqual(whole, halves)
 
+        tier, whole, halves = self.run_both("vs_bfm_copy", vs([
+            bfm, "s_mov_b32 s20, s9", "v_mov_b32_e32 v7, s20"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+
+        tier, whole, halves = self.run_both("vs_bfm_readback_mask", vs([
+            bfm, "v_mov_b32_e32 v7, s9", "v_readfirstlane_b32 s20, v7",
+            "s_mov_b32 s21, 0", "v_cndmask_b32_e64 v6, 0, 1, s[20:21]"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual(whole, halves)
+
+        for load in ("buffer_load_dword v6, v0, s[8:11], 0 offen",
+                     "image_sample_lz v6, v[1:2], s[80:87], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
+            (tier, _, _), _ = meta_of("vs_bfm_descriptor", vs([
+                bfm, "s_mov_b64 s[10:11], 0x18500000", "s_load_dwordx8 s[80:87], s[0:1], 0",
+                "s_waitcnt lgkmcnt(0)", load, "s_waitcnt vmcnt(0)"]))
+            self.assertEqual(tier, "A", load)
+
         (tier, _, _), _ = meta_of("vs_bfm_runtime_width", vs([
             "s_bfm_b64 s[8:9], s2, 54", "v_mov_b32_e32 v7, s9"]))
         self.assertEqual(tier, "C")

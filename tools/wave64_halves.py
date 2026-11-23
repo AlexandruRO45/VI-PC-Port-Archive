@@ -326,9 +326,13 @@ class Analysis:
         t = 0
         for r in _regs(a):
             bits = st["t"].get(r, 0)
-            # A word copied to a VGPR is scalar data. Reading the same pair as a mask
-            # still selects different lanes in a wave of 64 and two waves of 32.
-            if bits & LANE and st["g"].get(r) == ("bfm_word",) and base_op(ins["op"]) == "v_mov_b32":
+            # A folded BFM word is data at an export, store or resource descriptor.
+            # Keep its lane taint through copies in case the value becomes a mask.
+            op = base_op(ins["op"])
+            if bits & LANE and st["g"].get(r) == ("bfm_word",) and (
+                    op == "exp" or op.startswith(("buffer_store", "tbuffer_store")) or
+                    (a.get("k") == "sgpr" and a.get("n", 1) >= 4 and
+                     op.startswith(("buffer_load", "tbuffer_load", "image_")))):
                 bits &= ~LANE
             t |= bits
             if (id(ins), r) in self.stale:
@@ -1077,6 +1081,9 @@ class Analysis:
             elif tj & CNT:
                 ctok = scaled_cnt_token()
                 tag = ("cnt", ctok) if ctok is not None else None
+            if (op == "v_mov_b32" and tj == LANE and len(srcs) == 1 and len(_regs(srcs[0])) == 1
+                    and not partial_write(ins, op) and st["g"].get(_regs(srcs[0])[0]) == ("bfm_word",)):
+                tag = ("bfm_word",)
             if tag is None and tj == LANE and len(dests) == 1:
                 k = self.lmod_result(st, ins, op, a)
                 if k is not None:
@@ -1108,6 +1115,9 @@ class Analysis:
                     t_src |= X
             else:
                 t_src |= X
+        elif (op == "s_mov_b32" and len(srcs) == 1 and len(_regs(srcs[0])) == 1
+              and st["g"].get(_regs(srcs[0])[0]) == ("bfm_word",)):
+            tag = ("bfm_word",)
         elif op.startswith(("s_mov", "s_load", "s_buffer_load")) and len(srcs) == 1 and _regs(srcs[0]) and \
                 _regs(srcs[0])[0] in st["g"] and st["g"][_regs(srcs[0])[0]][0] in ("mask", "elect", "wfmask", "cnt"):
             tag = st["g"][_regs(srcs[0])[0]]
