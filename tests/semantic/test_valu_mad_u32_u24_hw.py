@@ -59,5 +59,54 @@ class MadU32U24ReferenceOracleTests(unittest.TestCase):
         res = oracle_mad_u32_u24(0xFFFFFF, 1, 0xFFFFFFFF)
         self.assertEqual(res, (0xFFFFFF + 0xFFFFFFFF) & MASK32)
 
+class RegKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+
+class MadU32U24AstValidationTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = InstructionAST(
+            mnemonic="v_mad_u32_u24",
+            dst=Operand(RegKind.VGPR, 3),
+            src0=Operand(RegKind.VGPR, 0),
+            src1=Operand(RegKind.VGPR, 1),
+            src2=Operand(RegKind.VGPR, 2),
+        )
+        self.assertEqual(ast.mnemonic, "v_mad_u32_u24")
+        self.assertEqual(ast.dst.index, 3)
+        self.assertEqual(ast.src0.index, 0)
+        self.assertEqual(ast.src1.index, 1)
+        self.assertEqual(ast.src2.index, 2)
+
+    def test_ast_imm_and_sgpr_operands(self):
+        ast = InstructionAST(
+            mnemonic="v_mad_u32_u24",
+            dst=Operand(RegKind.VGPR, 0),
+            src0=Operand(RegKind.SGPR, 4),
+            src1=Operand(RegKind.IMM, raw_val=50),
+            src2=Operand(RegKind.VGPR, 1),
+        )
+        self.assertEqual(ast.src0.kind, RegKind.SGPR)
+        self.assertEqual(ast.src1.kind, RegKind.IMM)
+        self.assertEqual(ast.src1.raw_val, 50)
+
 if __name__ == "__main__":
     unittest.main()
