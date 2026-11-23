@@ -29,13 +29,21 @@ FSSM fields written (offsets in the blob; every other header byte is zero):
     0x120 / 0x12C / 0x130  u32 section offset, size, and offset + size (fssm_header.directory_ok)
     0x138 PS: one 8-byte input record per "; input:" line (kind 6, semantic, mask 0xF, index, slot, read method);
           CS: COMPUTE_PGM_RSRC2 and the thread-group size x, y, z (docs/design.md, "Compute shaders")
-    code end: 4 x 0xBF9F0000 (s_code_end), u32 0, u32 0, no binding records, 0xFFFFFFFF, u32 0, u16 0, u16 name
-          length, the name (fssm_header.binding_table)
+    code end: 4 x 0xBF9F0000 (s_code_end), u32 0, u32 0, the "; binding:" records (20 bytes each, none by default),
+          0xFFFFFFFF, u32 0, u16 0, u16 name length, the name (fssm_header.binding_table)
 
 Header comments an .asm may carry (before its first instruction):
     ; stage: vs | ps | cs        default: the name's prefix (vs_, ps_, cs_)
     ; wave: 32 | 64              default 32
-    ; input: flat | interp [fp16]  PS only, one per table position, in v_interp attr order
+    ; input: flat | interp [fp16] [slot=N]
+                                 PS only, one per table position, in v_interp attr order. The record's parameter
+                                 slot (byte 6) is position + 1 unless slot= gives another: the table position, not
+                                 the slot, is the attr number the code reads (fssm_header.py)
+    ; binding: W0 W1 W2 W3 W4    one 20-byte binding record (five u32) in the tail, in order; the title's tails carry
+                                 5,640,704 of them (fssm_header.py), nothing in the chain reads their fields yet
+    ; first-payload: NAME        the container gets two XDAT 0x0D entries, as 195 of the title's do: first the same
+                                 code packed under NAME (another hash), then this shader's. fssm_unpack.py and the
+                                 runtime take the last one, so a reader that took the first would miss the shader
     ; data-at: 0xOFFSET          bytes from the first instruction to the data words (what s_getpc_b64 + K reaches)
     ; data: 0xWORD ...           u32 words placed there, after the code's s_endpgm; s_code_end fills the gap
     ; group: X,Y,Z  ; rsrc2: 0x...  CS only (thread-group size and COMPUTE_PGM_RSRC2)
@@ -87,14 +95,14 @@ def header_fields(text, name):
     """The packing options from an .asm's leading comment lines (see the module docstring)."""
     fields = {"stage": name[:2].lower() if name[2:3] == "_" else None, "wave": 32, "inputs": [],
               "data_at": None, "data": [], "group": (64, 1, 1), "rsrc2": 0x8088, "native_variant": None,
-              "position": 0}
+              "position": 0, "bindings": [], "first_payload": None}
     for ln in text.splitlines():
         s = ln.strip()
         if not s:
             continue
         if not s.startswith(";"):
             break
-        m = re.match(r";\s*(stage|wave|input|data-at|data|group|rsrc2|native-variant|position):\s*(.*?)\s*$", s)
+        m = re.match(r";\s*(stage|wave|input|data-at|data|group|rsrc2|native-variant|position|binding|first-payload):\s*(.*?)\s*$", s)
         if not m:
             continue
         key, value = m.groups()
@@ -105,9 +113,23 @@ def header_fields(text, name):
                 fields["wave"] = int(value)
             elif key == "input":
                 words = value.lower().split()
-                if not words or words[0] not in READ_METHODS or set(words[1:]) - {"fp16"}:
-                    raise PackError(f"{name}: input must be 'flat' or 'interp' [fp16], not {value!r}")
-                fields["inputs"].append((READ_METHODS[words[0]], "fp16" in words[1:]))
+                slots = [w for w in words[1:] if w.startswith("slot=")]
+                if (not words or words[0] not in READ_METHODS or set(words[1:]) - {"fp16"} - set(slots)
+                        or len(slots) > 1):
+                    raise PackError(f"{name}: input must be 'flat' or 'interp' [fp16] [slot=N], not {value!r}")
+                slot = int(slots[0][5:], 0) if slots else len(fields["inputs"]) + 1
+                if not 0 <= slot <= 0xFF:
+                    raise PackError(f"{name}: an input's slot is one byte, not {slot}")
+                fields["inputs"].append((READ_METHODS[words[0]], "fp16" in words[1:], slot))
+            elif key == "binding":
+                words = [int(w, 0) for w in value.split()]
+                if len(words) != 5 or not all(0 <= w <= 0xFFFFFFFF for w in words) or words[0] == SENTINEL:
+                    raise PackError(f"{name}: a binding is five u32 words, the first not 0xFFFFFFFF, not {value!r}")
+                fields["bindings"].append(tuple(words))
+            elif key == "first-payload":
+                if not re.fullmatch(r"[A-Za-z0-9_]+", value) or value == name:
+                    raise PackError(f"{name}: first-payload needs another plain name, not {value!r}")
+                fields["first_payload"] = value
             elif key == "data-at":
                 fields["data_at"] = int(value, 0)
             elif key == "data":
@@ -142,8 +164,10 @@ def header_fields(text, name):
     return fields
 
 
-def pack(code, *, stage, name, wave=32, inputs=(), data_at=None, data=(), group=(64, 1, 1), rsrc2=0x8088):
-    """One FSSM blob: the header fields above, the code section and the binding-table tail."""
+def pack(code, *, stage, name, wave=32, inputs=(), data_at=None, data=(), group=(64, 1, 1), rsrc2=0x8088,
+         bindings=()):
+    """One FSSM blob: the header fields above, the code section and the binding-table tail. inputs: (read method,
+    fp16) or (read method, fp16, slot) per table position; bindings: five-word records for the tail."""
     if len(code) < 4 or len(code) % 4 or struct.unpack_from("<I", code, len(code) - 4)[0] != ENDPGM:
         raise PackError(f"{name}: the code must be whole dwords ending with s_endpgm")
     if len(inputs) > MAX_INPUTS:
@@ -159,7 +183,10 @@ def pack(code, *, stage, name, wave=32, inputs=(), data_at=None, data=(), group=
     section_size = CODE_SKIP + len(body)
     code_end = HEADER_SIZE + section_size
     label = name.encode("ascii")
+    if any(len(b) != 5 or b[0] == SENTINEL for b in bindings):
+        raise PackError(f"{name}: a binding record is five u32 words, the first not the sentinel")
     tail = (struct.pack("<I", CODE_END_FILLER) * 4 + struct.pack("<II", 0, 0)
+            + b"".join(struct.pack("<5I", *b) for b in bindings)
             + struct.pack("<IIHH", SENTINEL, 0, 0, len(label)) + label)
     tail += bytes(-len(tail) % 4)
     blob = bytearray(HEADER_SIZE)
@@ -172,8 +199,9 @@ def pack(code, *, stage, name, wave=32, inputs=(), data_at=None, data=(), group=
     struct.pack_into("<I", blob, 0x12C, section_size)
     struct.pack_into("<I", blob, 0x130, code_end)
     if stage == "ps":
-        for position, (method, fp16) in enumerate(inputs):
-            record = bytes([INPUT_KIND, position, 0x0F, 0, 0, 0, position + 1, method | (FP16 if fp16 else 0)])
+        for position, (method, fp16, *slot) in enumerate(inputs):
+            slot = slot[0] if slot else position + 1
+            record = bytes([INPUT_KIND, position, 0x0F, 0, 0, 0, slot, method | (FP16 if fp16 else 0)])
             blob[INPUT_TABLE + 8 * position:INPUT_TABLE + 8 * position + 8] = record
     elif stage == "cs":
         struct.pack_into("<4I", blob, INPUT_TABLE, rsrc2, *group)
@@ -191,14 +219,22 @@ def isg1(position_mask):
     return struct.pack("<II", 1, 8) + element + name
 
 
-def container(fssm, position_mask=0):
+def xbch(fssm):
+    stream = zlib.compress(fssm, 9)
+    return b"XBCH" + struct.pack("<5I", 1, len(stream), 0, len(fssm), 0) + stream
+
+
+def container(fssm, position_mask=0, first=None):
     """The shader container the game ships: DXBC { DXIL { 16-byte program header stub, XDAT { 0x0D: XBCH +
     zlib(FSSM) } } }, as tools/fssm_unpack.py and the runtime's fssm_program() read it, then an ISG1 part when
-    position_mask is not 0."""
-    stream = zlib.compress(fssm, 9)
-    xbch = b"XBCH" + struct.pack("<5I", 1, len(stream), 0, len(fssm), 0) + stream
-    xdat_entry_at = 16 + 12 + 12
-    dxil = bytes(16) + b"XDAT" + struct.pack("<II", 1, 12) + struct.pack("<III", 0x0D, xdat_entry_at, len(xbch)) + xbch
+    position_mask is not 0. With first, XDAT has two 0x0D entries: first's, then fssm's."""
+    payloads = [xbch(p) for p in ([first] if first is not None else []) + [fssm]]
+    at = 16 + 12 + 12 * len(payloads)
+    entries, data = b"", b""
+    for payload in payloads:
+        entries += struct.pack("<III", 0x0D, at + len(data), len(payload))
+        data += payload
+    dxil = bytes(16) + b"XDAT" + struct.pack("<II", len(payloads), 12) + entries + data
     parts = [(b"DXIL", dxil)] + ([(b"ISG1", isg1(position_mask))] if position_mask else [])
     at = 32 + 4 * len(parts)
     offsets, body = [], b""
@@ -259,12 +295,14 @@ def pack_file(path, out, mcpu="gfx1013"):
     fields = header_fields(text, name)
     variant = fields.pop("native_variant")
     position = fields.pop("position")
+    first_name = fields.pop("first_payload")
     code = assemble(text, name, mcpu, fields["wave"])
+    first = pack(code, name=first_name, **fields) if first_name else None
     packed = []
     for packed_name, native in ((name, False),) + (((variant, True),) if variant else ()):
         blob = pack(code, name=packed_name, **fields)
         with open(os.path.join(out, packed_name + ".dxbc"), "wb") as f:
-            f.write(container(blob, position))
+            f.write(container(blob, position, first))
         packed.append((packed_name, fields["stage"], blob, native))
     return packed
 

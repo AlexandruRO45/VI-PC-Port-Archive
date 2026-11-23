@@ -46,6 +46,20 @@ def test_translated_index_is_keyed_by_the_packed_blob(tmp_path):
     assert (row["stage"], row["ps_flat_interpolants"]) == ("ps", [0])
 
 
+
+def test_slot_byte_and_first_payload_do_not_move_the_shader(tmp_path):
+    # The input's slot byte (9) is not its attr number (0), the tail has a binding record, and the container's first
+    # 0x0D payload is another program: the chain keys the shader by the last payload and declares its flat input at
+    # table position 0. A reader that took the slot or the first payload would give another index row.
+    asm = ("; stage: ps\n; input: flat slot=9\n; binding: 1 2 3 4 5\n; first-payload: ps_first\n"
+           "v_interp_mov_f32 v2, p0, attr0.x\nv_mov_b32_e32 v3, 1.0\nexp mrt0 v2, v3, v3, v3 done vm\ns_endpgm\n")
+    out, index = pack_and_translate(tmp_path, "ps_two", asm)
+    blob = (out / "fssm" / "ps_two.fssm").read_bytes()
+    assert index["ps_two"]["fssm_sha256"] == hashlib.sha256(blob).hexdigest()
+    assert index["ps_two"]["ps_flat_interpolants"] == [0]
+    assert "ps_first" not in index
+
+
 @pytest.mark.parametrize("header, system_inputs", [("; stage: ps\n; position: xy\n", ["0", "1"]),
                                                    ("; stage: ps\n", None)])
 def test_position_header_lets_a_pixel_shader_read_sv_position(tmp_path, header, system_inputs):
