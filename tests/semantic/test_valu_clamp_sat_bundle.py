@@ -445,6 +445,17 @@ class TestValuMulF32SIMDDivergence(unittest.TestCase):
         self.assertAlmostEqual(res_ab, res_ba, places=6)
         self.assertAlmostEqual(res_ab, 0.0, places=6)
 
+class TestValuMulF32BoundaryExtremes(unittest.TestCase):
+    """Stage 17: IEEE 754 boundary extremes and saturation for v_mul_f32."""
+
+    def test_mul_zero_saturation(self):
+        hw = run_binary_f32("v_mul_f32", 0.0, 50.0, clamp=True)
+        self.assertEqual(hw, 0.0)
+
+    def test_mul_inf_saturation(self):
+        hw = run_binary_f32("v_mul_f32", float("inf"), float("inf"), clamp=True)
+        self.assertEqual(hw, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
