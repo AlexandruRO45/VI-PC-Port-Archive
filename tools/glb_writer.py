@@ -29,6 +29,7 @@ from file_mode import published_mode  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
+MIN_UNSCALED_QUAT_NORM = math.sqrt(sys.float_info.min)
 CHUNK_TYPE_JSON = 0x4E4F534A  # b"JSON"
 CHUNK_TYPE_BIN = 0x004E4942   # b"BIN\x00"
 
@@ -1180,8 +1181,13 @@ def build_instanced_glb(
             sc = [float(v) for v in sc]
             q = [float(v) for v in q]
             n = math.sqrt(sum(v * v for v in q))
-            if not n or not math.isfinite(n):
-                raise GlbError("instance rotation must be a finite non-zero quaternion")
+            if n < MIN_UNSCALED_QUAT_NORM or not math.isfinite(n):
+                if not any(q) or not all(math.isfinite(v) for v in q):
+                    raise GlbError("instance rotation must be a finite non-zero quaternion")
+                # Rescale only when squaring overflows or loses precision below the normal range.
+                peak = max(map(abs, q))
+                q = [v / peak for v in q]
+                n = math.sqrt(sum(v * v for v in q))
             q = [v / n for v in q]
             if sc[0] * sc[1] * sc[2] <= 0:
                 raise GlbError("instance scale must have a positive determinant; mirror the mesh instead")
