@@ -235,6 +235,43 @@ class Mov64VccDataTests(unittest.TestCase):
                 self.assertEqual([mem[4 * l] for l in range(width)], [20 if l > 17 else 10 for l in range(width)])
                 self.assertEqual([mem[256 + 4 * l] for l in range(width)], [width - 18] * width)
 
+    def test_mov64_data_vcc_consumed_by_cndmask_and_exec_extracts_lane_bits(self):
+        cases = (
+            (0x11223344, 0x00000000),
+            (0x00000000, 0x80000000),
+            (0x00000002, 0x80000001),
+        )
+        for wave32 in (True, False):
+            width = 32 if wave32 else 64
+            tag = "w32" if wave32 else "w64"
+            prelude = [] if wave32 else [("s_mov_b64 s[12:13], exec", 4)]
+            spv_cnd = translate_cs(f"cs_{tag}_mov64_vcc_data_cndmask", prelude + [
+                ("s_mov_b64 vcc, s[4:5]", 4),
+                ("v_cndmask_b32_e64 v1, 10, 20, vcc", 8),
+                ("v_lshlrev_b32_e32 v4, 2, v0", 4),
+                ("buffer_store_dword v1, v4, s[0:3], 0 offen", 8),
+                ("s_endpgm", 4),
+            ], threads=width, wave32=wave32)
+            spv_exec = translate_cs(f"cs_{tag}_mov64_vcc_data_to_exec", prelude + [
+                ("s_mov_b64 vcc, s[4:5]", 4),
+                ("v_mov_b32_e32 v1, 10", 4),
+                ("s_mov_b64 exec, vcc", 4),
+                ("v_mov_b32_e32 v1, 20", 4),
+                ("s_mov_b64 exec, s[12:13]" if not wave32 else "s_mov_b32 exec_lo, -1", 4),
+                ("v_lshlrev_b32_e32 v4, 2, v0", 4),
+                ("buffer_store_dword v1, v4, s[0:3], 0 offen", 8),
+                ("s_endpgm", 4),
+            ], threads=width, wave32=wave32)
+            for s4, s5 in cases:
+                mask64 = (s5 << 32) | s4
+                want = [20 if ((mask64 >> l) & 1) else 10 for l in range(width)]
+                with self.subTest(kind="cndmask", wave=width, s4=hex(s4), s5=hex(s5)):
+                    mem = run_cs(spv_cnd, width, s4, s5)
+                    self.assertEqual([mem[4 * l] for l in range(width)], want)
+                with self.subTest(kind="exec", wave=width, s4=hex(s4), s5=hex(s5)):
+                    mem = run_cs(spv_exec, width, s4, s5)
+                    self.assertEqual([mem[4 * l] for l in range(width)], want)
+
 
 if __name__ == "__main__":
     unittest.main()

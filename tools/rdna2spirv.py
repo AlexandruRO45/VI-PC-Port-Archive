@@ -5996,6 +5996,17 @@ class Gen:
         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {v}")
         return lo_in, hi_in
 
+    def _mask_bit_from_word(self, word, lane):
+        """Extract bit (lane & 31) of scalar word as 0xFFFFFFFF (set) or 0 (clear)."""
+        sh, shr, bit, r = (self.tmp() for _ in range(4))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+        # Shift and mask, not OpBitFieldUExtract (Intel's driver takes the offset mod 16 for a 16-bit constant;
+        # see exec_half_write).
+        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
+
     def mask_src(self, a, wide=True):
         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane. A constant is a mask with one
         bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
@@ -6023,18 +6034,28 @@ class Gen:
                 self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
                 self.emit(f"{sel} = OpSelect %uint {up} {hi} {word}")
                 word = sel
-            sh, shr, bit, r = (self.tmp() for _ in range(4))
-            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
-            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
-            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
-            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
-            return r
+            return self._mask_bit_from_word(word, lane)
         if a["k"] == "special" and a["t"] == "null":
             return self.cu(0)
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
-            v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint %vcc")
-            return v
+            if self.holds_lane_mask(a):
+                v = self.tmp()
+                self.emit(f"{v} = OpLoad %uint %vcc")
+                return v
+            lane = self.wave_lane()
+            if a["t"] == "vcc_hi":
+                word = self.tmp()
+                self.emit(f"{word} = OpLoad %uint %vcc_hi")
+            elif a["t"] == "vcc" and wide and self.wave64:
+                lo, hi, up, word = (self.tmp() for _ in range(4))
+                self.emit(f"{lo} = OpLoad %uint %vcc")
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                self.emit(f"{word} = OpSelect %uint {up} {hi} {lo}")
+            else:
+                word = self.tmp()
+                self.emit(f"{word} = OpLoad %uint %vcc")
+            return self._mask_bit_from_word(word, lane)
         if a["k"] == "special" and a["t"] in ("exec", "exec_lo", "exec_hi"):
             return self.exec_value()
         if a["k"] == "imm":
@@ -6044,20 +6065,14 @@ class Gen:
             if lo in (0, 0xFFFFFFFF) and (hi == lo or not w64):
                 return self.cu(lo)              # 0 or -1: no lane or every lane, as before
             lane = self.wave_lane()
-            sh, word, shr, bit, r = (self.tmp() for _ in range(5))
-            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            word = self.tmp()
             if w64 and hi != lo:
                 up = self.tmp()
                 self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
                 self.emit(f"{word} = OpSelect %uint {up} {self.cu(hi)} {self.cu(lo)}")
             else:
                 self.emit(f"{word} = OpCopyObject %uint {self.cu(lo)}")
-            # Shift and mask, not OpBitFieldUExtract (Intel's driver takes the offset mod 16 for a 16-bit constant;
-            # see exec_half_write).
-            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
-            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
-            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
-            return r
+            return self._mask_bit_from_word(word, lane)
         raise Unsupported("mask operand")
 
     def is_mask_op(self, x):
