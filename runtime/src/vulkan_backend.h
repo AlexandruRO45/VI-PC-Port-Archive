@@ -1672,6 +1672,23 @@ public:
         return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
     }
 
+    // One vkQueueBindSparse for any sparse buffer, ordered on this queue's timeline as bind_tiles' binds are (the
+    // Xbox page mapper's arena, xbox_paging.h). `keepalive` is held until the bind completes. Returns the bind's
+    // ticket on timeline(), or 0 if nothing was bound.
+    std::uint64_t bind_sparse_ordered(VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                                      std::shared_ptr<const void> keepalive = {}) {
+        if (!buffer || binds.empty()) return 0;
+        PendingBindings pending;
+        pending.keepalive = std::move(keepalive);
+        return submit_sparse_binds(buffer, binds, std::move(pending));
+    }
+
+    // This queue's timeline semaphore: work submitted outside execute() orders itself against binds by waiting on it
+    // at a ticket, and by handing its own semaphore to the queue's next submission.
+    VkSemaphore timeline() const { return progress_; }
+    std::uint64_t submitted_ticket() const { return submitted_; }
+    std::uint64_t completed_ticket() const { return completed(); }
+
 private:
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
@@ -2180,6 +2197,7 @@ private:
         // Vulkan needs the buffer until the bind completes and the previous allocation until it is unmapped.
         std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
         std::shared_ptr<SparseBuffer> buffer;
+        std::shared_ptr<const void> keepalive;  // bind_sparse_ordered's caller-owned objects
     };
 
     static bool valid_tiles(const SparseBuffer& buffer, BufferTileRegion region) {
@@ -2188,10 +2206,8 @@ private:
 
     bool bind_tiles(const std::shared_ptr<SparseBuffer>& buffer,
                     std::map<std::uint64_t, BufferTile>& changes) {
-        auto& vk = context_.vk;
-        if (!vk.vkQueueBindSparse || context_.is_device_lost()) return false;
-        const auto ticket = submitted_ + 1;
-        PendingBindings pending{ticket, {}, buffer};
+        if (!context_.vk.vkQueueBindSparse || context_.is_device_lost()) return false;
+        PendingBindings pending{0, {}, buffer};
         std::vector<VkSparseMemoryBind> binds;
         for (const auto& [index, page] : changes) {
             const auto old = buffer->mapped.find(index);
@@ -2215,6 +2231,24 @@ private:
             binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
         }
         if (binds.empty()) return true;
+        if (!submit_sparse_binds(buffer->buffer, binds, std::move(pending))) return false;
+        for (auto it = changes.begin(); it != changes.end();) {
+            buffer->mapped.erase(it->first);
+            if (it->second.heap) ++it;
+            else it = changes.erase(it);
+        }
+        buffer->mapped.merge(changes);
+        return true;
+    }
+
+    // Submits `binds` for `buffer` after everything this queue submitted and its pending Wait()s; the next submission
+    // waits for it. Returns the ticket, or 0 if the bind was not submitted.
+    std::uint64_t submit_sparse_binds(VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                                      PendingBindings pending) {
+        auto& vk = context_.vk;
+        if (!vk.vkQueueBindSparse || context_.is_device_lost()) return 0;
+        const auto ticket = submitted_ + 1;
+        pending.ticket = ticket;
         collect_bindings(completed());
         auto semaphores = waits_;
         auto values = wait_values_;
@@ -2228,7 +2262,7 @@ private:
         tickets.pWaitSemaphoreValues = values.data();
         tickets.signalSemaphoreValueCount = 1;
         tickets.pSignalSemaphoreValues = &ticket;
-        const VkSparseBufferMemoryBindInfo buffer_bind{buffer->buffer, std::uint32_t(binds.size()), binds.data()};
+        const VkSparseBufferMemoryBindInfo buffer_bind{buffer, std::uint32_t(binds.size()), binds.data()};
         VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tickets};
         info.waitSemaphoreCount = std::uint32_t(semaphores.size());
         info.pWaitSemaphores = semaphores.data();
@@ -2243,20 +2277,14 @@ private:
             if (result != VK_SUCCESS) {
                 if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
                 pending_bindings_.pop_back();
-                return false;
+                return 0;
             }
             context_.record_submit_locked(progress_, ticket);
         }
         submitted_ = last_sparse_ = ticket;
         waits_.clear();
         wait_values_.clear();
-        for (auto it = changes.begin(); it != changes.end();) {
-            buffer->mapped.erase(it->first);
-            if (it->second.heap) ++it;
-            else it = changes.erase(it);
-        }
-        buffer->mapped.merge(changes);
-        return true;
+        return ticket;
     }
 
     std::uint64_t completed() const {
