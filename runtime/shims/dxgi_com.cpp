@@ -23,11 +23,12 @@ namespace {
 // Native DXGI accepts up to 40 queued frames on a waitable swapchain.
 constexpr UINT max_waitable_frame_latency = 40;
 
+std::set<std::string> g_seen_stubs;
+
 void stub(const char* method) {
     static std::mutex mutex;
-    static std::set<std::string> seen;
     std::lock_guard lock(mutex);
-    if (seen.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
+    if (g_seen_stubs.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
 }
 
 // IDXGIObject private data, shared by the factory, adapter and swapchain. SetPrivateData keeps a copy of the bytes;
@@ -634,17 +635,18 @@ struct ReservationState {
     std::atomic<UINT64> non_local{0};
 };
 
+std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> g_reservations;
+
 // Video-memory reservations are scoped per physical adapter in the process (matching native DXGI,
 // where separate IDXGIAdapter3 handles opened for the same LUID observe each other's reservations).
 std::shared_ptr<ReservationState> adapter_reservation_state(LUID luid, VkPhysicalDevice physical) {
     static std::mutex mutex;
-    static std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> table;
     const bool has_luid = (luid.LowPart != 0 || luid.HighPart != 0);
     const auto key =
         has_luid ? std::make_tuple(std::uint32_t(luid.LowPart), std::int32_t(luid.HighPart), std::uintptr_t(0))
                  : std::make_tuple(std::uint32_t(0), std::int32_t(0), reinterpret_cast<std::uintptr_t>(physical));
     std::lock_guard lock(mutex);
-    auto& entry = table[key];
+    auto& entry = g_reservations[key];
     if (!entry) entry = std::make_shared<ReservationState>();
     return entry;
 }
@@ -864,14 +866,17 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
     return S_OK;
 }
 
+using DwmFlushFn = HRESULT(WINAPI*)();
+std::once_flag g_dwm_flush_once;
+DwmFlushFn g_dwm_flush = nullptr;
+
 void wait_for_vblank() {
-    using DwmFlushFn = HRESULT(WINAPI*)();
-    static const DwmFlushFn dwm_flush = []() -> DwmFlushFn {
+    std::call_once(g_dwm_flush_once, [] {
         // Resolve dynamically so dxgi_com.cpp needs no extra dwmapi.lib link entry in CMakeLists.txt.
         const HMODULE mod = LoadLibraryW(L"dwmapi.dll");
-        return mod ? reinterpret_cast<DwmFlushFn>(GetProcAddress(mod, "DwmFlush")) : nullptr;
-    }();
-    if (dwm_flush && SUCCEEDED(dwm_flush())) return;
+        g_dwm_flush = mod ? reinterpret_cast<DwmFlushFn>(GetProcAddress(mod, "DwmFlush")) : nullptr;
+    });
+    if (g_dwm_flush && SUCCEEDED(g_dwm_flush())) return;
     Sleep(16);
 }
 

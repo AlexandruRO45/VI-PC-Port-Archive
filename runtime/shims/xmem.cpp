@@ -32,6 +32,9 @@ namespace {
 constexpr size_t kAlign = 64;
 constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
+std::set<std::pair<std::string, uint64_t>> g_seen_attributes;
+std::set<std::pair<uint32_t, uint64_t>> g_seen_transfers;
+
 // gta6rt --trace FILE: the first XMemAlloc, XMemFree and XMemVirtualAlloc call for each distinct raw attribute word go to the
 // startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
 // bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
@@ -39,10 +42,9 @@ constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size fie
 void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<std::string, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({api, attributes}).second) return;
+        if (!g_seen_attributes.insert({api, attributes}).second) return;
     }
     std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
@@ -260,11 +262,10 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
     }
     if (rt::startup_trace::enabled()) {
         static std::mutex mutex;
-        static std::set<std::pair<uint32_t, uint64_t>> seen;
         bool first = false;
         {
             const std::lock_guard lock(mutex);
-            first = seen.insert({type, static_cast<uint64_t>(size)}).second;
+            first = g_seen_transfers.insert({type, static_cast<uint64_t>(size)}).second;
         }
         if (first) {
             rt::startup_trace::event(
