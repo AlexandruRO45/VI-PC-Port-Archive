@@ -10144,7 +10144,13 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_cndmask_b32":
             # e32: dst, src0, src1 (vcc) ; e64: dst, src0, src1, sN[:N+1]/vcc
-            x, y = self.src_u(a[1]), self.src_u(a[2])
+            def _cnd_src(arg):
+                if arg.get("abs") or arg.get("neg"):
+                    r = self.tmp()
+                    self.emit(f"{r} = OpBitcast %uint {self.src_f(arg)}")
+                    return r
+                return self.src_u(arg)
+            x, y = _cnd_src(a[1]), _cnd_src(a[2])
             c = self.mask_src(a[3]) if len(a) > 3 else self.mask_src({"k": "special", "t": "vcc"})
             b, r = self.tmp(), self.tmp()
             self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
