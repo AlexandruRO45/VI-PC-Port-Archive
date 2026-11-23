@@ -189,5 +189,18 @@ class VMulI32I24SimdDivergenceTests(unittest.TestCase):
         for i in range(16, 32):
             self.assertEqual(wave.get_vgpr(i, 2), 0x12345678)
 
+class VMulI32I24TranslatorTests(unittest.TestCase):
+    def test_mul_i24_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, -10",
+            "v_mov_b32 v1, 20",
+            "v_mul_i32_i24 v2, v0, v1",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mul_i24_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, u32(-200))
+
 if __name__ == "__main__":
     unittest.main()
