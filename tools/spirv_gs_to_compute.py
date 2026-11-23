@@ -402,10 +402,22 @@ def main(argv):
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1
     target = f"spv{version[0]}.{version[1]}" if ver else "vulkan1.2"
-    subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
+    try:
+        subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
+    except OSError as e:
+        print(f"ERROR: cannot run {asm}: {e.strerror or e} (install SPIRV-Tools or set SPIRV_AS)",
+              file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: {asm} refused the rewritten module: {_why(e)}", file=sys.stderr)
+        return 2
     if lay_path:
-        with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(lay, f, indent=1)
+        try:
+            with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(lay, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {lay_path}: {e.strerror or e}", file=sys.stderr)
+            return 2
     print(json.dumps(lay))
     return 0
 

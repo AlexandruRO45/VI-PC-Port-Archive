@@ -415,3 +415,35 @@ def test_cli_names_a_disassembler_that_cannot_start(tmp_path: Path) -> None:
     assert "SPIRV_DIS" in result.stderr
     assert "Traceback" not in result.stderr
 
+
+
+def test_cli_names_an_assembler_that_cannot_start_or_refuses(tmp_path: Path, monkeypatch, capsys) -> None:
+    """spirv-as missing, or refusing the rewritten module, is one ERROR line, not a traceback."""
+    source = tmp_path / "gs.spv"
+    source.write_bytes(b"\x03\x02#\x07")
+    output = tmp_path / "cs.spv"
+
+    def start_fails(command, **kwargs):
+        if "--raw-id" in command:
+            return subprocess.CompletedProcess(command, 0, PHI_GS, "")
+        raise FileNotFoundError(2, "No such file or directory", command[0])
+
+    monkeypatch.setattr(gsc.subprocess, "run", start_fails)
+    assert gsc.main(["spirv_gs_to_compute.py", str(source), str(output)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: "), err
+    assert "SPIRV_AS" in err
+    assert not output.exists()
+
+    def refuses(command, **kwargs):
+        if "--raw-id" in command:
+            return subprocess.CompletedProcess(command, 0, PHI_GS, "")
+        raise subprocess.CalledProcessError(1, command, stderr="error: 0: 1: invalid opcode\n")
+
+    monkeypatch.setattr(gsc.subprocess, "run", refuses)
+    assert gsc.main(["spirv_gs_to_compute.py", str(source), str(output)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: "), err
+    assert "invalid opcode" in err
+    assert not output.exists()
+
