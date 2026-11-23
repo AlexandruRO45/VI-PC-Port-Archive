@@ -8,6 +8,7 @@ check.py / run_gpu_tests.py stop with "missing vk_compute_test", and so do the f
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -164,6 +165,15 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             self.assertEqual(Path(cmake).resolve(), native_cmake.resolve())
             self.assertEqual(ninja, "")
 
+            with self.subTest(source="bracketed PATH directory"):
+                bracketed_bin = root / "[sdk]"
+                bracketed_bin.mkdir()
+                shutil.copy(native_cmake, bracketed_bin)
+                shutil.copy(native_ninja, bracketed_bin)
+                cmake, ninja = run_probe(vs_empty, [bracketed_bin])
+                self.assertEqual(Path(cmake), bracketed_bin / native_cmake.name)
+                self.assertEqual(Path(ninja), bracketed_bin / native_ninja.name)
+
             # 4) VS bundled CMake + Ninja present -> must prefer VS over PATH.
             vs_full = root / "vs_full"
             vs_cmake = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "CMake" / "bin" / "cmake.exe"
@@ -172,6 +182,13 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             vs_ninja.parent.mkdir(parents=True)
             vs_cmake.write_bytes(b"")
             vs_ninja.write_bytes(b"")
+            with self.subTest(source="bracketed Visual Studio directory"):
+                bracketed_vs = root / "VS [2022]"
+                shutil.copytree(vs_full, bracketed_vs)
+                cmake, ninja = run_probe(bracketed_vs, [native_cmake_dir, native_ninja_dir])
+                self.assertEqual(Path(cmake), bracketed_vs / vs_cmake.relative_to(vs_full))
+                self.assertEqual(Path(ninja), bracketed_vs / vs_ninja.relative_to(vs_full))
+
             cmake, ninja = run_probe(vs_full, [native_cmake_dir, native_ninja_dir])
             self.assertEqual(Path(cmake).resolve(), vs_cmake.resolve())
             self.assertEqual(Path(ninja).resolve(), vs_ninja.resolve())
