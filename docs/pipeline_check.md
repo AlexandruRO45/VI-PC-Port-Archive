@@ -259,8 +259,9 @@ SPIR-V byte, and they enter the driver while their reservations fit three quarte
 the run starts, up to `--jobs` of them. One large module always gets in when none is compiling, so a module
 bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back. On
 Linux the budget is the smaller of `MemAvailable` and the room under the cgroup v2 `memory.max` of the process and
-every cgroup above it (a container, or `systemd-run -p MemoryMax=...`); on Windows it is `ullAvailPhys`. Where
-neither can be read, every large module compiles alone, as before. After each large module, glibc builds call
+every cgroup above it (a container, or `systemd-run -p MemoryMax=...`); on Windows it is `ullAvailPhys`; on macOS
+it is `hw.memsize` times the kernel's free percentage `kern.memorystatus_level` (what `memory_pressure` prints as
+"System-wide memory free percentage"). Where none can be read, every large module compiles alone, as before. After each large module, glibc builds call
 `malloc_trim(0)`: the driver's compiler frees its memory into the arena of the thread it ran on, and glibc kept it
 there.
 
@@ -276,6 +277,19 @@ compute modules of which 27 are over 4 MiB:
 One 5.7 MB ray-tracing compute module alone: 12.4 s and 1.96 GB peak (about 330 bytes per SPIR-V byte, hence the
 512 estimate); a 0.36 MB one: 0.13 s and 94 MB. The process grew past one module's peak even one at a time because
 of the arenas (16 modules, 6 threads: 6.2 GB; with `MALLOC_ARENA_MAX=1`: 2.1 GB).
+
+On a Mac, Metal compiles in its `MTLCompilerService` processes, not in the checker: one 4 MiB module took 11.7 s
+with 0.3 s of the checker's own CPU and 0.24 GB of its RSS, while `MTLCompilerService` held about 2.3 GB for a
+large module. The reservation is for that system memory, which is why the budget reads the system-wide free
+level. Apple M4 (24 GB), MoltenVK 1.4.2, two disjoint sets of 24 translated compute modules over 4 MiB (about
+125 MiB each), each run with an empty Metal cache for its modules:
+
+| Large modules | Threads | Wall time | Checker peak RSS | Lowest system free level |
+|---|---|---|---|---|
+| one at a time (what a Mac did before) | 5 | 1,291 s | 0.96 GB | 80% |
+| memory budget (16 GB of 21.4 GB available) | 5 | 701 s | 1.12 GB | 83% |
+
+With the Metal cache already holding the modules, both took about 10 s.
 
 - `--large-module-bytes N` changes the cutoff in bytes. `0` disables the gate.
 - `--large-parallel N` caps how many large modules compile at once: `0` (default) by the budget, `1` alone with

@@ -104,8 +104,15 @@ static int threads_never_exceed_the_budget() {
 
 static int estimate_and_memory_query() {
     CHECK(leonida::large_module_estimate(4u << 20) == (uint64_t(4) << 20) * leonida::kBytesPerSpirvByte);
-#if defined(__linux__) || defined(_WIN32)
-    CHECK(leonida::available_memory_bytes() > 0);   // Linux: MemAvailable; Windows: ullAvailPhys
+#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
+    // Linux: MemAvailable; Windows: ullAvailPhys; macOS: hw.memsize x kern.memorystatus_level
+    CHECK(leonida::available_memory_bytes() > 0);
+#endif
+#if defined(__APPLE__)
+    uint64_t total = 0;
+    size_t n = sizeof(total);
+    CHECK(sysctlbyname("hw.memsize", &total, &n, nullptr, 0) == 0);
+    CHECK(leonida::available_memory_bytes() <= total);   // a share of the physical memory, never more
 #endif
     leonida::release_free_memory();   // must be callable anywhere
     return 0;

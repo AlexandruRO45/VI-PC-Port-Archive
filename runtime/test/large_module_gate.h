@@ -27,6 +27,9 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 namespace leonida {
 
@@ -96,6 +99,18 @@ inline uint64_t available_memory_bytes() {
     if (!found) return 0;
     const uint64_t room = cgroup_memory_room();
     return std::max<uint64_t>(1, std::min(uint64_t(kb) * 1024, room));   // 0 would mean "unknown"
+#elif defined(__APPLE__)
+    // The kernel's own free percentage (kern.memorystatus_level: what memory_pressure prints as "System-wide memory
+    // free percentage", counting purgeable and compressible pages too) of the physical memory.
+    uint64_t total = 0;
+    uint32_t level = 0;
+    size_t n = sizeof(total);
+    if (sysctlbyname("hw.memsize", &total, &n, nullptr, 0) != 0 || n != sizeof(total)) return 0;
+    n = sizeof(level);
+    if (sysctlbyname("kern.memorystatus_level", &level, &n, nullptr, 0) != 0 || n != sizeof(level) || level == 0 ||
+        level > 100)
+        return 0;
+    return total / 100 * level;
 #else
     return 0;
 #endif
