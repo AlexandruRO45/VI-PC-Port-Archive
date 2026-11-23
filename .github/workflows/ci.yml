@@ -117,6 +117,15 @@ jobs:
           python -I tests/test_ttpf_assets.py
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
+      # The standard-library loop runs these files before the library is built, where the comparisons skip.
+      - name: Build the native TTPF kernels and compare them with the Python code
+        shell: bash
+        run: |
+          CARGO_HOME="$(mktemp -d)" cargo build --release --locked --offline --manifest-path tools/ttpf_native/Cargo.toml
+          CARGO_HOME="$(mktemp -d)" cargo test --release --locked --offline --manifest-path tools/ttpf_native/Cargo.toml
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import ttpf_mips; assert ttpf_mips._native()"
+          python -I tests/test_ttpf_native.py
+          python -I tests/test_ttpf_mips.py
   translator-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}

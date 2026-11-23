@@ -234,6 +234,249 @@ def _coalesce_x_runs(x_offs, eb):
     return runs
 
 
+# --- Optional native kernels (tools/ttpf_native) ----------------------------
+# `tools/ttpf_native` (built with Cargo, see its README.md) ports the element copy of `detile` and
+# `detile_volume_slice`, the BC block decoders of `decode_pixels` and `block_means` with the same
+# integer and float steps, so the bytes and doubles are identical; any call it refuses runs the
+# Python code. `LEONIDA_TTPF_NATIVE=0` keeps everything in Python.
+
+_NATIVE = []  # [ctypes library or None], filled on first use
+_NATIVE_BC_KIND = {71: 0, 72: 0, 74: 1, 75: 1, 77: 1, 78: 1, 80: 2, 83: 3, 95: 4, 96: 5, 98: 6, 99: 6}
+# BC4, BC5, BC6H and BC7 decode natively. BC1-BC3 keep the Python decoder, which already shares one
+# tuple per palette entry and is as fast as building the list from native output; their lists
+# still carry their blocks, so `block_means` runs natively for every kind.
+_NATIVE_DECODE_KINDS = frozenset({2, 3, 4, 5, 6})
+_NATIVE_BC_OK = {}  # kind -> whether its self-check against the Python code passed
+_NATIVE_TABLES = []  # [(BPTC table bytes, BC6H mode table or None)]
+_BC6H_PLAN_MAX, _BC6H_STRIDE = 128, 9 + 4 * 128  # BC6H_PLAN_MAX and BC6H_STRIDE in lib.rs
+
+
+def _native():
+    """The loaded `tools/ttpf_native` library, or None (not built, disabled or unloadable)."""
+    if not _NATIVE:
+        lib = None
+        if os.environ.get("LEONIDA_TTPF_NATIVE", "1") != "0":
+            import ctypes
+            name = {"win32": "ttpf_native.dll",
+                    "darwin": "libttpf_native.dylib"}.get(sys.platform, "libttpf_native.so")
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "ttpf_native", "target", "release", name)
+            if os.path.isfile(path):
+                try:
+                    lib = ctypes.CDLL(path)
+                    if lib.ttpf_native_abi() != 1:
+                        lib = None
+                except (OSError, AttributeError):
+                    lib = None
+            if lib is not None:
+                n, p, buf = ctypes.c_size_t, ctypes.c_void_p, ctypes.c_char_p
+                lib.ttpf_detile.argtypes = [buf, n, p, n, p, p, n, n]
+                lib.ttpf_decode_bc.argtypes = [ctypes.c_uint32, buf, n, n, n, buf, p, n, p, p, p, n, p]
+                lib.ttpf_decode_means.argtypes = [ctypes.c_uint32, buf, n, n, n, buf, p, n,
+                                                  n, n, n, n, n, p, n]
+                for fn in (lib.ttpf_detile, lib.ttpf_decode_bc, lib.ttpf_decode_means):
+                    fn.restype = ctypes.c_ssize_t
+        _NATIVE.append(lib)
+    return _NATIVE[0]
+
+
+def _native_bytes(buf):
+    """`buf` as `bytes` when it is a plain byte buffer, else None (the Python code handles it)."""
+    if type(buf) is bytes:
+        return buf
+    if isinstance(buf, bytearray):
+        return bytes(buf)
+    if isinstance(buf, memoryview) and buf.format == "B" and buf.ndim == 1:
+        return buf.tobytes()
+    return None
+
+
+def _native_detile(tiled, out, params, x_bits, y_bits):
+    """Fill `out` natively and return `bytes(out)`, or None to run the Python copy."""
+    lib = _native()
+    if lib is None or not all(type(v) is int and 0 <= v < 1 << 63 for v in params):
+        return None
+    flat = [v for pair in (*x_bits, *y_bits) for v in pair]
+    src = _native_bytes(tiled) if all(0 <= v < 1 << 63 for v in flat) else None
+    if src is None:
+        return None
+    import ctypes
+    dst = (ctypes.c_char * len(out)).from_buffer(out)
+    par = (ctypes.c_uint64 * 10)(*params)
+    bits = (ctypes.c_uint64 * max(1, len(flat)))(*flat)
+    status = lib.ttpf_detile(src, len(src), dst, len(out), par, bits, len(x_bits), len(y_bits))
+    del dst
+    return bytes(out) if status == 0 else None
+
+
+class _NativePixels(list):
+    """A `decode_pixels` list that remembers the BC blocks it was decoded from, so
+    `block_means` can average them natively. Any in-place change of the list forgets them."""
+    __slots__ = ("_src",)
+
+
+def _forgets_source(name):
+    base = getattr(list, name)
+
+    def method(self, *args, **kwargs):
+        self._src = None
+        return base(self, *args, **kwargs)
+    method.__name__ = name
+    return method
+
+
+for _name in ("__setitem__", "__delitem__", "__iadd__", "__imul__", "append", "extend", "insert",
+              "pop", "remove", "clear", "sort", "reverse"):
+    setattr(_NativePixels, _name, _forgets_source(_name))
+del _name
+
+
+def _pixel_list():
+    """The empty list a BC decoder fills: plain when the native library is off or absent."""
+    if _NATIVE == [None] or (not _NATIVE and os.environ.get("LEONIDA_TTPF_NATIVE", "1") == "0"):
+        return []
+    return _NativePixels()
+
+
+def _with_source(px, fmt, data, blocks_w, blocks_h):
+    """Record on `px` the blocks it was decoded from (a no-op for a plain list)."""
+    if type(px) is _NativePixels and len(px) == 16 * blocks_w * blocks_h:
+        src = _native_bytes(data)
+        if src is not None:
+            px._src = (fmt, src, blocks_w, blocks_h)
+    return px
+
+
+def _native_tables():
+    """(BPTC partition/anchor bytes, flat BC6H mode table or None) for the decoders."""
+    if not _NATIVE_TABLES:
+        import ctypes
+        tab = _bptc.load_bc7()
+        bptc = (bytes(v for part in tab["partition2"] for v in part)
+                + bytes(v for part in tab["partition3"] for v in part)
+                + bytes(tab["anchor2"]) + bytes(tab["anchor3a"]) + bytes(tab["anchor3b"]))
+        flat = [0] * (32 * _BC6H_STRIDE)
+        for code, (trans, base, deltas, reg) in bcpack._BC6H_INFO.items():
+            plan, hdr = bcpack._bc6h_plan(code)
+            if not 0 <= code < 32 or len(plan) > _BC6H_PLAN_MAX:
+                flat = None
+                break
+            at = code * _BC6H_STRIDE
+            flat[at:at + 9] = [1, int(trans), base, *deltas, reg, hdr, len(plan)]
+            flat[at + 9:at + 9 + 4 * len(plan)] = [v for item in plan for v in item]
+        bc6h = None if flat is None else (ctypes.c_int32 * len(flat))(*flat)
+        _NATIVE_TABLES.append((bptc if len(bptc) == 2240 else None, bc6h))
+    return _NATIVE_TABLES[0]
+
+
+def _native_decode_raw(lib, kind, data, blocks_w, blocks_h):
+    """The decoded pixels, sharing one float per distinct channel value and one tuple per
+    distinct (r, g, b), or None. A first call sizes the tables, so little is held at once."""
+    import ctypes
+    bptc, bc6h = _native_tables()
+    if bptc is None or (kind in (4, 5) and bc6h is None):
+        return None
+    args = (kind, data, len(data), blocks_w, blocks_h, bptc, bc6h, 0 if bc6h is None else len(bc6h))
+    counts = (ctypes.c_size_t * 2)()
+    if lib.ttpf_decode_bc(*args, None, 1, None, 0, None, 0, counts) != 1:
+        return None
+    k, m = counts
+    width = 1 if k <= 1 << 8 else 2 if k <= 1 << 16 else 4
+    pixels = (ctypes.c_uint8 * (16 * blocks_w * blocks_h * width))()
+    triples, scalars = (ctypes.c_uint32 * (3 * k))(), (ctypes.c_double * m)()
+    if lib.ttpf_decode_bc(*args, pixels, width, triples, k, scalars, m, counts) != 0:
+        return None
+    get = memoryview(scalars).cast("B").cast("d").tolist().__getitem__
+    tri = memoryview(triples).cast("B").cast("I")
+    table = list(zip(map(get, tri[0::3]), map(get, tri[1::3]), map(get, tri[2::3])))
+    del get, tri, triples, scalars
+    px = _NativePixels(map(table.__getitem__, memoryview(pixels).cast("B").cast("BHxI"[width - 1])))
+    px._src = None
+    return px
+
+
+def _native_means_raw(lib, fmt, data, dec_w, dec_h, blocks_w, blocks_h, rx, ry, block):
+    import ctypes
+    bptc, bc6h = _native_tables()
+    kind = _NATIVE_BC_KIND[fmt]
+    if bptc is None or (kind in (4, 5) and bc6h is None):
+        return None
+    out = (ctypes.c_double * (3 * blocks_w * blocks_h))()
+    if lib.ttpf_decode_means(kind, data, len(data), dec_w, dec_h, bptc, bc6h,
+                             0 if bc6h is None else len(bc6h), blocks_w, blocks_h, rx, ry, block,
+                             out, len(out)) != 0:
+        return None
+    return list(struct.iter_unpack("<3d", memoryview(out).cast("B")))
+
+
+def _native_ok(lib, fmt):
+    """Whether this format's native decoder and means agree with the Python ones on seeded
+    random blocks (every mode selector); checked once per block kind."""
+    kind = _NATIVE_BC_KIND[fmt]
+    if kind not in _NATIVE_BC_OK:
+        _NATIVE_BC_OK[kind] = False  # the check itself runs the Python code
+        _NATIVE_BC_OK[kind] = _native_self_check(lib, fmt, kind)
+    return _NATIVE_BC_OK[kind]
+
+
+def _native_self_check(lib, fmt, kind):
+    import random
+    rng = random.Random(0x77F + kind)
+    size = 8 if kind in (0, 2) else 16
+    blocks = bytearray(rng.randbytes(64 * size))
+    for i in range(64):
+        at = i * size
+        if kind in (4, 5):
+            blocks[at] = (blocks[at] & 0xE0) | (i & 31)
+        elif kind == 6:
+            m = i % 9
+            blocks[at] = 0 if m == 8 else ((1 << m) | (blocks[at] << (m + 1))) & 0xFF
+        elif kind in (0, 1) and i % 2:  # c0 <= c1 as well as c0 > c1
+            at += 8 if kind == 1 else 0
+            blocks[at:at + 2] = blocks[at + 2:at + 4]
+    data = bytes(blocks)
+    pack = struct.Struct("<3d").pack
+    try:
+        expected = decode_pixels(fmt, data, 8, 8)
+        means = block_means(list(expected), 8, 8, 29, 30, 4)
+    except Exception:  # noqa: BLE001 - a Python decoder that cannot run here is not compared
+        return False
+    native_px = _native_decode_raw(lib, kind, data, 8, 8)
+    native_means = _native_means_raw(lib, fmt, data, 8, 8, 8, 8, 29, 30, 4)
+    return (native_px is not None and native_means is not None
+            and b"".join(pack(*p) for p in expected) == b"".join(pack(*p) for p in native_px)
+            and b"".join(pack(*p) for p in means) == b"".join(pack(*p) for p in native_means))
+
+
+def _native_decode(fmt, data, blocks_w, blocks_h):
+    """`decode_pixels` for BC4, BC5, BC6H or BC7 natively, or None to run the Python decoder."""
+    kind = _NATIVE_BC_KIND.get(fmt)
+    if kind not in _NATIVE_DECODE_KINDS or type(blocks_w) is not int or type(blocks_h) is not int \
+            or not (0 < blocks_w < 1 << 24 and 0 < blocks_h < 1 << 24) or _NATIVE_BC_OK.get(kind) is False:
+        return None
+    lib = _native()
+    src = None if lib is None else _native_bytes(data)
+    if src is None or not _native_ok(lib, fmt):
+        return None
+    px = _native_decode_raw(lib, kind, src, blocks_w, blocks_h)
+    if px is not None:
+        px._src = (fmt, src, blocks_w, blocks_h)
+    return px
+
+
+def _native_block_means(pixels, blocks_w, blocks_h, rx, ry, block):
+    """`block_means` of a `_NativePixels` from its BC blocks, or None to run Python."""
+    src = pixels._src if type(pixels) is _NativePixels and hasattr(pixels, "_src") else None
+    if src is None or not all(type(v) is int and 0 < v < 1 << 31
+                              for v in (blocks_w, blocks_h, rx, ry, block)) or block < 2:
+        return None
+    fmt, data, dec_w, dec_h = src
+    lib = _native() if 0 < dec_w < 1 << 24 and 0 < dec_h < 1 << 24 else None
+    if lib is None or len(pixels) != 16 * dec_w * dec_h or not _native_ok(lib, fmt):
+        return None
+    return _native_means_raw(lib, fmt, data, dec_w, dec_h, blocks_w, blocks_h, rx, ry, block)
+
+
 def detile(layout, mip, tiled):
     """Copy the mip's elements out of the tiled allocation into block-linear order."""
     tile = layout["tile"]
@@ -251,6 +494,9 @@ def detile(layout, mip, tiled):
     y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
 
     row_stride = tiles_x * tile
+    fast = _native_detile(tiled, out, (eb, w, h, bw, bh, tile, tx, ty, row_stride, 0), x_bits, y_bits)
+    if fast is not None:
+        return fast
 
     def y_base_of(y):
         o = (y // bh) * row_stride
@@ -324,6 +570,10 @@ def detile_volume_slice(layout, tiled, z):
     y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
 
     row_stride = tiles_x * tile
+    fast = _native_detile(tiled, out, (eb, w, h, bw, bh, tile, 0, 0, row_stride, z_base + z_in_tile),
+                          x_bits, y_bits)
+    if fast is not None:
+        return fast
 
     def y_base_of(y):
         o = z_base + (y // bh) * row_stride + z_in_tile
@@ -758,13 +1008,17 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             return [(lut[vals[i]], lut[vals[i + 1]], lut[vals[i + 2]])
                     for i in range(0, n * 4, 4)]
         return None
+    native = _native_decode(fmt, data, blocks_w, blocks_h)
+    if native is not None:
+        return native
     if fmt in (71, 72, 74, 75, 77, 78):
         # BC1 stands alone; BC2/BC3 carry the same color block after eight alpha bytes and use
         # four RGB entries regardless of endpoint order.
         stride, skip, four = (8, 0, False) if fmt in (71, 72) else (16, 8, True)
-        return _decode_bc1_rows(data, blocks_w, blocks_h, stride, skip, four)
+        return _with_source(_decode_bc1_rows(data, blocks_w, blocks_h, stride, skip, four),
+                            fmt, data, blocks_w, blocks_h)
     if fmt == 80:
-        return _decode_bc4_rows(data, blocks_w, blocks_h)
+        return _with_source(_decode_bc4_rows(data, blocks_w, blocks_h), fmt, data, blocks_w, blocks_h)
     decode = _BLOCK_DECODERS.get(fmt)
     if decode is None and blocks_w > 0 and blocks_h > 0:
         return None  # a BC format with no decoder here (an empty grid still gives [])
@@ -802,7 +1056,7 @@ _BLOCK_DECODERS = {
 def _decode_bc1_rows(data, blocks_w, blocks_h, stride, skip, four_color):
     """BC1 color blocks of a whole surface in pixel order, filling the output one block row
     at a time. Equal endpoint pairs share one palette (a reset cache bounds the memory)."""
-    px, rows, head, cache = [], _BC1_ROWS, _BC1_HEAD, {}
+    px, rows, head, cache = _pixel_list(), _BC1_ROWS, _BC1_HEAD, {}
     for by in range(blocks_h):
         at = by * blocks_w * stride + skip
         r0, r1, r2, r3 = [], [], [], []
@@ -828,7 +1082,7 @@ def _decode_bc1_rows(data, blocks_w, blocks_h, stride, skip, four_color):
 
 def _decode_bc4_rows(data, blocks_w, blocks_h):
     """BC4 blocks of a whole surface in pixel order; same scheme as `_decode_bc1_rows`."""
-    px, rows, cache = [], _bc4_rows(), {}
+    px, rows, cache = _pixel_list(), _bc4_rows(), {}
     for by in range(blocks_h):
         at = by * blocks_w * 8
         r0, r1, r2, r3 = [], [], [], []
@@ -865,6 +1119,9 @@ def block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None, block=
     rx, ry = min(pw, width), min(ph, blocks_h * block)  # visible columns / rows of the grid
     if rx > 0 and ry > 0 and len(pixels) < (ry - 1) * width + rx:
         raise IndexError("list index out of range")
+    native = _native_block_means(pixels, blocks_w, blocks_h, rx, ry, block)
+    if native is not None:
+        return native
     # Columns of each block that fall inside the picture; rows are clamped per block row.
     cols = [min(block, max(0, rx - bx * block)) for bx in range(blocks_w)]
     add, div, get0, get1, get2 = (operator.add, operator.truediv, operator.itemgetter(0),
