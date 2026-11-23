@@ -265,6 +265,41 @@ class RandomCheckTest(unittest.TestCase):
         self.assertEqual(tally[("f32", "p2_f16 high = fma(h20, J, p1ll) in f16")], [1, 0])
         self.assertTrue(any("keeps vdst[31:16]" in b for b in bad))
 
+    # The checks above use p0 = p10 = p20 = 1.0, so a p2_f32 model that read P10 instead of P20
+    # still matched (a mutation kapitche found on PR #4338). Distinct attribute words expose it:
+    # p0 = 1.0, p10 = 2.0, p20 = 3.0, I = J = 1.0.
+    #   o[0] p1_f32      = 2*1 + 1 = 3.0                 -> 0x40400000
+    #   o[1] p2_f32      = 3*1 + 3 = 6.0                 -> 0x40C00000
+    #   o[4] p1ll high   = 2*1 + 1.875 = 3.875           -> 0x40780000
+    #   o[5] p2_f16 high = 2.125*1 + 3.875 = 6.0 (0x4600) -> 0xDEAD4600
+    # (the high half of 0x40400000 is the f16 0x4040 = 2.125, not 3.0).
+    DISTINCT_WORDS = [0x40400000, 0x40C00000, 0x00000000, 0xDEAD0000, 0x40780000, 0xDEAD4600, 0x3F800000]
+
+    def run_check_distinct(self, words):
+        params = {(0, 0): (0x3F800000, 0x40000000, 0x40400000)}
+        kinds = {(0, 0): "f32"}
+        ij = [(ihp.f32w(1.0), ihp.f32w(1.0))]
+        info = (params, kinds, ij, 4 * ihp.NOUT_PER)
+        tally, bad = {}, []
+        ihp.check_random(list(words), info, False, tally, bad)
+        return tally, bad
+
+    def test_distinct_attributes_all_match(self):
+        tally, bad = self.run_check_distinct(self.DISTINCT_WORDS)
+        self.assertEqual(bad, [])
+        self.assertEqual(len(tally), 9)
+        for name, counts in tally.items():
+            self.assertEqual(counts, [1, 0], name)
+
+    def test_distinct_attributes_catch_a_p10_for_p20_swap(self):
+        # fma(P10=2, J=1, p1=3) = 5.0 where fma(P20=3, J=1, p1=3) = 6.0: the swap is a mismatch
+        # only because the attribute words differ.
+        words = list(self.DISTINCT_WORDS)
+        words[1] = 0x40A00000                       # 5.0
+        tally, bad = self.run_check_distinct(words)
+        self.assertEqual(tally[("f32", "p2_f32 = fma(P20, J, p1)")], [0, 1])
+        self.assertTrue(any("p2_f32 = fma(P20, J, p1)" in b for b in bad))
+
 
 class CliTest(unittest.TestCase):
     def run_tool(self, *argv):
