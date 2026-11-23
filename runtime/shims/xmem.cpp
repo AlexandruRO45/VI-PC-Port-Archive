@@ -141,7 +141,7 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     return true;
 }
 
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
     // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
     // region. Nonzero attribute flags also fail until their host mapping is known.
@@ -209,6 +209,21 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     }
 
     return VirtualAlloc(address, size, host_type, protect);
+}
+
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    void* result = xmem_virtual_alloc(address, size, allocation_type, attributes, protect);
+    const DWORD error = GetLastError();
+    if (!result && rt::startup_trace::enabled()) {
+        rt::startup_trace::event("xmem_virtual_alloc_failed",
+            "\"size\":" + std::to_string(size) +
+            ",\"allocation_type\":" + std::to_string(allocation_type) +
+            ",\"attributes\":" + std::to_string(attributes) +
+            ",\"protect\":" + std::to_string(protect) +
+            ",\"error\":" + std::to_string(error));
+    }
+    SetLastError(error);
+    return result;
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,

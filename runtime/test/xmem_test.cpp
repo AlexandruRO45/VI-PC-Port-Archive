@@ -242,7 +242,16 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     check(untraced != nullptr, "XMemAlloc with the trace off still allocates");
     free_mem(untraced, 0x1111);
 
+    const auto virtual_alloc = reinterpret_cast<XMemVirtualAllocFn>(
+        rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    check(virtual_alloc(nullptr, 0, MEM_RESERVE, 0x1111, PAGE_READWRITE) == nullptr &&
+              GetLastError() == ERROR_INVALID_PARAMETER, "failed reservation preserves last error with trace off");
     check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
+    check(virtual_alloc(nullptr, 0, MEM_RESERVE, 0, PAGE_READWRITE) == nullptr &&
+              GetLastError() == ERROR_INVALID_PARAMETER, "trace retains invalid-size allocation error");
+    check(virtual_alloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, 0x183, 0x22004) == nullptr &&
+              GetLastError() == ERROR_NOT_SUPPORTED, "trace retains unsupported-attributes allocation error");
+
     void* a = alloc(4096, 0x5e50000);
     void* b = alloc(8192, 0x5e50000);  // same word again: no second event
     void* c = alloc(16, 0x99);
@@ -269,6 +278,10 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
     check(count("\"caller\":\"") == 5, "every event names its caller");
+    check(count("\"kind\":\"xmem_virtual_alloc_failed\"") == 2, "failed virtual allocations are traced");
+    check(count("\"size\":4096,\"allocation_type\":12288,\"attributes\":387,\"protect\":139268,\"error\":50") == 1,
+          "failed allocation trace describes the request and host error");
+
     DeleteFileW(path.c_str());
 }
 
@@ -328,7 +341,16 @@ void test_transfer_trace(XMemTransferMemoryFn transfer) {
 
     check(transfer(7, 12345) == TRUE, "XMemTransferMemory with the trace off still returns TRUE");
 
+    const auto virtual_alloc = reinterpret_cast<XMemVirtualAllocFn>(
+        rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    check(virtual_alloc(nullptr, 0, MEM_RESERVE, 0x1111, PAGE_READWRITE) == nullptr &&
+              GetLastError() == ERROR_INVALID_PARAMETER, "failed reservation preserves last error with trace off");
     check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
+    check(virtual_alloc(nullptr, 0, MEM_RESERVE, 0, PAGE_READWRITE) == nullptr &&
+              GetLastError() == ERROR_INVALID_PARAMETER, "trace retains invalid-size allocation error");
+    check(virtual_alloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, 0x183, 0x22004) == nullptr &&
+              GetLastError() == ERROR_NOT_SUPPORTED, "trace retains unsupported-attributes allocation error");
+
     transfer(0, 2097152);
     transfer(0, 2097152);  // same pair again: no second event
     transfer(0, 41943040);
