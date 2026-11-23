@@ -413,5 +413,52 @@ class TestDSMskorB32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(lds.read_dword(l * 4), 0x11111111)
 
 
+class TestDSMskorB32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_vdst_aliases_vaddr(self) -> None:
+        self.lds.write_dword(0x40, 0x12345678)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 0x00FF0000)
+        self.state.rf.set_vgpr(VGPR(3), 0x00AA0000)
+
+        inst = DSMskorInstruction(
+            opcode=DSOpcode.DS_MSKOR_RTN_B32,
+            vdst=VGPR(1),
+            vaddr=VGPR(1),
+            vmask=VGPR(2),
+            vdata=VGPR(3),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(new, 0x12AA5678)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(1)), 0x12345678)
+        self.assertEqual(self.lds.read_dword(0x40), 0x12AA5678)
+
+    def test_vdst_aliases_vmask(self) -> None:
+        self.lds.write_dword(0x40, 0x12345678)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 0x00FF0000)
+        self.state.rf.set_vgpr(VGPR(3), 0x00AA0000)
+
+        inst = DSMskorInstruction(
+            opcode=DSOpcode.DS_MSKOR_RTN_B32,
+            vdst=VGPR(2),
+            vaddr=VGPR(1),
+            vmask=VGPR(2),
+            vdata=VGPR(3),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(new, 0x12AA5678)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(2)), 0x12345678)
+        self.assertEqual(self.lds.read_dword(0x40), 0x12AA5678)
+
+
 if __name__ == "__main__":
     unittest.main()
