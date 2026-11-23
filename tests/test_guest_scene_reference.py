@@ -90,7 +90,8 @@ class GuestSceneReferenceTest(unittest.TestCase):
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader)]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            # CreateProcess diagnostics use the Windows code page, not necessarily UTF-8.
+            result = subprocess.run(cmd, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])
