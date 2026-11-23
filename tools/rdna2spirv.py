@@ -6732,6 +6732,8 @@ class Gen:
             return
         if op.startswith("v_") and a and not op.startswith(VALU_SCALAR_DST) and a[0]["k"] != "vgpr":
             raise Unsupported(f"{op} destination {a[0].get('t', a[0]['k'])} (a VALU result goes to a VGPR)")
+        if op in ("v_readlane_b32", "v_readfirstlane_b32") and a and a[0]["k"] == "vgpr":
+            raise Unsupported(f"{op} destination is a VGPR (a lane read goes to an SGPR)")
         if op == "s_sendmsg" and a and self.stage == "gs":
             t = a[0].get("t", "")
             if "GS_OP_EMIT" in t:

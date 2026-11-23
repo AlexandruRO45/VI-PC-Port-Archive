@@ -54,6 +54,17 @@ class ScalarDestinationRefused(unittest.TestCase):
                     translate(f"v_add_f32 {d}, v1, v2")
 
 
+class LaneReadsWriteAScalar(unittest.TestCase):
+    """The mirror rule: v_readlane_b32 and v_readfirstlane_b32 put a lane's value into an SGPR, never a VGPR."""
+
+    def test_a_vgpr_destination_is_refused(self):
+        for line in ("v_readfirstlane_b32 v8, v1", "v_readlane_b32 v8, v1, 0", "v_readlane_b32 v[8:9], v1, s2"):
+            with self.subTest(line=line):
+                with self.assertRaises(rdna2spirv.Unsupported) as cm:
+                    rdna2spirv.Gen("ps")._insn(shader_ir.parse_line("	" + line))
+                self.assertIn("SGPR", str(cm.exception))
+
+
 class ScalarDestinationStillAllowedWhereDefined(unittest.TestCase):
     def test_readlane_readfirstlane_and_compares_translate(self):
         for line in ("v_readfirstlane_b32 s8, v1", "v_readlane_b32 s8, v1, 0",
