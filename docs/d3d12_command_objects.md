@@ -727,13 +727,13 @@ Even taking both projects at face value, the following remain **Open**:
 
 The repository already implements the public-chain objects on Vulkan:
 
-- `ID3D12CommandQueue`, `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList7` and
-  `ID3D12Fence1` are defined in `runtime/shims/d3d12_com.cpp:41-352`, on the Windows SDK vtable
+- `ID3D12CommandQueue`, `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList8` and
+  `ID3D12Fence1` are defined in `runtime/shims/d3d12_com.cpp:150-1918`, on the Windows SDK vtable
   order, with generated stubs for every method they do not implement
   (`runtime/shims/d3d12_com.h:1-5`);
 - `CreateCommandQueue`/`CreateCommandAllocator`/`CreateCommandList`/`CreateFence` are wired at
-  the public device slots in `runtime/shims/d3d12_vulkan_device.cpp:345-382`;
-- `runtime/test/d3d12_com_test.cpp:77-153` creates all four, records clears and both barrier
+  the public device slots in `runtime/shims/d3d12_vulkan_device.cpp:5432-5553`;
+- `runtime/test/d3d12_com_test.cpp:90-335` creates all four, records clears and both barrier
   kinds, rejects an open list at `ExecuteCommandLists`, executes behind a queue `Wait`, and
   checks fence signalling and `SetEventOnCompletion`. The test is source-level evidence; this
   page did not rebuild the Vulkan runtime.
@@ -750,7 +750,7 @@ A runtime can create the four objects and hand them out at the **public** device
 today. That is an assumption, not a measurement: the Xbox device was measured at
 1/14/15/16/18/19/27/38/62/76, and slots 8/9/12/36 are exactly the ones this page needs. If the
 Xbox slots differ, a generic forward-to-PC thunk calls the wrong method. The current proxy
-(`runtime/shims/d3d12_xs_device.h:1-18`) forwards every unshadowed slot in PC order and logs
+(`runtime/shims/d3d12_xs_device.h:31-34`) forwards every unshadowed slot in PC order and logs
 first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success.
 
 Queues and fences are wrapped the same way.
@@ -856,7 +856,7 @@ enhanced-barrier `Barrier` at console slot 146 (section 3.3), which a console-or
 | `ID3D12GraphicsCommandList`/1–8 | Most recording methods are `void`; `Close`/`Reset` return `HRESULT`; `GetType` returns the list type; GCL8 `OMSetFrontAndBackStencilRef` is `void` | The builder's `+0xd0` and `+0x70` calls ignore RAX, consistent with `void`; no other convention measured |
 
 The `GetDesc` by-value return is the one place a generic thunk can get the ABI wrong on x64;
-the runtime implements it directly (`runtime/shims/d3d12_com.cpp:309`). No Xbox variant of that
+the runtime implements it directly (`runtime/shims/d3d12_com.cpp:1583`). No Xbox variant of that
 return has been measured.
 
 ## 7. Next measurable step
@@ -891,7 +891,7 @@ than invent slots.
    first argument words (§5.2).
 
 Do not fill the unknown slots with guesses. A wrong slot is worse than a clean refusal; the
-existing device proxy already follows that rule (`runtime/shims/d3d12_xs_device.h:16-18`).
+existing device proxy already follows that rule (`runtime/shims/d3d12_xs_device.h:33-41`).
 
 ## 8. References and provenance
 
