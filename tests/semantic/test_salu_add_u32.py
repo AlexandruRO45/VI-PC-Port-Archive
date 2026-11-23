@@ -267,5 +267,73 @@ class SaluAddU32AstValidationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_salu_instruction(line)
 
+
+# --- Section 3: Deterministic Scalar Interpreter ---
+
+class ScalarRegisterState:
+    """Simulates scalar register file (SGPRs) and condition code (SCC)."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs = [0] * num_sgprs
+        self.scc: int = 0
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def get_operand_val(self, op: Operand) -> int:
+        if op.kind == RegKind.SGPR:
+            return self.get_sgpr(op.index)
+        return op.raw_val & MASK32
+
+    def step(self, ast: InstructionAST) -> tuple[int, int]:
+        """Execute a single SALU instruction, returning (dst_val, new_scc)."""
+        s0 = self.get_operand_val(ast.src0)
+        s1 = self.get_operand_val(ast.src1)
+        if ast.mnemonic == "s_add_u32":
+            res, scc = ref_s_add_u32(s0, s1)
+            self.scc = scc
+            self.set_sgpr(ast.dst.index, res)
+            return res, scc
+        raise NotImplementedError(f"Unsupported mnemonic: {ast.mnemonic}")
+
+
+class SaluAddU32ScalarInterpreterTests(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter tests."""
+
+    def test_scalar_step_basic_add(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(2, 0x100)
+        state.set_sgpr(3, 0x200)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 4), Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 3))
+        res, scc = state.step(ast)
+        self.assertEqual(res, 0x300)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.get_sgpr(4), 0x300)
+        self.assertEqual(state.scc, 0)
+
+    def test_scalar_step_carry_update(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0xFFFFFFFF)
+        state.set_sgpr(1, 5)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        res, scc = state.step(ast)
+        self.assertEqual(res, 4)
+        self.assertEqual(scc, 1)
+        self.assertEqual(state.get_sgpr(2), 4)
+        self.assertEqual(state.scc, 1)
+
+    def test_scalar_chain_accumulations(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 10)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 0), Operand(RegKind.IMM, raw_val=5))
+        for expected in [15, 20, 25, 30]:
+            res, scc = state.step(ast)
+            self.assertEqual(res, expected)
+            self.assertEqual(scc, 0)
+            self.assertEqual(state.get_sgpr(0), expected)
+
 if __name__ == "__main__":
     unittest.main()
