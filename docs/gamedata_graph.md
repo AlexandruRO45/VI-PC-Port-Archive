@@ -6,8 +6,8 @@ reference tokens, and uses the same local carve. Only aggregate counts, root/cat
 reference-prefix names are recorded here. No archive, carved file, XML value, content-set id, entry
 name or target path is committed.
 
-`tools/gamedata_graph.py` rebuilds the documents with `gamedata_index.py` and
-`gamedata_xml.load_documents`, then keeps the reference strings long enough to join them. It is
+`tools/gamedata_graph.py` reads a carve through `gamedata_xml.load_documents` (the document rebuild
+behind the catalog), then keeps the reference strings long enough to join them. It is
 standard-library only and reads the same carve as the index and catalog. XML with an unsupported
 encoding counts as an unparsed payload; it supplies no edges and does not stop the other documents.
 
