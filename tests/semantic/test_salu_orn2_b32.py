@@ -345,5 +345,96 @@ class TestSaluOrn2B32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.interp.sgprs[10], 0x12345678)
         self.assertEqual(self.interp.sgprs[11], 0x9ABCDEF0)
 
+class SIMDWavefrontContext:
+    """Context modeling SIMD wavefront interaction with scalar SALU lane masks."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        assert wave_size in (32, 64)
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.salu: ScalarSALUInterpreter = ScalarSALUInterpreter()
+        self.lane_vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+
+    def step_salu(self, inst: SALUInstruction) -> tuple[int, int]:
+        return self.salu.execute(inst)
+
+    def apply_lane_mask_to_exec(self, mask_reg_idx: int) -> None:
+        mask = self.salu.sgprs[mask_reg_idx]
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def execute_vector_add_masked(self, vdst: int, vsrc0: int, vsrc1: int) -> None:
+        """Simulates a vector instruction active only on lanes where exec_mask bit is 1."""
+        for lane in range(self.wave_size):
+            if bool(self.exec_mask & (1 << lane)):
+                res = (self.lane_vgprs[lane][vsrc0] + self.lane_vgprs[lane][vsrc1]) & MASK32
+                self.lane_vgprs[lane][vdst] = res
+
+
+class TestSaluOrn2B32SIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD divergence, lane mask inversion, and wave execution masking."""
+
+    def test_wave32_divergent_branch_mask_combination(self) -> None:
+        wave = SIMDWavefrontContext(wave_size=32)
+        active_mask = 0b11110000111100001111000011110000
+        taken_mask =  0b00110011001100110011001100110011
+        wave.salu.write_sgpr(1, active_mask)
+        wave.salu.write_sgpr(2, taken_mask)
+
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        res, scc = wave.step_salu(inst)
+        expected = (active_mask | (~taken_mask & MASK32)) & MASK32
+        self.assertEqual(res, expected)
+        self.assertEqual(scc, 1)
+
+        wave.apply_lane_mask_to_exec(0)
+        self.assertEqual(wave.exec_mask, expected)
+
+    def test_wave_vector_isolation_under_orn2_mask(self) -> None:
+        wave = SIMDWavefrontContext(wave_size=32)
+        for lane in range(32):
+            wave.lane_vgprs[lane][1] = 10
+            wave.lane_vgprs[lane][2] = 20
+            wave.lane_vgprs[lane][0] = 0xCAFE
+
+        s0 = 0xFFFFFFFE
+        s1 = 0x00000001
+        wave.salu.write_sgpr(1, s0)
+        wave.salu.write_sgpr(2, s1)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        res, scc = wave.step_salu(inst)
+        self.assertEqual(res, 0xFFFFFFFE)
+        self.assertEqual(scc, 1)
+
+        wave.apply_lane_mask_to_exec(0)
+        wave.execute_vector_add_masked(vdst=0, vsrc0=1, vsrc1=2)
+
+        self.assertEqual(wave.lane_vgprs[0][0], 0xCAFE)
+        for lane in range(1, 32):
+            self.assertEqual(wave.lane_vgprs[lane][0], 30)
+
+    def test_uniform_scalar_broadcast(self) -> None:
+        wave = SIMDWavefrontContext(wave_size=32)
+        wave.salu.write_sgpr(1, 0x12345678)
+        wave.salu.write_sgpr(2, 0x9ABCDEF0)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 5),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        res, _ = wave.step_salu(inst)
+        for lane in range(32):
+            self.assertEqual(wave.salu.sgprs[5], res)
+
 if __name__ == "__main__":
     unittest.main()
