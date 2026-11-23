@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -64,6 +65,30 @@ class Main(unittest.TestCase):
     def test_reads_names_one_per_line_and_ignores_blank_lines(self):
         self.assertEqual(self.run_main("\nxdxr_build_check\n\n", "8", "xdxr_build_check"), 0)
         self.assertEqual(self.run_main("a\nb\n", "8", "a"), 1)
+
+    def test_cli_failure_list_with_optional_utf8_bom(self):
+        warning = "::warning::known failed, as expected until its fix is merged"
+        notice = "::notice::known passed: drop it from the expected failures"
+        cases = (
+            ("known\r\n", 0, [warning]),
+            ("\ufeffknown\r\n", 0, [warning]),
+            ("\ufeffother\r\n", 1, ["::error::other failed", notice]),
+            ("\ufeffknown\r\n\ufeffknown\r\n", 1, ["::error::\ufeffknown failed", warning]),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failed.txt"
+            for failed, code, lines in cases:
+                with self.subTest(failed=failed):
+                    path.write_bytes(failed.encode("utf-8"))
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-B", "-X", "utf8",
+                         str(SCRIPTS / "ci_expected_failures.py"), str(path), "8", "known"],
+                        capture_output=True, encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        (result.returncode, result.stdout, result.stderr),
+                        (code, "\n".join(lines) + "\n", ""),
+                    )
 
     def test_an_expected_argument_can_hold_several_names(self):
         self.assertEqual(self.run_main("a\nb\n", "8", " a  b\n"), 0)

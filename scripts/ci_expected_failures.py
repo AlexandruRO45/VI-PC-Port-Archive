@@ -44,7 +44,9 @@ def main(argv: list[str]) -> int:
         return 2
     try:
         with open(argv[0], encoding="utf-8") as f:
-            failed = [line.strip() for line in f if line.strip()]
+            # Decode first so a truncated BOM still raises a UTF-8 error.
+            contents = f.read().removeprefix("\ufeff")
+        failed = [line.strip() for line in contents.split("\n") if line.strip()]
     except OSError as e:
         print(f"ci_expected_failures: {argv[0]}: {e.strerror or e}", file=sys.stderr)
         return 2
