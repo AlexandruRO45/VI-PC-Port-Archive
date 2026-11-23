@@ -94,6 +94,16 @@ jobs:
             for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
             exit 1
           fi
+      # The standard-library loop also runs these tests before the optional library is built.
+      - name: Build the native BVH rehydrator and check Python parity
+        shell: bash
+        run: |
+          export CARGO_HOME="$(mktemp -d)"
+          cargo build --release --locked --offline --manifest-path tools/bvh_native/Cargo.toml
+          cargo test --release --locked --offline --manifest-path tools/bvh_native/Cargo.toml
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import bvh_native; assert bvh_native._load() is not None"
+          python -I tests/test_bvh_native.py
+          python -I tests/test_bvh_rehydrate.py
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: Test TTPF export retry
