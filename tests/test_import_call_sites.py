@@ -1,7 +1,8 @@
 """Unit tests for tools/import_call_sites.py: thunks and the direct calls to them, on an image built here byte by byte.
 
 The image has two executable-code layouts the tool must tell apart: calls (E8) and tail jumps (E9) to the thunk of an
-import, and an import nothing calls. It needs no game files and no third-party packages.
+import, and an import nothing calls. TailJumpThroughSlotTest adds `48 FF 25` tail jumps through a slot next to thunks
+that a `48` byte happens to precede. It needs no game files and no third-party packages.
 
     python -I tests/test_import_call_sites.py
 """
@@ -84,6 +85,88 @@ def build_image(callers):
         buf[at] = opcode
         buf[at + 1:at + 5] = rel32(at + 5, target)
     return bytes(buf)
+
+
+def with_tail_jump(data, at, slot, prefix=b"\x48"):
+    """`data` with a function body at `at` that ends in `prefix jmp qword [rip+disp32]` through `slot`.
+
+    The body is `sub rsp, 28h` / `add rsp, 28h`, then the jump; returns the image and the RVA of the jump's first byte.
+    """
+    buf = bytearray(data)
+    jump = at + 8
+    end = jump + len(prefix) + 6
+    buf[at:end] = b"\x48\x83\xec\x28\x48\x83\xc4\x28" + prefix + b"\xff\x25" + rel32(end, slot)
+    return bytes(buf), jump
+
+
+class TailJumpThroughSlotTest(unittest.TestCase):
+    """`48 FF 25` ending a function is a use of the import, not a thunk; the cases the `48` rule must keep apart."""
+
+    TAIL = TEXT_RVA + 0x180
+
+    def test_a_prefixed_tail_jump_is_a_site_at_its_rex_byte_not_a_thunk(self):
+        data, jump = with_tail_jump(build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_BAR)]), self.TAIL, IAT_BAR)
+        bar = import_call_sites.call_sites(data)["imports"]["xmem.dll!XMemBar"]
+        self.assertEqual(bar["thunks"], [THUNK_BAR])
+        self.assertEqual(bar["call"], [TEXT_RVA + 0x100])
+        self.assertEqual(bar["jmp"], [])
+        self.assertEqual(bar["iat_jmp"], [jump])
+        self.assertEqual(import_call_sites.call_sites(data)["imports"]["xmem.dll!XMemFoo"]["iat_jmp"], [])
+
+    def test_a_called_thunk_after_a_48_byte_stays_a_thunk(self):
+        data = bytearray(build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_BAR), (TEXT_RVA + 0x110, 0xE9, THUNK_BAR)]))
+        data[THUNK_BAR - 1] = 0x48  # e.g. the last byte of whatever comes before the thunk
+        bar = import_call_sites.call_sites(bytes(data))["imports"]["xmem.dll!XMemBar"]
+        self.assertEqual(bar["thunks"], [THUNK_BAR])
+        self.assertEqual((bar["call"], bar["jmp"], bar["iat_jmp"]), ([TEXT_RVA + 0x100], [TEXT_RVA + 0x110], []))
+
+    def test_a_prefixed_jump_that_a_branch_reaches_at_the_48_is_a_thunk_starting_there(self):
+        jump = self.TAIL + 8  # where with_tail_jump puts the `48`
+        data = build_image([(TEXT_RVA + 0x100, 0xE8, jump), (TEXT_RVA + 0x110, 0xE9, jump)])
+        data, at = with_tail_jump(data, self.TAIL, IAT_BAR)
+        self.assertEqual(at, jump)
+        bar = import_call_sites.call_sites(data)["imports"]["xmem.dll!XMemBar"]
+        self.assertEqual(sorted(bar["thunks"]), [THUNK_BAR, jump])
+        self.assertEqual((bar["call"], bar["jmp"], bar["iat_jmp"]), ([TEXT_RVA + 0x100], [TEXT_RVA + 0x110], []))
+
+    def test_an_unprefixed_jump_nothing_reaches_stays_an_uncalled_thunk(self):
+        data, jump = with_tail_jump(build_image([]), self.TAIL, IAT_BAR, prefix=b"")
+        bar = import_call_sites.call_sites(data)["imports"]["xmem.dll!XMemBar"]
+        self.assertEqual(bar["thunks"], [THUNK_BAR, jump])
+        self.assertEqual((bar["call"], bar["jmp"], bar["iat_jmp"]), ([], [], []))
+
+    def test_only_rex_w_marks_a_tail_jump(self):
+        for prefix in (b"\x40", b"\x41", b"\x49", b"\x4f"):
+            with self.subTest(prefix=prefix.hex()):
+                data, jump = with_tail_jump(build_image([]), self.TAIL, IAT_BAR, prefix=prefix)
+                bar = import_call_sites.call_sites(data)["imports"]["xmem.dll!XMemBar"]
+                self.assertEqual((bar["thunks"], bar["iat_jmp"]), ([THUNK_BAR, jump + 1], []))
+
+    def test_an_uncalled_thunk_after_a_48_byte_is_read_as_a_tail_jump(self):
+        # The ambiguity the module docstring names: nothing in the bytes tells these two apart.
+        data = bytearray(build_image([]))
+        data[THUNK_BAR - 1] = 0x48
+        bar = import_call_sites.call_sites(bytes(data))["imports"]["xmem.dll!XMemBar"]
+        self.assertEqual((bar["thunks"], bar["iat_jmp"]), ([], [THUNK_BAR - 1]))
+
+    def test_cli_lists_and_counts_the_tail_jump(self):
+        data, jump = with_tail_jump(build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_BAR)]), self.TAIL, IAT_BAR)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(data)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(import_call_sites.main([path, "--import", "xmem.dll!XMemBar"]), 0)
+            self.assertRegex(out.getvalue(), r"thunks +call +jmp +iat_jmp\n")
+            self.assertRegex(out.getvalue(), r"xmem\.dll!XMemBar +1 +1 +0 +1\n")
+            self.assertIn("1 import(s), 2 call site(s)", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(import_call_sites.main([path, "--import", "xmem.dll!XMemBar", "--json"]), 0)
+            bar = json.loads(out.getvalue())["imports"]["xmem.dll!XMemBar"]
+            self.assertEqual(bar, {"thunks": [hex(THUNK_BAR)], "call": [hex(TEXT_RVA + 0x100)], "jmp": [],
+                                   "iat_jmp": [hex(jump)]})
 
 
 class ImportCallSitesTest(unittest.TestCase):

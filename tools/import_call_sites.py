@@ -10,6 +10,20 @@ disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another ins
 thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
 slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
+A function that ends in a tail call to a `dllimport` function jumps through the slot itself, and MSVC writes that jump
+with a REX.W byte, `48 FF 25 disp32` (Wine's x64 unwinder accepts no other REX byte on the jump that ends an epilog).
+So each `FF 25` through a wanted slot is classified from what the bytes show:
+
+- an `E8`/`E9` targets the `FF`: a thunk (the byte before it does not matter);
+- the byte before is `48` and an `E8`/`E9` targets that byte: a thunk that starts at the `48`;
+- the byte before is `48` and nothing targets either: a tail jump, listed in `iat_jmp` at the RVA of the `48` and
+  counted as a site;
+- no `48` before it and nothing targets it: a thunk nothing calls, as before.
+
+The `48` rule is a heuristic, not a decoding. An uncalled thunk that happens to follow a `48` byte is reported as a tail
+jump, and a tail jump written without the prefix is reported as an uncalled thunk; the output does not mark either as
+uncertain, so `iat_jmp` is a bound like the other counts.
+
 With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. Output is counts
 and RVAs only, no instruction bytes (docs/runtime_imports.md, "The retail executable (RT-5)").
 """
@@ -27,6 +41,7 @@ import pe_inspect  # noqa: E402
 
 JMP_INDIRECT = re.compile(b"\xff\x25")
 REL_BRANCH = re.compile(b"[\xe8\xe9]")
+REX_W = 0x48  # the prefix of `rex.w jmp [rip+disp32]`, a tail call through an address-table slot
 
 
 def import_slots(img):
@@ -52,7 +67,8 @@ def import_slots(img):
 
 
 def call_sites(data, wanted=None, dlls=None):
-    """Per import: its thunk RVAs and the RVAs of the `call` and `jmp` instructions that target them.
+    """Per import: its thunk RVAs, the RVAs of the `call` and `jmp` instructions that target them, and in `iat_jmp`
+    the RVAs of tail jumps through its slot (`48 FF 25`, reported at the `48`; the module docstring has the rule).
 
     `wanted` is a set of 'dll!name' (compared case-insensitively on the dll), `dlls` a set of dll names; with both
     None every import is scanned.
@@ -73,7 +89,7 @@ def call_sites(data, wanted=None, dlls=None):
     slots = {rva: key for rva, key in import_slots(img).items() if selected(key)}
     code = [(s["rva"], img.section_data(s)) for s in img.sections if s["exec"]]
 
-    thunks = {}
+    jumps = {}  # RVA of each `FF 25` through a slot: (import, whether a `48` byte comes right before it)
     for rva, blob in code:
         for m in JMP_INDIRECT.finditer(blob):
             s = m.start()
@@ -81,19 +97,32 @@ def call_sites(data, wanted=None, dlls=None):
                 continue
             target = rva + s + 6 + struct.unpack_from("<i", blob, s + 2)[0]
             if target in slots:
-                thunks[rva + s] = slots[target]
+                jumps[rva + s] = (slots[target], s > 0 and blob[s - 1] == REX_W)
 
-    out = {key: {"thunks": [], "call": [], "jmp": []} for key in slots.values()}
-    for at, key in thunks.items():
-        out[key]["thunks"].append(at)
+    # Where an `FF 25`, or the `48` before one, could start an instruction that an `E8`/`E9` reaches.
+    starts = set(jumps) | {at - 1 for at, (_key, prefixed) in jumps.items() if prefixed}
+    branches = {}  # branch target: [(branch RVA, opcode)]
     for rva, blob in code:
         for m in REL_BRANCH.finditer(blob):
             s = m.start()
             if s + 5 > len(blob):
                 continue
-            key = thunks.get(rva + s + 5 + struct.unpack_from("<i", blob, s + 1)[0])
-            if key:
-                out[key]["call" if blob[s] == 0xE8 else "jmp"].append(rva + s)
+            target = rva + s + 5 + struct.unpack_from("<i", blob, s + 1)[0]
+            if target in starts:
+                branches.setdefault(target, []).append((rva + s, blob[s]))
+
+    out = {key: {"thunks": [], "call": [], "jmp": [], "iat_jmp": []} for key in slots.values()}
+    for at, (key, prefixed) in jumps.items():
+        if at in branches or not prefixed:
+            start = at  # a thunk: something calls it, or nothing marks it as a tail jump
+        elif at - 1 in branches:
+            start = at - 1  # a thunk that starts with the `48`
+        else:
+            out[key]["iat_jmp"].append(at - 1)
+            continue
+        out[key]["thunks"].append(start)
+        for site, opcode in branches.get(start, ()):
+            out[key]["call" if opcode == 0xE8 else "jmp"].append(site)
     for entry in out.values():
         for field in entry.values():
             field.sort()
@@ -121,10 +150,14 @@ def main(argv=None):
         printable = {k: {f: [hex(x) for x in v] for f, v in e.items()} for k, e in imports.items()}
         print(json.dumps({"image_base": hex(result["image_base"]), "imports": printable}, indent=1))
         return 0
-    print(f"{'import':56s} {'thunks':>6s} {'call':>5s} {'jmp':>4s}")
-    for key, e in sorted(imports.items(), key=lambda kv: (-(len(kv[1]["call"]) + len(kv[1]["jmp"])), kv[0])):
-        print(f"{key:56s} {len(e['thunks']):6d} {len(e['call']):5d} {len(e['jmp']):4d}")
-    total = sum(len(e["call"]) + len(e["jmp"]) for e in imports.values())
+
+    def sites(e):
+        return len(e["call"]) + len(e["jmp"]) + len(e["iat_jmp"])
+
+    print(f"{'import':56s} {'thunks':>6s} {'call':>5s} {'jmp':>4s} {'iat_jmp':>7s}")
+    for key, e in sorted(imports.items(), key=lambda kv: (-sites(kv[1]), kv[0])):
+        print(f"{key:56s} {len(e['thunks']):6d} {len(e['call']):5d} {len(e['jmp']):4d} {len(e['iat_jmp']):7d}")
+    total = sum(sites(e) for e in imports.values())
     print(f"{len(imports)} import(s), {total} call site(s)")
     return 0
 
