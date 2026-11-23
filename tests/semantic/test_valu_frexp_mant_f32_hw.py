@@ -329,5 +329,23 @@ class TestSIMDDivergence(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0xCAFEBABE)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    def test_alias_dst_equals_src0(self):
+        # v0 = v_frexp_mant_f32 v0
+        words = run_ps_frexp_mant_f32([
+            "v_mov_b32 v0, 0x40000000",  # 2.0
+            "v_frexp_mant_f32 v0, v0",
+        ])
+        self.assertEqual(words[0], f32_to_u32(0.5))
+
+    def test_alias_in_place_negative(self):
+        # v0 = v_frexp_mant_f32 v0 for negative value
+        words = run_ps_frexp_mant_f32([
+            "v_mov_b32 v0, 0xC0400000",  # -3.0
+            "v_frexp_mant_f32 v0, v0",
+        ])
+        self.assertEqual(words[0], f32_to_u32(-0.75))
+
+
 if __name__ == "__main__":
     unittest.main()
