@@ -12789,7 +12789,14 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-            lod = f[ncoord] if kind == "_l" and len(f) > ncoord else "%f0"
+            if kind == "_l":
+                # The LOD is its own address word after the coordinates (GFX10 MIMG address order). Without it the
+                # sample would read mip 0 with no diagnostic, so the listing is refused like the other short forms.
+                if len(f) <= ncoord:
+                    raise Unsupported(op + " lod")
+                lod = f[ncoord]
+            else:
+                lod = "%f0"
             if typed_sample:
                 operands = f"Lod {lod}"
                 if typed_implicit:
