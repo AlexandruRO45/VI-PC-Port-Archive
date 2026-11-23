@@ -153,6 +153,14 @@ def ref_pk_fma_f16(w_a: int, w_b: int, w_c: int, *, clamp: bool = False,
     if clamp: r_hi = clamp_f16(r_hi)
     return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
 
+def ref_pk_fmac_f16(w_acc: int, w_a: int, w_b: int) -> int:
+    acc_lo, acc_hi = unpack_f16x2(w_acc)
+    a_lo, a_hi = unpack_f16x2(w_a)
+    b_lo, b_hi = unpack_f16x2(w_b)
+    r_lo = bits_to_f16(a_lo) * bits_to_f16(b_lo) + bits_to_f16(acc_lo)
+    r_hi = bits_to_f16(a_hi) * bits_to_f16(b_hi) + bits_to_f16(acc_hi)
+    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
+
 class MachineState:
     def __init__(self, num_lanes: int = 64):
         self.num_lanes = num_lanes
@@ -367,6 +375,16 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
 
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             translate_lines("ps_bad_pk_fma", ["v_pk_fma_f16 v0, v1, v2", "s_endpgm"])
+
+    def test_v_pk_fmac_f16_reference_oracle(self):
+        w_acc = pack_f16x2(0x3c00, 0x3c00) # 1.0, 1.0
+        w_a = pack_f16x2(0x4000, 0x4000)   # 2.0, 2.0
+        w_b = pack_f16x2(0x4200, 0x4200)   # 3.0, 3.0
+        # 1.0 + 2.0 * 3.0 = 7.0 (0x4700)
+        res = ref_pk_fmac_f16(w_acc, w_a, w_b)
+        lo, hi = unpack_f16x2(res)
+        self.assertEqual(lo, 0x4700)
+        self.assertEqual(hi, 0x4700)
 
 if __name__ == '__main__':
     unittest.main()
