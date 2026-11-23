@@ -24,6 +24,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "shims.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -157,6 +158,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 127: return "Xbox CreateCommittedResourceX";
         case 133: return "Xbox CreatePlacedResourceX";
         default: return "forwarded";
     }
@@ -1945,6 +1947,31 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
+D3D12_RESOURCE_DESC sanitize_xbox_resource_desc(const D3D12_RESOURCE_DESC& xbox_desc) {
+    D3D12_RESOURCE_DESC pc_desc = xbox_desc;
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(pc_desc.Flags) & 0x3Fu);
+    pc_desc.Alignment = 0;
+    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    return pc_desc;
+}
+
+D3D12_RESOURCE_STATES sanitize_xbox_resource_state(D3D12_RESOURCE_STATES state) {
+    return static_cast<std::uint32_t>(state) == 0xFFFFFFFFu ? D3D12_RESOURCE_STATE_COMMON : state;
+}
+
+const D3D12_CLEAR_VALUE* sanitize_xbox_clear_value(const D3D12_RESOURCE_DESC& pc_desc,
+                                                   const D3D12_CLEAR_VALUE* clear_value,
+                                                   D3D12_CLEAR_VALUE& storage) {
+    if (!clear_value || pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return nullptr;
+    constexpr D3D12_RESOURCE_FLAGS kClearFlags =
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if ((pc_desc.Flags & kClearFlags) == 0) return nullptr;
+    storage = *clear_value;
+    storage.Format = pc_desc.Format;
+    return &storage;
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -1958,10 +1985,9 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     // The measured description is 56 bytes plus Xbox extension words; D3D12_RESOURCE_DESC is exactly 56 bytes.
     // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed
     // resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is ignored and replaced.
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
-    const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
-    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    const auto xbox_layout = static_cast<std::uint32_t>(xbox_desc->Layout);
+    D3D12_RESOURCE_DESC pc_desc = sanitize_xbox_resource_desc(*xbox_desc);
+    const D3D12_RESOURCE_STATES pc_state = sanitize_xbox_resource_state(initial_state);
 
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -1969,31 +1995,81 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
-    return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
-                                               *riid, out);
+    return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, pc_state, clear_value, *riid,
+                                               out);
 }
 
-// Xbox device slot 133: CreatePlacedResourceX(va, const D3D12_RESOURCE_DESC*, state, clear, riid, out).
-// Stand-in backs the call with a committed DEFAULT-heap resource after masking Xbox flags and mapping state 0xFFFFFFFF
-// to D3D12_RESOURCE_STATE_COMMON.
+void notify_xbox_d3d12_committed_alloc(ID3D12Device* real, const D3D12_RESOURCE_DESC& pc_desc) {
+    const auto* hooks = rt::shims::find_guest_xmem_hooks();
+    if (!hooks || !hooks->alloc_fn || !real) return;
+    const D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(0, 1, &pc_desc);
+    if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX) return;
+    // Bits 23:16 = 0x80 (eXMemAllocatorId_D3D12), bit 15 = 0x8000 (D3D12 allocation attribute).
+    constexpr std::uint64_t kD3d12CommittedAttr = 0x00808000ULL;
+    void* mem = hooks->alloc_fn(static_cast<std::size_t>(info.SizeInBytes), kD3d12CommittedAttr);
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 127 D3D12 hook alloc size=0x%llx attr=0x%llx -> %p\n",
+                     static_cast<unsigned long long>(info.SizeInBytes),
+                     static_cast<unsigned long long>(kD3d12CommittedAttr), mem);
+    }
+}
+
+// Xbox device slot 127: CreateCommittedResourceX(heap_props, heap_flags, desc, initial_layout, clear,
+// protected_session, num_castable, castable_formats, riid, out). Mirrors CreateCommittedResource3 semantics:
+// sanitizes console heap flags, resource flags/layout, clear value, and maps InitialLayout to COMMON.
+HRESULT proxy_create_committed_resource_x(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                                            D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
+                                            D3D12_RESOURCE_STATES initial_layout, const D3D12_CLEAR_VALUE* clear_value,
+                                            std::uint64_t /*protected_session*/, std::uint32_t /*num_castable*/,
+                                            const DXGI_FORMAT* /*castable_formats*/, const IID* riid, void** out) {
+    note_slot(127);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!heap_properties || !xbox_desc || !riid) return E_POINTER;
+
+    D3D12_HEAP_PROPERTIES pc_heap = *heap_properties;
+    if (pc_heap.Type < D3D12_HEAP_TYPE_DEFAULT || pc_heap.Type > D3D12_HEAP_TYPE_CUSTOM) {
+        pc_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    }
+    const auto xbox_flags = static_cast<std::uint32_t>(xbox_desc->Flags);
+    const auto xbox_layout_arg = static_cast<std::uint32_t>(initial_layout);
+    D3D12_RESOURCE_DESC pc_desc = sanitize_xbox_resource_desc(*xbox_desc);
+    D3D12_CLEAR_VALUE pc_clear{};
+    const D3D12_CLEAR_VALUE* pc_clear_ptr = sanitize_xbox_clear_value(pc_desc, clear_value, pc_clear);
+
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 127 CreateCommittedResourceX dim=%d width=%llu height=%u fmt=%d "
+                     "flags=0x%x->0x%x heap_flags=0x%x layout=0x%x->COMMON\n",
+                     static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
+                     static_cast<unsigned>(pc_desc.Height), static_cast<int>(pc_desc.Format), xbox_flags,
+                     static_cast<unsigned>(pc_desc.Flags), static_cast<unsigned>(heap_flags), xbox_layout_arg);
+    }
+    const HRESULT hr = self->real->CreateCommittedResource(&pc_heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
+                                                           D3D12_RESOURCE_STATE_COMMON, pc_clear_ptr, *riid, out);
+    if (SUCCEEDED(hr)) notify_xbox_d3d12_committed_alloc(self->real, pc_desc);
+    return hr;
+}
+
+// Xbox device slot 133: CreatePlacedResourceX(va, const D3D12_RESOURCE_DESC*, initial_layout, clear, riid, out).
+// Stand-in backs the call with a committed DEFAULT-heap resource after sanitizing Xbox flags/clear value and mapping
+// InitialLayout to D3D12_RESOURCE_STATE_COMMON.
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
-                                       D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear_value,
+                                       D3D12_RESOURCE_STATES initial_layout, const D3D12_CLEAR_VALUE* clear_value,
                                        const IID* riid, void** out) {
     note_slot(133);
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!xbox_desc || !riid) return E_POINTER;
 
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
-    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
-    const auto xbox_state = static_cast<std::uint32_t>(state);
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & 0x3Fu);
-    pc_desc.Alignment = 0;
-    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    const D3D12_RESOURCE_STATES pc_state =
-        xbox_state == 0xFFFFFFFFu ? D3D12_RESOURCE_STATE_COMMON : state;
+    const auto xbox_flags = static_cast<std::uint32_t>(xbox_desc->Flags);
+    const auto xbox_layout = static_cast<std::uint32_t>(xbox_desc->Layout);
+    const auto xbox_layout_arg = static_cast<std::uint32_t>(initial_layout);
+    D3D12_RESOURCE_DESC pc_desc = sanitize_xbox_resource_desc(*xbox_desc);
+    D3D12_CLEAR_VALUE pc_clear{};
+    const D3D12_CLEAR_VALUE* pc_clear_ptr = sanitize_xbox_clear_value(pc_desc, clear_value, pc_clear);
     D3D12_HEAP_PROPERTIES default_heap{};
     default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -2001,14 +2077,13 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
     if (first_call(logged)) {
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot 133 CreatePlacedResourceX va=0x%llx dim=%d width=%llu flags=0x%x->0x%x "
-                     "layout=0x%x state=0x%x->0x%x\n",
+                     "layout=0x%x initial_layout=0x%x->COMMON\n",
                      static_cast<unsigned long long>(va), static_cast<int>(pc_desc.Dimension),
                      static_cast<unsigned long long>(pc_desc.Width), xbox_flags,
-                     static_cast<unsigned>(pc_desc.Flags), xbox_layout, xbox_state,
-                     static_cast<unsigned>(pc_state));
+                     static_cast<unsigned>(pc_desc.Flags), xbox_layout, xbox_layout_arg);
     }
-    return self->real->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &pc_desc, pc_state, clear_value,
-                                               *riid, out);
+    return self->real->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
+                                               D3D12_RESOURCE_STATE_COMMON, pc_clear_ptr, *riid, out);
 }
 
 bool memory_range_valid(const void* ptr, std::size_t size, bool require_writable) {
@@ -2106,6 +2181,52 @@ bool try_create_shader_resource_view_x(DeviceProxy* /*self*/, std::uint64_t a1, 
     return true;
 }
 
+// Xbox device slot 25: struct-returning GetResourceAllocationInfo passes (out_buf, this, visible_mask, count, descs)
+// instead of PC's (this, out_buf, ...), and Xbox D3D12_RESOURCE_DESC entries carry console Layout/Flags bits.
+std::uint64_t proxy_get_resource_allocation_info(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2,
+                                                   std::uint64_t a3, std::uint64_t a4, std::uint64_t a5) {
+    const auto* self_ptr = reinterpret_cast<const void*>(self);
+    const auto* a1_ptr = reinterpret_cast<const void*>(a1);
+    const bool swapped =
+        !(memory_range_valid(self_ptr, sizeof(void*), false) &&
+          *reinterpret_cast<void* const*>(self_ptr) == reinterpret_cast<void*>(get_vtable())) &&
+        (memory_range_valid(a1_ptr, sizeof(void*), false) &&
+         *reinterpret_cast<void* const*>(a1_ptr) == reinterpret_cast<void*>(get_vtable()));
+
+    DeviceProxy* proxy = swapped ? reinterpret_cast<DeviceProxy*>(a1) : self;
+    const std::uint64_t out_buf = swapped ? reinterpret_cast<std::uint64_t>(self) : a1;
+    const std::uint64_t visible_mask = a2;
+    const std::uint64_t count = a3;
+    const std::uint64_t descs_arg = a4;
+
+    note_slot(25);
+    if (!proxy) return 0;
+    if (25 >= proxy->slot_count) return hr_to_u64(refuse_beyond_device(25, proxy->slot_count));
+
+    if (swapped) {
+        static std::atomic<bool> swapped_logged{false};
+        if (first_call(swapped_logged))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 25 GetResourceAllocationInfo swapped (buf, this) -> PC\n");
+
+        if (count > 0 && count <= 64 &&
+            memory_range_valid(reinterpret_cast<const void*>(descs_arg),
+                               static_cast<std::size_t>(count) * sizeof(D3D12_RESOURCE_DESC), false)) {
+            D3D12_RESOURCE_DESC sanitized[64]{};
+            const auto* src = reinterpret_cast<const D3D12_RESOURCE_DESC*>(descs_arg);
+            for (std::uint64_t i = 0; i < count; ++i) {
+                sanitized[i] = sanitize_xbox_resource_desc(src[i]);
+            }
+            forward_device<25>(proxy, out_buf, visible_mask & 1ULL, count,
+                               reinterpret_cast<std::uint64_t>(sanitized), a5);
+            return out_buf;
+        }
+        forward_device<25>(proxy, out_buf, visible_mask, count, descs_arg, a5);
+        return out_buf;
+    }
+
+    return forward_device<25>(proxy, a1, a2, a3, a4, a5);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2155,6 +2276,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 25) {
+        return proxy_get_resource_allocation_info(self, a1, a2, a3, a4, a5);
     } else if constexpr (Slot == 26) {
         // Xbox struct-returning calls pass (return_buffer, this, node_mask, heap_type) instead of (this,
         // return_buffer, ...). Detect the swapped registers and forward to PC slot 26.
@@ -2174,6 +2297,15 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         note_slot(26);
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
         return forward_device<26>(self, a1, a2, a3, a4, a5);
+    } else if constexpr (Slot == 127) {
+        return hr_to_u64(proxy_create_committed_resource_x(
+            self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
+            static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(a2)),
+            reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3),
+            static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), a6, static_cast<std::uint32_t>(a7),
+            reinterpret_cast<const DXGI_FORMAT*>(a8), reinterpret_cast<const IID*>(a9),
+            reinterpret_cast<void**>(a10)));
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_x(
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
@@ -2358,9 +2490,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
-        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76 || slot == 133)
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
+        slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+        slot == 75 || slot == 76 || slot == 127 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

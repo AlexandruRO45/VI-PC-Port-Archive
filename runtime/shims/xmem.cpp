@@ -68,11 +68,18 @@ void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAli
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
+    if (const auto* hooks = rt::shims::find_guest_xmem_hooks(); hooks && hooks->alloc_fn) {
+        return hooks->alloc_fn(size, attributes);
+    }
     return allocate_block(size);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
+    if (const auto* hooks = rt::shims::find_guest_xmem_hooks(); hooks && hooks->free_fn) {
+        hooks->free_fn(p, attributes);
+        return;
+    }
     _aligned_free(p);
 }
 

@@ -545,6 +545,63 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Slot 25 (GetResourceAllocationInfo): Xbox swapped (out_buf, this) register order with Xbox layout/flag bits.
+    {
+        using Slot25XboxFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT,
+                                                                      UINT, const D3D12_RESOURCE_DESC*);
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        D3D12_RESOURCE_DESC xbox_desc{};
+        xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        xbox_desc.Alignment = 0x10000;
+        xbox_desc.Width = 256;
+        xbox_desc.Height = 256;
+        xbox_desc.DepthOrArraySize = 1;
+        xbox_desc.MipLevels = 1;
+        xbox_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        xbox_desc.SampleDesc.Count = 1;
+        xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+        xbox_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20004);
+
+        D3D12_RESOURCE_ALLOCATION_INFO alloc_info{};
+        D3D12_RESOURCE_ALLOCATION_INFO* returned =
+            reinterpret_cast<Slot25XboxFn>(vtable[25])(&alloc_info, device.Get(), 1, 1, &xbox_desc);
+        check(returned == &alloc_info && alloc_info.SizeInBytes != 0 && alloc_info.SizeInBytes != UINT64_MAX &&
+                  alloc_info.Alignment >= 65536,
+              "slot 25 handles Xbox swapped (out_buf, this) and sanitizes Xbox resource desc");
+    }
+
+    // Slot 127 (CreateCommittedResourceX): 10-arg Xbox call with InitialLayout, console heap flags, and clear value.
+    {
+        using Slot127XboxFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                               const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                                               const D3D12_CLEAR_VALUE*, std::uint64_t, std::uint32_t,
+                                               const DXGI_FORMAT*, const IID*, void**);
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC xbox_desc{};
+        xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        xbox_desc.Width = 256;
+        xbox_desc.Height = 256;
+        xbox_desc.DepthOrArraySize = 1;
+        xbox_desc.MipLevels = 1;
+        xbox_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        xbox_desc.SampleDesc.Count = 1;
+        xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+        xbox_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x300005);
+        D3D12_CLEAR_VALUE clear_val{};
+        clear_val.Format = DXGI_FORMAT_UNKNOWN;
+
+        ComPtr<ID3D12Resource> committed_x;
+        const IID iid_res = __uuidof(ID3D12Resource);
+        const HRESULT hr_x = reinterpret_cast<Slot127XboxFn>(vtable[127])(
+            device.Get(), &heap_props, static_cast<D3D12_HEAP_FLAGS>(0x8), &xbox_desc,
+            static_cast<D3D12_RESOURCE_STATES>(0x3), &clear_val, 0, 0, nullptr, &iid_res,
+            reinterpret_cast<void**>(committed_x.GetAddressOf()));
+        check(SUCCEEDED(hr_x) && committed_x != nullptr,
+              "slot 127 sanitizes console heap flags, layout, clear value, and InitialLayout");
+    }
+
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
     if (real) real->AddRef();
     // Drop every device child before the proxy so the PC device is not released first.

@@ -1,7 +1,12 @@
 // Shim registry: reimplementations of console-only imports.
 // Add a DLL by writing a shims/<dll>.cpp with a SHIM_TABLE and listing it in CMakeLists.txt.
 #pragma once
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace rt::shims {
@@ -91,6 +96,77 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name);
 
 // Prints every unimplemented import that has been called.
 void report_called_unimplemented();
+
+// Layout of the Xbox GDK __XMemAllocationHooks__ export when present in the mapped guest module.
+struct XMemAllocationHooks {
+    void*(__stdcall* alloc_fn)(size_t size, uint64_t attributes);
+    void(__stdcall* free_fn)(void* p, uint64_t attributes);
+};
+
+// Resolves __XMemAllocationHooks__ from the mapped guest image at 0x140000000 when present, or nullptr.
+inline const XMemAllocationHooks* find_guest_xmem_hooks() {
+#ifdef _WIN32
+    static std::atomic<const XMemAllocationHooks*> cached{nullptr};
+    if (const auto* found = cached.load(std::memory_order_acquire)) return found;
+
+    const auto committed_ok = [](uintptr_t addr, size_t size) -> bool {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi))) return false;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+        const uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        return addr <= end && size <= end - addr;
+    };
+
+    constexpr uintptr_t kGuestBase = 0x140000000ULL;
+    if (!committed_ok(kGuestBase, sizeof(IMAGE_DOS_HEADER))) return nullptr;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(kGuestBase);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+        dos->e_lfanew > 0x10000) {
+        return nullptr;
+    }
+    const uintptr_t nt_addr = kGuestBase + static_cast<uintptr_t>(dos->e_lfanew);
+    if (!committed_ok(nt_addr, sizeof(IMAGE_NT_HEADERS64))) return nullptr;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(nt_addr);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return nullptr;
+    }
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return nullptr;
+    const IMAGE_DATA_DIRECTORY& exp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!exp_dir.VirtualAddress || exp_dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) return nullptr;
+
+    const uintptr_t exp_addr = kGuestBase + exp_dir.VirtualAddress;
+    if (!committed_ok(exp_addr, sizeof(IMAGE_EXPORT_DIRECTORY))) return nullptr;
+    const auto* exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(exp_addr);
+    if (!exp->NumberOfNames || !exp->AddressOfNames || !exp->AddressOfNameOrdinals || !exp->AddressOfFunctions) {
+        return nullptr;
+    }
+    const uintptr_t names_addr = kGuestBase + exp->AddressOfNames;
+    const uintptr_t ords_addr = kGuestBase + exp->AddressOfNameOrdinals;
+    const uintptr_t funcs_addr = kGuestBase + exp->AddressOfFunctions;
+    if (!committed_ok(names_addr, exp->NumberOfNames * sizeof(DWORD)) ||
+        !committed_ok(ords_addr, exp->NumberOfNames * sizeof(WORD)) ||
+        !committed_ok(funcs_addr, exp->NumberOfFunctions * sizeof(DWORD))) {
+        return nullptr;
+    }
+
+    const auto* names = reinterpret_cast<const DWORD*>(names_addr);
+    const auto* ords = reinterpret_cast<const WORD*>(ords_addr);
+    const auto* funcs = reinterpret_cast<const DWORD*>(funcs_addr);
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const uintptr_t name_ptr = kGuestBase + names[i];
+        if (!committed_ok(name_ptr, 24)) continue;
+        if (std::strcmp(reinterpret_cast<const char*>(name_ptr), "__XMemAllocationHooks__") != 0) continue;
+        const WORD ord = ords[i];
+        if (ord >= exp->NumberOfFunctions) return nullptr;
+        const uintptr_t sym_addr = kGuestBase + funcs[ord];
+        if (!committed_ok(sym_addr, sizeof(XMemAllocationHooks))) return nullptr;
+        const auto* hooks = reinterpret_cast<const XMemAllocationHooks*>(sym_addr);
+        cached.store(hooks, std::memory_order_release);
+        return hooks;
+    }
+#endif
+    return nullptr;
+}
 
 }  // namespace rt::shims
 
