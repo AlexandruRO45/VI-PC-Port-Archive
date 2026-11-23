@@ -1,0 +1,67 @@
+# Lanterns, a synthetic title-shaped guest run by `gta6rt --run` (runtime/test/lanterns/lanterns.cpp, docs/lanterns.md).
+# Included from runtime/CMakeLists.txt inside the Vulkan device block, after tiny_frame; opt-in, because it needs a
+# Vulkan GPU at run time:
+#
+#   -DLEONIDA_TEST_LANTERNS=ON, then build the `lanterns` and `gta6rt` targets.
+#
+# The shaders: fssm_pack.py (this folder) assembles shaders/*.asm with llvm-mc, packs each into a synthetic FSSM program
+# inside a DXBC/XDAT/XBCH container (<build>/generated/lanterns/<name>.dxbc, what the guest hands to
+# CreateGraphicsPipelineState) and runs tools/fssm_unpack.py, shader_disasm.py and rdna2spirv.py on that folder, which
+# write spirv/index.json keyed by each program's FSSM SHA-256 (what LEONIDA_SHADERS points the runtime at).
+# The guest links nothing from src/ or shims/: its device comes from the D3D12XboxCreateDevice it imports from
+# d3d12_xs.dll, which only gta6rt's shim registry can answer. The import library is tiny_frame's failing stub
+# (d3d12_xs_stub, test/fixtures/d3d12_xs_stub.cpp), built into a folder the loader does not search.
+#
+# Running it: run_lanterns.py (native Windows, or Wine with --wine) checks the exit code, the guest's PASS line and the
+# device line, and writes PNGs of the frames. On a native Windows build it is also the ctest `lanterns_stage1`.
+option(LEONIDA_TEST_LANTERNS
+       "Build lanterns.exe, a synthetic title-shaped guest for gta6rt --run (needs a Vulkan GPU to run)" OFF)
+if(LEONIDA_TEST_LANTERNS AND NOT TARGET d3d12_xs_stub)
+  message(STATUS "LEONIDA_TEST_LANTERNS: lanterns.exe needs gta6rt and the d3d12_xs_stub target; not built")
+elseif(LEONIDA_TEST_LANTERNS)
+  set(_lanterns_src ${CMAKE_CURRENT_SOURCE_DIR}/test/lanterns)
+  add_executable(lanterns ${_lanterns_src}/lanterns.cpp ${_lanterns_src}/lanterns_gpu.cpp)
+  target_link_libraries(lanterns PRIVATE d3d12_xs_stub Vulkan::Headers)
+  target_compile_definitions(lanterns PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+  target_compile_options(lanterns PRIVATE /W4 /permissive- /utf-8)
+  set_target_properties(lanterns PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/lanterns/$<CONFIG>")
+
+  if(NOT LEONIDA_LLVM_MC)
+    if(DEFINED ENV{LLVM_MC})
+      set(LEONIDA_LLVM_MC "$ENV{LLVM_MC}")
+    else()
+      find_program(LEONIDA_LLVM_MC llvm-mc HINTS "C:/msys64/ucrt64/bin")
+    endif()
+  endif()
+  find_program(LEONIDA_SPIRV_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND TARGET Python3::Interpreter)
+    set(LEONIDA_LANTERNS_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/generated/lanterns)
+    set(_lanterns_tools ${CMAKE_CURRENT_SOURCE_DIR}/../tools)
+    set(_lanterns_asm ${_lanterns_src}/shaders/vs_lanterns.asm ${_lanterns_src}/shaders/ps_lanterns_lit.asm
+                      ${_lanterns_src}/shaders/ps_lanterns_floor.asm)
+    get_filename_component(_lanterns_spirv_tools ${LEONIDA_SPIRV_AS} DIRECTORY)
+    file(TO_NATIVE_PATH "${_lanterns_spirv_tools}" _lanterns_spirv_tools)
+    add_custom_command(
+      OUTPUT ${LEONIDA_LANTERNS_SHADERS}/spirv/index.json
+      COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_LANTERNS_SHADERS}
+      COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${_lanterns_spirv_tools}"
+              $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/fssm_pack.py
+              ${LEONIDA_LANTERNS_SHADERS} ${_lanterns_asm} --translate
+      DEPENDS ${_lanterns_asm} ${_lanterns_src}/fssm_pack.py ${_lanterns_tools}/fssm_unpack.py
+              ${_lanterns_tools}/shader_disasm.py ${_lanterns_tools}/rdna2spirv.py
+      COMMENT "Packing and translating the Lanterns shaders"
+      VERBATIM)
+    add_custom_target(lanterns_shaders DEPENDS ${LEONIDA_LANTERNS_SHADERS}/spirv/index.json)
+    add_dependencies(lanterns lanterns_shaders)
+    if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME lanterns_stage1
+               COMMAND $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/run_lanterns.py
+                       --gta6rt $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:lanterns>
+                       --shaders ${LEONIDA_LANTERNS_SHADERS} --out ${CMAKE_CURRENT_BINARY_DIR}/lanterns_out --stage 1)
+      set_tests_properties(lanterns_stage1 PROPERTIES TIMEOUT 300)
+    endif()
+  else()
+    message(STATUS "llvm-mc (set LLVM_MC), spirv-as or Python 3 not found: lanterns.exe builds without its shaders")
+  endif()
+endif()

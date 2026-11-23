@@ -2121,6 +2121,8 @@ if(TARGET Vulkan::Headers)
         set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
       endif()
     endif()
+    # Lanterns, a synthetic title-shaped guest for gta6rt --run (opt-in: -DLEONIDA_TEST_LANTERNS=ON, docs/lanterns.md).
+    include(test/lanterns/lanterns.cmake)
     # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).
     if(TARGET bvh_builder_test)
       target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_com)
