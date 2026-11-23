@@ -993,12 +993,14 @@ def ensure_submodule() -> None:
         fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). "
              f"Download the project with: {clone}")
     log("initializing or updating third_party/rpf9-explorer")
-    r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive", "--checkout",
+    r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive",
                         "--", "third_party/rpf9-explorer"])
-    if r.returncode == 0 and submodule_ready():
-        return
-    fail("fetching third_party/rpf9-explorer failed. Check the Git output, then run "
-         "\"git submodule update --init --recursive --checkout -- third_party/rpf9-explorer\" and build again.")
+    manual = '"git submodule update --init --recursive --checkout -- third_party/rpf9-explorer"'
+    if r.returncode != 0:
+        fail(f"fetching third_party/rpf9-explorer failed. Check the Git output, then run {manual} and build again.")
+    if not submodule_ready():
+        fail("third_party/rpf9-explorer is missing or not at the recorded revision. "
+             f"To update it manually, run {manual} and build again.")
 
 
 def check(game: str, full: bool) -> dict:

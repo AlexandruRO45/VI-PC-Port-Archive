@@ -1,7 +1,9 @@
 """Exercise submodule initialization with local Git repositories and a synthetic file."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 from functools import partial
+import io
 import os
 from pathlib import Path
 import shutil
@@ -95,6 +97,21 @@ class EnsureSubmoduleTest(unittest.TestCase):
             make_game.ensure_submodule()
         self.assertEqual(self.git(self.source / self.submodule, "rev-parse", "HEAD").strip(), original)
         self.assertEqual(fixture.read_text(encoding="utf-8"), "local edit\n")
+
+    def test_an_outdated_checkout_respects_disabled_automatic_updates(self):
+        fixture, original, _ = self.advance_pin()
+        self.git(self.source, "config", f"submodule.{self.submodule.as_posix()}.update", "none")
+        stderr = io.StringIO()
+        with (mock.patch.object(make_game, "ROOT", str(self.source)),
+              mock.patch.object(make_game.subprocess, "run", new=partial(subprocess.run, env=self.git_env)),
+              redirect_stderr(stderr), self.assertRaises(SystemExit) as caught):
+            make_game.ensure_submodule()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("not at the recorded revision", stderr.getvalue())
+        self.assertIn("git submodule update --init --recursive --checkout -- third_party/rpf9-explorer",
+                      stderr.getvalue())
+        self.assertEqual(self.git(self.source / self.submodule, "rev-parse", "HEAD").strip(), original)
+        self.assertEqual(fixture.read_text(encoding="utf-8"), "synthetic\n")
 
     def test_initializes_submodule_in_clone(self):
         checkout = self.root / "clone"
