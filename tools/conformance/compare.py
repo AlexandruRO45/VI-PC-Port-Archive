@@ -939,18 +939,23 @@ def format_rgba(pixel):
     return ",".join(str(channel) for channel in pixel)
 
 
+def format_threshold_values(measured, limit, places):
+    """Keep the usual precision unless it hides the difference."""
+    measured_text = f"{measured:.{places}f}"
+    limit_text = f"{limit:.{places}f}"
+    if measured_text == limit_text:
+        return str(measured), str(limit)
+    return measured_text, limit_text
+
+
 def threshold_violation(stats, max_differing_percent, max_mean_delta):
     """Return why the scene fails the thresholds, or "" when it passes."""
     if stats.differing_percent > max_differing_percent:
-        return (
-            f"differing pixels {stats.differing_percent:.3f}% exceed "
-            f"--max-differing-percent {max_differing_percent:.3f}%"
-        )
+        measured, limit = format_threshold_values(stats.differing_percent, max_differing_percent, 3)
+        return f"differing pixels {measured}% exceed --max-differing-percent {limit}%"
     if stats.mean_absolute_delta > max_mean_delta:
-        return (
-            f"mean absolute channel delta {stats.mean_absolute_delta:.4f} exceeds "
-            f"--max-mean-delta {max_mean_delta:.4f}"
-        )
+        measured, limit = format_threshold_values(stats.mean_absolute_delta, max_mean_delta, 4)
+        return f"mean absolute channel delta {measured} exceeds --max-mean-delta {limit}"
     return ""
 
 
