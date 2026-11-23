@@ -325,7 +325,12 @@ class Analysis:
         """Taint of an operand; stale scalar reads add CTRL."""
         t = 0
         for r in _regs(a):
-            t |= st["t"].get(r, 0)
+            bits = st["t"].get(r, 0)
+            # A word copied to a VGPR is scalar data. Reading the same pair as a mask
+            # still selects different lanes in a wave of 64 and two waves of 32.
+            if bits & LANE and st["g"].get(r) == ("bfm_word",) and base_op(ins["op"]) == "v_mov_b32":
+                bits &= ~LANE
+            t |= bits
             if (id(ins), r) in self.stale:
                 t |= CTRL
         return t
@@ -765,9 +770,11 @@ class Analysis:
                 put(a[0], X | LANE | tacc)
             return
         if op == "s_bfm_b64" and dests:
-            # rdna2spirv.py compares per-half wave_lane (0..31) against offset..offset+size, so the upper half
-            # produces bits for lanes 0..31 instead of 32..63.
-            put(dests[0], t_src | LANE)
+            # Literal operands into a scalar pair are folded to two data words by mov64.
+            # Other forms still use the per-lane lowering.
+            folded = (len(a) == 3 and a[0].get("k") == "sgpr" and a[0].get("n") == 2
+                      and a[1].get("k") == a[2].get("k") == "imm")
+            put(dests[0], t_src | LANE, ("bfm_word",) if folded else None)
             return
 
         # --- cross-lane reads and writes

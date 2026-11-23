@@ -455,6 +455,23 @@ class Execution(unittest.TestCase):
         want = [(7 * k if k % 8 == 1 else 1000, int(k % 8 < 4)) for k in range(64)]
         self.assertEqual([w[:2] for w in whole], want)
 
+    def test_bfm_literal_words_and_mask(self):
+        bfm = "s_bfm_b64 s[8:9], 2, 54"
+        tier, whole, halves = self.run_both("vs_bfm_data", vs([
+            bfm, "v_mov_b32_e32 v6, s8", "v_mov_b32_e32 v7, s9"]))
+        self.assertEqual([w[:2] for w in whole], [(0, 0x00c00000)] * 64)
+        self.assertEqual(whole, halves)
+        self.assertEqual(tier, "A")
+
+        tier, whole, halves = self.run_both("vs_bfm_mask", vs([
+            bfm, "v_cndmask_b32_e64 v6, 0, 1, s[8:9]"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual(whole, halves)
+
+        (tier, _, _), _ = meta_of("vs_bfm_runtime_width", vs([
+            "s_bfm_b64 s[8:9], s2, 54", "v_mov_b32_e32 v7, s9"]))
+        self.assertEqual(tier, "C")
+
     def test_b_waterfall_invariant(self):
         tier, whole, halves = self.run_both("vs_b_wf", vs([
             "v_and_b32_e32 v4, 7, v0", "v_readfirstlane_b32 s20, v4", "v_cmp_eq_u32_e32 vcc, s20, v4",
