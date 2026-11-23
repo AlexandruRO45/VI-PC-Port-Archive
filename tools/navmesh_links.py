@@ -38,6 +38,48 @@ def _counter_top(counter, limit=32):
     return {str(k): v for k, v in counter.most_common(limit)}
 
 
+REFERENCE_FIELDS = (
+    "tiles_counted", "references", "endpoint0_only", "endpoint1_only", "both",
+    "cross_pair_only", "neither", "invalid_index", "repeated_in_polygon",
+)
+
+
+def _count_references(b, polygons, sector, link_offset, link_count, indices, counts):
+    """The caller has verified the polygon prefix chain and both table bounds."""
+    counts["tiles_counted"] += 1
+    counts["references"] += len(indices)
+    if not indices:
+        return
+    polygon = 0
+    start = 0
+    for offset, size in polygons:
+        for i in range(size):
+            count = struct.unpack_from("<I", b, offset + 44 * i + 0x20)[0] & 0x3F
+            if count:
+                refs = indices[start:start + count]
+                counts["repeated_in_polygon"] += count - len(set(refs))
+                for li in refs:
+                    if li >= link_count:
+                        counts["invalid_index"] += 1
+                        continue
+                    p0, p1, s0, s1 = struct.unpack_from("<HHII", b, link_offset + 32 * li + 12)
+                    first = s0 == sector and p0 == polygon
+                    second = s1 == sector and p1 == polygon
+                    if first and second:
+                        key = "both"
+                    elif first:
+                        key = "endpoint0_only"
+                    elif second:
+                        key = "endpoint1_only"
+                    elif sector in (s0, s1) and polygon in (p0, p1):
+                        key = "cross_pair_only"
+                    else:
+                        key = "neither"
+                    counts[key] += 1
+                start += count
+            polygon += 1
+
+
 def verify_tile(b, stats):
     """Verify +0x88 adjacent edges, polygon +0x20 link chain, and +0xA8/+0xB0 special links."""
     chk = {}
@@ -203,6 +245,8 @@ def verify_tile(b, stats):
 
     chk["poly_link_chain"] = chain_ok
     chk["link_indices_endpoints"] = endpoints_ok
+    if chain_ok and "reference_attribution" in stats:
+        _count_references(b, b98, c8, la, d4, lidx, stats["reference_attribution"])
     if chain_ok:
         pst = stats["polygons"]
         pst["total"] += c4
@@ -303,14 +347,16 @@ def _iter_resources(path, start=0, limit=None):
                 yield bytes(buf)
 
 
-def scan(path, start=0, limit=None):
+def scan(path, start=0, limit=None, *, reference_attribution=False):
     stats = new_stats()
+    if reference_attribution:
+        stats["reference_attribution"] = dict.fromkeys(REFERENCE_FIELDS, 0)
     for buf in _iter_resources(path, start=start, limit=limit):
         stats["tiles"] += 1
         chk = verify_tile(buf, stats)
         for name, ok in chk.items():
             stats["checks"][name]["pass" if ok else "fail"] += 1
-    return {
+    report = {
         "tiles": stats["tiles"],
         "checks": stats["checks"],
         "edges": {
@@ -336,6 +382,9 @@ def scan(path, start=0, limit=None):
             "flags1": _counter_top(stats["special_links"]["flags1"]),
         },
     }
+    if reference_attribution:
+        report["reference_attribution"] = stats["reference_attribution"]
+    return report
 
 
 def main(argv=None):
@@ -345,6 +394,8 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=None, help="Maximum byte span to scan")
     ap.add_argument("--out", default=None, help="Optional JSON output path")
     ap.add_argument("--quiet", action="store_true", help="Suppress stdout summary")
+    ap.add_argument("--reference-attribution", action="store_true",
+                    help="Count exact special-link endpoint matches and repeated indices per polygon")
     args = ap.parse_args(argv)
 
     if args.start < 0:
@@ -367,7 +418,7 @@ def main(argv=None):
             sys.stderr.write("error: --out must not overwrite the input path\n")
             return 2
 
-    doc = scan(args.input, start=args.start, limit=args.limit)
+    doc = scan(args.input, start=args.start, limit=args.limit, reference_attribution=args.reference_attribution)
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:

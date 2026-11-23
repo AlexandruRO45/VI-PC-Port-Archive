@@ -247,6 +247,31 @@ class NavmeshLinksTest(unittest.TestCase):
         self.assertEqual(doc["special_links"]["cross_tile_s0"], 1)
         self.assertEqual(doc["special_links"]["cross_tile_s1"], 1)
 
+    def test_reference_attribution(self):
+        sector = (260 << 9) | 250
+        links = [
+            (0, 0, 0, 0, 0, 0, 0, 1, sector, sector + 1, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 2, 2, sector, sector, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0, 2, sector + 1, sector, 0, 0, 0, 0),
+        ]
+        streams = build_tile(
+            sector=sector, links=links, poly_link_counts=(1, 2, 4),
+            link_indices=[0, 0, 0, 99, 0, 1, 2],
+        )
+        streams += build_tile(flags=1) + build_tile(corrupt_chain_total=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "nav.rpf")
+            make_rpf(rpf, streams)
+            result = subprocess.run([sys.executable, "-I", TOOL, rpf, "--reference-attribution"],
+                                    check=True, capture_output=True, text=True)
+            report = json.loads(result.stdout)
+            self.assertEqual(report.pop("reference_attribution"), {
+                "tiles_counted": 2, "references": 7, "endpoint0_only": 1,
+                "endpoint1_only": 1, "both": 1, "cross_pair_only": 2, "neither": 1,
+                "invalid_index": 1, "repeated_in_polygon": 1,
+            })
+            self.assertEqual(report, nl.scan(rpf))
+
     def test_malformed_inputs_and_no_partial_counter_leak(self):
         sector = (260 << 9) | 250
         # Counterexample where polygon 1 lists a cross-tile link whose index-1 endpoint is in sector+1

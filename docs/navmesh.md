@@ -533,6 +533,12 @@ are authoring/build-time inputs to that partition:
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
 - `tools/navmesh_links.py` (stdlib-only) decodes and verifies the 12-byte `+0x88` adjacent-polygon edges, the polygon
   `+0x20` special-link prefix-sum chain, and the 32-byte `+0xA8` special links and `+0xB0` index table.
+  With `--reference-attribution`, each index in a tile with verified table bounds and a complete polygon
+  prefix chain contributes to one bucket. The owning (sector, polygon) can match endpoint 0 only, endpoint
+  1 only, or both. A cross-pair match takes its sector from one endpoint and its polygon from the other.
+  The remaining buckets count references matching neither predicate and indices outside the link table.
+  `repeated_in_polygon` counts every occurrence of an index after its first in the same polygon slice,
+  including out-of-range indices. This separate frequency measure carries no validity judgment.
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
 
