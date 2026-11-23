@@ -595,6 +595,62 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         s_nan = classify_float_status(QNAN)
         self.assertTrue(s_nan.nan)
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    def test_signed_zero_ordering(self):
+        # -0.0 is strictly less than +0.0 in RDNA2 NMin
+        r1 = ref_min3_f32(POS_ZERO, NEG_ZERO, ONE_F32)
+        self.assertEqual(r1, NEG_ZERO)
+
+        r2 = ref_min3_f32(NEG_ZERO, POS_ZERO, ONE_F32)
+        self.assertEqual(r2, NEG_ZERO)
+
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {POS_ZERO:#x}",
+            f"v_mov_b32 v1, {NEG_ZERO:#x}",
+            f"v_mov_b32 v2, {ONE_F32:#x}",
+            "v_min3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], NEG_ZERO)
+
+    def test_infinities(self):
+        # min(-inf, 0.0, +inf) -> -inf
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {NEG_INF:#x}",
+            f"v_mov_b32 v1, {POS_ZERO:#x}",
+            f"v_mov_b32 v2, {POS_INF:#x}",
+            "v_min3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], NEG_INF)
+
+    def test_nan_skipping(self):
+        # min(NaN, 2.0, 3.0) -> 2.0
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {QNAN:#x}",
+            f"v_mov_b32 v1, {TWO_F32:#x}",
+            f"v_mov_b32 v2, {THREE_F32:#x}",
+            "v_min3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], TWO_F32)
+
+    def test_all_nans_returns_nan(self):
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {QNAN:#x}",
+            f"v_mov_b32 v1, {SNAN:#x}",
+            f"v_mov_b32 v2, {NEG_QNAN:#x}",
+            "v_min3_f32 v3, v0, v1, v2",
+        ])
+        self.assertTrue(is_nan_u32(words[0]))
+
+    def test_subnormals(self):
+        # Subnormals are ordered smaller than normal floats
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {SUBNORM_MIN:#x}",
+            f"v_mov_b32 v1, {SUBNORM_MAX:#x}",
+            f"v_mov_b32 v2, {ONE_F32:#x}",
+            "v_min3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], SUBNORM_MIN)
+
 
 if __name__ == "__main__":
     unittest.main()
