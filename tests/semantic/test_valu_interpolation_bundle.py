@@ -268,5 +268,62 @@ class TestInterpP2F32Oracle(unittest.TestCase):
         self.assertEqual(ref_interp_p2_f32(0.5, 0.0, -10.0, 0.0, clamp=True), f32_to_bits(0.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p2_f32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VInterpP2F32Instruction:
+    dst: RegisterOperand
+    src0: RegisterOperand  # j barycentric coordinate (usually v1)
+    attr: AttrOperand
+    accum: RegisterOperand
+    clamp: bool = False
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+class ScalarMachineInterpP2F32:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.attrs: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * 32
+
+    def step(self, insn: VInterpP2F32Instruction):
+        j_coord = bits_to_f32(self.vgprs[insn.src0.index])
+        accum = bits_to_f32(self.vgprs[insn.accum.index])
+        p0, p1, p2 = self.attrs[insn.attr.index]
+        res = ref_interp_p2_f32(j_coord, p0, p2, accum, clamp=insn.clamp)
+        self.vgprs[insn.dst.index] = res
+
+
+class TestInterpP2F32ASTAndScalar(unittest.TestCase):
+    def test_ast(self):
+        insn = VInterpP2F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            attr=AttrOperand(0, "y"),
+            accum=RegisterOperand(OperandType.VGPR, 2),
+            clamp=True,
+        )
+        self.assertEqual(insn.dst.name, "v2")
+        self.assertTrue(insn.clamp)
+
+    def test_scalar_pipeline(self):
+        machine = ScalarMachineInterpP2F32()
+        machine.vgprs[1] = f32_to_bits(0.5)
+        machine.vgprs[2] = f32_to_bits(3.0)  # accum from p1
+        machine.attrs[0] = (1.0, 5.0, 7.0)   # P0=1, P2=7 -> delta=6 -> + 0.5*6 = 3 -> 3+3=6.0
+        insn = VInterpP2F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            attr=AttrOperand(0, "x"),
+            accum=RegisterOperand(OperandType.VGPR, 2),
+        )
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[2], f32_to_bits(6.0))
+
+
 if __name__ == '__main__':
     unittest.main()
