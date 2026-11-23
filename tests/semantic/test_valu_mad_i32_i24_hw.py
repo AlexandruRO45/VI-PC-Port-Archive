@@ -416,5 +416,40 @@ class TestMadI32I24RegisterAliasing(unittest.TestCase):
         self.assertEqual(machine.vgprs[0], 12)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Invariance
+# ==============================================================================
+
+class TestMadI32I24StatusFlags(unittest.TestCase):
+    def test_scc_invariance(self):
+        machine = ScalarMachine()
+        machine.scc = 1
+        machine.vgprs[1] = 2
+        machine.vgprs[2] = 3
+        machine.vgprs[3] = 4
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        machine.step(insn)
+        # VOP3 does not alter SCC
+        self.assertEqual(machine.scc, 1)
+
+    def test_exec_mask_invariance(self):
+        wave = SIMDWave(wave_size=64)
+        orig_mask = 0xAAAA_5555_AAAA_5555
+        wave.exec_mask = orig_mask
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        wave.step(insn)
+        self.assertEqual(wave.exec_mask, orig_mask)
+
+
 if __name__ == '__main__':
     unittest.main()
