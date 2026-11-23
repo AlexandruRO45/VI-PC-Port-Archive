@@ -410,6 +410,19 @@ class Classification(unittest.TestCase):
         self.tier("vs_a_vcmpx_uniform", vs(["s_mov_b32 s20, 5", "v_mov_b32_e32 v6, 1", "v_cmpx_gt_u32_e32 s20, 3",
                                              "v_mov_b32_e32 v6, 2"]), "A", [])
 
+    def test_c_half_of_an_sgpr_pair_mask(self):
+        # A 32-bit write to one register of an SGPR-pair mask: in wave64 s25 is lanes 32..63, a 32-wide half has no
+        # such word. The same mask read intact, or its register reused as data afterwards, stays tier A.
+        for name, clobber in (("hi", "s_mov_b32 s25, 0"), ("lo", "s_mov_b32 s24, -1")):
+            self.tier(f"vs_c_pair_{name}", vs(["v_cmp_eq_u32_e64 s[24:25], 40, v0", clobber,
+                                               "v_cndmask_b32_e64 v7, 0, 7, s[24:25]", "v_mov_b32_e32 v6, 1"]),
+                      "C", ["mask-half"])
+        self.tier("vs_c_pair_saveexec", vs(["v_cmp_eq_u32_e64 s[24:25], 40, v0", "s_mov_b32 s25, 0",
+                                            "s_and_saveexec_b64 s[26:27], s[24:25]", "v_mov_b32_e32 v6, 2",
+                                            "s_mov_b64 exec, s[26:27]"]), "C", contains=["mask-half"])
+        self.tier("vs_a_pair_intact", vs(["v_cmp_eq_u32_e64 s[24:25], 40, v0", "v_cndmask_b32_e64 v7, 0, 7, s[24:25]",
+                                          "s_mov_b32 s25, 9", "v_mov_b32_e32 v6, s25"]), "A", [])
+
     def test_c_mask_stored_as_data(self):
         self.tier("ps_c_maskdata", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_mov_b64 s[6:7], vcc",
                                        "v_mov_b32_e32 v6, s6"]), "C")

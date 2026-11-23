@@ -550,6 +550,16 @@ class Analysis:
             if ev is not None:
                 ev["idioms"].add(name)
 
+        # An SGPR pair read while it holds part of a lane mask but not its two halves in place: one register was
+        # overwritten by a 32-bit op (s_mov_b32 s25, 0 after v_cmp ... s[24:25]) or the halves are swapped. In wave64
+        # the high register is lanes 32-63; a 32-wide half has no such word, so the halves see different masks.
+        held = self.masks.get(id(ins), {})
+        for x in srcs:
+            if x.get("k") == "sgpr" and x.get("n", 1) == 2:
+                ks = (held.get(x["r"]), held.get(x["r"] + 1))
+                if any(k is not None for k in ks) and ks != (lane_masks.MASK_LO, lane_masks.MASK_HI):
+                    violation("mask-half")
+
         def src_taint():
             t = 0
             for x in srcs:
