@@ -66,8 +66,10 @@ def markdown_files(root):
         if result.returncode == 0:
             return [os.path.join(root, name) for name in result.stdout.splitlines() if name]
     found = []
+    # Match the build/ and build-*/ exclusions used by .gitignore when Git cannot list tracked files.
+    ignored_dirs = (".git", "third_party", "node_modules", "__pycache__", "build")
     for base, dirs, names in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in (".git", "third_party", "node_modules", "__pycache__")]
+        dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith("build-")]
         found.extend(os.path.join(base, name) for name in names if name.endswith(".md"))
     return found
 
@@ -135,6 +137,18 @@ class RepositoryLinksTest(unittest.TestCase):
             page = os.path.join(tmp, "README.md")
             with open(page, "w", encoding="utf-8", newline="\n") as f:
                 f.write("# README\n")
+            with patch.object(subprocess, "run", side_effect=FileNotFoundError):
+                self.assertEqual(markdown_files(tmp), [page])
+
+    def test_markdown_files_ignores_build_trees_in_the_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "docs", "build-notes.md")
+            for path in (page,
+                         os.path.join(tmp, "runtime", "build", "_deps", "sdl3-src", "README.md"),
+                         os.path.join(tmp, "runtime", "build-vulkan", "_deps", "README.md")):
+                os.makedirs(os.path.dirname(path))
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("# Build notes\n")
             with patch.object(subprocess, "run", side_effect=FileNotFoundError):
                 self.assertEqual(markdown_files(tmp), [page])
 
