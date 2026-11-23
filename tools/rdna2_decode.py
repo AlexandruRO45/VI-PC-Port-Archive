@@ -1422,7 +1422,10 @@ def decode_bytes(code: bytes, *, wave32: bool = True, code_start: int = 0, name:
 
 
 def disasm_bytes(code: bytes, *, wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
-    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`."""
+    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`.
+
+    The listing contains only instructions. `name` is accepted for caller compatibility.
+    """
     invalid = 0
     with StringIO() as listing:
         for ins in _iter_insns(code, wave32, code_start):
