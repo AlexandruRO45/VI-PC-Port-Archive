@@ -129,9 +129,12 @@ in that layout with the same encoding, plus `import-manifest.json` (source, size
 Checked earlier with the shim of the open #279, which used the same layout: four imported blobs (2 KB to 1.2 MB)
 read back byte-identical through its `XGameSaveReadBlobData`.
 
-**VERIFY:** the title's real container and blob names. The default is container = slot name and blob = payload file
-name, and `--map` overrides it. Confirm or fix them from the executable's `XGameSaveCreateContainer` and
-`XGameSaveSubmitBlobWrite` calls.
+**Measured in the retail executable's XGameSave writer:** a save update submits two fixed blobs, `Save Game Header`
+(`0x128` bytes, serialized from the save object's fields) and `Save Game Data` (variable size), through two
+`XGameSaveSubmitBlobWrite` calls. The container name is assembled separately before `XGameSaveCreateContainer`, so
+container = slot name is still consistent. The import below instead writes each payload under its own file name;
+that is not a blob name the title reads, and the header is not an on-disk file, so an imported save is not loadable
+as-is. Use `--map` for the container and blob names, and produce the header separately once its format is known.
 
 ## Key names
 
