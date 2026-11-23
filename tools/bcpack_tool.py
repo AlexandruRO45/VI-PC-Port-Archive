@@ -4,9 +4,9 @@ Provides CLI inspection, diagnostics, statistical frequency profiling and
 decompression for Xbox Series BCPack streams (codecs BC1, BC3, BC4, BC5, BC6H, BC7).
 
 Usage:
-    python -I tools/bcpack_tool.py inspect <in.bin> --codec <1..7> --size <uncompressed_bytes> [--json]
-    python -I tools/bcpack_tool.py decode <in.bin> <out.bin> --codec <1..7> --size <uncompressed_bytes> [--provisional]
-    python -I tools/bcpack_tool.py profile <in.bin> --codec <1..7> --size <uncompressed_bytes>
+    python -I tools/bcpack_tool.py inspect <in.bin> --codec {1,3,4,5,6,7} --size <uncompressed_bytes> [--json]
+    python -I tools/bcpack_tool.py decode <in.bin> <out.bin> --codec {1,3,4,5,6,7} --size <uncompressed_bytes> [--provisional]
+    python -I tools/bcpack_tool.py profile <in.bin> --codec {1,3,4,5,6,7} --size <uncompressed_bytes>
 """
 from __future__ import annotations
 

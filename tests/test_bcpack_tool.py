@@ -317,5 +317,15 @@ class TestCliErrorPaths(unittest.TestCase):
                 self.assertEqual(f.read(), self.original_blocks)
 
 
+class TestUsageDocstring(unittest.TestCase):
+    def test_documented_codec_lists_match_accepted_codecs(self) -> None:
+        import re
+        expected = "{" + ",".join(str(c) for c in sorted(bcpack_tool.bcpack.ALL_CODECS)) + "}"
+        found = re.findall(r"--codec (\S+)", bcpack_tool.__doc__ or "")
+        self.assertEqual(len(found), 3, found)
+        for value in found:
+            self.assertEqual(value, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
