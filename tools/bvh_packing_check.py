@@ -49,6 +49,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_index as I  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+import pool_workers  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 BOX_TYPES = (R.BOX16, R.BOX32)
@@ -445,6 +446,7 @@ def _short():
 
 
 def scan_archive(path, workers, window, start=None, limit=None, progress=True):
+    workers = pool_workers.process_workers(workers)
     size = os.path.getsize(path)
     with open(path, "rb") as fh:
         first = struct.unpack("<I", fh.read(8)[4:8])[0] if size >= 8 else size
@@ -478,7 +480,8 @@ def scan_archive(path, workers, window, start=None, limit=None, progress=True):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Check the dehydrated BVH4 packing (docs/bvh.md §4a) without geometry.")
     ap.add_argument("inputs", nargs="+")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2),
+                    help="parallel scan processes (Windows: 61 at most)")
     ap.add_argument("--window", type=int, default=64 << 20, help="archive bytes per parallel job (default 64 MiB)")
     ap.add_argument("--start", type=int)
     ap.add_argument("--limit", type=int)
