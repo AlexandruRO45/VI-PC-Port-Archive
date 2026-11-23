@@ -58,6 +58,17 @@ def read(root, rel):
         return f.read()
 
 
+def llvm_mc_listed_tests(script):
+    """The files in the Translator step's llvm_mc_stdlib_tests array, or None if the array is gone. A commented-out
+    entry is not a registration: the shell never runs it, so the array can still be missing it."""
+    match = re.search(r"llvm_mc_stdlib_tests=\(\s*\n(.*?)\n\s*\)", script, re.S)
+    if match is None:
+        return None
+    entries = "\n".join(line for line in match.group(1).splitlines()
+                       if not line.lstrip().startswith("#"))
+    return sorted(re.findall(r"tests/[A-Za-z0-9_./-]+\.py", entries))
+
+
 def ci_rules(root):
     """(markers, pruned, loop_glob, semantic_dir, viewer_glob), exactly as the workflow spells them."""
     text = read(root, WORKFLOW)
@@ -422,15 +433,22 @@ class RepositoryRegistrationTest(unittest.TestCase):
         runnable = [rel for rel in gated if rel not in LLVM_MC_BLOCKED]
         self.assertGreaterEqual(len(runnable), 1, f"only found {gated}")
         script = step_script(ROOT, "Translator tests")
-        match = re.search(r"llvm_mc_stdlib_tests=\(\s*\n(.*?)\n\s*\)", script, re.S)
-        self.assertIsNotNone(match, "the Translator tests step has no llvm_mc_stdlib_tests array to keep in sync")
-        listed = sorted(re.findall(r"tests/[A-Za-z0-9_./-]+\.py", match.group(1)))
+        listed = llvm_mc_listed_tests(script)
+        self.assertIsNotNone(listed, "the Translator tests step has no llvm_mc_stdlib_tests array to keep in sync")
         self.assertEqual(listed, runnable,
                          "llvm_mc_stdlib_tests must list exactly the runnable stdlib files that skip without "
                          "llvm-mc (LLVM_MC_BLOCKED holds the ones waiting on a dependency); "
                          "otherwise a new one silently goes untested")
         self.assertIn('for t in "${llvm_mc_stdlib_tests[@]}"', script)
         self.assertIn('python -I "$t"', script)
+
+    def test_a_commented_out_llvm_mc_test_is_not_a_registration(self):
+        script = ("llvm_mc_stdlib_tests=(\n"
+                  "  # tests/test_old.py\n"
+                  "  tests/test_new.py\n"
+                  ")\n")
+        self.assertEqual(llvm_mc_listed_tests(script), ["tests/test_new.py"])
+        self.assertIsNone(llvm_mc_listed_tests("python -I tests/test_new.py\n"))
 
     def test_the_spirv_tools_check_flags_a_job_that_installs_nothing(self):
         workflow = read(ROOT, WORKFLOW)
