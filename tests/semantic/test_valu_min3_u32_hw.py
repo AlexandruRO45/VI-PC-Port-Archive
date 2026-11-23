@@ -282,5 +282,108 @@ class TestValuMin3U32ScalarInterpreter(unittest.TestCase):
             trans_res = run_translated_min3_u32(a, b, c)
             self.assertEqual(scalar_res, trans_res)
 
+class SIMDWavefront:
+    """Wavefront model simulating 32-lane or 64-lane SIMD execution."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"wave_size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+
+    def read_operand(self, op: Union[Register, int], lane: int) -> int:
+        if isinstance(op, int):
+            return op & MASK32
+        return self.vgprs[op.index][lane]
+
+    def write_vgpr(self, reg: Register, lane: int, val: int) -> None:
+        self.vgprs[reg.index][lane] = val & MASK32
+
+    def step(self, inst: VOP3Instruction) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                v0 = self.read_operand(inst.src0, lane)
+                v1 = self.read_operand(inst.src1, lane)
+                v2 = self.read_operand(inst.src2, lane)
+                res = oracle_min3_u32(v0, v1, v2)
+                self.write_vgpr(inst.dst, lane, res)
+
+
+class TestValuMin3U32SIMD(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for v_min3_u32."""
+
+    def test_simd32_all_lanes_active(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        for lane in range(32):
+            wave.vgprs[1][lane] = 100 + lane
+            wave.vgprs[2][lane] = 50 + lane * 2
+            wave.vgprs[3][lane] = 200 - lane
+        wave.step(inst)
+        for lane in range(32):
+            expected = min(100 + lane, 50 + lane * 2, 200 - lane)
+            self.assertEqual(wave.vgprs[0][lane], expected)
+
+    def test_simd64_divergence_exec_mask(self) -> None:
+        wave = SIMDWavefront(wave_size=64)
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        wave.exec_mask = 0x5555_5555_5555_5555  # even lanes active
+        for lane in range(64):
+            wave.vgprs[0][lane] = 0xCAFE_BABE
+            wave.vgprs[1][lane] = 10
+            wave.vgprs[2][lane] = 20
+            wave.vgprs[3][lane] = 30
+        wave.step(inst)
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[0][lane], 10)
+            else:
+                self.assertEqual(wave.vgprs[0][lane], 0xCAFE_BABE)
+
+    def test_simd_inactive_lanes_unmodified(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        wave.exec_mask = 0x0000_0001  # only lane 0 active
+        for lane in range(32):
+            wave.vgprs[0][lane] = 0x1111_1111 * lane
+            wave.vgprs[1][lane] = 5
+            wave.vgprs[2][lane] = 15
+            wave.vgprs[3][lane] = 25
+        wave.step(inst)
+        self.assertEqual(wave.vgprs[0][0], 5)
+        for lane in range(1, 32):
+            self.assertEqual(wave.vgprs[0][lane], 0x1111_1111 * lane)
+
+    def test_simd_translator_active_mask_preservation(self) -> None:
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        lines = [inst.to_asm(), "s_endpgm"]
+        spv = support.translate_lines("ps_simd_min3", lines)
+        self.assertIn("OpExtInst", spv)
+
 if __name__ == "__main__":
     unittest.main()
