@@ -13,6 +13,10 @@ def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
         raise ValueError(f"{path}: invalid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path}: invalid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # json.load recurses once per nesting level; a file nested deeper than the interpreter's limit is an
+        # invalid index, not a tool crash. Callers handle ValueError (make_game, fssm_unpack, shader_disasm).
+        raise ValueError(f"{path}: invalid JSON: nesting is too deep") from exc
     if not isinstance(rows, list):
         raise ValueError(f"{path}: expected an array of shader entries")
     stems = set()

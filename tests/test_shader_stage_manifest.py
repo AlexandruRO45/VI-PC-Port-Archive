@@ -148,6 +148,18 @@ class ShaderStemsTests(unittest.TestCase):
             shader_stems(path, "file", ".dxbc")
         self.assertIn(path, str(ctx.exception))
 
+    def test_deeply_nested_json_raises_value_error_with_path(self):
+        # json.load recurses per nesting level; past the recursion limit it raises RecursionError, which the
+        # callers' (OSError, ValueError) handlers would not catch. The reader reports it as invalid JSON.
+        depth = 100_000
+        for idx, raw in enumerate(("[" * depth + "]" * depth, "[" + '{"file": ' * depth + "1" + "}" * depth + "]")):
+            with self.subTest(case=idx):
+                path = self.write_bytes(f"deep_{idx}.json", raw.encode("ascii"))
+                with self.assertRaises(ValueError) as ctx:
+                    shader_stems(path, "file", ".dxbc")
+                self.assertIn(path, str(ctx.exception))
+                self.assertIn("nesting is too deep", str(ctx.exception))
+
 
 class CallerIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -176,6 +188,11 @@ class CallerIntegrationTests(unittest.TestCase):
             f.write("{truncated")
         self.assertIsNone(make_game.unpacked_shader_stems(dxbc))
 
+        depth = 100_000
+        with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8") as f:
+            f.write("[" * depth + "]" * depth)
+        self.assertIsNone(make_game.unpacked_shader_stems(dxbc))
+
     def test_fssm_unpack_carve_index_rejects_traversal_and_malformed_json(self):
         src = os.path.join(self.dir, "carved")
         os.makedirs(src)
@@ -183,6 +200,8 @@ class CallerIntegrationTests(unittest.TestCase):
             ("dot.json", json.dumps([{"file": "..dxbc"}]), "expected a shader basename"),
             ("dotdot.json", json.dumps([{"file": "...dxbc"}]), "expected a shader basename"),
             ("bad.json", "{not json", "invalid JSON"),
+            ("deep.json", "[" * (100_000) + "]" * (100_000),
+             "nesting is too deep"),
         ):
             with self.subTest(case=name):
                 idx = os.path.join(self.dir, name)
@@ -205,6 +224,8 @@ class CallerIntegrationTests(unittest.TestCase):
             ("dot.json", json.dumps([{"name": "."}]), "expected a shader basename"),
             ("dotdot.json", json.dumps([{"name": ".."}]), "expected a shader basename"),
             ("bad.json", "[{\"name\":", "invalid JSON"),
+            ("deep.json", "[" * (100_000) + "]" * (100_000),
+             "nesting is too deep"),
         ):
             with self.subTest(case=name):
                 idx = os.path.join(self.dir, name)
