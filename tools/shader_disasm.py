@@ -20,6 +20,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from mc_command import mc_command  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
@@ -179,7 +180,10 @@ def one(path, out, mcpu, backend="llvm-mc"):
             listing.write(asm)
             if err.strip():
                 listing.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
-        os.replace(listing.name, output_path(path, out))
+        target = output_path(path, out)
+        # the staged file is 0600; publish it with the bits a plain open() of the listing would have had
+        os.chmod(listing.name, published_mode(target))
+        os.replace(listing.name, target)
     finally:
         if os.path.exists(listing.name):
             os.unlink(listing.name)

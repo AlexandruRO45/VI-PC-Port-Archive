@@ -153,6 +153,22 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("0 invalid words", body)
 
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_a_listing_gets_the_bits_of_a_plain_open(self):
+        mc = self.fake("import sys\n"
+                       "probe = sys.stdin.read().strip() == %r\n"
+                       "print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]' if probe else %r)\n"
+                       % (PROBE, ASM))
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        plain = os.path.join(out, "plain.txt")
+        with open(plain, "w", encoding="utf-8", newline="\n"):
+            pass
+        # the staged file is created 0600; the published listing must match what open() makes here
+        self.assertEqual(os.stat(os.path.join(out, "one.s")).st_mode & 0o777, os.stat(plain).st_mode & 0o777)
+
+
 class DisasmInputTest(unittest.TestCase):
     """Short blobs, bad --jobs/--limit and an empty folder end with a reason, not a traceback."""
 
