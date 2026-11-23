@@ -255,22 +255,24 @@ def main() -> int:
     if tests is None:
         return 2
     wine = args.wine
-    results = {}
+    results = []
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
         for test in tests:
             name = test.get("name", "?")
             status, detail = run_test(test, args, wine)
-            results[name] = status
+            results.append((name, status))
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":
                 for line in detail.rstrip().splitlines()[-40:]:
                     print(f"    {line}")
 
-    missing = [n for n in args.require if n not in results]
-    failed_required = [n for n in args.require if results.get(n) != "pass"]
-    counts = {s: sum(1 for v in results.values() if v == s) for s in ("pass", "fail", "skip")}
+    listed = {name for name, _ in results}
+    not_passed = {name for name, status in results if status != "pass"}
+    missing = [n for n in args.require if n not in listed]
+    failed_required = [n for n in args.require if n not in listed or n in not_passed]
+    counts = {s: sum(1 for _, v in results if v == s) for s in ("pass", "fail", "skip")}
     print(f"\n{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped under Wine "
           f"({len(results)} tests)")
     for n in missing:
@@ -285,7 +287,7 @@ def main() -> int:
                 f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
                 f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
                 f.write("| Test | Result | Required |\n|---|---|---|\n")
-                for name, status in results.items():
+                for name, status in results:
                     f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
                 f.write("\n")
         except OSError as e:

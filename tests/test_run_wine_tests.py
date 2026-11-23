@@ -408,6 +408,25 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("required tests that did not pass: bad", out)
 
+    def test_all_occurrences_of_a_required_name_must_pass(self):
+        cases = (
+            (("bad.py", "ok.py"), 1, "1 passed, 1 failed"),
+            (("ok.py", "bad.py"), 1, "1 passed, 1 failed"),
+            (("ok.py", "ok.py"), 0, "2 passed, 0 failed"),
+        )
+        for commands, expected_code, counts in cases:
+            with self.subTest(commands=commands):
+                entries = [ctest_entry("same", self.command(command)) for command in commands]
+                summary = self.root / "summary.md"
+                summary.unlink(missing_ok=True)
+                code, out, _ = self.run_main(entries, "--require", "same", "--summary", str(summary))
+                self.assertEqual(code, expected_code)
+                self.assertIn(f"{counts}, 0 skipped under Wine (2 tests)", out)
+                text = summary.read_text(encoding="utf-8")
+                self.assertIn(counts, text)
+                for command, status in (("ok.py", "pass"), ("bad.py", "fail")):
+                    self.assertEqual(text.count(f"| `same` | {status} | yes |"), commands.count(command))
+
     def test_a_required_test_that_is_not_listed_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "absent")
         self.assertEqual(code, 1)
