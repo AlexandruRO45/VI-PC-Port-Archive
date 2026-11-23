@@ -12,6 +12,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 import zlib
@@ -21,6 +22,7 @@ TOOL = os.path.join(ROOT, "tools", "rbf0_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import rbf0_index  # noqa: E402
+import report_paths  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -351,6 +353,23 @@ class ArgumentTest(unittest.TestCase):
         self.assertIn("would overwrite", result.stderr)
         with open(stream, "rb") as f:
             self.assertEqual(f.read(), b"synthetic stream")
+
+    def test_out_guard_follows_the_folding_volume(self):
+        """out asks report_paths, so a case-insensitive APFS volume refuses an output that is the source archive;
+        the private realpath+normcase copy answered "two files" there and let the report replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = os.path.join(tmp, "café.rpf")
+            decomposed = os.path.join(tmp, unicodedata.normalize("NFD", "café.rpf"))
+            folding = [True]
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
+                    mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+                self.assertTrue(rbf0_index.same_output_path(composed, decomposed))
+                folding[0] = False
+                self.assertFalse(rbf0_index.same_output_path(composed, decomposed))
+
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")), \
+                    mock.patch.object(report_paths, "_same_resolved_name", return_value=True):
+                self.assertTrue(rbf0_index.same_output_path(os.path.join(tmp, "one.rpf"), os.path.join(tmp, "ONE.RPF")))
 
     def test_unwritable_output_path_fails_before_the_scan(self):
         for out in (os.path.join(self.root, "no_such_folder", "x.json"), self.root):

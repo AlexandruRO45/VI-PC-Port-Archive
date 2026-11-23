@@ -34,6 +34,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from zero_span import gap_split  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 MAGIC = b"RBF0"
 PROLOGUE = b"\xfb\xff\x01\x00"
@@ -502,14 +503,7 @@ def byte_count(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+same_output_path = same_report_path
 
 
 def main():

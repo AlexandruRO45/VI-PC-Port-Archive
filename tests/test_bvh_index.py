@@ -9,6 +9,7 @@ import os
 import struct
 import sys
 import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 import zlib
@@ -17,6 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import bvh_index  # noqa: E402
+import report_paths  # noqa: E402
 
 
 def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0, root=0x136AC):
@@ -433,6 +435,23 @@ class ScanTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
                 bvh_index.main([path, "--limit", value])
             self.assertEqual(cm.exception.code, 2)
+
+    def test_out_guard_follows_the_folding_volume(self):
+        """--out asks report_paths, so a case-insensitive APFS volume refuses an --out that is the source archive;
+        the private realpath+normcase copy answered "two files" there and let the report replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = os.path.join(tmp, "café.rpf")
+            decomposed = os.path.join(tmp, unicodedata.normalize("NFD", "café.rpf"))
+            folding = [True]
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
+                    mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+                self.assertTrue(bvh_index.same_output_path(composed, decomposed))
+                folding[0] = False
+                self.assertFalse(bvh_index.same_output_path(composed, decomposed))
+
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")), \
+                    mock.patch.object(report_paths, "_same_resolved_name", return_value=True):
+                self.assertTrue(bvh_index.same_output_path(os.path.join(tmp, "one.rpf"), os.path.join(tmp, "ONE.RPF")))
 
 
     def test_directory_scan_honours_max_inflate(self):

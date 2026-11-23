@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -21,6 +22,7 @@ TOOLS_DIR = os.path.join(ROOT, "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+import report_paths
 import tex_headers
 
 
@@ -979,6 +981,23 @@ class CliInputTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             with open(manifest, "r", encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {"files": []})
+
+    def test_out_guard_follows_the_folding_volume(self):
+        """--out asks report_paths, so a case-insensitive APFS volume refuses an --out that is one of the input
+        archives or manifests; the private realpath+normcase copy answered "two files" there and let the report replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = os.path.join(tmp, "café.rpf")
+            decomposed = os.path.join(tmp, unicodedata.normalize("NFD", "café.rpf"))
+            folding = [True]
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
+                    mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+                self.assertTrue(tex_headers.same_output_path(composed, decomposed))
+                folding[0] = False
+                self.assertFalse(tex_headers.same_output_path(composed, decomposed))
+
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")), \
+                    mock.patch.object(report_paths, "_same_resolved_name", return_value=True):
+                self.assertTrue(tex_headers.same_output_path(os.path.join(tmp, "one.rpf"), os.path.join(tmp, "ONE.RPF")))
 
     def test_output_parent_creation_failure_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:
