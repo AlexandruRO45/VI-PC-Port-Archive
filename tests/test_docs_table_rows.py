@@ -22,6 +22,21 @@ class DocsTableRowsTest(unittest.TestCase):
                     continue  # this is a table header followed by its separator
                 self.fail(f"{path.relative_to(ROOT)}:{i + 1}: table row without a table header")
 
+    def test_no_blank_line_splits_a_table(self):
+        # A blank line ends a Markdown table. It is only a new table when the next row is a header with its
+        # separator right after it; otherwise the rows below the blank are detached from the header above.
+        def is_separator(row):
+            return set(row.replace("|", "").replace(" ", "")) <= set("-:")
+
+        for path in DOCS:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for i in range(1, len(lines) - 1):
+                if lines[i].strip() or not lines[i - 1].startswith("|") or not lines[i + 1].startswith("|"):
+                    continue
+                if is_separator(lines[i + 1]) or (i + 2 < len(lines) and is_separator(lines[i + 2])):
+                    continue  # a new table: header then separator
+                self.fail(f"{path.relative_to(ROOT)}:{i + 1}: blank line ends the table before this row")
+
     def test_no_duplicate_rows_in_one_table(self):
         for path in DOCS:
             lines = path.read_text(encoding="utf-8").splitlines()
