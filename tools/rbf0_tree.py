@@ -47,14 +47,6 @@ CSV_COLUMNS = ["resource", "root", "status", "parent", "slot", "sibling", "child
                "length", "nul", "utf8", "value", "source"]
 
 
-def _utf8(raw):
-    """Return (text, valid). Invalid bytes become U+FFFD and are counted, never silently accepted."""
-    try:
-        return raw.decode("utf-8"), True
-    except UnicodeDecodeError:
-        return raw.decode("utf-8", "replace"), False
-
-
 def _render(value):
     """A stable textual form for XML and for JSON consumers that want one scalar spelling."""
     if isinstance(value, bool):
@@ -78,6 +70,11 @@ class SelectionError(ValueError):
     """An invalid resource offset or limit."""
 
 
+_ST_H, _ST_I, _ST_Q = struct.Struct("<H"), struct.Struct("<I"), struct.Struct("<Q")
+_ST_F, _ST_D, _ST_HHH = struct.Struct("<f"), struct.Struct("<d"), struct.Struct("<HHH")
+_ST_FFF, _ST_DDD = struct.Struct("<fff"), struct.Struct("<ddd")
+
+
 class Parser:
     """One RBF0 resource. `parse()` always returns a document, with a partial tree on failure."""
 
@@ -90,7 +87,6 @@ class Parser:
         self.p = 8 if self.wide else 4
         self.scalar = 8 if self.wide else 4
         self.descs = []
-        self.stack = []
         self.root = None
         self.status = "ok"
         self.error = ""
@@ -105,180 +101,298 @@ class Parser:
         self.invalid_utf8 = 0
         self.max_depth = 0
 
-    def take(self, n, what):
-        if self.p + n > len(self.data):
-            raise TreeError(f"{what} truncated", self.p, truncated=True)
-        start = self.p
-        self.p += n
-        return self.data[start:self.p]
-
-    def _descriptor(self, index, kind, at):
-        if index == len(self.descs):
-            n = struct.unpack("<H", self.take(2, "descriptor name length"))[0]
-            raw = self.take(n, "descriptor name")
-            name, valid = _utf8(raw)
-            if not valid:
-                self.invalid_utf8 += 1
-            self.descs.append({
-                "index": index,
-                "name": name,
-                "first_type": TYPE_NAMES.get(kind, f"0x{kind:02x}"),
-                "offset": at,
-                "name_offset": self.p - n,
-                "uses": 0,
-                "types": {},
-                "utf8_valid": valid,
-            })
-            self.descriptor_names.add(name)
-        elif index > len(self.descs):
-            raise TreeError(f"descriptor index {index} of {len(self.descs)}", at)
-        desc = self.descs[index]
-        desc["uses"] += 1
-        key = TYPE_NAMES.get(kind, f"0x{kind:02x}")
-        desc["types"][key] = desc["types"].get(key, 0) + 1
-        return desc
-
-    def _attach(self, frame, node):
-        node["depth"] = frame["depth"] + 1
-        if frame["node"]["kind"] != "element":
-            raise TreeError("record outside an element", node["offset"])
-        if node["kind"] == "value" and frame["attrs_seen"] < frame["attrs_declared"]:
-            if frame["content_started"]:
-                frame["node"]["attribute_order_violation"] = True
-                self.attribute_order_violations += 1
-            frame["node"]["attributes"].append(node)
-            frame["node"]["attrs_actual"] += 1
-            frame["attrs_seen"] += 1
-            return
-        if node["kind"] in ("element", "text") and frame["attrs_seen"] < frame["attrs_declared"]:
-            frame["node"]["attribute_order_violation"] = True
-            self.attribute_order_violations += 1
-        frame["content_started"] = True
-        frame["node"]["content"].append(node)
-        frame["node"]["content_count"] += 1
-        if node["kind"] == "element":
-            frame["node"]["children"] += 1
-            if frame["text_seen"]:
-                frame["node"]["text_before_child"] = True
-                self.text_before_child += 1
-            frame["child_seen"] = True
-        elif node["kind"] == "value":
-            if frame["child_seen"]:
-                frame["node"]["value_after_child"] = True
-                self.value_after_child += 1
-        elif node["kind"] == "text":
-            if frame["child_seen"]:
-                frame["node"]["text_after_child"] = True
-                self.text_after_child += 1
-            if frame["text_seen"]:
-                frame["node"]["multiple_text"] = True
-            frame["text_seen"] = True
-
     def parse(self):
+        """Walk the record stream once. The hot loop keeps the open element's state in locals and the parents'
+        states on a stack, so a record costs no method call; every error offset, node key order and counter
+        matches the record-at-a-time reading it replaced."""
         data = self.data
-        if len(data) < 4 or data[:4] != MAGIC:
+        n = len(data)
+        if n < 4 or data[:4] != MAGIC:
             raise TreeError("not an RBF0 stream", 0)
+        scalar = self.scalar
+        st_int, st_float, st_vec = (_ST_Q, _ST_D, _ST_DDD) if self.wide else (_ST_I, _ST_F, _ST_FFF)
+        vec_size = 3 * scalar
+        p = self.p
+        counts = self.counts
+        descs = self.descs
+        parents = []        # saved states of the open ancestors of `node`
+        node = None         # the innermost open element; its state lives in the locals below
+        depth = 0
+        declared = seen = nchild = 0
+        started = child_seen = text_seen = False
+        content = attributes = None
+        max_depth = 0
+        attribute_mismatches = attribute_order_violations = 0
+        text_after_child = text_before_child = value_after_child = invalid_utf8 = 0
         try:
-            while self.p < len(data):
-                self.record_offset = self.p
-                at = self.p
-                index = self.take(1, "record index")[0]
-                kind = self.take(1, "record type")[0]
+            while p < n:
+                at = p
+                index = data[p]
+                p += 1
+                if p >= n:
+                    raise TreeError("record type truncated", p, truncated=True)
+                kind = data[p]
+                p += 1
                 if index == 0xFF:
                     if kind != 0xFF:
                         raise TreeError("close tag is not FF FF", at)
-                    if not self.stack:
+                    if node is None:
                         raise TreeError("close without an open element", at)
-                    frame = self.stack.pop()
-                    frame["node"]["end"] = self.p
-                    if frame["attrs_seen"] < frame["attrs_declared"]:
-                        frame["node"]["attribute_mismatch"] = True
-                        self.attribute_mismatches += 1
-                    if not self.stack:
-                        self.root = frame["node"]
+                    node["attrs_actual"] = seen
+                    node["children"] = nchild
+                    node["content_count"] = len(content)
+                    node["end"] = p
+                    if seen < declared:
+                        node["attribute_mismatch"] = True
+                        attribute_mismatches += 1
+                    if not parents:
+                        self.root = node
+                        node = None
                         break
+                    node, declared, seen, nchild, started, child_seen, text_seen, content, attributes = \
+                        parents.pop()
+                    depth -= 1
                     continue
                 if index == 0xFD:
                     if kind != 0xFF:
                         raise TreeError("text tag is not FD FF", at)
-                    n = struct.unpack("<I", self.take(4, "text length"))[0]
-                    raw = self.take(n, "text")
-                    payload_at = self.p - n
-                    body = raw[:-1] if raw.endswith(b"\x00") else raw
-                    text, valid = _utf8(body)
-                    if not valid:
-                        self.invalid_utf8 += 1
-                    node = {
+                    if p + 4 > n:
+                        raise TreeError("text length truncated", p, truncated=True)
+                    length = _ST_I.unpack_from(data, p)[0]
+                    p += 4
+                    if p + length > n:
+                        raise TreeError("text truncated", p, truncated=True)
+                    raw = data[p:p + length]
+                    p += length
+                    terminated = raw.endswith(b"\x00")
+                    body = raw[:-1] if terminated else raw
+                    try:
+                        text = body.decode("utf-8")
+                        valid = True
+                    except UnicodeDecodeError:
+                        text = body.decode("utf-8", "replace")
+                        valid = False
+                        invalid_utf8 += 1
+                    if node is None:
+                        raise TreeError("text outside an element", at)
+                    child = {
                         "kind": "text",
                         "offset": at,
-                        "payload_offset": payload_at,
-                        "length": n,
-                        "nul_terminated": raw.endswith(b"\x00"),
+                        "payload_offset": p - length,
+                        "length": length,
+                        "nul_terminated": terminated,
                         "text": text,
                         "utf8_valid": valid,
+                        "depth": depth + 1,
                     }
-                    if not self.stack:
-                        raise TreeError("text outside an element", at)
-                    self._attach(self.stack[-1], node)
-                    self.counts["texts"] += 1
+                    if seen < declared:
+                        node["attribute_order_violation"] = True
+                        attribute_order_violations += 1
+                    started = True
+                    content.append(child)
+                    if child_seen:
+                        node["text_after_child"] = True
+                        text_after_child += 1
+                    if text_seen:
+                        node["multiple_text"] = True
+                    text_seen = True
+                    counts["texts"] += 1
                     continue
-                desc = self._descriptor(index, kind, at)
-                name = desc["name"]
+                # A record with a descriptor: a known index, or the next new one with its name inline.
+                type_name = TYPE_NAMES.get(kind) or f"0x{kind:02x}"
+                if index < len(descs):
+                    desc = descs[index]
+                    name = desc["name"]
+                    types = desc["types"]
+                    types[type_name] = types.get(type_name, 0) + 1
+                elif index == len(descs):
+                    if p + 2 > n:
+                        raise TreeError("descriptor name length truncated", p, truncated=True)
+                    length = _ST_H.unpack_from(data, p)[0]
+                    p += 2
+                    if p + length > n:
+                        raise TreeError("descriptor name truncated", p, truncated=True)
+                    raw = data[p:p + length]
+                    p += length
+                    try:
+                        name = raw.decode("utf-8")
+                        valid = True
+                    except UnicodeDecodeError:
+                        name = raw.decode("utf-8", "replace")
+                        valid = False
+                        invalid_utf8 += 1
+                    types = {type_name: 1}
+                    descs.append({
+                        "index": index,
+                        "name": name,
+                        "first_type": type_name,
+                        "offset": at,
+                        "name_offset": p - length,
+                        "uses": 0,
+                        "types": types,
+                        "utf8_valid": valid,
+                    })
+                    self.descriptor_names.add(name)
+                else:
+                    raise TreeError(f"descriptor index {index} of {len(descs)}", at)
                 if kind == 0x00:
-                    raw = self.take(6, "element header")
-                    payload_at = self.p - 6
-                    word0, word1, attrs = struct.unpack("<HHH", raw)
+                    if p + 6 > n:
+                        raise TreeError("element header truncated", p, truncated=True)
+                    word0, word1, attrs = _ST_HHH.unpack_from(data, p)
+                    header = p
+                    p += 6
                     if word0 or word1:
                         raise TreeError(f"element header word is not zero ({word0}, {word1})", at)
-                    node = {
+                    child_depth = depth + 1
+                    if child_depth > max_depth:
+                        max_depth = child_depth
+                    child = {
                         "kind": "element",
                         "name": name,
                         "descriptor": index,
                         "offset": at,
-                        "header_offset": payload_at,
+                        "header_offset": header,
                         "attrs_declared": attrs,
                         "attrs_actual": 0,
-                        "depth": len(self.stack) + 1,
+                        "depth": child_depth,
                         "children": 0,
                         "content_count": 0,
                         "attributes": [],
                         "content": [],
                         "end": None,
                     }
-                    self.counts["elements"] += 1
-                    self.max_depth = max(self.max_depth, len(self.stack) + 1)
-                    if self.stack:
-                        self._attach(self.stack[-1], node)
-                    else:
+                    counts["elements"] += 1
+                    if node is None:
                         if self.root is not None:
                             raise TreeError("second root element", at)
-                        self.root = node
-                    self.stack.append({
-                        "node": node,
-                        "attrs_declared": attrs,
-                        "attrs_seen": 0,
-                        "content_started": False,
-                        "child_seen": False,
-                        "text_seen": False,
-                        "depth": len(self.stack) + 1,
-                    })
+                        self.root = child
+                    else:
+                        if seen < declared:
+                            node["attribute_order_violation"] = True
+                            attribute_order_violations += 1
+                        started = child_seen = True
+                        content.append(child)
+                        nchild += 1
+                        if text_seen:
+                            node["text_before_child"] = True
+                            text_before_child += 1
+                        parents.append((node, declared, seen, nchild, started, child_seen, text_seen,
+                                        content, attributes))
+                    node = child
+                    depth = child_depth
+                    declared = attrs
+                    seen = nchild = 0
+                    started = child_seen = text_seen = False
+                    content = child["content"]
+                    attributes = child["attributes"]
                     continue
-                if kind not in VALUE_TYPES:
+                # A value record. Its bytes are read and counted before a missing parent element is reported.
+                if kind == 0x10:
+                    if p + scalar > n:
+                        raise TreeError("integer truncated", p, truncated=True)
+                    child = {"kind": "value", "name": name, "descriptor": index, "type": "int", "offset": at,
+                             "payload_offset": p, "size": scalar, "value": st_int.unpack_from(data, p)[0]}
+                    p += scalar
+                    counts["ints"] += 1
+                elif kind == 0x60:
+                    if p + 2 > n:
+                        raise TreeError("string length truncated", p, truncated=True)
+                    length = _ST_H.unpack_from(data, p)[0]
+                    p += 2
+                    if p + length > n:
+                        raise TreeError("string truncated", p, truncated=True)
+                    raw = data[p:p + length]
+                    p += length
+                    # The measured string form is length-prefixed, not NUL-terminated. Keep every byte even if
+                    # the last one is zero; only the text record (whose u32 length includes a terminator in
+                    # this corpus) is trimmed.
+                    try:
+                        value = raw.decode("utf-8")
+                        valid = True
+                    except UnicodeDecodeError:
+                        value = raw.decode("utf-8", "replace")
+                        valid = False
+                        invalid_utf8 += 1
+                    child = {"kind": "value", "name": name, "descriptor": index, "type": "string",
+                             "offset": at, "payload_offset": p - length, "size": length, "value": value,
+                             "byte_length": length, "nul_terminated": raw.endswith(b"\x00"),
+                             "utf8_valid": valid}
+                    counts["strings"] += 1
+                elif kind == 0x40:
+                    if p + scalar > n:
+                        raise TreeError("float truncated", p, truncated=True)
+                    value = st_float.unpack_from(data, p)[0]
+                    child = {"kind": "value", "name": name, "descriptor": index, "type": "float", "offset": at,
+                             "payload_offset": p, "size": scalar, "value": value}
+                    p += scalar
+                    if value - value != 0.0:    # NaN, or an infinity (inf - inf is NaN)
+                        child["float_special"] = _render(value)
+                        child["value"] = None
+                    counts["floats"] += 1
+                elif kind == 0x50:
+                    if p + vec_size > n:
+                        raise TreeError("vector truncated", p, truncated=True)
+                    value = list(st_vec.unpack_from(data, p))
+                    child = {"kind": "value", "name": name, "descriptor": index, "type": "vec3", "offset": at,
+                             "payload_offset": p, "size": vec_size, "value": value}
+                    p += vec_size
+                    x, y, z = value
+                    if (x - x) + (y - y) + (z - z) != 0.0:
+                        child["float_special"] = [_render(v) for v in value]
+                        child["value"] = [v if math.isfinite(v) else None for v in value]
+                    counts["vec3"] += 1
+                elif kind == 0x20 or kind == 0x30:
+                    child = {"kind": "value", "name": name, "descriptor": index, "type": "bool", "offset": at,
+                             "payload_offset": p, "size": 0, "value": kind == 0x20}
+                    counts["bools"] += 1
+                else:
                     raise TreeError(f"unknown record type {kind:#04x}", at)
-                node = self._value(kind, name, index, at)
-                if not self.stack:
+                if node is None:
                     raise TreeError("value outside an element", at)
-                self._attach(self.stack[-1], node)
-                self.counts["values"] += 1
+                child["depth"] = depth + 1
+                if seen < declared:
+                    if started:
+                        node["attribute_order_violation"] = True
+                        attribute_order_violations += 1
+                    attributes.append(child)
+                    seen += 1
+                else:
+                    started = True
+                    content.append(child)
+                    if child_seen:
+                        node["value_after_child"] = True
+                        value_after_child += 1
+                counts["values"] += 1
         except TreeError as exc:
             if not self.error:
                 self.status = "truncated" if exc.truncated else "bad"
                 self.error = str(exc)
                 self.error_offset = exc.offset
+        self.p = p
+        # Elements still open (a truncated or malformed stream) get the totals a close would have written.
+        open_frames = 0
+        if node is not None:
+            open_frames = len(parents) + 1
+            node["attrs_actual"] = seen
+            node["children"] = nchild
+            node["content_count"] = len(content)
+            for ancestor, _declared, ancestor_seen, ancestor_children, _s, _c, _t, ancestor_content, _a in parents:
+                ancestor["attrs_actual"] = ancestor_seen
+                ancestor["children"] = ancestor_children
+                ancestor["content_count"] = len(ancestor_content)
+        for desc in descs:
+            desc["uses"] = sum(desc["types"].values())
+        self.attribute_mismatches = attribute_mismatches
+        self.attribute_order_violations = attribute_order_violations
+        self.text_after_child = text_after_child
+        self.text_before_child = text_before_child
+        self.value_after_child = value_after_child
+        self.invalid_utf8 = invalid_utf8
+        self.max_depth = max_depth
         if self.status == "ok":
-            if self.stack:
+            if open_frames:
                 self.status = "truncated"
-                self.error = f"{len(self.stack)} unclosed element(s) at 0x{self.p:x}"
+                self.error = f"{open_frames} unclosed element(s) at 0x{self.p:x}"
                 self.error_offset = self.p
             elif self.root is None:
                 self.status = "bad"
@@ -312,53 +426,6 @@ class Parser:
             "invalid_utf8": self.invalid_utf8,
             "max_depth": self.max_depth,
             "tree": self.root,
-        }
-
-    def _value(self, kind, name, index, at):
-        payload_at = self.p
-        extra = {}
-        if kind == 0x10:
-            raw = self.take(self.scalar, "integer")
-            value = struct.unpack("<Q" if self.wide else "<I", raw)[0]
-            self.counts["ints"] += 1
-        elif kind == 0x20 or kind == 0x30:
-            value = kind == 0x20
-            self.counts["bools"] += 1
-        elif kind == 0x40:
-            raw = self.take(self.scalar, "float")
-            value = struct.unpack("<d" if self.wide else "<f", raw)[0]
-            self.counts["floats"] += 1
-        elif kind == 0x50:
-            raw = self.take(3 * self.scalar, "vector")
-            value = list(struct.unpack("<ddd" if self.wide else "<fff", raw))
-            if any(not math.isfinite(v) for v in value):
-                extra["float_special"] = [_render(v) for v in value]
-                value = [v if math.isfinite(v) else None for v in value]
-            self.counts["vec3"] += 1
-        else:  # 0x60
-            n = struct.unpack("<H", self.take(2, "string length"))[0]
-            raw = self.take(n, "string")
-            payload_at = self.p - n
-            # The measured string form is length-prefixed, not NUL-terminated. Keep every byte even if the last
-            # one is zero; only the text record (whose u32 length includes a terminator in this corpus) is trimmed.
-            value, valid = _utf8(raw)
-            if not valid:
-                self.invalid_utf8 += 1
-            extra = {"byte_length": n, "nul_terminated": raw.endswith(b"\x00"), "utf8_valid": valid}
-            self.counts["strings"] += 1
-        if isinstance(value, float) and not math.isfinite(value):
-            extra["float_special"] = _render(value)
-            value = None
-        return {
-            "kind": "value",
-            "name": name,
-            "descriptor": index,
-            "type": VALUE_TYPES[kind],
-            "offset": at,
-            "payload_offset": payload_at,
-            "size": self.p - payload_at,
-            "value": value,
-            **extra,
         }
 
 

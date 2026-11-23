@@ -506,6 +506,7 @@ python -I tools/rbf0_encode.py <work>\rbf0-tree.json <work>\rbf0-encoded
 # Unit tests: synthetic headers and trees only
 python -I tests/test_rbf0_index.py
 python -I tests/test_rbf0_tree.py
+python -I tests/test_rbf0_tree_parity.py
 python -I tests/test_rbf0_encode.py
 python -I tests/test_imhex_patterns.py
 ```
