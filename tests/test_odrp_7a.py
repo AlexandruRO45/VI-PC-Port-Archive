@@ -645,6 +645,10 @@ class ArchiveAndCliTest(unittest.TestCase):
             ("--limit", "0", "must be at least 1"),
             ("--limit", "-5", "must be at least 1"),
             ("--max-inflate", "0", "must be at least 1"),
+            ("--start", "abc", "invalid int value: 'abc'"),
+            ("--start", "1.5", "invalid int value: '1.5'"),
+            ("--limit", "abc", "invalid int value: 'abc'"),
+            ("--limit", "1.5", "invalid int value: '1.5'"),
         ):
             out = os.path.join(self.root, "bad_num.json")
             proc = subprocess.run(

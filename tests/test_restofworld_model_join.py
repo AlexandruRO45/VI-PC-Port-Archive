@@ -775,6 +775,19 @@ class ModelJoinTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertFalse(os.path.exists(out_ok))
 
+        # A non-integer numeric flag names the value; it is not the bound message.
+        for flag, value in (("--start", "abc"), ("--start", "1.5"), ("--limit", "abc"), ("--max-inflate", "1.5")):
+            proc = subprocess.run(
+                [sys.executable, "-I", TOOL, src_rpf, out_ok, flag, value],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 2, (flag, value, proc.stderr))
+            self.assertIn(f"invalid int value: {value!r}", proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+            self.assertFalse(os.path.exists(out_ok))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -290,7 +290,9 @@ class ArchiveTest(unittest.TestCase):
                                      ("--limit", "-100", "must be at least 1"),
                                      ("--max-inflate", "0", "must be at least 1"),
                                      ("--limit", "abc", "invalid int value: 'abc'"),
-                                     ("--max-inflate", "1.5", "invalid int value: '1.5'")):
+                                     ("--max-inflate", "1.5", "invalid int value: '1.5'"),
+                                     ("--start", "abc", "invalid int value: 'abc'"),
+                                     ("--start", "1.5", "invalid int value: '1.5'")):
             out = os.path.join(self.root, "bad.json")
             proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", flag, value],
                                   capture_output=True, text=True, encoding="utf-8", errors="replace")

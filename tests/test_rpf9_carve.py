@@ -106,7 +106,10 @@ class CarveEdgeTest(unittest.TestCase):
                                          ("--limit", "0", "must be at least 1"),
                                          ("--limit", "-1", "must be at least 1"),
                                          ("--limit", "abc", "invalid int value: 'abc'"),
-                                         ("--limit", "1.5", "invalid int value: '1.5'")):
+                                         ("--limit", "1.5", "invalid int value: '1.5'"),
+                                         ("--start", "abc", "invalid int value: 'abc'"),
+                                         ("--start", "1.5", "invalid int value: '1.5'"),
+                                         ("--start", "", "invalid int value: ''")):
                 out = os.path.join(tmp, "out")
                 p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only", flag, value],
                                    capture_output=True, text=True)
