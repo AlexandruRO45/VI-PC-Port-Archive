@@ -10,8 +10,12 @@ Reads tracked files only; no game files.
 import ast
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 THIRD_PARTY = {"numpy", "PIL"}
@@ -19,8 +23,8 @@ THIRD_PARTY = {"numpy", "PIL"}
 
 def tracked_files():
     try:
-        out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
-        return [p for p in out.splitlines() if p]
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
+        return [os.fsdecode(path) for path in out.split(b"\0") if path]
     except (OSError, subprocess.CalledProcessError):
         found = []
         for root, dirs, files in os.walk(ROOT):
@@ -51,6 +55,20 @@ def read(path):
 
 
 class DocsPythonDeps(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "requires git")
+    def test_index_paths_with_spaces_and_unicode(self):
+        tracked = ["docs/space name.md", "docs/café.md", "tools/café.py"]
+        with tempfile.TemporaryDirectory() as root, patch.dict(globals(), ROOT=root):
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "core.quotePath", "true"], cwd=root, check=True)
+            for name in tracked:
+                path = Path(root) / name
+                path.parent.mkdir(exist_ok=True)
+                path.touch()
+            (Path(root) / "untracked.md").touch()
+            subprocess.run(["git", "add", "--", *tracked], cwd=root, check=True)
+            self.assertCountEqual(tracked_files(), tracked)
+
     def test_listing_checker_sees_a_missing_and_a_stale_name(self):
         text = "- Python tools run with `python -I`; the exceptions are `a.py` and `gone.py`.\n- Next bullet `b.py`.\n"
         self.assertEqual(listed_tools(text), {"a.py", "gone.py"})

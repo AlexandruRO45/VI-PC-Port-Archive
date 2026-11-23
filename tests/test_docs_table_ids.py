@@ -11,8 +11,12 @@ tracked Markdown only; no game files.
 """
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOLD_ID = re.compile(r"^\*\*[^*]+\*\*$")  # the whole first cell is bold
@@ -46,8 +50,8 @@ def repeated_ids(text):
 
 def markdown_files():
     try:
-        out = subprocess.run(["git", "ls-files", "*.md"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
-        files = out.split()
+        out = subprocess.run(["git", "ls-files", "-z", "*.md"], cwd=ROOT, capture_output=True, check=True).stdout
+        files = [os.fsdecode(path) for path in out.split(b"\0") if path]
     except (OSError, subprocess.CalledProcessError):
         files = [os.path.relpath(os.path.join(r, f), ROOT).replace(os.sep, "/")
                  for r, d, fs in os.walk(ROOT) if ".git" not in r for f in fs if f.endswith(".md")]
@@ -55,6 +59,20 @@ def markdown_files():
 
 
 class RepeatedTableIds(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "requires git")
+    def test_index_paths_with_spaces_and_unicode(self):
+        tracked = ["docs/space name.md", "docs/café.md", "tools/café.py"]
+        with tempfile.TemporaryDirectory() as root, patch.dict(globals(), ROOT=root):
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "core.quotePath", "true"], cwd=root, check=True)
+            for name in tracked:
+                path = Path(root) / name
+                path.parent.mkdir(exist_ok=True)
+                path.touch()
+            (Path(root) / "untracked.md").touch()
+            subprocess.run(["git", "add", "--", *tracked], cwd=root, check=True)
+            self.assertCountEqual(markdown_files(), ["docs/space name.md", "docs/café.md"])
+
     def test_checker_flags_a_repeated_bold_id_only(self):
         text = "\n".join([
             "| # | Scope |", "|---|---|",
