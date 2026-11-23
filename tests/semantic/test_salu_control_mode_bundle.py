@@ -255,6 +255,17 @@ class TestSleepOracle(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSleepAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        cycles = model_sleep(2)
+        self.assertEqual(cycles, 128)
+
+    def test_translator_sleep_ast(self):
+        prog = ["s_sleep 2", "s_endpgm"]
+        spv = support.translate_lines("cs_sleep_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
