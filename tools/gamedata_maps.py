@@ -60,12 +60,16 @@ import argparse
 import json
 import math
 import os
+import stat
 import struct
 import sys
+import tempfile
 import unicodedata
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MAGIC = (b"MHIU", b"PAMH")
@@ -494,11 +498,35 @@ def check_report_path(out_path: str, carve_dir: str, rows: list[dict] | None = N
                 raise ValueError(f"--json would overwrite the input {candidate}")
 
 
-def _make_parent(path: str) -> None:
-    """Create the folder an output path lives in so a missing folder does not lose a finished scan."""
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+def _write_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a stream such as os.devnull."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None:
+        if not stat.S_ISREG(mode):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+            return
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", delete=False,
+                                         dir=os.path.dirname(destination), prefix=".gamedata_maps-", suffix=".tmp")
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def main() -> int:
@@ -549,9 +577,7 @@ def main() -> int:
         if census:
             out["pamh_census"] = census
         try:
-            _make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            _write_report(a.json, out)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 1

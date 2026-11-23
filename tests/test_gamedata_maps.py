@@ -7,6 +7,7 @@ u8 heights with a default fill. PAMH is HMAP v1.2: a row table, a max u8 array
 and a min u8 array. The archive tests build a carve-shaped directory and check
 the CLI, including a MHIU split across two 64 KiB streams.
 """
+import io
 import json
 import os
 import struct
@@ -275,6 +276,32 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertIn(f"cannot write {out}", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("wrote", result.stdout)
+
+    def test_failed_json_write_leaves_the_previous_report_intact(self):
+        self.finish()
+
+        def fail_after_prefix(data, stream, **kwargs):
+            stream.write('{"payloads":')
+            raise OSError("synthetic write failure")
+
+        for previous in (None, b'{"payloads":[]}'):
+            with self.subTest(existing=previous is not None):
+                out = os.path.join(self.root, f"maps-{previous is not None}.json")
+                if previous is not None:
+                    with open(out, "wb") as f:
+                        f.write(previous)
+                before = os.listdir(self.root)
+                with (mock.patch.object(sys, "argv", [TOOL, self.carve, "--json", out]),
+                      mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+                      mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+                      mock.patch.object(gamedata_maps.json, "dump", side_effect=fail_after_prefix)):
+                    self.assertEqual(gamedata_maps.main(), 1)
+                self.assertIn(f"cannot write {out}", stderr.getvalue())
+                self.assertNotIn("wrote", stdout.getvalue())
+                if previous is not None:
+                    with open(out, "rb") as f:
+                        self.assertEqual(f.read(), previous)
+                self.assertCountEqual(os.listdir(self.root), before)
 
     def test_creates_missing_parent_directories_for_json_with_lf_endings(self):
         self.add(pamh_payload(3, 2, [1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 5]))
