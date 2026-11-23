@@ -257,3 +257,51 @@ class TestValuLshlrevB16SimdDivergence(unittest.TestCase):
                 self.assertEqual(dest_vgpr[lane], (lane << 2) & MASK16)
             else:
                 self.assertEqual(dest_vgpr[lane], 0xDEAD)
+
+
+class TestValuLshlrevB16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        # v0 = v0 (shift) << v1 (val)
+        state = RegisterState()
+        state.vgpr[0] = 3
+        state.vgpr[1] = 0x0010
+        inst = ASTInstruction(
+            opcode=Opcode.V_LSHLREV_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, 0x0080)
+        self.assertEqual(state.vgpr[0], 0x0080)
+
+    def test_dst_aliases_src1(self):
+        # v1 = v0 (shift) << v1 (val)
+        state = RegisterState()
+        state.vgpr[0] = 4
+        state.vgpr[1] = 0x0005
+        inst = ASTInstruction(
+            opcode=Opcode.V_LSHLREV_B16,
+            dst=ASTOperand.vgpr(1),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, 0x0050)
+        self.assertEqual(state.vgpr[1], 0x0050)
+
+    def test_self_aliasing(self):
+        # v0 = v0 << (v0 & 0xF)
+        state = RegisterState()
+        state.vgpr[0] = 2  # 2 << 2 = 8
+        inst = ASTInstruction(
+            opcode=Opcode.V_LSHLREV_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, 8)
+        self.assertEqual(state.vgpr[0], 8)
