@@ -151,11 +151,13 @@ class SlugTest(unittest.TestCase):
 
     def test_fence_with_info_string_inside_a_block_is_not_a_closer(self):
         # A closing fence has no info string. Regex-pairing arbitrary ``` runs pairs
-        # the opening fence with the ```python line and hides the heading after it.
+        # the opening fence with the ```python line, then pairs a later fence with a
+        # trailing one and hides the real heading between them.
         with tempfile.TemporaryDirectory() as tmp:
             page = os.path.join(tmp, "page.md")
             with open(page, "w", encoding="utf-8", newline="\n") as f:
-                f.write("```sh\necho hi\n```python\nprint('x')\n```\n\n# Real heading\n")
+                f.write("```sh\necho hi\n```python\nprint('x')\n```\n\n# Real heading\n\n"
+                        "```\ncode\n```\n")
             self.assertEqual(anchors(page), {"real-heading"})
 
 
