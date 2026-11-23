@@ -157,5 +157,25 @@ class VAddF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 4, oracle_add_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
         self.assertEqual(wave.get_f64(0, 4), f64_to_u64(30.0))
 
+class VAddF64SimdIeeeTests(unittest.TestCase):
+    def test_add_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0xAAAAAAAA  # Odd lanes active
+        for i in range(32):
+            wave.set_f64(i, 4, 0xDEADBEEFCAFEBABE)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 4, oracle_add_f64(f64_to_u64(i), f64_to_u64(1.0)))
+        for i in range(32):
+            if (0xAAAAAAAA >> i) & 1:
+                self.assertEqual(wave.get_f64(i, 4), f64_to_u64(i + 1.0))
+            else:
+                self.assertEqual(wave.get_f64(i, 4), 0xDEADBEEFCAFEBABE)
+
+    def test_add_ieee_boundary_extremes(self):
+        # Infinity + number = Infinity
+        self.assertEqual(oracle_add_f64(F64_POS_INF, f64_to_u64(1.0)), F64_POS_INF)
+        # NaN propagation
+        self.assertTrue(is_nan_u64(oracle_add_f64(F64_QNAN, f64_to_u64(1.0))))
+
 if __name__ == "__main__":
     unittest.main()
