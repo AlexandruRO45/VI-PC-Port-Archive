@@ -467,6 +467,72 @@ class TestVAshrrevI16BoundaryExtremes(unittest.TestCase):
             with self.subTest(shift=sh):
                 self.assertEqual(ref_v_ashrrev_i16(sh, 0xFFFF), 0xFFFF)
 
+class TestVAshrrevI16NegativeAndTranslator(unittest.TestCase):
+    """Part 8: Negative controls, syntax rejection, mutation detection, and translator execution."""
 
-if __name__ == '__main__':
+    def test_syntax_rejection(self) -> None:
+        invalid_assemblies = [
+            "v_ashrrev_i16",
+            "v_ashrrev_i16 v0",
+            "v_ashrrev_i16 v0, v1",
+            "v_ashrrev_i16 v0, v1, v2, v3",
+            "v_ashrrev_i16 10, v1, v2",
+            "v_ashrrev_i16 v0, v1, v2 op_sel:[bad]",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises(ValueError):
+                    VAshrrevI16Instruction.parse(asm)
+
+    def test_mutation_detection_logical_vs_arithmetic(self) -> None:
+        # Mutant: performs logical right shift instead of arithmetic right shift
+        def mutant_lshr(sh: int, val: int) -> int:
+            return (u16(val) >> (sh & 0xF)) & MASK16
+
+        # Negative value 0xFFF0 (-16) >> 2:
+        # Arithmetic: 0xFFFC (-4)
+        # Logical: 0x3FFC
+        oracle_res = ref_v_ashrrev_i16(2, 0xFFF0)
+        mutant_res = mutant_lshr(2, 0xFFF0)
+        self.assertEqual(oracle_res, 0xFFFC)
+        self.assertEqual(mutant_res, 0x3FFC)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_translator_emits_op_shift_right_arithmetic(self) -> None:
+        """Verifies tools/rdna2spirv.py emits OpShiftRightArithmetic for v_ashrrev_i16."""
+        prog = [
+            "v_mov_b32 v1, 2",
+            "v_mov_b32 v2, 0xFFF0",
+            "v_ashrrev_i16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ashr_i16_check", prog)
+        self.assertIn("OpShiftRightArithmetic", spv)
+
+    def test_translator_backed_execution_via_spirv_mini_interp(self) -> None:
+        """Translates and runs v_ashrrev_i16 instructions through spirv_mini_interp."""
+        test_cases = [
+            # (shift, value, expected_v0)
+            (2, 0xFFF0, 0x0000FFFC),   # -16 >> 2 = -4
+            (1, 0x8000, 0x0000C000),   # -32768 >> 1 = -16384
+            (3, 80, 0x0000000A),       # 80 >> 3 = 10
+            (15, 0x8000, 0x0000FFFF),  # -32768 >> 15 = -1
+            (0, 0x1234, 0x00001234),   # identity
+        ]
+        for sh, val, expected in test_cases:
+            with self.subTest(shift=sh, val=hex(val)):
+                prog = [
+                    f"v_mov_b32 v1, {sh:#x}",
+                    f"v_mov_b32 v2, {val:#x}",
+                    "v_ashrrev_i16 v0, v1, v2",
+                    "exp mrt0 v0, v0, v0, v0 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_ashr_{sh}_{val}", prog)
+                mrt0 = si.run_fragment(spv)["%out_mrt0"][0]
+                self.assertEqual(mrt0, expected)
+
+
+if __name__ == "__main__":
     unittest.main()
