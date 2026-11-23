@@ -546,26 +546,29 @@ def _forward_switch(sel_type, literal):
 
 
 class ForwardSwitchSelectorTests(unittest.TestCase):
-    """SHADER-1089: a selector defined further down still sets the case literal width (it was one word)."""
+    """SHADER-1089: a selector defined after the OpSwitch is refused, as spirv-as refuses it, instead of
+    guessing 32-bit case literals (one word for a 64-bit selector)."""
 
-    def literal(self, sel_type, literal):
-        return _literal_words(spirv_asm.assemble(_forward_switch(sel_type, literal)), 251, 2)[:-1]
-
-    def test_64_bit_selector_defined_later_gives_two_words(self):
-        self.assertEqual(self.literal("u64", "1"), [1, 0])
-        self.assertEqual(self.literal("u64", "0x100000001"), [1, 1])
-        self.assertEqual(self.literal("i64", "-1"), [0xFFFFFFFF, 0xFFFFFFFF])
-
-    def test_same_words_as_when_the_selector_comes_first(self):
-        for sel_type, literal in (("u64", "0x100000001"), ("i64", "-2"), ("u32", "7"), ("i16", "-1")):
+    def test_selector_defined_later_is_refused(self):
+        for sel_type, literal in (("u64", "1"), ("u64", "0x100000001"), ("i64", "-1"), ("u32", "7")):
             with self.subTest(f"{sel_type} {literal}"):
-                self.assertEqual(self.literal(sel_type, literal),
-                                 _literal_words(spirv_asm.assemble(_switch(sel_type, literal)), 251, 2)[:-1])
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError,
+                                            r"line 22: OpSwitch selector %k has no known type"):
+                    spirv_asm.assemble(_forward_switch(sel_type, literal))
 
-    def test_64_bit_literal_beyond_u64_is_still_refused(self):
-        with self.assertRaises(spirv_asm.SpirvAsmError):
-            spirv_asm.assemble(_forward_switch("u64", "0x10000000000000000"))
+    def test_selector_defined_first_still_assembles(self):
+        self.assertEqual(_literal_words(spirv_asm.assemble(_switch("u64", "0x100000001")), 251, 2)[:-1], [1, 1])
+        self.assertEqual(_literal_words(spirv_asm.assemble(_switch("i16", "-1")), 251, 2)[:-1], [0xFFFFFFFF])
 
+    @unittest.skipUnless(SPIRV_AS, "spirv-as not installed")
+    def test_spirv_as_refuses_it_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "m.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(_forward_switch("u64", "1"))
+            r = subprocess.run([SPIRV_AS, src, "-o", os.path.join(d, "m.spv"), "--target-env", "vulkan1.2"],
+                               capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
 
 if __name__ == "__main__":
     unittest.main()
