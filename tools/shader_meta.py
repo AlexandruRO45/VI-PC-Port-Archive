@@ -413,6 +413,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             elif op.startswith("s_add") and sy and cx is not None:
                 new_scale[d] = sy
     elif op in ("s_addc_u32", "s_subb_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+        # Track pointer origins, but SCC is unknown even if both explicit operands are zero.
         d = a[0]["r"]
         tx = sym.get(a[1]["r"]) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else None
         ty = sym.get(a[2]["r"]) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else None
@@ -421,9 +422,6 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             new_sym[d] = ("user_off", ux)
         elif op == "s_addc_u32" and uy is not None:
             new_sym[d] = ("user_off", uy)
-        elif _const_of(sym, a[1]) == 0 and _const_of(sym, a[2]) == 0:
-            # High-dword carry-add on a zeroed upper word (descriptor table truncated below 4 GB).
-            new_sym[d] = ("const", 0)
     elif op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
                 "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_ashr_i32",
                 "s_bfm_b32", "s_bfe_u32", "s_min_u32", "s_max_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":

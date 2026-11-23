@@ -599,6 +599,17 @@ class OperandClassificationTests(unittest.TestCase):
                  "image_sample v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D", "s_endpgm"]
         return M.analyse_instructions([[shader_ir.parse_line(ln) for ln in lines]], [[]])["literal_samplers"]
 
+    def test_implicit_carry_does_not_make_a_zero_sampler_word(self):
+        # These two operations read SCC even though both explicit operands are zero.
+        for op in ("s_addc_u32", "s_subb_u32"):
+            with self.subTest(op=op):
+                self.assertEqual(self._literal_samplers_with([
+                    "s_cmp_eq_u32 s8, s8",
+                    f"{op} s13, 0, 0",
+                ]), [])
+
+        self.assertEqual(self._literal_samplers_with(["s_mov_b32 s13, 0"]), [[0x92, 0, 0, 0]])
+
     def test_inverted_scalar_logic_folds_into_literal_sampler(self):
         # s_not_b32, s_nand_b32, s_nor_b32 and s_xnor_b32 of known constants give a known constant, so a literal
         # S# with a dword built by one of them is reported in literal_samplers.
