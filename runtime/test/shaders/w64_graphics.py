@@ -73,6 +73,11 @@ def _a_discard(i):
     return (7 * y + x, 1, 2000 + y, x % 4 + 1)
 
 
+def _a_break(i):
+    x, y = _x(i), _y(i)
+    return (x % 4 + 1, 1000 + x, 2000 + 5 * (y % 8 + 1), x % 4)
+
+
 def _b_waterfall(i):
     x, y = _x(i), _y(i)
     a = x % 4 + 4 * (y % 4)
@@ -180,6 +185,7 @@ FIXTURES = {
     "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
     "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_a_discard": ("A", _a_discard, {}),
+    "ps_w64_a_break": ("A", _a_break, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),

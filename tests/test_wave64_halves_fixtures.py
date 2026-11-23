@@ -8,6 +8,8 @@ Tier A and B fixtures gave identical words (and the words their header derives),
 test pins the translator's detector to what the hardware showed. The permute fixtures (TEST-319: ps_w64_a_permlane,
 _a_swizzle, _a_bpermute) gave the words their header derives on an RTX 5070 (32 only), and every fixture's
 RTX 5070 run matched (tiers A, B) or differed from (tier C) a 64-lane RX 580 (GCN, RADV) reference.
+ps_w64_a_break (SHADER-821: a `break` loop's lane mask in an SGPR pair) gave the words its header derives on an
+RTX 3070 (32 only); it has no 64-lane run yet.
 Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build shaders; the
 pure-Python parts run without them.
 """
@@ -36,6 +38,7 @@ EXPECT = {
     "ps_w64_a_swizzle": ("A", [], []),
     "ps_w64_a_bpermute": ("A", [], []),
     "ps_w64_a_discard": ("A", [], []),
+    "ps_w64_a_break": ("A", [], []),
     "ps_w64_b_waterfall": ("B", [], ["waterfall"]),
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),
     "ps_w64_b_readlane_uniform": ("B", [], ["readlane-uniform"]),
@@ -166,6 +169,8 @@ def test_expected_words_of_the_gpu_fixtures():
     assert w64_graphics._a_discard(29 + 64 * 3) == (0xBF800000,) * 4                 # x < 30: discarded
     assert w64_graphics._a_discard(30 + 64 * 49) == (7 * 49 + 30, 1, 2049, 3)
     assert w64_graphics._a_discard(31 + 64 * 1) == (0xBF800000,) * 4                 # x % 4 == 3, y odd
+    assert w64_graphics._a_break(6 + 64 * 11) == (3, 1006, 2000 + 5 * 4, 2)          # 3 trips on x, 4 on y
+    assert w64_graphics._a_break(8 + 64 * 7) == (1, 1008, 2000 + 5 * 8, 0)           # leaves at once on x, 8 on y
     assert w64_graphics._vs_a_skip(1 + 64 * 3) == (7 * 3 + 1, 1, 2000 + 3, 2)        # no whole-quad word in r1
     assert w64_graphics._vs_a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
     assert w64_graphics._vs_b_readlane_uniform(70) == (6 + 123, 200, 6 + 123, 277)
