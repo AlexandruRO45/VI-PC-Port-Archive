@@ -78,9 +78,9 @@ def build_archive(cache, drop_tail=False, tail=True):
     return bytes(data)
 
 
-def run(*args):
+def run(*args, env=None):
     return subprocess.run(
-        [sys.executable, "-I", TOOL, *args], capture_output=True, text=True
+        [sys.executable, "-I", TOOL, *args], capture_output=True, text=True, env=env
     )
 
 
@@ -144,8 +144,15 @@ class PsocacheExtractTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
     def test_output_outside_the_temp_directory_is_refused(self):
-        outside = os.path.join(ROOT, "psocache_should_not_exist.bin")
-        p = run(self.archive, outside)
+        # The child gets a temporary directory of its own, so the path is outside it wherever the checkout is.
+        temp = os.path.join(self.tmp.name, "temp")
+        os.mkdir(temp)
+        outside = os.path.join(self.tmp.name, "psocache_should_not_exist.bin")
+        inside = os.path.join(temp, "cache.bin")
+        env = dict(os.environ, TMPDIR=temp, TEMP=temp, TMP=temp)
+        p = run(self.archive, inside, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = run(self.archive, outside, env=env)
         self.assertEqual(p.returncode, 2)
         self.assertIn("temporary directory", p.stderr)
         self.assertFalse(os.path.exists(outside))
