@@ -14,13 +14,17 @@ import collections
 import json
 import mmap
 import os
+import stat
 import struct
 import sys
+import tempfile
 import zlib
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_clips  # noqa: E402
@@ -173,9 +177,7 @@ def main():
             return 2
     rows = [{k: v for k, v in d.items() if k != "entries"} | {"entries": len(d.get("entries", ()))} for d in dicts]
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "rig_dictionaries": rows}, f, indent=1)
+        write_json_report(a.out, {"summary": summary, "rig_dictionaries": rows})
     except OSError as e:
         print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
         return 2
@@ -184,6 +186,42 @@ def main():
     if "rbf0_join" in summary:
         print(json.dumps(summary["rbf0_join"]))
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".anim_rigs-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
