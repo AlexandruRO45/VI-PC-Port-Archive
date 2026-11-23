@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -106,8 +107,48 @@ class Evaluate(unittest.TestCase):
         self.assertTrue(rows[1][4])
 
 
+class RamType(unittest.TestCase):
+    """#8179: the memory type is read from the modules and shown; the verdict stays on capacity."""
+
+    def test_smbios_codes(self):
+        self.assertEqual(pc.ram_type_from_smbios([34, 34]), "DDR5")
+        self.assertEqual(pc.ram_type_from_smbios([26]), "DDR4")
+        self.assertEqual(pc.ram_type_from_smbios([35]), "LPDDR5")
+        self.assertEqual(pc.ram_type_from_smbios([26, 34]), "DDR4/DDR5")
+        self.assertEqual(pc.ram_type_from_smbios([0, 2]), "")   # Unknown / Other
+        self.assertEqual(pc.ram_type_from_smbios([]), "")
+
+    def test_windows_query_output(self):
+        with patch.object(pc.sys, "platform", "win32"), \
+                patch.object(pc, "_run", return_value="34\r\n34") as run:
+            self.assertEqual(pc.detect_ram_type(), "DDR5")
+        self.assertIn("SMBIOSMemoryType", run.call_args.args[0][-1])
+        with patch.object(pc.sys, "platform", "win32"), patch.object(pc, "_run", return_value=""):
+            self.assertEqual(pc.detect_ram_type(), "")
+
+    def test_mac_query_output(self):
+        out = "Memory:\n\n      Memory: 24 GB\n      Type: LPDDR5\n      Manufacturer: Example\n"
+        with patch.object(pc.sys, "platform", "darwin"), patch.object(pc, "_run", return_value=out):
+            self.assertEqual(pc.detect_ram_type(), "LPDDR5")
+
+    def test_type_is_shown_not_judged(self):
+        ddr4 = pc.evaluate(XBOX, "Intel Core i7-12700K", "RTX 3070", 24, "DDR4")
+        ddr5 = pc.evaluate(XBOX, "Intel Core i7-12700K", "RTX 3070", 24, "DDR5")
+        self.assertEqual(ddr5[2][2][1], ddr4[2][2][1])           # same capacity, same verdict
+        self.assertEqual(ddr5[2][2][3], "24 GB DDR5")
+        self.assertIn("your PC: 24 GB DDR5", pc.result_as_text(XBOX, *ddr5))
+        self.assertEqual(pc.evaluate(XBOX, "", "", 24)[2][2][3], "24 GB")
+        self.assertEqual(pc.evaluate(XBOX, "", "", None, "DDR5")[2][2][3], "")
+
+    def test_checker_uses_type_only_with_detected_size(self):
+        info = {"cpu": "Intel Core i7-12700K", "gpu": "RTX 3070", "ram": 24, "ram_type": "DDR5"}
+        with patch.object(pc, "detect_all", return_value=info):
+            self.assertEqual(pc.SpecChecker(XBOX).check().checks[2].detected, "24 GB DDR5")
+            self.assertEqual(pc.SpecChecker(XBOX).check(ram=64).checks[2].detected, "64 GB")
+
+
 class Api(unittest.TestCase):
-    GOOD = ("AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 32)
+    GOOD =("AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 32)
     WEAK = ("Intel Core i3-10100F", "NVIDIA GeForce GTX 1650", 8)
 
     def setUp(self):

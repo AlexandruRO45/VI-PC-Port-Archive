@@ -361,8 +361,9 @@ def _join(items):
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def evaluate(profile_name: str, cpu: str, gpu: str, ram):
-    """Compare the hardware with a profile. Returns (headline, subtitle, rows)."""
+def evaluate(profile_name: str, cpu: str, gpu: str, ram, ram_type: str = ""):
+    """Compare the hardware with a profile. Returns (headline, subtitle, rows). ram_type ("DDR5") is
+    shown with the size; the RAM verdict compares capacity only."""
     p = PROFILES[profile_name]
     cs = [cpu_score(n) for n in p["cpu_ref"]]
     gs = [gpu_score(n) for n in p["gpu_ref"]]
@@ -373,7 +374,7 @@ def evaluate(profile_name: str, cpu: str, gpu: str, ram):
          cpu_s is not None and not cpu_exact),
         ("GPU", _judge(gpu_s, min(gs), max(gs), GPU_TOL), p["gpu_text"], gpu.strip(),
          gpu_s is not None and not gpu_exact),
-        ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], f"{ram} GB" if ram else "", False),
+        ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], ram_text(ram, ram_type), False),
     ]
     weak = [r[0] for r in rows if r[1] == BELOW]
     unknown = [r[3] or r[0] for r in rows if r[1] == UNKNOWN]
@@ -559,6 +560,48 @@ def detect_ram_gb():
     return max(4, min(128, round(gb)))
 
 
+# SMBIOS type 17 "Memory Type" codes (DSP0134), as Win32_PhysicalMemory.SMBIOSMemoryType reports them
+SMBIOS_MEMORY_TYPES = {
+    18: "DDR", 19: "DDR2", 24: "DDR3", 26: "DDR4", 27: "LPDDR", 28: "LPDDR2", 29: "LPDDR3",
+    30: "LPDDR4", 34: "DDR5", 35: "LPDDR5",
+}
+
+
+def ram_type_from_smbios(codes) -> str:
+    """"DDR5" from the SMBIOS memory type codes of the installed modules, "" when none is known.
+    Modules of different types (rare) are listed as "DDR4/DDR5"."""
+    names = []
+    for code in codes:
+        name = SMBIOS_MEMORY_TYPES.get(code)
+        if name and name not in names:
+            names.append(name)
+    return "/".join(names)
+
+
+def detect_ram_type() -> str:
+    """The installed memory type ("DDR4", "DDR5", ...), or "" when this OS doesn't say without root.
+    Only shown next to the size: the RAM verdict compares capacity alone."""
+    try:
+        if sys.platform == "win32":
+            out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        "(Get-CimInstance Win32_PhysicalMemory).SMBIOSMemoryType"])
+            return ram_type_from_smbios(int(v) for v in out.split() if v.isdigit())
+        if sys.platform == "darwin":
+            m = re.search(r"^\s*Type:\s*(\S*DDR\d*)\s*$",
+                          _run(["system_profiler", "SPMemoryDataType"]), re.M)
+            return m.group(1) if m else ""
+    except Exception:
+        pass
+    return ""  # Linux: dmidecode needs root, and /proc and /sys don't carry the type
+
+
+def ram_text(ram, ram_type="") -> str:
+    """The "your PC" text of the RAM row: "24 GB DDR5", "24 GB", or "" when the size is unknown."""
+    if not ram:
+        return ""
+    return f"{ram} GB {ram_type}" if ram_type else f"{ram} GB"
+
+
 def detect_all() -> dict:
     best = None
     for name, vram in detect_gpus():  # with several GPUs, use the strongest
@@ -571,7 +614,7 @@ def detect_all() -> dict:
         gpu = clean_name(best[1])
         if best[2]:
             gpu += f" ({best[2]} GB VRAM)"
-    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb()}
+    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb(), "ram_type": detect_ram_type()}
 
 
 # ----------------------------------------------------------------------------
@@ -634,12 +677,14 @@ class SpecChecker:
 
     def check(self, cpu=None, gpu=None, ram=None) -> Report:
         """Anything left as None is detected from this PC."""
+        ram_type = ""
         if cpu is None or gpu is None or ram is None:
             info = detect_all()
             cpu = info["cpu"] if cpu is None else cpu
             gpu = info["gpu"] if gpu is None else gpu
-            ram = info["ram"] if ram is None else ram
-        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram)
+            if ram is None:  # the type belongs to the detected modules, not to a size given by hand
+                ram, ram_type = info["ram"], info.get("ram_type", "")
+        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram, ram_type)
         return Report(self.profile, headline, summary, [Check(*r) for r in rows])
 
     def warn_if_weak(self, report=None) -> bool:
@@ -698,6 +743,7 @@ class App:
         root.configure(bg=BG)
         self.q = queue.Queue()
         self.last_text = ""
+        self.detected_ram = (None, "")  # (GB, type) from the last detection
         self.wrapped = []        # (label, margin) pairs re-wrapped on resize
         self._style()
 
@@ -853,8 +899,10 @@ class App:
 
     def refresh(self, *_):
         name = self.profile_var.get()
-        headline, sub, rows = evaluate(name, self.cpu_var.get(), self.gpu_var.get(),
-                                       self.get_ram())
+        ram = self.get_ram()
+        # The detected type only describes the detected size, not one picked from the list
+        ram_type = self.detected_ram[1] if ram is not None and ram == self.detected_ram[0] else ""
+        headline, sub, rows = evaluate(name, self.cpu_var.get(), self.gpu_var.get(), ram, ram_type)
         self.headline.config(text=headline)
         self.sub.config(text=sub)
         for (res, ref, mine), (_lbl, st, ref_text, mine_text, est) in zip(self.rows, rows):
@@ -879,7 +927,7 @@ class App:
             try:
                 info = detect_all()
             except Exception:
-                info = {"cpu": "", "gpu": "", "ram": None}
+                info = {"cpu": "", "gpu": "", "ram": None, "ram_type": ""}
             self.q.put(info)
 
         threading.Thread(target=work, daemon=True).start()
@@ -892,6 +940,7 @@ class App:
             self.root.after(150, self._poll)
             return
         self.btn.config(state="normal")
+        self.detected_ram = (info["ram"], info.get("ram_type", ""))
         missing = []
         for key, var, label in (("cpu", self.cpu_var, "CPU"), ("gpu", self.gpu_var, "GPU"),
                                 ("ram", self.ram_var, "RAM")):
@@ -944,8 +993,9 @@ def run_cli(args):
     cpu = args.cpu or info.get("cpu", "")
     gpu = args.gpu or info.get("gpu", "")
     ram = args.ram or info.get("ram")
-    print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram or '?'} GB\n")
-    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram)))
+    ram_type = "" if args.ram else info.get("ram_type", "")
+    print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram_text(ram, ram_type) or '? GB'}\n")
+    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram, ram_type)))
 
 
 def main():
