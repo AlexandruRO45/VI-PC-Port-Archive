@@ -372,5 +372,72 @@ class TestSAndn2B32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res, 0)
         self.assertEqual(state.scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Divergence and Wave32 Execution Masking
+# -----------------------------------------------------------------------------
+
+class TestSAndn2B32Divergence(unittest.TestCase):
+    """Unit tests for SIMD divergence, branch management, and Wave32 EXEC masks."""
+
+    def test_wave32_branch_divergence_exec_pruning(self):
+        state = ScalarState()
+        state.exec_lo = ALL32
+        state.vcc_lo = 0x5555_5555
+
+        then_mask = state.vcc_lo & state.exec_lo
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src0=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src1=RegOperand(RegisterKind.SPECIAL, name="vcc_lo"),
+        )
+        ScalarInterpreter.step(instr, state)
+        else_mask = state.exec_lo
+
+        self.assertEqual(then_mask & else_mask, 0)
+        self.assertEqual(then_mask | else_mask, ALL32)
+        self.assertEqual(else_mask, 0xAAAA_AAAA)
+        self.assertEqual(state.scc, 1)
+
+    def test_wave32_all_lanes_disabled(self):
+        state = ScalarState()
+        state.exec_lo = ALL32
+        state.vcc_lo = ALL32
+
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src0=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src1=RegOperand(RegisterKind.SPECIAL, name="vcc_lo"),
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.exec_lo, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_wave32_single_lane_toggles(self):
+        for lane in range(32):
+            with self.subTest(lane=lane):
+                state = ScalarState()
+                state.exec_lo = ALL32
+                instr = SAndn2B32Instruction(
+                    dst=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+                    src0=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+                    src1=ImmOperand(value=1 << lane),
+                )
+                ScalarInterpreter.step(instr, state)
+                expected = ALL32 & ~(1 << lane)
+                self.assertEqual(state.exec_lo, expected)
+                self.assertEqual(state.scc, 1)
+
+    def test_wave32_inactive_lane_preservation(self):
+        state = ScalarState()
+        state.exec_lo = 0x0000_FFFF
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src0=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src1=ImmOperand(value=0x0000_00FF),
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.exec_lo, 0x0000_FF00)
+        self.assertEqual(state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
