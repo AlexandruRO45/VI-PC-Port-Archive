@@ -1656,8 +1656,9 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_M15_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m15_shaders)
       get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
       file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
-      set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm
-                            ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm)
+      set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json
+                            ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm ${LEONIDA_M15_DIR}/spirv/vs_m15.spv
+                            ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm ${LEONIDA_M15_DIR}/spirv/ps_m15.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_M15_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M15_DIR}
@@ -1743,9 +1744,12 @@ if(TARGET Vulkan::Headers)
       # barriers and a second pass that samples the first one's target, three frames in flight with a fence each.
       # Pass 1's two-output PS and its single-output occlusion probe go through the same translator build.
       set(LEONIDA_M3_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m3_shaders)
-      set(LEONIDA_M3_FILES ${LEONIDA_M3_DIR}/spirv/index.json ${LEONIDA_M3_DIR}/fssm/vs_m3.fssm
-                           ${LEONIDA_M3_DIR}/fssm/ps_m3.fssm ${LEONIDA_M3_DIR}/fssm/vs_m2.fssm
-                           ${LEONIDA_M3_DIR}/fssm/ps_m3_post.fssm ${LEONIDA_M3_DIR}/fssm/ps_m3_query.fssm)
+      set(LEONIDA_M3_FILES ${LEONIDA_M3_DIR}/spirv/index.json
+                           ${LEONIDA_M3_DIR}/fssm/vs_m3.fssm ${LEONIDA_M3_DIR}/spirv/vs_m3.spv
+                           ${LEONIDA_M3_DIR}/fssm/ps_m3.fssm ${LEONIDA_M3_DIR}/spirv/ps_m3.spv
+                           ${LEONIDA_M3_DIR}/fssm/vs_m2.fssm ${LEONIDA_M3_DIR}/spirv/vs_m2.spv
+                           ${LEONIDA_M3_DIR}/fssm/ps_m3_post.fssm ${LEONIDA_M3_DIR}/spirv/ps_m3_post.spv
+                           ${LEONIDA_M3_DIR}/fssm/ps_m3_query.fssm ${LEONIDA_M3_DIR}/spirv/ps_m3_query.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_M3_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M3_DIR}
@@ -1777,8 +1781,9 @@ if(TARGET Vulkan::Headers)
       # their synthetic FSSM programs (the compute header and the words their "fssm-data" comments give), which the
       # test wraps in shader containers.
       set(LEONIDA_M4_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m4_shaders)
-      set(LEONIDA_M4_FILES ${LEONIDA_M4_DIR}/spirv/index.json ${LEONIDA_M4_DIR}/fssm/cs_m4_fill.fssm
-                           ${LEONIDA_M4_DIR}/fssm/cs_m4_indirect.fssm)
+      set(LEONIDA_M4_FILES ${LEONIDA_M4_DIR}/spirv/index.json
+                           ${LEONIDA_M4_DIR}/fssm/cs_m4_fill.fssm ${LEONIDA_M4_DIR}/spirv/cs_m4_fill.spv
+                           ${LEONIDA_M4_DIR}/fssm/cs_m4_indirect.fssm ${LEONIDA_M4_DIR}/spirv/cs_m4_indirect.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_M4_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M4_DIR}
@@ -1805,8 +1810,8 @@ if(TARGET Vulkan::Headers)
       # the test also compares typed-buffer and counter clears with the host runtime on the layer's adapter.
       set(LEONIDA_BUFFER_UAV_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/buffer_uav_shaders)
       set(LEONIDA_BUFFER_UAV_FILES ${LEONIDA_BUFFER_UAV_DIR}/spirv/index.json
-                                   ${LEONIDA_BUFFER_UAV_DIR}/fssm/cs_buf_typed.fssm
-                                   ${LEONIDA_BUFFER_UAV_DIR}/fssm/cs_buf_counter.fssm)
+                                   ${LEONIDA_BUFFER_UAV_DIR}/fssm/cs_buf_typed.fssm ${LEONIDA_BUFFER_UAV_DIR}/spirv/cs_buf_typed.spv
+                                   ${LEONIDA_BUFFER_UAV_DIR}/fssm/cs_buf_counter.fssm ${LEONIDA_BUFFER_UAV_DIR}/spirv/cs_buf_counter.spv)
       add_custom_command(
         OUTPUT ${LEONIDA_BUFFER_UAV_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_BUFFER_UAV_DIR}
