@@ -163,5 +163,28 @@ class TestFrexpExpF64DeterministicExecution(unittest.TestCase):
                 self.assertEqual(got, p + 1)
 
 
+class TestFrexpExpF64MultiLaneDivergence(unittest.TestCase):
+    def test_multiple_divergent_channels(self):
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0x3ff00000",  # 1.0 -> exp 1
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0x40100000",  # 4.0 -> exp 3
+            "v_mov_b32 v4, 0",
+            "v_mov_b32 v5, 0x3fd00000",  # 0.25 -> exp -1
+            "v_mov_b32 v6, 0",
+            "v_mov_b32 v7, 0x40590000",  # 100.0 -> exp 7
+            "v_frexp_exp_i32_f64 v8, v[0:1]",
+            "v_frexp_exp_i32_f64 v9, v[2:3]",
+            "v_frexp_exp_i32_f64 v10, v[4:5]",
+            "v_frexp_exp_i32_f64 v11, v[6:7]",
+            "exp mrt0 v8, v9, v10, v11 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_multi", lines)
+        words = mrt0_words(spv)
+        self.assertEqual([s32(w) for w in words], [1, 3, -1, 7])
+
+
 if __name__ == "__main__":
     unittest.main()
