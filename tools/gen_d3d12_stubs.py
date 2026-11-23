@@ -18,6 +18,7 @@ import errno
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 
@@ -140,9 +141,17 @@ def coverage(interfaces, leaves, sources):
 
 
 def write_if_changed(path, text):
-    dest = os.path.abspath(path)
-    if os.path.isdir(dest) or path.endswith((os.sep, "/")) or (os.altsep and path.endswith(os.altsep)):
+    if os.path.isdir(path) or path.endswith((os.sep, "/")) or (os.altsep and path.endswith(os.altsep)):
         raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    dest = os.path.realpath(path)
     encoded = text.encode("utf-8")
     try:
         with open(dest, "rb") as f:

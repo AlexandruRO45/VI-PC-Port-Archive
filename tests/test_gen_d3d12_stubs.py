@@ -630,6 +630,30 @@ class WriteIfChangedStagingTests(unittest.TestCase):
             gen.write_if_changed(folder, "// nope\n")
         self.assertEqual(sorted(os.listdir(self.dir)), before)
 
+    def test_devnull_destination_writes_directly_without_staging(self):
+        source = os.path.join(self.dir, "impl.cpp")
+        header = os.path.join(self.dir, "d3d12.h")
+        with open(source, "w", encoding="utf-8", newline="\n") as f:
+            f.write("HRESULT STDMETHODCALLTYPE DoThing(UINT a);\n")
+        with open(header, "w", encoding="utf-8", newline="\n") as f:
+            f.write(GOOD_HEADER)
+        with mock.patch.object(gen.tempfile, "mkstemp", side_effect=AssertionError("must not stage non-regular dest")), \
+                mock.patch("sys.argv", ["gen_d3d12_stubs.py", "--header", header, "--source", source,
+                                        "--report", os.devnull, "IBase"]):
+            self.assertEqual(gen.main(), 0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlinks")
+    def test_symlinked_destination_keeps_link_and_updates_target(self):
+        target = os.path.join(self.dir, "real.h")
+        link = os.path.join(self.dir, "link.h")
+        with open(target, "wb") as f:
+            f.write(b"// old\n")
+        os.symlink(target, link)
+        gen.write_if_changed(link, "// new\n")
+        self.assertTrue(os.path.islink(link))
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), b"// new\n")
+
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_posix_mode_bits_preserved_for_new_and_replaced_files(self):
         import file_mode
