@@ -499,11 +499,18 @@ class MainTest(unittest.TestCase):
             ("bad_fail", "FAIL_REGULAR_EXPRESSION", ["unmatched", None]),
             ("bad_skip", "SKIP_REGULAR_EXPRESSION", False),
         )
-        entries = [ctest_entry(name, self.command("ok.py"), {field: value}) for name, field, value in cases]
-        entries.append(ctest_entry("ok", self.command("ok.py"), {"PASS_REGULAR_EXPRESSION": []}))
-
-        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
-            code, out, err = self.run_main(entries, "--require", "bad_pass", "--require", "ok")
+        launches = self.artifact / "launches.txt"
+        script = self.artifact / "record.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            "with Path(__file__).with_name('launches.txt').open('a') as f:\n"
+            "    f.write('launched\\n')\n",
+            encoding="utf-8",
+        )
+        command = self.command(script.name)
+        entries = [ctest_entry(name, command, {field: value}) for name, field, value in cases]
+        entries.append(ctest_entry("ok", command, {"PASS_REGULAR_EXPRESSION": []}))
+        code, out, err = self.run_main(entries, "--require", "bad_pass", "--require", "ok")
 
         self.assertEqual(code, 1)
         self.assertEqual(err, "")
@@ -511,7 +518,7 @@ class MainTest(unittest.TestCase):
             self.assertIn(f"[FAIL] {name}\n    invalid CTest {field}", out)
         self.assertIn("[PASS] ok", out)
         self.assertIn("1 passed, 3 failed, 0 skipped", out)
-        launch.assert_called_once()
+        self.assertEqual(launches.read_text(encoding="utf-8").splitlines(), ["launched"])
 
     def test_an_unbuilt_test_without_a_command_is_valid_inventory(self):
         code, out, err = self.run_main([{"name": "unbuilt"}], "--require", "unbuilt")
