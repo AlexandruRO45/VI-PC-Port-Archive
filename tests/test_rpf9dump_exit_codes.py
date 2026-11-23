@@ -99,6 +99,90 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
                     self.assertIn(str(out / src.stem), errors[0])
                     self.assertEqual(blocker.read_bytes(), b"keep")
 
+    def assert_blocked_directory(self, result, blocker):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        errors = result.stderr.splitlines()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith(f"cannot create output directory '{blocker}':"), errors)
+        self.assertEqual(blocker.read_bytes(), b"keep")
+
+    def test_blocked_mode_subdirectory_reports_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            audio = root / "audio.rpf"
+            textures = root / "textures.rpf"
+            awc_rpf(audio)
+            texture_dictionary_rpf(textures)
+            for mode, src, child in (("audio", audio, "awc"), ("xma", audio, "xma"),
+                                     ("models", textures, "models"), ("textures", textures, "textures")):
+                with self.subTest(mode=mode):
+                    out = root / f"out-{mode}"
+                    blocker = out / src.stem / child
+                    blocker.parent.mkdir(parents=True)
+                    blocker.write_bytes(b"keep")
+                    result = run(mode, src, out)
+                    self.assert_blocked_directory(result, blocker)
+                    if mode == "audio":
+                        self.assertFalse((blocker.parent / "audio_manifest.json").exists())
+                    else:
+                        self.assertEqual(result.stdout, "")
+
+    def test_blocked_audio_member_parent_reports_an_error_and_rerun_completes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            src = root / "audio.rpf"
+            awc_rpf(src)
+            out = root / "out"
+            awc = out / src.stem / "awc"
+            blocker = awc / "recovered"
+            manifest = awc.parent / "audio_manifest.json"
+            awc.mkdir(parents=True)
+            blocker.write_bytes(b"keep")
+            failed = run("audio", src, out)
+            self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+            errors = failed.stderr.splitlines()
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"cannot extract audio into '{awc}':"), errors)
+            self.assertIn(str(blocker), errors[0])
+            self.assertEqual(blocker.read_bytes(), b"keep")
+            self.assertFalse(manifest.exists())
+            blocker.unlink()
+            retry = run("audio", src, out)
+            self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+            report = json.loads(manifest.read_bytes())
+            self.assertEqual(report["Count"], 1)
+            self.assertTrue((awc / report["Banks"][0]["Path"]).read_bytes().startswith(b"ADAT"))
+
+    def test_blocked_item_subdirectory_reports_an_error_and_rerun_completes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            audio = root / "audio.rpf"
+            textures = root / "textures.rpf"
+            awc_rpf(audio)
+            texture_dictionary_rpf(textures)
+            for mode, src, item, name, magic in (
+                ("xma", audio, "audio_0001_at_0000000000001000", "00001234.xma.wav", b"RIFF"),
+                ("textures", textures, "dictionary_at_0000000000001010", "000_probe.dds", b"DDS "),
+            ):
+                with self.subTest(mode=mode):
+                    out = root / f"out-{mode}"
+                    blocker = out / src.stem / mode / item
+                    blocker.parent.mkdir(parents=True)
+                    blocker.write_bytes(b"keep")
+                    manifest = blocker.parent / "manifest.json"
+                    if mode == "textures":
+                        manifest.write_text("{}", encoding="utf-8")
+                    failed = run(mode, src, out)
+                    self.assert_blocked_directory(failed, blocker)
+                    self.assertFalse(manifest.exists())
+                    self.assertFalse((blocker.parent / "manifest.json.partial").exists())
+                    blocker.unlink()
+                    retry = run(mode, src, out)
+                    self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+                    self.assertEqual((blocker / name).read_bytes()[:4], magic)
+                    if mode == "textures":
+                        self.assertEqual(json.loads(manifest.read_bytes())["Count"], 1)
+
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

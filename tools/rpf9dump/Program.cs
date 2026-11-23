@@ -65,12 +65,10 @@ var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
 string outDir = Path.Combine(outRoot, baseName);
-try { Directory.CreateDirectory(outDir); }
-catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-{
-    Console.Error.WriteLine($"cannot create output directory '{outDir}': {e.Message}");
-    return 1;
-}
+string sub = Path.Combine(outDir, mode == "audio" ? "awc" : mode);
+if (CreateOutputDirectory(outDir) is { } rootError) return ReportOutputError(rootError);
+if (mode is ("xma" or "models" or "textures") && CreateOutputDirectory(sub) is { } subError)
+    return ReportOutputError(subError);
 int ok = 0, fail = 0, skip = 0, writeFail = 0;
 // Every mode below works on all cores by default. Core's readers open their own read handle per call, entry and
 // file names come from offsets and indexes, and results are put back in source order, so outputs match a
@@ -131,11 +129,19 @@ else if (mode == "audio")
     }
     var doc = ArchiveReader.Open(src);
     var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
-    string sub = Path.Combine(outDir, "awc");
     var todo = banks.Where(e => !File.Exists(ArchiveReader.SafeDestination(sub, e.Path))).ToList();
+    if (todo.Count != 0 && File.Exists(sub))
+        return ReportOutputError($"cannot create output directory '{sub}': a file already exists at that path");
     Console.WriteLine($"  {banks.Count:N0} banks, {todo.Count:N0} to write");
-    for (int i = 0; i < todo.Count; i += 500)
-        doc.ExtractAsync(todo.Skip(i).Take(500), sub).GetAwaiter().GetResult();
+    try
+    {
+        for (int i = 0; i < todo.Count; i += 500)
+            doc.ExtractAsync(todo.Skip(i).Take(500), sub).GetAwaiter().GetResult();
+    }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+    {
+        return ReportOutputError($"cannot extract audio into '{sub}': {e.Message}");
+    }
     ok = banks.Count;
     var rows = banks.AsParallel().AsOrdered().WithDegreeOfParallelism(par.MaxDegreeOfParallelism).Select(e => { var info = AwcInfo.Inspect(src, e.Offset, e.Size);
         return new { e.Path, e.Offset, e.Size, Streams = info?.Streams.Select(s => new { s.Index, Id = s.Id.ToString("X8"), s.Codec, s.Channels, s.SampleRate, s.DurationSeconds, s.IsStreamed }) }; }).ToList();
@@ -146,15 +152,18 @@ else if (mode == "xma")
     // XMA2 streams (AWC codec 5) as RIFF XMA2 .wav files that ffmpeg decodes (AwcRecovery.WriteXmaWave).
     var doc = ArchiveReader.Open(src);
     var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
-    string sub = Path.Combine(outDir, "xma"); Directory.CreateDirectory(sub);
     Parallel.ForEach(banks, par, e =>
     {
         var info = AwcInfo.Inspect(src, e.Offset, e.Size);
-        if (info == null) return;
+        if (info == null || !info.Streams.Any(st => st.Codec == 5)) return;
+        string dir = Path.Combine(sub, Util.Safe(Path.GetFileNameWithoutExtension(e.Name)));
+        if (CreateOutputDirectory(dir) is { } error)
+        {
+            if (Interlocked.Increment(ref fail) <= 5) Console.Error.WriteLine(error);
+            return;
+        }
         foreach (var st in info.Streams.Where(x => x.Codec == 5))
         {
-            string dir = Path.Combine(sub, Util.Safe(Path.GetFileNameWithoutExtension(e.Name)));
-            Directory.CreateDirectory(dir);
             string path = Path.Combine(dir, $"{st.Id:X8}.xma.wav");
             if (File.Exists(path)) { Interlocked.Increment(ref ok); continue; }
             try { Util.WriteAtomic(path, tmp => AwcRecovery.WriteXmaWave(src, e.Offset, e.Size, st.Index, tmp)); Interlocked.Increment(ref ok); }
@@ -239,7 +248,6 @@ else if (mode is "models" or "textures")
         });
         return got.SelectMany(g => g).OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
     }
-    string sub = Path.Combine(outDir, mode); Directory.CreateDirectory(sub);
     // The manifest is streamed row by row: holding 150k rows (each capturing its decoded model through lazy
     // projections) ran out of memory on levels.rpf. Written to a .partial file and renamed when complete.
     string manifestPath = Path.Combine(sub, "manifest.json"), partial = manifestPath + ".partial";
@@ -289,6 +297,7 @@ else if (mode is "models" or "textures")
                     Console.Error.WriteLine($"  model decode failed at 0x{list[start + i].Offset:X}: {reason.Code} ({reason.Detail})");
             }
             if (r.Error != null && fail <= 5) Console.WriteLine(r.Error);
+            if (r.DirectoryError != null && fail <= 5) Console.Error.WriteLine(r.DirectoryError);
             if (r.Row != null) Row(r.Row);
         }
         Console.WriteLine($"  exported {start + n:N0}/{list.Count:N0}");
@@ -320,9 +329,9 @@ else if (mode is "models" or "textures")
                     // A directory or DDS write failure leaves the embedded texture missing from disk: retryable,
                     // so it fails the run like the obj write above. Embedded decode failures count like the
                     // textures branch counts dictionary decode failures: reported, non-fatal for the run.
-                    string td;
-                    try { td = Path.Combine(sub, stem + "_tex"); Directory.CreateDirectory(td); }
-                    catch (Exception wex) { return new Result(null, 0, 1, 0, null, $"  fail {e.Name}: {wex.GetType().Name} {wex.Message}", 1); }
+                    string td = Path.Combine(sub, stem + "_tex");
+                    if (CreateOutputDirectory(td) is { } error)
+                        return new Result(null, 0, 1, 0, null, null, 1, DirectoryError: error);
                     foreach (var t in m.EmbeddedTextures)
                     {
                         string p = Path.Combine(td, $"{t.Index:D3}_{Util.Safe(t.Name)}.dds");
@@ -352,9 +361,9 @@ else if (mode is "models" or "textures")
             {
                 var dict = RageTextureDecoder.Inspect(sys, gfx);
                 if (dict == null) return new Result(null, 0, 1, 0, null, null, 0);
-                string td;
-                try { td = Path.Combine(sub, stem); Directory.CreateDirectory(td); }
-                catch (Exception wex) { return new Result(null, 0, 1, 0, null, $"  fail {e.Name}: {wex.GetType().Name} {wex.Message}", 1); }
+                string td = Path.Combine(sub, stem);
+                if (CreateOutputDirectory(td) is { } error)
+                    return new Result(null, 0, 1, 0, null, null, 1, DirectoryError: error);
                 int wfail = 0;
                 foreach (var t in dict.Textures)
                 {
@@ -405,6 +414,21 @@ else if (mode is "models" or "textures")
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
 return (mode == "ttpf" && fail != 0) || writeFail != 0 ? 1 : 0;
 
+static string? CreateOutputDirectory(string path)
+{
+    try { Directory.CreateDirectory(path); return null; }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+    {
+        return $"cannot create output directory '{path}': {e.Message}";
+    }
+}
+
+static int ReportOutputError(string error)
+{
+    Console.Error.WriteLine(error);
+    return 1;
+}
+
 // A stale marker may be read-only from an earlier interrupted run; clear the attribute so the withdraw works.
 static void WithdrawMarker(string path)
 {
@@ -425,4 +449,4 @@ static void Usage()
 
 // One exported entry: its manifest row (null when nothing was written), counts, a failure to report in order,
 // and how many of its failures were output-write failures (the ones a retry can fix; decode failures are not).
-readonly record struct Result(object? Row, int Ok, int Fail, int Embedded, ModelDecodeFailure? DecodeFailure, string? Error, int WriteFail);
+readonly record struct Result(object? Row, int Ok, int Fail, int Embedded, ModelDecodeFailure? DecodeFailure, string? Error, int WriteFail, string? DirectoryError = null);
