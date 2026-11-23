@@ -749,6 +749,18 @@ class ArchiveAndCliTest(unittest.TestCase):
                 if not m.closed:
                     m.close()
 
+    def test_carve_stored_map_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "index.json"), "w", encoding="utf-8-sig", newline="\n") as fh:
+                json.dump({"files": [{"off": 4096, "stored": 512}]}, fh)
+            self.assertEqual(odrp_7a._carve_stored_map(d), {4096: 512})
+
+    def test_carve_stored_map_malformed_json_with_utf8_bom_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "index.json"), "w", encoding="utf-8-sig", newline="\n") as fh:
+                fh.write("{not valid json")
+            self.assertEqual(odrp_7a._carve_stored_map(d), {})
+
 
 if __name__ == "__main__":
     unittest.main()

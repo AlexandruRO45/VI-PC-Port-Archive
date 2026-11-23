@@ -969,7 +969,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
 def _carve_stored_map(folder):
     manifest = os.path.join(folder, "index.json")
     try:
-        with open(manifest, encoding="utf-8") as fh:
+        with open(manifest, encoding="utf-8-sig") as fh:
             files = json.load(fh).get("files", [])
         return {int(item["off"]): int(item["stored"]) for item in files}
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
