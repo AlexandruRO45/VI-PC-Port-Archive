@@ -172,6 +172,8 @@ def translate_tests(work, names):
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
+    if os.environ.get("LEONIDA_MINLOD_FALLBACK") == "1":   # image_sample_d_cl without shaderResourceMinLod (Intel)
+        cmd.append("--min-lod-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).

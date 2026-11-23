@@ -813,6 +813,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
+        if os.environ.get("LEONIDA_MINLOD_FALLBACK") == "1":   # image_sample_d_cl clamp in the gradients, no shaderResourceMinLod
+            cmd.append("--min-lod-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1

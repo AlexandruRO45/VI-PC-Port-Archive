@@ -32,6 +32,9 @@ docs/design.md): the fragmentShaderBarycentric feature, and a driver other than 
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
+shader_resource_min_lod is the core shaderResourceMinLod feature (the MinLod image operand of image_sample_d_cl).
+Where it is false (Intel Xe-LP), the shaders are translated with --min-lod-fallback.
+
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
@@ -81,6 +84,7 @@ FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool3
 F12_SIZE = 208              # sizeof(VkPhysicalDeviceVulkan12Features): 16 + 47 VkBool32, padded to 8
 F13_SIZE = 80               # sizeof(VkPhysicalDeviceVulkan13Features): 16 + 15 VkBool32, padded to 8
 # Byte offsets of the VkBool32 members read below (16-byte header, then 4 bytes per member in header order)
+F2_SHADER_RESOURCE_MIN_LOD = 16 + 4 * 43   # VkPhysicalDeviceFeatures::shaderResourceMinLod, inside Features2
 F12_SEPARATE_DEPTH_STENCIL_LAYOUTS = 16 + 4 * 35
 F12_TIMELINE_SEMAPHORE = 16 + 4 * 37
 F12_BUFFER_DEVICE_ADDRESS = 16 + 4 * 38
@@ -292,6 +296,7 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
+                          bool(u32(f2, F2_SHADER_RESOURCE_MIN_LOD)),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
         if chosen is None:
@@ -302,7 +307,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, min_lod, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -325,6 +330,7 @@ def query(*, stage_caps=False) -> dict:
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
             "max_push_constants_size": max_push_constants_size,
+            "shader_resource_min_lod": min_lod,
             "vendor_id": vendor,
             "device_id": device,
             "driver_id": driver,

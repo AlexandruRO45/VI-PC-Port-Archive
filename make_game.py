@@ -1219,7 +1219,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--min-lod-fallback", "min_lod_fallback"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1341,6 +1342,13 @@ def runtime_gpu_per_vertex():
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def runtime_gpu_min_lod():
+    """shader_resource_min_lod as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where
+    the device lacks shaderResourceMinLod (Intel Xe-LP), None when it can't tell."""
+    v = runtime_gpu_info().get("shader_resource_min_lod")
+    return None if v is None else bool(v)
 
 
 def runtime_gpu_max_push_constants():
@@ -2137,6 +2145,9 @@ def main() -> int:
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
+    ap.add_argument("--min-lod-fallback", action="store_true",
+                    help="apply the minimum-LOD clamp of image_sample_d_cl to the gradients instead of the MinLod "
+                         "image operand; on by itself when the runtime's GPU lacks shaderResourceMinLod (Intel)")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
@@ -2219,6 +2230,14 @@ def main() -> int:
             a.f16_interp_fallback = True
         elif per_vertex is None:
             a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
+    if "shaders" in stages and not a.min_lod_fallback:
+        min_lod = runtime_gpu_min_lod()
+        if min_lod is False:
+            log("shaders: the GPU the runtime would use lacks shaderResourceMinLod: translating with "
+                "--min-lod-fallback")
+            a.min_lod_fallback = True
+        elif min_lod is None:
+            a.min_lod_fallback = keep_recorded_fallback("--min-lod-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()

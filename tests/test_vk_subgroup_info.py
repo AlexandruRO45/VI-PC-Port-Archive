@@ -69,6 +69,7 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    shader_resource_min_lod: bool = True
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
@@ -224,7 +225,11 @@ class FakeVulkan:
         seen_types = set()
         for stype, node_addr in self._iter_chain(addr):
             seen_types.add(stype)
-            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+                ctypes.c_uint32.from_address(
+                    node_addr + vk_info.F2_SHADER_RESOURCE_MIN_LOD
+                ).value = int(dev.shader_resource_min_lod)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F12_SEPARATE_DEPTH_STENCIL_LAYOUTS
                 ).value = int(dev.separate_depth_stencil_layouts)
@@ -797,6 +802,7 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "shader_resource_min_lod": True,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -831,6 +837,14 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(result["supported_subgroup_stages"], supported)
         self.assertEqual(result["required_subgroup_size_stages"], required)
         self.assertEqual(result["max_compute_workgroup_subgroups"], 17)
+
+    def test_shader_resource_min_lod(self):
+        """The core shaderResourceMinLod feature (VkPhysicalDeviceFeatures, 43rd member) is reported as it is."""
+        self.assertEqual(vk_info.F2_SHADER_RESOURCE_MIN_LOD, 16 + 4 * 43)
+        for has in (True, False):
+            with self.subTest(has=has):
+                res, _vk = self._run_query(FakeDevice(shader_resource_min_lod=has))
+                self.assertIs(res["shader_resource_min_lod"], has)
 
     def test_rdna2_amd_windows(self):
         """#857: RDNA2 by PCI device ID, and only under AMD's proprietary driver (RADV takes the same modules)."""

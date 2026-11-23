@@ -68,6 +68,10 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+# --min-lod-fallback: image_sample_d_cl without shaderResourceMinLod (Intel Xe-LP). The clamp is applied to the
+# gradients instead of through the MinLod image operand: where the footprint they give is finer than the clamp, they
+# are replaced by an isotropic footprint of exactly 2^minlod texels, so the sampler picks the clamped level.
+MIN_LOD_FALLBACK = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
@@ -12282,7 +12286,11 @@ class Gen:
                 kind = kind[:-3]
                 if kind not in ("", "_b", "_c", "_c_b", "_d"):
                     raise Unsupported(op)
-                self.uses_minlod = True
+                if MIN_LOD_FALLBACK and kind != "_d":
+                    # --min-lod-fallback folds the clamp into the gradients of image_sample_d_cl only; the other
+                    # clamp forms need MinLod, which the GPU lacks.
+                    raise Unsupported(op + " without shaderResourceMinLod")
+                self.uses_minlod = not MIN_LOD_FALLBACK
             # Address order after the offset: bias, z-compare, gradients, coordinates, LOD, clamp.
             bias = None
             if kind in ("_b", "_c_b"):
@@ -12370,6 +12378,9 @@ class Gen:
                     vals.append(minlod)
                 return f" {'|'.join(masks)} {' '.join(vals)}" if masks else ""
             if kind == "_d":
+                if minlod is not None and MIN_LOD_FALLBACK:
+                    grads = self.min_lod_grads(img, grads, grad_width, ncoord, minlod)
+                    minlod = None
                 if minlod is not None:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
                 else:
@@ -13189,6 +13200,59 @@ class Gen:
         self.emit(f"{m2} = OpFMul %float {d2} {j}")
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
+
+    def min_lod_grads(self, img, grads, width, ncoord, minlod):
+        """--min-lod-fallback: the gradients of an image_sample_d_cl with its minimum-LOD clamp folded in.
+
+        The footprint is rho^2 = max(|dx * size|^2, |dy * size|^2) in level-0 texels (size = the image's width,
+        height, and depth for 3D; an array layer has no gradient). Where rho^2 >= 4^minlod the clamp does nothing
+        and the gradients are returned as they are, so that case is exact. Where it is smaller they become
+        (2^minlod / width, 0, ..) and (0, 2^minlod / height, ..): an isotropic footprint of 2^minlod texels, so the
+        sampler's level is minlod. The difference from MinLod is an anisotropic filter's extra taps, which a clamped
+        sample no longer takes along the stretched axis. A NaN clamp compares false and keeps the gradients."""
+        self.uses_query = True
+        vf = "%float" if width == 1 else f"%v{width}float"
+        qtype = "%int" if ncoord == 1 else "%v3int" if ncoord == 3 else "%v2int"
+        sz = self.tmp()
+        self.emit(f"{sz} = OpImageQuerySizeLod {qtype} {img} {self.as_int(self.cu(0))}")
+        if qtype == "%v3int" and width == 2:
+            szs = self.tmp()
+            self.emit(f"{szs} = OpVectorShuffle %v2int {sz} {sz} 0 1")
+            sz = szs
+        szf = self.tmp()
+        self.emit(f"{szf} = OpConvertSToF {vf} {sz}")
+        rho = []
+        for g in grads:
+            t, d = self.tmp(), self.tmp()
+            self.emit(f"{t} = OpFMul {vf} {g} {szf}")
+            self.emit(f"{d} = " + (f"OpFMul %float {t} {t}" if width == 1 else f"OpDot %float {t} {t}"))
+            rho.append(d)
+        r2, unit, unit2, lt = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{r2} = OpExtInst %float %glsl FMax {rho[0]} {rho[1]}")
+        self.emit(f"{unit} = OpExtInst %float %glsl Exp2 {minlod}")
+        self.emit(f"{unit2} = OpFMul %float {unit} {unit}")
+        self.emit(f"{lt} = OpFOrdLessThan %bool {r2} {unit2}")
+        step = self.tmp()
+        if width > 1:
+            rep = self.tmp()
+            self.emit(f"{rep} = OpCompositeConstruct {vf} {' '.join([unit] * width)}")
+            self.emit(f"{step} = OpFDiv {vf} {rep} {szf}")
+        else:
+            self.emit(f"{step} = OpFDiv %float {unit} {szf}")
+        out = []
+        for axis, g in enumerate(grads):
+            if width == 1:
+                iso = step
+            else:
+                comp = self.tmp()
+                self.emit(f"{comp} = OpCompositeExtract %float {step} {axis}")
+                iso = self.tmp()
+                self.emit(f"{iso} = OpCompositeConstruct {vf} " +
+                          " ".join(comp if k == axis else "%f0" for k in range(width)))
+            sel = self.tmp()
+            self.emit(f"{sel} = OpSelect {vf} {lt} {iso} {g}")
+            out.append(sel)
+        return tuple(out)
 
     def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
@@ -17538,6 +17602,9 @@ def main():
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
+    ap.add_argument("--min-lod-fallback", action="store_true",
+                    help="image_sample_d_cl without shaderResourceMinLod (e.g. Intel Xe-LP): apply the minimum-LOD "
+                         "clamp to the gradients instead of the MinLod image operand")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
@@ -17588,6 +17655,7 @@ def main():
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, OPT_SPIRV
+    global MIN_LOD_FALLBACK
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
@@ -17600,6 +17668,7 @@ def main():
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
+    MIN_LOD_FALLBACK = a.min_lod_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
     OPT_SPIRV = a.opt
