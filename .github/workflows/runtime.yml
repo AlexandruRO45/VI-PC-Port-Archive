@@ -539,8 +539,7 @@ jobs:
       - name: Runtime tests on MoltenVK
         shell: bash
         env:
-          # vk_overlapping_occlusion: since #2100 (D3D-252), https://github.com/ItsNotRexed/Leonida/issues/3796#issuecomment-7086691314
-          EXPECTED_FAILURES: vk_overlapping_occlusion
+          EXPECTED_FAILURES: ""
         run: |
           set +e
           ctest --test-dir runtime/build --output-on-failure -j "$(sysctl -n hw.ncpu)" 2>&1 | tee "$RUNNER_TEMP/ctest.log"
@@ -555,9 +554,13 @@ jobs:
         env:
           # ps_ssharp: #1845 (the S#'s LOD bias, which a Metal sampler can't take). The others are tests newer than the
           # job, wrong on MoltenVK: https://github.com/ItsNotRexed/Leonida/issues/3796#issuecomment-7086691314
+          # BUILD-1895: on the Apple Paravirtual device, one has a wrong permlane result and one times out after 120 s;
+          # both need investigation on MoltenVK: https://github.com/ItsNotRexed/Leonida/issues/5781#issuecomment-7101046294
           EXPECTED_FAILURES: >-
             ps_ssharp
             cs_fma_fused
+            cs_fmt_int_narrow
+            cs_w32_permlane_fi
             ps_vcmp_f32_nan
             ps_vcmp_f16
             ps_vcmp_f16_e64
