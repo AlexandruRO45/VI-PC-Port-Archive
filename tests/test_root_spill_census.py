@@ -266,6 +266,62 @@ class CliTest(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
             self.assertIn("containers: 1, with an RTS0 part: 1", result.stdout)
 
+    def test_unreadable_index_is_one_error_line(self):
+        # An index that cannot be read (missing, not UTF-8, empty, not JSON) is one error line and exit 2: there is
+        # no census to report, and a traceback names the parser's internals instead of the input.
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {}
+            cases["missing"] = (os.path.join(tmp, "absent.json"), "cannot read")
+            binary = os.path.join(tmp, "binary.json")
+            with open(binary, "wb") as f:
+                f.write(b"\x00\x01GARBAGE\xff" * 40)
+            cases["not UTF-8"] = (binary, "cannot read")
+            empty = os.path.join(tmp, "empty.json")
+            with open(empty, "wb"):
+                pass
+            cases["empty"] = (empty, "is not valid JSON")
+            text = os.path.join(tmp, "text.json")
+            with open(text, "w", encoding="utf-8") as f:
+                f.write("not json\n")
+            cases["not JSON"] = (text, "is not valid JSON")
+            for label, (path, reason) in cases.items():
+                with self.subTest(label=label):
+                    out = os.path.join(tmp, "report.json")
+                    r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("error: ", r.stderr)
+                    self.assertIn(reason, r.stderr)
+                    self.assertIn(path, r.stderr)         # the message names the input
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertFalse(os.path.exists(out))  # nothing was measured, so no report
+
+    def test_unreadable_carve_index_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump(NO_SPILL, f)
+            carve = os.path.join(tmp, "carve.json")
+            with open(carve, "wb") as f:
+                f.write(b"\xff\xfe not utf-8")
+            r = subprocess.run([sys.executable, "-I", TOOL, index, "--carve", carve],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn(f"error: cannot read {carve}", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertNotIn("containers:", r.stdout)  # the census did not run
+
+    def test_deeply_nested_index_is_refused(self):
+        # json.load recurses per level; a file with tens of thousands of brackets is refused, not a RecursionError.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "deep.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[" * 100000 + "]" * 100000)
+            r = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("nested too deeply", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

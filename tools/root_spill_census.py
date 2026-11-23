@@ -115,6 +115,27 @@ def stage_sgpr(text):
     return stage, sgpr
 
 
+def read_json(path):
+    """The JSON at `path`, or a ValueError that says in one line why it cannot be read.
+
+    An index saved with a UTF-8 BOM (PowerShell 5.1 Set-Content, some editors) is still JSON, so it is read as
+    utf-8-sig. Everything else the reader can fail on - a missing or unreadable file, bytes that are not UTF-8, text
+    that is not JSON, nesting deeper than the parser can hold - becomes one message for `main` to print as an error
+    line, so an unusable input never ends in a traceback.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except OSError as e:
+        raise ValueError(f"cannot read {path}: {e.strerror or e}") from None
+    except UnicodeDecodeError as e:
+        raise ValueError(f"cannot read {path}: {e}") from None
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} is not valid JSON: {e}") from None
+    except RecursionError:
+        raise ValueError(f"{path} is nested too deeply to read") from None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("index", help="spirv/index.json written by tools/rdna2spirv.py")
@@ -132,14 +153,20 @@ def main(argv=None):
         for other in (a.index, a.carve):
             if other and same_report_path(other, a.json):
                 ap.error("--json must not overwrite an input index")
-    with open(a.index, encoding="utf-8-sig") as f:  # an index saved with a UTF-8 BOM is still JSON
-        index = json.load(f)
+    try:
+        index = read_json(a.index)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if not isinstance(index, dict):
         ap.error(f"{a.index} is not a translator index (expected a JSON object)")
     carve = None
     if a.carve:
-        with open(a.carve, encoding="utf-8-sig") as f:  # same for the carve index
-            carve = json.load(f)
+        try:
+            carve = read_json(a.carve)  # the carve index is read the same way
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     # --base overrides the stages it names and keeps the defaults for the rest, so a partial override never drops
     # a stage from the check.
     summary = census(index, {**DEFAULT_BASE, **dict(a.base)}, carve)
