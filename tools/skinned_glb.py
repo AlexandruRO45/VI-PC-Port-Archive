@@ -41,7 +41,7 @@ above 255. Only ``0x8C`` is accepted: no ``0x8B`` joint layout has been measured
 so ``0x8B`` is rejected rather than guessed.
 
 The joint index is local to the drawable model's own palette: a sorted ``u32``
-joaat32 array at ``grmModel + 0x20`` with its length at ``grmModel + 0x0C``. The
+joaat32 array at ``grmModel + 0x28`` with its length at ``grmModel + 0x14``. The
 ped skeleton bind pose is ``drawable.skeleton[].bind_matrix`` from a decoded
 skeleton resource (bone -> model, column-major, RAGE Z-up). Palette hashes are
 resolved against the drawable's own skeleton/string table and then the ped
