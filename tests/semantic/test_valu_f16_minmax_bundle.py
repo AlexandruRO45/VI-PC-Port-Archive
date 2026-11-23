@@ -299,5 +299,63 @@ class TestMaxF16Oracle(unittest.TestCase):
         self.assertEqual(ref_max_f16(NEG_ZERO16, POS_ZERO16), POS_ZERO16)
 
 
+# ------------------------------------------------------------------------------
+# v_max_f16 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VMaxF16Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+    src1: Union[RegisterOperand, LiteralOperand]
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+class ScalarMachineMaxF16:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value & MASK16
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index] & MASK16
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index] & MASK16
+        raise TypeError(f"Unknown operand: {op}")
+
+    def step(self, insn: VMaxF16Instruction):
+        s0 = self.read_operand(insn.src0)
+        s1 = self.read_operand(insn.src1)
+        res = ref_max_f16(s0, s1)
+        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
+
+
+class TestMaxF16ASTAndScalar(unittest.TestCase):
+    def test_ast(self):
+        insn = VMaxF16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        self.assertEqual(insn.dst.name, "v0")
+
+    def test_scalar_execution(self):
+        machine = ScalarMachineMaxF16()
+        machine.vgprs[1] = f16_to_bits(1.0)
+        machine.vgprs[2] = f16_to_bits(4.0)
+        insn = VMaxF16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[0], f16_to_bits(4.0))
+
+
 if __name__ == '__main__':
     unittest.main()
