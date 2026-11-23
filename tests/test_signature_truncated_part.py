@@ -37,6 +37,17 @@ def test_truncated_signature_is_per_shader_failure(tmp_path, tag, reader):
     (b"OSG1", rdna2spirv.output_signature),
     (b"OSG1", rdna2spirv.output_signature_full),
 ])
+def test_signature_shorter_than_its_header_is_per_shader_failure(tmp_path, tag, reader):
+    args = container(tmp_path, tag, bytes(4))
+    with pytest.raises(rdna2spirv.Unsupported, match="truncated .* signature"):
+        reader(*args)
+
+
+@pytest.mark.parametrize("tag,reader", [
+    (b"ISG1", rdna2spirv.input_signature),
+    (b"OSG1", rdna2spirv.output_signature),
+    (b"OSG1", rdna2spirv.output_signature_full),
+])
 def test_complete_signature_keeps_register(tmp_path, tag, reader):
     element = struct.pack("<6I", 0, 0, 0, 0, 3, 7) + bytes([15, 15]) + bytes(6)
     args = container(tmp_path, tag, struct.pack("<II", 1, 8) + element)
