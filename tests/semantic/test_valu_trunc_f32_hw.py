@@ -106,5 +106,62 @@ class TestValuTruncF32Oracle(unittest.TestCase):
         self.assertEqual(ref_trunc_f32(QNAN_F32), QNAN_F32)
 
 
+class Opcode(Enum):
+    V_TRUNC_F32 = auto()
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    value: int = 0
+
+    @classmethod
+    def vgpr(cls, idx: int) -> ASTOperand:
+        return cls(kind=OperandKind.VGPR, index=idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> ASTOperand:
+        return cls(kind=OperandKind.SGPR, index=idx)
+
+    @classmethod
+    def imm(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.IMM, value=val & MASK32)
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+
+    def disasm(self) -> str:
+        def fmt(op: ASTOperand) -> str:
+            if op.kind == OperandKind.VGPR:
+                return f"v{op.index}"
+            if op.kind == OperandKind.SGPR:
+                return f"s{op.index}"
+            return hex(op.value)
+        return f"v_trunc_f32 {fmt(self.dst)}, {fmt(self.src0)}"
+
+
+class TestValuTruncF32AST(unittest.TestCase):
+    """Stage 2: AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_vgpr(self) -> None:
+        inst = ASTInstruction(Opcode.V_TRUNC_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        self.assertEqual(inst.disasm(), "v_trunc_f32 v0, v1")
+
+    def test_ast_construction_sgpr_src(self) -> None:
+        inst = ASTInstruction(Opcode.V_TRUNC_F32, ASTOperand.vgpr(2), ASTOperand.sgpr(4))
+        self.assertEqual(inst.disasm(), "v_trunc_f32 v2, s4")
+
+
 if __name__ == "__main__":
     unittest.main()
