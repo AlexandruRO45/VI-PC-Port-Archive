@@ -684,7 +684,9 @@ class ArchiveAndCliTest(unittest.TestCase):
         with open(os.path.join(folder, f"{0x1000:012x}.bin"), "wb") as fh:
             fh.write(self.meta_single)
         for entry in ('{"off": 1e400, "stored": 300}', '{"off": 4096, "stored": 1e400}',
-                      '{"off": -1e400, "stored": 300}'):
+                      '{"off": -1e400, "stored": 300}',
+                      # A fractional offset must not truncate onto the existing file's offset.
+                      '{"off": 4096.75, "stored": 300}', '{"off": 4096, "stored": 30.5}'):
             with self.subTest(entry=entry):
                 with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as fh:
                     fh.write('{"files": [%s]}' % entry)

@@ -320,7 +320,9 @@ class WorldIndexTest(unittest.TestCase):
         with open(os.path.join(carve_dir, f"{0x1000:012x}.bin"), "wb") as f:
             f.write(blob)
         for entry in ('{"off": 1e400, "stored": 300}', '{"off": 4096, "stored": 1e400}',
-                      '{"off": -1e400, "stored": 300}'):
+                      '{"off": -1e400, "stored": 300}',
+                      # A fractional offset must not truncate onto the existing file's offset.
+                      '{"off": 4096.75, "stored": 300}', '{"off": 4096, "stored": 30.5}'):
             with self.subTest(entry=entry):
                 with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8") as f:
                     f.write('{"files": [%s]}' % entry)

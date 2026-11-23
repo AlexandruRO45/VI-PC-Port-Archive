@@ -476,7 +476,12 @@ def _carve_successors(folder):
     try:
         with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
             entries = json.load(f).get("files", [])
-        by_off = {int(e["off"]): int(e["stored"]) for e in entries}
+        def _as_int(value):
+            # A fractional offset would silently truncate onto another file's offset.
+            if not isinstance(value, int):
+                raise TypeError("index offsets and sizes must be integers")
+            return value
+        by_off = {_as_int(e["off"]): _as_int(e["stored"]) for e in entries}
     # OverflowError: json decodes a number such as 1e400 as infinity, and int() refuses it.
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return {}

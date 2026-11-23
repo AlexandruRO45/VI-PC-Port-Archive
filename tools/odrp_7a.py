@@ -971,7 +971,12 @@ def _carve_stored_map(folder):
     try:
         with open(manifest, encoding="utf-8") as fh:
             files = json.load(fh).get("files", [])
-        return {int(item["off"]): int(item["stored"]) for item in files}
+        def _as_int(value):
+            # A fractional offset would silently truncate onto another file's offset.
+            if not isinstance(value, int):
+                raise TypeError("index offsets and sizes must be integers")
+            return value
+        return {_as_int(item["off"]): _as_int(item["stored"]) for item in files}
     # OverflowError: json decodes a number such as 1e400 as infinity, and int() refuses it.
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return {}
