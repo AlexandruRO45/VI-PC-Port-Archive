@@ -286,7 +286,7 @@ def test_kernels_assemble_for_both_families(arch, wave, tmp_path):
     """Every format and dmask of the kernel text assembles with AMD clang for the family (no GPU needed)."""
     import subprocess
     try:
-        clang = runner.find_clang()
+        clang = runner.find_clang(arch)
     except runner.Unavailable as e:
         pytest.skip(str(e))
     kernels = []

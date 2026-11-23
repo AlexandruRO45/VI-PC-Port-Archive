@@ -54,7 +54,7 @@ class Descriptors(unittest.TestCase):
 
     def test_kernels_assemble_for_gfx1036(self):
         try:
-            clang = runner.find_clang()
+            clang = runner.find_clang("gfx1036")
         except runner.Unavailable as e:
             self.skipTest(str(e))
         kernels = []

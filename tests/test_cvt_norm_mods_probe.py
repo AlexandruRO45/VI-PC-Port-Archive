@@ -183,7 +183,7 @@ class ReferenceModelTests(unittest.TestCase):
 
     def test_kernels_assemble_when_amd_clang_available(self):
         try:
-            clang = runner.find_clang()
+            clang = runner.find_clang("gfx1036")
         except runner.Unavailable as e:
             self.skipTest(str(e))
         for wave in (32, 64):

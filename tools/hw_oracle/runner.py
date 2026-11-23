@@ -7,7 +7,8 @@ picks the one for the platform.
 Tools are located through environment variables first, then by looking in the usual places:
     LEONIDA_AMD_CLANG   AMD clang (its folder must also hold ld.lld); default: amdclang / clang on PATH that lists
                         the amdgcn target (a launcher without ld.lld beside it is followed to the clang it is
-                        installed as), %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel
+                        installed as), %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel;
+                        find_clang(cpu) also passes over one that cannot assemble for that -mcpu
     LEONIDA_HIP_DLL     the HIP runtime (amdhip64_7.dll); default: the one in System32 (it ships with the driver)
     LEONIDA_HOST_CC     a C compiler for hw_oracle.c (MinGW gcc, or cl.exe from a Developer shell); default: gcc on
                         PATH, C:\\msys64\\ucrt64\\bin, then on Windows a cl on PATH or Visual Studio's (vswhere)
@@ -48,6 +49,19 @@ def _has_amdgcn(clang):
     return "amdgcn" in out
 
 
+def _assembles_for(clang, cpu):
+    """True when clang assembles an empty module for -mcpu=cpu. Listing amdgcn is not enough: Ubuntu 22.04's clang 14
+    has the target but refuses gfx1036 ("invalid target ID"), which LLVM 15 added."""
+    with tempfile.TemporaryDirectory(prefix="leonida-clang-cpu-") as d:
+        try:
+            r = subprocess.run([clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={cpu}", "-x", "assembler", "-c", "-",
+                                "-o", os.path.join(d, "empty.o")],
+                               input="", capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return r.returncode == 0
+
+
 def _installed_clang(clang):
     """The clang a launcher stands for. The rocm-sdk wheels put `amdclang` in the Python environment's Scripts (bin)
     folder: it has the amdgcn target, but ld.lld and amdgpu-arch sit beside the real clang, in the folder `--version`
@@ -66,11 +80,14 @@ def _installed_clang(clang):
     return clang
 
 
-def find_clang():
+def find_clang(cpu=None):
+    """The AMD clang to assemble with; with cpu (e.g. "gfx1036"), only one that accepts -mcpu=cpu."""
     env = os.environ.get("LEONIDA_AMD_CLANG")
     if env:
         if not os.path.isfile(env):
             raise Unavailable(f"LEONIDA_AMD_CLANG={env} does not exist")
+        if cpu and not _assembles_for(env, cpu):
+            raise Unavailable(f"LEONIDA_AMD_CLANG={env} cannot assemble for {cpu}")
         return env
     cands = [shutil.which(n) for n in ("amdclang", "clang")]
     for var in ("HIP_PATH", "ROCM_PATH"):
@@ -80,10 +97,10 @@ def find_clang():
     tail = os.path.join("Lib", "site-packages", "_rocm_sdk_core", "lib", "llvm", "bin", _exe("clang"))
     cands.append(os.path.join(REPO, ".venv", tail))   # only the repo root's venv, never a glob under the cwd
     for c in cands:
-        if c and os.path.isfile(c) and _has_amdgcn(c):
+        if c and os.path.isfile(c) and _has_amdgcn(c) and (not cpu or _assembles_for(c, cpu)):
             return _installed_clang(c)
-    raise Unavailable("no AMD clang (set LEONIDA_AMD_CLANG; `pip install rocm-sdk-core` from "
-                      "https://stable.repo.amd.com/rocm/whl-next/ provides one)")
+    raise Unavailable(f"no AMD clang{f' that assembles for {cpu}' if cpu else ''} (set LEONIDA_AMD_CLANG; "
+                      "`pip install rocm-sdk-core` from https://stable.repo.amd.com/rocm/whl-next/ provides one)")
 
 
 def find_hip_dll():

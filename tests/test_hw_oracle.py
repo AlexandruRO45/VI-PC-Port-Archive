@@ -594,6 +594,58 @@ class ClangOnPath(unittest.TestCase):
             runner._find_lld(found)
 
 
+class ClangForCpu(unittest.TestCase):
+    """find_clang(cpu) passes over a clang that lists amdgcn but refuses -mcpu=cpu, as Ubuntu 22.04's clang 14 refuses
+    gfx1036 ("invalid target ID"); the probe tests then skip instead of failing in the assembler."""
+    EXT = ".exe" if os.name == "nt" else ""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.old, self.new = (self.clang(root / name) for name in ("llvm14", "llvm22"))
+        self.cpus = {self.old: {"gfx1030"}, self.new: {"gfx1030", "gfx1036"}}
+
+    def clang(self, folder):
+        folder.mkdir()
+        for name in ("clang", "ld.lld"):   # ld.lld beside it: find_clang returns the clang where it was found
+            (folder / (name + self.EXT)).write_bytes(b"")
+        return str(folder / ("clang" + self.EXT))
+
+    def run_tool(self, cmd, **kw):
+        cpu = next((a.split("=", 1)[1] for a in cmd if a.startswith("-mcpu=")), None)
+        if cpu is not None:
+            ok = cpu in self.cpus[cmd[0]]
+            return subprocess.CompletedProcess(cmd, 0 if ok else 1, "", "" if ok else "invalid target ID")
+        return subprocess.CompletedProcess(cmd, 0, "amdgcn" if "--print-targets" in cmd else "", "")
+
+    def path(self, on_path, env_clang=""):
+        patches = [unittest.mock.patch.object(runner.shutil, "which", side_effect=lambda n: on_path.get(n)),
+                   unittest.mock.patch.object(runner.subprocess, "run", side_effect=self.run_tool),
+                   unittest.mock.patch.dict(os.environ, {"LEONIDA_AMD_CLANG": env_clang, "HIP_PATH": "",
+                                                         "ROCM_PATH": ""})]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_clang_that_refuses_the_cpu_is_passed_over(self):
+        self.path({"amdclang": self.old, "clang": self.new})
+        self.assertEqual(runner.find_clang("gfx1036"), self.new)
+        self.assertEqual(runner.find_clang("gfx1030"), self.old)
+        self.assertEqual(runner.find_clang(), self.old)   # no cpu: the first amdgcn clang, as before
+
+    def test_no_clang_for_the_cpu_is_unavailable(self):
+        self.path({"clang": self.old})
+        with self.assertRaisesRegex(runner.Unavailable, "gfx1036"):
+            runner.find_clang("gfx1036")
+
+    def test_the_named_clang_is_checked_too(self):
+        self.path({"clang": self.new}, env_clang=self.old)
+        with self.assertRaisesRegex(runner.Unavailable, "LEONIDA_AMD_CLANG=.*gfx1036"):
+            runner.find_clang("gfx1036")
+        self.assertEqual(runner.find_clang(), self.old)
+
+
 def relocatable(sections, symbols):
     """A little-endian ELF64 relocatable object: sections is [(name, bytes, address)], symbols [(name, section
     number from 1, value)]. Only what drm.text_section reads is filled in."""
