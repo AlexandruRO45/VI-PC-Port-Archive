@@ -238,5 +238,65 @@ class SXorB32SimdDivergenceTests(unittest.TestCase):
         for lane in range(64):
             self.assertEqual(wave.vgprs[lane][0], 0)
 
+class SXorB32RegisterAliasingTests(unittest.TestCase):
+    def test_dst_aliases_src0(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x0F0F0F0F)
+        state.set_sgpr(1, 0xF0F0F0F0)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        execute_scalar_xor_b32(state, ast)
+        self.assertEqual(state.get_sgpr(0), MASK32)
+        self.assertEqual(state.scc, 1)
+
+    def test_dst_aliases_src1(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x11111111)
+        state.set_sgpr(1, 0x11111111)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 1),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        execute_scalar_xor_b32(state, ast)
+        self.assertEqual(state.get_sgpr(1), 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_all_operands_alias(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x12345678)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 0),
+        )
+        execute_scalar_xor_b32(state, ast)
+        self.assertEqual(state.get_sgpr(0), 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_unrelated_registers_preserved(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x11)
+        state.set_sgpr(1, 0x22)
+        state.set_sgpr(2, 0x33)
+        state.set_sgpr(3, 0x44)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 2),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        execute_scalar_xor_b32(state, ast)
+        self.assertEqual(state.get_sgpr(0), 0x11)
+        self.assertEqual(state.get_sgpr(1), 0x22)
+        self.assertEqual(state.get_sgpr(2), 0x11 ^ 0x22)
+        self.assertEqual(state.get_sgpr(3), 0x44)
+
 if __name__ == "__main__":
     unittest.main()
