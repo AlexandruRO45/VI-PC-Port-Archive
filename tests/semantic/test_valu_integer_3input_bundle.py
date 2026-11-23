@@ -586,5 +586,23 @@ class TestAndOrB32SIMDBoundaries(unittest.TestCase):
         self.assertEqual(oracle_and_or_b32(MASK32, MASK32, MASK32), MASK32)
         self.assertEqual(oracle_and_or_b32(MASK32, 0, 0), 0)
 
+# ---------------------------------------------------------------------------
+# Opcode 5: v_and_or_b32 - Translator Integration
+# ---------------------------------------------------------------------------
+
+class TestAndOrB32Translator(unittest.TestCase):
+    def test_translated_execution(self) -> None:
+        triples = [
+            (0xFF, 0x0F, 0xF0),
+            (0x1234_5678, 0xFFFF_0000, 0x0000_ABCD),
+            (0, MASK32, 42),
+            (0xAAAA_AAAA, 0x5555_5555, 0x1111_1111),
+            (MASK32, MASK32, 0),
+        ]
+        for a, b, c in triples:
+            expected = oracle_and_or_b32(a, b, c)
+            actual = run_translated_triop("v_and_or_b32", a, b, c)
+            self.assertEqual(actual, expected)
+
 if __name__ == "__main__":
     unittest.main()
