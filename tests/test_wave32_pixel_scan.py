@@ -172,6 +172,28 @@ class ScanTests(unittest.TestCase):
             scan.main(["no_such_shaders_dir_xyz"])
         self.assertNotEqual(cm.exception.code, 0)
 
+    def test_the_output_guard_covers_the_fssm_headers(self):
+        # scan_directory reads each listing's FSSM wave-size header (rdna2spirv.native_paths), so --out naming
+        # one of those is refused, as wave64_graphics_scan.py's guard does (finding in the coordination issue).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "disasm").mkdir()
+            (root / "fssm").mkdir()
+            listing = fixture("ps_lane.s", ["v_mbcnt_lo_u32_b32 v0, -1, 0", "s_endpgm"])[1]
+            (root / "disasm" / "ps_lane.s").write_text(listing, encoding="utf-8", newline="\n")
+            header = bytearray(fssm_header.WAVE_FLAGS_OFFSET + 4)
+            header[:4] = fssm_header.MAGIC
+            (root / "fssm" / "ps_lane.fssm").write_bytes(header)
+            out = str(root / "fssm" / "ps_lane.fssm")
+            err = io.StringIO()
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                scan.main([str(root / "disasm"), "--out", out])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("FSSM header", err.getvalue())
+            with open(out, "rb") as f:
+                self.assertEqual(f.read()[:4], fssm_header.MAGIC)   # untouched
+
 
 if __name__ == "__main__":
     unittest.main()
