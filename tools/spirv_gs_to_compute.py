@@ -18,6 +18,7 @@ Slots are ordered Position first, then by location; `--layout` writes them with 
 p, `InvocationId` reads 0 (only `Invocations 1` is supported). The workgroup is 64x1x1; invocations past
 `primitive_count` return at once. Push constants and set 0 are untouched. The draw afterwards turns each strip into
 triangles (or lines, points) in emission order.
+Explicit stream instructions can capture a fixed stream 0 using the same emit and strip-end path.
 
 Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
@@ -37,6 +38,7 @@ OUT_TOPOLOGY = {"OutputPoints": "points", "OutputLineStrip": "line_strip", "Outp
 KEEP_BUILTINS = ("SubgroupLocalInvocationId", "SubgroupSize", "NumSubgroups", "SubgroupId")
 FLOAT_CONTROL_MODES = {"DenormPreserve", "DenormFlushToZero", "SignedZeroInfNanPreserve",
                        "RoundingModeRTE", "RoundingModeRTZ"}
+STREAM_INSTRUCTIONS = {"OpEmitStreamVertex": "OpEmitVertex", "OpEndStreamPrimitive": "OpEndPrimitive"}
 
 
 class Unsupported(Exception):
@@ -58,6 +60,20 @@ def parse(text):
 
 def find_type(defs, op, operands):
     return next((r for r, d in defs.items() if d == (op, operands)), None)
+
+
+def is_stream_zero_constant(defs, identifier):
+    op, operands = defs.get(identifier, ("", []))
+    if not operands or defs.get(operands[0], ("", []))[0] != "OpTypeInt":
+        return False
+    if op == "OpConstantNull":
+        return True
+    if op != "OpConstant" or len(operands) != 2:
+        return False
+    try:
+        return int(operands[1], 0) == 0
+    except ValueError:
+        return False
 
 
 def layout_of(text):
@@ -117,7 +133,12 @@ def layout_of(text):
 def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[str, int | str | list[str]]]:
     """Return (compute module text, layout dict for --layout)."""
     lay = layout_of(text)
-    defs, _ = parse(text)
+    defs, decorations = parse(text)
+    for entries in decorations.values():
+        for decoration in entries:
+            words = decoration.partition(";")[0].split()
+            if words[:1] == ["Stream"] and words[1:] != ["0"]:
+                raise Unsupported("geometry capture supports only output stream 0")
     main, ins, outs, builtins = lay["main"], lay["input_vars"], lay["output_vars"], lay["builtins"]
     uint = find_type(defs, "OpTypeInt", ["32", "0"])
     f32 = find_type(defs, "OpTypeFloat", ["32"])
@@ -191,7 +212,9 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     state = "header"        # header -> main_entry -> main_vars -> main -> other
     for ln in text.splitlines():
         s = ln.strip()
-        if s == "OpCapability Geometry":
+        if s in ("OpCapability Geometry", "OpCapability GeometryStreams"):
+            continue
+        if re.match(r"OpDecorate %\w+ Stream\b", s):
             continue
         m = re.match(r"OpEntryPoint Geometry (%\w+) (\"[^\"]*\")(.*)$", s)
         if m:
@@ -262,6 +285,13 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                     f"%gsc_recbase = OpIMul {uint} %gsc_prim {k(mv)}",
                     f"%gsc_metabase = OpIMul {uint} %gsc_prim {k(mv + 1)}"]
             block_tail[entry_label] = "%gsc_body"
+        stream = re.match(r"(OpEmitStreamVertex|OpEndStreamPrimitive)\s+(%\w+)\s*(?:;.*)?$", s)
+        if stream:
+            if state != "main":
+                raise Unsupported(f"{stream[1]} outside the geometry entry function")
+            if not is_stream_zero_constant(defs, stream[2]):
+                raise Unsupported(f"{stream[1]} requires constant stream 0")
+            s = STREAM_INSTRUCTIONS[stream[1]]
         if state not in ("main", "main_vars"):
             out.append(ln)
             continue

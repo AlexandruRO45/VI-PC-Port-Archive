@@ -234,6 +234,44 @@ def maybe_validate_spirv(spvasm):
 
 
 class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
+    def test_stream_zero_capture_preserves_vertices_and_strip_end(self):
+        ordinary = _make_gs([
+            "%entry = OpLabel",
+            "OpStore %out_pos %v_a", "OpEmitVertex",
+            "OpStore %out_pos %v_b", "OpEmitVertex",
+            "OpStore %out_pos %v_c", "OpEmitVertex",
+            "OpEndPrimitive", "OpReturn",
+        ])
+        source = ordinary.replace("OpCapability Geometry", "OpCapability Geometry\nOpCapability GeometryStreams")
+        source = source.replace("OpDecorate %out_pos BuiltIn Position",
+                                "OpDecorate %out_pos BuiltIn Position\nOpDecorate %out_pos Stream 0")
+        source = source.replace("OpEmitVertex", "OpEmitStreamVertex %u0")
+        source = source.replace("OpEndPrimitive", "OpEndStreamPrimitive %u0")
+        maybe_validate_spirv(source)
+        out, layout = gsc.rewrite(source)
+        maybe_validate_spirv(out)
+        self.assertEqual((out, layout), gsc.rewrite(ordinary))
+
+        records, metadata = [None] * 3, [-1] * 4
+        run_capture_spvasm(out, gid_x=0, prim_count=1, in_data=[], rec_buf=records, meta_buf=metadata)
+        self.assertEqual(records, [(1.0, 0.0, 0.0, 1.0), (2.0, 0.0, 0.0, 1.0), (3.0, 0.0, 0.0, 1.0)])
+        self.assertEqual(metadata, [3, 0, 0, 1])
+
+    def test_stream_selection_must_be_fixed_to_zero(self):
+        source = _make_gs([
+            "%entry = OpLabel", "OpStore %out_pos %v_a", "OpEmitStreamVertex %u1", "OpReturn",
+        ]).replace("OpCapability Geometry", "OpCapability Geometry\nOpCapability GeometryStreams")
+        with self.assertRaisesRegex(gsc.Unsupported, "constant stream 0"):
+            gsc.rewrite(source)
+        specialized = source.replace("%u1 = OpConstant %uint 1", "%u1 = OpSpecConstant %uint 0")
+        with self.assertRaisesRegex(gsc.Unsupported, "constant stream 0"):
+            gsc.rewrite(specialized)
+        nonzero_output = source.replace("OpEmitStreamVertex %u1", "OpEmitStreamVertex %u0")
+        nonzero_output = nonzero_output.replace("OpDecorate %out_pos BuiltIn Position",
+                                                "OpDecorate %out_pos BuiltIn Position\nOpDecorate %out_pos Stream 1")
+        with self.assertRaisesRegex(gsc.Unsupported, "output stream 0"):
+            gsc.rewrite(nonzero_output)
+
     def test_over_emit_clamped_and_neighbor_primitive_uncorrupted(self):
         # OutputVertices = 3, but GS emits 5 vertices + OpEndPrimitive + OpReturn.
         gs = _make_gs([
