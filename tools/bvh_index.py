@@ -510,7 +510,12 @@ def main(argv=None):
     else:
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)
-        except (OSError, ValueError) as e:
+        except OSError as e:
+            # The OSError text repeats the target (and doubles its backslashes on Windows): print the path and
+            # the reason once each, as the other report-writing tools do.
+            print(f"{a.target}: {e.strerror or e}", file=sys.stderr)
+            return 2
+        except ValueError as e:
             print(f"{a.target}: {e}", file=sys.stderr)
             return 2
     for s in summaries:

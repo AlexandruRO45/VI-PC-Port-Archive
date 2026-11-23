@@ -514,5 +514,21 @@ def setUpModule():
     unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
+class MissingTargetMessage(unittest.TestCase):
+    """A missing archive is one line with the path once and the reason once, not the raw OSError repr."""
+
+    def test_missing_target_path_is_not_repeated_or_quoted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "absent.rpf")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = bvh_index.main([missing])
+            line = stderr.getvalue().strip()
+            self.assertEqual(rc, 2)
+            self.assertEqual(line.count(missing), 1, line)
+            self.assertNotIn("'", line, line)          # no repr() quoting around the path
+            self.assertNotIn("\\\\", line, line)        # no doubled separators from the exception text
+
+
 if __name__ == "__main__":
     unittest.main()
