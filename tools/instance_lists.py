@@ -36,6 +36,7 @@ import sys
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 import world_index as wi  # noqa: E402  (same 0x7a header, schema and stream helpers)
 
 PROP_LIST, PROP_INST = 0xBA049770, 0xEA6B3A96
@@ -327,15 +328,6 @@ def scan(path, T, start=None, limit=None):
                 pos = s + max(used, 1)
 
 
-def same_output_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def _int_arg(text):
     try:
         return int(text, 0)
@@ -363,7 +355,7 @@ def main(argv=None):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
             return 2
         for path in args.inputs:
-            if same_output_path(args.json, path):
+            if same_report_path(args.json, path):
                 print(f"error: --json would overwrite the input {path}", file=sys.stderr)
                 return 2
     T = {}
