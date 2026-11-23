@@ -71,6 +71,7 @@ sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -538,9 +539,70 @@ def find_dumps(containers: list | None = None) -> list:
     return list(found.values())
 
 
+PICK_TITLE = "Choose the folder that holds MicrosoftGame.Config"
+PICK_UNSUPPORTED = ("That folder isn't a supported version of the game. Choose the folder that holds "
+                    "MicrosoftGame.Config and the .rpf archives.")
+
+
+def native_picker():
+    """The desktop's own folder dialog on Linux and the BSDs, where Tk's is a bare one of its own: kdialog on
+    KDE, zenity elsewhere (GNOME and the rest), either one when only that one is installed. Returns
+    (tool, path) or None: on Windows and macOS Tk already opens the system dialog, and with no display there
+    is nothing to open."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    kde = "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+    for tool in (("kdialog", "zenity") if kde else ("zenity", "kdialog")):
+        exe = shutil.which(tool)
+        if exe:
+            return tool, exe
+    return None
+
+
+def native_ask(tool: str, exe: str, start: str) -> str:
+    """One folder dialog from `tool`: the chosen folder, or "" on cancel. OSError when the tool itself fails."""
+    if tool == "kdialog":
+        cmd = [exe, "--title", "Leonida", "--getexistingdirectory", start]
+    else:
+        cmd = [exe, "--file-selection", "--directory", "--title=" + PICK_TITLE,
+               "--filename=" + os.path.join(start, "")]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    if r.returncode == 1:       # both tools: the dialog was cancelled or closed
+        return ""
+    if r.returncode != 0:
+        raise OSError(f"{tool} exited with {r.returncode}")
+    return r.stdout.strip("\r\n")
+
+
+def native_warn(tool: str, exe: str, msg: str) -> None:
+    cmd = ([exe, "--title", "Leonida", "--sorry", msg] if tool == "kdialog"
+           else [exe, "--warning", "--title=Leonida", "--text=" + msg])
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def pick_game() -> str:
     """--pick: choose the game folder in the system's folder dialog. Asks again until the folder is a supported
     version; cancelling stops the build."""
+    native = native_picker()
+    if native:
+        start = os.path.expanduser("~")
+        try:
+            while True:
+                d = native_ask(*native, start)
+                if not d:
+                    fail("No folder chosen: choose one with --pick or --game.")
+                d = os.path.normpath(d)
+                v = match_version(d)
+                if v:
+                    log(f"chose {v['title']} {v['version']} in {d}")
+                    return d
+                notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
+                native_warn(*native, PICK_UNSUPPORTED + notes)
+                start = d           # open the next dialog where the last one left off
+        except OSError as e:        # the tool is there but won't run (no portal, broken install): try Tk
+            log(f"the {native[0]} folder dialog couldn't open ({e}); using Tk's")
     try:
         import tkinter
         from tkinter import filedialog, messagebox
@@ -551,8 +613,7 @@ def pick_game() -> str:
     root.attributes("-topmost", True)
     try:
         while True:
-            d = filedialog.askdirectory(parent=root, mustexist=True,
-                                        title="Choose the folder that holds MicrosoftGame.Config")
+            d = filedialog.askdirectory(parent=root, mustexist=True, title=PICK_TITLE)
             if not d:
                 fail("No folder chosen: choose one with --pick or --game.")
             d = os.path.normpath(d)
@@ -561,9 +622,7 @@ def pick_game() -> str:
                 log(f"chose {v['title']} {v['version']} in {d}")
                 return d
             notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
-            messagebox.showwarning("Leonida", "That folder isn't a supported version of the game. Choose the "
-                                   "folder that holds MicrosoftGame.Config and the .rpf archives." + notes,
-                                   parent=root)
+            messagebox.showwarning("Leonida", PICK_UNSUPPORTED + notes, parent=root)
     finally:
         root.destroy()
 
@@ -1283,12 +1342,13 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
 
 
 def fspx_cache_complete(spirv: str) -> bool:
-    """Check that the FSPX translation index and its named modules are present."""
+    """Check that the FSPX translation index names at least one program and that its named modules are present.
+    A translation that produced no modules writes a bare `{}`, which must not be cached as a finished step."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
     except ValueError:
         return False
-    return isinstance(index, dict) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    return isinstance(index, dict) and bool(index) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
@@ -1497,7 +1557,7 @@ def runtime_gpu_max_push_constants():
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
-                       "spirv_opt.py", "report_paths.py", "gfx10_formats.json")
+                       "spirv_opt.py", "report_paths.py", "replace_retry.py", "gfx10_formats.json")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:
@@ -1524,6 +1584,22 @@ def drop(*paths: str) -> None:
 
 
 SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
+
+
+def drop_index(index: str) -> str:
+    """Remove a translated index the next run must not take as finished; "" once it is gone.
+
+    A remove that fails returns a sentence for the stage's failure message instead of raising: on Windows the
+    lock that stopped the index being read or merged (an antivirus scan, the search indexer) usually stops this
+    too, and the PermissionError traceback would hide why the stage failed. The reason is the strerror, not
+    str(error), which quotes the path a second time through repr() (every Windows backslash doubled)."""
+    try:
+        os.remove(index)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f" {index} could not be removed ({error.strerror or error}): delete it before running the shaders stage again."
+    return ""
 
 
 def translator_digest() -> str:
@@ -1640,14 +1716,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     if bad:
         # An older index describes the corpus from the run before: keeping it would make the next run take the
         # failed translation as finished. The next successful --merge writes it again.
-        index = os.path.join(spirv, "index.json")
-        try:
-            os.remove(index)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log(f"  cannot remove the stale {index}: {e}")
-        fail("rdna2spirv.py: " + ", ".join(bad))
+        fail("rdna2spirv.py: " + ", ".join(bad) + "." + drop_index(os.path.join(spirv, "index.json")))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
     index = os.path.join(spirv, "index.json")
     if os.path.isfile(index):
@@ -1656,18 +1725,18 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
             with open(index, encoding="utf-8") as f:
                 merged = json.load(f)
         except (OSError, ValueError) as e:
-            os.remove(index)
-            fail(f"rdna2spirv.py --merge wrote an unreadable {index}: {e}")
+            fail(f"rdna2spirv.py --merge wrote an unreadable {index}: {getattr(e, 'strerror', None) or e}."
+                 + drop_index(index))
         if not merged:
             # A marker left behind would look like a finished translation to the next run; drop it with the failure.
-            os.remove(index)
+            left = drop_index(index)
             # The plan would make the retry reuse the same empty parts even after the disassembly was repaired.
             try:
                 os.remove(plan_path)
             except OSError:
                 pass
             fail("rdna2spirv.py translated 0 shaders, so the empty index is not kept. Run the shaders stage again; "
-                 "if it happens again, the disassembly logged above is why.")
+                 "if it happens again, the disassembly logged above is why." + left)
 
 
 def verify_translation_completeness(dxbc: str, spirv: str) -> None:
@@ -1813,7 +1882,13 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     pools = []
     for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
-    settings = ttpf_assets.load_profile(work) if pools else None
+    if pools:
+        try:
+            settings = ttpf_assets.load_profile(work)
+        except ValueError as exc:   # a hand-edited calibration profile is one build error, not a traceback
+            fail(str(exc))
+    else:
+        settings = None
     # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
     # in one destination namespace would share that folder and its manifest, so the second pool would
     # look already exported and lose all its DDS. Give every member of a colliding group its own
@@ -1949,7 +2024,7 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
                            stdin=subprocess.DEVNULL)
         progress.tick()
         if r.returncode == 0 and os.path.isfile(tmp):
-            os.replace(tmp, dst)
+            replace_retry(tmp, dst)
             return True
         if os.path.isfile(tmp):
             os.remove(tmp)
@@ -2042,6 +2117,18 @@ def build_pipeline_check(jobs: int) -> None:
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
             *, work: str | None = None) -> None:
+    destinations = [*RUNTIME_FILES, "game_path.txt"]
+    if work is not None:
+        destinations.append("shader_path.txt")
+    if os.name != "nt":
+        destinations.append("gta6rt.sh")
+    # Check the complete set before compiling or copying, so a later conflict leaves the old runtime usable.
+    for name in destinations:
+        destination = os.path.join(out, name)
+        if os.path.isdir(destination):
+            fail(f"runtime: {destination} is a directory and the runtime needs it as a file. "
+                 "Use another --out folder or move the directory before retrying.")
+
     if runtime_build:
         log(f"runtime: using the build in {runtime_build}")
         build = runtime_build
@@ -2129,7 +2216,8 @@ def require_translated_shaders(work: str) -> str:
         with open(index, encoding="utf-8") as f:
             translated = json.load(f)
     except (OSError, ValueError) as e:
-        fail(f"The translated shader index {index} is unreadable ({e}): run the shaders stage again.")
+        fail(f"The translated shader index {index} is unreadable ({getattr(e, 'strerror', None) or e}): "
+             "run the shaders stage again.")
     if not translated:
         # A build from before the shaders stage refused an empty merge can carry this marker.
         fail(f"The translated shader index {index} is empty, so there is nothing to check. Run the shaders stage again.")
@@ -2275,7 +2363,7 @@ def pipeline_names(spirv: str) -> "list[str]":
         with open(path, encoding="utf-8") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
-        fail(f"pipelines: cannot read {path}: {e}")
+        fail(f"pipelines: cannot read {path}: {getattr(e, 'strerror', None) or e}")
     if not isinstance(index, dict):
         fail(f"pipelines: {path} must contain a JSON object")
     return sorted(index, key=lambda n: n.encode("utf-8"))
@@ -2513,19 +2601,17 @@ def main() -> int:
     is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")
     game_entries = []
     if is_game_drive_root:
-        try:
-            game_entries = [
-                os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
-                for e in os.listdir(real_game)
-            ]
-        except OSError:
-            game_entries = []
+        # The dump's own top-level names, from the version manifest: os.listdir(real_game) would also count an
+        # unrelated --out or --work folder on the drive, so the rerun that resumes the build was rejected.
+        top_level = {rel.replace("\\", "/").split("/", 1)[0] for rel in [v["expected_exe"], *v["files"]]}
+        game_entries = [os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
+                        for e in sorted(top_level) if e]
     for p in (out, work):
         # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
         real_destination = os.path.normcase(os.path.realpath(p))
         if is_game_drive_root:
             # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
-            # inside the dump's existing top-level entries, but allow separate top-level folders.
+            # inside the dump's own top-level entries, but allow separate top-level folders.
             inside = (real_destination == real_game) or any(
                 path_is_within(real_destination, entry) for entry in game_entries
             )

@@ -30,6 +30,8 @@ Usage: `python -I tools/awc_opus.py --help` lists the options.
 """
 import argparse
 import functools
+import json
+from collections import Counter
 import os
 import struct
 import sys
@@ -40,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from awc_ogg_inventory import INVENTORY_NAME, inventory_bytes, read_inventory  # noqa: E402
 from file_mode import new_file_mode, published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from rsc8_audio import decode_marker_records, marker_records, pair_marker_regions, parse_adat_header_bytes
 from report_paths import path_key  # noqa: E402
 
 # ---- Ogg ----
@@ -345,7 +348,38 @@ def bank_output_dir(path, out_dir):
     return os.path.join(out_dir, name)
 
 
-def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
+def music_cue_regions(data, frame_limits):
+    """Join a unique marker stream-table entry to a unique exported music channel in this bank."""
+    if not frame_limits:
+        return []
+    bank = parse_adat_header_bytes(data, 0, len(data))
+    if bank is None:
+        return []
+    entries = bank["entries"]
+    occurrences = Counter(sid for sid, _ in entries)
+    rows = []
+    for sid, tags in entries:
+        if sid not in frame_limits or occurrences[sid] != 1:
+            continue
+        for kind, offset, size in tags:
+            if kind != 0xBD:
+                continue
+            blob = data[offset:offset + size]
+            if not decode_marker_records(blob)["offsets_ascending"]:
+                continue
+            for region in pair_marker_regions(marker_records(blob))["regions"]:
+                if region["end"] <= frame_limits[sid]:
+                    rows.append({"file": f"{sid:08X}.ogg", "name_hash": f"{region['name']:08X}",
+                                 "start_sample": region["start"], "end_sample": region["end"]})
+    return rows
+
+
+def write_cue_sheet(sheet, rows):
+    payload = {"sample_rate": 48000, "regions": rows}
+    write_file(sheet, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+
+
+def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_sheet: bool = False):
     od = bank_output_dir(path, out_dir)
     known, previous = read_inventory(od)
     inventory_path = os.path.join(od, INVENTORY_NAME)
@@ -354,25 +388,36 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
         # Invalidate the previous run before reading the bank, which may now be unreadable or malformed.
         write_file(inventory_path, inventory_bytes(known, current))
     try:
-        return _export_bank_audio(path, od, pre_skip, current)
+        return _export_bank_audio(path, od, pre_skip, current, cue_sheet)
     finally:
         if current:
             write_file(inventory_path, inventory_bytes(known | current, current))
 
 
-def _export_bank_audio(path: str, od: str, pre_skip: int, current: set[str]):
+def _export_bank_audio(path: str, od: str, pre_skip: int, current: set[str], cue_sheet: bool):
+    if cue_sheet:
+        sheet = os.path.join(od, "cue_regions.json")
+        if os.path.exists(sheet):
+            # A skipped bank or interrupted channel write must not leave last run's regions current.
+            write_cue_sheet(sheet, [])
     with open(path, "rb") as f:
         d = f.read()
     streams, music = parse_awc(d)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
+    channel_counts = Counter()
+    frame_limits = {}
     for mus, data in music:
         for cid, samples, rate, codec, pk, packet_channels in music_channels(d, mus, data):
+            if cue_sheet:
+                channel_counts[cid] += 1
             if pk:
                 n48 = samples * 48000 // rate if rate else 0
                 name = f"{cid:08X}.ogg"
-                write_ogg_opus(os.path.join(od, name), pk, packet_channels, cid, n48, pre_skip=pre_skip)
+                granule = write_ogg_opus(os.path.join(od, name), pk, packet_channels, cid, n48, pre_skip=pre_skip)
                 current.add(name)
+                if cue_sheet and rate == 48000 and samples > 0:
+                    frame_limits[cid] = min(samples, max(0, granule - pre_skip))
                 counts["music"] += 1
     for s, stem in zip(streams, export_stems([s["id"] for s in streams])):
         at, size = s["data"]
@@ -401,6 +446,13 @@ def _export_bank_audio(path: str, od: str, pre_skip: int, current: set[str]):
             counts["pcm"] += 1
             continue
         counts["other"] += 1
+    if cue_sheet:
+        for stream in streams:
+            frame_limits.pop(stream["id"], None)
+        verified = {cid: limit for cid, limit in frame_limits.items() if channel_counts[cid] == 1}
+        rows = music_cue_regions(d, verified)
+        if rows:
+            write_cue_sheet(sheet, rows)
     return counts
 
 
@@ -408,6 +460,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("out")
+    ap.add_argument("--cue-sheet", action="store_true", help="write paired music cues beside their Ogg files")
     ap.add_argument("--limit", type=int, help="maximum number of banks to export (default: all)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="banks to export at once (default: half the CPU count)")
@@ -471,7 +524,7 @@ def main(argv=None) -> int:
     if jobs == 1:
         for i, (b, output_parent) in enumerate(banks):
             try:
-                add(export_bank(b, output_parent, a.pre_skip))
+                add(export_bank(b, output_parent, a.pre_skip, a.cue_sheet))
             except (ValueError, struct.error, IndexError, OSError) as e:
                 skipped(b, e)
                 continue
@@ -479,7 +532,7 @@ def main(argv=None) -> int:
                 print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=process_workers(jobs)) as ex:
-            futures = {ex.submit(export_bank, b, output_parent, a.pre_skip): b for b, output_parent in banks}
+            futures = {ex.submit(export_bank, b, output_parent, a.pre_skip, a.cue_sheet): b for b, output_parent in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 b = futures[fut]
                 try:
