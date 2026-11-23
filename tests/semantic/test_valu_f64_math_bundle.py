@@ -177,5 +177,25 @@ class VAddF64SimdIeeeTests(unittest.TestCase):
         # NaN propagation
         self.assertTrue(is_nan_u64(oracle_add_f64(F64_QNAN, f64_to_u64(1.0))))
 
+class VAddF64TranslatorTests(unittest.TestCase):
+    def test_add_f64_translation_and_interp(self):
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(1.5) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(1.5) >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {f64_to_u64(2.5) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(2.5) >> 32) & MASK32:#010x}",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_add_f64_test", lines)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(4.0))
+
+    def test_add_f64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_add_f64", ["v_add_f64"])
+
 if __name__ == "__main__":
     unittest.main()
