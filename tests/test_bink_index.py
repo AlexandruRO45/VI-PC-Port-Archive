@@ -226,6 +226,62 @@ class TestCommandLine(unittest.TestCase):
                              [f"bink_index: error: cannot read {source}: input is locked"])
             self.assertFalse(os.path.exists(out))
 
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the index used to report the
+        # remaining files and exit 0, hiding the incomplete directory.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "inputs")
+            os.mkdir(target)
+            with open(os.path.join(target, "a.bk2"), "wb") as fh:
+                fh.write(make_stream())
+            sub = os.path.join(target, "sub")
+            os.mkdir(sub)
+            with open(os.path.join(sub, "b.bk2"), "wb") as fh:
+                fh.write(make_stream())
+            os.chmod(sub, 0o000)
+            try:
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(bink.main([target]), 2)
+                self.assertIn("bink_index: error:", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+            finally:
+                os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_a_clean_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard went unexercised there. Forcing os.scandir to raise for one
+        # folder gives os.walk the same PermissionError a real lockout would, on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "inputs")
+            os.mkdir(target)
+            with open(os.path.join(target, "a.bk2"), "wb") as fh:
+                fh.write(make_stream())
+            sub = os.path.join(target, "sub")
+            os.mkdir(sub)
+            with open(os.path.join(sub, "b.bk2"), "wb") as fh:
+                fh.write(make_stream())
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(sub))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(bink.os, "scandir", scandir):
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(bink.main([target]), 2)
+            self.assertEqual(err.getvalue().splitlines(),
+                             [f"bink_index: error: cannot read {sub}: Access is denied"])
+            self.assertNotIn("Traceback", err.getvalue())
+
     def test_output_write_failure_is_an_error(self):
         for extension in ("csv", "json"):
             with self.subTest(extension=extension):

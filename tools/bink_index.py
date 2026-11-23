@@ -174,6 +174,12 @@ def scan_file(path, source):
     return rows, stats
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; an index must not report an
+    # incomplete directory as complete. main() turns the OSError into one error line and exit 2.
+    raise exc
+
+
 def scan_target(target, skip_report=None):
     """Index a single container or every file below a directory.
 
@@ -186,7 +192,7 @@ def scan_target(target, skip_report=None):
     if os.path.isdir(target):
         base = target
         paths = []
-        for root, _dirs, files in os.walk(target):
+        for root, _dirs, files in os.walk(target, onerror=_walk_error):
             for name in files:
                 path = os.path.join(root, name)
                 if skip_report is not None and same_output_path(path, skip_report):
