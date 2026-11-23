@@ -247,6 +247,10 @@ void run_checks(const std::filesystem::path& root) {
         write_path(package / "data" / "link-source.txt", "link bytes");
         check(link != nullptr, "CreateHardLinkW resolves");
         if (link) {
+            const BOOL existing_result = link(L"GAME:\\data\\link-source.txt", L"GAME:\\data\\link-source.txt", nullptr);
+            const DWORD existing_error = ::GetLastError();
+            check(!existing_result && existing_error == ERROR_ALREADY_EXISTS,
+                  "existing guest hard link name reports ERROR_ALREADY_EXISTS");
             write_path(package / "data" / "link-fail-source.txt", "failure bytes");
             const std::wstring invalid_destination = L"GAME:\\data\\" + std::wstring(300, L'x');
             check(!link(invalid_destination.c_str(), L"GAME:\\data\\link-fail-source.txt", nullptr),

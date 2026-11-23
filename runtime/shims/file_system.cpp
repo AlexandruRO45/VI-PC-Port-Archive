@@ -1203,7 +1203,8 @@ BOOL WINAPI create_hard_link_w(LPCWSTR link, LPCWSTR existing, LPSECURITY_ATTRIB
     if (source.error) return fail_bool(source.error);
     std::filesystem::path destination;
     DWORD error = 0;
-    if (!copy_destination(link, true, destination, error)) return fail_bool(error);
+    if (!copy_destination(link, true, destination, error))
+        return fail_bool(error == ERROR_FILE_EXISTS ? ERROR_ALREADY_EXISTS : error);
     const Target writable_source = write_target(existing, true);
     if (writable_source.error) return fail_bool(writable_source.error);
     if (::CreateHardLinkW(destination.c_str(), writable_source.path.c_str(), security)) return TRUE;
