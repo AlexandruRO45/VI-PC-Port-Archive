@@ -5641,6 +5641,13 @@ public:
             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
+        // A shader-visible heap with zero descriptors has no host answer: the runtime passes it to the driver,
+        // and WARP removes the device (DXGI_ERROR_DRIVER_INTERNAL_ERROR) while the RTX 3060 driver faults (D3D-434).
+        // Refuse it rather than ask the GPU address arena for an empty range (which it refuses as "full").
+        if ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && !desc->NumDescriptors) {
+            log_once("CreateDescriptorHeap refused (shader-visible, 0 descriptors), type", desc->Type);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         auto* heap = new DescriptorHeap(state_, *desc);
         heap->attach_device(identity());
         if (!heap->ok()) {

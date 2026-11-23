@@ -2300,7 +2300,9 @@ The trace will enumerate them.
   heaps, which needs Resizable BAR, accepts it, so that case is compared only on a host without them); a
   global-realtime queue is `DXGI_ERROR_ACCESS_DENIED` without the privilege; `Map` refuses a
   non-empty read range past the buffer. Not compared, because the host faults or the layer cannot follow it: a null
-  heap-properties or descriptor-heap description (the host faults), more mips than the full chain (the RX 9070 XT
+  heap-properties or descriptor-heap description (the host faults), a shader-visible descriptor heap with zero
+  descriptors (the runtime passes it to the driver: WARP removes the device with `DXGI_ERROR_DRIVER_INTERNAL_ERROR`,
+  the RTX 3060 driver faults; the layer refuses it with `E_INVALIDARG`, D3D-434), more mips than the full chain (the RX 9070 XT
   runtime keeps up to 16 on a 16×16 texture and dies on 17), `D32_FLOAT` and `D16_UNORM` as render targets and the R32
   and R16 colour formats as depth buffers (accepted by the host; the layer creates the Vulkan format of the same name,
   and the Vulkan drivers measured can't make that attachment, so the test prints these instead of failing),
