@@ -1215,6 +1215,12 @@ if(TARGET Vulkan::Headers)
     endforeach()
     add_test(NAME d3d12_trace COMMAND "${Python3_EXECUTABLE}" -I
              "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>" ${_trace_runner})
+    # LEONIDA_VK_VALIDATION=1 with and without the layer: the GPU tests' device reports its deliberate invalid call,
+    # or says that validation is not active; never 0 errors from a layer that was not loaded (vk_test_device.h).
+    add_test(NAME vk_validation_probe COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_validation_probe.py" "$<TARGET_FILE:d3d12_com_test>"
+             ${_trace_runner})
+    set_tests_properties(vk_validation_probe PROPERTIES SKIP_RETURN_CODE 77)
 
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
     add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)

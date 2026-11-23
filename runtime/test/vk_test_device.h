@@ -2,6 +2,9 @@
 // VK_KHR_synchronization2) with dynamicRendering, synchronization2, timelineSemaphore and
 // separateDepthStencilLayouts, images, buffers and one-shot submissions.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; Device::validation_errors() counts errors.
+// The layer is asked for when the loader lists it; otherwise (Wine's loader lists none) it must come from outside the
+// program, through VK_INSTANCE_LAYERS. Either way a deliberate invalid call after device creation must be reported,
+// or the device fails with "validation is not active": a test never reports 0 errors from a layer that was not there.
 #pragma once
 
 #include "vulkan_loader.h"
@@ -163,6 +166,20 @@ public:
     }
 
     unsigned validation_errors() const { return validation_error_count(); }
+
+    // Whether the loader lists the instance extension `name` (without a layer).
+    bool instance_extension_listed(const char* name) const {
+        const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
+        std::vector<VkExtensionProperties> extensions;
+        if (!enumerate || enumerate_all(extensions, [&](std::uint32_t* count, VkExtensionProperties* values) {
+                return enumerate(nullptr, count, values);
+            }) != VK_SUCCESS)
+            return false;
+        for (const auto& e : extensions)
+            if (std::strcmp(e.extensionName, name) == 0) return true;
+        return false;
+    }
     unsigned known_validation_errors() const { return known_validation_error_count(); }
 
     // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
@@ -240,14 +257,24 @@ public:
             if (layer_result != VK_SUCCESS) return failure("vkEnumerateInstanceLayerProperties", layer_result);
             bool found = false;
             for (const auto& properties : layers) found = found || std::strcmp(properties.layerName, layer) == 0;
-            if (!found) {
-                std::fprintf(stderr, "LEONIDA_VK_VALIDATION is set but %s is not installed\n", layer);
-                return DeviceStatus::failed;
+            if (found) {
+                instance_info.enabledLayerCount = 1;
+                instance_info.ppEnabledLayerNames = &layer;
+            } else {
+                // Wine's vulkan-1.dll lists no layers and refuses every explicit one, but the host's layer, loaded by
+                // the host's loader through VK_INSTANCE_LAYERS, still validates and reports through the messenger.
+                // validation_probe() after device creation tells whether such a layer is really there.
+                if (!instance_extension_listed(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+                    std::fprintf(stderr, "LEONIDA_VK_VALIDATION is set but the Vulkan loader lists neither %s nor "
+                                         "VK_EXT_debug_utils\n", layer);
+                    return DeviceStatus::failed;
+                }
+                std::fprintf(stderr, "LEONIDA_VK_VALIDATION: the Vulkan loader does not list %s; relying on a "
+                                     "layer enabled outside this program (VK_INSTANCE_LAYERS), checked by a probe\n",
+                             layer);
             }
             instance_info.pNext = &validation_features;
-            instance_info.enabledLayerCount = 1;
-            instance_info.ppEnabledLayerNames = &layer;
-            debug_utils = true;  // the validation layer provides it
+            debug_utils = true;  // the validation layer provides it; the loader too, when the layer is not listed
         } else if (request_debug_utils) {
             const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
                 instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
@@ -593,7 +620,33 @@ public:
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pool.queueFamilyIndex = family;
         result = fn<PFN_vkCreateCommandPool>("vkCreateCommandPool")(device, &pool, nullptr, &pool_);
-        return result == VK_SUCCESS ? DeviceStatus::ready : failure("vkCreateCommandPool", result);
+        if (result != VK_SUCCESS) return failure("vkCreateCommandPool", result);
+        if (validation && !validation_probe()) {
+            std::fprintf(stderr, "LEONIDA_VK_VALIDATION is set but validation is not active: a deliberate invalid "
+                                 "call was not reported (on Windows, install the Vulkan SDK; under Wine, set "
+                                 "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation before wine)\n");
+            return DeviceStatus::failed;
+        }
+        return DeviceStatus::ready;
+    }
+
+    // Whether a validation layer is really watching this device: a buffer with no usage bits breaks
+    // VUID-VkBufferCreateInfo-usage-requiredbitmask, a stateless check the layer always runs and drivers survive. The
+    // probe's own error is taken back off the count.
+    bool validation_probe() {
+        const unsigned errors = validation_error_count();
+        std::fprintf(stderr, "validation probe: one deliberate error follows (a buffer with usage 0)\n");
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = 256;
+        info.usage = 0;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer probe = VK_NULL_HANDLE;
+        if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &info, nullptr, &probe) == VK_SUCCESS && probe)
+            fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device, probe, nullptr);
+        const bool reported = validation_error_count() > errors;
+        validation_error_count() = errors;
+        std::fprintf(stderr, "validation probe: %s\n", reported ? "reported, validation is active" : "not reported");
+        return reported;
     }
 
     bool depth_format_usable(VkFormat format) const {

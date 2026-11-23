@@ -212,6 +212,12 @@ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation LEONIDA_VK_VALIDATION=1 LEONIDA_D
 `CURRENT-VALIDATION-ENABLED` report (with Synchronization) shows it was active, fails on any `Validation Error`
 line, and skips (77) where no layer is active.
 
+The GPU test programs that count validation errors themselves (`vk_test_device.h`: `d3d12_*_test` and others) do the
+same under Wine: when the loader does not list the layer they rely on one enabled from outside, and every device
+makes one deliberate invalid call (a buffer with no usage bits) that must come back as a validation error. If it
+does not, the test fails with "validation is not active" instead of reporting 0 errors. `ctest -R vk_validation_probe`
+checks both sides with `d3d12_com_test`.
+
 Start each `xvfb-run` with the prefix's Wine processes gone (`WINEPREFIX=... wineserver -k`, or `wineserver -w` to
 wait), or run everything under one `xvfb-run` as `ctest` does. `xvfb-run -a` gives every run its own X display and
 closes it when the run ends, while the prefix's `wineserver` and `explorer.exe` stay a few seconds longer, still
