@@ -5,6 +5,7 @@
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "../src/debug_label.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -98,10 +99,11 @@ const char* name(leonida::ReplayResult result) {
 
 // The label of a SetMarker/BeginEvent call, as UTF-8. Metadata says what the data is (WinPixEventRuntime's
 // pix3_win.h: PIX_EVENT_UNICODE_VERSION 0, a UTF-16 string; PIX_EVENT_ANSI_VERSION 1, an ANSI string;
-// PIX_EVENT_PIX3BLOB_VERSION 2, PIX's own encoded event). Strings end at their terminator or at `size` bytes. The
-// PIX3 blob is not decoded (its console form is unmeasured, docs/d3d12_vulkan.md section 4.10); it gets a fixed
-// label, so the event still nests.
-std::string event_label(UINT metadata, const void* data, UINT size) {
+// PIX_EVENT_PIX3BLOB_VERSION 2 and WINPIX_EVENT_PIX3BLOB_V2, PIX's own encoded events, read by src/debug_label.h).
+// Strings end at their terminator or at `size` bytes. A blob that does not decode (its console form is unmeasured,
+// docs/d3d12_vulkan.md question 21) gets a fixed label, so the event still nests. `context` is the interface the
+// call came through, which a PC V2 blob repeats after its colour.
+std::string event_label(UINT metadata, const void* data, UINT size, const void* context) {
     if (!data || !size) return {};
     std::wstring wide;
     if (metadata == 0) {
@@ -119,7 +121,12 @@ std::string event_label(UINT metadata, const void* data, UINT size) {
         wide.resize(std::size_t(std::max(count, 0)));
         if (count > 0) MultiByteToWideChar(CP_ACP, 0, text, int(n), wide.data(), count);
     } else {
-        if (metadata != 2) stub("SetMarker/BeginEvent with unknown metadata");
+        if (metadata != leonida::pix::blob_version && metadata != leonida::pix::blob_v2)
+            stub("SetMarker/BeginEvent with unknown metadata");
+        leonida::DecodedLabel label;
+        if (leonida::decode_event(metadata, data, size, reinterpret_cast<std::uint64_t>(context), label) &&
+            !label.name.empty())
+            return label.name;
         return "PIX event";
     }
     if (wide.empty()) return {};
@@ -745,11 +752,13 @@ public:
     // names the call only, never the label.
     void STDMETHODCALLTYPE SetMarker(UINT metadata, const void* data, UINT size) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetMarker");
-        check(list_.marker(leonida::DebugMarker::Kind::set, event_label(metadata, data, size)));
+        check(list_.marker(leonida::DebugMarker::Kind::set,
+                           event_label(metadata, data, size, static_cast<ID3D12GraphicsCommandList*>(this))));
     }
     void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void* data, UINT size) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::BeginEvent");
-        check(list_.marker(leonida::DebugMarker::Kind::begin, event_label(metadata, data, size)));
+        check(list_.marker(leonida::DebugMarker::Kind::begin,
+                           event_label(metadata, data, size, static_cast<ID3D12GraphicsCommandList*>(this))));
     }
     void STDMETHODCALLTYPE EndEvent() override {
         d3d12_trace::record("ID3D12GraphicsCommandList::EndEvent");
@@ -1666,7 +1675,7 @@ private:
     }
 
     void marker(leonida::DebugMarker::Kind kind, UINT metadata, const void* data, UINT size) {
-        const std::string label = event_label(metadata, data, size);
+        const std::string label = event_label(metadata, data, size, static_cast<ID3D12CommandQueue*>(this));
         std::lock_guard lock(mutex_);
         queue_.marker(kind, label.c_str());
     }

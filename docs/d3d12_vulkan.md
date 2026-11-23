@@ -3461,9 +3461,13 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
   `ExecuteCommandLists` calls.
 - **Labels.** The `Metadata` argument says what the data is, following WinPixEventRuntime's `pix3_win.h`:
   0 (`PIX_EVENT_UNICODE_VERSION`) a UTF-16 string, 1 (`PIX_EVENT_ANSI_VERSION`) an ANSI string, both cut at the
-  terminator or at `Size` bytes and converted to UTF-8; 2 (`PIX_EVENT_PIX3BLOB_VERSION`) PIX's own encoded event,
-  which is not decoded and gets the fixed label `PIX event` so the nesting is still visible (question 21). Other
-  values get the same label and log once.
+  terminator or at `Size` bytes and converted to UTF-8; 2 (`PIX_EVENT_PIX3BLOB_VERSION`) and 6345127
+  (`WINPIX_EVENT_PIX3BLOB_V2`) are PIX's own encoded events, decoded by `runtime/src/debug_label.h` with the PC
+  layouts of WinPixEventRuntime's `PIXEventsLegacy.h` and `PIXEvents.h` (the format string is kept, its printf
+  arguments are not applied, as vkd3d-proton does). In a V2 blob the context word after the colour is skipped only
+  when it equals the interface the call came through, so PIX_XBOX builds, which write none, decode too. A blob that
+  does not decode keeps the fixed label `PIX event`, so the nesting is still visible (question 21). Other values get
+  the same label and log once.
 - **Private data, on every object.** `SetPrivateData`, `GetPrivateData`, `SetPrivateDataInterface` and `SetName`
   live in the shared `Object` base, so the device, queues, allocators, lists, fences, descriptor heaps and
   resources all have them. Every answer is the host runtime's: `d3d12_private_data_test` runs the same 672 steps
@@ -3863,7 +3867,7 @@ nothing is copied from their trees.
 | 18 | Does the game alias buffers/images in a heap, or use reserved/tiled resources? | Trace `CreatePlacedResource` ranges, aliasing barriers, `CreateReservedResource` and tile mappings. If yes, implement shared memory per heap range or fall back to linear allocations with a clear log. Shaders: 30 declare `TILED_RESOURCES` in SFI0 (`tools/feature_scan.py`), so reserved/tiled resources are likely used. Placed resources are D3D-16 and reserved resources D3D-20 (#313). |
 | 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. **Origin measured** (section "Root-signature flag quirk"): in the package only `XboxBvhBuilder.dll` sets them, in its 52 compiled `RTS0` parts and unconditionally at `0xc30e` before serialising; the FSR DLL's 29 `RTS0` parts carry 0. Compare against the public flag enum and observe the game's behaviour with and without the mask; check whether the executable's root signatures carry them. |
 | 20 | Which of the BVH builder's 52 `FSSM` programs does the game actually use, and do the translated programs match a reference? | Dump the slot-62 compute PSOs on the first RT frame and map each to its container by the `ILDN` name; 51/52 pass `spirv-val` today and the one missing rule is named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. 42/52 pass `spirv-val` today and the four missing rules are named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
-| 21 | Which `Metadata` values and blob format does the console's PIX use for `SetMarker`/`BeginEvent`? The layer reads 0 and 1 as strings and labels 2 (the PC PIX3 blob) `PIX event` (section 4.10). | Log the `Metadata` values the game passes; if it is 2, decode the console blob from the executable's PIX calls rather than assuming the PC WinPixEventRuntime layout. |
+| 21 | Which `Metadata` values and blob format does the console's PIX use for `SetMarker`/`BeginEvent`? The layer reads 0 and 1 as strings and decodes 2 and 6345127 with the PC PIX3 blob layouts, falling back to `PIX event` (section 4.10). | Log the `Metadata` values the game passes; if it is 2, decode the console blob from the executable's PIX calls rather than assuming the PC WinPixEventRuntime layout. |
 | 22 | Does the game ask `CheckFeatureSupport(D3D12_OPTIONS5)` for `RaytracingTier` and switch ray tracing off when it reads `NOT_SUPPORTED`? The layer answers `NOT_SUPPORTED` because full DXR (`CreateStateObject`, `DispatchRays`) is not implemented, even though the XDXR acceleration-structure path the game's own traversal shaders use is ([bvh.md](bvh.md) §7a). On the console, ray tracing is always present, so the game may never ask. | The first-boot trace (`--trace-d3d12`) logs every `CheckFeatureSupport` call and its answer. If the game asks and gates its RT on the tier, decide with the maintainer whether to report `TIER_1_0`/`1_1` for this game while `DispatchRays` stays unimplemented; until then, keep the conservative answer. |
 
 ## 9. Risks and non-goals

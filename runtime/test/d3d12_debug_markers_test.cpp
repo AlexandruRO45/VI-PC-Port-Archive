@@ -134,7 +134,10 @@ int run_markers(ID3D12Device* device) {
     const wchar_t nested[] = L"nested café";
     const char ansi[] = "ansi pass and more";
     const wchar_t spans[] = L"spans two lists";
-    const std::uint64_t blob[2] = {0x1234, 0x5678};
+    // A legacy PIX3 blob as PIXEventsLegacy.h writes it: event info (BeginEvent_NoArgs), colour, string info (ANSI),
+    // then the string packed into words up to a zero character.
+    std::uint64_t blob[5] = {0x002ull << 10, 0xFF336699, (8ull << 55) | (1ull << 54), 0, 0};
+    std::memcpy(&blob[3], "pix pass", 8);
     first->SetMarker(0, frame, sizeof(frame));
     first->SetMarker(0, nullptr, 0);
     first->BeginEvent(1, ansi, 9);  // "ansi pass"
@@ -329,12 +332,12 @@ int main() {
             "cmd begin spans two lists",
             "cmd end",
             "cmd end",
-            "cmd begin PIX event",
+            "cmd begin pix pass",
             "cmd end",  // closed with the submission
             "queue insert after",
             "queue end",
             // the second list alone: its two leading ends have nothing open, the PIX event is closed at its end
-            "cmd begin PIX event",
+            "cmd begin pix pass",
             "cmd end",
         };
         for (std::size_t i = 0; i < g_calls.size() || i < want.size(); ++i) {
