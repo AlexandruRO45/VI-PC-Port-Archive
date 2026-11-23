@@ -355,3 +355,42 @@ class TestSaluAndn2B32ConditionCodes(unittest.TestCase):
         sdst, scc = ref_andn2_b32(0, 0x55555555)
         self.assertEqual(sdst, 0)
         self.assertEqual(scc, 0)
+
+
+class TestSaluAndn2B32BitwiseEdgeCases(unittest.TestCase):
+    """Test suite for 32-bit IEEE-754 bit representations and boundary bitmasks."""
+
+    def test_ieee754_single_precision_bit_patterns(self):
+        cases = [
+            0x7F800000,  # +inf
+            0xFF800000,  # -inf
+            0x7FC00000,  # Quiet NaN
+            0x7F800001,  # Signaling NaN
+            0x00000000,  # +0.0
+            0x80000000,  # -0.0
+            0x00000001,  # Minimum subnormal
+            0x007FFFFF,  # Maximum subnormal
+        ]
+        for p0 in cases:
+            for p1 in cases:
+                with self.subTest(p0=hex(p0), p1=hex(p1)):
+                    sdst, scc = ref_andn2_b32(p0, p1)
+                    expected = p0 & (~p1 & MASK32)
+                    self.assertEqual(sdst, expected)
+                    self.assertEqual(scc, int(expected != 0))
+
+    def test_boundary_alternating_bitmasks(self):
+        checkerboards = [
+            0x55555555,
+            0xAAAAAAAA,
+            0x33333333,
+            0xCCCCCCCC,
+            0x0F0F0F0F,
+            0xF0F0F0F0,
+            0x00FF00FF,
+            0xFF00FF00,
+        ]
+        for cb0 in checkerboards:
+            for cb1 in checkerboards:
+                sdst, scc = ref_andn2_b32(cb0, cb1)
+                self.assertEqual(sdst, cb0 & (~cb1 & MASK32))
