@@ -298,5 +298,43 @@ class SXorB32RegisterAliasingTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr(2), 0x11 ^ 0x22)
         self.assertEqual(state.get_sgpr(3), 0x44)
 
+class SXorB32ConditionCodesTests(unittest.TestCase):
+    def test_scc_nonzero_and_zero_transitions(self):
+        state = ScalarRegisterState()
+        # Non-zero result sets SCC to 1
+        state.set_sgpr(0, 1)
+        state.set_sgpr(1, 0)
+        ast1 = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 2),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        execute_scalar_xor_b32(state, ast1)
+        self.assertEqual(state.scc, 1)
+
+        # Zero result transitions SCC to 0
+        state.set_sgpr(0, 0x55555555)
+        state.set_sgpr(1, 0x55555555)
+        ast2 = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 2),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        execute_scalar_xor_b32(state, ast2)
+        self.assertEqual(state.scc, 0)
+
+    def test_scc_msb_and_lsb_activation(self):
+        # MSB (bit 31) only set -> non-zero -> SCC == 1
+        res, scc = oracle_xor_b32(0, 0x80000000)
+        self.assertEqual(res, 0x80000000)
+        self.assertEqual(scc, 1)
+
+        # LSB (bit 0) only set -> non-zero -> SCC == 1
+        res, scc = oracle_xor_b32(0, 1)
+        self.assertEqual(res, 1)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
