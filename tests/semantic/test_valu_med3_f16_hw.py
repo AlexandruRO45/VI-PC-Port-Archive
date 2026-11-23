@@ -153,5 +153,79 @@ class TestVMed3F16Oracle(unittest.TestCase):
         self.assertEqual(v_med3_f16_oracle(0xC200, 0xC000, 0xBC00, clamp=True), F16_POS_ZERO)
 
 
+# Append AST definitions to file
+@dataclasses.dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index must be in [0, 255], got {self.index}")
+
+
+@dataclasses.dataclass(frozen=True)
+class ImmF16:
+    raw: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.raw <= 0xFFFF):
+            raise ValueError(f"ImmF16 raw bits must be in [0, 0xFFFF], got {self.raw}")
+
+
+class ALUOp(enum.Enum):
+    V_MED3_F16 = "v_med3_f16"
+
+
+@dataclasses.dataclass(frozen=True)
+class VMed3F16Instruction:
+    dst: VGPR
+    src0: Union[VGPR, ImmF16]
+    src1: Union[VGPR, ImmF16]
+    src2: Union[VGPR, ImmF16]
+    op_sel: Tuple[int, int, int, int] = (0, 0, 0, 0)  # (s0, s1, s2, dst)
+    clamp: bool = False
+    neg0: bool = False
+    neg1: bool = False
+    neg2: bool = False
+    abs0: bool = False
+    abs1: bool = False
+    abs2: bool = False
+
+    def __post_init__(self) -> None:
+        for b in self.op_sel:
+            if b not in (0, 1):
+                raise ValueError(f"op_sel bits must be 0 or 1, got {self.op_sel}")
+
+
+class TestVMed3F16AST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation(self) -> None:
+        inst = VMed3F16Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=VGPR(2),
+            src2=ImmF16(0x3C00),
+            op_sel=(1, 0, 0, 1),
+            clamp=True,
+        )
+        self.assertEqual(inst.dst.index, 0)
+        self.assertEqual(inst.src0.index, 1)
+        self.assertEqual(inst.op_sel, (1, 0, 0, 1))
+        self.assertTrue(inst.clamp)
+
+    def test_ast_vgpr_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+
+    def test_ast_op_sel_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            VMed3F16Instruction(
+                dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
+                op_sel=(2, 0, 0, 0)
+            )
+
 if __name__ == "__main__":
     unittest.main()
