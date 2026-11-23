@@ -380,6 +380,16 @@ class Gen:
         self.n += 1
         return f"%t{self.n}"
 
+    def ford_ne(self, x, y, result=None):
+        """Ordered not-equal of two floats (false when either is NaN), emitted as OpFOrdLessThan || OpFOrdGreaterThan:
+        the same IEEE predicate as OpFOrdNotEqual, which MoltenVK 1.4.2 evaluates as the unordered `!=` (true on
+        NaN; ps_vcmp_f32_nan, ps_vcmp_f16 on an Apple M5). `result` names the id to define, else a new one."""
+        lt, gt, b = self.tmp(), self.tmp(), result or self.tmp()
+        self.emit(f"{lt} = OpFOrdLessThan %bool {x} {y}")
+        self.emit(f"{gt} = OpFOrdGreaterThan %bool {x} {y}")
+        self.emit(f"{b} = OpLogicalOr %bool {lt} {gt}")
+        return b
+
     def cu(self, v):
         v &= 0xFFFFFFFF
         if v not in self.consts:
@@ -1733,6 +1743,8 @@ class Gen:
                 self.emit(f"{b} = OpCopyObject %bool {'%false' if cond == 'f' else '%true'}")
         elif cond not in ops:
             raise Unsupported(op)
+        elif ops[cond] == "OpFOrdNotEqual":     # lg: not as OpFOrdNotEqual, which MoltenVK gets wrong (ford_ne)
+            self.ford_ne(x, y, result=b)
         else:
             self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
         if scalar and ty in ("u32", "i32") and use_wave_equal:
@@ -9371,8 +9383,8 @@ class Gen:
                 self.emit(f"{np} = OpFNegate %double {pmul}")
                 self.emit(f"{pe_raw} = OpExtInst %double %glsl Fma {x} {y} {np}")
                 self.emit(f"{p_z} = OpFOrdEqual %bool {pmul} {d0}")
-                self.emit(f"{x_nz} = OpFOrdNotEqual %bool {x} {d0}")
-                self.emit(f"{y_nz} = OpFOrdNotEqual %bool {y} {d0}")
+                self.ford_ne(x, d0, result=x_nz)
+                self.ford_ne(y, d0, result=y_nz)
                 self.emit(f"{xy_nz} = OpLogicalAnd %bool {x_nz} {y_nz}")
                 self.emit(f"{p_uf} = OpLogicalAnd %bool {p_z} {xy_nz}")
                 xv2, xhi, yv2, yhi, xysgn, psgn, pe_uf_v2, pe_uf, pe = (self.tmp() for _ in range(9))
@@ -9396,7 +9408,7 @@ class Gen:
                 self.emit(f"{s_df_se} = OpFAdd %double {s_df} {se}")
                 self.emit(f"{rem} = OpFAdd %double {s_df_se} {pe}")
                 rem_nz, rem_pos, phi_pos, same_sgn, adj1, do_adj = (self.tmp() for _ in range(6))
-                self.emit(f"{rem_nz} = OpFOrdNotEqual %bool {rem} {d0}")
+                self.ford_ne(rem, d0, result=rem_nz)
                 self.emit(f"{rem_pos} = OpFOrdGreaterThan %bool {rem} {d0}")
                 self.emit(f"{phi_pos} = OpFOrdGreaterThan %bool {f_plain} {d0}")
                 self.emit(f"{same_sgn} = OpLogicalEqual %bool {rem_pos} {phi_pos}")
