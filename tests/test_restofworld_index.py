@@ -297,6 +297,27 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_bad_archive_header_is_refused_before_writing_a_report(self):
+        wrong = b"NOPE" + struct.pack("<I", 16) + bytes(8) + zlib.compress(text())
+        cases = (
+            (wrong, [], "not an RPF9 archive"),
+            (wrong, ["--start", "16"], "not an RPF9 archive"),
+            (b"9FPR\x10", [], "truncated RPF9 header"),
+        )
+        for payload, args, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic, args=args):
+                source = os.path.join(self.root, "bad-header.rpf")
+                out = os.path.join(self.root, "bad-header.json")
+                with open(source, "wb") as f:
+                    f.write(payload)
+
+                proc = subprocess.run([sys.executable, "-I", TOOL, source, out, "--quiet", *args],
+                                      capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn(diagnostic, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
     def test_missing_source_is_an_error_not_a_traceback(self):
         out = os.path.join(self.root, "missing.json")
         proc = subprocess.run([sys.executable, "-I", TOOL, os.path.join(self.root, "nope.rpf"), out, "--quiet"],
