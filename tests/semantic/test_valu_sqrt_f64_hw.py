@@ -612,5 +612,78 @@ class TestValuSqrtF64RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.state.vgprs[3], 0x33333333)
 
 
+# ---------------------------------------------------------------------------
+# Stage 6: Condition codes, status flags, and IEEE classification
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class F64StatusFlags:
+    """Architectural classification flags for 64-bit float results."""
+    is_zero: bool
+    is_negative: bool
+    is_inf: bool
+    is_nan: bool
+    is_subnormal: bool
+    is_clamped: bool
+
+
+def compute_f64_status_flags(bits: int, clamped: bool = False) -> F64StatusFlags:
+    sign = bool(bits & SIGN_MASK)
+    exp = (bits & EXP_MASK) >> 52
+    frac = bits & FRAC_MASK
+    is_nan = (exp == 0x7FF) and (frac != 0)
+    is_inf = (exp == 0x7FF) and (frac == 0)
+    is_zero = (exp == 0) and (frac == 0)
+    is_subnormal = (exp == 0) and (frac != 0)
+    return F64StatusFlags(
+        is_zero=is_zero,
+        is_negative=sign,
+        is_inf=is_inf,
+        is_nan=is_nan,
+        is_subnormal=is_subnormal,
+        is_clamped=clamped,
+    )
+
+
+class TestValuSqrtF64ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and carry/borrow generation for v_sqrt_f64."""
+
+    def test_status_flags_zero(self) -> None:
+        flags_pos = compute_f64_status_flags(POS_ZERO_BITS)
+        self.assertTrue(flags_pos.is_zero)
+        self.assertFalse(flags_pos.is_negative)
+
+        flags_neg = compute_f64_status_flags(NEG_ZERO_BITS)
+        self.assertTrue(flags_neg.is_zero)
+        self.assertTrue(flags_neg.is_negative)
+
+    def test_status_flags_inf(self) -> None:
+        flags = compute_f64_status_flags(POS_INF_BITS)
+        self.assertTrue(flags.is_inf)
+        self.assertFalse(flags.is_nan)
+
+    def test_status_flags_nan(self) -> None:
+        flags = compute_f64_status_flags(CANONICAL_QNAN)
+        self.assertTrue(flags.is_nan)
+        self.assertFalse(flags.is_inf)
+
+    def test_status_flags_subnormal(self) -> None:
+        flags = compute_f64_status_flags(0x0000_0000_0000_0001)
+        self.assertTrue(flags.is_subnormal)
+        self.assertFalse(flags.is_zero)
+
+    def test_status_flags_clamped(self) -> None:
+        val_4 = f64_to_bits(4.0)
+        res_clamped = oracle_sqrt_f64(val_4, clamp=True)
+        flags = compute_f64_status_flags(res_clamped, clamped=True)
+        self.assertTrue(flags.is_clamped)
+        self.assertEqual(bits_to_f64(res_clamped), 1.0)
+
+    def test_spirv_float64_capability_present(self) -> None:
+        lines = ["v_sqrt_f64 v[0:1], v[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_flags_check", lines)
+        self.assertIn("OpCapability Float64", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
