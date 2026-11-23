@@ -655,5 +655,29 @@ class TestSNandB64ReferenceOracle(unittest.TestCase):
         res_same, _ = oracle_s_nand_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
         self.assertIsInstance(res_same, int)
 
+class TestSNandB64ASTAndInterpreter(unittest.TestCase):
+    """Symbolic AST definitions and scalar interpreter execution for s_nand_b64."""
+
+    def test_ast_to_asm(self) -> None:
+        inst = SOP2_64Instruction(SALUOpcode.S_NAND_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
+        self.assertEqual(inst.to_asm(), "s_nand_b64 s[4:5], s[0:1], s[2:3]")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = SALUMachineState()
+        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
+        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
+        inst = SOP2_64Instruction(SALUOpcode.S_NAND_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
+        res, scc = state.step(inst)
+        self.assertEqual(res, state.read_pair(SGPRPair(4)))
+        self.assertEqual(scc, state.scc)
+
+    def test_register_aliasing_dst_src0(self) -> None:
+        state = SALUMachineState()
+        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
+        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
+        inst = SOP2_64Instruction(SALUOpcode.S_NAND_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
+        res, scc = state.step(inst)
+        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+
 if __name__ == "__main__":
     unittest.main()
