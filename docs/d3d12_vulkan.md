@@ -3454,8 +3454,15 @@ reports one (D3D-264). Implemented in `runtime/src/vulkan_breadcrumbs.h`, `runti
   device's distinct families, as its other resources are; with one family it stays `EXCLUSIVE`.
   Replay and `emit()` are not changed.
 - **States, never inferred from the CPU.** *Submitted*: `vkQueueSubmit` succeeded, nothing more; a failed
-  submission forgets its lists. *Started*: the GPU wrote the tag into the begin word. *Completed*: it wrote the
-  end word. *Unknown*: the ring runs CPU only (no `VK_AMD_buffer_marker`), records no markers and knows only that
+  submission forgets its lists. *Started*: the GPU wrote the tag into the begin word. Vulkan orders that
+  write after every earlier command of the queue has started, but not before the list's own commands, so
+  *started* says where the GPU got in the queue, not that a command of the list ran, and a list can already
+  run while it still reads *submitted*: both are lower bounds. "Queue" here is the Vulkan queue: D3D12
+  queues that share one VkQueue (when the GPU has no free one) are ordered together, so a list can read
+  *submitted* only because another D3D12 queue's list ahead of it on that VkQueue has not finished.
+  *Completed*: it wrote the end word, after every command of the list finished executing (which does not
+  make their memory writes visible).
+  *Unknown*: the ring runs CPU only (no `VK_AMD_buffer_marker`), records no markers and knows only that
   the list was submitted, on which queue; such a list is never reported as started or completed. Because every list gets a new tag, a slot needs no clearing: an older tag still in the word reads as
   "not yet". Queues share the ring; a slot handed to a later list drops the earlier one from the history, which is
   sorted by when each list was marked.
