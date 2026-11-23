@@ -681,6 +681,13 @@ The compute path, end to end:
     topology, stencil references and the blend factor are dynamic, and so are vertex strides when the pipeline has
     vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not declare the stride
     state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
+  - **Blending and integer targets:** a UINT or SINT render target cannot blend. The PC runtime refuses a pipeline
+    (`E_INVALIDARG`) that enables blending for an integer target its pixel shader writes; with the shader leaving that
+    target unwritten, with no pixel shader, or with the target not bound, the pipeline is accepted. Measured on
+    NVIDIA and WARP over every render-target format (exactly the integer ones are not blendable), as target 0 and as
+    target 1 under shared and independent blend states; `d3d12_blend_format_test` repeats a sample of it on the host
+    adapter and WARP and compares the layer. The layer refuses the same pipelines, and leaves `blendEnable` off for an
+    integer target it accepts one for, since Vulkan needs the format's blend feature for it.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.

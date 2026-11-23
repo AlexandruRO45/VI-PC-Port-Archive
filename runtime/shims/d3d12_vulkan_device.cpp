@@ -291,6 +291,25 @@ bool alpha_unused(DXGI_FORMAT format) {
            format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
 }
 
+// The UINT and SINT render-target formats, which cannot blend (D3D12 and Vulkan agree on this one).
+bool integer_render_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -2800,11 +2819,25 @@ public:
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
         depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
 
+        // The PC runtime (NVIDIA and WARP) refuses blending that a pixel shader's output meets on an integer target:
+        // E_INVALIDARG when a bound integer render target has blending enabled and the pixel shader writes that target.
+        // An integer target the shader leaves unwritten (or a pipeline with no pixel shader) is accepted. Vulkan needs
+        // the format's BLEND feature for blendEnable at all, so those targets get it off below.
+        for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
+            const D3D12_RENDER_TARGET_BLEND_DESC& b =
+                desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
+            if (!b.BlendEnable || !integer_render_format(desc.RTVFormats[i]) || !stages[2].entry) continue;
+            const auto& written = stages[2].entry->outputs;
+            if (std::find(written.begin(), written.end(), i) == written.end()) continue;
+            log_once("blending enabled for an integer render target the pixel shader writes; format",
+                     desc.RTVFormats[i]);
+            return E_INVALIDARG;
+        }
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             const D3D12_RENDER_TARGET_BLEND_DESC& b =
                 desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
-            blends[i].blendEnable = b.BlendEnable;
+            blends[i].blendEnable = b.BlendEnable && !integer_render_format(desc.RTVFormats[i]);
             blends[i].srcColorBlendFactor = blend_factor(b.SrcBlend);
             blends[i].dstColorBlendFactor = blend_factor(b.DestBlend);
             blends[i].colorBlendOp = blend_op(b.BlendOp);
