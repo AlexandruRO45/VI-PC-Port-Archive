@@ -437,6 +437,22 @@ void test_physical_pages(const PhysicalApi& api) {
     uint64_t zero_count = 0;
     check(api.allocate(0x280, &zero_count, nullptr) == TRUE, "allocating zero pages succeeds");
     check(api.allocate(0x280, nullptr, pages) == FALSE, "a null count fails");
+
+    // Null addresses must be rejected with ERROR_INVALID_PARAMETER, including on unmap paths.
+    SetLastError(0);
+    check(api.map(nullptr, 1, nullptr) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "XMemMapPhysicalPages(nullptr, 1, nullptr) fails with ERROR_INVALID_PARAMETER");
+    SetLastError(0);
+    check(api.map(nullptr, 0, nullptr) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "XMemMapPhysicalPages(nullptr, 0, nullptr) fails with ERROR_INVALID_PARAMETER");
+    void* const null_addr[1] = {nullptr};
+    const uint64_t zero_page[1] = {0};
+    SetLastError(0);
+    check(api.scatter(null_addr, 1, nullptr) == FALSE && GetLastError() == ERROR_INVALID_PARAMETER,
+          "XMemMapPhysicalPagesScatter([nullptr], 1, nullptr) fails with ERROR_INVALID_PARAMETER");
+    SetLastError(0);
+    check(api.scatter(null_addr, 1, zero_page) == FALSE && GetLastError() == ERROR_INVALID_PARAMETER,
+          "XMemMapPhysicalPagesScatter([nullptr], 1, [0]) fails with ERROR_INVALID_PARAMETER");
     // The windows were split into one placeholder per page; the process exit releases them.
 }
 

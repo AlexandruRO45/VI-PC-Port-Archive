@@ -463,7 +463,7 @@ DWORD view_protect(const Window& window) {
     return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
 }
 
-bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
+bool aligned_page_address(uintptr_t address) { return address != 0 && (address & (kPhysicalPageSize - 1)) == 0; }
 
 // gta6rt --trace FILE: the first XMemAllocatePhysicalPages for each distinct attribute word goes to the startup trace
 // as an "xmem_physical_pages" event with the page count and the caller.
