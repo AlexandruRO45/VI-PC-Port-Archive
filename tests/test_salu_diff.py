@@ -249,6 +249,27 @@ class OracleGuards(unittest.TestCase):
             d.hw_prepare(mock_oracle, programs)
         self.assertIn("the hardware runner returned 1 results for 2 programs", str(ctx.exception))
 
+    def test_hw_prepare_refuses_a_none_batch_result(self):
+        mock_oracle = unittest.mock.MagicMock()
+        mock_oracle.arch = "gfx1030"
+        mock_oracle.run.return_value = None
+        with self.assertRaises(RuntimeError) as ctx:
+            d.hw_prepare(mock_oracle, [["s_mov_b32 s4, 0"]])
+        self.assertIn("no result from the hardware runner", str(ctx.exception))
+
+    def test_main_exits_2_on_a_none_batch_result(self):
+        mock_oracle = unittest.mock.MagicMock()
+        mock_oracle.arch = "gfx1030"
+        mock_oracle.device = "mock device"
+        mock_oracle.run.return_value = None
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("hw_oracle.runner.open_oracle", return_value=mock_oracle):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = d.main(["--oracle", "hw", "--programs", "2", "--seed", "1"])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: no result from the hardware runner", out.getvalue())
+        mock_oracle.close.assert_called_once()
+
     def test_check_refuses_none_or_short_hw_results(self):
         lines = ["s_mov_b32 s4, 0"] + d.observe([4, 5, 6])
         with self.assertRaises(RuntimeError) as ctx:

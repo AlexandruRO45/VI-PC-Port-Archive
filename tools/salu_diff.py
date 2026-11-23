@@ -693,6 +693,10 @@ def hw_prepare(oracle, programs):
         else:
             todo.append(i)
     raw = oracle.run([programs[i] for i in todo])
+    if raw is None:
+        if todo:
+            raise RuntimeError("no result from the hardware runner")
+        raw = []
     if len(raw) != len(todo):
         raise RuntimeError(f"the hardware runner returned {len(raw)} results for {len(todo)} programs")
     for i, r in zip(todo, raw):
