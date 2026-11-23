@@ -82,6 +82,7 @@ method, scope and caveats. No game data is included.
 | [coder.md](coder.md) | The compressed mass in `story000_script.rpf`: entry framing (`align16(entry+8)` payload), the 32-value tag alphabet, deflate-shaped but proprietary, variable-length 7/8-bit LSB-first codes with no stored table, and the `n7 = 116..127` search that finishes it. |
 | [mission_logic.md](mission_logic.md) | Mission state tables: 0x20 record layout (band counter, byte offsets), the 64-byte pool element with world transforms, case-folding joaat keys, 53.5 % of states named, 113 state-set clusters covering 82.4 % of files. |
 | [gbuffer.md](gbuffer.md) | Deferred G-buffer targets (`PS_DeferredTextured` and all 2,989 `*Deferred*` pixel shaders, `PROC-146`): 5- and 6-target `OSG1`/`PSV0` signatures (`float32` + `exp ... compr` on all outputs), the 24-bit octahedral normal split across `mrt1.gba` (`2047.5` scale, `1/255` byte packing), sqrt-encoded `mrt2`, byte IDs in `mrt3.zw`, float motion in `mrt4`, and why binding `f16` targets mangles the normal bytes. |
+| [modding.md](modding.md) | Model swaps from `mods/<folder>/mod.json`: the loader and its checks, the `mods` folder or `--mods DIR`, the model names and `joaat` hashes a mod resolves, and the archetype-lookup hook that still needs the executable's address (RT-5). |
 
 ## Other languages
 
