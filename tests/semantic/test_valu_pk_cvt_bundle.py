@@ -413,5 +413,31 @@ class VCvtPknormU16F16EdgeCasesTests(unittest.TestCase):
     def test_nan_produces_zero(self):
         self.assertEqual(ref_norm16_u16(0x7E00), 0x0000)
 
+class VCvtPknormU16F16TranslatorTests(unittest.TestCase):
+    def test_translation_basic(self):
+        lines = [
+            "v_mov_b32 v1, 0x3C00",
+            "v_mov_b32 v2, 0x3800",
+            "v_cvt_pknorm_u16_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pknorm_u16_basic", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word & 0xFFFF, 0xFFFF)
+        self.assertEqual((word >> 16) & 0xFFFF, 0x8000)
+
+    def test_translation_clamp_negative(self):
+        lines = [
+            "v_mov_b32 v1, 0xBC00",
+            "v_mov_b32 v2, 0xFC00",
+            "v_cvt_pknorm_u16_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pknorm_u16_clamp", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word, 0x00000000)
+
 if __name__ == '__main__':
     unittest.main()
