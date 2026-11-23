@@ -3993,7 +3993,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     tr.transformData.deviceAddress = addr(t.transform_va);
                     geoms.push_back(g);
                     const std::uint32_t prim_count =
-                        (t.index_type != 0 && t.index_count >= 3) ? (t.index_count / 3u) : (t.vertex_count / 3u);
+                        (tr.indexType != VK_INDEX_TYPE_NONE_KHR) ? (t.index_count / 3u) : (t.vertex_count / 3u);
                     ranges.push_back({prim_count, 0, 0, 0});
                 }
             }

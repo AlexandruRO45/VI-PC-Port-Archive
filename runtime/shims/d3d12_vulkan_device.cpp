@@ -5635,7 +5635,7 @@ public:
                                                                                           : VK_INDEX_TYPE_NONE_KHR);
                 geoms.push_back(g);
                 const std::uint32_t prims =
-                    (gd->Triangles.IndexFormat != DXGI_FORMAT_UNKNOWN && gd->Triangles.IndexCount >= 3)
+                    (tr.indexType != VK_INDEX_TYPE_NONE_KHR)
                         ? (gd->Triangles.IndexCount / 3u)
                         : (gd->Triangles.VertexCount / 3u);
                 max_prims.push_back(prims);

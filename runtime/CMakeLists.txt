@@ -2963,6 +2963,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # KHR BLAS triangle primitive count matches indexType (no vertex_count fallback when index_count < 3; no GPU).
+    add_executable(replay_blas_prim_count_test test/replay_blas_prim_count_test.cpp)
+    target_link_libraries(replay_blas_prim_count_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_blas_prim_count_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_blas_prim_count COMMAND replay_blas_prim_count_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
