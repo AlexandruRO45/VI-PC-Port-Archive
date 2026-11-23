@@ -1515,11 +1515,13 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     // ALLOW_UNORDERED_ACCESS, on buffers and textures alike. It changes nothing on one adapter; GetHeapProperties keeps it.
     if ((UINT(heap_flags) & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) && !uav)
         return "ALLOW_SHADER_ATOMICS without ALLOW_UNORDERED_ACCESS";
-    // Upload heaps start in (a part of) GENERIC_READ, readback heaps in COPY_DEST; COMMON on both; no UAVs.
-    if (heap.Type == D3D12_HEAP_TYPE_UPLOAD && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_GENERIC_READ))))
-        return "upload heap state or UAV";
-    if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
-        return "readback heap state or UAV";
+    // Upload heaps start in (a part of) GENERIC_READ, readback heaps in COPY_DEST; COMMON on both; no UAVs and no
+    // render targets: a buffer there takes no flag but DENY_SHADER_RESOURCE (host adapter and WARP, every flag
+    // combination of d3d12_vulkan_device_test's CPU-heap rows and a 40,000-description random sweep).
+    if (heap.Type == D3D12_HEAP_TYPE_UPLOAD && (uav || rt || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_GENERIC_READ))))
+        return "upload heap state, UAV or render target";
+    if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || rt || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
+        return "readback heap state, UAV or render target";
 
     if (const char* why = initial_state_refusal(buffer, flags, state, acceleration_structures)) return why;
 
@@ -6495,8 +6497,8 @@ public:
                                                      acceleration_structures());
         const D3D12_HEAP_TYPE heap_type = heap->properties().Type;
         if (!why && (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK) &&
-            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-            why = "UAV access in an upload or readback heap";
+            (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)))
+            why = "UAV access or a render target in an upload or readback heap";
         if (why) {
             log_once((std::string(method) + " refused (" + why + "), dimension").c_str(), int(desc->Dimension));
             return d3d12_trace::result(method, E_INVALIDARG);

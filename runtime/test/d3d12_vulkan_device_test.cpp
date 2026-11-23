@@ -3351,6 +3351,23 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
          }},
+        // A buffer in an upload or readback heap takes no flag but DENY_SHADER_RESOURCE: ALLOW_RENDER_TARGET is
+        // refused there too, alone or with DENY_SHADER_RESOURCE.
+        {"committed: upload buffer with ALLOW_RENDER_TARGET", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+             return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+         }},
+        {"committed: readback buffer with ALLOW_RENDER_TARGET | DENY_SHADER_RESOURCE", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+             return committed(d, {D3D12_HEAP_TYPE_READBACK}, desc, D3D12_RESOURCE_STATE_COPY_DEST);
+         }},
+        {"committed: upload buffer with DENY_SHADER_RESOURCE", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+             return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+         }},
         // CreateCommittedResource: heap properties and flags.
         {"committed: heap type 99", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE(99)}, buffer_desc(256));
@@ -4706,6 +4723,22 @@ int compare_placed_reserved(ID3D12Device* ours) {
              PlacedArgs a;
              a.heap.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
              a.state = D3D12_RESOURCE_STATE_GENERIC_READ;
+             return placed(d, desc, a);
+         }},
+        {"placed: upload buffer with ALLOW_RENDER_TARGET", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+             a.state = D3D12_RESOURCE_STATE_GENERIC_READ;
+             return placed(d, desc, a);
+         }},
+        {"placed: readback buffer with ALLOW_RENDER_TARGET", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_READBACK;
+             a.state = D3D12_RESOURCE_STATE_COPY_DEST;
              return placed(d, desc, a);
          }},
         {"placed: readback buffer in COPY_DEST", [](ID3D12Device* d) {
