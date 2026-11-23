@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 from unittest.mock import Mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +25,7 @@ import bcpack  # noqa: E402
 import bcpack_history_calib as calib  # noqa: E402
 import bcpack_tables as tables  # noqa: E402
 import bcpack_tables_bptc as bptc  # noqa: E402
+import report_paths  # noqa: E402
 import ttpf_mips as ttpf  # noqa: E402
 
 
@@ -1136,6 +1138,225 @@ class PoolSelfCalibrationTest(unittest.TestCase):
             with redirect_stderr(err_s):
                 self.assertEqual(calib.main(["--verify", bad_bc7, "--codec", "bc7"]), 2)
             self.assertIn("ERROR:", err_s.getvalue())
+
+
+class TestReportPaths(unittest.TestCase):
+    def test_uses_shared_same_report_path(self):
+        self.assertIs(calib.same_report_path, report_paths.same_report_path)
+
+    def test_refuses_out_overwriting_input_pool_direct_and_dot_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = os.path.join(tmp, "test.ttpf")
+            with open(pool, "wb") as f:
+                f.write(b"SYNTHETIC-POOL-DATA")
+            with open(pool, "rb") as f:
+                original_bytes = f.read()
+
+            # Direct same path
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main([pool, "--out", pool])
+            self.assertEqual(rc, 2)
+            self.assertIn("would overwrite input", err.getvalue())
+            with open(pool, "rb") as f:
+                self.assertEqual(f.read(), original_bytes)
+
+            # Dot-segment alias
+            alt = os.path.join(tmp, ".", "test.ttpf")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main([pool, "--out", alt])
+            self.assertEqual(rc, 2)
+            self.assertIn("would overwrite input", err.getvalue())
+            with open(pool, "rb") as f:
+                self.assertEqual(f.read(), original_bytes)
+
+    def test_refuses_out_overwriting_ref_pairs_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pairs = os.path.join(tmp, "pairs.json")
+            with open(pairs, "w", encoding="utf-8") as f:
+                f.write('{"pairs": []}')
+            with open(pairs, "rb") as f:
+                original = f.read()
+
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main(["--ref-pairs", pairs, "--out", pairs])
+            self.assertEqual(rc, 2)
+            self.assertIn("would overwrite input", err.getvalue())
+            with open(pairs, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_refuses_out_overwriting_ref_dds_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = os.path.join(tmp, "ref_pool.ttpf")
+            with open(pool, "wb") as f:
+                f.write(b"POOL")
+            dds = os.path.join(tmp, "ref.dds")
+            with open(dds, "wb") as f:
+                f.write(b"DDS")
+            spec = f"{pool}:0={dds}"
+
+            # Overwriting dds
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main(["--ref-dds", spec, "--out", dds])
+            self.assertEqual(rc, 2)
+            self.assertIn("would overwrite input", err.getvalue())
+
+            # Overwriting pool
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main(["--ref-dds", spec, "--out", pool])
+            self.assertEqual(rc, 2)
+            self.assertIn("would overwrite input", err.getvalue())
+
+    def test_refuses_out_case_alias_on_folding_volume_mocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = os.path.join(tmp, "test.ttpf")
+            with open(pool, "wb") as f:
+                f.write(b"POOL")
+            folded = os.path.join(tmp, "TEST.TTPF")
+            with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+                  mock.patch.object(report_paths, "_resolved_key", side_effect=str),
+                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    rc = calib.main([pool, "--out", folded])
+                self.assertEqual(rc, 2)
+                self.assertIn("would overwrite input", err.getvalue())
+            self.assertGreaterEqual(probe.call_count, 1)
+
+    def test_refuses_out_as_directory_when_json_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = os.path.join(tmp, "test.ttpf")
+            with open(pool, "wb") as f:
+                f.write(b"POOL")
+            json_dir = os.path.join(tmp, "out.json")
+            os.mkdir(json_dir)
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main([pool, "--out", json_dir])
+            self.assertEqual(rc, 2)
+            self.assertIn("is an existing directory", err.getvalue())
+
+    def test_refuses_out_as_file_when_directory_expected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = os.path.join(tmp, "test.ttpf")
+            with open(pool, "wb") as f:
+                f.write(b"POOL")
+            dir_file = os.path.join(tmp, "dir_file_target")
+            with open(dir_file, "wb") as f:
+                f.write(b"DATA")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main([pool, "--out", dir_file])
+            self.assertEqual(rc, 2)
+            self.assertIn("is an existing file", err.getvalue())
+
+    def test_refuses_out_missing_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = os.path.join(tmp, "test.ttpf")
+            with open(pool, "wb") as f:
+                f.write(b"POOL")
+            missing = os.path.join(tmp, "nonexistent_dir", "out.json")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main([pool, "--out", missing])
+            self.assertEqual(rc, 2)
+            self.assertIn("folder does not exist", err.getvalue())
+
+    def test_refuses_directory_target_overwriting_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out_dir")
+            os.mkdir(out_dir)
+            collide_pool = os.path.join(out_dir, "bc6h.json")
+            with open(collide_pool, "wb") as f:
+                f.write(b"POOL")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main([collide_pool, "--codec", "bc6h", "--out", out_dir])
+            self.assertEqual(rc, 2)
+            self.assertIn("would overwrite input", err.getvalue())
+
+    def test_distinct_out_writes_successfully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pairs = os.path.join(tmp, "pairs.json")
+            with open(pairs, "w", encoding="utf-8") as f:
+                f.write('{"pairs": []}')
+            out = os.path.join(tmp, "history.json")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main(["--ref-pairs", pairs, "--out", out, "--codec", "bc6h"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(out))
+
+    def test_allows_out_directory_matching_input_folder_when_targets_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pairs = os.path.join(tmp, "pairs.json")
+            with open(pairs, "w", encoding="utf-8") as f:
+                f.write('{"pairs": []}')
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main(["--ref-pairs", pairs, "--out", tmp, "--codec", "bc6h"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "bc6h.json")))
+
+    def test_refuses_out_multi_codec_when_only_one_target_collides_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out")
+            os.mkdir(out_dir)
+            colliding_input = os.path.join(out_dir, "bc1.json")
+            with open(colliding_input, "w", encoding="utf-8") as f:
+                f.write('{"preserved": true}')
+
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = calib.main(["--ref-pairs", colliding_input, "--codec", "bc1,bc6h", "--out", out_dir])
+            self.assertEqual(rc, 2)
+            self.assertIn("would overwrite input", err.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(out_dir, "bc6h.json")))
+            with open(colliding_input, "r", encoding="utf-8") as f:
+                self.assertIn('"preserved": true', f.read())
+
+    def test_refuses_invalid_ref_dds_spec_up_front(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = calib.main(["--ref-dds", "invalid_spec_without_equals", "--out", "history.json"])
+        self.assertEqual(rc, 2)
+        self.assertIn("invalid --ref-dds", err.getvalue())
+
+    def test_write_outputs_allows_directory_in_inputs_and_preflights_all_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs = {"bc1": {"a": 1}, "bc6h": {"b": 2}}
+            written = calib.write_outputs(tmp, docs, [tmp])
+            self.assertEqual(len(written), 2)
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "bc1.json")))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "bc6h.json")))
+
+            sub = os.path.join(tmp, "sub")
+            os.mkdir(sub)
+            collide = os.path.join(sub, "bc6h.json")
+            with open(collide, "w", encoding="utf-8") as f:
+                f.write("UNTOUCHED")
+            with self.assertRaises(calib.CliError) as cm:
+                calib.write_outputs(sub, docs, [collide])
+            self.assertIn("would overwrite input", str(cm.exception))
+            self.assertFalse(os.path.exists(os.path.join(sub, "bc1.json")))
+            with open(collide, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "UNTOUCHED")
+
+    def test_allows_out_matching_verify_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pairs = os.path.join(tmp, "pairs.json")
+            with open(pairs, "w", encoding="utf-8") as f:
+                json.dump({"pairs": []}, f)
+            history = os.path.join(tmp, "history.json")
+            # --out X --verify X is a supported combination (calibrate and verify schema)
+            rc = calib.main(["--ref-pairs", pairs, "--codec", "bc1", "--out", history, "--verify", history])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(history))
 
 
 if __name__ == "__main__":

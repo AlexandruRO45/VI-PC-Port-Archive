@@ -30,6 +30,7 @@ if _TOOLS_DIR not in sys.path:
 import bcpack  # noqa: E402
 import bcpack_tables as _tables  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import ttpf_mips as _ttpf  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -2575,26 +2576,31 @@ def _write_json_deterministic(path, obj):
         fh.write(text)
 
 
-def write_outputs(out_path, docs, pools):
+def write_outputs(out_path, docs, inputs):
     """Write either a combined `.json` file or per-codec `<codec>.json` files into a directory."""
+    inputs = inputs or []
+    if not os.path.isdir(out_path):
+        for p in inputs:
+            if same_report_path(out_path, p):
+                raise CliError(f"--out would overwrite input {p}")
     is_json_file = out_path.lower().endswith(".json")
     if is_json_file:
         if os.path.isdir(out_path):
             raise CliError(f"--out {out_path} is an existing directory")
-        for p in pools:
-            if _ttpf.same_output_path(out_path, p):
-                raise CliError(f"--out would overwrite input pool {p}")
         _write_json_deterministic(out_path, docs)
         return [out_path]
     if os.path.isfile(out_path):
         raise CliError(f"--out {out_path} is an existing file (use a directory or a .json path)")
-    os.makedirs(out_path, exist_ok=True)
-    written = []
+    targets = {}
     for ckey in sorted(docs.keys()):
         target = os.path.join(out_path, f"{ckey}.json")
-        for p in pools:
-            if _ttpf.same_output_path(target, p):
-                raise CliError(f"--out would overwrite input pool {p}")
+        for p in inputs:
+            if same_report_path(target, p):
+                raise CliError(f"--out would overwrite input {p}")
+        targets[ckey] = target
+    os.makedirs(out_path, exist_ok=True)
+    written = []
+    for ckey, target in targets.items():
         _write_json_deterministic(target, docs[ckey])
         written.append(target)
     return written
@@ -2703,7 +2709,41 @@ def run(argv=None):
 
     report = {"codecs": [CODEC_KEYS[c] for c in codecs]}
 
+    protected_inputs = list(args.inputs) + list(pools)
+    parsed_ref_dds = []
+    for spec in args.ref_dds:
+        pool_path, idx, dds_path = parse_ref_dds_spec(spec)
+        parsed_ref_dds.append((pool_path, idx, dds_path))
+        protected_inputs.extend([pool_path, dds_path])
+    protected_inputs.extend(args.ref_pairs)
+
     if args.out:
+        if not args.out.strip():
+            raise CliError("--out path must not be empty")
+        if not os.path.isdir(args.out):
+            for inp in protected_inputs:
+                if same_report_path(args.out, inp):
+                    raise CliError(f"--out would overwrite input {inp}")
+        is_json_file = args.out.lower().endswith(".json")
+        if is_json_file:
+            if os.path.isdir(args.out):
+                raise CliError(f"--out {args.out} is an existing directory")
+            parent = os.path.dirname(os.path.abspath(args.out))
+            if not os.path.isdir(parent):
+                raise CliError(f"--out folder does not exist: {parent}")
+        else:
+            if os.path.isfile(args.out):
+                raise CliError(f"--out {args.out} is an existing file (use a directory or a .json path)")
+            dest_abs = os.path.abspath(args.out)
+            check_folder = dest_abs if os.path.isdir(dest_abs) else os.path.dirname(dest_abs)
+            if not os.path.isdir(check_folder):
+                raise CliError(f"--out folder does not exist: {check_folder}")
+            for ckey in sorted(CODEC_KEYS[cid] for cid in codecs):
+                target = os.path.join(args.out, f"{ckey}.json")
+                for inp in protected_inputs:
+                    if same_report_path(target, inp):
+                        raise CliError(f"--out would overwrite input {inp}")
+
         if not pools and not args.ref_dds and not args.ref_pairs:
             raise CliError("calibration requires TTPF inputs, --ref-dds, or --ref-pairs")
         calibrators = {}
@@ -2715,8 +2755,7 @@ def run(argv=None):
             else:
                 calibrators[cid] = BcSimpleCalibrator(cid)
 
-        for spec in args.ref_dds:
-            pool_path, index, dds_path = parse_ref_dds_spec(spec)
+        for pool_path, index, dds_path in parsed_ref_dds:
             apply_ref_dds(pool_path, index, dds_path, calibrators)
         for pairs_path in args.ref_pairs:
             apply_ref_pairs_file(pairs_path, calibrators)
@@ -2737,7 +2776,7 @@ def run(argv=None):
             docs[ckey] = doc
             cal_stats[ckey] = st
 
-        written = write_outputs(args.out, docs, pools)
+        written = write_outputs(args.out, docs, protected_inputs)
         report["out"] = args.out
         report["files_written"] = len(written)
         report["pools_scanned"] = len(pools)
