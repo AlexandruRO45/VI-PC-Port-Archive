@@ -10,6 +10,7 @@ import json
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -342,6 +343,15 @@ class TestCommandLine(unittest.TestCase):
         self.assertIn("would overwrite an input file", err.getvalue())
         with open(payload, "rb") as f:
             self.assertEqual(f.read(), make_stream())
+
+    def test_the_guards_use_the_shared_report_path_helper(self):
+        # The private copy missed the case-folding-volume probe; tools/report_paths.py has it.
+        tools = os.path.join(ROOT, "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import report_paths
+
+        self.assertIs(bink.same_report_path, report_paths.same_report_path)
 
     def test_output_folder_is_rejected(self):
         err = io.StringIO()
