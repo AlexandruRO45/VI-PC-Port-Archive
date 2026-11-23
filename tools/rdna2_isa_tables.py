@@ -520,7 +520,6 @@ SMEM = {
     0x25: ('s_memrealtime', (('SDATA', 2, 'i'),)),
     0x26: ('s_atc_probe', (('SDATA', 1, 'i'), ('SBASE', 2, 'i'), ('SOFFSET', 1, 'i'))),  # llvm-mc, gfx101x and gfx103x
     0x27: ('s_atc_probe_buffer', (('SDATA', 1, 'i'), ('SBASE', 4, 'i'), ('SOFFSET', 1, 'i'))),
-    0x2a: ('s_get_waveid_in_workgroup', (('SDATA', 1, 'i'),)),
 }
 
 # gfx101x-only SMEM ops (scalar stores, scratch, atomics, dcache discard): not in the RDNA2 (gfx103x) XML; names and
@@ -541,6 +540,7 @@ SMEM_GFX101 = {
     0x21: ('s_dcache_wb', ()),
     0x28: ('s_dcache_discard', (('SBASE', 2, 'i'), ('SOFFSET', 1, 'i'))),
     0x29: ('s_dcache_discard_x2', (('SBASE', 2, 'i'), ('SOFFSET', 1, 'i'))),
+    0x2a: ('s_get_waveid_in_workgroup', (('SDATA', 1, 'i'),)),
     0x40: ('s_buffer_atomic_swap', (('SDATA', 1, 'i'), ('SBASE', 4, 'i'), ('SOFFSET', 1, 'i'))),
     0x41: ('s_buffer_atomic_cmpswap', (('SDATA', 2, 'i'), ('SBASE', 4, 'i'), ('SOFFSET', 1, 'i'))),
     0x42: ('s_buffer_atomic_add', (('SDATA', 1, 'i'), ('SBASE', 4, 'i'), ('SOFFSET', 1, 'i'))),

@@ -245,6 +245,12 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         code = bytes.fromhex("000084f400000000")
         self.assertEqual(rdna2_decode.disasm_bytes(code, mcpu="gfx1013")[0].split(";")[0].strip(), "s_dcache_wb")
         self.assertEqual(rdna2_decode.disasm_bytes(code, mcpu="gfx1030")[1], 2)
+        # s_get_waveid_in_workgroup (0x2a) likewise: llvm-mc decodes 0000a8f400000000 as `s_get_waveid_in_workgroup s0`
+        # for gfx1010/gfx1013 and refuses it for gfx1030/gfx1036.
+        code = bytes.fromhex("0000a8f400000000")
+        self.assertEqual(rdna2_decode.disasm_bytes(code, mcpu="gfx1013")[0].split(";")[0].strip(),
+                         "s_get_waveid_in_workgroup s0")
+        self.assertEqual(rdna2_decode.disasm_bytes(code, mcpu="gfx1030")[1], 2)
 
     def test_mubuf_mtbuf_mimg_global_ds_exp_vintrp(self):
         # MUBUF: buffer_load_format_d16_xyzw v[8:9], v5, s[4:7], 0 offen (encoding verified against llvm-mc)
