@@ -1,9 +1,13 @@
 """tools/ps_helper_probe.py: the analysis on a CPU model of what gfx1036 does (each check, and that it fails when the
 model breaks that rule), the programs' shape, and (with LEONIDA_PS_ORACLE_BUILD set to a runtime build
 and an AMD GPU selected) the measurement itself. Standard library only."""
+import contextlib
+import io
+import json
 import os
 import struct
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -105,6 +109,52 @@ class Programs(unittest.TestCase):
                 self.assertEqual(lines[-1], "s_endpgm")
                 self.assertEqual(sum(ln.startswith("exp ") for ln in lines), 1)
                 self.assertEqual("s_wqm_b64 exec, exec" in lines, H.PROGRAMS[name][0])
+
+
+class CommandLine(unittest.TestCase):
+    """--json is written once the measurement is done, so a path the tool cannot write must be refused first."""
+
+    def run_main(self, argv, report):
+        """main() with measure() replaced, so the command line is checked without a GPU or a runtime build."""
+        original = H.measure
+        H.measure = report
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = H.main(argv)
+        finally:
+            H.measure = original
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_json_that_is_a_directory_is_refused_before_the_measurement(self):
+        def no_measurement(_build):
+            raise AssertionError("measure() must not run when --json names a directory")
+        with tempfile.TemporaryDirectory() as d:
+            code, _out, err = self.run_main(["--build", d, "--json", d], no_measurement)
+        self.assertEqual(code, 2)
+        self.assertIn("is a directory", err)
+
+    def test_a_json_in_a_missing_folder_is_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "new", "words.json")
+            code, _out, err = self.run_main(["--build", d, "--json", path],
+                                            lambda _build: ("test device", model()))
+            self.assertEqual(err, "")
+            self.assertEqual(code, 0)
+            with open(path, encoding="utf-8") as f:
+                document = json.load(f)
+        self.assertEqual(document["device"], "test device")
+        self.assertEqual(set(document["words"]), set(H.PROGRAMS))
+
+    def test_a_json_under_a_file_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "plain.txt")
+            with open(blocker, "w", encoding="utf-8") as f:
+                f.write("not a folder")
+            code, _out, err = self.run_main(["--build", d, "--json", os.path.join(blocker, "words.json")],
+                                            lambda _build: ("test device", model()))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write", err)
 
 
 @unittest.skipUnless(os.environ.get("LEONIDA_PS_ORACLE_BUILD"), "set LEONIDA_PS_ORACLE_BUILD to a runtime build "
