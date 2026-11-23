@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -393,6 +394,39 @@ class DivFmasF32Tests(unittest.TestCase):
         # Flush applies before mul:2 and after div:2.
         self.assertEqual(run_f32_u(0x00400000, f2u(1.0), 0, False, "v_div_fmas_f32 v0, v1, v2, v3 mul:2"), 0)
         self.assertEqual(run_f32_u(0x00800000, f2u(1.0), 0, False, "v_div_fmas_f32 v0, v1, v2, v3 div:2"), 0)
+
+    def test_subnormal_multiplicands_survive_fma_input_flush(self):
+        fma = si.fma_f32
+
+        def flush(value):
+            return math.copysign(0.0, value) if abs(value) < 2.0 ** -126 else value
+
+        def flush_fma(x, y, z):
+            return fma(flush(x), flush(y), flush(z))
+
+        # A native RTX 5070 on driver 610.88 flushes the reported subnormal operand before Fma.
+        with mock.patch.object(si, "fma_f32", side_effect=flush_fma):
+            for operands, plain, scaled in (
+                ((0x00080000, f2u(2.0 ** 80), 0), 0x26800000, 0x06800000),
+                ((0x80080000, f2u(2.0 ** 80), 0), 0xA6800000, 0x86800000),
+                ((0x00000001, f2u(2.0 ** 120), 0), 0x31000000, 0x11000000),
+                ((0x00080000, f2u(2.0 ** 80), f2u(-(2.0 ** -51))), 0x26000000, 0x06000000),
+            ):
+                x, y, z = operands
+                for a, b in ((x, y), (y, x)):
+                    with self.subTest(x=hex(a), y=hex(b), z=hex(z)):
+                        self.assertEqual(run_f32_u(a, b, z, False), plain)
+                        self.assertEqual(run_f32_u(a, b, z, True), scaled)
+
+    def test_fma_rescale_stays_in_the_normal_finite_range(self):
+        for large, expected in (
+            (0x0BFFFFFF, (0x00080000, 0x0BFFFFFF)),  # one word below the minimum larger operand
+            (0x0C000000, (0x0A000000, 0x00800000)),  # the scaled larger operand is the smallest normal
+            (0x7F800000, (0x00080000, 0x7F800000)),  # infinity remains an infinity
+        ):
+            with self.subTest(large=hex(large)), mock.patch.object(si, "fma_f32", wraps=si.fma_f32) as fma:
+                run_f32_u(0x00080000, large, 0, False)
+                self.assertEqual(tuple(f2u(word) for word in fma.call_args_list[0].args[:2]), expected)
 
     def test_input_and_output_modifiers(self):
         self.assertEqual(run_f32(-2.0, 1.5, 4.0, False, "v_div_fmas_f32 v0, |v1|, -v2, v3"), f2u(1.0))

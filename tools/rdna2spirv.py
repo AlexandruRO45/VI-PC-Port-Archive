@@ -925,6 +925,45 @@ class Gen:
         else:
             self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
 
+    def rescale_f32_fma_inputs(self, x_bits, y_bits):
+        """Keep a subnormal multiplicand alive on drivers that flush f32 inputs.
+
+        Multiply the smaller operand by 2^23 and divide the larger by 2^23, but only when the smaller is a
+        nonzero subnormal and the larger is finite and stays normal. The product is unchanged, so the FMA can
+        still round the sum with the original addend. Build the scaled operands from their integer bits.
+        """
+        x_mag, y_mag, x_smaller = (self.tmp() for _ in range(3))
+        self.emit(f"{x_mag} = OpBitwiseAnd %uint {x_bits} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{y_mag} = OpBitwiseAnd %uint {y_bits} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{x_smaller} = OpULessThan %bool {x_mag} {y_mag}")
+        small, large, small_mag, large_mag = (self.tmp() for _ in range(4))
+        self.emit(f"{small} = OpSelect %uint {x_smaller} {x_bits} {y_bits}")
+        self.emit(f"{large} = OpSelect %uint {x_smaller} {y_bits} {x_bits}")
+        self.emit(f"{small_mag} = OpSelect %uint {x_smaller} {x_mag} {y_mag}")
+        self.emit(f"{large_mag} = OpSelect %uint {x_smaller} {y_mag} {x_mag}")
+
+        nonzero, below_normal, subnormal, can_shift, finite, normal_after_shift, rescale = (self.tmp() for _ in range(7))
+        self.emit(f"{nonzero} = OpINotEqual %bool {small_mag} {self.cu(0)}")
+        self.emit(f"{below_normal} = OpULessThan %bool {small_mag} {self.cu(0x00800000)}")
+        self.emit(f"{subnormal} = OpLogicalAnd %bool {nonzero} {below_normal}")
+        self.emit(f"{can_shift} = OpUGreaterThanEqual %bool {large_mag} {self.cu(24 << 23)}")  # exponent >= -103
+        self.emit(f"{finite} = OpULessThan %bool {large_mag} {self.cu(0x7F800000)}")
+        self.emit(f"{normal_after_shift} = OpLogicalAnd %bool {can_shift} {finite}")
+        self.emit(f"{rescale} = OpLogicalAnd %bool {subnormal} {normal_after_shift}")
+
+        mantissa, up, sign, up_bits, down_bits = (self.tmp() for _ in range(5))
+        self.emit(f"{mantissa} = OpConvertUToF %float {small_mag}")
+        self.emit(f"{up} = OpFMul %float {mantissa} {self.fconst(2.0 ** -126)}")
+        self.emit(f"{sign} = OpBitwiseAnd %uint {small} {self.cu(0x80000000)}")
+        self.emit(f"{up_bits} = OpBitwiseOr %uint {self.tou(up)} {sign}")
+        self.emit(f"{down_bits} = OpISub %uint {large} {self.cu(23 << 23)}")
+        scaled_x, scaled_y, out_x, out_y = (self.tmp() for _ in range(4))
+        self.emit(f"{scaled_x} = OpSelect %uint {x_smaller} {up_bits} {down_bits}")
+        self.emit(f"{scaled_y} = OpSelect %uint {x_smaller} {down_bits} {up_bits}")
+        self.emit(f"{out_x} = OpSelect %uint {rescale} {scaled_x} {x_bits}")
+        self.emit(f"{out_y} = OpSelect %uint {rescale} {scaled_y} {y_bits}")
+        return self.tof(out_x), self.tof(out_y)
+
     def fma_exact(self, r, x, y, z):
         """r = x * y + z rounded once to f32, built from single-rounded NoContraction f32 operations (--fma exact,
         SHADER-497): for a device whose driver splits GLSL Fma into two roundings and that has no VK_KHR_shader_fma
@@ -8423,12 +8462,14 @@ class Gen:
             # subnormal outputs single-round, and f32 output denormal flush matching denorm32=0).
             vcc_b = self.tmp_bool_nz(self.mask_src({"k": "special", "t": "vcc"}))
             if op == "v_div_fmas_f32":
-                x, y, z = (self.src_f(t) for t in a[1:4])
+                x_bits, y_bits = (self.src_u(t) for t in a[1:3])
+                x, y, z = self.tof(x_bits), self.tof(y_bits), self.src_f(a[3])
                 ax, ay, az, f_plain, scale_up, f_up = (self.tmp() for _ in range(6))
                 self.emit(f"{ax} = OpExtInst %float %glsl FAbs {x}")
                 self.emit(f"{ay} = OpExtInst %float %glsl FAbs {y}")
                 self.emit(f"{az} = OpExtInst %float %glsl FAbs {z}")
-                self.emit_fma(f_plain, x, y, z)
+                plain_x, plain_y = self.rescale_f32_fma_inputs(x_bits, y_bits)
+                self.emit_fma(f_plain, plain_x, plain_y, z)
                 self.emit(f"{scale_up} = OpFOrdGreaterThanEqual %bool {az} {self.fconst(2.0)}")
                 self.emit(f"{f_up} = OpFMul %float {f_plain} {self.fconst(2.0 ** 64)}")
                 gx64, gy1, bx, gy64, gx1, by, gx32, gy32, bxy, b1, big = (self.tmp() for _ in range(11))
