@@ -201,11 +201,21 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_markers: error: {a.src}: no such file or directory", file=sys.stderr)
         return 2
+    if a.out:
+        out = os.path.abspath(a.out)
+        try:    # preflight: a mistyped folder should not fail after the archive has been walked
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+        except OSError as e:
+            ap.error(f"--out cannot be written to {a.out}: {e.strerror or e}")
     report = scan(a.src)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
-            f.write("\n")
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=2)
+                f.write("\n")
+        except OSError as e:    # a folder removed or locked since the preflight: a line, not a traceback
+            print(f"awc_markers: error: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 1
     print(f"{report['banks']} banks, {report['streams']} streams")
     for name in ("streamed_music", "other"):
         g = report[name]
