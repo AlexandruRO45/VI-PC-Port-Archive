@@ -6,6 +6,7 @@
 Usage:
   powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
 """
+import argparse
 import math
 import os
 import struct
@@ -333,7 +334,10 @@ def test_f16_nan_and_modifiers(wave_size=32):
     print(f"[{name}] ALL NaN & MODIFIER TESTS PASSED on gfx1036 silicon!")
 
 
-def main():
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.parse_args(argv)
+
     print("=" * 70)
     print("PROBING GFX1036 SILICON FOR V_CMP(X) 16-BIT OP_SEL & CONSTANTS")
     print("=" * 70)
