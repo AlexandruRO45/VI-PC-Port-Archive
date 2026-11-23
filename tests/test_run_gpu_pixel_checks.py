@@ -98,12 +98,17 @@ class PixelChecks(unittest.TestCase):
 
         for pixel in (0, 1337):
             for channel in range(4):
-                with self.subTest(pixel=pixel, channel=channel):
-                    corrupted = frame.copy()
-                    bad_pixel = list(corrupted[pixel])
-                    bad_pixel[channel] = 0x7FC00000
-                    corrupted[pixel] = tuple(bad_pixel)
-                    self.assertTrue(rgt.ij_computed_problem(corrupted))
+                for bits in (0x7FC00000, 0x7F800000, 0xFF800000):
+                    with self.subTest(pixel=pixel, channel=channel, bits=hex(bits)):
+                        corrupted = frame.copy()
+                        bad_pixel = list(corrupted[pixel])
+                        bad_pixel[channel] = bits
+                        corrupted[pixel] = tuple(bad_pixel)
+                        problem = rgt.ij_computed_problem(corrupted)
+                        if channel == 2:
+                            self.assertIn(f"non-finite computed I/J result at ({pixel % 64},{pixel // 64})", problem)
+                        else:
+                            self.assertTrue(problem)
 
     def test_nan_frame_fails(self):
         nan = self.raw(struct.pack("<4f", NAN, NAN, NAN, NAN) * 4096)
