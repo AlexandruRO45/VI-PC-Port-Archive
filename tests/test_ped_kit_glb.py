@@ -89,7 +89,8 @@ def make_kit_fixture(root: Path) -> dict:
                      "File": (part / "model.obj").relative_to(root).as_posix(),
                      "MeshShaders": [0], "Materials": [{"ShaderIndex": 0, "Textures": []}]})
     models_manifest = root / "models.json"
-    write_json(models_manifest, {"src": str(root / "synthetic.rpf"), "Count": len(rows), "Items": rows})
+    archive = "/Synthetic archives/character packs.rpf"
+    write_json(models_manifest, {"src": archive, "Count": len(rows), "Items": rows})
 
     texture_dir = root / "textures"
     texture_dir.mkdir()
@@ -112,7 +113,8 @@ def make_kit_fixture(root: Path) -> dict:
     # The subset of the viewer parts index read by this CLI. Its producer is a separate tool.
     with closing(sqlite3.connect(index)) as db:
         db.executescript("""
-            CREATE TABLE models(id INTEGER PRIMARY KEY, name TEXT, murmur64 TEXT);
+            CREATE TABLE models(id INTEGER PRIMARY KEY, archive TEXT NOT NULL, offset INTEGER NOT NULL,
+                                drawable INTEGER NOT NULL, name TEXT, murmur64 TEXT, UNIQUE(archive, offset, drawable));
             CREATE TABLE model_exports(input_id INTEGER, model_id INTEGER, file TEXT, obj_path TEXT,
                                        glb_path TEXT, glb_status TEXT);
             CREATE VIEW model_assets AS
@@ -122,7 +124,8 @@ def make_kit_fixture(root: Path) -> dict:
             CREATE TABLE ttpf_textures(input_id INTEGER, asset_key TEXT, file TEXT, dds_path TEXT, status TEXT);
         """)
         for i, (row, key) in enumerate(zip(rows, (trousers, jacket)), 1):
-            db.execute("INSERT INTO models VALUES (?,?,?)", (i, row["Name"], f"{key:016X}"))
+            db.execute("INSERT INTO models VALUES (?,?,?,?,?,?)",
+                       (i, archive, row["Offset"], -1, row["Name"], f"{key:016X}"))
             db.execute("INSERT INTO model_exports VALUES (1,?,?,NULL,?,'ready')",
                        (i, row["File"], str(root / row["Glb"])))
             db.execute("INSERT INTO materials VALUES (?,0)", (i,))
@@ -130,7 +133,7 @@ def make_kit_fixture(root: Path) -> dict:
             db.execute("INSERT INTO ttpf_textures VALUES (2,?,?,?,'ready')",
                        (row["AssetKey"], row["File"], str(texture_dir / row["File"])))
         db.commit()
-    return dict(catalogue=catalogue, skeleton=skeleton, index=index, models_manifest=models_manifest,
+    return dict(catalogue=catalogue, skeleton=skeleton, index=index, archive=archive, models_manifest=models_manifest,
                 textures_manifest=textures_manifest, parts=parts, pixels=pixels, png=png)
 
 
@@ -139,11 +142,12 @@ class PedKitGlbTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.fixture = make_kit_fixture(self.root)
 
-    def export(self, kit_id, out, index=None):
+    def export(self, kit_id, out, index=None, *, sources=()):
         return subprocess.run([
             sys.executable, "-I", str(ROOT / "tools" / "ped_kit_glb.py"), str(self.fixture["catalogue"]),
             "--id", str(kit_id), "--index", str(index or self.fixture["index"]),
             "--skeleton", str(self.fixture["skeleton"]), "--out", str(out),
+            *(arg for source in sources for arg in ("--model-source", *map(str, source))),
         ], capture_output=True, text=True, timeout=20)
 
     def image(self, gltf, binary, texture_info):
@@ -194,7 +198,8 @@ class PedKitGlbTests(unittest.TestCase):
         key = f"{ped_catalogues.murmur64(PART_NAMES[1]):016X}"
         warm_key = f"{WARM:016X}"
         cases = [
-            ("duplicate drawable identity", "INSERT INTO models SELECT 9,name,murmur64 FROM models WHERE murmur64=?",
+            ("duplicate drawable identity", "INSERT INTO models SELECT 9,archive,offset+1,drawable,name,murmur64 "
+             "FROM models WHERE murmur64=?",
              (key,), key, "ambiguous"),
             ("DDS not ready", "UPDATE ttpf_textures SET status='missing' WHERE asset_key=?",
              (warm_key,), warm_key, "no match"),
@@ -216,6 +221,123 @@ class PedKitGlbTests(unittest.TestCase):
                 self.assertIn(resource_id.lower(), result.stderr.lower())
                 self.assertIn(reason, result.stderr.lower())
                 self.assertEqual(out.read_bytes(), b"previous complete export")
+
+    def test_physical_sources_select_geometry_after_index_rebuild(self):
+        original = self.fixture["parts"][1]
+        alternate = make_part(self.root / "alternate", PART_NAMES[1], [(-.2, 0), (.2, 0), (0, .3)], [0, 1, 2])
+        jackets = [(-1, original), (7, alternate)]
+        trousers_key, jacket_key = (f"{ped_catalogues.murmur64(name):016x}" for name in PART_NAMES)
+        archive = self.fixture["archive"]
+        out = self.root / "selected.glb"
+        first_exports = {}
+        for order in [jackets, jackets[::-1]]:
+            # Rebuild the jacket rows in a different order, as two manifest imports would do.
+            index = self.root / f"rebuilt-{order[0][0]}.sqlite"
+            shutil.copyfile(self.fixture["index"], index)
+            with closing(sqlite3.connect(index)) as db:
+                db.execute("DELETE FROM model_exports WHERE model_id=2")
+                db.execute("DELETE FROM materials WHERE model_id=2")
+                db.execute("DELETE FROM models WHERE id=2")
+                for child, folder in order:
+                    model_id = db.execute(
+                        "INSERT INTO models(archive,offset,drawable,name,murmur64) VALUES (?,?,?,?,?)",
+                        (archive, 256, child, PART_NAMES[1] + ".#dr", jacket_key.upper()),
+                    ).lastrowid
+                    db.execute("INSERT INTO model_exports VALUES (1,?,?,NULL,?,'ready')",
+                               (model_id, str(folder / "model.obj"), str(folder / "model.glb")))
+                    db.execute("INSERT INTO materials VALUES (?,0)", (model_id,))
+                db.commit()
+            for child, folder in jackets:
+                with self.subTest(first_child=order[0][0], selected=child):
+                    sources = [(trousers_key, archive, 128, -1), ("0x" + jacket_key, archive, "0x100", child)]
+                    result = self.export(101, out, index, sources=sources)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    gltf, binary = skinned_glb.read_glb(str(out))
+                    prim = gltf["meshes"][0]["primitives"][1]
+                    source, raw = skinned_glb.read_glb(str(folder / "model.glb"))
+                    expected = source["meshes"][0]["primitives"][0]
+                    self.assertEqual(skinned_glb.accessor_bytes(gltf, binary, prim["attributes"]["POSITION"])[0],
+                                     skinned_glb.accessor_bytes(source, raw, expected["attributes"]["POSITION"])[0])
+                    self.assertEqual(skinned_glb.accessor_bytes(gltf, binary, prim["indices"])[0],
+                                     skinned_glb.accessor_bytes(source, raw, expected["indices"])[0])
+                    payload = out.read_bytes()
+                    self.assertEqual(payload, first_exports.setdefault(child, payload))
+        self.assertNotEqual(first_exports[-1], first_exports[7])
+
+    def test_invalid_physical_sources_preserve_previous_export(self):
+        archive = self.fixture["archive"]
+        trousers, jacket = (f"{ped_catalogues.murmur64(name):016X}" for name in PART_NAMES)
+        selected = (jacket, archive, 256, -1)
+        cases = [
+            ("no match", [(trousers, archive, 256, -1)]),  # Right physical tuple, wrong hash.
+            ("no match", [(jacket, archive.lower(), 256, -1)]),
+            ("no match", [(jacket, archive, 128, -1)]),
+            ("no match", [(jacket, archive, 256, 0)]),
+            ("duplicate", [selected, selected]),
+            ("not selected", [selected, ("0000000000000042", archive, 128, -1)]),
+            ("OFFSET", [(jacket, archive, -1, -1)]),
+            ("OFFSET", [(jacket, archive, 2**63, -1)]),
+            ("DRAWABLE", [(jacket, archive, 256, -2)]),
+            ("DRAWABLE", [(jacket, archive, 256, 2**63)]),
+            ("16 hexadecimal", [("00000042", archive, 256, -1)]),
+            ("16 hexadecimal", [("10000000000000000", archive, 256, -1)]),
+        ]
+        out = self.root / "existing.glb"
+        out.write_bytes(b"previous export")
+        for reason, sources in cases:
+            with self.subTest(sources=sources):
+                result = self.export(101, out, sources=sources)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(out.read_bytes(), b"previous export")
+
+    def test_selected_model_still_requires_one_ready_owned_glb(self):
+        jacket = f"{ped_catalogues.murmur64(PART_NAMES[1]):016X}"
+        selected = [(jacket, self.fixture["archive"], 256, -1)]
+        out = self.root / "existing.glb"
+        out.write_bytes(b"previous export")
+        # The other namesake has a ready export. It cannot substitute for the selected source.
+        for reason, status in [("ready GLB", "missing"), ("shared", "ready")]:
+            with self.subTest(reason=reason):
+                index = self.root / f"{status}.sqlite"
+                shutil.copyfile(self.fixture["index"], index)
+                with closing(sqlite3.connect(index)) as db:
+                    db.execute("INSERT INTO models SELECT 3,archive,offset,7,name,murmur64 FROM models WHERE id=2")
+                    db.execute("INSERT INTO model_exports SELECT 9,3,file,obj_path,glb_path,glb_status "
+                               "FROM model_exports WHERE model_id=2")
+                    db.execute("UPDATE model_exports SET glb_status=? WHERE model_id=2", (status,))
+                    db.commit()
+                result = self.export(101, out, index, sources=selected)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(jacket.lower(), result.stderr.lower())
+                self.assertIn(reason.lower(), result.stderr.lower())
+                self.assertEqual(out.read_bytes(), b"previous export")
+
+    def test_output_cannot_replace_an_unselected_namesake_glb(self):
+        alternate = make_part(self.root / "alternate", PART_NAMES[1], [(-.2, 0), (.2, 0), (0, .3)], [0, 1, 2])
+        alternate_glb = alternate / "model.glb"
+        originals = {p: p.read_bytes() for p in (self.fixture["parts"][1] / "model.glb", alternate_glb)}
+        with closing(sqlite3.connect(self.fixture["index"])) as db:
+            db.execute("INSERT INTO models SELECT 3,archive,offset,7,name,murmur64 FROM models WHERE id=2")
+            db.execute("INSERT INTO model_exports VALUES (1,3,?,NULL,?,'ready')",
+                       (str(alternate / "model.obj"), str(alternate_glb)))
+            db.commit()
+        key = f"{ped_catalogues.murmur64(PART_NAMES[1]):016X}"
+        for path in (alternate_glb, self.root / "alias.glb"):
+            with self.subTest(output=path.name):
+                if path != alternate_glb:
+                    try:
+                        path.symlink_to(alternate_glb)
+                    except (NotImplementedError, OSError) as exc:
+                        self.skipTest(f"cannot create symbolic links: {exc}")
+                result = self.export(101, path, sources=[(key, self.fixture["archive"], 256, -1)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("replace", result.stderr.lower())
+                for source, before in originals.items():
+                    self.assertEqual(source.read_bytes(), before)
+                if path != alternate_glb:
+                    self.assertTrue(path.is_symlink())
 
     def test_export_preserves_source_glb_when_it_is_the_output(self):
         source = self.fixture["parts"][1] / "model.glb"
