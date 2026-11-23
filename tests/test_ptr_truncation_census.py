@@ -183,6 +183,24 @@ class SummaryTests(unittest.TestCase):
             self.assertIn("one file", message)
             self.assertFalse(os.path.exists(one))
 
+    def test_jobs_below_one_is_refused(self):
+        # max(1, a.jobs) used to turn 0 and a negative count into one worker and a clean-looking run.
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+            for bad in ("0", "-3"):
+                stderr = sys.stderr
+                sys.stderr = io.StringIO()
+                try:
+                    with self.assertRaises(SystemExit) as cm:
+                        P.main([disasm, "--jobs", bad])
+                finally:
+                    message = sys.stderr.getvalue()
+                    sys.stderr = stderr
+                self.assertEqual(cm.exception.code, 2, bad)
+                self.assertIn("--jobs must be at least 1", message, bad)
+
     def test_missing_folder(self):
         stderr = sys.stderr
         sys.stderr = io.StringIO()
