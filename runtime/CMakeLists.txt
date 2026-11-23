@@ -101,7 +101,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   )
 
-  add_executable(gta6rt
+  add_library(gta6rt_core SHARED
     src/main.cpp
     src/pe_loader.cpp
     shims/registry.cpp
@@ -120,22 +120,22 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/xbox_console_stubs.cpp
   )
-  add_dependencies(gta6rt gta6rt_tls_host)
-  target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-  target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
-  # Static shim tables register themselves at startup; keep the linker from dropping their objects.
-  # GTA6RT_HOST_BASE keeps the loader's own image off the default x64 EXE base (0x140000000), where a mapped EXE
-  # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
+  add_dependencies(gta6rt_core gta6rt_tls_host)
+  target_compile_definitions(gta6rt_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_compile_options(gta6rt_core PRIVATE /W4 /permissive- /utf-8)
   set(GTA6RT_HOST_BASE /BASE:0x10000000000)
-  # BUILD-1457: a thread that asks for no stack size gets the reserve in this program's PE header, 1 MB by default:
-  # a thread the game starts with dwStackSize 0, a thread-pool thread, a std::thread of the shims. The D3D12 shim
-  # creates Vulkan pipelines on the calling thread, the driver compiles there, and AMD's Windows compiler (26.11.2)
-  # overflows 1 MB on some of the game's shaders (docs/pipeline_check.md, "Stack reserve"). run_entry already gives
-  # the entry thread 8 MB (shims/process_shim.h); this is the same number for the others. Keep it in step with
-  # scripts/build_runtime.ps1.
   set(GTA6RT_STACK 8388608)
-  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
-  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
+  target_link_options(gta6rt_core PRIVATE /OPT:NOREF)
+  target_link_libraries(gta6rt_core PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
+
+  # Minimal zero-CRT stub EXE that holds an unused 1-byte TLS slot-0 anchor so the mapped guest EXE
+  # can own TLS slot 0 while gta6rt_core.dll runs on TLS slot >= 1.
+  add_executable(gta6rt src/gta6rt_stub.cpp)
+  add_dependencies(gta6rt gta6rt_core gta6rt_tls_host)
+  target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8 /GS-)
+  target_link_options(gta6rt PRIVATE /NODEFAULTLIB /ENTRY:stub_entry /SUBSYSTEM:CONSOLE ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
+  target_link_libraries(gta6rt PRIVATE kernel32 shell32)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
@@ -409,8 +409,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     endif()
   endif()
   if(LEONIDA_SDL3 AND TARGET SDL3::SDL3-static)
-    target_sources(gta6rt PRIVATE shims/gameinput.cpp)
-    target_link_libraries(gta6rt PRIVATE SDL3::SDL3-static)
+    target_sources(gta6rt_core PRIVATE shims/gameinput.cpp)
+    target_link_libraries(gta6rt_core PRIVATE SDL3::SDL3-static)
 
     # GameInput through the shim registry on SDL virtual joysticks: no controller, no game data.
     add_executable(gameinput_test test/gameinput_test.cpp shims/gameinput.cpp shims/registry.cpp)
@@ -2805,8 +2805,8 @@ if(TARGET Vulkan::Headers)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
-      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
-      target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
+      target_link_libraries(gta6rt_core PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(gta6rt_core PRIVATE LEONIDA_VULKAN_DEVICE)
 
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
       # device it gets, mapped and run by `gta6rt --run` with LEONIDA_D3D12=vulkan: the loader, the game thread, the
@@ -2877,7 +2877,7 @@ if(TARGET Vulkan::Headers)
           message(FATAL_ERROR "LEONIDA_GUEST_SCENE requires static SDL3; configure SDL3_DIR or LEONIDA_SDL3_FETCH")
         endif()
         target_compile_definitions(tiny_guest_draw PRIVATE LEONIDA_GUEST_SCENE)
-        target_sources(gta6rt PRIVATE test/scene_input_driver.cpp)
+        target_sources(gta6rt_core PRIVATE test/scene_input_driver.cpp)
       endif()
       # This guest can use a synthetic fixture produced on another machine. Register the automated test
       # if the tools to generate the fixture are available locally.

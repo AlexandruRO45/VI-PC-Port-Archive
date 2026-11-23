@@ -177,8 +177,6 @@ void* WINAPI ApuMapApuAddress_stub(uint32_t /*apu_address*/) {
 
 SHIM_TABLE(xbox_console_stubs,
     {"xcrdapi.dll", "DStorageGetFactory", reinterpret_cast<void*>(&DStorageGetFactory_stub)},
-    {"xg_xs.dll", "XGCreateTextureComputer", reinterpret_cast<void*>(&XGCreateTextureComputer_stub)},
-    {"xg_xs.dll", "XGSuggestSwizzleMode", reinterpret_cast<void*>(&XGSuggestSwizzleMode_stub)},
     {"chad.dll", "XDspActivate", reinterpret_cast<void*>(&XDspActivate_stub)},
     {"chad.dll", "XDspConnectWithMaximumStreamLimit", reinterpret_cast<void*>(&XDspConnectWithMaximumStreamLimit_stub)},
     {"chad.dll", "XDspDeactivate", reinterpret_cast<void*>(&XDspDeactivate_stub)},

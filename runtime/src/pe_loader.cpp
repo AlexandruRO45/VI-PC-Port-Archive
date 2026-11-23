@@ -278,6 +278,27 @@ TlsHostModule ensure_tls_host(size_t slot) {
 
     if (slot == 0) {
         g_tls_hosts[0] = load_tls_host_image(primary, true);
+        // If the host process EXE is our minimal zero-CRT slot-0 anchor stub (TLS index 0, size <= 16 bytes),
+        // reuse slot 0 for the primary mapped EXE so MSVC /GA hardcoded slot-0 accesses (`gs:[58h] -> [rax]`)
+        // read the guest EXE's TLS block while gta6rt_core.dll safely keeps its own slot >= 1.
+        HMODULE exe_mod = GetModuleHandleW(nullptr);
+        if (exe_mod && g_tls_hosts[0].index != TLS_OUT_OF_INDEXES) {
+            auto* base = reinterpret_cast<uint8_t*>(exe_mod);
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+            auto* nt = at<IMAGE_NT_HEADERS64>(base, dos->e_lfanew);
+            const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+            if (dir.Size && dir.VirtualAddress) {
+                auto* tls = at<IMAGE_TLS_DIRECTORY64>(base, dir.VirtualAddress);
+                const uint64_t raw_sz = tls->EndAddressOfRawData >= tls->StartAddressOfRawData
+                                            ? (tls->EndAddressOfRawData - tls->StartAddressOfRawData)
+                                            : 0;
+                const uint64_t total_sz = raw_sz + tls->SizeOfZeroFill;
+                if (tls->AddressOfIndex && *reinterpret_cast<DWORD*>(tls->AddressOfIndex) == 0 && total_sz > 0 &&
+                    total_sz <= 16) {
+                    g_tls_hosts[0].index = 0;
+                }
+            }
+        }
         return g_tls_hosts[0];
     }
 

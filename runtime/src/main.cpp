@@ -58,7 +58,7 @@ int usage() {
 
 }  // namespace
 
-int wmain(int argc, wchar_t** argv) {
+extern "C" __declspec(dllexport) int gta6rt_wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
