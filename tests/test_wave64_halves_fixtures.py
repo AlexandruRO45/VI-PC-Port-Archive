@@ -154,7 +154,9 @@ def test_a_bad_census_entry_field_is_one_line_not_a_traceback(tmp_path, capsys):
     """#1651 guarded the document shape but not the per-entry fields: a non-string wave64_graphics tier
     is unhashable (TypeError on the Counter key), a non-list reasons/idioms is not iterable, a list of
     non-strings is unhashable, and mixed-type tiers blow up sorted(). Each used to exit 1 with a
-    traceback; now one ERROR line, exit 2, and no shader name leaks."""
+    traceback; now one ERROR line, exit 2, and no shader name leaks. The why field of a tier C entry
+    is checked the same way: on its own it is only stored, but a census that counts it must not be
+    the one mode that crashes."""
     base = {"stage": "ps", "wave64": True}
     cases = (
         ({"wave64_graphics": ["A"]}, "wave64_graphics is list"),
@@ -163,6 +165,11 @@ def test_a_bad_census_entry_field_is_one_line_not_a_traceback(tmp_path, capsys):
         ({"wave64_graphics": "C", "wave64_graphics_reasons": 3}, "wave64_graphics_reasons is int"),
         ({"wave64_graphics": "C", "wave64_graphics_reasons": [["x"]]}, "must contain only strings"),
         ({"wave64_graphics": "B", "wave64_graphics_idioms": "waterfall"}, "wave64_graphics_idioms is str"),
+        ({"wave64_graphics": "C", "wave64_graphics_why": None}, "wave64_graphics_why is NoneType"),
+        ({"wave64_graphics": "C", "wave64_graphics_why": 7}, "wave64_graphics_why is int"),
+        ({"wave64_graphics": "C", "wave64_graphics_why": "mask-half|sink"}, "wave64_graphics_why is str"),
+        ({"wave64_graphics": "C", "wave64_graphics_why": {"reason": "x"}}, "wave64_graphics_why is dict"),
+        ({"wave64_graphics": "C", "wave64_graphics_why": ["ok", 5]}, "wave64_graphics_why must contain only strings"),
     )
     for extra, diagnostic in cases:
         path = tmp_path / "index.json"
@@ -183,6 +190,20 @@ def test_a_bad_census_entry_field_is_one_line_not_a_traceback(tmp_path, capsys):
     assert wave64_halves.main(["--census", str(path)]) == 2
     out = capsys.readouterr()
     assert "wave64_graphics is int" in out.err and "Traceback" not in out.err
+
+
+def test_a_valid_why_field_still_censuses(tmp_path, capsys):
+    """rdna2spirv.py --wave64-why writes wave64_graphics_why as a list of why lines; the field guard
+    must not touch an index that carries it: same tier counts, same reason counts, exit 0."""
+    why = ["unsafe-vote-branch|sink: v_readfirstlane|producer: s_cbranch_execz|source: EXEC|@both"]
+    path = tmp_path / "index.json"
+    path.write_text(json.dumps({"s0": {"stage": "ps", "wave64": True, "wave64_graphics": "C",
+                                       "wave64_graphics_reasons": ["unsafe-vote-branch"],
+                                       "wave64_graphics_why": why}}), encoding="utf-8")
+    capsys.readouterr()
+    assert wave64_halves.main(["--census", str(path)]) == 0
+    out = capsys.readouterr()
+    assert out.err == "" and "ps: C=1" in out.out and "unsafe-vote-branch" in out.out
 
 
 def test_an_empty_index_still_reports_no_tier(tmp_path, capsys):

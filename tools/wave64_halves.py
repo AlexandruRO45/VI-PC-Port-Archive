@@ -1527,9 +1527,11 @@ def census(index):
         # #1651 guarded the document shape but not these fields: a non-string tier is unhashable
         # (TypeError on the Counter key), a non-list reasons/idioms is not iterable, and mixed-type
         # tiers blow up sorted(). Refuse them as a usage error, naming the field not the shader.
+        # The why field is here too so the census and the --why census of the same index agree: a
+        # string or dict would iterate without an error and count nothing, a null or int would raise.
         if not isinstance(t, str):
             raise ValueError(f"wave64_graphics is {type(t).__name__}, expected a string tier (A/B/C)")
-        for field in ("wave64_graphics_reasons", "wave64_graphics_idioms"):
+        for field in ("wave64_graphics_reasons", "wave64_graphics_idioms", "wave64_graphics_why"):
             v = m.get(field, [])
             if not isinstance(v, list):
                 raise ValueError(f"{field} is {type(v).__name__}, expected a list of strings")
