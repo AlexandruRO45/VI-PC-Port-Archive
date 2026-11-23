@@ -321,7 +321,8 @@ def main(argv=None):
     for command in (direct, batch):
         command.add_argument("--maintenance4", action="store_true",
                              help="allow wider output vectors when the pipeline enables maintenance4")
-        command.add_argument("--quiet", action="store_true", help="display diagnostics and the summary")
+        command.add_argument("--quiet", action="store_true",
+                             help="only print pipelines with problems, then the summary")
         command.add_argument("--report", type=Path, help="write structured results to JSON")
     single = commands.add_parser("inspect", help="show the reflected user inputs and outputs of one entry point")
     single.add_argument("module", type=Path)
