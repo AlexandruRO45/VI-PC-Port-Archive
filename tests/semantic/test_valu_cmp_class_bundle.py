@@ -742,3 +742,21 @@ class TestCmpxClassF16SIMDAndProperties(unittest.TestCase):
     def test_cascaded_cmpx_narrowing_hardware(self):
         val_cascade, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=True, test_id="cascade")
         self.assertEqual(val_cascade, 1)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f16 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestCmpxClassF16NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 300)
+
+    def test_boundary_extremes_hardware(self):
+        val_snan, _ = run_cmp_shader("f16", 0x7C01, CLASS_SNAN, is_cmpx=True, test_id="snan")
+        self.assertEqual(val_snan, 1)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        _, spv = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=True, test_id="lowering")
+        self.assertIn("OpStore %active", spv)
