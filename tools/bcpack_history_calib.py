@@ -16,6 +16,7 @@ Two complementary calibration paths are supported (and may be combined):
    BC7 Mode-1 shared p-bit parity), intra-block smoothness index voting, and
    sibling raw/zlib mip endpoint fitting on mixed-codec textures to produce
    **provisional** tables usable with `--history <path> --allow-provisional`.
+Usage: `python -I tools/bcpack_history_calib.py --help` lists the options.
 """
 import argparse
 import json
