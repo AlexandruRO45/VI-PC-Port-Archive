@@ -252,5 +252,20 @@ class TestSBfeI32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 1)
 
 
+class TestSBfeI32Bounds(unittest.TestCase):
+    """Status flags and sign-extension boundary handling for s_bfe_i32."""
+
+    def test_sign_extension_at_word_top(self):
+        # 3-bit negative field at top: bit 31 set
+        val, scc = ref_bfe_i32(0x80000000, 31 | (1 << 16))
+        self.assertEqual(val, MASK32)
+        self.assertEqual(scc, 1)
+
+    def test_zero_field(self):
+        val, scc = ref_bfe_i32(0x00000000, 10 | (5 << 16))
+        self.assertEqual(val, 0)
+        self.assertEqual(scc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
