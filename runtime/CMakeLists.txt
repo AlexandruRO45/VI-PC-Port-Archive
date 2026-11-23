@@ -764,6 +764,19 @@ if(BUILD_TESTING)
       add_test(NAME fsr_dispatch COMMAND fsr_dispatch_test)
       set_tests_properties(fsr_dispatch PROPERTIES SKIP_RETURN_CODE 77)
 
+      # Optional: skips unless the driver's NGX Core is loadable. Drives src/dlss_backend.cpp end to end
+      # (init/capability/create/eval/destroy) on the PC D3D12 device with procedural mock buffers.
+      add_executable(dlss_dispatch_test
+        test/dlss_dispatch_test.cpp
+        src/dlss_backend.cpp
+      )
+      target_compile_definitions(dlss_dispatch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+      target_compile_options(dlss_dispatch_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      target_link_options(dlss_dispatch_test PRIVATE /OPT:NOREF)
+      target_link_libraries(dlss_dispatch_test PRIVATE ${D3D12_LIBRARY} ${DXGI_LIBRARY})
+      add_test(NAME dlss_dispatch COMMAND dlss_dispatch_test)
+      set_tests_properties(dlss_dispatch PROPERTIES SKIP_RETURN_CODE 77)
+
       # Optional: skips unless LEONIDA_GAME_DIR is set. Constructs the package's XboxBvhBuilder on the device proxy.
       add_executable(bvh_builder_test
         test/bvh_builder_test.cpp
