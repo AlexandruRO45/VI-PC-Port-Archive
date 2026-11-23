@@ -26,6 +26,11 @@
 #include <utility>
 #include <vector>
 
+#include <locale.h>
+#ifdef __APPLE__
+#include <xlocale.h>  // strtod_l
+#endif
+
 namespace leonida {
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -330,12 +335,30 @@ public:
     explicit JsonReader(std::string_view text) : text_(text) {}
 
     bool parse(Json& out) {
-        if (!value(out, 0)) return false;
+        NumericLocale locale;
+        if (!locale.handle || !value(out, 0, locale)) return false;
         space();
         return pos_ == text_.size();
     }
 
 private:
+    // JSON always uses a dot. One explicit C locale per document avoids changing the caller's process/thread
+    // locale, allocating a locale per number, or relying on a function-local static in guest callbacks.
+    struct NumericLocale {
+#ifdef _WIN32
+        _locale_t handle = _create_locale(LC_NUMERIC, "C");
+        ~NumericLocale() { if (handle) _free_locale(handle); }
+        double convert(const char* text, char** end) const { return _strtod_l(text, end, handle); }
+#else
+        locale_t handle = newlocale(LC_NUMERIC_MASK, "C", nullptr);
+        ~NumericLocale() { if (handle) freelocale(handle); }
+        double convert(const char* text, char** end) const { return strtod_l(text, end, handle); }
+#endif
+        NumericLocale() = default;
+        NumericLocale(const NumericLocale&) = delete;
+        NumericLocale& operator=(const NumericLocale&) = delete;
+    };
+
     void space() {
         while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\n' || text_[pos_] == '\r' ||
                                        text_[pos_] == '\t'))
@@ -348,7 +371,7 @@ private:
         return true;
     }
 
-    bool value(Json& out, int depth) {
+    bool value(Json& out, int depth, const NumericLocale& locale) {
         if (depth > 64) return false;
         space();
         if (pos_ >= text_.size()) return false;
@@ -365,7 +388,7 @@ private:
                 space();
                 if (pos_ >= text_.size() || text_[pos_++] != ':') return false;
                 Json item;
-                if (!value(item, depth + 1)) return false;
+                if (!value(item, depth + 1, locale)) return false;
                 out.object.emplace_back(std::move(key), std::move(item));
                 space();
                 if (pos_ >= text_.size()) return false;
@@ -383,7 +406,7 @@ private:
             if (pos_ < text_.size() && text_[pos_] == ']') return ++pos_, true;
             for (;;) {
                 Json item;
-                if (!value(item, depth + 1)) return false;
+                if (!value(item, depth + 1, locale)) return false;
                 out.array.push_back(std::move(item));
                 space();
                 if (pos_ >= text_.size()) return false;
@@ -410,7 +433,7 @@ private:
         const std::string token(text_.substr(start, pos_ - start));
         char* end = nullptr;
         errno = 0;
-        out.number = std::strtod(token.c_str(), &end);
+        out.number = locale.convert(token.c_str(), &end);
         return errno != ERANGE && end == token.c_str() + token.size();
     }
 
