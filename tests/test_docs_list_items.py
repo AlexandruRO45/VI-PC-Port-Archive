@@ -15,18 +15,30 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ITEM = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s+(\S.*)$")
+BACKTICK = chr(96)
+FENCE_OPENING = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 WINDOW = 8      # lines between the two items
 OPENING = 60    # characters of the item's text that must match (after the list marker)
 
 
 def repeated_items(text):
     """[(line a, line b)] for list items within WINDOW lines whose first OPENING characters are equal."""
-    items, in_fence = [], False
+    items, fence = [], None
     for n, line in enumerate(text.split("\n"), 1):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
+        line = line.rstrip("\r")
+        if fence is not None:
+            marker, length = fence
+            closing = rf"^ {{0,3}}{re.escape(marker)}{{{length},}}[ \t]*$"
+            if re.fullmatch(closing, line):
+                fence = None
             continue
-        m = None if in_fence else ITEM.match(line)
+        opening = FENCE_OPENING.match(line)
+        if opening:
+            marker, info = opening.groups()
+            if marker[0] != BACKTICK or BACKTICK not in info:
+                fence = (marker[0], len(marker))
+                continue
+        m = ITEM.match(line)
         if m and len(m.group(2)) >= OPENING:
             items.append((n, len(m.group(1)), m.group(2)[:OPENING]))
     found = []
@@ -58,6 +70,29 @@ class RepeatedListItems(unittest.TestCase):
                           "- **99 three-slice 2D arrays** (`depth = 3`, `depth - 1 = 2`) appeared as `depth = 2`",
                           "```", current, current, "```"])
         self.assertEqual(repeated_items(text), [(1, 4)])
+
+    def test_shorter_backtick_line_does_not_close_longer_fence(self):
+        tick = BACKTICK
+        repeated = "- **Synthetic repeated item.** " + "x" * OPENING
+        text = "\n".join([
+            repeated,
+            tick * 4 + "markdown",
+            tick * 3,
+            repeated,
+            tick * 3,
+            tick * 4,
+        ])
+        self.assertEqual(repeated_items(text), [])
+
+    def test_tilde_fence_content_is_not_scanned(self):
+        repeated = "- **Synthetic repeated item.** " + "x" * OPENING
+        text = "\n".join([
+            repeated,
+            "~~~~markdown",
+            repeated,
+            "~~~~",
+        ])
+        self.assertEqual(repeated_items(text), [])
 
     def test_docs_have_no_repeated_list_items(self):
         found = []
