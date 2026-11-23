@@ -1,0 +1,199 @@
+#version 460
+// The layer half of d3d12_descriptor_fuzz_test: one probe of one descriptor slot per dispatch, written to the
+// translator's runtime contract (docs/design.md, "User data", "Xbox GPU addresses" and "Images"; the T#/S# lookup is
+// tools/rdna2spirv.py desc_probe, the V# bounds are docs/buffer_bounds.md). The host half is the HLSL in the test,
+// which does the same with D3D12 resource arrays; the two must write the same bytes.
+// Root arguments in the console compute layout (rt::rootsig::pack_stage: from s4, one dword per table):
+//   s4   the probe kind (the Kind enum in the test)
+//   s5   the descriptor's index in the view table
+//   s6   the sampler's index in the sampler table
+//   s7   the first 16-byte element of the output this probe writes (64 of them)
+//   s8   a mip level or LOD (sample, load) or the number of 16-byte rows to read (CBV)
+//   s9   an array layer (2D array sample)
+//   s10:s11  a root UAV: the console VA of the output buffer
+//   s12  a descriptor table of views (its 32-bit console VA), 32 bytes a slot
+//   s13  a descriptor table of samplers, 32 bytes a slot (the S# in the first 16)
+// Each of the 64 invocations writes one uvec4.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D images[];
+layout(set = 0, binding = 1) uniform sampler samplers[];
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
+    uint map[];  // mask, then 10 uints per slot: key[8], index, pad
+};
+layout(set = 0, binding = 3) uniform texture2DArray arrays[];
+layout(set = 0, binding = 4, r32ui) uniform readonly uimage2D r32[];
+
+const uint kSample2D = 0, kLoad2D = 1, kSample2DArray = 2, kTypedSrv = 3, kRawSrv = 4, kStruct4Srv = 5,
+           kStruct16Srv = 6, kCbv = 7, kTypedUav = 8, kRawUav = 9, kTexUav = 10;
+const uint kViewStride = 8, kSamplerStride = 8;  // dwords: GetDescriptorHandleIncrementSize is 32 for both
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+Words at(uvec2 va) { return Words(add64(pc.heap_base, va)); }
+
+uint lookup(uint key[8]) {
+    uint h = 2166136261u;
+    for (int i = 0; i < 8; ++i) h = (h ^ key[i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && map[slot + i] == key[i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+// The view slot's first dword, in the view table.
+uint view_dword() { return pc.s[5] * kViewStride; }
+
+uint image_index() {
+    Words views = at(uvec2(pc.s[12], 0u));
+    uint key[8];
+    for (int k = 0; k < 8; ++k) key[k] = views.w[view_dword() + k];
+    return lookup(key);
+}
+
+uint sampler_index() {
+    Words table = at(uvec2(pc.s[13], 0u));
+    uint key[8];
+    for (int k = 0; k < 8; ++k) key[k] = k < 4 ? table.w[pc.s[6] * kSamplerStride + k] : 0xffffffffu;
+    return lookup(key);
+}
+
+// A V#'s fields (gfx10_descriptors.h, encode(const Buffer&)).
+struct VSharp {
+    uvec2 base;
+    uint stride, records, dst_sel, oob;
+};
+
+VSharp vsharp() {
+    Words views = at(uvec2(pc.s[12], 0u));
+    const uint d = view_dword();
+    VSharp v;
+    v.base = uvec2(views.w[d], views.w[d + 1] & 0xffffu);
+    v.stride = bitfieldExtract(views.w[d + 1], 16, 14);
+    v.records = views.w[d + 2];
+    v.dst_sel = bitfieldExtract(views.w[d + 3], 0, 12);
+    v.oob = bitfieldExtract(views.w[d + 3], 28, 2);
+    return v;
+}
+
+uint word_at(VSharp v, uint byte_offset) { return at(add64(v.base, uvec2(byte_offset, 0u))).w[0]; }
+
+uint select_channel(uvec4 raw, uint sel) {
+    switch (sel) {
+    case 0u: return 0u;
+    case 1u: return 1u;
+    case 4u: return raw.x;
+    case 5u: return raw.y;
+    case 6u: return raw.z;
+    case 7u: return raw.w;
+    }
+    return 0u;
+}
+
+// buffer_load_format_xyzw of a 32-bit-per-channel uint format: STRIDE bytes an element, only the index checked
+// against NUM_RECORDS (OOB_SELECT 1), DST_SEL applied to the channels the element has. Out of range the channels
+// read 0 but DST_SEL still applies, so a selected 1 stays 1 (tools/rdna2spirv.py, the MUBUF format load).
+uvec4 typed_load(uint index) {
+    const VSharp v = vsharp();
+    uvec4 raw = uvec4(0u);
+    if (index < v.records)
+        for (uint c = 0; c < 4u && c * 4u < v.stride; ++c) raw[c] = word_at(v, index * v.stride + c * 4u);
+    return uvec4(select_channel(raw, bitfieldExtract(v.dst_sel, 0, 3)),
+                 select_channel(raw, bitfieldExtract(v.dst_sel, 3, 3)),
+                 select_channel(raw, bitfieldExtract(v.dst_sel, 6, 3)),
+                 select_channel(raw, bitfieldExtract(v.dst_sel, 9, 3)));
+}
+
+// buffer_load_dword of a raw V# (OOB_SELECT 3): the bytes are checked against NUM_RECORDS.
+uint raw_load(uint byte_offset) {
+    const VSharp v = vsharp();
+    return byte_offset + 4u <= v.records ? word_at(v, byte_offset) : 0u;
+}
+
+// buffer_load_dwordx4 of a structured V# (OOB_SELECT 0): index against NUM_RECORDS, offset against STRIDE.
+uvec4 structured_load(uint index, uint dwords) {
+    const VSharp v = vsharp();
+    uvec4 out_value = uvec4(0u);
+    if (index >= v.records) return out_value;
+    for (uint c = 0; c < dwords; ++c)
+        if (c * 4u < v.stride) out_value[c] = word_at(v, index * v.stride + c * 4u);
+    return out_value;
+}
+
+// The texel grid a sample probe uses: texel centres from two widths left of the image to three right, so that every
+// address mode is reached and no coordinate falls on a texel edge at any mip.
+vec2 sample_uv(uint i, ivec2 size) {
+    const ivec2 g = ivec2(i % 8u, i / 8u);
+    const ivec2 step_ = max(size / 2, ivec2(1));
+    return (vec2(g * step_ - 2 * step_) + 0.5) / vec2(max(size, ivec2(1)));
+}
+
+void main() {
+    const uint i = gl_LocalInvocationID.x;
+    const uint kind = pc.s[4];
+    uvec4 result = uvec4(0u);
+    if (kind == kSample2D) {
+        const uint image = image_index(), smp = sampler_index();
+        const ivec2 size = textureSize(sampler2D(images[image], samplers[smp]), 0);
+        result = floatBitsToUint(textureLod(sampler2D(images[image], samplers[smp]), sample_uv(i, size),
+                                            float(pc.s[8])));
+    } else if (kind == kSample2DArray) {
+        const uint image = image_index(), smp = sampler_index();
+        const ivec2 size = textureSize(sampler2DArray(arrays[image], samplers[smp]), 0).xy;
+        result = floatBitsToUint(textureLod(sampler2DArray(arrays[image], samplers[smp]),
+                                            vec3(sample_uv(i, size), float(pc.s[9])), float(pc.s[8])));
+    } else if (kind == kLoad2D) {
+        const uint image = image_index();
+        const int mip = int(pc.s[8]);
+        const ivec2 size = max(textureSize(sampler2D(images[image], samplers[0]), mip), ivec2(1));
+        const ivec2 xy = ivec2(i % 8u, i / 8u) % size;
+        result = floatBitsToUint(texelFetch(sampler2D(images[image], samplers[0]), xy, mip));
+    } else if (kind == kTypedSrv) {
+        result = typed_load(i);
+    } else if (kind == kTypedUav) {
+        result = uvec4(typed_load(i).x, 0u, 0u, 0u);  // RWBuffer<uint>: buffer_load_format_x
+    } else if (kind == kRawSrv || kind == kRawUav) {
+        result = uvec4(raw_load(i * 4u), 0u, 0u, 0u);
+    } else if (kind == kStruct4Srv) {
+        result = structured_load(i, 1u);
+    } else if (kind == kStruct16Srv) {
+        result = structured_load(i, 4u);
+    } else if (kind == kCbv) {
+        if (i < pc.s[8]) {
+            const VSharp v = vsharp();
+            for (uint c = 0; c < 4u; ++c) {
+                const uint offset = i * 16u + c * 4u;
+                result[c] = offset + 4u <= v.records ? word_at(v, offset) : 0u;
+            }
+        }
+    } else if (kind == kTexUav) {
+        const uint image = image_index();
+        const ivec2 size = max(imageSize(r32[image]), ivec2(1));
+        result = uvec4(imageLoad(r32[image], ivec2(i % 8u, i / 8u) % size).x, 0u, 0u, 0u);
+    }
+    Words out_words = at(uvec2(pc.s[10], pc.s[11]));
+    const uint first = (pc.s[7] + i) * 4u;
+    for (uint c = 0; c < 4u; ++c) out_words.w[first + c] = result[c];
+}

@@ -2611,6 +2611,25 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_bindless_churn PROPERTIES SKIP_RETURN_CODE 77)
       add_test(NAME d3d12_bindless_churn_validated COMMAND d3d12_bindless_churn_test --validated)
       set_tests_properties(d3d12_bindless_churn_validated PROPERTIES SKIP_RETURN_CODE 77)
+      # Differential descriptor fuzzer: random heaps, views, samplers, CopyDescriptors(Simple) and table rebinds,
+      # every output byte compared with the host PC runtime (HLSL) and the layer (test/glsl/cs_descriptor_fuzz.comp,
+      # written to the translator's contract). ctest runs one fixed seed; --seed/--cases/--only/--warp for sweeps.
+      set(LEONIDA_TEST_CS_DESCRIPTOR_FUZZ ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_descriptor_fuzz.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_DESCRIPTOR_FUZZ}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_DESCRIPTOR_FUZZ}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_descriptor_fuzz.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_descriptor_fuzz.comp
+        COMMENT "Compiling the descriptor fuzz test shader"
+        VERBATIM)
+      add_executable(d3d12_descriptor_fuzz_test test/d3d12_descriptor_fuzz_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_CS_DESCRIPTOR_FUZZ})
+      target_link_libraries(d3d12_descriptor_fuzz_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_descriptor_fuzz_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_DESCRIPTOR_FUZZ_SPV="${LEONIDA_TEST_CS_DESCRIPTOR_FUZZ}")
+      target_compile_options(d3d12_descriptor_fuzz_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_descriptor_fuzz COMMAND d3d12_descriptor_fuzz_test --seed 1 --cases 12)
+      set_tests_properties(d3d12_descriptor_fuzz PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(d3d12_pipeline_library_test test/d3d12_pipeline_library_test.cpp
                      ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_pipeline_library_test PRIVATE gta6rt_d3d12_com)
@@ -2677,7 +2696,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test, d3d12_descriptor_fuzz_test and d3d12_mesh_test are not built")
     endif()
 
     # Native D3D12 SV_InnerCoverage reference; its HLSL is compiled at runtime, so glslang is not needed.
