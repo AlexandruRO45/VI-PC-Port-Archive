@@ -9,6 +9,8 @@ afterwards. The summary is printed first, and on failure the last run's log tail
 unless --play-audio sets LEONIDA_SCENE_AUDIO=winmm. The guest then plays the pulse synchronously with PlaySoundW.
 Run records distinguish a child exit, a deadline expiry and a launch failure.
 --negative-controls also runs a corrupted scene.bin and a corrupted checkpoint.bin, and each one must exit with 1.
+--wine takes a Wine binary or a command split the way a shell would, such as "umu-run" or
+"/path/to/proton run"; outside Windows it defaults to $WINE.
 Exit code 0 means every check passed, 1 means a check failed and 2 means bad arguments.
 """
 from __future__ import annotations
@@ -17,6 +19,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import struct
 import subprocess
@@ -187,7 +190,7 @@ class Session:
 
     def run(self, name: str, mode: str, package: Path, overlay: Path) -> tuple[int, list[bytes], bytes]:
         a, wine = self.args, bool(self.args.wine)
-        cmd = ([a.wine] if wine else []) + [str(a.loader), "--run", guest_path(a.guest, wine), "--game-dir",
+        cmd = (list(a.wine) if wine else []) + [str(a.loader), "--run", guest_path(a.guest, wine), "--game-dir",
                                             guest_path(package, wine), "--overlay", guest_path(overlay, wine),
                                             "--", guest_path(a.shaders, wine)]
         env_set = {"LEONIDA_SCENE_MODE": mode,
@@ -258,7 +261,8 @@ def negative_controls(session: Session, out: Path) -> dict:
 def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
     out.mkdir(parents=True, exist_ok=True)  # parse_args has checked that it is new or empty
     session = Session(args, out)
-    report: dict = {"status": "fail", "frames": FRAMES, "headless": True, "wine": args.wine, "temporary": temporary,
+    wine = shlex.join(args.wine) if args.wine else None
+    report: dict = {"status": "fail", "frames": FRAMES, "headless": True, "wine": wine, "temporary": temporary,
                     "audio_mode": "winmm" if args.play_audio else "offline", "report": str(out / "report.json")}
     try:
         shader_files = tree_files(args.shaders)
@@ -314,13 +318,32 @@ def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
     return 0 if report["status"] == "pass" else 1
 
 
+def wine_command(text: str, ap: argparse.ArgumentParser) -> list[str]:
+    """--wine: a Wine binary (a path with spaces stays one word) or a command split the way a shell would.
+    The first word must be an existing file or on PATH; it is resolved, the remaining words are passed as given."""
+    if Path(text).is_file():
+        parts = [text]
+    else:
+        try:
+            parts = shlex.split(text)
+        except ValueError as e:
+            ap.error(f"--wine: malformed command: {e}")
+        if not parts:
+            ap.error("--wine: must be a nonempty command")
+    found = parts[0] if Path(parts[0]).is_file() else shutil.which(parts[0])
+    if not found:
+        ap.error(f"--wine: {parts[0]} not found")
+    return [str(Path(found).resolve())] + parts[1:]
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--loader", type=Path, required=True)
     ap.add_argument("--guest", type=Path, required=True)
     ap.add_argument("--shaders", type=Path, required=True, help="shader root containing spirv/")
     ap.add_argument("--out", type=Path, help="new or empty folder (default: a temporary folder, removed afterwards)")
-    ap.add_argument("--wine", help="run the loader through this Wine binary")
+    ap.add_argument("--wine", default=None if os.name == "nt" else os.environ.get("WINE") or None,
+                    help="run the loader through this Wine binary or command (default outside Windows: $WINE)")
     ap.add_argument("--play-audio", action="store_true", help="LEONIDA_SCENE_AUDIO=winmm instead of offline")
     ap.add_argument("--negative-controls", action="store_true", help="also run a bad scene.bin and checkpoint")
     args = ap.parse_args()
@@ -330,12 +353,9 @@ def parse_args() -> argparse.Namespace:
     if not (args.shaders / "spirv").is_dir():
         ap.error("--shaders: no spirv/ folder under it")
     if args.wine:
-        found = args.wine if Path(args.wine).is_file() else shutil.which(args.wine)
-        if not found:
-            ap.error("--wine: not found")
-        args.wine = str(Path(found).resolve())
+        args.wine = wine_command(args.wine, ap)
     elif os.name != "nt":
-        ap.error("--wine is required outside Windows")
+        ap.error("--wine (or $WINE) is required outside Windows")
     if args.out and args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir())):
         ap.error("--out must be new or an empty folder")
     args.loader, args.guest, args.shaders = args.loader.resolve(), args.guest.resolve(), args.shaders.resolve()

@@ -531,7 +531,7 @@ python -I scripts/run_guest_scene.py --loader path/to/gta6rt.exe --guest path/to
     --shaders path/to/m15_shaders --out new-scene-run --negative-controls
 ```
 
-For Wine, add `--wine path/to/wine`. The runner launches the mapped guest for an
+For Wine, add `--wine path/to/wine` (or a command such as `--wine umu-run`; `$WINE` is the default). The runner launches the mapped guest for an
 uninterrupted 600-frame run, a 300-frame save, and a fresh process that restores the
 checkpoint. This opt-in build links a fixture input source into the loader. Scripted keyboard changes feed the SDL virtual pad. GameInput readings
 drive the position of one quad. The guest streams ten 16-byte synthetic palette pages from

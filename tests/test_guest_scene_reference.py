@@ -3,6 +3,7 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import shlex
 import struct
 import subprocess
 import sys
@@ -117,6 +118,55 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertEqual(session.runs["full"]["outcome"], "timed_out")
             self.assertIsNone(session.runs["full"]["returncode"])
             self.assertNotIn("launch_error", session.runs["full"])
+
+    def test_wine_accepts_a_command_and_the_wine_environment_variable(self):
+        # --wine is a binary or a shell-split command (umu-run, "proton run"); outside Windows $WINE is the default.
+        # Only the first word is looked up and resolved. A synthetic stand-in records the argv it is given.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "spirv").mkdir()
+            (root / "loader.exe").write_bytes(b"synthetic")
+            spaced = root / "wine dir"
+            spaced.mkdir()
+            wrapper = spaced / "fake wine"
+            wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            wrapper.chmod(0o755)
+            base = ["run_guest_scene.py", "--loader", str(root / "loader.exe"), "--guest", str(root / "loader.exe"),
+                    "--shaders", str(root)]
+            cases = [
+                ({}, ["--wine", f"{shlex.quote(str(wrapper))} run --verbose"], [str(wrapper.resolve()), "run", "--verbose"]),
+                ({}, ["--wine", str(wrapper)], [str(wrapper.resolve())]),
+                ({"WINE": f"{shlex.quote(str(wrapper))} run"}, [], [str(wrapper.resolve()), "run"]),
+                ({"WINE": "ignored-when-given"}, ["--wine", str(wrapper)], [str(wrapper.resolve())]),
+            ]
+            for env, extra, expected in cases:
+                with self.subTest(env=env, extra=extra), mock.patch.object(sys, "argv", base + extra), \
+                        mock.patch.dict(runner.os.environ, env, clear=False), mock.patch.object(runner.os, "name", "posix"):
+                    if "WINE" not in env:
+                        runner.os.environ.pop("WINE", None)
+                    self.assertEqual(runner.parse_args().wine, expected)
+            session = runner.Session(argparse.Namespace(wine=[str(wrapper), "run"], loader=root / "loader.exe",
+                                                        guest=root / "loader.exe", shaders=root, play_audio=False), root)
+            session.logs.mkdir()
+            with mock.patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                session.run("full", "full", root, root)
+            self.assertEqual(run.call_args.args[0][:3], [str(wrapper), "run", str(root / "loader.exe")])
+
+    def test_wine_command_errors_exit_with_code_2(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "spirv").mkdir()
+            (root / "loader.exe").write_bytes(b"synthetic")
+            base = ["run_guest_scene.py", "--loader", str(root / "loader.exe"), "--guest", str(root / "loader.exe"),
+                    "--shaders", str(root)]
+            for extra, env in ((["--wine", "no-such-wine-binary-xyz run"], {}), (["--wine", "'unterminated"], {}),
+                               ([], {})):
+                with self.subTest(extra=extra), mock.patch.object(sys, "argv", base + extra), \
+                        mock.patch.dict(runner.os.environ, env), mock.patch.object(runner.os, "name", "posix"), \
+                        mock.patch("sys.stderr"), self.assertRaises(SystemExit) as exit_:
+                    runner.os.environ.pop("WINE", None)
+                    runner.parse_args()
+                self.assertEqual(exit_.exception.code, 2)
 
 
 if __name__ == "__main__":
