@@ -377,6 +377,8 @@ class Gen:
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
+        self.f32_rtz_fns: dict[str, list[str]] = {}       # "sub"/"mul" -> %f32_{sub,mul}_rtz_fn lines
+        self.bvh_fn = None    # lines of %image_bvh_fn, once an image_bvh(_64)_intersect_ray needs it
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
@@ -992,7 +994,7 @@ class Gen:
         self.emit(f"{away} = OpLogicalOr %bool {a1} {a2}")
         return away
 
-    def f32_sub_rtz(self, x, y):
+    def _emit_f32_sub_rtz(self, x, y):
         r, bb, t1, t2, t3, e = (self.tmp() for _ in range(6))
         self.emit(f"{r} = OpFSub %float {x} {y}")
         self.emit(f"{bb} = OpFSub %float {r} {x}")
@@ -1004,7 +1006,7 @@ class Gen:
         self.emit(f"{step} = OpLogicalOr %bool {self._f32_away(r, e)} {self._f32_overflowed(r, x, y)}")
         return self._f32_step_toward_zero(r, step)
 
-    def f32_mul_rtz(self, x, y):
+    def _emit_f32_mul_rtz(self, x, y):
         m = self.tmp()
         self.emit(f"{m} = OpFMul %float {x} {y}")
 
@@ -1050,6 +1052,42 @@ class Gen:
         self.emit(f"{valid} = OpLogicalAnd %bool {mfin} {over}")
         self.emit(f"{step} = OpLogicalOr %bool {valid} {self._f32_overflowed(m, x, y)}")
         return self._f32_step_toward_zero(m, step)
+
+    def _ensure_f32_rtz_fn(self, kind):
+        fn_name = f"%f32_{kind}_rtz_fn"
+        if kind not in self.f32_rtz_fns:
+            saved_body, saved_active, saved_bc = self.body, self._active_ssa, self.bitcast_from
+            self.body = []
+            self._active_ssa = None
+            self.bitcast_from = {}
+            px, py = f"%f32_{kind}_rtz_x", f"%f32_{kind}_rtz_y"
+            try:
+                res = self._emit_f32_sub_rtz(px, py) if kind == "sub" else self._emit_f32_mul_rtz(px, py)
+                self.emit(f"OpReturnValue {res}")
+                fn_body = self.body
+            finally:
+                self.body, self._active_ssa, self.bitcast_from = saved_body, saved_active, saved_bc
+            self.f32_rtz_fns[kind] = (
+                [f"{fn_name} = OpFunction %float Pure %fn_f32_rtz",
+                 f"{px} = OpFunctionParameter %float",
+                 f"{py} = OpFunctionParameter %float",
+                 f"%f32_{kind}_rtz_entry = OpLabel"]
+                + fn_body
+                + ["OpFunctionEnd"]
+            )
+        return fn_name
+
+    def f32_sub_rtz(self, x, y):
+        fn_name = self._ensure_f32_rtz_fn("sub")
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %float {fn_name} {x} {y}")
+        return r
+
+    def f32_mul_rtz(self, x, y):
+        fn_name = self._ensure_f32_rtz_fn("mul")
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %float {fn_name} {x} {y}")
+        return r
 
     def f64_add_mode(self, x, y, r, lo, hi):
         """v_add_f64 under MODE.FP_ROUND[3:2]: ``r`` = x + y rounded to nearest (bits lo/hi). When the mode is
@@ -13841,6 +13879,311 @@ class Gen:
         self.emit(f"{end} = OpLabel")
 
     # ---- ray tracing: image_bvh(64)_intersect_ray ----
+    def _ensure_image_bvh_fn(self):
+        """Build (once per module) the shared %image_bvh_fn helper used by both image_bvh_intersect_ray
+        and image_bvh64_intersect_ray, keeping the triangle/box traversal and RTZ box-slab math out of %main."""
+        if self.bvh_fn is not None:
+            return "%image_bvh_fn"
+        saved_body, saved_active, saved_bc = self.body, self._active_ssa, self.bitcast_from
+        self.body = []
+        self._active_ssa = None
+        self.bitcast_from = {}
+        try:
+            e = self.emit
+            T = self.tmp
+            haddr = "%bvh_addr"
+            ntype = "%bvh_ntype"
+            sortb = "%bvh_sort"
+            tmax = "%bvh_tmax"
+            org_v = "%bvh_org"
+            dvec = "%bvh_dir"
+            inv_v = "%bvh_inv"
+
+            ptr = T()
+            e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {haddr}")
+            sort = T()
+            e(f"{sort} = OpINotEqual %bool {sortb} {self.cu(0)}")
+
+            def ext3(vec):
+                xs = []
+                for c in range(3):
+                    r = T()
+                    e(f"{r} = OpCompositeExtract %float {vec} {c}")
+                    xs.append(r)
+                return xs
+
+            org = ext3(org_v)
+            dirv = ext3(dvec)
+            inv = ext3(inv_v)
+
+            def ldw(i):
+                pp, v = T(), T()
+                e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                e(f"{v} = OpLoad %uint {pp} Aligned 4")
+                return v
+
+            INF, ONE, NEGINF = (self.tof(self.cu(x)) for x in (0x7F800000, 0x3F800000, 0xFF800000))
+
+            def fop(o, x, y):
+                r = T()
+                e(f"{r} = {o} %float {x} {y}")
+                return r
+
+            def fext(name, *xs):
+                r = T()
+                e(f"{r} = OpExtInst %float %glsl {name} {' '.join(xs)}")
+                return r
+
+            def bop(o, x, y):
+                r = T()
+                e(f"{r} = {o} %bool {x} {y}")
+                return r
+
+            def sel(c, x, y, ty="%float"):
+                r = T()
+                e(f"{r} = OpSelect {ty} {c} {x} {y}")
+                return r
+
+            is_tri, is_b16, is_box = T(), T(), T()
+            e(f"{is_tri} = OpULessThan %bool {ntype} {self.cu(4)}")
+            e(f"{is_b16} = OpIEqual %bool {ntype} {self.cu(4)}")
+            bx16 = T()
+            e(f"{bx16} = OpIEqual %bool {ntype} {self.cu(5)}")
+            e(f"{is_box} = OpLogicalOr %bool {is_b16} {bx16}")
+            L = {k: T() + "_" + k for k in ("tri", "nt", "box", "oth", "end1", "end2")}
+            e(f"OpSelectionMerge {L['end1']} None")
+            e(f"OpBranchConditional {is_tri} {L['tri']} {L['nt']}")
+
+            # ---------------- triangle ----------------
+            e(f"{L['tri']} = OpLabel")
+            # The node type picks the triangle's vertex slots in the 64-byte node (12 bytes each; slot 4 is the
+            # metadata words 12..14): TRI0 (0,1,2), TRI1 (1,3,2), TRI2 (2,3,4), TRI3 (2,4,0). AMD GPURT
+            # CalcTriangleCompressionVertexIndices; the XDXR software path's Read3Verts (docs/bvh.md 7a).
+            def ldw_dyn(i):
+                pp, v = T(), T()
+                e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {i}")
+                e(f"{v} = OpLoad %uint {pp} Aligned 4")
+                return v
+
+            nsh = T()
+            e(f"{nsh} = OpShiftLeftLogical %uint {ntype} {self.cu(2)}")
+            V = []
+            for table in (0x2210, 0x4331, 0x0422):         # slot of vertex j for node types 0..3, one nibble each
+                slot, w0 = T(), T()
+                e(f"{slot} = OpBitFieldUExtract %uint {self.cu(table)} {nsh} {self.cu(4)}")
+                e(f"{w0} = OpIMul %uint {slot} {self.cu(3)}")
+                row = []
+                for c in range(3):
+                    wc = w0
+                    if c:
+                        wc = T()
+                        e(f"{wc} = OpIAdd %uint {w0} {self.cu(c)}")
+                    row.append(self.tof(ldw_dyn(wc)))
+                V.append(row)
+            ad = [fext("FAbs", d) for d in dirv]
+            c01, c02, c12 = bop("OpFOrdGreaterThanEqual", ad[0], ad[1]), bop("OpFOrdGreaterThanEqual", ad[0], ad[2]), \
+                bop("OpFOrdGreaterThanEqual", ad[1], ad[2])
+            k_a = sel(c02, self.cu((0 << 4) | (2 << 2) | 1), self.cu((2 << 4) | (1 << 2) | 0), "%uint")
+            k_b = sel(c12, self.cu((1 << 4) | (0 << 2) | 2), self.cu((2 << 4) | (1 << 2) | 0), "%uint")
+            pk = sel(c01, k_a, k_b, "%uint")
+            kx0, ky0, kz = T(), T(), T()
+            e(f"{kx0} = OpBitwiseAnd %uint {pk} {self.cu(3)}")
+            e(f"{ky0} = OpBitFieldUExtract %uint {pk} {self.cu(2)} {self.cu(2)}")
+            e(f"{kz} = OpShiftRightLogical %uint {pk} {self.cu(4)}")
+
+            def vx(vec, i):
+                r = T()
+                e(f"{r} = OpVectorExtractDynamic %float {vec} {i}")
+                return r
+
+            dkz = vx(dvec, kz)
+            neg = bop("OpFOrdLessThan", dkz, "%f0")
+            kx = sel(neg, ky0, kx0, "%uint")
+            ky = sel(neg, kx0, ky0, "%uint")
+            # Measured on RDNA2 (docs/design.md, Ray tracing row): the words are the watertight test's T, det and edge
+            # functions, scaled by k = |d[kz]|^3. They are computed here without a division, with the shear multiplied
+            # through by |d[kz]| (A'' = |d[kz]| A' = A[kx] |d[kz]| - sign(d[kz]) d[kx] A[kz]), so U, V, W and det carry
+            # |d[kz]|^2 and the sum below sign(d[kz]) |d[kz]|^3 T. The supplied inverse direction is not used. A shear
+            # divided by d[kz] gives the same words on every measured row but d.z = +inf (and divides by zero at d = 0);
+            # this form gives that row too, a fit after the runs.
+            adz = fext("FAbs", dkz)
+            NEG1 = self.tof(self.cu(0xBF800000))
+            sgz = sel(neg, NEG1, ONE)
+            sx = fop("OpFMul", sgz, vx(dvec, kx))          # sign(d[kz]) d[kx], sign(d[kz]) d[ky]
+            sy = fop("OpFMul", sgz, vx(dvec, ky))
+            rel = []
+            for j in range(3):
+                vv = T()
+                comps = [fop("OpFSub", V[j][c], org[c]) for c in range(3)]
+                e(f"{vv} = OpCompositeConstruct %v3float {' '.join(comps)}")
+                rel.append(vv)
+
+            def shear(vv):
+                zk = vx(vv, kz)
+                return (fop("OpFSub", fop("OpFMul", vx(vv, kx), adz), fop("OpFMul", sx, zk)),
+                        fop("OpFSub", fop("OpFMul", vx(vv, ky), adz), fop("OpFMul", sy, zk)), zk)
+
+            (ax, ay, az0), (bx, by, bz0), (cx, cy, cz0) = (shear(r) for r in rel)
+            uu = fop("OpFSub", fop("OpFMul", cx, by), fop("OpFMul", cy, bx))
+            vv_ = fop("OpFSub", fop("OpFMul", ax, cy), fop("OpFMul", ay, cx))
+            ww = fop("OpFSub", fop("OpFMul", bx, ay), fop("OpFMul", by, ax))
+            lt0 = lambda x: bop("OpFOrdLessThan", x, "%f0")
+            gt0 = lambda x: bop("OpFOrdGreaterThan", x, "%f0")
+            eq0 = lambda x: bop("OpFOrdEqual", x, "%f0")
+            orr = lambda x, y: bop("OpLogicalOr", x, y)
+            andd = lambda x, y: bop("OpLogicalAnd", x, y)
+            det = fop("OpFAdd", uu, fop("OpFAdd", vv_, ww))
+            tt = fop("OpFAdd", fop("OpFAdd", fop("OpFMul", uu, az0), fop("OpFMul", vv_, bz0)), fop("OpFMul", ww, cz0))
+            tk = fop("OpFMul", sgz, tt)                    # k*T
+            # Inside: det is not 0 or NaN, and every edge function has det's sign, or is 0 and its edge passes RDNA2's
+            # tie rule (docs/design.md, Ray tracing row; measured with x, y and z dominant, both windings, both signs
+            # of d[kz]): the edge from P to Q, with (tx, ty) = Q - P in the sheared frame with the d[kz] < 0 swap
+            # undone, passes when ty == 0 ? sign(det) tx > 0 : sign(d[kz]) sign(det) ty > 0. Hit: inside and
+            # sign(det) T >= 0 (t = 0 hits); there is no test against the ray extent. Every compare is ordered, so a NaN
+            # fails it.
+            dpos, dneg = gt0(det), lt0(det)
+            sd = sel(dpos, ONE, NEG1)
+            sdz = fop("OpFMul", sgz, sd)                   # sign(d[kz]) sign(det)
+
+            def inside(x, p, q):
+                tx, ty = fop("OpFSub", q[0], p[0]), fop("OpFSub", q[1], p[1])
+                tx, ty = sel(neg, ty, tx), sel(neg, tx, ty)        # undo the kx/ky swap of d[kz] < 0
+                tie = sel(eq0(ty), gt0(fop("OpFMul", sd, tx)), gt0(fop("OpFMul", sdz, ty)), "%bool")
+                return sel(eq0(x), tie, gt0(fop("OpFMul", sd, x)), "%bool")
+
+            a2, b2, c2 = (ax, ay), (bx, by), (cx, cy)
+            front = bop("OpFOrdGreaterThanEqual", fop("OpFMul", sd, tk), "%f0")
+            hit = andd(andd(orr(dpos, dneg), andd(inside(uu, b2, c2), inside(vv_, c2, a2))),
+                       andd(inside(ww, a2, b2), front))
+            # The node's triangle-ID word (byte offset 60) holds one byte per node type: bits [1:0] pick which
+            # vertex's weight is returned first, bits [3:2] the second (0 = vertex 0's, U; 1 = V; 2 = W; 3 is not used
+            # by a builder and reads U, as in the XDXR software path). 0x09 is the plain (V, W). AMD GPURT
+            # SwizzleBarycentrics and TRIANGLE_ID_I/J_SRC_SHIFT; XDXR TestXboxBvh4Leaf (docs/bvh.md 7a).
+            tid, tsh, tby = T(), T(), T()
+            e(f"{tsh} = OpShiftLeftLogical %uint {ntype} {self.cu(3)}")
+            e(f"{tid} = OpShiftRightLogical %uint {ldw(15)} {tsh}")
+            e(f"{tby} = OpBitwiseAnd %uint {tid} {self.cu(0xF)}")
+
+            def pick(shift):
+                s_ = T()
+                e(f"{s_} = OpBitFieldUExtract %uint {tby} {self.cu(shift)} {self.cu(2)}")
+                is1, is2 = T(), T()
+                e(f"{is1} = OpIEqual %bool {s_} {self.cu(1)}")
+                e(f"{is2} = OpIEqual %bool {s_} {self.cu(2)}")
+                return sel(is2, ww, sel(is1, vv_, uu))
+
+            # The four words, hit or miss: (k*T, k*det, k*b_i, k*b_j). The hardware returns every zero as +0, where
+            # IEEE arithmetic gives -0 for some (t = 0, an edge function through a vertex on the ray), and every NaN
+            # as 0xFFC00000. SPIR-V leaves a NaN's bits to the driver, and a zero's sign too without float controls, so
+            # both are fixed by a select on the integer side. A miss replaces word 0 with copysign(inf, word 1):
+            # det = 0 gives +inf, a NaN det -inf.
+            def canon(x):
+                u, nan = self.tou(x), T()
+                e(f"{nan} = OpIsNan %bool {x}")
+                return sel(nan, self.cu(0xFFC00000), sel(eq0(x), self.cu(0), u, "%uint"), "%uint")
+
+            w = [canon(x) for x in [tk] + [fop("OpFMul", adz, x) for x in (det, pick(0), pick(2))]]
+            sgn, minf = T(), T()
+            e(f"{sgn} = OpBitwiseAnd %uint {w[1]} {self.cu(0x80000000)}")
+            e(f"{minf} = OpBitwiseOr %uint {sgn} {self.cu(0x7F800000)}")
+            w[0] = sel(hit, w[0], minf, "%uint")
+            # A NaN in t max, the origin, the direction or the inverse direction (an axis nothing else reads included),
+            # or an infinite origin, returns (inf, 1, 0, 0) whatever the node holds.
+            bad = None
+            for x, test in [(tmax, "OpIsNan")] + [(x, "OpIsNan") for x in org + dirv + inv] + [(x, "OpIsInf") for x in org]:
+                b = T()
+                e(f"{b} = {test} %bool {x}")
+                bad = b if bad is None else orr(bad, b)
+            tri_words = [sel(bad, self.cu(c), v, "%uint") for v, c in zip(w, (0x7F800000, 0x3F800000, 0, 0))]
+            tri_vec = T()
+            e(f"{tri_vec} = OpCompositeConstruct %v4uint_bvh {' '.join(tri_words)}")
+            e(f"OpBranch {L['end1']}")
+
+            # ---------------- not a triangle ----------------
+            e(f"{L['nt']} = OpLabel")
+            e(f"OpSelectionMerge {L['end2']} None")
+            e(f"OpBranchConditional {is_box} {L['box']} {L['oth']}")
+            e(f"{L['box']} = OpLabel")
+            dist, idx = [], []
+            for i in range(4):
+                child = ldw(i)
+                # box32: min/max f32 at 16 + 24 i; box16: 6 halves at 16 + 12 i (min x,y,z, max x,y,z)
+                m32 = [self.tof(ldw(4 + 6 * i + c)) for c in range(6)]
+                h = [ldw(4 + 3 * i + c) for c in range(3)]
+                m16 = []
+                for hw in h:
+                    v2 = T()
+                    e(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {hw}")
+                    for c in range(2):
+                        x = T()
+                        e(f"{x} = OpCompositeExtract %float {v2} {c}")
+                        m16.append(x)
+                mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
+                b0 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[c], org[c]), inv[c]) for c in range(3)]
+                b1 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[3 + c], org[c]), inv[c]) for c in range(3)]
+                near, far, nnan, fnan = [], [], [], []
+                for c in range(3):
+                    pos = bop("OpFOrdGreaterThanEqual", inv[c], "%f0")
+                    n_, f_ = sel(pos, b0[c], b1[c]), sel(pos, b1[c], b0[c])
+                    nn, fn = T(), T()
+                    e(f"{nn} = OpIsNan %bool {n_}")
+                    e(f"{fn} = OpIsNan %bool {f_}")
+                    near.append(sel(nn, NEGINF, n_))
+                    far.append(sel(fn, INF, f_))
+                    nnan.append(nn)
+                    fnan.append(fn)
+                tmin = fext("FMax", fext("FMax", near[0], near[1]), near[2])
+                tmx = fext("FMin", fext("FMin", far[0], far[1]), far[2])
+                nonan = T()
+                e(f"{nonan} = OpLogicalNot %bool "
+                  f"{orr(andd(andd(nnan[0], nnan[1]), nnan[2]), andd(andd(fnan[0], fnan[1]), fnan[2]))}")
+                tnear = fext("FMax", "%f0", tmin)
+                h1 = bop("OpFOrdGreaterThanEqual", tmx, tnear)
+                h2 = bop("OpFOrdLessThan", tmin, tmax)
+                hb = andd(nonan, andd(h1, h2))
+                dist.append(sel(hb, tnear, INF))
+                idx.append(sel(hb, child, self.cu(0xFFFFFFFF), "%uint"))
+            for p_, q_ in ((0, 2), (1, 3), (0, 1), (2, 3), (1, 2)):
+                sw = andd(sort, bop("OpFOrdLessThan", dist[q_], dist[p_]))
+                dist[p_], dist[q_] = sel(sw, dist[q_], dist[p_]), sel(sw, dist[p_], dist[q_])
+                idx[p_], idx[q_] = sel(sw, idx[q_], idx[p_], "%uint"), sel(sw, idx[p_], idx[q_], "%uint")
+            box_vec = T()
+            e(f"{box_vec} = OpCompositeConstruct %v4uint_bvh {' '.join(idx)}")
+            e(f"OpBranch {L['end2']}")
+
+            e(f"{L['oth']} = OpLabel")
+            c_ff = self.cu(0xFFFFFFFF)
+            oth_vec = T()
+            e(f"{oth_vec} = OpCompositeConstruct %v4uint_bvh {c_ff} {c_ff} {c_ff} {c_ff}")
+            e(f"OpBranch {L['end2']}")
+
+            e(f"{L['end2']} = OpLabel")
+            nt_vec = T()
+            e(f"{nt_vec} = OpPhi %v4uint_bvh {box_vec} {L['box']} {oth_vec} {L['oth']}")
+            e(f"OpBranch {L['end1']}")
+
+            e(f"{L['end1']} = OpLabel")
+            res_vec = T()
+            e(f"{res_vec} = OpPhi %v4uint_bvh {tri_vec} {L['tri']} {nt_vec} {L['end2']}")
+            e(f"OpReturnValue {res_vec}")
+            fn_body = self.body
+        finally:
+            self.body, self._active_ssa, self.bitcast_from = saved_body, saved_active, saved_bc
+        self.bvh_fn = (
+            ["%image_bvh_fn = OpFunction %v4uint_bvh None %fn_image_bvh",
+             "%bvh_addr = OpFunctionParameter %ulong",
+             "%bvh_ntype = OpFunctionParameter %uint",
+             "%bvh_sort = OpFunctionParameter %uint",
+             "%bvh_tmax = OpFunctionParameter %float",
+             "%bvh_org = OpFunctionParameter %v3float",
+             "%bvh_dir = OpFunctionParameter %v3float",
+             "%bvh_inv = OpFunctionParameter %v3float",
+             "%bvh_entry = OpLabel"]
+            + fn_body
+            + ["OpFunctionEnd"]
+        )
+        return "%image_bvh_fn"
+
     def image_bvh(self, op, a, mods):
         """One BVH traversal step against AMD's hardware node format, emulated over buffer reads. Semantics follow
         Mesa RADV's software path (radv_nir_rt_common.c: intersect_ray_amd_software_box / _tri), which RADV uses
@@ -13879,13 +14222,12 @@ class Gen:
             return r
 
         # descriptor base (bits [39:0], 256-byte units) and sort flag
-        bhi, base40, base = T(), T(), T()
+        bhi, base = T(), T()
         e(f"{bhi} = OpBitwiseAnd %uint {desc[1]} {self.cu(0xFF)}")
         base40 = u64(desc[0], bhi)
         e(f"{base} = OpShiftLeftLogical %ulong {base40} {self.cl(8)}")
-        sortb, sort = T(), T()
+        sortb = T()
         e(f"{sortb} = OpShiftRightLogical %uint {desc[1]} {self.cu(31)}")
-        e(f"{sort} = OpINotEqual %bool {sortb} {self.cu(0)}")
         # node id
         if is64:
             node = u64(ld(regs[0]), ld(regs[1]))
@@ -13902,249 +14244,25 @@ class Gen:
         e(f"{nm} = OpBitwiseAnd %ulong {node} {self.cl(0xFFFFFFFFFFFFFFF8)}")
         e(f"{off} = OpShiftLeftLogical %ulong {nm} {self.cl(3)}")
         e(f"{addr} = OpIAdd %ulong {base} {off}")
-        ptr = T()
-        e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
-
-        def ldw(i):
-            pp, v = T(), T()
-            e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-            e(f"{v} = OpLoad %uint {pp} Aligned 4")
-            return v
+        haddr = self.host_addr(addr)
 
         f = lambda r: self.tof(ld(r))
         tmax = f(rest[0])
         org = [f(r) for r in rest[1:4]]
         dirv = [f(r) for r in rest[4:7]]
         inv = [f(r) for r in rest[7:10]]
-        INF, ONE, NEGINF = (self.tof(self.cu(x)) for x in (0x7F800000, 0x3F800000, 0xFF800000))
-        out = lambda k, v: self.dst({"k": "vgpr", "r": vd["r"] + k, "n": 1}, v)
+        org_v, dir_v, inv_v = T(), T(), T()
+        e(f"{org_v} = OpCompositeConstruct %v3float {' '.join(org)}")
+        e(f"{dir_v} = OpCompositeConstruct %v3float {' '.join(dirv)}")
+        e(f"{inv_v} = OpCompositeConstruct %v3float {' '.join(inv)}")
 
-        def fop(o, x, y):
-            r = T()
-            e(f"{r} = {o} %float {x} {y}")
-            return r
-
-        def fext(name, *xs):
-            r = T()
-            e(f"{r} = OpExtInst %float %glsl {name} {' '.join(xs)}")
-            return r
-
-        def bop(o, x, y):
-            r = T()
-            e(f"{r} = {o} %bool {x} {y}")
-            return r
-
-        def sel(c, x, y, ty="%float"):
-            r = T()
-            e(f"{r} = OpSelect {ty} {c} {x} {y}")
-            return r
-
-        is_tri, is_b16, is_box = T(), T(), T()
-        e(f"{is_tri} = OpULessThan %bool {ntype} {self.cu(4)}")
-        e(f"{is_b16} = OpIEqual %bool {ntype} {self.cu(4)}")
-        bx16 = T()
-        e(f"{bx16} = OpIEqual %bool {ntype} {self.cu(5)}")
-        e(f"{is_box} = OpLogicalOr %bool {is_b16} {bx16}")
-        L = {k: T() + "_" + k for k in ("tri", "nt", "box", "oth", "end1", "end2")}
-        e(f"OpSelectionMerge {L['end1']} None")
-        e(f"OpBranchConditional {is_tri} {L['tri']} {L['nt']}")
-
-        # ---------------- triangle ----------------
-        e(f"{L['tri']} = OpLabel")
-        # The node type picks the triangle's vertex slots in the 64-byte node (12 bytes each; slot 4 is the
-        # metadata words 12..14): TRI0 (0,1,2), TRI1 (1,3,2), TRI2 (2,3,4), TRI3 (2,4,0). AMD GPURT
-        # CalcTriangleCompressionVertexIndices; the XDXR software path's Read3Verts (docs/bvh.md 7a).
-        def ldw_dyn(i):
-            pp, v = T(), T()
-            e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {i}")
-            e(f"{v} = OpLoad %uint {pp} Aligned 4")
-            return v
-        nsh = T()
-        e(f"{nsh} = OpShiftLeftLogical %uint {ntype} {self.cu(2)}")
-        V = []
-        for table in (0x2210, 0x4331, 0x0422):         # slot of vertex j for node types 0..3, one nibble each
-            slot, w0 = T(), T()
-            e(f"{slot} = OpBitFieldUExtract %uint {self.cu(table)} {nsh} {self.cu(4)}")
-            e(f"{w0} = OpIMul %uint {slot} {self.cu(3)}")
-            row = []
-            for c in range(3):
-                wc = w0
-                if c:
-                    wc = T()
-                    e(f"{wc} = OpIAdd %uint {w0} {self.cu(c)}")
-                row.append(self.tof(ldw_dyn(wc)))
-            V.append(row)
-        ad = [fext("FAbs", d) for d in dirv]
-        c01, c02, c12 = bop("OpFOrdGreaterThanEqual", ad[0], ad[1]), bop("OpFOrdGreaterThanEqual", ad[0], ad[2]), \
-            bop("OpFOrdGreaterThanEqual", ad[1], ad[2])
-        k_a = sel(c02, self.cu((0 << 4) | (2 << 2) | 1), self.cu((2 << 4) | (1 << 2) | 0), "%uint")
-        k_b = sel(c12, self.cu((1 << 4) | (0 << 2) | 2), self.cu((2 << 4) | (1 << 2) | 0), "%uint")
-        pk = sel(c01, k_a, k_b, "%uint")
-        kx0, ky0, kz = T(), T(), T()
-        e(f"{kx0} = OpBitwiseAnd %uint {pk} {self.cu(3)}")
-        e(f"{ky0} = OpBitFieldUExtract %uint {pk} {self.cu(2)} {self.cu(2)}")
-        e(f"{kz} = OpShiftRightLogical %uint {pk} {self.cu(4)}")
-        dvec = T()
-        e(f"{dvec} = OpCompositeConstruct %v3float {' '.join(dirv)}")
-
-        def vx(vec, i):
-            r = T()
-            e(f"{r} = OpVectorExtractDynamic %float {vec} {i}")
-            return r
-        dkz = vx(dvec, kz)
-        neg = bop("OpFOrdLessThan", dkz, "%f0")
-        kx = sel(neg, ky0, kx0, "%uint")
-        ky = sel(neg, kx0, ky0, "%uint")
-        # Measured on RDNA2 (docs/design.md, Ray tracing row): the words are the watertight test's T, det and edge
-        # functions, scaled by k = |d[kz]|^3. They are computed here without a division, with the shear multiplied
-        # through by |d[kz]| (A'' = |d[kz]| A' = A[kx] |d[kz]| - sign(d[kz]) d[kx] A[kz]), so U, V, W and det carry
-        # |d[kz]|^2 and the sum below sign(d[kz]) |d[kz]|^3 T. The supplied inverse direction is not used. A shear
-        # divided by d[kz] gives the same words on every measured row but d.z = +inf (and divides by zero at d = 0);
-        # this form gives that row too, a fit after the runs.
-        adz = fext("FAbs", dkz)
-        NEG1 = self.tof(self.cu(0xBF800000))
-        sgz = sel(neg, NEG1, ONE)
-        sx = fop("OpFMul", sgz, vx(dvec, kx))          # sign(d[kz]) d[kx], sign(d[kz]) d[ky]
-        sy = fop("OpFMul", sgz, vx(dvec, ky))
-        rel = []
-        for j in range(3):
-            vv = T()
-            comps = [fop("OpFSub", V[j][c], org[c]) for c in range(3)]
-            e(f"{vv} = OpCompositeConstruct %v3float {' '.join(comps)}")
-            rel.append(vv)
-        def shear(vv):
-            zk = vx(vv, kz)
-            return (fop("OpFSub", fop("OpFMul", vx(vv, kx), adz), fop("OpFMul", sx, zk)),
-                    fop("OpFSub", fop("OpFMul", vx(vv, ky), adz), fop("OpFMul", sy, zk)), zk)
-        (ax, ay, az0), (bx, by, bz0), (cx, cy, cz0) = (shear(r) for r in rel)
-        uu = fop("OpFSub", fop("OpFMul", cx, by), fop("OpFMul", cy, bx))
-        vv_ = fop("OpFSub", fop("OpFMul", ax, cy), fop("OpFMul", ay, cx))
-        ww = fop("OpFSub", fop("OpFMul", bx, ay), fop("OpFMul", by, ax))
-        lt0 = lambda x: bop("OpFOrdLessThan", x, "%f0")
-        gt0 = lambda x: bop("OpFOrdGreaterThan", x, "%f0")
-        eq0 = lambda x: bop("OpFOrdEqual", x, "%f0")
-        orr = lambda x, y: bop("OpLogicalOr", x, y)
-        andd = lambda x, y: bop("OpLogicalAnd", x, y)
-        det = fop("OpFAdd", uu, fop("OpFAdd", vv_, ww))
-        tt = fop("OpFAdd", fop("OpFAdd", fop("OpFMul", uu, az0), fop("OpFMul", vv_, bz0)), fop("OpFMul", ww, cz0))
-        tk = fop("OpFMul", sgz, tt)                    # k*T
-        # Inside: det is not 0 or NaN, and every edge function has det's sign, or is 0 and its edge passes RDNA2's tie
-        # rule (docs/design.md, Ray tracing row; measured with x, y and z dominant, both windings, both signs of
-        # d[kz]): the edge from P to Q, with (tx, ty) = Q - P in the sheared frame with the d[kz] < 0 swap undone,
-        # passes when ty == 0 ? sign(det) tx > 0 : sign(d[kz]) sign(det) ty > 0. Hit: inside and sign(det) T >= 0
-        # (t = 0 hits); there is no test against the ray extent. Every compare is ordered, so a NaN fails it.
-        dpos, dneg = gt0(det), lt0(det)
-        sd = sel(dpos, ONE, NEG1)
-        sdz = fop("OpFMul", sgz, sd)                   # sign(d[kz]) sign(det)
-
-        def inside(x, p, q):
-            tx, ty = fop("OpFSub", q[0], p[0]), fop("OpFSub", q[1], p[1])
-            tx, ty = sel(neg, ty, tx), sel(neg, tx, ty)        # undo the kx/ky swap of d[kz] < 0
-            tie = sel(eq0(ty), gt0(fop("OpFMul", sd, tx)), gt0(fop("OpFMul", sdz, ty)), "%bool")
-            return sel(eq0(x), tie, gt0(fop("OpFMul", sd, x)), "%bool")
-        a2, b2, c2 = (ax, ay), (bx, by), (cx, cy)
-        front = bop("OpFOrdGreaterThanEqual", fop("OpFMul", sd, tk), "%f0")
-        hit = andd(andd(orr(dpos, dneg), andd(inside(uu, b2, c2), inside(vv_, c2, a2))),
-                   andd(inside(ww, a2, b2), front))
-        # The node's triangle-ID word (byte offset 60) holds one byte per node type: bits [1:0] pick which vertex's
-        # weight is returned first, bits [3:2] the second (0 = vertex 0's, U; 1 = V; 2 = W; 3 is not used by a
-        # builder and reads U, as in the XDXR software path). 0x09 is the plain (V, W). AMD GPURT
-        # SwizzleBarycentrics and TRIANGLE_ID_I/J_SRC_SHIFT; XDXR TestXboxBvh4Leaf (docs/bvh.md 7a).
-        tid, tsh, tby = T(), T(), T()
-        e(f"{tsh} = OpShiftLeftLogical %uint {ntype} {self.cu(3)}")
-        e(f"{tid} = OpShiftRightLogical %uint {ldw(15)} {tsh}")
-        e(f"{tby} = OpBitwiseAnd %uint {tid} {self.cu(0xF)}")
-
-        def pick(shift):
-            s_ = T()
-            e(f"{s_} = OpBitFieldUExtract %uint {tby} {self.cu(shift)} {self.cu(2)}")
-            is1, is2 = T(), T()
-            e(f"{is1} = OpIEqual %bool {s_} {self.cu(1)}")
-            e(f"{is2} = OpIEqual %bool {s_} {self.cu(2)}")
-            return sel(is2, ww, sel(is1, vv_, uu))
-        # The four words, hit or miss: (k*T, k*det, k*b_i, k*b_j). The hardware returns every zero as +0, where IEEE
-        # arithmetic gives -0 for some (t = 0, an edge function through a vertex on the ray), and every NaN as
-        # 0xFFC00000. SPIR-V leaves a NaN's bits to the driver, and a zero's sign too without float controls, so both
-        # are fixed by a select on the integer side. A miss replaces word 0 with copysign(inf, word 1): det = 0 gives
-        # +inf, a NaN det -inf.
-        def canon(x):
-            u, nan = self.tou(x), T()
-            e(f"{nan} = OpIsNan %bool {x}")
-            return sel(nan, self.cu(0xFFC00000), sel(eq0(x), self.cu(0), u, "%uint"), "%uint")
-        w = [canon(x) for x in [tk] + [fop("OpFMul", adz, x) for x in (det, pick(0), pick(2))]]
-        sgn, minf = T(), T()
-        e(f"{sgn} = OpBitwiseAnd %uint {w[1]} {self.cu(0x80000000)}")
-        e(f"{minf} = OpBitwiseOr %uint {sgn} {self.cu(0x7F800000)}")
-        w[0] = sel(hit, w[0], minf, "%uint")
-        # A NaN in t max, the origin, the direction or the inverse direction (an axis nothing else reads included),
-        # or an infinite origin, returns (inf, 1, 0, 0) whatever the node holds.
-        bad = None
-        for x, test in [(tmax, "OpIsNan")] + [(x, "OpIsNan") for x in org + dirv + inv] + [(x, "OpIsInf") for x in org]:
-            b = T()
-            e(f"{b} = {test} %bool {x}")
-            bad = b if bad is None else orr(bad, b)
-        for k, (v, c) in enumerate(zip(w, (0x7F800000, 0x3F800000, 0, 0))):
-            out(k, sel(bad, self.cu(c), v, "%uint"))
-        e(f"OpBranch {L['end1']}")
-
-        # ---------------- not a triangle ----------------
-        e(f"{L['nt']} = OpLabel")
-        e(f"OpSelectionMerge {L['end2']} None")
-        e(f"OpBranchConditional {is_box} {L['box']} {L['oth']}")
-        e(f"{L['box']} = OpLabel")
-        dist, idx = [], []
-        for i in range(4):
-            child = ldw(i)
-            # box32: min/max f32 at 16 + 24 i; box16: 6 halves at 16 + 12 i (min x,y,z, max x,y,z)
-            m32 = [self.tof(ldw(4 + 6 * i + c)) for c in range(6)]
-            h = [ldw(4 + 3 * i + c) for c in range(3)]
-            m16 = []
-            for w in h:
-                v2 = T()
-                e(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
-                for c in range(2):
-                    x = T()
-                    e(f"{x} = OpCompositeExtract %float {v2} {c}")
-                    m16.append(x)
-            mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
-            b0 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[c], org[c]), inv[c]) for c in range(3)]
-            b1 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[3 + c], org[c]), inv[c]) for c in range(3)]
-            near, far, nnan, fnan = [], [], [], []
-            for c in range(3):
-                pos = bop("OpFOrdGreaterThanEqual", inv[c], "%f0")
-                n_, f_ = sel(pos, b0[c], b1[c]), sel(pos, b1[c], b0[c])
-                nn, fn = T(), T()
-                e(f"{nn} = OpIsNan %bool {n_}")
-                e(f"{fn} = OpIsNan %bool {f_}")
-                near.append(sel(nn, NEGINF, n_))
-                far.append(sel(fn, INF, f_))
-                nnan.append(nn)
-                fnan.append(fn)
-            tmin = fext("FMax", fext("FMax", near[0], near[1]), near[2])
-            tmx = fext("FMin", fext("FMin", far[0], far[1]), far[2])
-            nonan = T()
-            e(f"{nonan} = OpLogicalNot %bool "
-              f"{orr(andd(andd(nnan[0], nnan[1]), nnan[2]), andd(andd(fnan[0], fnan[1]), fnan[2]))}")
-            tnear = fext("FMax", "%f0", tmin)
-            h1 = bop("OpFOrdGreaterThanEqual", tmx, tnear)
-            h2 = bop("OpFOrdLessThan", tmin, tmax)
-            hb = andd(nonan, andd(h1, h2))
-            dist.append(sel(hb, tnear, INF))
-            idx.append(sel(hb, child, self.cu(0xFFFFFFFF), "%uint"))
-        for p_, q_ in ((0, 2), (1, 3), (0, 1), (2, 3), (1, 2)):
-            sw = andd(sort, bop("OpFOrdLessThan", dist[q_], dist[p_]))
-            dist[p_], dist[q_] = sel(sw, dist[q_], dist[p_]), sel(sw, dist[p_], dist[q_])
-            idx[p_], idx[q_] = sel(sw, idx[q_], idx[p_], "%uint"), sel(sw, idx[p_], idx[q_], "%uint")
+        fn_name = self._ensure_image_bvh_fn()
+        res = T()
+        e(f"{res} = OpFunctionCall %v4uint_bvh {fn_name} {haddr} {ntype} {sortb} {tmax} {org_v} {dir_v} {inv_v}")
         for k in range(4):
-            out(k, idx[k])
-        e(f"OpBranch {L['end2']}")
-        e(f"{L['oth']} = OpLabel")
-        for k in range(4):            # instance / aabb nodes are handled by the shader, not the instruction
-            out(k, self.cu(0xFFFFFFFF))
-        e(f"OpBranch {L['end2']}")
-        e(f"{L['end2']} = OpLabel")
-        e(f"OpBranch {L['end1']}")
-        e(f"{L['end1']} = OpLabel")
+            wk = T()
+            e(f"{wk} = OpCompositeExtract %uint {res} {k}")
+            self.dst({"k": "vgpr", "r": vd["r"] + k, "n": 1}, wk)
 
     def ms_export(self, tgt, ins):
         """NGG export in a mesh shader: thread t exports vertex t (pos/param) and primitive t (prim). The values are
@@ -14916,6 +15034,8 @@ def assemble(gen):
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
+    if gen.f32_rtz_fns:
+        types.append("%fn_f32_rtz = OpTypeFunction %float %float %float")
     # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
     # them, so a shader that gains a ballot keeps the name %v4uint_st (SHADER-1016).
     st_types = gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image
@@ -15000,6 +15120,11 @@ def assemble(gen):
                 if gen.coherent_images:
                     dec.append(f"OpDecorate %stv{cls}_{di} Coherent")
                 gvars += [f"%stv{cls}_{di} = OpVariable %_ptr_UC_rt_stv{cls}_{di} UniformConstant"]
+    if gen.bvh_fn:
+        types += [
+            "%v4uint_bvh = OpTypeVector %uint 4",
+            "%fn_image_bvh = OpTypeFunction %v4uint_bvh %ulong %uint %uint %float %v3float %v3float %v3float",
+        ]
     if gsx:
         nst = gen.gs["maxv"] * gen.gs["nreg"]
         types += [f"%gs_arr_in = OpTypeArray %v4float {gen.cu(3)}", "%_ptr_Input_gs_arr = OpTypePointer Input %gs_arr_in",
@@ -15285,6 +15410,10 @@ def assemble(gen):
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
+    for function in gen.f32_rtz_fns.values():
+        helpers.extend(function)
+    if gen.bvh_fn:
+        helpers.extend(gen.bvh_fn)
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
     for function in gen.x_round_fns.values():
