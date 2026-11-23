@@ -422,8 +422,9 @@ class AtomicPackTest(unittest.TestCase):
         target_dir = os.path.join(self.root, "target")
         os.mkdir(target_dir)
         junction = os.path.join(self.root, "junction")
+        # mklink answers in the console (OEM) code page, which a localized Windows fills with non-UTF-8 bytes.
         result = subprocess.run(["cmd", "/c", "mklink", "/J", junction, target_dir],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, encoding="oem", errors="replace")
         if result.returncode:
             self.skipTest("cannot create junction: " + result.stderr)
         self.addCleanup(os.rmdir, junction)

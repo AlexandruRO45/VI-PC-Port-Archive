@@ -29,9 +29,10 @@ class BuildDestinationTest(unittest.TestCase):
 
     def link(self, target, path):
         if os.name == "nt":
-            # Junctions work without Developer Mode or symlink privileges on Windows.
+            # Junctions work without Developer Mode or symlink privileges on Windows. cmd prints mklink's message in
+            # the console (OEM) code page, e.g. "Jonction créée" is 0x82 0x82 in cp850, which is not UTF-8.
             result = subprocess.run(["cmd", "/c", "mklink", "/J", path, target],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, encoding="oem", errors="replace")
             if result.returncode:
                 self.skipTest("cannot create a directory junction: " + result.stderr)
             self.addCleanup(os.rmdir, path)
