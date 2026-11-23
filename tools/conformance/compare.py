@@ -1871,4 +1871,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32" and not sys.stdout.isatty():
+        # Keep the pipe encoding and escape characters it cannot represent.
+        sys.stdout.reconfigure(errors="backslashreplace")
     sys.exit(main())
