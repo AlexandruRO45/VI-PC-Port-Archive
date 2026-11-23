@@ -399,6 +399,9 @@ def check(tools, spirv, name):
 
 
 def main(argv):
+    if any(arg in ("-h", "--help") for arg in argv):
+        print(__doc__)
+        return 0
     if not argv:
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
