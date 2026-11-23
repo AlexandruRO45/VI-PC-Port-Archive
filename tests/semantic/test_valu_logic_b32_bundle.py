@@ -1267,3 +1267,41 @@ class TestOr3B32SIMDAndProperties(unittest.TestCase):
             "v_or3_b32 v0, v3, v2, v1",
         ])
         self.assertEqual(val_abc, val_cba)
+
+
+# ------------------------------------------------------------------------------
+# v_or3_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestOr3B32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(TypeError):
+            VOr3B32Instruction(
+                dst=RegisterOperand(OperandType.SGPR, 1),
+                src0=RegisterOperand(OperandType.VGPR, 1),
+                src1=RegisterOperand(OperandType.VGPR, 2),
+                src2=RegisterOperand(OperandType.VGPR, 3),
+            )
+
+    def test_boundary_extremes_hardware(self):
+        val_sparse, _ = run_shader("ps_or3_sparse", [
+            "v_mov_b32 v1, 0x00000001",
+            "v_mov_b32 v2, 0x00000002",
+            "v_mov_b32 v3, 0x00000004",
+            "v_or3_b32 v0, v1, v2, v3",
+        ])
+        self.assertEqual(val_sparse, 0x7)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        val, spv = run_shader("ps_or3_lowering", [
+            "v_mov_b32 v1, 0x1",
+            "v_mov_b32 v2, 0x2",
+            "v_mov_b32 v3, 0x4",
+            "v_or3_b32 v0, v1, v2, v3",
+        ])
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertEqual(val, 0x7)
+
+
+if __name__ == "__main__":
+    unittest.main()
