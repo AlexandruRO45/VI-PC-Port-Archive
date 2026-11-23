@@ -1,5 +1,7 @@
 """Self-tests for the mini SPIR-V interpreter, using hand-written modules and expectations taken from the SPIR-V
 and GLSL.std.450 specifications (not from the translator)."""
+import math
+import struct
 import unittest
 
 import spirv_mini_interp as si
@@ -501,6 +503,13 @@ OpStore %f32_control %control
             with self.subTest(op=op, propagated=True):
                 text = header + f"%nan = OpBitcast %float %cNaN\n%x = {op}\n%res = OpBitcast %uint %x\n"
                 self.assertEqual(si.run_fragment(text + "OpStore %out %res\n" + FOOTER)["%out"][0], 0x7FC00001)
+
+    def test_created_nan_is_pinned_whatever_the_host_gives(self):
+        arm64_nan = math.copysign(math.nan, 1.0)
+        self.assertEqual(struct.pack("<d", si.ieee_nan(arm64_nan, 0.0, math.inf)),
+                         struct.pack("<Q", 0xFFF8000000000000))
+        self.assertEqual(struct.pack("<d", si.ieee_nan(arm64_nan, arm64_nan, 1.0)), struct.pack("<d", arm64_nan))
+        self.assertEqual(si.ieee_nan(2.5, 1.0, 1.5), 2.5)
 
     def test_ordered_integer_comparisons(self):
         # 2 vs 0xFFFFFFFF: unsigned 2 < 4294967295, signed 2 > -1
