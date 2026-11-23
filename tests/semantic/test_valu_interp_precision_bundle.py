@@ -115,6 +115,19 @@ class TestInterpP2F32Reference(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP2F32ReachingWrite(unittest.TestCase):
+    def test_p2_f32_reaching_write_chain(self):
+        code = [
+            "v_interp_p1_f32 v6, v0, attr4.x",
+            "v_mov_b32_e32 v7, 42",
+            "v_interp_p2_f32 v6, v1, attr4.x",
+            "exp mrt0, v6, v7, v6, v7 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p2_f32_reach", code)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
