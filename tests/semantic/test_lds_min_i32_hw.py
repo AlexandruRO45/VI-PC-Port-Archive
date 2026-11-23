@@ -832,3 +832,61 @@ class TestLdsMinI32IEEE754AndBoundaries(unittest.TestCase):
         ]
         for m, d, expected_signed in cases:
             self.assertEqual(oracle_ds_min_i32(m, d), expected_signed)
+
+
+# ---------------------------------------------------------------------------
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestLdsMinI32NegativeAndSyntax(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_invalid_offset_ranges(self) -> None:
+        with self.assertRaises(ValueError):
+            DSOffset(offset=-1)
+        with self.assertRaises(ValueError):
+            DSOffset(offset=65536)
+
+    def test_instruction_syntax_rejection(self) -> None:
+        # Non-returning ds_min_i32 cannot have vdst
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_MIN_I32,
+                vdst=Register(RegKind.VGPR, 5),
+                vaddr=Register(RegKind.VGPR, 1),
+                vdata=Register(RegKind.VGPR, 2),
+            )
+        # Returning ds_min_rtn_i32 requires vdst
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_MIN_RTN_I32,
+                vdst=None,
+                vaddr=Register(RegKind.VGPR, 1),
+                vdata=Register(RegKind.VGPR, 2),
+            )
+
+    def test_mutation_detection_oracle(self) -> None:
+        # Mutant: using unsigned min instead of signed min
+        def mutant_unsigned_min(m: int, d: int) -> int:
+            return min(m & MASK32, d & MASK32)
+
+        # 0x80000000 vs 1: signed min is 0x80000000, unsigned min is 1
+        m, d = 0x80000000, 1
+        self.assertNotEqual(oracle_ds_min_i32(m, d), mutant_unsigned_min(m, d))
+
+        # Mutant: using max instead of min
+        def mutant_max_i32(m: int, d: int) -> int:
+            return m if s32(m) >= s32(d) else d
+        self.assertNotEqual(oracle_ds_min_i32(10, 20), mutant_max_i32(10, 20))
+
+
+if __name__ == "__main__":
+    unittest.main()
