@@ -284,9 +284,10 @@ A tile's cell is recovered by comparing it with its grid's fallback mosaic, then
 
 - Water height and fog (`method: content`): each tile is point-sampled to the fallback's pixels per tile and
   compared with every cell by mean absolute difference; the two fog textures of a dictionary are matched together.
-  An anchor is a tile with detail (standard deviation above 0.5) whose runner-up distance is at least twice the
-  best and 0.5 above it. 737 of 738 water-height tiles are anchors; the one flat tile stays unplaced. For fog,
-  617 dictionaries have detail in either texture and 561 are anchors.
+  An anchor is a tile with detail (a standard deviation over its pixels above 0.5 in at least one channel, so a
+  solid colour is flat) whose runner-up distance is at least twice the best and 0.5 above it. 737 of 738
+  water-height tiles are anchors; the one flat tile stays unplaced. For fog, 599 dictionaries have detail in
+  either texture and 561 are anchors.
 - Shoreline (`method: mask`): the fallback's most common colour, `(0, 128, 0, 128)`, is background. Tiles and cells
   are compared by intersection over union of their feature masks (pixels more than 32 from the background), 264
   fallback cells have features and 6 tiles have none. The tiles, in archive order, are aligned to cells in text
@@ -310,7 +311,7 @@ number order in each grid is there: in the `--json` placements the three-digit c
 are stored after the last four-digit cells, where text order puts them. The dictionary names most likely
 contain the decimal cell index; with one deciding step per grid this is a strong hint, not a read name.
 - Between two anchors, tiles are placed by archive order when their number equals the free cells between them
-  (`placed_by_order`): 31 fog tiles, none for water height. 721 fog dictionaries stay unplaced; 677 of them have
+  (`placed_by_order`): 31 fog tiles, none for water height. 721 fog dictionaries stay unplaced; 688 of them have
   no detail in either texture (`unplaced_without_detail`), which content cannot place.
 - Cross-check (`in_water_height_cells`, `anchors_in_water_height_cells`, `placed_by_order_in_water_height_cells`):
   all 262 placed shoreline tiles and all 561 fog anchors lie in a cell that also has a water-height tile; of the

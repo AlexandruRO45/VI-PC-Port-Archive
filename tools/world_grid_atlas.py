@@ -304,6 +304,11 @@ def tile_step(tile, p: int) -> int:
     return w // p
 
 
+def spatial_std(img) -> float:
+    """Largest per-channel standard deviation over the pixels: a solid colour is flat whatever its channels."""
+    return float(img.std()) if img.ndim == 2 else float(img.reshape(-1, img.shape[-1]).std(0).max())
+
+
 def match_content(tiles: list, fallbacks: list, geom: dict) -> dict:
     """tiles: per dictionary, a list of images (one per grid); fallbacks: the matching mosaics."""
     import numpy as np
@@ -320,7 +325,7 @@ def match_content(tiles: list, fallbacks: list, geom: dict) -> dict:
         o = np.argsort(d, kind="stable")[:2]
         best.append((int(o[0]), float(d[o[0]])))
         runner.append(float(d[o[1]]))
-        detail.append(any(float(img.std()) > DETAIL_STD for img in images))
+        detail.append(any(spatial_std(img) > DETAIL_STD for img in images))
     anchors = {i: best[i][0] for i in range(len(tiles))
                if detail[i] and runner[i] >= ANCHOR_RATIO * max(best[i][1], 1e-9)
                and runner[i] - best[i][1] >= ANCHOR_GAP}

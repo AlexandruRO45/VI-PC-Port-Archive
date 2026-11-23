@@ -398,6 +398,28 @@ class ForwardCheckTest(unittest.TestCase):
         return [it["Offset"] for it in self.items[archive] if it["Textures"][0]["Name"] == name]
 
     # -- tests --
+    def test_anchor_needs_the_runner_up_twice_as_far(self):
+        # From a review of #4353: pins ANCHOR_RATIO; at exactly twice the best distance the tile is an anchor.
+        t = np.array([[0., 4.], [0., 4.]])
+
+        def anchors(runner):
+            cells = np.concatenate((t + 2, t + runner), axis=1)
+            return wga.match_content([[t]], [cells], {"rows": 1, "columns": 2})["anchors"]
+
+        self.assertEqual(anchors(3), {})  # runner-up 3 vs best 2: gap 1 passes, ratio 1.5 does not
+        self.assertEqual(anchors(4), {0: 0})
+
+    def test_a_solid_colour_is_flat_whatever_its_channels(self):
+        # Detail is the spread over pixels per channel, not across the channels of one colour.
+        geom = {"rows": 1, "columns": 2}
+        cells = np.concatenate((np.full((2, 2, 3), (4., 8., 12.)), np.full((2, 2, 3), 40.)), axis=1)
+        solid = np.full((2, 2, 3), (4., 8., 12.))
+        varied = solid + np.array([[0., 2.], [0., 2.]])[:, :, None]
+        for tile, detail, anchors in ((solid, False, {}), (varied, True, {0: 0}),
+                                      (np.full((2, 2), 8.), False, {})):
+            m = wga.match_content([[tile]], [cells if tile.ndim == 3 else cells[:, :, 0]], geom)
+            self.assertEqual((m["detail"], m["anchors"]), ([detail], anchors), tile.shape)
+
     def test_every_tile_returns_to_its_cell(self):
         truth = self.build()
         p, data = self.run_tool()
