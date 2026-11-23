@@ -67,8 +67,8 @@ class RcpIflagModsTest(unittest.TestCase):
             return m.group(1)
 
         if scale_bits is not None:
-            const = match_result(rf"OpConstant %uint {scale_bits}")
-            scale = match_result(rf"OpBitcast %float {const}")
+            # A module-scope float constant (rdna2spirv's fconst), written as repr() of its exact value.
+            scale = match_result(rf"OpConstant %float {re.escape(repr(si.u2f(scale_bits)))}")
             value = match_result(rf"OpFMul %float {value} {scale}")
         else:
             self.assertNotRegex(spv, r"\bOpFMul %float\b")

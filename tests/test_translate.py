@@ -1017,10 +1017,8 @@ def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
     defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
     clamp = defs[_gather_rounded_lod(defs)].split()
     assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FClamp"]
-    for limit, bits in zip(clamp[-2:], (0x3e800000, 0x3f400000)):
-        cast, scalar, value = defs[limit].split()
-        assert (cast, scalar) == ("OpBitcast", "%float")
-        assert defs[value] == f"OpConstant %uint {bits}"
+    for limit, value in zip(clamp[-2:], (0.25, 0.75)):
+        assert defs[limit] == f"OpConstant %float {value!r}"        # module-scope float constants (fconst)
 
 
 def test_gather4_l_run_time_lod_bounds_clamp_without_fclamp(make_shader):

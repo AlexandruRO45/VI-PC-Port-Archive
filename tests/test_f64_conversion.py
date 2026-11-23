@@ -1,6 +1,7 @@
 """Check the SPIR-V data flow for output modifiers on v_cvt_f32_f64."""
 
 import re
+import struct
 import sys
 import tempfile
 import unittest
@@ -42,8 +43,8 @@ class F64ConversionTest(unittest.TestCase):
 
         value = result(r"OpFConvert %float %\w+")
         if scale_bits is not None:
-            constant = result(rf"OpConstant %uint {scale_bits}")
-            scale = result(rf"OpBitcast %float {constant}")
+            # A module-scope float constant (rdna2spirv's fconst), written as repr() of its exact value.
+            scale = result(rf"OpConstant %float {re.escape(repr(struct.unpack('<f', struct.pack('<I', scale_bits))[0]))}")
             value = result(rf"OpFMul %float {value} {scale}")
         if clamp:
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
