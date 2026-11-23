@@ -3,7 +3,7 @@ using RpfPreview.Core;
 
 public static class Util
 {
-    // Every output is written to a unique <path>.*.partial and renamed into place. The exporters skip any file that
+    // Every output is written to a unique short sibling .partial and renamed into place. The exporters skip any file that
     // already exists, and make_game.py takes manifest.json / audio_manifest.json as proof a step finished, so a
     // file cut short by a stopped run or a full disk must never appear under its final name.
     // Unique names matter on parallel export (two models with the same stem) and when a stale exclusive
@@ -22,8 +22,10 @@ public static class Util
     public static void WriteAllBytes(string path, byte[] data) => WriteAtomic(path, t => File.WriteAllBytes(t, data));
     public static void WriteAllText(string path, string text) => WriteAtomic(path, t => File.WriteAllText(t, text));
 
+    // The final model filename can be near a filesystem's 255-byte component limit. Appending a suffix to it
+    // would make the temporary name invalid even when the final name itself fits.
     public static string PartialName(string path) =>
-        path + $".{Environment.ProcessId}.{Environment.CurrentManagedThreadId}.{Guid.NewGuid():N}.partial";
+        Path.Combine(Path.GetDirectoryName(path) ?? "", $".rpf9dump-{Guid.NewGuid():N}.partial");
 
     public static void TryDelete(string path)
     {

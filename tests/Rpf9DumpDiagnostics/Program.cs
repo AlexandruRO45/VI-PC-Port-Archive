@@ -33,8 +33,15 @@ try
     string failed = Path.Combine(dir, "b.dds");
     try { Util.WriteAtomic(failed, t => { File.WriteAllBytes(t, [9]); throw new IOException("disk full"); }); Check(false, "error propagates"); }
     catch (IOException) { }
-    Check(!File.Exists(failed) && Directory.GetFiles(dir, "b.dds*partial").Length == 0,
+    Check(!File.Exists(failed) && Directory.GetFiles(dir).All(p => !p.EndsWith(".partial", StringComparison.Ordinal)),
         "a failed write leaves neither file nor a .partial");
+
+    // A valid final component near the usual 255-byte limit must not grow when written atomically.
+    string longPath = Path.Combine(dir, new string('a', 220) + ".obj");
+    Util.WriteAllText(longPath, "model");
+    Check(File.ReadAllText(longPath) == "model", "long final filename is written");
+    Check(Directory.GetFiles(dir).All(p => !p.EndsWith(".partial", StringComparison.Ordinal)),
+          "long filename leaves no partial");
 
     // A stopped run's leftover .partial must not block a writer that opens with FileMode.CreateNew.
     string stale = Path.Combine(dir, "c.xma.wav");
@@ -42,7 +49,7 @@ try
     Util.WriteAtomic(stale, t => { using var f = new FileStream(t, FileMode.CreateNew); f.WriteByte(5); });
     Check(File.ReadAllBytes(stale).SequenceEqual(new byte[] { 5 })
          && !File.Exists(stale + ".partial")
-         && Directory.GetFiles(dir, "c.xma.wav*partial").Length == 0,
+         && Directory.GetFiles(dir).All(p => !p.EndsWith(".partial", StringComparison.Ordinal)),
          "stale .partial is replaced");
 }
 finally { Directory.Delete(dir, true); }
