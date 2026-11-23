@@ -32,9 +32,6 @@ import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from report_paths import same_report_path  # noqa: E402
-
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from report_paths import path_key, same_report_path  # noqa: E402

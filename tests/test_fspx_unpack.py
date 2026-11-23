@@ -407,42 +407,36 @@ class Cli(unittest.TestCase):
             with open(blocker, "rb") as f:
                 self.assertEqual(f.read(), b"keep me")
 
-    def test_refuses_to_overwrite_dxbc_input_in_same_directory(self):
+    def test_dxbc_input_in_the_out_folder_is_refused_before_any_write(self):
+        # main's input-folder rule (BUILD-1043) runs first and refuses with exit 2.
         c = Containers().container()
         with tempfile.TemporaryDirectory() as t:
             src = os.path.join(t, "foo.dxbc")
             with open(src, "wb") as f:
                 f.write(c)
             code, _, err = self.run_tool(src, "--out", t)
-            self.assertEqual(code, 1)
-            self.assertIn("refusing to overwrite", err.lower())
+            self.assertEqual(code, 2)
+            self.assertIn("collides with the input folder", err)
             with open(src, "rb") as f:
                 self.assertEqual(f.read(), c)
             self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
             self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
 
-    def test_case_variant_of_an_input_is_refused_only_where_case_is_ignored(self):
-        # FOO.DXBC in, FOO.dxbc out: one file on Windows and on a case-insensitive macOS volume (refused), two files
-        # on a case-sensitive volume such as ext4 (written beside the input, which stays untouched).
-        import report_paths
+    def test_case_variant_input_in_the_out_folder_is_refused_on_every_volume(self):
+        # FOO.DXBC in, --out its own folder: the input-folder rule refuses it whatever the volume does with letter
+        # case, so nothing is written beside the input.
         c = Containers().container()
         with tempfile.TemporaryDirectory() as t:
             src = os.path.join(t, "FOO.DXBC")
             with open(src, "wb") as f:
                 f.write(c)
-            ignores_case = report_paths.path_key(src) == report_paths.path_key(os.path.join(t, "FOO.dxbc"))
             code, _, err = self.run_tool(src, "--out", t)
+            self.assertEqual(code, 2)
+            self.assertIn("collides with the input folder", err)
             with open(src, "rb") as f:
                 self.assertEqual(f.read(), c)
-            if ignores_case:
-                self.assertEqual(code, 1)
-                self.assertIn("refusing to overwrite", err.lower())
-                self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
-                self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
-            else:
-                self.assertEqual(code, 0, err)
-                self.assertTrue(os.path.isfile(os.path.join(t, "FOO.dxbc")))
-                self.assertTrue(os.path.isfile(os.path.join(t, "index.json")))
+            self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
+            self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
 
     def test_case_sensitive_volume_writes_beside_a_case_variant_input(self):
         # The Linux case from review on any host: report_paths keeps letter case on a case-sensitive volume, so
@@ -478,31 +472,35 @@ class Cli(unittest.TestCase):
             idx_in = os.path.join(t, "index.json")
             with open(idx_in, "wb") as f:
                 f.write(b'{"keep": true}\n')
+            # index.json sits in --out itself, so main's input-folder rule refuses it first with exit 2.
             code, _, err = self.run_tool(idx_in, "--out", t)
-            self.assertEqual(code, 1)
-            self.assertIn("refusing to overwrite", err.lower())
+            self.assertEqual(code, 2)
+            self.assertIn("collides with the input folder", err)
             with open(idx_in, "rb") as f:
                 self.assertEqual(f.read(), b'{"keep": true}\n')
 
     def test_refuses_second_input_collision_without_partial_writes(self):
+        # The second input is a bare payload in --out's fspx/ subfolder: not the input folder itself, so only the
+        # collision check catches it, and it must do so before the first input writes anything.
         c = Containers().container()
+        payload = make_fspx([(0, kind0()), (6, program())])
         with tempfile.TemporaryDirectory() as t:
             d1 = os.path.join(t, "d1")
             d2 = os.path.join(t, "d2")
             os.makedirs(d1)
-            os.makedirs(d2)
+            os.makedirs(os.path.join(d2, "fspx"))
             first = os.path.join(d1, "alpha.dxbc")
-            second = os.path.join(d2, "beta.dxbc")
-            for p in (first, second):
-                with open(p, "wb") as f:
-                    f.write(c)
+            second = os.path.join(d2, "fspx", "beta.code")
+            with open(first, "wb") as f:
+                f.write(c)
+            with open(second, "wb") as f:
+                f.write(payload)
             code, _, err = self.run_tool(first, second, "--out", d2)
             self.assertEqual(code, 1)
             self.assertIn("refusing to overwrite", err.lower())
             with open(second, "rb") as f:
-                self.assertEqual(f.read(), c)
+                self.assertEqual(f.read(), payload)
             self.assertFalse(os.path.exists(os.path.join(d2, "alpha.dxbc")))
-            self.assertFalse(os.path.exists(os.path.join(d2, "fspx")))
             self.assertFalse(os.path.exists(os.path.join(d2, "index.json")))
 
 
