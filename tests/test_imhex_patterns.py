@@ -18,8 +18,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATTERNS = os.path.join(ROOT, "tools", "imhex")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,13 +31,24 @@ import rbf0_index  # noqa: E402
 from test_psin_index import SCHEMA as PSIN_SCHEMA, joaat, make_lenm, make_lsch, make_section  # noqa: E402
 
 
+def cli_binary(path):
+    """The executable that answers the pattern-language CLI. The Windows installer's imhex.exe is a small console
+    launcher that starts imhex-gui.exe beside it without passing on its output or exit code, so a rejected pattern
+    looks like a silent success; run imhex-gui.exe directly when it is there."""
+    if os.path.basename(path).lower() == "imhex.exe":
+        gui = os.path.join(os.path.dirname(path), "imhex-gui.exe")
+        if os.path.isfile(gui):
+            return gui
+    return path
+
+
 def find_imhex():
     candidates = [os.environ.get("LEONIDA_IMHEX"), shutil.which("imhex")]
     if os.name == "nt":
         candidates.append(os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "ImHex", "imhex.exe"))
     for c in candidates:
         if c and os.path.isfile(c):
-            return c
+            return cli_binary(c)
     return None
 
 
@@ -133,6 +145,37 @@ class InputsAndMagic(unittest.TestCase):
         self.assertEqual(pragma_magic("rbf0.hexpat"), rbf0_index.MAGIC)
         self.assertEqual(pragma_magic("rpf9.hexpat"), b"9FPR")  # RPF9 stored little-endian (docs/rpf.md)
         self.assertEqual(pragma_magic("psin.hexpat"), psin_index.MAGIC)
+
+
+class FindImHex(unittest.TestCase):
+    """Which binary the ImHex half runs. Empty files stand in for an install; nothing is started."""
+
+    def install(self, *names):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name in names:
+            open(os.path.join(tmp.name, name), "wb").close()
+        return tmp.name
+
+    def test_the_windows_launcher_is_swapped_for_the_gui_binary_beside_it(self):
+        folder = self.install("imhex.exe", "imhex-gui.exe")
+        self.assertEqual(cli_binary(os.path.join(folder, "ImHex.EXE")), os.path.join(folder, "imhex-gui.exe"))
+
+    def test_a_lone_imhex_binary_is_used_as_it_is(self):
+        folder = self.install("imhex.exe")
+        self.assertEqual(cli_binary(os.path.join(folder, "imhex.exe")), os.path.join(folder, "imhex.exe"))
+        folder = self.install("imhex", "imhex-gui.exe")
+        self.assertEqual(cli_binary(os.path.join(folder, "imhex")), os.path.join(folder, "imhex"))
+
+    def test_an_explicit_gui_binary_is_kept(self):
+        folder = self.install("imhex.exe", "imhex-gui.exe")
+        gui = os.path.join(folder, "imhex-gui.exe")
+        self.assertEqual(cli_binary(gui), gui)
+
+    def test_leonida_imhex_goes_through_the_same_swap(self):
+        folder = self.install("imhex.exe", "imhex-gui.exe")
+        with mock.patch.dict(os.environ, {"LEONIDA_IMHEX": os.path.join(folder, "imhex.exe")}):
+            self.assertEqual(find_imhex(), os.path.join(folder, "imhex-gui.exe"))
 
 
 @unittest.skipUnless(IMHEX, "ImHex is not installed (set LEONIDA_IMHEX to imhex.exe)")
