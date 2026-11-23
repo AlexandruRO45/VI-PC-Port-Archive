@@ -43,9 +43,10 @@ class LodOptionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "textures.rpf"
             texture_dictionary_rpf(src)
-            r = run("textures", src, Path(tmp) / "out", "--lod", "1")
-            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-            self.assertIn("--lod applies to models only", r.stdout)
+            for value in ("0", "1"):   # even the default: --lod names a models option
+                r = run("textures", src, Path(tmp) / "out", "--lod", value)
+                self.assertEqual(r.returncode, 2, (value, r.stdout, r.stderr))
+                self.assertIn("--lod applies to models only", r.stdout)
             self.assertFalse((Path(tmp) / "out" / "textures" / "textures").exists())
 
     def test_a_lod_export_has_its_own_directory_and_records_the_lod(self):

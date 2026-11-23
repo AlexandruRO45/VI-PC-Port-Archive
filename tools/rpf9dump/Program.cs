@@ -14,7 +14,7 @@ string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPa
 // --lod N (models only) exports the drawable's LOD N model list instead of the first: 0 is the pointer at
 // drawable +0x50, 1 to 3 the ones at +0x58, +0x60 and +0x68. docs/bvh.md §7: most interior BLAS are built
 // from LOD 1.
-long scanStart = 0; long? scanLength = null; int lod = 0;
+long scanStart = 0; long? scanLength = null; int lod = 0; bool lodGiven = false;
 for (int i = 3; i < args.Length; i += 2)
 {
     if (args[i] == "--lod")
@@ -25,6 +25,7 @@ for (int i = 3; i < args.Length; i += 2)
             Console.WriteLine($"--lod needs a LOD index from 0 to {RageModelDecoder.LodCount - 1}.");
             return 2;
         }
+        lodGiven = true;
         continue;
     }
     if (i + 1 >= args.Length || !long.TryParse(args[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out long bytes) || bytes < 0)
@@ -42,7 +43,7 @@ if (window && mode is not ("models" or "textures"))
     Console.WriteLine("--start/--length apply to models and textures; other modes need a recognized archive.");
     return 2;
 }
-if (lod != 0 && mode != "models")
+if (lodGiven && mode != "models")
 {
     Console.WriteLine("--lod applies to models only.");
     return 2;
