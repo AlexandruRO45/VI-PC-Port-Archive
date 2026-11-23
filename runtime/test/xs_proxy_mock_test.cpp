@@ -436,6 +436,42 @@ int check_fence1() {
     return 0;
 }
 
+// ---- The console's own ID3D12Device IID ----
+//
+// The game executable (1.0.2.1) asks D3D12XboxCreateDevice for {5405c344-d457-444e-b4dd-2366e45aee39}, the console
+// headers' ID3D12Device IID, which no PC object implements. The proxy answers it (asking the PC device for
+// ID3D12Device in its place); an IID that differs only in its last byte is still refused, and so is the console IID
+// when the PC device has no ID3D12Device at all.
+int check_console_device_iid() {
+    constexpr IID kConsoleDevice{0x5405c344, 0xd457, 0x444e, {0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39}};
+    constexpr IID kNearMiss{0x5405c344, 0xd457, 0x444e, {0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x3a}};
+
+    Mock* mock = new_mock(Kind::device);
+    mock->device_level = 9;
+    mock->refs = 1;
+    void* device = nullptr;
+    EXPECT(SUCCEEDED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), kConsoleDevice, &device)));
+    EXPECT(device != nullptr);
+
+    void* again = nullptr;
+    EXPECT(hr_of(raw(device, 0, word(&kConsoleDevice), word(&again))) == S_OK && again == device);
+    EXPECT(release(again) == 1);
+    void* near_miss = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 0, word(&kNearMiss), word(&near_miss))) == E_NOINTERFACE && !near_miss);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+
+    // A PC object with no ID3D12Device: the console IID is refused too, and the caller's reference is kept.
+    Mock* not_a_device = new_mock(Kind::queue);
+    not_a_device->refs = 1;
+    void* refused = reinterpret_cast<void*>(1);
+    EXPECT(FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(not_a_device), kConsoleDevice, &refused)));
+    EXPECT(!refused && not_a_device->refs == 1);
+    EXPECT(release(not_a_device) == 0);
+    std::printf("%s: the console ID3D12Device IID is answered over a PC device, a near miss is refused, and a PC object "
+                "that is no device refuses it\n", g_label);
+    return 0;
+}
+
 // ---- 3. Creation failures and refused interfaces ----
 
 int check_create_failures() {
@@ -947,7 +983,8 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
+    if (check_tail(true) || check_levels() || check_fence1() || check_console_device_iid() || check_create_failures() ||
+        check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
