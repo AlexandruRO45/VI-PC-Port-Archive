@@ -885,6 +885,10 @@ if(BUILD_TESTING)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
   add_test(NAME shader_library COMMAND shader_library_test)
+  # Keep an unavailable POSIX comma-decimal locale visible as a skip, not a passing parser regression.
+  add_executable(json_numeric_locale_test test/json_numeric_locale_test.cpp)
+  add_test(NAME shader_library_numeric_locale COMMAND json_numeric_locale_test)
+  set_tests_properties(shader_library_numeric_locale PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
