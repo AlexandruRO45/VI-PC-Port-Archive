@@ -74,8 +74,16 @@ def chunks():
     return struct.pack("<III", 0x88560988, 8, 7) + bytes(52)
 
 
+def aux(entries, payload=None, trailing=b""):
+    """A synthetic auxiliary table: u32 count, {u32 tag, u32 size} pairs, payloads, then trailing bytes."""
+    data = struct.pack("<I", len(entries)) + b"".join(struct.pack("<II", t, n) for t, n in entries)
+    if payload is None:
+        payload = b"".join(bytes([i + 1]) * n for i, (_, n) in enumerate(entries))
+    return data + payload + trailing
+
+
 def clip():
-    return struct.pack("<I", 3) + b"\x01\x01\x00\x00" + bytes(56)
+    return aux([(0x101, 8), (0x113, 12), (0x207, 4)], trailing=b"\xee" * 36)
 
 
 def rbf0():
@@ -167,7 +175,49 @@ class ClassifyTest(unittest.TestCase):
 
     def test_clip_header(self):
         r = anim_index.classify(clip(), 0x600, 70)
-        self.assertEqual((r["version"], r["detail"]), (3, "24-byte header"))
+        self.assertEqual((r["signature"], r["version"], r["count"], r["detail"]),
+                         ("clip-stream", None, 3, "aux-table tags=0x101,0x113,0x207 payload_end=52"))
+
+    def test_aux_two_entries_exact_fit(self):
+        data = aux([(0x101, 40), (0x207, 20)])   # payloads end exactly at the end of the stream
+        self.assertEqual(anim_index.aux_table(data), ([(0x101, 40), (0x207, 20)], len(data)))
+        r = anim_index.classify(data, 0, len(data))
+        self.assertEqual((r["signature"], r["count"]), ("clip-stream", 2))
+
+    def test_aux_trailing_schema_bytes_kept(self):
+        data = aux([(0x101, 16), (0x204, 8), (0x207, 8)], trailing=bytes(range(64)))
+        self.assertEqual(anim_index.aux_table(data)[1], 4 + 24 + 32)
+        self.assertEqual(anim_index.classify(data, 0, len(data))["signature"], "clip-stream")
+
+    def test_aux_payload_overruns_stream(self):
+        short = aux([(0x101, 40), (0x207, 30)])[:-1]   # last payload one byte short
+        self.assertIsNone(anim_index.aux_table(short))
+        self.assertEqual(anim_index.classify(short, 0, len(short))["signature"], "raw:02000000")
+
+    def test_aux_declared_size_too_large(self):
+        data = aux([(0x101, 8), (0x113, 0xFFFFFFF0), (0x207, 8)], payload=bytes(64))
+        self.assertIsNone(anim_index.aux_table(data))
+        self.assertNotEqual(anim_index.classify(data, 0, len(data))["signature"], "clip-stream")
+
+    def test_aux_truncated_directory(self):
+        data = aux([(0x101, 0), (0x113, 0), (0x207, 0)])[:20]   # the matching 8-byte prefix, directory cut
+        self.assertIsNone(anim_index.aux_table(data))
+        self.assertIsNone(anim_index.aux_table(data[:8]))
+        self.assertEqual(anim_index.classify(data[:8], 0, 8)["signature"], "raw:03000000")
+
+    def test_aux_wrong_count_or_first_tag(self):
+        for entries in ([(0x101, 4)], [(0x101, 4)] * 4, [(0x113, 4), (0x207, 4)], [(0x207, 4), (0x101, 4)]):
+            data = aux(entries, trailing=b"\x5a" * 64)
+            self.assertIsNone(anim_index.aux_table(data), entries)
+            self.assertNotEqual(anim_index.classify(data, 0, len(data))["signature"], "clip-stream")
+
+    def test_aux_prefix_with_overrunning_size_is_generic(self):
+        # The old 8-byte prefix check called this a clip stream; its declared payload does not fit.
+        data = struct.pack("<III", 2, 0x101, 1 << 20) + bytes(60)
+        self.assertEqual(anim_index.classify(data, 0, len(data))["signature"], "raw:02000000")
+
+    def test_aux_valid_page_stops_rbf0_continuation(self):
+        self.assertIn(anim_index.classify(clip(), 0, len(clip()))["signature"], anim_index.STOP_SIGNATURES)
 
     def test_rbf0(self):
         r = anim_index.classify(rbf0(), 0x700, 30)
@@ -451,6 +501,29 @@ class RigArchiveTest(unittest.TestCase):
         r = anim_index.parse_rbf0(blob)
         self.assertEqual(r["summary"]["rigsets"], 3)
         self.assertEqual(r["summary"]["entries"], 3)
+
+    def test_collect_skeletons_dir_matches_archive_classification(self):
+        carved = os.path.join(self.root, "carved_skels")
+        os.makedirs(carved)
+        big_skel = b"SKEL_Large\x00" + b"SKEL_Other\x00" + b"\x00" * 20000
+        rbf0_with_skel = b"RBF0" + b"\x00" * 16 + b"SKEL_NotASkeleton\x00" + b"\x00" * 32
+        with open(os.path.join(carved, "000000000100.bin"), "wb") as f:
+            f.write(self.skel)
+        with open(os.path.join(carved, "000000000200.bin"), "wb") as f:
+            f.write(big_skel)
+        with open(os.path.join(carved, "000000000300.bin"), "wb") as f:
+            f.write(self.front)
+        with open(os.path.join(carved, "000000000400.bin"), "wb") as f:
+            f.write(rbf0_with_skel)
+        got = anim_index.collect_skeletons_dir(carved)
+        self.assertEqual(
+            [(r["offset"], r["kind"], r["names"]) for r in got],
+            [
+                (0x100, "plain-bone-table", ["SKEL_Second", "SKEL_Synthetic"]),
+                (0x200, "plain-bone-table", ["SKEL_Large", "SKEL_Other"]),
+                (0x300, "bone-table", ["SKEL_Front"]),
+            ],
+        )
 
     def test_cli_rejects_a_shared_rig_destination(self):
         out = os.path.join(self.root, "index.json")
