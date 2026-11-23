@@ -407,9 +407,14 @@ def main(argv=None):
         print("world_interior_names.py: %s" % why, file=sys.stderr)
         return 2
     summary, rows = resolve(names, scan(a.path, a.start, a.limit, a.jobs), duplicate_keys, malformed)
-    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
+    try:
+        os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
+    except OSError as exc:
+        why = exc.strerror or exc
+        print("world_interior_names.py: --out %s: %s" % (a.out, why), file=sys.stderr)
+        return 2
     print(json.dumps(summary, indent=1, sort_keys=True))
     return 0
 

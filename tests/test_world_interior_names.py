@@ -11,7 +11,8 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -420,6 +421,58 @@ class CliTest(unittest.TestCase):
                     T.main(argv)
                 finally:
                     sys.stderr = saved
+
+    def test_bad_names_file_is_one_error_line_before_scanning(self):
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        bad_dir = os.path.join(self.tmp.name, "names_dir")
+        os.makedirs(bad_dir)
+        out = os.path.join(self.tmp.name, "out", "report.json")
+        cases = [("directory", bad_dir, None)]
+        for label, payload in (
+            ("invalid utf-8", b"\xff\xfe\x80"),
+            ("malformed json", b"{not json"),
+            ("non-object json", b"[1, 2]"),
+            ("non-object InteriorNames", b'{"InteriorNames": [1]}'),
+        ):
+            p = os.path.join(self.tmp.name, f"bad_{len(cases)}.json")
+            with open(p, "wb") as f:
+                f.write(payload)
+            cases.append((label, p, payload))
+        for label, bad_names, _ in cases:
+            with self.subTest(case=label):
+                err = io.StringIO()
+                with mock.patch.object(T, "scan", side_effect=AssertionError("scan started")), \
+                        redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    rc = T.main([folder, "--names", bad_names, "--out", out])
+                self.assertEqual(rc, 2)
+                lines = err.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1, err.getvalue())
+                self.assertTrue(lines[0].startswith(f"world_interior_names.py: --names {bad_names}:"), lines[0])
+                self.assertNotIn("Traceback", err.getvalue())
+                self.assertFalse(os.path.exists(out))
+
+    def test_unwritable_out_is_one_error_line(self):
+        folder = os.path.join(self.tmp.name, "carved_out")
+        os.makedirs(folder)
+        out_dir = os.path.join(self.tmp.name, "existing_dir")
+        os.makedirs(out_dir)
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        for label, bad_out in (("directory", out_dir), ("file parent", os.path.join(blocker, "report.json"))):
+            with self.subTest(case=label):
+                err = io.StringIO()
+                with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    rc = T.main([folder, "--names", self.names, "--out", bad_out])
+                self.assertEqual(rc, 2)
+                lines = err.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1, err.getvalue())
+                self.assertTrue(lines[0].startswith("world_interior_names.py: --out"), lines[0])
+                self.assertIn(bad_out, lines[0])
+                self.assertNotIn("Traceback", err.getvalue())
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
 
 
 if __name__ == "__main__":
