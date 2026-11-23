@@ -176,7 +176,7 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
     if "TIMEOUT" in props:
         try:
             ctest_timeout = float(props["TIMEOUT"])
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return "fail", "invalid CTest TIMEOUT"
         if not math.isfinite(ctest_timeout) or ctest_timeout < 0:
             return "fail", "invalid CTest TIMEOUT"

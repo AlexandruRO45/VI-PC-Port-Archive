@@ -529,6 +529,29 @@ class MainTest(unittest.TestCase):
                     self.run_main([ctest_entry("ok", self.command("ok.py"))], "--timeout", text)
                 self.assertEqual(ctx.exception.code, 2)
 
+    def test_an_overflowing_ctest_timeout_fails_only_that_test(self):
+        entries = []
+        for name, timeout in (("too_large", 10**400), ("too_negative", -(10**400)), ("ok", 3.5)):
+            program = self.artifact / f"{name}.py"
+            program.write_text(
+                "from pathlib import Path\nPath(__file__).with_suffix('.launched').touch()\n",
+                encoding="utf-8",
+            )
+            entries.append(ctest_entry(name, self.command(program.name), {"TIMEOUT": timeout}))
+
+        summary = self.root / "summary.md"
+        code, out, err = self.run_main(entries, "--require", "too_large", "--require", "ok",
+                                      "--summary", str(summary))
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        for name in ("too_large", "too_negative"):
+            self.assertIn(f"[FAIL] {name}\n    invalid CTest TIMEOUT", out)
+        self.assertIn("[PASS] ok", out)
+        self.assertEqual({path.stem for path in self.artifact.glob("*.launched")}, {"ok"})
+        report = summary.read_text(encoding="utf-8")
+        self.assertIn("| `too_large` | fail | yes |", report)
+        self.assertIn("| `ok` | pass | yes |", report)
+
     def test_a_blank_wine_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as ctx:
             self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "")
