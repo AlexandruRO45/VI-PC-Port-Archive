@@ -14347,17 +14347,20 @@ class Gen:
             else:
                 raise Unsupported(f"export {tgt}")
         self.outputs[name] = tgt
+        if all(comp is None for comp in comps):
+            return
         # Exports from inactive lanes don't happen: keep the previous output value.
         old, sel = self.tmp(), self.tmp()
         self.emit(f"{old} = OpLoad %v4float {name}")
-        if self.stage == "ps" and tgt.startswith("mrt") and None in comps:
+        if None in comps:
             # EN gates each component (each RG/BA pair when compressed). Keep the previous export in off slots.
-            self.partial_color_outputs.add(name)
+            if self.stage == "ps" and tgt.startswith("mrt"):
+                self.partial_color_outputs.add(name)
             for i, comp in enumerate(comps):
                 if comp is None:
                     comps[i] = self.tmp()
                     self.emit(f"{comps[i]} = OpCompositeExtract %float {old} {i}")
-        self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comp or '%f0' for comp in comps)}")
+        self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comps)}")
         self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {v} {old}")
         self.emit(f"OpStore {name} {sel}")
         if F16_HALVES and tgt.startswith("param") and self.stage == "vs":
