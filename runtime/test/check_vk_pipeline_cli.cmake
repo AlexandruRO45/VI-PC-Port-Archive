@@ -63,6 +63,31 @@ if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: ")
   message(FATAL_ERROR "Expected valid arguments to reach the malformed index, got ${code}\n${log}")
 endif()
 
+# Placeholder contents suffice because conflicts must be refused before loading Vulkan.
+file(WRITE "${TEST_DIR}/index.json" "{\"sample\":{\"stage\":\"ps\",\"inputs\":[3]}}\n")
+file(MAKE_DIRECTORY "${TEST_DIR}/stubs")
+set(module "${TEST_DIR}/sample.spv")
+set(stub "${TEST_DIR}/stubs/vs_3.spv")
+file(WRITE "${module}" "synthetic module\n")
+file(WRITE "${stub}" "synthetic stub\n")
+file(SHA256 "${module}" module_before)
+file(SHA256 "${stub}" stub_before)
+check_protected_input("SPIR-V input" "${module}")
+check_protected_input("SPIR-V input" --stats "${TEST_DIR}/./sample.spv")
+check_protected_input("SPIR-V input" --inflight-file "${stub}")
+
+file(CREATE_LINK "${stub}" "${TEST_DIR}/stats-link.csv" RESULT stub_link)
+if(stub_link STREQUAL "0")
+  check_protected_input("SPIR-V input" --stats "${TEST_DIR}/stats-link.csv")
+  file(REMOVE "${TEST_DIR}/stats-link.csv")
+endif()
+
+file(SHA256 "${module}" module_after)
+file(SHA256 "${stub}" stub_after)
+if(NOT module_before STREQUAL module_after OR NOT stub_before STREQUAL stub_after)
+  message(FATAL_ERROR "An output conflict modified a shader input")
+endif()
+
 # A malformed byte count must not reach Vulkan or wrap to an in-range value.
 foreach(bytes -1 1.5 4294967296)
   file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"cs\",\"lds_bytes\":${bytes}}}\n")

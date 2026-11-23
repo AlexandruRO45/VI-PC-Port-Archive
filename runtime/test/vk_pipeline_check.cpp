@@ -448,6 +448,23 @@ std::string stub_filename(const char* kind, const std::vector<uint32_t>& raw_loc
     return out;
 }
 
+struct GraphicsStubs {
+    std::string vertex;
+    std::string fragment;
+};
+
+GraphicsStubs graphics_stubs(const ShaderMeta& meta) {
+    if (meta.stage == "ps") return {stub_filename("vs", meta.inputs), {}};
+    if (meta.stage == "vs") return {{}, stub_filename("ps", meta.outputs)};
+    if (meta.stage == "ms") return {{}, stub_filename("ps", meta.params)};
+    if (meta.stage == "gs") {
+        const auto& inputs = meta.has_gs_input_locations ? meta.gs_input_locations : meta.gs_inputs;
+        const auto& outputs = meta.has_gs_output_locations ? meta.gs_output_locations : meta.gs_outputs;
+        return {stub_filename("vs", inputs), stub_filename("ps", outputs)};
+    }
+    return {};
+}
+
 bool is_graphics_stage(const std::string& st) {
     return st == "ps" || st == "vs" || st == "ms" || st == "gs";
 }
@@ -887,9 +904,9 @@ int main(int argc, char** argv) {
         return std::filesystem::equivalent(a, b, error);
     };
     // These inputs already exist on a valid invocation. Compare file identity so aliases are also protected.
-    for (const auto& [option, output] : {std::pair{"cache path", &cache_path},
-                                        std::pair{"--stats", &stats_path},
-                                        std::pair{"--inflight-file", &inflight_path}}) {
+    const auto outputs = {std::pair{"cache path", &cache_path}, std::pair{"--stats", &stats_path},
+                          std::pair{"--inflight-file", &inflight_path}};
+    for (const auto& [option, output] : outputs) {
         if (output->empty()) continue;
         const char* input = nullptr;
         if (same_file(*output, index_path)) input = "index.json";
@@ -920,6 +937,24 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, index_unreadable ? "error: cannot read %s/index.json: %s\n" : "error: malformed JSON in %s/index.json: %s\n",
                      dir.c_str(), index_err.c_str());
         return 2;
+    }
+    // Before opening any outputs, protect all modules in the index and their partner stubs. A new output
+    // cannot alias an existing input, so avoid scanning the index for paths that do not exist.
+    for (const auto& [option, output] : outputs) {
+        std::error_code error;
+        if (output->empty() || !std::filesystem::exists(*output, error)) continue;
+        const auto overlaps_input = [&](const std::string& input) {
+            if (!same_file(*output, input)) return false;
+            std::fprintf(stderr, "error: %s must not overwrite SPIR-V input %s\n", option, input.c_str());
+            return true;
+        };
+        for (const auto& [name, meta] : index) {
+            if (overlaps_input(dir + "/" + name + ".spv")) return 2;
+            const auto stubs = graphics_stubs(meta);
+            if ((!stubs.vertex.empty() && overlaps_input(dir + "/stubs/" + stubs.vertex)) ||
+                (!stubs.fragment.empty() && overlaps_input(dir + "/stubs/" + stubs.fragment)))
+                return 2;
+        }
     }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
 
@@ -1719,9 +1754,10 @@ int main(int argc, char** argv) {
                     std::vector<VkFormat> color_formats;
                     VkFormat depth_format = VK_FORMAT_UNDEFINED;
                     bool use_vertex_input = true;
+                    const auto stubs = graphics_stubs(meta);
 
                     if (stage == "ps") {
-                        std::string vs_fn = stub_filename("vs", meta.inputs);
+                        const auto& vs_fn = stubs.vertex;
                         VkShaderModule vs_mod = load_stub(vs_fn);
                         if (!vs_mod) {
                             skip_reason = "missing stub " + vs_fn;
@@ -1738,7 +1774,7 @@ int main(int argc, char** argv) {
                             }
                         }
                     } else if (stage == "vs") {
-                        std::string ps_fn = stub_filename("ps", meta.outputs);
+                        const auto& ps_fn = stubs.fragment;
                         VkShaderModule ps_mod = load_stub(ps_fn);
                         if (!ps_mod) {
                             skip_reason = "missing stub " + ps_fn;
@@ -1749,7 +1785,7 @@ int main(int argc, char** argv) {
                         }
                     } else if (stage == "ms") {
                         use_vertex_input = false;
-                        std::string ps_fn = stub_filename("ps", meta.params);
+                        const auto& ps_fn = stubs.fragment;
                         VkShaderModule ps_mod = load_stub(ps_fn);
                         if (!ps_mod) {
                             skip_reason = "missing stub " + ps_fn;
@@ -1759,10 +1795,8 @@ int main(int argc, char** argv) {
                             stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, false));
                         }
                     } else if (stage == "gs") {
-                        const auto& gs_in = meta.has_gs_input_locations ? meta.gs_input_locations : meta.gs_inputs;
-                        const auto& gs_out = meta.has_gs_output_locations ? meta.gs_output_locations : meta.gs_outputs;
-                        std::string vs_fn = stub_filename("vs", gs_in);
-                        std::string ps_fn = stub_filename("ps", gs_out);
+                        const auto& vs_fn = stubs.vertex;
+                        const auto& ps_fn = stubs.fragment;
                         VkShaderModule vs_mod = load_stub(vs_fn);
                         VkShaderModule ps_mod = load_stub(ps_fn);
                         if (!vs_mod) skip_reason = "missing stub " + vs_fn;
