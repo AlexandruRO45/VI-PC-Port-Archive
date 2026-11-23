@@ -1162,6 +1162,49 @@ void run_checks(const std::filesystem::path& root) {
                   GetLastError() == ERROR_INVALID_NAME,
               "T:\\.. cannot climb out of the scratch folder into the package");
 
+        // A read of a missing name in a folder only the overlay has (T:\ and its folders, a folder the title made
+        // under GAME:\) is a missing file in an existing folder: ERROR_FILE_NOT_FOUND, as the host answers and as
+        // a write-open of the same name does, not ERROR_PATH_NOT_FOUND for the folder the package lacks.
+        {
+            const auto missing_w = [&](const wchar_t* name, DWORD error) {
+                SetLastError(0);
+                if (attributes_w(name) != INVALID_FILE_ATTRIBUTES || GetLastError() != error) return false;
+                SetLastError(0);
+                const HANDLE opened =
+                    create_w(name, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (opened != INVALID_HANDLE_VALUE) ::CloseHandle(opened);
+                return opened == INVALID_HANDLE_VALUE && GetLastError() == error;
+            };
+            const std::filesystem::path host_folder = root / "host_missing_name";
+            std::filesystem::create_directories(host_folder);
+            check(missing_w((host_folder / "missing.bin").c_str(), ERROR_FILE_NOT_FOUND) &&
+                      missing_w((host_folder / "nodir" / "missing.bin").c_str(), ERROR_PATH_NOT_FOUND),
+                  "the host: a missing name is ERROR_FILE_NOT_FOUND, a missing folder ERROR_PATH_NOT_FOUND");
+            check(missing_w(L"T:\\missing.bin", ERROR_FILE_NOT_FOUND),
+                  "a missing name on T:\\ is ERROR_FILE_NOT_FOUND for GetFileAttributesW and a read-open");
+            check(missing_w(L"T:\\cache\\missing.bin", ERROR_FILE_NOT_FOUND),
+                  "and in a folder of T:\\");
+            check(mkdir_w(L"GAME:\\titlemade", nullptr) != FALSE && !std::filesystem::exists(package / "titlemade"),
+                  "a folder the title makes under GAME:\\ is in the overlay only");
+            check(missing_w(L"GAME:\\titlemade\\missing.bin", ERROR_FILE_NOT_FOUND),
+                  "a missing name in a folder the title made is ERROR_FILE_NOT_FOUND");
+            check(missing_w(L"T:\\nodir\\missing.bin", ERROR_PATH_NOT_FOUND) &&
+                      missing_w(L"GAME:\\nodir\\missing.bin", ERROR_PATH_NOT_FOUND),
+                  "a missing folder is still ERROR_PATH_NOT_FOUND, on T:\\ and on GAME:\\");
+            check(missing_w(L"GAME:\\data\\missing.bin", ERROR_FILE_NOT_FOUND),
+                  "a missing name in a package folder is still ERROR_FILE_NOT_FOUND");
+            write_path(package / "data" / "package_only.txt", "package only");
+            std::filesystem::create_directories(overlay / "data");
+            h = create_w(L"GAME:\\data\\package_only.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0,
+                         nullptr);
+            check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package only",
+                  "a package file in a folder the overlay also has still reads from the package");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            check(!std::filesystem::exists(overlay / ".gta6rt-temp" / "missing.bin") &&
+                      !std::filesystem::exists(overlay / "titlemade" / "missing.bin"),
+                  "and the failed reads leave nothing behind");
+        }
+
         // The overlay's own folders (.gta6rt-deleted, .gta6rt-temp, .gta6rt-copy) are hidden from GAME:\ listings and,
         // as an explicit GAME: or G: path, refused like any other invalid name, in every spelling parse_console()
         // normalises (RT-294). T:\ still names the scratch folder, and an ordinary dotted name is not reserved.
