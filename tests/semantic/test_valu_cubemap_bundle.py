@@ -334,5 +334,12 @@ class VCubeTcAstTests(unittest.TestCase):
         self.assertEqual(ast.mnemonic, "v_cubetc_f32")
         self.assertEqual(ast.dst.index, 5)
 
+class VCubeTcScalarInterpreterTests(unittest.TestCase):
+    def test_cubetc_scalar_execution(self):
+        # +Y major: (0.5, 3.0, 1.2) -> tc = +z = 1.2
+        self.assertEqual(oracle_cubetc_f32(0.5, 3.0, 1.2), 1.2)
+        # -Y major: (0.5, -3.0, 1.2) -> tc = -z = -1.2
+        self.assertEqual(oracle_cubetc_f32(0.5, -3.0, 1.2), -1.2)
+
 if __name__ == "__main__":
     unittest.main()
