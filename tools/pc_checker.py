@@ -689,7 +689,7 @@ def _lerp(a: str, b: str, t: float) -> str:
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, profile=None, cpu=None, gpu=None, ram=None):
         self.root = root
         root.title("Leonida PC Checker")
         root.geometry("1000x640")
@@ -698,12 +698,13 @@ class App:
         self.q = queue.Queue()
         self.last_text = ""
         self.wrapped = []        # (label, margin) pairs re-wrapped on resize
+        self._pending_overrides = {}
         self._style()
 
-        self.profile_var = tk.StringVar(value=list(PROFILES)[0])
-        self.cpu_var = tk.StringVar()
-        self.gpu_var = tk.StringVar()
-        self.ram_var = tk.StringVar(value="16")
+        self.profile_var = tk.StringVar(value=profile if profile in PROFILES else list(PROFILES)[0])
+        self.cpu_var = tk.StringVar(value="" if cpu is None else str(cpu))
+        self.gpu_var = tk.StringVar(value="" if gpu is None else str(gpu))
+        self.ram_var = tk.StringVar(value="16" if ram is None else str(ram))
 
         self._stripe()
         self._title()
@@ -718,7 +719,9 @@ class App:
         for v in (self.profile_var, self.cpu_var, self.gpu_var, self.ram_var):
             v.trace_add("write", self.refresh)
         self.refresh()
-        self.start_detect()
+        overrides = {k: v for k, v in (("cpu", cpu), ("gpu", gpu), ("ram", ram)) if v is not None}
+        if len(overrides) < 3:
+            self.start_detect(keep_overrides=overrides)
 
     def _style(self):
         st = ttk.Style()
@@ -870,7 +873,8 @@ class App:
         self.root.after(1500, lambda: self.copy_btn.config(text="Copy result"))
 
     # Detection runs in a thread so the window doesn't freeze
-    def start_detect(self):
+    def start_detect(self, keep_overrides=None):
+        self._pending_overrides = dict(keep_overrides) if keep_overrides else {}
         self.btn.config(state="disabled")
         self.status.config(text="Detecting...", fg=MUTED)
 
@@ -890,10 +894,14 @@ class App:
         except queue.Empty:
             self.root.after(150, self._poll)
             return
+        overrides = self._pending_overrides
+        self._pending_overrides = {}
         self.btn.config(state="normal")
         missing = []
         for key, var, label in (("cpu", self.cpu_var, "CPU"), ("gpu", self.gpu_var, "GPU"),
                                 ("ram", self.ram_var, "RAM")):
+            if key in overrides:
+                continue
             if info[key]:
                 var.set(str(info[key]))
             else:
@@ -901,21 +909,25 @@ class App:
         if missing:
             self.status.config(text=f"Couldn't detect {', '.join(missing)}. "
                                     "Pick from the lists.", fg=ORANGE)
-        elif gpu_score(info["gpu"]) is None or cpu_score(info["cpu"]) is None:
+        elif gpu_score(self.gpu_var.get()) is None or cpu_score(self.cpu_var.get()) is None:
             self.status.config(text="Detected, but a component isn't recognised. "
                                     "Pick the closest match from the list.", fg=ORANGE)
         else:
             self.status.config(text="Detected.", fg=MINT)
 
 
-def run_gui():
+def run_gui(args=None):
     if sys.platform == "win32":
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
     root = tk.Tk()
-    App(root)
+    if args is None:
+        App(root)
+    else:
+        App(root, profile=_pick_profile(args.profile),
+            cpu=args.cpu, gpu=args.gpu, ram=args.ram)
     root.mainloop()
 
 
@@ -968,7 +980,7 @@ def main():
             print("tkinter isn't available; using text mode.\n")
         run_cli(args)
     else:
-        run_gui()
+        run_gui(args)
 
 
 if __name__ == "__main__":

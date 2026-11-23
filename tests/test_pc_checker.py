@@ -1,6 +1,8 @@
 """Tests for tools/pc_checker.py. Run with: python -I tests/test_pc_checker.py"""
+import argparse
 import os
 import sys
+import types
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
@@ -152,6 +154,220 @@ class Api(unittest.TestCase):
         os.environ[pc.SKIP_ENV] = "1"
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
+
+
+class _FakeVar:
+    def __init__(self, value=""):
+        self._value = str(value)
+        self._traces = []
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = str(value)
+        for cb in list(self._traces):
+            cb()
+
+    def trace_add(self, _mode, cb):
+        self._traces.append(cb)
+
+
+class _FakeWidget:
+    def __init__(self, *args, **kwargs):
+        self.master = args[0] if args else None
+        self.options = dict(kwargs)
+        self.after_callbacks = []
+
+    def config(self, **kwargs):
+        self.options.update(kwargs)
+
+    configure = config
+
+    def pack(self, **_kwargs):
+        return self
+
+    def pack_configure(self, **_kwargs):
+        return self
+
+    def grid(self, **_kwargs):
+        return self
+
+    def bind(self, *_args, **_kwargs):
+        pass
+
+    def columnconfigure(self, *_args, **_kwargs):
+        pass
+
+    def rowconfigure(self, *_args, **_kwargs):
+        pass
+
+    def title(self, *_args):
+        pass
+
+    def geometry(self, *_args):
+        pass
+
+    def minsize(self, *_args):
+        pass
+
+    def option_add(self, *_args):
+        pass
+
+    def after(self, _ms, cb):
+        self.after_callbacks.append(cb)
+
+    def mainloop(self):
+        pass
+
+
+class _FakeStyle:
+    def theme_use(self, _name):
+        pass
+
+    def configure(self, *_args, **_kwargs):
+        pass
+
+    def map(self, *_args, **_kwargs):
+        pass
+
+
+def _fake_tk_modules():
+    roots = []
+
+    def make_root():
+        root = _FakeWidget()
+        roots.append(root)
+        return root
+
+    fake_tk = types.SimpleNamespace(
+        Tk=make_root,
+        TclError=RuntimeError,
+        StringVar=_FakeVar,
+        Frame=_FakeWidget,
+        Canvas=_FakeWidget,
+        Label=_FakeWidget,
+        Button=_FakeWidget,
+    )
+    fake_ttk = types.SimpleNamespace(
+        Style=_FakeStyle,
+        Combobox=_FakeWidget,
+        Spinbox=_FakeWidget,
+    )
+    return fake_tk, fake_ttk, roots
+
+
+class GuiOverrides(unittest.TestCase):
+    """GUI mode honors --cpu, --gpu, --ram and --profile instead of dropping them."""
+
+    def setUp(self):
+        self._tk, self._ttk = pc.tk, pc.ttk
+        self._detect, self._run_gui = pc.detect_all, pc.run_gui
+        self._argv = sys.argv
+        fake_tk, fake_ttk, self.roots = _fake_tk_modules()
+        pc.tk, pc.ttk = fake_tk, fake_ttk
+
+    def tearDown(self):
+        pc.tk, pc.ttk = self._tk, self._ttk
+        pc.detect_all, pc.run_gui = self._detect, self._run_gui
+        sys.argv = self._argv
+
+    def _drain_detect(self, app):
+        info = app.q.get(timeout=2)
+        app.q.put(info)
+        app._poll()
+
+    def test_main_passes_overrides_to_run_gui(self):
+        seen = []
+        pc.run_gui = lambda args=None: seen.append(args)
+        sys.argv = ["pc_checker.py", "--profile", "2",
+                    "--cpu", "Ryzen 5 5600", "--gpu", "RTX 3070", "--ram", "32"]
+        pc.main()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].profile, 2)
+        self.assertEqual(seen[0].cpu, "Ryzen 5 5600")
+        self.assertEqual(seen[0].gpu, "RTX 3070")
+        self.assertEqual(seen[0].ram, 32)
+
+    def test_all_overrides_skip_detection_and_populate_comparison(self):
+        pc.detect_all = lambda: self.fail("should not detect when all three overrides are given")
+        apps = []
+        orig_app = pc.App
+
+        def capture_app(*args, **kwargs):
+            app = orig_app(*args, **kwargs)
+            apps.append(app)
+            return app
+
+        pc.App = capture_app
+        self.addCleanup(setattr, pc, "App", orig_app)
+        args = argparse.Namespace(profile=2, cpu="AMD Ryzen 5 5600",
+                                  gpu="NVIDIA GeForce RTX 3070", ram=32)
+        pc.run_gui(args)
+        self.assertEqual(len(apps), 1)
+        app = apps[0]
+        self.assertEqual(app.profile_var.get(), "Community 1080p Low estimate")
+        self.assertEqual(app.cpu_var.get(), "AMD Ryzen 5 5600")
+        self.assertEqual(app.gpu_var.get(), "NVIDIA GeForce RTX 3070")
+        self.assertEqual(app.ram_var.get(), "32")
+        self.assertEqual(app.headline.options["text"], "Looks good")
+        self.assertIn("Community 1080p Low estimate", app.last_text)
+        self.assertIn("AMD Ryzen 5 5600", app.last_text)
+        self.assertIn("NVIDIA GeForce RTX 3070", app.last_text)
+        self.assertIn("32 GB", app.last_text)
+
+    def test_partial_overrides_survive_initial_detection(self):
+        pc.detect_all = lambda: {
+            "cpu": "Intel Core i3-10100F",
+            "gpu": "NVIDIA GeForce GTX 1650",
+            "ram": 8,
+        }
+        app = pc.App(pc.tk.Tk(), cpu="AMD Ryzen 5 5600", ram=32)
+        self._drain_detect(app)
+        self.assertEqual(app.cpu_var.get(), "AMD Ryzen 5 5600")
+        self.assertEqual(app.gpu_var.get(), "NVIDIA GeForce GTX 1650")
+        self.assertEqual(app.ram_var.get(), "32")
+        self.assertEqual(app.headline.options["text"], "Probably not enough")
+        self.assertIn("The GPU is weaker than Xbox Series X", app.sub.options["text"])
+        self.assertEqual(app.status.options["text"], "Detected.")
+
+    def test_manual_detect_replaces_startup_overrides(self):
+        pc.detect_all = lambda: {
+            "cpu": "AMD Ryzen 5 5600",
+            "gpu": "NVIDIA GeForce RTX 3070",
+            "ram": 16,
+        }
+        app = pc.App(pc.tk.Tk(), cpu="AMD Ryzen 7 9800X3D",
+                     gpu="NVIDIA GeForce RTX 4090", ram=64)
+        app.start_detect()
+        self._drain_detect(app)
+        self.assertEqual(app.cpu_var.get(), "AMD Ryzen 5 5600")
+        self.assertEqual(app.gpu_var.get(), "NVIDIA GeForce RTX 3070")
+        self.assertEqual(app.ram_var.get(), "16")
+
+    def test_run_gui_without_args_still_detects_all_parts(self):
+        pc.detect_all = lambda: {
+            "cpu": "AMD Ryzen 5 5600",
+            "gpu": "NVIDIA GeForce RTX 3070",
+            "ram": 32,
+        }
+        apps = []
+        orig_app = pc.App
+
+        def capture_app(*args, **kwargs):
+            app = orig_app(*args, **kwargs)
+            apps.append(app)
+            return app
+
+        pc.App = capture_app
+        self.addCleanup(setattr, pc, "App", orig_app)
+        pc.run_gui()
+        self.assertEqual(len(apps), 1)
+        self._drain_detect(apps[0])
+        self.assertEqual(apps[0].profile_var.get(), XBOX)
+        self.assertEqual(apps[0].cpu_var.get(), "AMD Ryzen 5 5600")
+        self.assertEqual(apps[0].gpu_var.get(), "NVIDIA GeForce RTX 3070")
+        self.assertEqual(apps[0].ram_var.get(), "32")
 
 
 if __name__ == "__main__":
