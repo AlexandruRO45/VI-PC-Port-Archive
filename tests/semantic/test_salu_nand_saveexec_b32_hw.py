@@ -89,5 +89,118 @@ class TestSaluNandSaveexecB32Oracle(unittest.TestCase):
             self.assertEqual(saved_d, val)
             self.assertEqual(scc, 1)
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegKind(enum.Enum):
+    SGPR = "s"
+    EXEC_LO = "exec_lo"
+    VCC_LO = "vcc_lo"
+
+
+@dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int = 0
+
+    def __str__(self) -> str:
+        if self.kind == RegKind.SGPR:
+            return f"s{self.index}"
+        return self.kind.value
+
+
+@dataclass(frozen=True)
+class Immediate:
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.value & MASK32)
+
+    def __str__(self) -> str:
+        return f"0x{self.value:08X}"
+
+
+Operand = Union[Register, Immediate]
+
+
+class Opcode(enum.Enum):
+    S_NAND_SAVEEXEC_B32 = "s_nand_saveexec_b32"
+    S_MOV_B32 = "s_mov_b32"
+
+
+@dataclass
+class Instruction:
+    opcode: Opcode
+    dst: Register
+    src0: Operand
+
+    def __str__(self) -> str:
+        return f"{self.opcode.value} {self.dst}, {self.src0}"
+
+
+class ASTNode:
+    def eval(self, env: Dict[str, int]) -> int:
+        raise NotImplementedError
+
+
+@dataclass
+class LiteralNode(ASTNode):
+    val: int
+
+    def eval(self, env: Dict[str, int]) -> int:
+        return self.val & MASK32
+
+
+@dataclass
+class RegReadNode(ASTNode):
+    name: str
+
+    def eval(self, env: Dict[str, int]) -> int:
+        return env.get(self.name, 0) & MASK32
+
+
+@dataclass
+class NandSaveExecB32Node(ASTNode):
+    src0: ASTNode
+    exec_lo: ASTNode
+
+    def eval(self, env: Dict[str, int]) -> Tuple[int, int, int]:
+        s0 = self.src0.eval(env)
+        exec_val = self.exec_lo.eval(env)
+        return ref_nand_saveexec_b32(s0, exec_val)
+
+
+# ==============================================================================
+# Unit Tests: Symbolic AST Opcode Definitions
+# ==============================================================================
+
+class TestSaluNandSaveexecB32AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_creation_and_string(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 4),
+            src0=Register(RegKind.SGPR, 6),
+        )
+        self.assertEqual(inst.opcode, Opcode.S_NAND_SAVEEXEC_B32)
+        self.assertEqual(str(inst), "s_nand_saveexec_b32 s4, s6")
+
+    def test_instruction_with_immediate(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 2),
+            src0=Immediate(0x1234_5678),
+        )
+        self.assertEqual(str(inst), "s_nand_saveexec_b32 s2, 0x12345678")
+
+    def test_ast_evaluation_matches_oracle(self) -> None:
+        env = {"s0": 0x00FF_00FF, "exec_lo": 0x0F0F_0F0F}
+        node = NandSaveExecB32Node(RegReadNode("s0"), RegReadNode("exec_lo"))
+        result = node.eval(env)
+        expected = ref_nand_saveexec_b32(0x00FF_00FF, 0x0F0F_0F0F)
+        self.assertEqual(result, expected)
+
 if __name__ == "__main__":
     unittest.main()
