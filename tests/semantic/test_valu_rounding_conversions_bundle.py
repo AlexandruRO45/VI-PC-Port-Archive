@@ -478,6 +478,22 @@ class TestVCvtU32F32ReferenceOracle(unittest.TestCase):
         res = oracle_v_cvt_u32_f32(0x40a00000)
         self.assertEqual(res, 0x5)
 
+class TestVCvtU32F32ASTAndInterpreter(unittest.TestCase):
+    """Stage 2 for v_cvt_u32_f32: AST and deterministic interpreter execution."""
+
+    def test_v_cvt_u32_f32_ast_emission(self):
+        lines = [
+            "v_mov_b32 v1, 0x40a00000",
+            "v_cvt_u32_f32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        spv = support.translate_lines("ps_ast_v_cvt_u32_f32", lines + ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("OpConvertFToU", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x5)
+
 
 if __name__ == '__main__':
     unittest.main()
