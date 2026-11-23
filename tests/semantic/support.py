@@ -1,4 +1,5 @@
 """Shared helpers for the translator tests (standard library only)."""
+import contextlib
 import gc
 import os
 import struct
@@ -11,6 +12,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 # The mutation tests point this at a sabotaged copy of tools/; normally it is the repository's own.
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
+SHADERS_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 
 sys.dont_write_bytecode = True      # never drop __pycache__ into the tree under test
 sys.path.insert(0, TOOLS_DIR)
@@ -20,6 +22,25 @@ from spirv_mini_interp import run_fragment  # noqa: E402
 # translate() reads <dir>/<name>.s and, for pixel shaders, an input signature from <dir>/../<name>.dxbc.
 # A DXBC container with zero parts (magic, 24 zero bytes, part count 0, 4 more bytes) declares no inputs.
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+
+
+@contextlib.contextmanager
+def shaders_importable():
+    """runtime/test/shaders (check, compute_fixture, build) importable inside the block, and nothing left behind.
+
+    Those modules put more folders on sys.path when they load, and "build" is a name any other test could meet,
+    so a plain sys.path.insert in a test would leak into every test that runs after it in the same pytest process.
+    On exit sys.path is what it was and the modules first imported from that folder are forgotten."""
+    saved_path, known = list(sys.path), set(sys.modules)
+    sys.path.insert(0, SHADERS_DIR)
+    try:
+        yield
+    finally:
+        sys.path[:] = saved_path
+        for name in set(sys.modules) - known:
+            origin = getattr(sys.modules[name], "__file__", None)
+            if origin and os.path.dirname(os.path.abspath(origin)) == os.path.abspath(SHADERS_DIR):
+                del sys.modules[name]
 
 
 def translate_fixture(name, dxbc=STUB_DXBC, fssm=None):

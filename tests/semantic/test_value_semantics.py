@@ -61,7 +61,6 @@ the channel order of the 10:10:10:2 typed-buffer formats: the names list the cha
 import math
 import os
 import struct
-import sys
 import unittest
 from unittest import mock
 
@@ -594,11 +593,8 @@ class TranslatorValueSemantics(unittest.TestCase):
     def test_narrow_integer_typed_buffers(self):
         # cs_fmt_int_narrow.asm in the interpreter against the words check.py expects from the GPU, which are the
         # same program's output on gfx1036 run natively: a 136-word heap filled with 0xee as vk_compute_test's.
-        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
-        try:
+        with support.shaders_importable():
             import check
-        finally:
-            sys.path.pop(0)
         spv = support.translate_fixture("cs_fmt_int_narrow", fssm=CS_BOUNDS_FSSM)
         memory = {4 * i: 0xEEEEEEEE for i in range(len(check.FMT_INT_NARROW_WORDS))}
         support.run_fragment(
@@ -856,9 +852,9 @@ class LaneMaskConstants(unittest.TestCase):
            "cs_w64_mask_imm": [0xFFFFFF00] * 7 + [2080]}
 
     def run_words(self, name, lanes):
-        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
-        from compute_fixture import compute_header
-        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+        with support.shaders_importable():
+            from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.SHADERS_DIR, name + ".asm"))
         spv = support.translate_fixture(name, fssm=bytes(header))
         memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
         si.run_workgroup(spv, lanes, lanes,

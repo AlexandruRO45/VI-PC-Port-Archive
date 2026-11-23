@@ -960,10 +960,11 @@ class GeometryRing(unittest.TestCase):
            "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)", "s_endpgm"]
 
     def tier(self, body):
-        sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
-        import build                                       # gs_container: gs_tri's ISG1/OSG1
+        with support.shaders_importable():
+            import build                                   # gs_container: gs_tri's ISG1/OSG1
+            gs_dxbc = build.gs_container()
         name = "gs_w64_ring_test"
-        translate_listing(name, listing(name, self.PRO + body + self.EPI), build.gs_container())
+        translate_listing(name, listing(name, self.PRO + body + self.EPI), gs_dxbc)
         w = rdna2spirv.translate.last_gen.w64g
         return w["tier"], w["reasons"]
 
