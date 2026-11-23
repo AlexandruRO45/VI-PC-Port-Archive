@@ -882,6 +882,28 @@ class CliTests(unittest.TestCase):
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the scan used to report an
+        # empty directory and exit 0, hiding the incomplete scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "sub")
+            os.mkdir(sub)
+            with open(os.path.join(sub, "x.bin"), "wb") as fh:
+                fh.write(b"\x63\x30\x00\x00" + b"\0" * 60)
+            os.chmod(sub, 0o000)
+            try:
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                r = self.run_tool(tmp, "--quiet")
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("error:", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+            finally:
+                os.chmod(sub, 0o755)
+
 
 if __name__ == "__main__":
     unittest.main()

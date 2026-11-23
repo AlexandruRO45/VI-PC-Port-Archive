@@ -697,10 +697,16 @@ def iter_archive(path):
             m.close()
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a scan must not report an
+    # incomplete directory as complete. main() turns the OSError into one error line and exit 2.
+    raise exc
+
+
 def iter_inputs(paths):
     for path in paths:
         if os.path.isdir(path):
-            for root, _, files in os.walk(path):
+            for root, _, files in os.walk(path, onerror=_walk_error):
                 for f in sorted(files):
                     full = os.path.join(root, f)
                     with open(full, "rb") as fh:
@@ -922,8 +928,12 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name, args.faces, args.centres, args.normals, args.cones)
-             for name, data in iter_inputs(args.inputs)]
+    try:
+        pages = [summarise_page(data, name, args.faces, args.centres, args.normals, args.cones)
+                 for name, data in iter_inputs(args.inputs)]
+    except OSError as exc:
+        print(f"error: {exc.filename or args.inputs[0]}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     total = totals(pages)
     if not args.quiet:
         for p in pages:
