@@ -936,3 +936,35 @@ class TestVMovrelsd2B32Bitfields(unittest.TestCase):
         spv = support.translate_lines("ps_vmovrelsd2_neighbour", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0xAAAA5555)
+
+
+class TestVMovrelsd2B32Integration(unittest.TestCase):
+    def test_full_pipeline_compilation(self):
+        m0 = (1 << 16) | 2
+        lines = [
+            "v_mov_b32 v4, 0x7777AAAA",
+            f"s_mov_b32 m0, {m0}",
+            "v_movrelsd_2_b32 v2, v2",
+            "v_mov_b32 v0, v3",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrelsd2_full", lines)
+        self.assertIn("OpCapability Shader", spv)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x7777AAAA)
+
+    def test_negative_rejects_sgpr_operands(self):
+        lines = [
+            "v_movrelsd_2_b32 s0, v1",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_vmovrelsd2_sgpr", lines)
+
+
+if __name__ == "__main__":
+    unittest.main()
