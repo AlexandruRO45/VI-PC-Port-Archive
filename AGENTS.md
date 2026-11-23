@@ -114,5 +114,8 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
   `tex_headers.py` and `skinned_glb.py` (which fall back to the standard library when numpy is absent).
 - A text file a tool writes names its line ending - `open(path, "w", encoding="utf-8", newline="\n")` - so the same
   input gives the same bytes on every platform; `tests/test_text_write_line_endings.py` catches a writer that forgets.
+- A PowerShell script that writes a text file names its encoding too (`Set-Content ... -Encoding utf8`): Windows
+  PowerShell 5.1 writes the ANSI code page there and PowerShell 7 UTF-8; `tests/test_ps1_write_encoding.py` catches a
+  writer that forgets.
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.

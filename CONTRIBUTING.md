@@ -31,6 +31,9 @@ methods are still open.
   encoding="utf-8", newline="\n")` (the same for `Path.open`, `Path.write_text` and a text-mode
   `tempfile.NamedTemporaryFile`), so the output is LF on Windows too and the same input gives the same bytes on every
   platform. `tests/test_text_write_line_endings.py` fails for a writer that forgets it.
+- A PowerShell script that writes a text file names its encoding too (`Set-Content ... -Encoding utf8`): Windows
+  PowerShell 5.1 writes the ANSI code page where PowerShell 7 writes UTF-8, so the same script would leave different
+  bytes. `tests/test_ps1_write_encoding.py` fails for a writer that forgets it.
 - A report writer refuses an output that names one of its inputs or another output, and asks
   `tools/report_paths.same_report_path(a, b)` rather than deriving the answer again: it resolves both paths,
   applies the volume's case rules and falls back to `os.path.samefile`, so a new tool reuses one answer
