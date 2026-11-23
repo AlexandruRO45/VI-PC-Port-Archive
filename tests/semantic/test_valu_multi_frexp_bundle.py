@@ -32,7 +32,7 @@ for p in (HERE, TESTS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from support import translate_lines, mrt0_words  # noqa: E402
+from support import translate_lines, mrt0_words, rdna2spirv  # noqa: E402
 
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
@@ -240,7 +240,7 @@ class VFrexpExpI16F16TranslatorTests(unittest.TestCase):
         self.assertEqual(val, 1)
 
     def test_frexp_exp_f16_syntax_rejection(self):
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "v_frexp_exp_i16_f16: missing operands"):
             translate_lines("ps_bad_frexp_exp_f16", ["v_frexp_exp_i16_f16"])
 
 # -----------------------------------------------------------------------------
@@ -301,7 +301,7 @@ class VFrexpMantF16TranslatorTests(unittest.TestCase):
         self.assertEqual(val, 0x3800)
 
     def test_frexp_mant_f16_syntax_rejection(self):
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "v_frexp_mant_f16: missing operands"):
             translate_lines("ps_bad_frexp_mant_f16", ["v_frexp_mant_f16"])
 
 # -----------------------------------------------------------------------------
@@ -364,7 +364,7 @@ class VFrexpExpI32F32TranslatorTests(unittest.TestCase):
         self.assertEqual(val, 1)
 
     def test_frexp_exp_f32_syntax_rejection(self):
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "v_frexp_exp_i32_f32: missing operands"):
             translate_lines("ps_bad_frexp_exp_f32", ["v_frexp_exp_i32_f32"])
 
 # -----------------------------------------------------------------------------
@@ -424,7 +424,7 @@ class VFrexpMantF32TranslatorTests(unittest.TestCase):
         self.assertEqual(val, 0x3F000000)
 
     def test_frexp_mant_f32_syntax_rejection(self):
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "v_frexp_mant_f32: missing operands"):
             translate_lines("ps_bad_frexp_mant_f32", ["v_frexp_mant_f32"])
 
 # -----------------------------------------------------------------------------

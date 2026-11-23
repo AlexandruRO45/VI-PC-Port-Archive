@@ -16476,6 +16476,9 @@ def translate(path):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
         check_printed_encodings(path, info)
+    for ins in insns:
+        if not ins["args"] and ins["op"].startswith("v_") and base_op(ins["op"]) not in NOOPS:
+            raise Unsupported(f"{ins['op']}: missing operands")
     g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
     g.exec_static_true = not any(writes_exec(i) for i in insns)
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
