@@ -859,6 +859,16 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertTrue(os.path.exists(new_buf))
         self.assertEqual(hashlib.sha256(_read(new_buf)).hexdigest(), before_hash)
 
+    def test_palette_resolver_guards_non_dict_bones(self):
+        # BUILD-2683: a non-dict entry in drawable.skeleton must not raise AttributeError
+        resolver = skinned_glb.PaletteResolver(
+            {"drawable": {"skeleton": [None, "invalid", 123, {"name": "SKEL_ROOT", "parent": 1}]}},
+            {"SKEL_ROOT": {"name": "SKEL_ROOT"}}
+        )
+        self.assertIn("SKEL_ROOT", resolver.own_by_name)
+        # own_parent_name with non-dict parent reference
+        self.assertIsNone(skinned_glb.own_parent_name(resolver.own_by_name["SKEL_ROOT"], resolver.own_skeleton))
+
 
 if __name__ == "__main__":
     unittest.main()

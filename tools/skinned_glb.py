@@ -549,6 +549,8 @@ class PaletteResolver:
         self.own_by_name = {}
         self.by_hash: dict[int, tuple[str, str]] = {}
         for bone in own:
+            if not isinstance(bone, dict):
+                continue
             name = bone.get("name")
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)
@@ -586,7 +588,9 @@ def own_parent_name(record, own_skeleton) -> str | None:
     if parent_name is None:
         parent = record.get("parent")
         if isinstance(parent, int) and 0 <= parent < len(own_skeleton):
-            parent_name = own_skeleton[parent].get("name")
+            parent_bone = own_skeleton[parent]
+            if isinstance(parent_bone, dict):
+                parent_name = parent_bone.get("name")
     return parent_name if isinstance(parent_name, str) and parent_name else None
 
 
