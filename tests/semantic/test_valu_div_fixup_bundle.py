@@ -82,5 +82,104 @@ class TestVDivScaleF32Reference(unittest.TestCase):
         self.assertEqual(vcc, 1)
 
 
+class RegType(enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index_or_val: int | float
+    size: int = 1
+
+    @classmethod
+    def vgpr(cls, idx: int, size: int = 1) -> Operand:
+        if not (0 <= idx + size - 1 < 256):
+            raise ValueError(f"VGPR index out of range: {idx}")
+        return cls(RegType.VGPR, idx, size)
+
+    @classmethod
+    def sgpr(cls, idx: int, size: int = 1) -> Operand:
+        if not (0 <= idx + size - 1 < 106):
+            raise ValueError(f"SGPR index out of range: {idx}")
+        return cls(RegType.SGPR, idx, size)
+
+    @classmethod
+    def imm32(cls, val: float) -> Operand:
+        return cls(RegType.IMM, float(val), 1)
+
+
+@dataclasses.dataclass
+class Instruction:
+    opcode: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand | None = None
+
+
+class ValuDivState:
+    def __init__(self) -> None:
+        self.vgprs: dict[int, int] = {i: 0 for i in range(256)}
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+        self.vcc: int = 0
+
+    def read_f32(self, op: Operand) -> float:
+        if op.reg_type == RegType.IMM:
+            return float(op.index_or_val)
+        elif op.reg_type == RegType.VGPR:
+            return bits_to_f32(self.vgprs[int(op.index_or_val)])
+        return bits_to_f32(self.sgprs[int(op.index_or_val)])
+
+    def read_f64(self, op: Operand) -> float:
+        if op.reg_type == RegType.VGPR:
+            lo = self.vgprs[int(op.index_or_val)]
+            hi = self.vgprs[int(op.index_or_val) + 1]
+            return bits_to_f64((hi << 32) | lo)
+        lo = self.sgprs[int(op.index_or_val)]
+        hi = self.sgprs[int(op.index_or_val) + 1]
+        return bits_to_f64((hi << 32) | lo)
+
+    def write_f32(self, idx: int, val: float) -> None:
+        self.vgprs[idx] = f32_to_bits(val)
+
+    def write_f64(self, idx: int, val: float) -> None:
+        bits = f64_to_bits(val)
+        self.vgprs[idx] = bits & MASK32
+        self.vgprs[idx + 1] = (bits >> 32) & MASK32
+
+def step_scalar_div_scale_f32(state: ValuDivState, instr: Instruction) -> None:
+    if instr.opcode != "v_div_scale_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    numer = state.read_f32(instr.src0)
+    denom = state.read_f32(instr.src1)
+    sel = state.read_f32(instr.src2)
+    val, vcc = ref_div_scale_f32(numer, denom, sel)
+    state.write_f32(int(instr.dst.index_or_val), val)
+    state.vcc = vcc
+
+
+class TestVDivScaleF32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_div_scale_f32."""
+
+    def test_ast_construction_and_bounds(self):
+        instr = Instruction("v_div_scale_f32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        self.assertEqual(instr.opcode, "v_div_scale_f32")
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuDivState()
+        state.write_f32(1, 10.0)
+        state.write_f32(2, 2.0)
+        state.write_f32(3, 10.0)
+        instr = Instruction("v_div_scale_f32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_scalar_div_scale_f32(state, instr)
+        self.assertEqual(bits_to_f32(state.vgprs[0]), 10.0)
+        self.assertEqual(state.vcc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
