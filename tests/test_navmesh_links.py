@@ -447,6 +447,18 @@ class NavmeshLinksTest(unittest.TestCase):
                 if failed_check == "poly_link_chain":
                     self.assertEqual(st["polygons"]["total"], 0)
 
+    def test_archive_limit_requires_the_full_compressed_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "nav.rpf")
+            streams = build_tile()
+            make_rpf(rpf, streams)
+            stored = len(zlib.compress(streams[0]))
+
+            self.assertEqual(nl.scan(rpf, limit=stored - 1)["tiles"], 0)
+            at_boundary = nl.scan(rpf, limit=stored)
+            self.assertEqual(at_boundary["tiles"], 1)
+            self.assertEqual(at_boundary, nl.scan(rpf))
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             rpf = os.path.join(tmp, "nav.rpf")

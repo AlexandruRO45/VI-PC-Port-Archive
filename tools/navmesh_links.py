@@ -475,16 +475,14 @@ def _iter_resources(path, start=0, limit=None):
         scan_end = size if limit is None else min(size, scan_start + limit)
         if scan_start >= scan_end:
             return
-        gen = nd.walk(m, scan_start, size)
+        gen = nd.walk(m, scan_start, scan_end)
         pending = None
         while True:
             item = pending if pending is not None else next(gen, None)
             pending = None
             if item is None:
                 break
-            off0, _, d0 = item
-            if off0 >= scan_end:
-                break
+            _, _, d0 = item
             if len(d0) < 64:
                 continue
             cls = nd.classify(d0)
