@@ -468,6 +468,45 @@ class TestManifestVerifier(unittest.TestCase):
                 self.assertEqual(report.bytes_verified, verified_bytes)
                 self.assertEqual(report.to_dict()["bytes_verified"], verified_bytes)
 
+    def test_progress_rate_counts_only_fully_hashed_bytes(self) -> None:
+        self.write_manifest(self.manifest_path, {
+            "alpha.bin": self.payloads["alpha.bin"],
+            "bravo.bin": self.payloads["bravo.bin"],
+        })
+        hash_file = mv.sha256_file
+
+        def hash_with_denied_read(path: str, *, expected_size: int | None = None) -> str:
+            if os.path.basename(path) == "alpha.bin":
+                raise PermissionError("Simulated permission denied")
+            return hash_file(path, expected_size=expected_size)
+
+        with open(os.path.join(self.game_dir, "bravo.bin"), "r+b") as f:
+            f.write(bytes([self.payloads["bravo.bin"][0] ^ 1]))
+
+        progress = io.StringIO()
+        events = []
+        with (
+            patch.object(mv, "sha256_file", side_effect=hash_with_denied_read),
+            patch.object(mv.time, "time", side_effect=[0, 1 / 64, 1 / 32, 1 / 16]),
+        ):
+            report = mv.verify_manifest(
+                self.game_dir, self.manifest_path, jobs=1,
+                progress_callback=events.append, progress_stream=progress,
+            )
+
+        unreadable, changed = events
+        self.assertEqual([unreadable.status, changed.status], ["UNREADABLE", "CHANGED"])
+        self.assertEqual([unreadable.rate_mib, changed.rate_mib], [0.0, 2.0])
+        self.assertEqual(unreadable.completed_bytes, SYNTHETIC_SIZES["alpha.bin"])
+        self.assertEqual(changed.completed_bytes, unreadable.completed_bytes + SYNTHETIC_SIZES["bravo.bin"])
+        self.assertEqual(changed.completed_files, 2)
+        self.assertEqual(changed.pct, 1.0)
+        self.assertEqual(report.bytes_verified, SYNTHETIC_SIZES["bravo.bin"])
+        self.assertEqual(progress.getvalue().splitlines(), [
+            "[ 80.0%] 1/2 files       0 MiB/s",
+            "[100.0%] 2/2 files       2 MiB/s",
+        ])
+
     def test_empty_manifest_and_zero_byte_file(self) -> None:
         zero_p = os.path.join(self.game_dir, "empty.bin")
         with open(zero_p, "wb"):

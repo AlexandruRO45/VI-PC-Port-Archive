@@ -294,7 +294,7 @@ def verify_manifest(
                 unreadable_map[rel] = err_msg
 
         elapsed = max(time.time() - t0, 1e-6)
-        rate_mib = (completed_bytes / elapsed) / (1024 * 1024)
+        rate_mib = (bytes_verified / elapsed) / (1024 * 1024)
         pct = (
             completed_bytes / total_manifest_bytes
             if total_manifest_bytes > 0
