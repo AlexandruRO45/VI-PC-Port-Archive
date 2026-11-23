@@ -77,12 +77,19 @@ namespace {
 // The method a std::source_location names: the identifier just before the parameter list of function_name(). MSVC and
 // clang-cl give the whole signature ("void __cdecl rt::d3d12::`anonymous-namespace'::GraphicsCommandList::
 // RSSetViewports(unsigned int,const struct D3D12_VIEWPORT *)"), where the first '(' after an identifier character
-// opens the parameters (the one in clang's "(anonymous namespace)" follows a space); a bare name is kept whole.
+// opens the parameters (the one in clang's "(anonymous namespace)" follows a space); a bare name is kept whole. A
+// bundle's deferred call runs in a lambda, which MSVC names "...::DrawInstanced::<lambda_1>::operator ()(...)": the
+// method is the identifier before "::<lambda".
 std::string_view method_of(const char* function) {
     const std::string_view name = function ? function : "";
     const auto identifier = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
     };
+    if (const std::size_t lambda = name.find("::<lambda"); lambda != std::string_view::npos) {
+        std::size_t begin = lambda;
+        while (begin > 0 && identifier(name[begin - 1])) --begin;
+        if (begin < lambda) return name.substr(begin, lambda - begin);
+    }
     std::size_t open = name.find('(');
     while (open != std::string_view::npos && (open == 0 || !identifier(name[open - 1]))) open = name.find('(', open + 1);
     const std::size_t end = open == std::string_view::npos ? name.size() : open;
@@ -1052,6 +1059,8 @@ private:
     }
 
     // `where` is the call site, which the compiler fills in: each refusing site is logged once (log_refused_call).
+    // The private helpers below that check (atomic_copy, record_draw, parameter, ...) take a defaulted `where` too
+    // and pass it on, so the line names the D3D12 method that called them, not the helper (found in review).
     void check(bool ok, std::source_location where = std::source_location::current()) {
         if (ok) return;
         invalid_ = true;
@@ -1094,47 +1103,49 @@ private:
 
     void atomic_copy(std::uint32_t bytes, ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                      UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
-                     const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
+                     const D3D12_SUBRESOURCE_RANGE_UINT64* ranges,
+                     std::source_location where = std::source_location::current()) {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !dst || !src || (count && (!resources || !ranges)))
-            return check(false);
+            return check(false, where);
         const auto dst_desc = dst->GetDesc();
         const auto src_desc = src->GetDesc();
         if (dst_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             src_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
-            return check(false);
+            return check(false, where);
         if (dst_offset % bytes != 0 || src_offset % bytes != 0 || dst_offset > dst_desc.Width ||
             dst_desc.Width - dst_offset < bytes || src_offset > src_desc.Width || src_desc.Width - src_offset < bytes)
-            return check(false);
+            return check(false, where);
         leonida::AtomicCopyBuffer copy{resource_id(dst), dst_offset, resource_id(src), src_offset, bytes, {}};
         copy.dependencies.reserve(count);
         for (UINT i = 0; i < count; ++i) {
             ID3D12Resource* dep = resources[i];
-            if (!dep) return check(false);
+            if (!dep) return check(false, where);
             const auto dep_desc = dep->GetDesc();
             const auto& r = ranges[i];
             UINT64 begin = r.Range.Begin;
             UINT64 end = r.Range.End;
             if (dep_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-                if (r.Subresource != 0) return check(false);
+                if (r.Subresource != 0) return check(false, where);
                 if (begin >= end || (end != UINT64_MAX && end > dep_desc.Width))
-                    return check(false);
+                    return check(false, where);
             } else {
                 const UINT total_subresources = subresource_count(dep_desc);
                 if (r.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && r.Subresource >= total_subresources)
-                    return check(false);
-                if (begin != 0 || end != UINT64_MAX) return check(false);
+                    return check(false, where);
+                if (begin != 0 || end != UINT64_MAX) return check(false, where);
             }
             copy.dependencies.push_back({resource_id(dep), r.Subresource, begin, end});
         }
-        check(list_.atomic_copy(copy));
+        check(list_.atomic_copy(copy), where);
     }
 
     void clear_unordered_access(D3D12_CPU_DESCRIPTOR_HANDLE view, ID3D12Resource* resource, bool is_float,
-                                const std::array<std::uint32_t, 4>& values, UINT count, const D3D12_RECT* rects) {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);  // no clear is allowed in a bundle
+                                const std::array<std::uint32_t, 4>& values, UINT count, const D3D12_RECT* rects,
+                                std::source_location where = std::source_location::current()) {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false, where);  // no clear is allowed in a bundle
         leonida::UavView target{};
-        if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false);
-        check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)));
+        if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false, where);
+        check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)), where);
     }
 
     // The Vulkan format a descriptor's FORMAT and DST_SEL name: a UAV has no component mapping of its own, so its
@@ -1199,9 +1210,10 @@ private:
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
     // signature that is already bound changes nothing: "existing root signature bindings do not become stale"
     // (D3D12, "Using a Root Signature"), and engines rebind routinely.
-    void bind_root(RootState& state, ID3D12RootSignature* signature) {
+    void bind_root(RootState& state, ID3D12RootSignature* signature,
+                   std::source_location where = std::source_location::current()) {
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
-                l.bind_root(compute ? l.compute_ : l.graphics_, signature);
+                l.bind_root(compute ? l.compute_ : l.graphics_, signature, where);
             }))
             return hold(signature);  // the bundle keeps it for as long as it can be executed
         const RootArgumentLayout* layout = root_signature_layout(signature);
@@ -1214,7 +1226,7 @@ private:
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
                                    : "SetGraphicsRootSignature(signature that does not fit the graphics layout)");
-            check(false);
+            check(false, where);
         }
     }
 
@@ -1226,10 +1238,11 @@ private:
     }
 
     // The parameter, if it exists and has the expected type; null after recording an invalid call.
-    const RootArgumentLayout::Parameter* parameter(RootState& state, UINT index, rt::rootsig::ParamType type) {
+    const RootArgumentLayout::Parameter* parameter(RootState& state, UINT index, rt::rootsig::ParamType type,
+                                                   std::source_location where = std::source_location::current()) {
         if (!state.layout || index >= state.layout->parameters.size() ||
             state.layout->parameters[index].type != type) {
-            check(false);
+            check(false, where);
             return nullptr;
         }
         return &state.layout->parameters[index];
@@ -1243,11 +1256,12 @@ private:
             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
     }
 
-    void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+    void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset,
+                   std::source_location where = std::source_location::current()) {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
             // The layout is the executing list's, so the range is checked when it runs; no signature takes more
             // than D3D12_MAX_ROOT_COST dwords, which bounds what is copied from the caller's memory.
-            if (count > D3D12_MAX_ROOT_COST) return check(false);
+            if (count > D3D12_MAX_ROOT_COST) return check(false, where);
             const auto* words = static_cast<const std::uint32_t*>(data);
             std::vector<std::uint32_t> copy;
             if (data) copy.assign(words, words + count);
@@ -1256,24 +1270,25 @@ private:
             defer([=, compute = &state == &compute_, copy = std::move(copy),
                    given = data != nullptr](GraphicsCommandList& l) {
                 l.constants(compute ? l.compute_ : l.graphics_, index, count,
-                            !given ? nullptr : copy.empty() ? &none : copy.data(), offset);
+                            !given ? nullptr : copy.empty() ? &none : copy.data(), offset, where);
             });
             return;
         }
-        const RootArgumentLayout::Parameter* p = parameter(state, index, rt::rootsig::ParamType::Constants);
+        const RootArgumentLayout::Parameter* p = parameter(state, index, rt::rootsig::ParamType::Constants, where);
         if (!p) return;
-        if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
+        if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false, where);
         const auto* values = static_cast<const std::uint32_t*>(data);
         const std::uint32_t first = first_dword(state, *p);
         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
     }
 
-    void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
+    void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type,
+                 std::source_location where = std::source_location::current()) {
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
-                l.address(compute ? l.compute_ : l.graphics_, index, va, type);
+                l.address(compute ? l.compute_ : l.graphics_, index, va, type, where);
             }))
             return;
-        const RootArgumentLayout::Parameter* p = parameter(state, index, type);
+        const RootArgumentLayout::Parameter* p = parameter(state, index, type, where);
         if (!p) return;
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
@@ -1331,10 +1346,11 @@ private:
     // the application makes the call, and not again at each ExecuteBundle. After Close nothing is appended, since
     // another list may be executing the bundle: a state call is ignored, and a draw or dispatch (`command`) makes
     // the list invalid.
-    bool defer(std::function<void(GraphicsCommandList&)> run, bool command = false) {
+    bool defer(std::function<void(GraphicsCommandList&)> run, bool command = false,
+               std::source_location where = std::source_location::current()) {
         if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) return false;
         if (list_.closed()) {
-            if (command) check(false);
+            if (command) check(false, where);
             return true;
         }
         calls_.push_back({list_.commands().size(), std::move(run)});
@@ -1370,8 +1386,9 @@ private:
 
     // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
     // currently bound heap of that type, without clearing any omitted heap slot on the parent.
-    void verify_bundle_descriptor_heaps(ID3D12DescriptorHeap* cbv, ID3D12DescriptorHeap* smp) {
-        if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false);
+    void verify_bundle_descriptor_heaps(ID3D12DescriptorHeap* cbv, ID3D12DescriptorHeap* smp,
+                                        std::source_location where = std::source_location::current()) {
+        if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false, where);
     }
 
     void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
@@ -1424,10 +1441,10 @@ private:
                       : leonida::IndexBufferView{};
     }
 
-    void record_dispatch(UINT x, UINT y, UINT z) {
-        if (!compute_pipeline_ || !compute_.layout) return check(false);
+    void record_dispatch(UINT x, UINT y, UINT z, std::source_location where = std::source_location::current()) {
+        if (!compute_pipeline_ || !compute_.layout) return check(false, where);
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}), where);
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -1444,8 +1461,9 @@ private:
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
-    void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+    void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance,
+                     std::source_location where = std::source_location::current()) {
+        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false, where);
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
@@ -1453,7 +1471,7 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
-        check(list_.draw(std::move(draw)));
+        check(list_.draw(std::move(draw)), where);
     }
 };
 

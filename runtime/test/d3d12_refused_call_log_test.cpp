@@ -1,9 +1,10 @@
 // A recorded call the layer refuses marks its list invalid, so Close returns E_INVALIDARG; each refusing call site is
 // logged once, with its method and line, so a failing Close names its cause. Here ClearRenderTargetView with a null
-// view and RSSetViewports with one viewport too many are recorded three times each on a direct list: every Close
-// returns E_INVALIDARG, and stderr gets exactly one line per method. RSSetViewports records nothing in the D3D12 trace
-// before its check, so the method comes from the call site, not from the trace. A valid list closes with S_OK and logs
-// nothing. Needs a Vulkan 1.3 device (SKIP otherwise). No game data.
+// view, RSSetViewports with one viewport too many and Dispatch with no compute pipeline are recorded three times each
+// on a direct list: every Close returns E_INVALIDARG, and stderr gets exactly one line per method. RSSetViewports
+// records nothing in the D3D12 trace before its check, so the method comes from the call site, not from the trace;
+// Dispatch is refused inside a private helper (record_dispatch), and the line still names Dispatch. A valid list
+// closes with S_OK and logs nothing. Needs a Vulkan 1.3 device (SKIP otherwise). No game data.
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -98,6 +99,7 @@ int main() {
             }
             list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{0}, color, 0, nullptr);
             list->RSSetViewports(UINT(std::size(viewports)), viewports);
+            list->Dispatch(1, 1, 1);  // no compute pipeline or root signature: refused in record_dispatch
             close = list->Close();
         }
         if (SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr))) {
@@ -112,9 +114,12 @@ int main() {
     REQUIRE(valid == S_OK);
     REQUIRE(count_of(log, "ID3D12GraphicsCommandList::ClearRenderTargetView refused a recorded call") == 1);
     REQUIRE(count_of(log, "ID3D12GraphicsCommandList::RSSetViewports refused a recorded call") == 1);
-    REQUIRE(count_of(log, "refused a recorded call") == 2);
-    REQUIRE(count_of(log, "(d3d12_com.cpp:") == 2);
-    std::printf("d3d12_refused_call_log: three refused lists close with E_INVALIDARG and name their two refusing calls "
-                "once each; a valid list closes with S_OK and logs nothing: PASS\n");
+    REQUIRE(count_of(log, "ID3D12GraphicsCommandList::Dispatch refused a recorded call") == 1);
+    REQUIRE(count_of(log, "record_dispatch") == 0);
+    REQUIRE(count_of(log, "refused a recorded call") == 3);
+    REQUIRE(count_of(log, "(d3d12_com.cpp:") == 3);
+    std::printf("d3d12_refused_call_log: three refused lists close with E_INVALIDARG and name their three refusing "
+                "calls once each, Dispatch's from its helper too; a valid list closes with S_OK and logs nothing: "
+                "PASS\n");
     return 0;
 }
