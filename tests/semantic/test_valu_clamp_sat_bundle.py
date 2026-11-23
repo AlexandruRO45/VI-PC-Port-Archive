@@ -311,6 +311,23 @@ class TestValuSubF32ClampOracle(unittest.TestCase):
         hw = run_binary_f32("v_sub_f32", 1.5, 0.1, omod="div:2", clamp=True)
         self.assertAlmostEqual(hw, 0.7, places=6)
 
+class TestValuSubF32AST(unittest.TestCase):
+    """Stage 8: Symbolic AST and typed modifier definitions for v_sub_f32."""
+
+    def test_ast_sub_compilation(self):
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",  # 1.0
+            "v_mov_b32 v1, 0x40000000",  # 2.0
+            "v_sub_f32_e64 v2, v0, v1 clamp",  # 1.0 - 2.0 = -1.0 -> 0.0
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(next_test_id("ps_ast_sub"), lines)
+        self.assertIn("OpFSub", spv)
+        self.assertIn("FClamp", spv)
+        words = support.mrt0_words(spv)
+        self.assertAlmostEqual(bits_to_f32(words[0]), 0.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
