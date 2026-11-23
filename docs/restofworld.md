@@ -614,6 +614,12 @@ On the data (core_restofworld, first 500 streams), slot 17's width follows the s
 - For `0x84`, bit 15 of the second 8 bytes' first u16 is set on 117,067 (62.7%). Those 8 bytes may be a
   second binding, but no shader read of them was traced.
 
+Over **every** `42 40 00 00` block of the seven archives (1,835,706 blocks, read through
+`tools/vertex_types.py`'s block walk) the width rule has no exception: all 16,993 `0x84` blocks have two pairs and
+all 4,212 `0x4b` blocks have one. The flag shares differ from the core_restofworld sample: bit 15 of u16 0 is set
+on 1,983,761 of 49,186,448 `0x84` vertices (4.0%) and 347,923 of 3,026,377 `0x4b` vertices (11.5%), and in the
+second 8 bytes of `0x84` on 37,538,519 (76.3%).
+
 Element indices are mostly unique per vertex (115,101 distinct non-flagged values over the 186,727 `0x84`
 vertices), so few elements are shared by enough vertices to test the coordinates. In the 39 elements with
 8 or more vertices, positions are an affine function of the three coordinates: the median rms residual is
