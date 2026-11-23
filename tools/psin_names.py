@@ -88,13 +88,14 @@ def hash_values(blob):
 
 
 def load_names(paths):
-    """The set of names in rpf9_names.py JSON files and one-name-per-line text files. A .json file that is not
-    JSON, or not the shape rpf9_names.py writes, raises ValueError naming the file (--names is repeatable)."""
+    """The set of names in rpf9_names.py JSON files and one-name-per-line text files, read as UTF-8 with an
+    optional BOM (Notepad and PowerShell 5.1 write one). A .json file that is not JSON, or not the shape
+    rpf9_names.py writes, raises ValueError naming the file (--names is repeatable)."""
     names = set()
     for path in paths:
         if path.endswith(".json"):
             try:
-                with open(path, encoding="utf-8") as f:
+                with open(path, encoding="utf-8-sig") as f:
                     doc = json.load(f)
             except (ValueError, RecursionError) as e:   # ValueError: not JSON, or not UTF-8
                 raise ValueError(f"{path}: not JSON: {e}") from None
@@ -108,7 +109,7 @@ def load_names(paths):
                                      "strings")
                 names.update(SUFFIX.sub("", n) for n in listed)
         else:
-            with open(path, encoding="utf-8", errors="replace") as f:
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
                 names.update(line.strip() for line in f)
     names.discard("")
     return names

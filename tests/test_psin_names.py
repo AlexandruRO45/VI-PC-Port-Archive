@@ -78,6 +78,16 @@ class TestDictionaries(unittest.TestCase):
                 f.write("prop_lamp_03\n\n")
             self.assertEqual(N.load_names([j, t]), {"prop_crate_01", "veh_frame", "prop_lamp_03"})
 
+    def test_names_files_saved_with_a_utf8_bom(self):
+        """Notepad's UTF-8 and PowerShell 5.1's Set-Content write a BOM: it must not hide the first name."""
+        with tempfile.TemporaryDirectory() as d:
+            j, t = os.path.join(d, "n.json"), os.path.join(d, "n.txt")
+            with open(j, "w", encoding="utf-8-sig") as f:
+                json.dump({"files": [{"names": ["prop_crate_01.#dr"]}]}, f)
+            with open(t, "w", encoding="utf-8-sig") as f:
+                f.write("prop_lamp_03\n")
+            self.assertEqual(N.load_names([j, t]), {"prop_crate_01", "prop_lamp_03"})
+
 
 class TestScan(unittest.TestCase):
     def folder(self, d, blobs):
