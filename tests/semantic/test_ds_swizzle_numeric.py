@@ -162,9 +162,6 @@ class DsSwizzleNumericTests(unittest.TestCase):
 
     def test_invalid_offsets_and_modifiers_stay_refused(self):
         for bad in (
-            "ds_swizzle_b32 v2, v1 offset:0xc000",
-            "ds_swizzle_b32 v2, v1 offset:0xff1b",
-            "ds_swizzle_b32 v2, v1 offset:0xffff",
             "ds_swizzle_b32 v2, v1 offset:65536",
             "ds_swizzle_b32 v2, v1 offset:-1",
             "ds_swizzle_b32 v2, v1 offset:notanumber",

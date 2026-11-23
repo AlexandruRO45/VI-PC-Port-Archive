@@ -1915,7 +1915,7 @@ class Gen:
         text = line + " " + str(ins.get("raw", ""))
         bm = _re.search(r'swizzle\(BITMASK_PERM,\s*"([01pi]{5})"\)', text)
         m = _re.search(r"swizzle\((\w+)((?:,\s*\d+)*)\)", text)
-        and_m = or_m = xor_m = 0
+        and_m = or_m = xor_m = offset = 0
         if bm:
             kind, args = "BITMASK_PERM", []
             # One character per lane-index bit, bit 4 first: p = keep, i = invert, 0 / 1 = force.
@@ -1931,11 +1931,22 @@ class Gen:
         elif m:
             kind = m.group(1)
             args = [int(x) for x in m.group(2).split(",")[1:]] if m.group(2) else []
+            if kind == "ROTATE":
+                if len(args) != 2 or args[0] not in (0, 1) or not 0 <= args[1] <= 31:
+                    raise Unsupported("ds_swizzle ROTATE operands")
+                # LLVM's symbolic ROTATE spelling omits the mask. Keep it when the listing has encoding bytes.
+                enc = ins.get("enc")
+                mask = int(enc[:2], 16) & 31 if enc and len(enc) == 16 else 0
+                offset = 0xc000 | (args[0] << 10) | (args[1] << 5) | mask
+            elif kind == "FFT":
+                if len(args) != 1 or not 0 <= args[0] <= 31:
+                    raise Unsupported("ds_swizzle FFT operands")
+                offset = 0xe000 | args[0]
         else:
             # Raw 16-bit DS_SWIZZLE_B32 offset (RDNA2 ISA): llvm-mc prints numeric offset:N when QDMode bits 13:8
             # are non-zero (e.g. 0x81e4 -> offset:33252) and omits offset: when it is 0. Measured across all 65,536
             # offsets on gfx1036: 0x0000..0x7FFF is bitmask mode, 0x8000..0xBFFF is QDMode (bits 13:8 ignored), and
-            # 0xC000..0xFFFF (bits 15:14 = 11) is a separate hardware mode (not a quad permute) and stays Unsupported.
+            # 0xC000..0xFFFF (bits 15:14 = 11) contains the rotate and FFT modes.
             if ("swizzle(" in text or len(mods) > 1 or len(a) != 2 or
                     any(x["k"] in ("special", "raw") for x in a) or
                     any(not mod.startswith("offset:") for mod in mods)):
@@ -1946,9 +1957,12 @@ class Gen:
                     off = int(mods[0][7:], 0)
                 except ValueError:
                     raise Unsupported("ds_swizzle pattern") from None
-                if not 0 <= off <= 0xBFFF:
+                if not 0 <= off <= 0xFFFF:
                     raise Unsupported("ds_swizzle offset")
-            if off & 0x8000:
+            if off >= 0xc000:
+                kind = "ROTATE" if off < 0xe000 else "FFT"
+                offset = off
+            elif off & 0x8000:
                 kind = "QUAD_PERM"
                 args = [(off >> (2 * i)) & 3 for i in range(4)]
             else:
@@ -1984,6 +1998,25 @@ class Gen:
             src, keep = self.tmp(), self.tmp()
             self.emit(f"{keep} = OpBitwiseAnd %uint {lane} {self.cu(~(args[0] - 1) & 0xFFFFFFFF)}")
             self.emit(f"{src} = OpBitwiseOr %uint {keep} {self.cu(args[1])}")
+        elif kind in ("ROTATE", "FFT"):
+            low, preserved, shuffled, src = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            mask = offset & 31
+            self.emit(f"{low} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{preserved} = OpBitwiseAnd %uint {lane} {self.cu(0xffffffe0 | mask)}")
+            if kind == "ROTATE":
+                amount = (offset >> 5) & 31
+                if offset & 0x400:
+                    amount = (-amount) & 31
+                added = self.tmp()
+                self.emit(f"{added} = OpIAdd %uint {low} {self.cu(amount)}")
+                self.emit(f"{shuffled} = OpBitwiseAnd %uint {added} {self.cu(31 ^ mask)}")
+            elif mask == 31:
+                shuffled = self.cu(0)  # All lane bits are preserved. A 32-bit shift by 32 is undefined.
+            else:
+                reversed_bits = self.tmp()
+                self.emit(f"{reversed_bits} = OpBitReverse %uint {low}")
+                self.emit(f"{shuffled} = OpShiftRightLogical %uint {reversed_bits} {self.cu(27 + mask.bit_count())}")
+            self.emit(f"{src} = OpBitwiseOr %uint {preserved} {shuffled}")
         else:
             raise Unsupported("ds_swizzle " + kind)
         self.ds_lane_read(a[0], self.src_u(a[1]), src, lane)

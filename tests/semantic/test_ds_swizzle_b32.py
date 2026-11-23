@@ -804,11 +804,8 @@ class EmulationAndParsingTests(unittest.TestCase):
         self.assertFalse(gen_emu.wave64 or gen_emu.emulate)
         self.assertEqual(spv_plain, spv_emu)
 
-    def test_raw_numeric_offsets_and_unknown_swizzle_kind_raise_unsupported(self):
-        # A numeric offset in the bitmask or QUAD_PERM range is decoded since #4177; 0xC000..0xFFFF is a separate mode
-        # on RDNA2 (measured on gfx1036 for all 16,384 offsets, docs/design.md "ds_swizzle_b32"), so it and an unknown
-        # kind are refused, not guessed.
-        for bad_mod in ("offset:0xc000", "offset:0xffff", "offset:swizzle(UNKNOWN,1)"):
+    def test_out_of_range_offsets_and_unknown_swizzle_kind_raise_unsupported(self):
+        for bad_mod in ("offset:0x10000", "offset:-1", "offset:swizzle(UNKNOWN,1)"):
             with self.subTest(mod=bad_mod):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate_cs("cs_w32_swz_bad", [
