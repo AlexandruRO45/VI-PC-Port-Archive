@@ -38,8 +38,10 @@ FIND_HASH_LOOKUP_STUB = (
 )
 EXE_CHECKLIST_STUB = "import sys\n"
 # The build script leaves a marker; the loader is replaced by an alias that echoes its arguments.
-BUILD_STUB = r"""
+MARK_BUILD = """
 Set-Content -LiteralPath (Join-Path $PSScriptRoot 'built.txt') -Value 'built'
+"""
+BUILD_STUB = MARK_BUILD + r"""
 if ($env:LEONIDA_TEST_INCOMPLETE_RUNTIME -ne '1') {
     $build = Join-Path (Split-Path $PSScriptRoot -Parent) 'runtime\build'
     foreach ($name in 'gta6rt.exe', 'gta6rt_tls_host.dll') {
@@ -57,13 +59,14 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value (Join-Path $P
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell diagnostics script")
 class FirstLookRebuildTest(unittest.TestCase):
     def run_case(self, source_newer=False, missing=(), incomplete_build=False, cache=None,
-                 source_path="runtime/src/pe_loader.cpp"):
+                 source_path="runtime/src/pe_loader.cpp", check_noop_rebuild=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for folder in ("scripts", "tools", "runtime/build", "runtime/src"):
                 (root / folder).mkdir(parents=True)
             shutil.copyfile(SCRIPT, root / "scripts" / SCRIPT.name)
-            (root / "scripts" / "build_runtime.ps1").write_text(BUILD_STUB, encoding="utf-8")
+            build_stub = MARK_BUILD if check_noop_rebuild else BUILD_STUB
+            (root / "scripts" / "build_runtime.ps1").write_text(build_stub, encoding="utf-8", newline="\n")
             (root / "tools" / "pe_inspect.py").write_text(PE_INSPECT_STUB, encoding="utf-8", newline="\n")
             (root / "tools" / "gdk_runtime_calls.py").write_text(GDK_RUNTIME_CALLS_STUB, encoding="utf-8", newline="\n")
             (root / "tools" / "find_hash_lookup.py").write_text(FIND_HASH_LOOKUP_STUB, encoding="utf-8", newline="\n")
@@ -88,10 +91,28 @@ class FirstLookRebuildTest(unittest.TestCase):
             env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
             env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
             env["LEONIDA_TEST_INCOMPLETE_RUNTIME"] = "1" if incomplete_build else "0"
-            run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                  "-Command", RUN], cwd=root, env=env, capture_output=True, text=True, timeout=60)
-            dry_run = (root / "reports" / "exe" / "fixture" / "dryrun.txt").is_file()
-            return (root / "scripts" / "built.txt").is_file(), dry_run, run.returncode, run.stdout + run.stderr
+            built = root / "scripts" / "built.txt"
+            dry_run = root / "reports" / "exe" / "fixture" / "dryrun.txt"
+
+            def invoke():
+                built.unlink(missing_ok=True)
+                dry_run.unlink(missing_ok=True)
+                run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                      "-Command", RUN], cwd=root, env=env, capture_output=True, text=True, timeout=60)
+                return built.is_file(), dry_run.is_file(), run.returncode, run.stdout + run.stderr
+
+            first = invoke()
+            if check_noop_rebuild:
+                self.assertEqual(first[:3], (True, True, 0), first[3])
+                reused = invoke()
+                self.assertEqual(reused[:3], (False, True, 0), reused[3])
+                os.utime(source, (newer + 1, newer + 1))
+                changed = invoke()
+                self.assertEqual(changed[:3], (True, True, 0), changed[3])
+                os.utime(loader, (older - 1, older - 1))
+                replaced = invoke()
+                self.assertEqual(replaced[:3], (True, True, 0), replaced[3])
+            return first
 
     def test_a_loader_older_than_the_sources_is_rebuilt(self):
         built, dry_run, code, out = self.run_case(source_newer=True)
@@ -124,6 +145,9 @@ class FirstLookRebuildTest(unittest.TestCase):
                 self.assertTrue(built, out)
                 self.assertTrue(dry_run, out)
                 self.assertEqual(code, 0, out)
+
+    def test_a_generator_checked_without_relinking_is_only_rebuilt_when_it_changes(self):
+        self.run_case(source_newer=True, source_path="tools/gen_d3d12_stubs.py", check_noop_rebuild=True)
 
     def test_an_incomplete_build_stops_before_the_dry_run(self):
         built, dry_run, code, out = self.run_case(missing=("gta6rt_tls_host.dll",), incomplete_build=True)

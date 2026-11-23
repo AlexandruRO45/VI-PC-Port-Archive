@@ -57,13 +57,23 @@ $rt = Find-RuntimeLoader $build $folders
 # is rebuilt then too, not only when missing.
 $sources = @(
     "runtime\src", "runtime\shims", "runtime\CMakeLists.txt",
-    "third_party\xtaskqueue\Include", "third_party\xtaskqueue\Source",
-    "tools\gen_d3d12_stubs.py"
+    "third_party\xtaskqueue\Include", "third_party\xtaskqueue\Source"
 ) | ForEach-Object { Join-Path $root $_ } |
     Where-Object { Test-Path -LiteralPath $_ }
 $newest = $sources | ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -File -ErrorAction SilentlyContinue } |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-$stale = $rt -and $newest -and ($newest.LastWriteTimeUtc -gt (Get-Item -LiteralPath $rt).LastWriteTimeUtc)
+$generator = Get-Item -LiteralPath (Join-Path $root "tools\gen_d3d12_stubs.py") -ErrorAction SilentlyContinue
+$generatorTime = if ($generator) { $generator.LastWriteTimeUtc }
+$loaderTime = if ($rt) { (Get-Item -LiteralPath $rt).LastWriteTimeUtc }
+if ($rt -and $generator -and $generatorTime -gt $loaderTime) {
+    # The generator preserves an identical header, so a successful build can leave the loader untouched.
+    $checked = Get-Content -LiteralPath "$rt.first-look-stubs" -TotalCount 1 -ErrorAction SilentlyContinue
+    if ($checked -ne "$($loaderTime.Ticks) $($generatorTime.Ticks)" -and
+        (-not $newest -or $generatorTime -gt $newest.LastWriteTimeUtc)) {
+        $newest = $generator
+    }
+}
+$stale = $rt -and $newest -and ($newest.LastWriteTimeUtc -gt $loaderTime)
 if ($stale) { Write-Host "$rt is older than $($newest.Name): rebuilding it first" }
 $tlsName = "gta6rt_tls_host.dll"
 $hasTls = $rt -and (Test-Path -LiteralPath (Join-Path (Split-Path -LiteralPath $rt) $tlsName) -PathType Leaf)
@@ -95,6 +105,11 @@ if (-not $hasTls -or $stale) {
     if (-not $rt) { throw "runtime build did not produce gta6rt.exe in $build" }
     $tlsHost = Join-Path (Split-Path -LiteralPath $rt) $tlsName
     if (-not (Test-Path -LiteralPath $tlsHost -PathType Leaf)) { throw "runtime build did not produce $tlsHost" }
+    $loaderTime = (Get-Item -LiteralPath $rt).LastWriteTimeUtc
+    if ($generator -and $generatorTime -gt $loaderTime) {
+        Set-Content -LiteralPath "$rt.first-look-stubs" -Value "$($loaderTime.Ticks) $($generatorTime.Ticks)" `
+            -Encoding ASCII -ErrorAction SilentlyContinue
+    }
 }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & {
