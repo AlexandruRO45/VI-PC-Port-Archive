@@ -424,7 +424,7 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(streams["j0"], j0)
         self.assertEqual(streams["j1"], j1)
 
-    def test_mismatched_geometry_attribute_counts_are_rejected(self):
+    def test_mismatched_geometry_attribute_counts_are_rejected_before_packing(self):
         from anim_glb import pack_glb
 
         skeleton = _skeleton_dir(self.root)
@@ -437,8 +437,10 @@ class SkinnedGlbTest(unittest.TestCase):
                 accessor = source["accessors"][attributes[name]]
                 with mock.patch.dict(accessor, count=2), open(path, "wb") as handle:
                     handle.write(pack_glb(source, binary))
-                with self.assertRaisesRegex(skinned_glb.SkinError, f"{name.lower()} count 2 != skin stream count 3"):
-                    skinned_glb.build_skinned_glb(skeleton, [component])
+                with mock.patch.object(skinned_glb, "accessor_bytes", wraps=skinned_glb.accessor_bytes) as pack:
+                    with self.assertRaisesRegex(skinned_glb.SkinError, f"{name.lower()} count 2 != skin stream count 3"):
+                        skinned_glb.build_skinned_glb(skeleton, [component])
+                    pack.assert_not_called()
 
     def test_empty_component_list_is_rejected(self):
         skeleton = _skeleton_dir(self.root)

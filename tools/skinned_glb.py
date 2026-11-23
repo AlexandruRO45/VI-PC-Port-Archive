@@ -649,10 +649,20 @@ def read_glb(path: str) -> tuple[dict, bytes]:
     return gltf, bin_data
 
 
-def accessor_bytes(gltf: dict, bin_data: bytes, index: int) -> tuple[bytes, dict]:
-    """Return tightly packed accessor bytes and a copy of its glTF metadata."""
+def _accessor_metadata(gltf: dict, index: int) -> dict:
     try:
         accessor = gltf["accessors"][index]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise SkinError(f"invalid accessor {index}: {exc}") from exc
+    if not isinstance(accessor, dict):
+        raise SkinError(f"invalid accessor {index}: expected an object")
+    return accessor
+
+
+def accessor_bytes(gltf: dict, bin_data: bytes, index: int) -> tuple[bytes, dict]:
+    """Return tightly packed accessor bytes and a copy of its glTF metadata."""
+    accessor = _accessor_metadata(gltf, index)
+    try:
         view = gltf["bufferViews"][accessor["bufferView"]]
     except (KeyError, IndexError, TypeError) as exc:
         raise SkinError(f"invalid accessor {index}: {exc}") from exc
@@ -727,22 +737,23 @@ class _GlbBuilder:
         return len(self.accessors) - 1
 
 
-def _component_geometry(gltf: dict, bin_data: bytes, primitive: dict) -> tuple[dict, int]:
+def _component_geometry(gltf: dict, bin_data: bytes, primitive: dict,
+                        vertex_count: int, mesh_name: str) -> tuple[dict, tuple[bytes, dict]]:
     attributes = primitive.get("attributes")
     if not isinstance(attributes, dict):
         raise SkinError("source primitive has no attributes")
-    out = {}
-    for name in GEOMETRY_ATTRIBUTES:
-        if name not in attributes:
-            continue
-        payload, accessor = accessor_bytes(gltf, bin_data, attributes[name])
-        out[name] = (payload, accessor)
-    if "POSITION" not in out:
+    if "POSITION" not in attributes:
         raise SkinError("source primitive has no POSITION accessor")
     if "indices" not in primitive:
         raise SkinError("source primitive has no index accessor")
-    index_payload, index_accessor = accessor_bytes(gltf, bin_data, primitive["indices"])
-    return out, (index_payload, index_accessor)
+    attribute_indices = {name: attributes[name] for name in GEOMETRY_ATTRIBUTES if name in attributes}
+    for name, index in attribute_indices.items():
+        count = _accessor_metadata(gltf, index).get("count")
+        if count != vertex_count:
+            raise SkinError(f"{mesh_name}: model.glb {name.lower()} count {count} != skin stream count {vertex_count}")
+
+    out = {name: accessor_bytes(gltf, bin_data, index) for name, index in attribute_indices.items()}
+    return out, accessor_bytes(gltf, bin_data, primitive["indices"])
 
 
 def _source_meshes(model: dict) -> list[dict]:
@@ -824,13 +835,8 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                     bind = list(joints.binds[parent_index])
                 local_to_joint.append(joints.add(name, bind, parent_index))
 
-            attributes, index_pair = _component_geometry(gltf, glb_bin, source_primitive)
-            for name, (_, accessor) in attributes.items():
-                if accessor["count"] != streams["count"]:
-                    raise SkinError(
-                        f"{mesh.get('name', 'mesh')}: model.glb {name.lower()} count "
-                        f"{accessor['count']} != skin stream count {streams['count']}"
-                    )
+            attributes, index_pair = _component_geometry(
+                gltf, glb_bin, source_primitive, streams["count"], mesh.get("name", "mesh"))
 
             normalised = normalise_weights(
                 streams["j0"], streams["j1"], streams["w0"], streams["w1"],
