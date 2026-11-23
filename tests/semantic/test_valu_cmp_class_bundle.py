@@ -368,3 +368,44 @@ class TestCmpClassF32Oracle(unittest.TestCase):
 
         res_zero, _ = run_cmp_shader("f32", 0x3F800000, 0, is_cmpx=False, test_id="zero_mask")
         self.assertEqual(res_zero, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VCmpClassF32Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+    mask: Union[RegisterOperand, LiteralOperand]
+
+
+def step_cmp_class_f32(machine: ScalarMachineClassLogic, insn: VCmpClassF32Instruction):
+    s0 = machine.read_operand(insn.src0) & MASK32
+    mask = machine.read_operand(insn.mask) & MASK32
+    res = 1 if ref_cmp_class_f32(s0, mask) else 0
+    if insn.dst.op_type == OperandType.VCC:
+        machine.vcc = MASK32 if res else 0
+    elif insn.dst.op_type == OperandType.SGPR:
+        machine.sgprs[insn.dst.index] = MASK32 if res else 0
+
+
+class TestCmpClassF32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineClassLogic()
+        machine.vgprs[1] = 0x3F800000  # +1.0 (class 8: +normal)
+        insn = VCmpClassF32Instruction(
+            dst=RegisterOperand(OperandType.VCC),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        step_cmp_class_f32(machine, insn)
+
+        val_hw, _ = run_cmp_shader("f32", 0x3F800000, CLASS_POS_NORMAL, is_cmpx=False, test_id="ast_scalar")
+        self.assertEqual(machine.vcc, MASK32)
+        self.assertEqual(val_hw, 1)
+
+    def test_scalar_sgpr_dst_hardware(self):
+        val_sgpr, _ = run_cmp_shader("f32", 0xFF800000, CLASS_NEG_INF, is_cmpx=False, test_id="sgpr_dst")
+        self.assertEqual(val_sgpr, 1)
