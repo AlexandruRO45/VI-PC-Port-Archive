@@ -282,5 +282,14 @@ class VMulHiI32I24OracleTests(unittest.TestCase):
         # -8388608 * -8388608 = 70368744177664 (0x400000000000) -> high 32 bits is 0x4000
         self.assertEqual(oracle_mul_hi_i32_i24(0x00800000, 0x00800000), 0x00004000)
 
+class VMulHiI32I24AstInterpreterTests(unittest.TestCase):
+    def test_mul_hi_i24_ast_construction(self):
+        ast = ValuInstructionAST("v_mul_hi_i32_i24", Operand(RegKind.VGPR, 2), Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1))
+        self.assertEqual(ast.mnemonic, "v_mul_hi_i32_i24")
+
+    def test_mul_hi_i24_scalar_execution(self):
+        res = oracle_mul_hi_i32_i24(-50, 100)
+        self.assertEqual(res, 0xFFFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
