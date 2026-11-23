@@ -4,6 +4,7 @@
 // descriptions the PC runtime refuses, and the D3D12_OPTIONS17 answer, are compared with the host's runtime live
 // when there is one: a refused description leaves the slot as it was. No shaders or game data. Set
 // LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -449,7 +450,8 @@ int main() {
                 if (host_nn)
                     EXPECT(host2(desc2(point)) != host2(desc2(point, D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)));
             } else {
-                std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
+                std::printf("no host D3D12 reference (Wine, or no device): edge cases checked against their recorded "
+                            "answers only\n");
             }
         }
 

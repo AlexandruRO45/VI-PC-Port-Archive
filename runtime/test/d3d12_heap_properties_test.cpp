@@ -8,6 +8,7 @@
 // (77) without a Vulkan GPU or the standalone device; without a host D3D12 device only the layer's own record is
 // printed. The host runs on the layer's adapter (host_adapter.h; LEONIDA_HOST_ADAPTER picks another, "warp" WARP).
 // Set LEONIDA_D3D49_VERBOSE=1 to print every value.
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "host_adapter.h"
 
@@ -254,10 +255,13 @@ int main() {
         SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
         hostadapter::reference(factory.p, &luid, hostadapter::wanted() == "warp", &adapter.p, host_name);
     Ref<ID3D12Device> host;
-    if (!have_adapter) {
+    if (!create_host || hostwine::host_is_wine()) {
+        std::printf("heap properties: no host D3D12 reference (Wine, or no host d3d12.dll); %zu values recorded, "
+                    "not compared\n", ours.values.size());
+    } else if (!have_adapter) {
         std::printf("heap properties: no host adapter to compare with; %zu values recorded, not compared\n",
                     ours.values.size());
-    } else if (!create_host || FAILED(create_host(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+    } else if (FAILED(create_host(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
         std::printf("heap properties: no host D3D12 device to compare with; %zu values recorded, not compared\n",
                     ours.values.size());
     } else {

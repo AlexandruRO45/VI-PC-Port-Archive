@@ -7,6 +7,7 @@
 // host runtime faults on is reported and not compared. No shaders or game data. Skips (77) without a Vulkan GPU;
 // without a host D3D12 device only the layer's own record is printed. Set LEONIDA_D3D49_VERBOSE=1 to print every
 // step.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
@@ -371,9 +372,10 @@ int main(int argc, char** argv) {
         EXPECT(run(device.p, false, ours));
 
         Ref<ID3D12Device> host;
-        host.p = create_host();
+        host.p = hostwine::host_is_wine() ? nullptr : create_host();
         if (!host.p) {
-            std::printf("residency: no host D3D12 device to compare with; %zu steps recorded, not compared\n",
+            std::printf("residency: no host D3D12 reference (Wine, or no device) to compare with; %zu steps recorded, "
+                        "not compared\n",
                         ours.values.size());
         } else {
             Record theirs;

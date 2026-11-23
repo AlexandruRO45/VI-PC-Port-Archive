@@ -1,6 +1,7 @@
 // D3D12 ExecuteIndirect with a GPU count buffer and one DISPATCH argument per record.
 // The same synthetic workload runs on native WARP and on the Vulkan layer, with actual GPU readback.
 // Set LEONIDA_VK_VALIDATION=1 to enable Vulkan core and synchronization validation.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "shader_fixture_path.h"
 #include "d3d12_test_shaders.h"
@@ -184,8 +185,16 @@ int main() {
     if (!compile) return 77;
     Ref<ID3DBlob> native, errors;
     if (FAILED(compile(native_shader, std::strlen(native_shader), nullptr, nullptr, nullptr,
-                       "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p)
+                       "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p) {
+        // Wine's d3dcompiler_47 (vkd3d-shader) has no InterlockedAdd on RWByteAddressBuffer yet, so the WARP
+        // reference shader cannot be built there; every case compares against it.
+        if (hostwine::host_is_wine()) {
+            std::printf("SKIP: Wine's d3dcompiler cannot compile the WARP reference shader (InterlockedAdd on "
+                        "RWByteAddressBuffer)\n");
+            return 77;
+        }
         return 1;
+    }
     const auto* native_bytes = static_cast<const std::uint8_t*>(native->GetBufferPointer());
     const std::vector<std::uint8_t> native_code(native_bytes, native_bytes + native->GetBufferSize());
     Ref<IDXGIFactory4> factory;

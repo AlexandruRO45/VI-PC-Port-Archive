@@ -16,6 +16,7 @@
 //      VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) when glslangValidator compiled the test shader
 //
 // Synthetic data only; no game files. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -580,9 +581,12 @@ int main() {
         device->CreateShaderResourceView(tex_r32.p, &rev_srv, slot(6));
         EXPECT(all_zero(base + std::size_t(6) * step, step));
 
-        // 4. Differential UAV clear comparison against Windows WARP.
+        // 4. Differential UAV clear comparison against Windows WARP. Wine's EnumWarpAdapter is vkd3d's, which rounds
+        // E5B9G9R9 differently, so it is not the reference there.
         Ref<ID3D12Device> warp;
-        if (!hostwine::host_is_wine()) {
+        if (hostwine::host_is_wine())
+            std::printf("Wine's WARP stand-in (vkd3d) rounds R9G9B9E5 differently: UAV clears not compared with it\n");
+        else {
             Ref<IDXGIFactory4> factory;
             Ref<IDXGIAdapter> adapter;
             if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
