@@ -195,9 +195,10 @@ lane per invocation and keeps VGPRs and SGPRs as uint arrays with exact bit patt
 all-ones and covered only branch-free vertex and pixel shaders with no memory loads: common float and integer ALU
 ops and exports to `gl_Position`, params and MRTs. Unsupported instructions are reported by name, never guessed.
 In that version, `VS_Passthrough` and `VS_BlurFilter` translated and validated. Coverage across the corpus
-and the blocking instructions are in `<work>\shaders\spirv_run.log`; the former next steps, structured branches
-(EXEC masks) and the descriptor/binding model for `s_load`, `s_buffer_load`, `buffer_*` and `image_*`, are now
-implemented. Current coverage is in *Translator status* below.
+and the blocking instructions are the tally `tools\rdna2spirv.py` prints when a translation run ends
+(`<n> shaders: <k> translated, <v> pass spirv-val`, then a count per rejection reason); the next steps,
+structured branches (EXEC masks) and the descriptor/binding model for `s_load`, `s_buffer_load`, `buffer_*`
+and `image_*`, are now implemented. Current coverage is in *Translator status* below.
 
 Also handled: 64-bit scalar moves, per-invocation EXEC reads, whole-quad mode on EXEC, `m0`, SCC, vector and scalar
 compares, `v_mul_hi_u32`, `v_cvt_pkrtz_f16_f32` (now exact round-toward-zero; the earlier round-to-nearest version
@@ -244,7 +245,8 @@ target and dumps the floats. Test shaders are in `<work>\gputest`.
 
 Full corpus (verified pixel-shader inputs incl. front face, ACO-confirmed 16-bit semantics, `vcc_hi` as an SGPR,
 code-embedded data via `s_getpc_b64`, global memory, exact packed-f16 modifiers): **All 26,503 shaders translate and pass `spirv-val`** (Vulkan 1.2 target, `--allow-offset-texture-operand`): 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. `spirv/index.json` lists each one's requirements. Output:
-`<work>\shaders\spirv\` (`.spvasm` + `.spv`), and the log is `<work>\shaders\spirv_run.log`.
+`<work>\shaders\spirv\` (`.spvasm` + `.spv`); no log file is written beside them, the tally and the rejection
+reasons are the last lines `tools\rdna2spirv.py` prints, which `make_game.py` passes to its own stdout.
 
 How the generated SPIR-V expects the runtime to work:
 
