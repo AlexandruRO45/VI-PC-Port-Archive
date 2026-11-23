@@ -72,6 +72,7 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import rdna2spirv  # noqa: E402  (base_op, BRANCHES, fold_far_branches, reachable_code, native_blob, stage_of)
+from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
 from wave64_graphics_scan import scanned_paths  # noqa: E402
 
@@ -927,7 +928,7 @@ def main(argv=None) -> int:
             ap.error(f"{args.out} is a directory, not a JSON file")
         if not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
             ap.error(f"output directory does not exist: {os.path.dirname(os.path.abspath(args.out))}")
-        if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in scanned_paths(args.src)):
+        if any(same_report_path(args.out, p) for p in scanned_paths(args.src)):
             ap.error("output must not overwrite a listing it scans")
     summary = summarise(*scan_directory(args.src))
     print_summary(summary)

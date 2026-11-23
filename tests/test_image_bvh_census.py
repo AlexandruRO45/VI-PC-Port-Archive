@@ -15,6 +15,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import image_bvh_census as census  # noqa: E402
+import report_paths  # noqa: E402
 
 ENC = " ; encoding: [0x00,0x00,0x00,0x00]"      # only the length matters: every instruction is 4 bytes here
 
@@ -275,10 +276,12 @@ class SummaryTests(unittest.TestCase):
         self.assertNotEqual(cm.exception.code, 0)
 
     def test_output_must_not_overwrite_a_listing(self):
+        self.assertIs(census.same_report_path, report_paths.same_report_path)
         with tempfile.TemporaryDirectory() as src:
             self.directory(src, {"cs_tri": listing(CALL32, "s_endpgm")})
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-                census.main([src, "--out", os.path.join(src, "cs_tri.s")])
+            for alias in (os.path.join(src, "cs_tri.s"), os.path.join(src, ".", "cs_tri.s")):
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                    census.main([src, "--out", alias])
             with open(os.path.join(src, "cs_tri.s"), encoding="utf-8") as f:
                 self.assertIn("image_bvh", f.read())
 
