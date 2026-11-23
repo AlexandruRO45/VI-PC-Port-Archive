@@ -8,7 +8,7 @@ Usage:
 
 It translates each probe with tools/rdna2spirv.py and runs it through
 runtime/build/vk_compute_test.exe, so it needs a Vulkan device, the SPIR-V tools on PATH
-and a built runtime/ directory.
+and a built runtime/ directory. `--help` prints this text and runs nothing.
 """
 import math
 import os
@@ -366,9 +366,19 @@ def main():
     print("ALL GFX1036 SILICON PROBES (WAVE32 & WAVE64) PASSED WITH ZERO DIVERGENCES!")
     print("=" * 70)
 
+USAGE = "usage: probe_gfx1036_vcmp16.py [--help]   (run from the repository root; no other arguments)"
+
 if __name__ == "__main__":
     try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
+    args = sys.argv[1:]
+    if args:
+        if args in (["-h"], ["--help"]):
+            print(__doc__.strip())
+            sys.exit(0)
+        print(f"unexpected argument: {args[0]}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
     main()
