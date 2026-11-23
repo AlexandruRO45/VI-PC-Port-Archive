@@ -4,6 +4,7 @@ Standard library only; no game data: the tools are mocked or fed hand-made input
 """
 import contextlib
 import io
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -235,7 +236,65 @@ class DecodeXmaStdinTest(unittest.TestCase):
                 self.assertEqual(f.read(), "b''")
 
 
+def pause_xma_decode(folder, pipe):
+    def pause(cmd, **kwargs):
+        with open(cmd[-1], "wb") as f:
+            f.write(b"partial")
+        pipe.send(cmd[-1])
+        pipe.recv()  # the parent kills this worker while its staging guard is held
+
+    with pipe, mock.patch.object(make_game.subprocess, "run", pause):
+        make_game.decode_xma("stub", folder)
+
+
 class DecodeXmaStagingTest(unittest.TestCase):
+    def test_cleanup_leaves_unmarked_staging_alone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for name in (".xma-old", ".xma-decode-unmarked"):
+                staging = os.path.join(folder, name)
+                os.mkdir(staging)
+                with open(os.path.join(staging, "stream.wav"), "wb") as f:
+                    f.write(b"unknown owner")
+            make_game.decode_xma("stub", folder)
+            for name in (".xma-old", ".xma-decode-unmarked"):
+                with open(os.path.join(folder, name, "stream.wav"), "rb") as f:
+                    self.assertEqual(f.read(), b"unknown owner")
+
+    def test_killed_decode_is_reclaimed_without_touching_a_live_decode(self):
+        with tempfile.TemporaryDirectory() as folder:
+            open(os.path.join(folder, "stream.xma.wav"), "wb").close()
+            ctx = multiprocessing.get_context("spawn")
+            reader, writer = ctx.Pipe()
+            with reader, writer:
+                proc = ctx.Process(target=pause_xma_decode, args=(folder, writer))
+                proc.start()
+                try:
+                    self.assertTrue(reader.poll(15), "worker did not write its WAV")
+                    partial = reader.recv()
+                    os.utime(partial, (1, 1))
+
+                    def success(cmd, **kwargs):
+                        with open(cmd[-1], "wb") as f:
+                            f.write(b"complete")
+                        return subprocess.CompletedProcess(cmd, 0)
+
+                    with mock.patch.object(make_game.subprocess, "run", success):
+                        make_game.decode_xma("stub", folder)
+                    self.assertTrue(os.path.isfile(partial), "live decoder lost its staging file")
+                finally:
+                    proc.kill()
+                    proc.join(15)
+                    self.assertFalse(proc.is_alive())
+                    proc.close()
+
+            # The completed WAV means there is no pending decode to trigger cleanup.
+            with mock.patch.object(make_game.subprocess, "run") as ffmpeg:
+                make_game.decode_xma("stub", folder)
+                ffmpeg.assert_not_called()
+            self.assertEqual(sorted(os.listdir(folder)), ["stream.wav", "stream.xma.wav"])
+            with open(os.path.join(folder, "stream.wav"), "rb") as f:
+                self.assertEqual(f.read(), b"complete")
+
     def test_failed_concurrent_decode_cannot_remove_successful_output(self):
         with tempfile.TemporaryDirectory() as folder:
             src = os.path.join(folder, "stream.xma.wav")

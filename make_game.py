@@ -44,6 +44,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
     sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
@@ -1613,10 +1614,69 @@ def mark(path: str, what: str) -> None:
         f.write(f"{what} finished\n")
 
 
-def pending_xma(xma_dir: str) -> list:
+XMA_STAGING_PREFIX = ".xma-decode-"
+XMA_OWNER = ".leonida-xma-owner"
+XMA_ABANDONED = ".leonida-xma-abandoned"
+
+
+@contextmanager
+def xma_staging(parent: str):
+    with tempfile.TemporaryDirectory(prefix=XMA_STAGING_PREFIX, dir=parent) as staging:
+        owner = os.path.join(staging, XMA_OWNER)
+        with open(owner, "xb") as guard:
+            try:
+                if os.name != "nt":
+                    import fcntl
+                    fcntl.flock(guard, fcntl.LOCK_EX)
+            except OSError:
+                # Keep private staging on filesystems without advisory locks.
+                pass
+            else:
+                # Only a writer with a guard marks the directory eligible for cleanup.
+                guard.write(b"1")
+                guard.flush()
+            yield os.path.join(staging, "stream.wav")
+
+
+def reap_xma_staging(staging: str) -> None:
+    if _linked(staging):
+        return
+    owner = os.path.join(staging, XMA_OWNER)
+    abandoned = os.path.join(staging, XMA_ABANDONED)
+    try:
+        if not os.path.isfile(abandoned):
+            if _linked(owner) or os.stat(owner).st_size != 1:
+                return
+            # Windows denies renaming an open Python file. POSIX permits it, so acquire
+            # the writer's lock first. Both guards are released when the process dies.
+            if os.name == "nt":
+                os.rename(owner, abandoned)
+            else:
+                import fcntl
+                with open(owner, "rb") as guard:
+                    fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.rename(owner, abandoned)
+        # Only unlink our payload. If an orphaned ffmpeg still holds it open on
+        # Windows, keep the abandoned marker so a later run can finish cleanup.
+        try:
+            os.remove(os.path.join(staging, "stream.wav"))
+        except FileNotFoundError:
+            pass
+        os.remove(abandoned)
+        os.rmdir(staging)
+    except OSError:
+        # A live writer, another cleaner or a file we cannot remove.
+        pass
+
+
+def pending_xma(xma_dir: str, *, reap: bool = False) -> list:
     """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet."""
     todo = []
-    for root, _, files in os.walk(xma_dir):
+    for root, dirs, files in os.walk(xma_dir):
+        if reap:
+            for name in dirs:
+                if name.startswith(XMA_STAGING_PREFIX):
+                    reap_xma_staging(os.path.join(root, name))
         for f in files:
             if f.endswith(".xma.wav") and not os.path.isfile(os.path.join(root, f[:-8] + ".wav")):
                 todo.append(os.path.join(root, f))
@@ -1626,7 +1686,7 @@ def pending_xma(xma_dir: str) -> list:
 def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
     """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
     temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
-    todo = pending_xma(xma_dir)
+    todo = pending_xma(xma_dir, reap=True)
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
@@ -1634,8 +1694,7 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
     def one(src: str) -> bool:
         dst = src[:-8] + ".wav"
         # Each decode owns its staging file, on the same filesystem as the destination.
-        with tempfile.TemporaryDirectory(prefix=".xma-", dir=os.path.dirname(dst)) as staging:
-            tmp = os.path.join(staging, "stream.wav")
+        with xma_staging(os.path.dirname(dst)) as tmp:
             # No stdin: ffmpeg otherwise reads key commands and can suspend a background build.
             r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
                                stdin=subprocess.DEVNULL)
