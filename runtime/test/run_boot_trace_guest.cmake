@@ -30,6 +30,15 @@ execute_process(
 file(WRITE "${LOG}" "${err}")
 message("--- gta6rt stdout ---\n${out}\n--- gta6rt stderr ---\n${err}\n--- exit: ${result}")
 
+# GitHub's Windows runners have no Vulkan device. The guest then fails to create the device and the loader reports
+# it on stderr; CTest skips on the marker (SKIP_REGULAR_EXPRESSION) instead of reporting a broken boot path.
+string(FIND "${err}" "no Vulkan 1.3 GPU" no_vulkan)
+string(FIND "${err}" "no GPU named by LEONIDA_VK_DEVICE" no_filtered)
+if(result EQUAL 77 OR NOT no_vulkan EQUAL -1 OR NOT no_filtered EQUAL -1)
+  message("SKIP: no Vulkan 1.3 device for d3d12 boot trace guest")
+  return()
+endif()
+
 set(failures)
 if(NOT "${result}" STREQUAL "0")
   list(APPEND failures "exit is '${result}', not 0")

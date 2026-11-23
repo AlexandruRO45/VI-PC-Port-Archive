@@ -64,6 +64,16 @@ class CTestRegistrationTest(unittest.TestCase):
         self.assertEqual(len(skips), 3, f"expected three whole-test SKIP paths, got {len(skips)}")
         self.assertEqual(skips, [77, 77, 77], "SKIP paths must return 77 for SKIP_RETURN_CODE 77")
 
+    def test_boot_trace_guest_skips_without_a_vulkan_device(self):
+        # The Windows CI job has no GPU. The opt-in guest must be a SKIP there, not a failure, and the marker has
+        # to come from the runner script so ctest's SKIP_REGULAR_EXPRESSION can see it.
+        m = re.search(r"set_tests_properties\(d3d12_boot_trace_guest PROPERTIES(.*?)\)", self.cmake, re.S)
+        self.assertIsNotNone(m, "d3d12_boot_trace_guest has no test properties")
+        self.assertIn("SKIP_REGULAR_EXPRESSION", m.group(1))
+        runner = (ROOT / "runtime" / "test" / "run_boot_trace_guest.cmake").read_text(encoding="utf-8")
+        self.assertIn("no Vulkan 1.3 GPU", runner)
+        self.assertIn("SKIP: no Vulkan 1.3 device for d3d12 boot trace guest", runner)
+
     def test_whole_test_skips_return_the_skip_code(self):
         # A test registered with SKIP_RETURN_CODE 77 that prints SKIP and returns 0 is counted as passed although it
         # checked nothing: bink_audio_test did that for a movie without audio tracks after #1580.

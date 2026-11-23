@@ -2230,7 +2230,9 @@ if(TARGET Vulkan::Headers)
               -DSUMMARY=${_boot_trace_out}/summary.json
               -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_boot_trace_guest.cmake
           )
-          set_tests_properties(d3d12_boot_trace_guest PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+          # A GPU-less CI runner cannot make the Vulkan device; the runner script prints the skip marker below.
+          set_tests_properties(d3d12_boot_trace_guest PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            SKIP_REGULAR_EXPRESSION "SKIP: no Vulkan 1\\.3 device for d3d12 boot trace guest")
         else()
           message(STATUS "tiny_boot_trace_guest will build. The CTest needs a Windows host and Python 3.")
         endif()

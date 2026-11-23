@@ -20,6 +20,7 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/boot_trace.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
@@ -58,6 +59,7 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/boot_trace.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
@@ -149,6 +151,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DLEONIDA_D3D12_SHIM_TESTS=ON
           -DLEONIDA_REQUIRE_VULKAN=ON
+          -DLEONIDA_TEST_BOOT_TRACE_GUEST=ON
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded

@@ -71,6 +71,14 @@ class CMakeListsUsesTheModuleTest(unittest.TestCase):
         for c in configures:
             self.assertIn("-DLEONIDA_REQUIRE_VULKAN=ON", c)
 
+    def test_windows_ci_builds_the_boot_trace_guest(self):
+        ci = (ROOT / ".github" / "workflows" / "runtime.yml").read_text(encoding="utf-8")
+        windows = re.search(r"^  windows:\n(.*?)(?=^  \w)", ci, re.S | re.M)
+        self.assertIsNotNone(windows, "the windows job is missing")
+        configure = re.search(r"- name: Configure\n(.*?)(?=\n      - name:)", windows.group(1), re.S)
+        self.assertIsNotNone(configure, "the windows Configure step is missing")
+        self.assertIn("-DLEONIDA_TEST_BOOT_TRACE_GUEST=ON", configure.group(1))
+
 
 if __name__ == "__main__":
     unittest.main()
