@@ -818,11 +818,13 @@ public:
     }
 
 private:
-    // A non-negative integer field, or 0 when it is missing, not a number or out of range.
+    // A non-negative integer field, or 0 when it is missing or invalid.
     static std::uint32_t u32(const Json* value) {
         if (!value || value->kind != Json::Kind::number) return 0;
         const double n = value->number;
-        return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
+        if (!(n >= 0 && n <= 4294967295.0)) return 0;
+        const auto integer = std::uint32_t(n);
+        return n == integer ? integer : 0;
     }
 
     using LookupKey = std::pair<std::string_view, std::string_view>;

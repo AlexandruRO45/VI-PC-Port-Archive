@@ -23,6 +23,56 @@ namespace {
 
 std::vector<std::uint8_t> bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
+int test_integer_metadata() {
+    using namespace leonida;
+    struct Case { const char* json; std::uint32_t expected; };
+    const Case cases[] = {
+        {"1.5", 0}, {"32.5", 0}, {"64.5", 0}, {"144.5", 0}, {"1024.75", 0},
+        {"4294967294.5", 0}, {"1.0000000000000002", 0}, {"0.5", 0},
+        {"0", 0}, {"-0.0", 0}, {"1", 1}, {"17.0", 17}, {"1.6e1", 16},
+        {"4294967295", 0xffffffffu}, {"4.294967295e9", 0xffffffffu},
+        {"-1", 0}, {"-0.5", 0}, {"4294967296", 0}, {"4294967295.5", 0}, {"1e100", 0},
+        {"null", 0}, {"true", 0}, {"\"7\"", 0}, {"[]", 0}, {"{}", 0}
+    };
+    const testfiles::ScratchDir scratch("leonida_integer_metadata_test");
+    std::filesystem::create_directories(scratch.path());
+    {
+        std::ofstream index(scratch.path() / "index.json", std::ios::binary);
+        index << '{';
+        for (std::size_t i = 0; i < std::size(cases); ++i) {
+            const auto token = cases[i].json;
+            if (i) index << ',';
+            index << '"' << i << "\":{\"stage\":\"cs\",\"fssm_sha256\":\"" << i << "\","
+                  << "\"push_constant_bytes\":" << token << ",\"lds_bytes\":" << token
+                  << ",\"local_size\":[" << token << ",1,1],\"subgroup_size\":" << token
+                  << ",\"input_signature\":[{\"semantic_index\":" << token << ",\"register\":" << token
+                  << ",\"system_value\":" << token << "}],\"inputs\":[" << token << ",7],\"outputs\":["
+                  << token << ",9],\"f16_halves\":{\"0\":[" << token << ",11]},\"literal_samplers\":[["
+                  << token << ",2,3,4]],\"max_vertices\":" << token << ",\"max_primitives\":" << token << '}';
+        }
+        index << '}';
+        CHECK(index.good());
+    }
+    ShaderLibrary library;
+    CHECK(library.load(scratch.path()) && library.size() == std::size(cases));
+    for (std::size_t i = 0; i < std::size(cases); ++i) {
+        const auto* entry = library.find("cs", std::to_string(i));
+        CHECK(entry);
+        const auto expected = cases[i].expected;
+        CHECK(entry->push_constant_bytes == expected && entry->lds_bytes == expected);
+        CHECK(entry->local_size[0] == expected && entry->local_size[1] == 1 && entry->local_size[2] == 1);
+        CHECK(entry->subgroup_size == expected && entry->max_vertices == expected && entry->max_primitives == expected);
+        CHECK(entry->input_signature.size() == 1 && entry->input_signature[0].semantic_index == expected &&
+              entry->input_signature[0].register_index == expected && entry->input_signature[0].system_value == expected);
+        CHECK((entry->inputs == std::vector<std::uint32_t>{expected, 7}));
+        CHECK((entry->outputs == std::vector<std::uint32_t>{expected, 9}));
+        CHECK((entry->f16_halves.size() == 1 && entry->f16_halves.at(0) == std::array<std::uint32_t, 2>{expected, 11}));
+        CHECK((entry->literal_samplers.size() == 1 &&
+               entry->literal_samplers[0] == std::array<std::uint32_t, 4>{expected, 2, 3, 4}));
+    }
+    return 0;
+}
+
 // The dynamic-Huffman sample: an LCG over a skewed alphabet (the same generator produced `dynamic` below).
 std::vector<std::uint8_t> skewed(std::size_t n) {
     static constexpr char alphabet[] = "eeeeettaaoinshrdlu";
@@ -252,6 +302,7 @@ int fspx_checks() {
 
 int main() {
     using namespace leonida;
+    CHECK(test_integer_metadata() == 0);
 
     // Test the shared file reader without passing malformed bytes to a driver.
     const std::vector<std::uint32_t> header = {0x07230203, 0x00010300, 0, 1, 0};
