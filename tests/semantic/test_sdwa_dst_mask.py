@@ -39,6 +39,7 @@ from __future__ import annotations
 import gc
 import os
 from pathlib import Path
+import re
 import struct
 import sys
 import tempfile
@@ -446,13 +447,13 @@ class SdwaDstNegativeControlTests(unittest.TestCase):
         good_words = support.mrt0_words(spv)
         self.assertEqual(good_words[0], 0x1234AA78)
 
-        self.assertIn("OpBitFieldInsert", spv)
-        bad_spv = spv.replace("OpBitFieldInsert", "OpBitFieldUExtract")
-        try:
-            bad_words = support.mrt0_words(bad_spv)
-            self.assertNotEqual(bad_words[0], 0x1234AA78)
-        except Exception:
-            pass
+        # Insert into 0 instead of the old v0: UNUSED_PRESERVE lowered like UNUSED_PAD. The sabotaged module has to run
+        # (OpBitFieldUExtract with the insert's operands did not: its offset was 0xAA) and give the padded word.
+        bad_spv, count = re.subn(r"(= OpBitFieldInsert %uint )%\w+", r"\1%c0", spv)
+        self.assertEqual(count, 1)
+        bad_words = support.mrt0_words(bad_spv)
+        self.assertEqual(bad_words[0], 0x0000AA00)
+        self.assertNotEqual(bad_words[0], 0x1234AA78)
 
     def test_detect_sext_vs_uext_sabotage(self):
         asm = """\
