@@ -349,11 +349,11 @@ class Oracle:
             # every program in the chunk was rejected: that is a broken harness (a bad prologue, the wrong
             # architecture), not a thousand skips
             raise RuntimeError(
-    "the assembler rejected every program in a chunk:\n"
-    + (str(results[idx[0]]) if idx else "empty chunk")
-    + "\nFULL ASSEMBLER ERROR:\n"
-    + err[:6000]
-)
+                "the assembler rejected every program in a chunk:\n"
+                + (str(results[idx[0]]) if idx else "empty chunk")
+                + "\nFULL ASSEMBLER ERROR:\n"
+                + err[:6000]
+            )
         tokens = []
         for n, i in zip(names, live):
             p = programs[i]
