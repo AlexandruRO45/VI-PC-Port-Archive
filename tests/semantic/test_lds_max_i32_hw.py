@@ -137,6 +137,91 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
         mem = run_cs_lds(instructions)
         self.assertEqual(mem.get(0), to_unsigned_u32(-20))
 
+class RegType(Enum):
+    VGPR = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+
+    def __post_init__(self):
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of bounds [0, 255]")
+
+    @classmethod
+    def vgpr(cls, idx: int) -> Operand:
+        return cls(RegType.VGPR, index=idx)
+
+    def to_asm(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclass(frozen=True)
+class DSMaxI32Instruction:
+    vaddr: Operand
+    vdata: Operand
+    offset: int = 0
+    rtn: bool = False
+    vdst: Optional[Operand] = None
+
+    def __post_init__(self):
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"Offset {self.offset} out of bounds [0, 65535]")
+        if self.rtn and self.vdst is None:
+            raise ValueError("Returning form requires vdst operand")
+        if not self.rtn and self.vdst is not None:
+            raise ValueError("Non-returning form must not have vdst operand")
+
+    def to_asm(self) -> str:
+        off_str = f" offset:{self.offset}" if self.offset != 0 else ""
+        if self.rtn:
+            return f"ds_max_rtn_i32 {self.vdst.to_asm()}, {self.vaddr.to_asm()}, {self.vdata.to_asm()}{off_str}"
+        return f"ds_max_i32 {self.vaddr.to_asm()}, {self.vdata.to_asm()}{off_str}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_ast_construction_and_formatting(self):
+        insn1 = DSMaxI32Instruction(
+            vaddr=Operand.vgpr(0),
+            vdata=Operand.vgpr(1),
+            offset=16,
+        )
+        self.assertEqual(insn1.to_asm(), "ds_max_i32 v0, v1 offset:16")
+
+        insn2 = DSMaxI32Instruction(
+            vaddr=Operand.vgpr(0),
+            vdata=Operand.vgpr(1),
+            offset=8,
+            rtn=True,
+            vdst=Operand.vgpr(2),
+        )
+        self.assertEqual(insn2.to_asm(), "ds_max_rtn_i32 v2, v0, v1 offset:8")
+
+    def test_ast_immutability(self):
+        insn = DSMaxI32Instruction(
+            vaddr=Operand.vgpr(0),
+            vdata=Operand.vgpr(1),
+        )
+        with self.assertRaises(Exception):
+            insn.offset = 4  # type: ignore
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(ValueError):
+            DSMaxI32Instruction(
+                vaddr=Operand.vgpr(0),
+                vdata=Operand.vgpr(1),
+                offset=70000,
+            )
+        with self.assertRaises(ValueError):
+            DSMaxI32Instruction(
+                vaddr=Operand.vgpr(0),
+                vdata=Operand.vgpr(1),
+                rtn=True,
+                vdst=None,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
