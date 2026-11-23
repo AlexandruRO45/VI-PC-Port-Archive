@@ -9,10 +9,30 @@ import tracemalloc
 import unittest
 from contextlib import redirect_stderr
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import sandbox_scene
+from test_dds_png import DDPF_FOURCC, dds_buffer
+
 
 class TestSandboxScene(unittest.TestCase):
+    def test_texture_bytes_respects_dds_color_space(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checker.dds")
+            # The white texel contributes half the light at full alpha, a quarter at alpha 85.
+            for dxgi, white_alpha, gray, alpha in (
+                (29, 255, 188, 255), (28, 255, 128, 255),  # RGBA8 sRGB and UNORM
+                (29, 85, 137, 170), (28, 85, 64, 170),
+            ):
+                with self.subTest(dxgi=dxgi, white_alpha=white_alpha):
+                    rgba = bytes((0, 0, 0, 255, 255, 255, 255, white_alpha))
+                    with open(path, "wb") as f:
+                        f.write(dds_buffer(2, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi))
+                    self.assertEqual(sandbox_scene.texture_bytes(path, 1),
+                                     struct.pack("<II4B", 1, 1, gray, gray, gray, alpha))
+                    self.assertEqual(sandbox_scene.texture_bytes(path, 2), struct.pack("<II", 2, 1) + rgba)
+
     def test_draw_rows(self):
         result = sandbox_scene.draw_rows((0, 0, 0, 1), 1.0, 1.0, (10, 20, 30))
         self.assertAlmostEqual(result[0][0], 1.0, places=6)

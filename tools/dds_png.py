@@ -1239,8 +1239,8 @@ def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
 
 
 def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _DdsHeader,
-                  masks: tuple[int, int, int, int] | None, alpha_mode: int) -> tuple[int, int, bytes, bool]:
-    """Decode data starting at the selected plane, in its source color space."""
+                  masks: tuple[int, int, int, int] | None, alpha_mode: int, max_size: int) -> tuple[int, int, bytes]:
+    """Decode the selected plane and apply its color space when resizing."""
     payload = memoryview(data)
     srgb = info["dxgi_format"] in _SRGB_DXGI_FORMATS
     width, height, pitch = plane.width, plane.height, plane.row_pitch
@@ -1283,22 +1283,18 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
         opaque[3::4] = b"\xff" * (width * height)
         rgba = bytes(opaque)
 
-    return width, height, rgba, srgb
-
-
-def _decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None = None,
-                z: int = 0) -> tuple[int, int, bytes, bool]:
-    info, masks, alpha_mode = _parse_header_internal(data)
-    plane = _locate_plane(info, mip=mip, layer=layer, face=face, z=z)
-    payload = memoryview(data)[plane.offset:plane.offset + plane.byte_length]
-    return _decode_plane(payload, plane, info, masks, alpha_mode)
+    return downscale_rgba(width, height, rgba, max_size, srgb=srgb)
 
 
 def decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None = None,
-               z: int = 0) -> tuple[int, int, bytes]:
-    """Decode one DDS image plane into top-down row-major RGBA8 with straight alpha."""
-    width, height, rgba, _ = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
-    return width, height, rgba
+               z: int = 0, max_size: int = 0) -> tuple[int, int, bytes]:
+    """Decode one plane into top-down, straight-alpha RGBA8. Set max_size to limit its longest side."""
+    if max_size < 0:
+        raise DdsError(f"Invalid max_size: {max_size}")
+    info, masks, alpha_mode = _parse_header_internal(data)
+    plane = _locate_plane(info, mip=mip, layer=layer, face=face, z=z)
+    payload = memoryview(data)[plane.offset:plane.offset + plane.byte_length]
+    return _decode_plane(payload, plane, info, masks, alpha_mode, max_size)
 
 
 def _box_spans(source: int, target: int) -> list:
@@ -1426,13 +1422,6 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
     return PNG_SIGNATURE + ihdr + idat + iend
 
 
-def _preview_png(image: tuple[int, int, bytes, bool], max_size: int) -> bytes:
-    w, h, rgba, srgb = image
-    if max_size > 0:
-        w, h, rgba = downscale_rgba(w, h, rgba, max_size, srgb=srgb)
-    return encode_png(w, h, rgba)
-
-
 def _read_header(source: BinaryIO) -> bytes:
     header = source.read(DDS_HEADER_SIZE)
     if header[84:88] == b"DX10":
@@ -1444,9 +1433,7 @@ def dds_to_png_bytes(
     data: bytes, max_size: int = 0, *, mip: int = 0, layer: int = 0, face: str | None = None, z: int = 0,
 ) -> bytes:
     """Encode one DDS plane as PNG, optionally downscaling the selected mip."""
-    if max_size < 0:
-        raise DdsError(f"Invalid max_size: {max_size}")
-    return _preview_png(_decode_dds(data, mip=mip, layer=layer, face=face, z=z), max_size)
+    return encode_png(*decode_dds(data, mip=mip, layer=layer, face=face, z=z, max_size=max_size))
 
 
 def read_half_texel(path: str, *, x: int, y: int, mip: int = 0, layer: int = 0,
@@ -1487,7 +1474,7 @@ def dds_file_to_png_bytes(
             raise DdsError(f"Truncated {info['format']} payload for the selected plane")
         f.seek(plane.offset)
         payload = f.read(plane.byte_length)
-    return _preview_png(_decode_plane(payload, plane, info, masks, alpha_mode), max_size)
+    return encode_png(*_decode_plane(payload, plane, info, masks, alpha_mode, max_size))
 
 
 def main(argv: list[str] | None = None) -> int:
