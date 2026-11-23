@@ -455,6 +455,19 @@ class BuildRowsReadCountTest(unittest.TestCase):
         self.assertEqual([call.args[0]["off"] for call in source.read.call_args_list],
                          [0x1000, 0x2000])
 
+    def test_json_write_failure_preserves_previous_report(self):
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = os.path.join(tmp, "out.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(tool, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    tool.write_json(path, {"streams": 0}, [])
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()
