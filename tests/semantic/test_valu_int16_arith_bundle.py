@@ -171,6 +171,23 @@ class TestVAddU16EdgeCases(unittest.TestCase):
         self.assertEqual(ref_v_add_u16(0xFFFF, 0xFFFF), 0xFFFE)
         self.assertEqual(ref_v_add_u16(0xFFFF, 0xFFFF, clamp=True), 0xFFFF)
 
+class TestVAddU16Translator(unittest.TestCase):
+    def test_translate_v_add_u16(self):
+        lines = [
+            "v_mov_b32 v1, 100",
+            "v_mov_b32 v2, 200",
+            "v_add_u16 v0, v1, v2",
+            "v_mov_b32 v3, 60000",
+            "v_mov_b32 v4, 10000",
+            "v_add_u16 v1, v3, v4 clamp",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_add_u16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = mrt0_words(spv)
+        self.assertEqual(words, [300, 0xFFFF, 300, 0xFFFF])
+
 
 if __name__ == "__main__":
     unittest.main()
