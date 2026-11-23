@@ -245,5 +245,73 @@ class TestSymbolicAST(unittest.TestCase):
             )
 
 
+class ScalarThreadState:
+    def __init__(self, lane_id: int = 0, wave_size: int = 32):
+        self.lane_id = lane_id
+        self.wave_size = wave_size
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+        self.lgkm_cnt = 0
+
+
+class ScalarDSBPermuteInterpreter:
+    def __init__(self, wave_vdata: Optional[list[int]] = None, exec_mask: int = 0xFFFFFFFF):
+        self.wave_vdata = wave_vdata if wave_vdata is not None else [0] * 32
+        self.exec_mask = exec_mask
+
+    def step(self, insn: DSBPermuteB32Instruction, state: ScalarThreadState) -> int:
+        vaddr = state.vgprs[insn.vaddr.index]
+        res = ref_ds_bpermute_b32(
+            lane_id=state.lane_id,
+            vaddr=vaddr,
+            vdata_table=self.wave_vdata,
+            exec_mask=self.exec_mask,
+            offset=insn.offset,
+            wave_size=state.wave_size,
+        )
+        state.vgprs[insn.dst.index] = res
+        state.lgkm_cnt += 1
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step(self):
+        wave_vdata = [i * 10 for i in range(32)]
+        interp = ScalarDSBPermuteInterpreter(wave_vdata)
+        state = ScalarThreadState(lane_id=4)
+        state.vgprs[1] = 8 * 4  # vaddr points to lane 8
+        state.vgprs[2] = 40     # local vdata
+
+        insn = DSBPermuteB32Instruction(
+            dst=Operand.vgpr(3),
+            vaddr=Operand.vgpr(1),
+            vdata=Operand.vgpr(2),
+            offset=0,
+        )
+        res = interp.step(insn, state)
+        self.assertEqual(res, 80)
+        self.assertEqual(state.vgprs[3], 80)
+        self.assertEqual(state.lgkm_cnt, 1)
+
+    def test_scalar_interpreter_chained_permutations(self):
+        wave_vdata = [i + 1 for i in range(32)]
+        interp = ScalarDSBPermuteInterpreter(wave_vdata)
+        state = ScalarThreadState(lane_id=0)
+
+        # Step 1: gather from lane 3 -> gets 4
+        state.vgprs[1] = 3 * 4
+        insn1 = DSBPermuteB32Instruction(Operand.vgpr(3), Operand.vgpr(1), Operand.vgpr(2))
+        interp.step(insn1, state)
+        self.assertEqual(state.vgprs[3], 4)
+
+        # Step 2: use result to gather from lane (4 * 4) -> lane 4 -> gets 5
+        state.vgprs[4] = state.vgprs[3] * 4
+        insn2 = DSBPermuteB32Instruction(Operand.vgpr(5), Operand.vgpr(4), Operand.vgpr(2))
+        interp.step(insn2, state)
+        self.assertEqual(state.vgprs[5], 5)
+        self.assertEqual(state.lgkm_cnt, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
+
