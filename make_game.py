@@ -391,6 +391,68 @@ def volume_roots() -> list:
     return roots
 
 
+DRIVE_FIXED = 3   # GetDriveTypeW: a local disk (network, removable, optical and RAM drives are other values)
+
+
+def local_drive_roots() -> list:
+    """Where another drive for --work can be. Windows: each drive letter on a local disk; network shares are left out
+    because a remote work folder can make the dotnet build fail. Else: the folders under the POSIX mount roots
+    (/mnt/<disk>, /media/<user>/<label>, /Volumes/<name>), each of which may be a mounted drive."""
+    if os.name == "nt":
+        import ctypes
+        import string
+        get_type = ctypes.windll.kernel32.GetDriveTypeW
+        return [f"{d}:\\" for d in string.ascii_uppercase if get_type(f"{d}:\\") == DRIVE_FIXED]
+    roots = []
+    for base in volume_roots():
+        try:
+            with os.scandir(base) as entries:
+                roots += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+    return roots
+
+
+def volume_id(path: str):
+    """Which volume a path is on (st_dev, the volume serial number on Windows), or None when it can't be read."""
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
+def drives_with_room(need_gb: float, work: str, limit: int = 3) -> list:
+    """(root, free GiB) of up to `limit` other local drives with at least need_gb GiB free, most free first, for the
+    low-space message. A drive that can't be read (an empty card reader, a stale mount) is skipped."""
+    found, seen = [], {volume_id(work)}
+    for root in local_drive_roots():
+        vid = volume_id(root)
+        # POSIX: /media/<user> and /media/<user>/<label> can both be listed; count each volume once.
+        if vid is None or vid in seen:
+            continue
+        try:
+            free_gb = shutil.disk_usage(root).free / 2**30
+        except OSError:
+            continue
+        if free_gb < need_gb:
+            continue
+        seen.add(vid)
+        found.append((root, free_gb))
+    found.sort(key=lambda d: -d[1])
+    return found[:limit]
+
+
+def work_drive_hint(need_gb: float, work: str) -> str:
+    """The part of the low-space message that names drives with room, or "" when there are none."""
+    drives = drives_with_room(need_gb, work)
+    if not drives:
+        return ""
+    listed = ", ".join(f"{root} ({free:.0f} GB free)" for root, free in drives)
+    example = os.path.join(drives[0][0], "LeonidaWork")
+    return (f" Drives with room: {listed}. For example add --work \"{example}\": only the work files go there, "
+            "the finished port stays in --out (it can stay on your SSD).")
+
+
 def xvd_header(path: str):
     """The few XVD header fields the build reports, or None when the file isn't an XVD. Reads 4 KiB, nothing else."""
     try:
@@ -895,7 +957,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         if loader_stages_selected and not wav and assets_gb and free_gb >= need_gb - assets_gb:
             hint = " To prepare the loader without exporting assets, use --stages check,shaders,runtime."
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
-             "Free some space or choose another drive with --work." + hint)
+             "Free some space or choose another drive with --work." + work_drive_hint(need_gb, work) + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():

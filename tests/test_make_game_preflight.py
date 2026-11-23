@@ -1301,5 +1301,77 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
                     os.rmdir(link)
 
 
+class WorkDriveHintTest(PreflightTestBase):
+    """The low-space message names other drives with room for --work (#7034). Drives are faked: each root is a name,
+    its volume and free space come from the tables below, so no real disk is listed or measured."""
+    WORK = os.path.join("C:\\" if os.name == "nt" else "/home/u", "Leonida", "work")
+
+    def fake_drives(self, drives, work_volume="C"):
+        """drives: {root: (volume, free GiB or None for a drive that can't be measured)}."""
+        volumes = {self.WORK: work_volume, **{r: v for r, (v, _) in drives.items()}}
+
+        def usage(path):
+            free = drives[path][1]
+            if free is None:
+                raise OSError("not ready")
+            return Usage(4000 * 2**30, 0, int(free * 2**30))
+
+        return mock.patch.multiple(
+            make_game,
+            local_drive_roots=mock.Mock(return_value=list(drives)),
+            volume_id=mock.Mock(side_effect=volumes.get),
+        ), mock.patch("shutil.disk_usage", side_effect=usage)
+
+    def test_lists_other_drives_with_room_most_free_first(self):
+        drives = {"C:\\": ("C", 900), "D:\\": ("D", 500), "E:\\": ("E", 50), "H:\\": ("H", 1500)}
+        patch_drives, patch_usage = self.fake_drives(drives)
+        with patch_drives, patch_usage:
+            found = make_game.drives_with_room(400, self.WORK)
+        # C: is the work folder's own drive and E: is too small.
+        self.assertEqual([root for root, _ in found], ["H:\\", "D:\\"])
+
+    def test_skips_unreadable_drives_and_repeats_of_one_volume(self):
+        drives = {"/media/u": ("M", 800), "/media/u/disk": ("M", 800),
+                  "/mnt/card": ("K", None), "/mnt/gone": (None, 1)}
+        patch_drives, patch_usage = self.fake_drives(drives)
+        with patch_drives, patch_usage:
+            found = make_game.drives_with_room(400, self.WORK)
+        self.assertEqual([root for root, _ in found], ["/media/u"])
+
+    def test_limits_the_list(self):
+        drives = {f"{d}:\\": (d, 1000 - i) for i, d in enumerate("DFGHIJ")}
+        patch_drives, patch_usage = self.fake_drives(drives)
+        with patch_drives, patch_usage:
+            self.assertEqual(len(make_game.drives_with_room(400, self.WORK)), 3)
+
+    def test_hint_gives_a_work_folder_on_the_drive_with_most_room(self):
+        drives = {"D:\\": ("D", 500), "H:\\": ("H", 1500)}
+        patch_drives, patch_usage = self.fake_drives(drives)
+        with patch_drives, patch_usage:
+            hint = make_game.work_drive_hint(400, self.WORK)
+        self.assertIn("H:\\ (1500 GB free), D:\\ (500 GB free)", hint)
+        self.assertIn(f'--work "{os.path.join("H:\\", "LeonidaWork")}"', hint)
+        self.assertIn("--out", hint)
+
+    def test_hint_is_empty_without_a_drive_with_room(self):
+        patch_drives, patch_usage = self.fake_drives({"D:\\": ("D", 100)})
+        with patch_drives, patch_usage:
+            self.assertEqual(make_game.work_drive_hint(400, self.WORK), "")
+
+    def test_low_space_failure_includes_the_hint(self):
+        with tempfile.TemporaryDirectory() as tmp_work, \
+                mock.patch("sys.version_info", (3, 12, 0)), \
+                mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                mock.patch("make_game.tool_available", return_value=True), \
+                mock.patch("make_game.ensure_submodule", return_value=None), \
+                mock.patch("os.path.isfile", return_value=True), \
+                mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 485 * 2**30, 15 * 2**30)), \
+                mock.patch("make_game.work_drive_hint", return_value=" Drives with room: X.") as hint:
+            error = self.assert_fails(make_game.preflight, ["shaders"], tmp_work, wav=False,
+                                      match="choose another drive with --work. Drives with room: X.")
+            hint.assert_called_once_with(30, tmp_work)
+            self.assertIn("15 GB free", error)
+
+
 if __name__ == "__main__":
     unittest.main()
