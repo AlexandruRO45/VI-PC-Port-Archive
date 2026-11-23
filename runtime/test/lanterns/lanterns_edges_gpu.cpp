@@ -63,17 +63,21 @@ bool EdgeDraw::create(Gpu& gpu, const EdgeShaders& shaders) {
         return SUCCEEDED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, state, nullptr,
                                                           IID_PPV_ARGS(&out.p)));
     };
-    CHECK(make(upload_heap, buffer_desc(vertex_bytes), D3D12_RESOURCE_STATE_GENERIC_READ, vertices_));
-    CHECK(make(upload_heap, buffer_desc(256), D3D12_RESOURCE_STATE_GENERIC_READ, alpha_));
+    // The vertices and the PS's alpha word live in DEFAULT buffers, filled from one UPLOAD staging buffer by
+    // CopyBufferRegion, as the main scene's buffers are (lanterns_gpu.cpp). Reading them straight from UPLOAD heaps
+    // drew nothing on an Intel UHD 770 under native Windows.
+    const std::uint64_t alpha_offset = align(vertex_bytes, 256);
+    CHECK(make(default_heap, buffer_desc(vertex_bytes), D3D12_RESOURCE_STATE_COPY_DEST, vertices_));
+    CHECK(make(default_heap, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST, alpha_));
+    Ref<ID3D12Resource> staging;   // kept alive until the copy's fence has passed
+    CHECK(make(upload_heap, buffer_desc(alpha_offset + 256), D3D12_RESOURCE_STATE_GENERIC_READ, staging));
     CHECK(make(readback_heap, buffer_desc(std::uint64_t(kPitch) * kHeight), D3D12_RESOURCE_STATE_COPY_DEST, readback_));
-    void* mapped = nullptr;
-    CHECK(SUCCEEDED(vertices_->Map(0, nullptr, &mapped)));
+    std::uint8_t* mapped = nullptr;
+    CHECK(SUCCEEDED(staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
     std::memcpy(mapped, vertices.data(), vertex_bytes);
-    vertices_->Unmap(0, nullptr);
-    CHECK(SUCCEEDED(alpha_->Map(0, nullptr, &mapped)));
     const float alpha[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-    std::memcpy(mapped, alpha, sizeof(alpha));
-    alpha_->Unmap(0, nullptr);
+    std::memcpy(mapped + alpha_offset, alpha, sizeof(alpha));
+    staging->Unmap(0, nullptr);
     D3D12_RESOURCE_DESC tex{};
     tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     tex.Width = kWidth;
@@ -102,8 +106,18 @@ bool EdgeDraw::create(Gpu& gpu, const EdgeShaders& shaders) {
     CHECK(SUCCEEDED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator_.p))));
     CHECK(SUCCEEDED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator_.p, nullptr,
                                                IID_PPV_ARGS(&list_.p))));
-    CHECK(list_->Close() == S_OK);
     CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_.p))));
+    list_->CopyBufferRegion(vertices_.p, 0, staging.p, 0, vertex_bytes);
+    list_->CopyBufferRegion(alpha_.p, 0, staging.p, alpha_offset, sizeof(alpha));
+    const D3D12_RESOURCE_BARRIER filled[] = {
+        transition(vertices_.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        transition(alpha_.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+    list_->ResourceBarrier(2, filled);
+    CHECK(list_->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list_.p};
+    queue_->ExecuteCommandLists(1, lists);
+    CHECK(SUCCEEDED(queue_->Signal(fence_.p, ++fence_value_)));
+    CHECK(wait_fence(fence_, fence_value_));
     return true;
 }
 
