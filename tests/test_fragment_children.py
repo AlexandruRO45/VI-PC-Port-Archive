@@ -246,6 +246,32 @@ class TestCommandLine(unittest.TestCase):
                     self.assertNotIn("a.rpf:", result.stdout)   # the scan did not start
                     self.assertFalse(os.path.exists(os.path.dirname(out)))
 
+    def test_report_paths_are_preflighted_and_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment()))
+            long_json = os.path.join(tmp, "x" * 300 + ".json")
+            result = self.run_tool(path, "--json", long_json)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(os.path.exists(long_json))
+
+            long_records = os.path.join(tmp, "y" * 300 + ".jsonl")
+            result = self.run_tool(path, "--records", long_records)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(os.path.exists(long_records))
+
+            same = os.path.join(tmp, "same.json")
+            result = self.run_tool(path, "--json", same, "--records", same)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--json", result.stderr)
+            self.assertIn("--records", result.stderr)
+            self.assertFalse(os.path.exists(same))
+
 
 if __name__ == "__main__":
     unittest.main()

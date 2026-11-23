@@ -358,14 +358,28 @@ def main(argv=None):
             # checked before the scan: the scan can run for hours and would raise only at write time
             print(f"error: {out} is in a folder that does not exist: {parent}", file=sys.stderr)
             return 2
+    if a.records and a.json and ss.same_output_path(a.records, a.json):
+        print("error: --json and --records name the same file", file=sys.stderr)
+        return 2
     t0 = time.time()
-    stats = scan_archive(a.archive, a.start, a.end, a.jobs, a.records, lambda text: print(text, flush=True))
+    try:
+        stats = scan_archive(a.archive, a.start, a.end, a.jobs, a.records, lambda text: print(text, flush=True))
+    except OSError as exc:
+        if a.records:
+            print(f"error: cannot write {a.records}: {exc}", file=sys.stderr)
+        else:
+            print(f"error: {a.archive}: {exc}", file=sys.stderr)
+        return 2
     print(f"{os.path.basename(a.archive)}: {time.time() - t0:.0f}s")
     for key, value in stats.items():
         print(f"  {key:26s} {value:10d}")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(stats, fh, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(stats, fh, indent=1)
+        except OSError as exc:
+            print(f"error: cannot write {a.json}: {exc}", file=sys.stderr)
+            return 2
     return 0
 
 
