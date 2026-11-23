@@ -8,6 +8,7 @@
 #include <aclapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <clocale>
 #include <cstdio>
 #include <exception>
@@ -1077,6 +1078,132 @@ void run_checks(const std::filesystem::path& root) {
         write_path(overlay / ".gta6rt-copy" / "123-1", "half");
         check(!contains(list(first_w, next_w, find_close, L"GAME:\\*"), L".gta6rt-copy"),
               "the copy staging folder is hidden from a GAME: listing");
+    }
+
+    // DeleteFile and MoveFileEx of a package file while another thread's write-open copies it up. The host orders two
+    // calls on one name: the delete (or move) goes first and the open fails with ERROR_FILE_NOT_FOUND, or the open goes
+    // first and the delete, allowed by FILE_SHARE_DELETE, takes the name away once the handle closes. Either way the
+    // name is gone afterwards; a marker written during the copy used to let the rename into place bring it back.
+    // The copy runs under <overlay>\.gta6rt-copy: a watcher thread polls that folder, the main thread makes its call as
+    // soon as a staging file appears, and an attempt counts only if the watcher still saw the staging file after the
+    // call started. Attempts that miss the copy are retried, and a run that never lands one says so.
+    {
+        const std::filesystem::path folder = package / "copyrace";
+        const std::filesystem::path staging = overlay / ".gta6rt-copy";
+        constexpr int kMiB = 64;  // the copy takes tens of milliseconds, the call that has to land in it far less
+        {
+            std::filesystem::create_directories(folder);
+            std::string block(1 << 20, '\0');
+            for (size_t i = 0; i < block.size(); ++i) block[i] = static_cast<char>('a' + i % 26);
+            const HANDLE h = ::CreateFileW((folder / L"race0.bin").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                           FILE_ATTRIBUTE_NORMAL, nullptr);
+            bool written = h != INVALID_HANDLE_VALUE;
+            for (int i = 0; written && i < kMiB; ++i) {
+                DWORD n = 0;
+                written = ::WriteFile(h, block.data(), static_cast<DWORD>(block.size()), &n, nullptr) && n == block.size();
+            }
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            check(written, "a 64 MiB package file for the copy-up race");
+        }
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        const auto ticks = [] {
+            LARGE_INTEGER t{};
+            QueryPerformanceCounter(&t);
+            return t.QuadPart;
+        };
+        const auto staging_entries = [&] {
+            std::vector<std::wstring> names;
+            for (const auto& n : list(::FindFirstFileW, ::FindNextFileW, ::FindClose, (staging / L"*").c_str()))
+                if (n != L"." && n != L"..") names.push_back(n);
+            return names;
+        };
+        std::wstring current = L"race0.bin";  // each attempt renames the package file to a name nothing has touched
+        int serial = 0;
+        const auto race = [&](bool move, const char* what) {
+            constexpr int kWanted = 3, kAttempts = 20;
+            int hits = 0, attempts = 0;
+            bool call_ok = true, open_ok = true, gone = true, no_staging = true, moved_ok = true;
+            for (; attempts < kAttempts && hits < kWanted; ++attempts) {
+                const std::wstring leaf = L"race" + std::to_wstring(++serial) + L".bin", moved_leaf = leaf + L".moved";
+                if (!::MoveFileW((folder / current).c_str(), (folder / leaf).c_str())) {
+                    check(false, "the package file is renamed for the next attempt");
+                    return;
+                }
+                current = leaf;
+                const std::wstring game = L"GAME:\\copyrace\\" + leaf, game_moved = L"GAME:\\copyrace\\" + moved_leaf;
+                const std::vector<std::wstring> before = staging_entries();
+                const auto copying = [&] {
+                    for (const auto& n : staging_entries())
+                        if (std::find(before.begin(), before.end(), n) == before.end()) return true;
+                    return false;
+                };
+                std::atomic<bool> stop{false}, opened{false};
+                std::atomic<long long> last_seen{0};  // when a poll that found a staging file started
+                HANDLE handle = INVALID_HANDLE_VALUE;
+                DWORD open_error = 0;
+                std::thread watcher([&] {
+                    while (!stop.load()) {
+                        const long long t = ticks();
+                        if (copying()) last_seen.store(t);
+                    }
+                });
+                std::thread writer([&] {
+                    handle = create_w(game.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                                      nullptr);
+                    open_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+                    opened.store(true);
+                });
+                const long long deadline = ticks() + 10 * frequency.QuadPart;
+                while (last_seen.load() == 0 && !opened.load() && ticks() < deadline) std::this_thread::yield();
+                long long started = 0;
+                bool acted = false, ok = false;
+                if (last_seen.load() != 0 && !opened.load()) {
+                    started = ticks();
+                    ok = move ? move_ex_w(game.c_str(), game_moved.c_str(), 0) != FALSE : delete_w(game.c_str()) != FALSE;
+                    acted = true;
+                }
+                writer.join();
+                stop.store(true);
+                watcher.join();
+                if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
+                if (acted && last_seen.load() > started) {
+                    ++hits;
+                    if (!ok) call_ok = false;
+                    // ERROR_ACCESS_DENIED is the host's answer for an open that meets the delete in flight, the file
+                    // marked for deletion but not yet unlinked (a delete without POSIX semantics).
+                    if (handle == INVALID_HANDLE_VALUE && open_error != ERROR_FILE_NOT_FOUND &&
+                        open_error != ERROR_ACCESS_DENIED)
+                        open_ok = false;
+                    SetLastError(0);
+                    if (attributes_w(game.c_str()) != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND)
+                        gone = false;
+                    if (copying()) no_staging = false;
+                    WIN32_FILE_ATTRIBUTE_DATA data{};
+                    if (move && (!attributes_ex_w(game_moved.c_str(), GetFileExInfoStandard, &data) ||
+                                 data.nFileSizeHigh != 0 || data.nFileSizeLow != static_cast<DWORD>(kMiB) << 20))
+                        moved_ok = false;
+                }
+                std::error_code ec;  // the overlay copies of this attempt's names are not used again
+                std::filesystem::remove(overlay / "copyrace" / leaf, ec);
+                std::filesystem::remove(overlay / "copyrace" / moved_leaf, ec);
+            }
+            std::printf("NOTE %s during a copy-up: %d of %d attempt(s) landed while the copy ran\n", what, hits, attempts);
+            if (hits == 0) {
+                std::printf("SKIP %s during a copy-up: no attempt landed while the copy ran, so the order is not "
+                            "checked\n", what);
+                return;
+            }
+            const std::string w = what;
+            check(call_ok, (w + " during a copy-up succeeds").c_str());
+            check(open_ok, (w + " during a copy-up: the write-open succeeds or fails as the name is gone").c_str());
+            check(gone, (w + " during a copy-up: the name is gone once the handle is closed").c_str());
+            check(no_staging, (w + " during a copy-up leaves no staging file behind").c_str());
+            if (move) check(moved_ok, (w + " during a copy-up: the new name holds the whole package file").c_str());
+        };
+        race(false, "DeleteFileW");
+        race(true, "MoveFileExW");
     }
 
     // RT-218: "G:\" is the package and "T:\" a writable scratch folder in the overlay, as in the other console layers.
