@@ -314,6 +314,32 @@ class DamagedIndex(unittest.TestCase):
                 self.assertEqual(f.read(), "previous run\n")     # not truncated by the entry that failed
             self.assertFalse(os.path.exists(os.path.join(tmp, "ms_b.mesh_vs.spvasm")))
 
+    def test_an_explicit_empty_layout_errors_before_any_output_changes(self):
+        # An explicit "mesh_compute": {} is a bad layout, not the translator's omitted key. It must error
+        # before either existing .spvasm is touched, even when an earlier entry is valid.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout()}, "ms_b": {"mesh_compute": {}}})
+            kept_a = os.path.join(tmp, "ms_a.mesh_vs.spvasm")
+            kept_b = os.path.join(tmp, "ms_b.mesh_vs.spvasm")
+            for path in (kept_a, kept_b):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("previous run\n")
+            with self.assertRaises(vs.LayoutError) as ctx:
+                vs.write_for_index(tmp)
+            self.assertIn("ms_b", str(ctx.exception))
+            for path in (kept_a, kept_b):
+                with open(path, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "previous run\n")
+
+    def test_an_omitted_mesh_compute_key_is_skipped(self):
+        # The translator omits the key when there is no mesh-compute layout; that entry is intentionally
+        # skipped, not an error, and the valid entry is still written.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout()}, "ms_b": {"stage": "ms"}})
+            written = vs.write_for_index(tmp)
+            self.assertEqual(written, [os.path.join(tmp, "ms_a.mesh_vs.spvasm")])
+            self.assertFalse(os.path.exists(os.path.join(tmp, "ms_b.mesh_vs.spvasm")))
+
     def test_an_entry_names_itself(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_index(tmp, {"ms_a": {"mesh_compute": [layout()]}})

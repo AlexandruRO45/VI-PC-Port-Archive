@@ -315,7 +315,7 @@ def write_for_index(spirv_dir):
     todo = []
     for name, meta in sorted(index.items()):
         lay = meta.get("mesh_compute") if isinstance(meta, dict) else None
-        if not lay:
+        if lay is None:      # the translator omits the key when there is no layout; an explicit {} is a bad layout
             continue
         who = f"{name}.mesh_compute"
         try:
