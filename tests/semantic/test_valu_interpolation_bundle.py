@@ -505,5 +505,50 @@ class TestInterpP1llF16Oracle(unittest.TestCase):
         self.assertEqual(res, f32_to_bits(2.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p1ll_f16 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VInterpP1llF16Instruction:
+    dst: RegisterOperand
+    src0: RegisterOperand
+    attr: AttrOperand
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+class ScalarMachineInterpP1llF16:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.attrs: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * 32
+
+    def step(self, insn: VInterpP1llF16Instruction):
+        i_coord = bits_to_f32(self.vgprs[insn.src0.index])
+        p0, p1, p2 = self.attrs[insn.attr.index]
+        res = ref_interp_p1ll_f16(i_coord, p0, p1)
+        self.vgprs[insn.dst.index] = res
+
+
+class TestInterpP1llF16ASTAndScalar(unittest.TestCase):
+    def test_ast(self):
+        insn = VInterpP1llF16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            src0=RegisterOperand(OperandType.VGPR, 0),
+            attr=AttrOperand(0, "x"),
+        )
+        self.assertEqual(insn.dst.name, "v2")
+
+    def test_scalar_execution(self):
+        machine = ScalarMachineInterpP1llF16()
+        machine.vgprs[0] = f32_to_bits(0.25)
+        machine.attrs[0] = (0.0, 4.0, 8.0)
+        insn = VInterpP1llF16Instruction(dst=RegisterOperand(OperandType.VGPR, 2), src0=RegisterOperand(OperandType.VGPR, 0), attr=AttrOperand(0, "x"))
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[2], f32_to_bits(1.0))
+
+
 if __name__ == '__main__':
     unittest.main()
