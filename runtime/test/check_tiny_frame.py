@@ -100,10 +100,17 @@ def main():
     timeout = 180 if options.runner else 90  # a first start of Wine in a fresh prefix can take tens of seconds
 
     if options.probe:
-        probe = subprocess.run([*options.runner, options.probe], capture_output=True, timeout=timeout)
+        probe = subprocess.run([*options.runner, options.probe], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=timeout)
         if probe.returncode == SKIP:
             print("SKIP: no usable Vulkan device (the probe test skipped)")
             return SKIP
+        if probe.returncode:
+            for output in (probe.stdout, probe.stderr):
+                if output:
+                    print(output.rstrip("\n"))
+            print(f"FAIL: Vulkan device probe exited with code {probe.returncode}")
+            return 1
 
     environment = dict(os.environ, LEONIDA_D3D12="vulkan")
     run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],

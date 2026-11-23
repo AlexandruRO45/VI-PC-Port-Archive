@@ -1,7 +1,12 @@
 """The verdict logic of runtime/test/check_tiny_frame.py on synthetic output: no loader, GPU or game files."""
+import contextlib
 import importlib.util
+import io
+import subprocess
+import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("check_tiny_frame", ROOT / "runtime" / "test" / "check_tiny_frame.py")
@@ -66,6 +71,37 @@ class CheckOutputTest(unittest.TestCase):
         output = "\n".join(line for line in good_output().split("\n") if not line.startswith("[d3d12-trace]"))
         self.assertEqual(check.check_output(0, output), ["the trace has no `D3D12XboxCreateDevice ok` at its place "
                                                          "in the first-frame order"])
+
+
+class ProbeTest(unittest.TestCase):
+    def run_with_probe(self, code: int) -> tuple[int, str, int]:
+        probe = subprocess.CompletedProcess(
+            ["probe.exe"], code, "probe stdout detail\n", "probe stderr detail\n")
+        loader = subprocess.CompletedProcess(["loader.exe"], 0, good_output(), "")
+        output = io.StringIO()
+        args = ["check_tiny_frame.py", "loader.exe", "guest.exe", "--probe", "probe.exe"]
+        with patch.object(sys, "argv", args), patch.object(check.subprocess, "run", side_effect=[probe, loader]) as run:
+            with contextlib.redirect_stdout(output):
+                result = check.main()
+        return result, output.getvalue(), run.call_count
+
+    def test_failed_probe_blocks_a_passing_loader_and_preserves_diagnostics(self):
+        for code in (1, -9):
+            with self.subTest(code=code):
+                result, output, calls = self.run_with_probe(code)
+                self.assertEqual((result, calls), (1, 1))
+                self.assertIn(f"Vulkan device probe exited with code {code}", output)
+                self.assertIn("probe stdout detail", output)
+                self.assertIn("probe stderr detail", output)
+
+    def test_successful_probe_runs_the_loader(self):
+        result, _, calls = self.run_with_probe(0)
+        self.assertEqual((result, calls), (0, 2))
+
+    def test_skipped_probe_skips_the_fixture(self):
+        result, output, calls = self.run_with_probe(77)
+        self.assertEqual((result, calls), (77, 1))
+        self.assertIn("SKIP:", output)
 
 
 class SubsequenceTest(unittest.TestCase):
