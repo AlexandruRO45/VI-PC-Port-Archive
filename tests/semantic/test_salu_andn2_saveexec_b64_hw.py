@@ -299,3 +299,42 @@ class TestSaluAndn2SaveexecB64SimdDivergence(unittest.TestCase):
         self.assertEqual(new_exec, odd_lanes)
         self.assertEqual(sdst, even_lanes)
         self.assertEqual(scc, 1)
+
+
+class TestSaluAndn2SaveexecB64RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_src0_aliasing(self):
+        # sdst and ssrc0 overlap in s[0:1]
+        state = ScalarRegisterState(exec_mask=0x0000FFFFFFFF0000)
+        initial_s0 = 0x00000000FFFFFFFF
+        state.write_sgpr_u64(0, initial_s0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_SAVEEXEC_B64,
+            dst=ASTOperand.sgpr(0, 2),
+            src0=ASTOperand.sgpr(0, 2),
+        )
+        new_exec, sdst, scc = state.execute(inst)
+
+        # Source is read BEFORE destination is overwritten with saved EXEC
+        self.assertEqual(sdst, 0x0000FFFFFFFF0000)
+        self.assertEqual(state.sgpr[0], 0xFFFF0000)
+        self.assertEqual(state.sgpr[1], 0x0000FFFF)
+        self.assertEqual(new_exec, 0x000000000000FFFF)
+        self.assertEqual(state.exec_mask, 0x000000000000FFFF)
+        self.assertEqual(scc, 1)
+
+    def test_dst_is_exec(self):
+        # When sdst is EXEC: sdst = EXEC, then EXEC = ssrc0 & ~EXEC
+        state = ScalarRegisterState(exec_mask=ALL_LANES_ACTIVE)
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_SAVEEXEC_B64,
+            dst=ASTOperand.exec_mask(),
+            src0=ASTOperand.literal64(0x123456789ABCDEF0),
+        )
+        new_exec, sdst, scc = state.execute(inst)
+        # old_exec was ALL_LANES_ACTIVE, so new_exec is 0
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(state.exec_mask, 0)
+        self.assertEqual(scc, 0)
