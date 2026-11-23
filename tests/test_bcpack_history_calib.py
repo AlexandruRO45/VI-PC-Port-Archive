@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 from unittest.mock import Mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1136,6 +1137,20 @@ class PoolSelfCalibrationTest(unittest.TestCase):
             with redirect_stderr(err_s):
                 self.assertEqual(calib.main(["--verify", bad_bc7, "--codec", "bc7"]), 2)
             self.assertIn("ERROR:", err_s.getvalue())
+
+
+class WriteJsonReportPreserveTest(unittest.TestCase):
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(calib, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    calib.write_json_report(path, '{"new": true}\n')
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

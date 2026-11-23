@@ -20,13 +20,17 @@ Two complementary calibration paths are supported (and may be combined):
 import argparse
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import bcpack  # noqa: E402
 import bcpack_tables as _tables  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
@@ -2571,8 +2575,40 @@ def _write_json_deterministic(path, obj):
     if parent:
         os.makedirs(parent, exist_ok=True)
     text = json.dumps(obj, sort_keys=True, indent=2) + "\n"
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
+    write_json_report(path, text)
+
+
+def write_json_report(path, text):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".bcpack_history_calib-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def write_outputs(out_path, docs, pools):
