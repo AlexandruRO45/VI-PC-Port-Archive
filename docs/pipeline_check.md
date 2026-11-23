@@ -306,7 +306,13 @@ Measured on Windows 11, RTX 3080 (NVIDIA 621.14), 32 GB RAM, the wave64-emulated
   the gate never admits large modules that together can't fit under it.
 - A driver that crashes instead of returning an error when its allocation fails is handled as any other crash:
   `--inflight-file` and `--isolate` name the module, and the `pipelines` stage of `make_game.py` retries it alone.
-- `--isolate` children run in the same job and get the same cap each.
+- `--isolate` children run in the same job and get the same cap each. They run one after the other, so at most
+  one capped child compiles at a time and the per-process limit also bounds the total.
+- An allocation in the checker itself can fail under a tight cap (`std::bad_alloc`; seen once on an RX 6800 XT at
+  2048 MiB with 8 threads and a cold driver cache, in the review of #8371). That entry's pipeline is counted as
+  failed, `PIPELINE FAIL <name> (out of memory in the checker under --memory-cap-mb N; try a larger cap or fewer
+  --jobs)`, and the other entries are checked; before, the process ended with an uncaught exception.
+  `VK_PIPELINE_CHECK_SIMULATE_BAD_ALLOC=<name substring>` throws it on purpose, for tests.
 - Off Windows there is no default cap, and `--memory-cap-mb N` with N > 0 is refused with exit 2 (not implemented
   there) rather than reported as installed. On Linux a container or `systemd-run -p MemoryMax=...` caps the
   process, and the budget above reads that limit.

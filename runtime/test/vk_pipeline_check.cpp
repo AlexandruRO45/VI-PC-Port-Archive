@@ -52,6 +52,9 @@
 //                 is an error (exit 2) before any Vulkan call, since the caller asked for the containment.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE=1 makes setting up the memory cap fail (on every platform),
 //                 for testing the warning and the error above.
+//   test hook     VK_PIPELINE_CHECK_SIMULATE_BAD_ALLOC=<module name substring> throws std::bad_alloc just before the
+//                 pipeline of a matching module, as an allocation under the cap can: its pipeline is counted as
+//                 failed ("out of memory in the checker") and the other modules are checked.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] simulates a process crash
 //                 just before the pipeline of a matching module is created. For testing --isolate and the
 //                 pipelines stage's retry.
@@ -85,6 +88,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -1629,10 +1633,16 @@ int main(int argc, char** argv) {
 #endif
             std::raise(sim_crash.sig);
         }
+        static const std::string sim_bad_alloc = [] {   // test hook, see the header
+            const char* v = std::getenv("VK_PIPELINE_CHECK_SIMULATE_BAD_ALLOC");
+            return std::string(v ? v : "");
+        }();
+        if (!sim_bad_alloc.empty() && name.find(sim_bad_alloc) != std::string::npos) throw std::bad_alloc();
     };
 
-    auto worker = [&] {
-        for (size_t k; (k = next++) < work.size();) {
+    // One index entry: its module and pipeline, on the worker thread that took it. `worker` below runs it with
+    // std::bad_alloc caught.
+    auto check_module = [&](size_t k) {
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
@@ -1646,7 +1656,7 @@ int main(int argc, char** argv) {
                                 name.c_str(), stage.c_str());
                 }
                 ++done;
-                continue;
+                return;
             }
             std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
             const std::streamoff file_size = f.tellg();
@@ -1658,7 +1668,7 @@ int main(int argc, char** argv) {
                                 name.c_str(), static_cast<long long>(file_size), max_bytes);
                 }
                 ++done;
-                continue;
+                return;
             }
             uint32_t shared_memory_limit = 0;
             if (stage == "cs") shared_memory_limit = props.limits.maxComputeSharedMemorySize;
@@ -1670,13 +1680,13 @@ int main(int argc, char** argv) {
                 std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds %s %u)\n",
                             name.c_str(), meta.lds_bytes, limit_name, shared_memory_limit);
                 ++done;
-                continue;
+                return;
             }
             if (const std::string miss = check_missing_module_feature(meta); !miss.empty()) {
                 // No module was attempted, so only the pipeline skip is counted.
                 record_skip(name, stage, miss);
                 ++done;
-                continue;
+                return;
             }
             // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
             // module have been destroyed, including on failure. The watchdog and cache writer don't take this lock.
@@ -1940,6 +1950,31 @@ int main(int argc, char** argv) {
             if (++done % 1000 == 0) {
                 std::lock_guard<std::mutex> g(mu);
                 std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", size_t(done), work.size(), elapsed());
+            }
+    };
+    // An allocation in the checker can fail under --memory-cap-mb (reported in #8371 on an RX 6800 XT, 2048 MiB, 8
+    // threads, cold driver cache). Its pipeline is counted as failed, named with the cap, and the thread goes
+    // on with the next entry, instead of std::bad_alloc ending the process. The locks and the large-module ticket
+    // are scoped, so unwinding releases them; a shader module created before the failure is not destroyed.
+    auto worker = [&] {
+        for (size_t k; (k = next++) < work.size();) {
+            try {
+                check_module(k);
+            } catch (const std::bad_alloc&) {
+                std::lock_guard<std::mutex> g(mu);
+                const std::string& name = *work[k].first;
+                const std::string& stage = work[k].second->stage;
+                // A failed pipeline, as a --skip-file entry is: the entry's pipeline never completed, whether the
+                // allocation failed before or after its module, so the stage's pipeline counts still add up.
+                stats[stage].pipes_bad++;
+                if (cap_ok && memory_cap_mb)
+                    std::printf("PIPELINE FAIL %s (out of memory in the checker under --memory-cap-mb %llu; try a "
+                                "larger cap or fewer --jobs)\n",
+                                name.c_str(), static_cast<unsigned long long>(memory_cap_mb));
+                else
+                    std::printf("PIPELINE FAIL %s (out of memory in the checker)\n", name.c_str());
+                if (inflight.erase(std::this_thread::get_id()) && inflight.empty()) write_inflight();
+                ++done;
             }
         }
     };
