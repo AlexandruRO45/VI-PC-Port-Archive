@@ -450,8 +450,8 @@ class WavValidationTest(unittest.TestCase):
                 for mode in ("models", "textures"):
                     p = os.path.join(out, name, mode)
                     os.makedirs(p, exist_ok=True)
-                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
-                        f.write("{}")
+                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                        f.write('{"Count": 0, "Items": []}\n')
                     with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
                         f.write(make_game.decoder_digest())
             audio_dir = os.path.join(out, "audio")
@@ -480,8 +480,8 @@ class WavValidationTest(unittest.TestCase):
                 for mode in ("models", "textures"):
                     p = os.path.join(out, name, mode)
                     os.makedirs(p, exist_ok=True)
-                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
-                        f.write("{}")
+                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                        f.write('{"Count": 0, "Items": []}\n')
                     with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
                         f.write(make_game.decoder_digest())
 
@@ -515,8 +515,8 @@ class WavValidationTest(unittest.TestCase):
                 for mode in ("models", "textures"):
                     p = os.path.join(out, name, mode)
                     os.makedirs(p, exist_ok=True)
-                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
-                        f.write("{}")
+                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                        f.write('{"Count": 0, "Items": []}\n')
                     with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
                         f.write(make_game.decoder_digest())
             audio = os.path.join(out, "audio")
@@ -541,8 +541,8 @@ class WavValidationTest(unittest.TestCase):
                 for mode in ("models", "textures"):
                     p = os.path.join(out, name, mode)
                     os.makedirs(p, exist_ok=True)
-                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
-                        f.write("{}")
+                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                        f.write('{"Count": 0, "Items": []}\n')
                     with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
                         f.write(make_game.decoder_digest())
 

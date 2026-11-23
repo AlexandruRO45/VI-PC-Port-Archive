@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 
@@ -65,6 +67,47 @@ def run(*args):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class Rpf9dumpExitCodeTest(unittest.TestCase):
+    def test_make_game_resumes_missing_texture_from_real_export(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import make_game
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            game = Path(tmp) / "source"
+            game.mkdir()
+            texture_dictionary_rpf(game / "textures.rpf")
+            audio = work / "assets" / "audio"
+            audio.mkdir(parents=True)
+            for name in ("audio_manifest.json", "ogg.done", "xma.done"):
+                (audio / name).touch()
+
+            ran = []
+
+            def run_export(argv, *args, **kwargs):
+                result = run(*argv[1:])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                ran.append(argv[1])
+
+            with mock.patch.object(make_game, "MODEL_ARCHIVES", ["textures.rpf"]), \
+                    mock.patch.object(make_game, "rpf9dump", return_value="rpf9dump"), \
+                    mock.patch.object(make_game, "decoder_digest", return_value="fixture-decoder"), \
+                    mock.patch.object(make_game, "run", side_effect=run_export), \
+                    mock.patch.object(make_game.shutil, "which", return_value=None):
+                make_game.assets(str(game), str(work), False, 1)
+                self.assertEqual(ran, ["models", "textures"])
+                ran.clear()
+                folder = work / "assets" / "textures" / "textures"
+                dds = folder / "dictionary_at_0000000000001010" / "000_probe.dds"
+                expected = dds.read_bytes()
+                self.assertEqual(expected[:4], b"DDS ")
+                dds.unlink()
+                make_game.assets(str(game), str(work), False, 1)
+                self.assertEqual(ran, ["textures"])
+                self.assertEqual(dds.read_bytes(), expected)
+                ran.clear()
+                make_game.assets(str(game), str(work), False, 1)
+                self.assertEqual(ran, [])
+
     def test_missing_or_directory_source_exits_2_before_the_output_folder_is_created(self):
         # A mistyped source used to create <out>/<name> and then die with an unhandled FileNotFoundException
         # from FileInfo.Length. Both mistakes are usage errors (exit 2) and must leave the output alone.

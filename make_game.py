@@ -1844,6 +1844,7 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     # make_game.py also runs under python -I, which omits the script directory.
     if TOOLS not in sys.path:
         sys.path.insert(0, TOOLS)
+    import rpf_asset_resume
     import ttpf_assets
 
     get_exporter = functools.cache(rpf9dump)
@@ -1867,14 +1868,21 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         for mode in ("models", "textures"):
             folder = os.path.join(out, name, mode)
             record = os.path.join(folder, DECODER_RECORD)
-            if os.path.isdir(folder) and read_shader_setting(record) != decoder:
-                # rpf9dump keeps the files it finds, so another decoder's output is removed first. The exporter is
-                # built before that: a build that fails leaves the old export in place.
-                get_exporter(work)
-                log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
-                shutil.rmtree(folder)
-            elif os.path.isfile(os.path.join(folder, "manifest.json")):
-                continue
+            try:
+                rpf_asset_resume.check_unlinked(out)
+                rpf_asset_resume.check_unlinked(os.path.dirname(folder))
+                rpf_asset_resume.check_unlinked(folder)
+                rpf_asset_resume.check_unlinked(record)
+                if os.path.isdir(folder) and read_shader_setting(record) != decoder:
+                    # rpf9dump keeps the files it finds, so another decoder's output is removed first. The exporter is
+                    # built before that: a build that fails leaves the old export in place.
+                    get_exporter(work)
+                    log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
+                    shutil.rmtree(folder)
+                elif rpf_asset_resume.complete(folder, mode):
+                    continue
+            except (OSError, rpf_asset_resume.LinkedExport) as exc:
+                fail(f"assets: cannot resume {mode} from {rel}: {exc}")
             archive_todo.append((rel, mode, folder, record, src))
 
     # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
@@ -1937,9 +1945,18 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     for rel, mode, folder, record, src in archive_todo:
         log(f"assets: {mode} from {rel}")
         os.makedirs(folder, exist_ok=True)
+        try:
+            rpf_asset_resume.check_directories(folder, mode)
+            rpf_asset_resume.check_unlinked(record)
+        except (OSError, rpf_asset_resume.LinkedExport) as exc:
+            fail(f"assets: cannot resume {mode} from {rel}: {exc}")
         with open(record, "w", encoding="utf-8", newline="\n") as f:
             f.write(decoder + "\n")
         dump(mode, src, out)
+        try:
+            rpf_asset_resume.remember(folder, mode)
+        except (OSError, ValueError, RecursionError) as exc:
+            fail(f"assets: cannot record completed {mode} from {rel}: {exc}")
         progress.tick(force=True)
     for p, name, root, pool_dir, record in pool_todo:
         log(f"assets: texture pool {os.path.relpath(p, game)}")

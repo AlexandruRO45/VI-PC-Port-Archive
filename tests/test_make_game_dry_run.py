@@ -464,8 +464,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             for mode in ("models", "textures"):
                 dest = os.path.join(assets_dir, name, mode)
                 os.makedirs(dest, exist_ok=True)
-                with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write('{"Count": 0, "Items": []}\n')
                 with open(os.path.join(dest, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
                     f.write(make_game.decoder_digest())
 
@@ -543,10 +543,16 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         os.makedirs(os.path.join(self.tmp.name, "third_party", "rpf9-explorer", "Core"))
         os.makedirs(os.path.join(self.work_dir, "assets", "audio"))
 
+        def fake_run(cmd):
+            if cmd[0] == exe and cmd[1] in ("models", "textures"):
+                manifest = Path(cmd[3], "scene", cmd[1], "manifest.json")
+                manifest.write_text('{"Count": 0, "Items": []}\n', encoding="utf-8", newline="\n")
+
         with mock.patch.object(make_game, "ROOT", self.tmp.name), \
                 mock.patch.object(make_game, "MODEL_ARCHIVES", ["scene.rpf"]), \
                 mock.patch.object(make_game, "need"), mock.patch.object(make_game, "py"), \
-                mock.patch.object(make_game, "run") as run, mock.patch("shutil.which", return_value=None):
+                mock.patch.object(make_game, "run", side_effect=fake_run) as run, \
+                mock.patch("shutil.which", return_value=None):
             make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
 
         commands = [call.args[0] for call in run.call_args_list]

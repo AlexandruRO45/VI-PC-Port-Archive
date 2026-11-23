@@ -179,6 +179,11 @@ each archive's models and textures and each texture pool. When it changes, the a
 makes it again. Older work folders have no record, so their models, textures and pools are exported once more after
 upgrading.
 
+When the decoder matches, the assets stage checks the recorded OBJ and DDS outputs before reusing each RPF model
+or texture export. It checks that the files exist and hashes only the manifest. An incomplete export is retried
+for that archive and mode, reusing files already on disk.
+Older manifests get an inventory on the next run. A texture that the exporter skipped is left out of the inventory.
+
 Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run together when selected (they do not
 depend on each other). `pipelines` starts once the translated shaders are ready and, when this run includes runtime,
 that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the rest of assets; it creates every

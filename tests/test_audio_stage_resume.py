@@ -116,7 +116,9 @@ class AudioStageResumeTest(unittest.TestCase):
         for rel in make_game.MODEL_ARCHIVES:
             name = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
-                self.touch(self.work, "assets", name, mode, "manifest.json")
+                manifest = self.touch(self.work, "assets", name, mode, "manifest.json")
+                with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+                    f.write('{"Count": 0, "Items": []}\n')
                 with open(os.path.join(self.work, "assets", name, mode, make_game.DECODER_RECORD), "w") as f:
                     f.write(make_game.decoder_digest())
         self.touch(self.audio, "audio_manifest.json")
