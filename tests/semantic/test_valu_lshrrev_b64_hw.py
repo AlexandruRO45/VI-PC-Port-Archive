@@ -170,5 +170,86 @@ class TestVLshrrevB64AST(unittest.TestCase):
             Operand(RegType.VGPR, -1, size=2)
 
 
+class ScalarRegisterFile:
+    def __init__(self):
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+
+    def read_operand32(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        elif op.reg_type == RegType.IMM:
+            return op.value & MASK32
+        raise ValueError(f"Unknown reg_type: {op.reg_type}")
+
+    def read_operand64(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            lo = self.vgprs[op.index] & MASK32
+            hi = self.vgprs[op.index + 1] & MASK32
+            return (hi << 32) | lo
+        elif op.reg_type == RegType.SGPR:
+            lo = self.sgprs[op.index] & MASK32
+            hi = self.sgprs[op.index + 1] & MASK32
+            return (hi << 32) | lo
+        elif op.reg_type == RegType.IMM:
+            return op.value & MASK64
+        raise ValueError(f"Unknown reg_type: {op.reg_type}")
+
+    def write_vgpr64(self, idx: int, value64: int) -> None:
+        if not (0 <= idx <= 254):
+            raise ValueError(f"VGPR 64-bit pair index out of range: {idx}")
+        self.vgprs[idx] = value64 & MASK32
+        self.vgprs[idx + 1] = (value64 >> 32) & MASK32
+
+
+class ScalarVALUInterpreter:
+    @staticmethod
+    def execute(rf: ScalarRegisterFile, inst: VLshrrevB64Instruction) -> int:
+        sh = rf.read_operand32(inst.shift)
+        val = rf.read_operand64(inst.src)
+        res = ref_lshrrev_b64(sh, val)
+        rf.write_vgpr64(inst.dst.index, res)
+        return res
+
+
+class TestVLshrrevB64ScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter and execution model."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_scalar_execution_all_vgpr(self):
+        val = 0xABCDEF0112345678
+        self.rf.write_vgpr64(2, val)
+        self.rf.vgprs[4] = 8
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 0, size=2),
+            shift=Operand(RegType.VGPR, 4, size=1),
+            src=Operand(RegType.VGPR, 2, size=2),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = val >> 8
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[0], expected & MASK32)
+        self.assertEqual(self.rf.vgprs[1], (expected >> 32) & MASK32)
+
+    def test_scalar_execution_sgpr_and_imm(self):
+        val = 0x8000000000000000
+        self.rf.sgprs[2] = val & MASK32
+        self.rf.sgprs[3] = (val >> 32) & MASK32
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 4, size=2),
+            shift=Operand(RegType.IMM, 0, value=1, size=1),
+            src=Operand(RegType.SGPR, 2, size=2),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = 0x4000000000000000
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[4], expected & MASK32)
+        self.assertEqual(self.rf.vgprs[5], (expected >> 32) & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
