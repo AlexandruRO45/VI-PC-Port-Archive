@@ -153,12 +153,27 @@ std::array<std::atomic<Module*>, kMaxMappedTlsModules> g_tls_slot_owners{};
 std::array<std::atomic<uint64_t>, kMaxMappedTlsModules> g_tls_slot_generations{};
 std::atomic<uint64_t> g_next_tls_generation{1};
 std::vector<TlsCloneRecord> g_tls_clones;
+bool g_tls_event_hooked = false;
+
+void set_host_thread_event_hook(HMODULE module, void(__cdecl* fn)(DWORD)) {
+    if (!module) return;
+    using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
+    if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(module, "gta6rt_tls_host_set_thread_event"))) {
+        set(fn);
+        g_tls_event_hooked = (fn != nullptr);
+    }
+}
 
 // Frees every TLS helper clone this process loaded and deletes its files. load() registers the wrapper with atexit;
 // the --run path in main() must also call this directly before ExitProcess, which skips the atexit table. Call it
 // only when no mapped code can run again: it unmaps the helper images.
 void cleanup_tls_clones_internal() {
+    std::lock_guard alloc_lock(g_tls_alloc_mutex);
+    if (g_tls_hosts[0].module && g_tls_event_hooked) set_host_thread_event_hook(g_tls_hosts[0].module, nullptr);
     for (const auto& rec : g_tls_clones) {
+        for (size_t i = 1; i < kMaxMappedTlsModules; ++i) {
+            if (g_tls_hosts[i].module == rec.module) g_tls_hosts[i] = {};
+        }
         if (rec.module) FreeLibrary(rec.module);
         if (!rec.path.empty()) DeleteFileW(rec.path.c_str());
     }
@@ -243,9 +258,7 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
     host.index = *reinterpret_cast<DWORD*>(tls->AddressOfIndex);
     if (hook_thread_events) {
         // Only the primary helper reports thread attach/detach events; on_host_thread_event iterates all active slots.
-        using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
-        if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event")))
-            set(&on_host_thread_event);
+        set_host_thread_event_hook(host.module, &on_host_thread_event);
     }
     return host;
 }
@@ -253,6 +266,8 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
 // Must be called with g_tls_alloc_mutex held and WITHOUT g_tls_lock held (LoadLibraryExW takes the Windows loader lock).
 TlsHostModule ensure_tls_host(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return {};
+    if (g_tls_hosts[0].module && !g_tls_event_hooked)
+        set_host_thread_event_hook(g_tls_hosts[0].module, &on_host_thread_event);
     if (g_tls_hosts[slot].index != TLS_OUT_OF_INDEXES) return g_tls_hosts[slot];
 
     const std::filesystem::path primary = tls_host_base_path();
