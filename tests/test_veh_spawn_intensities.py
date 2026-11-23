@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import veh_spawn_intensities as vsi  # noqa: E402
 
-# Entries shaped like the table: one 7-band ladder, one variant with mud in band 6, one 2-band.
+# Entries shaped like the table: one 7-band ladder, one variant with mud in band 6, one 2-band,
+# and a fourth that repeats the first entry's sets and rain fields so the group columns merge.
 A_SETS = [(-1.0, 0.0, 0.0, 0.0), (0.0, 0.1, 0.0, 0.0), (0.1, 0.2, 0.0, 0.0), (0.2, 0.4, 0.0, 0.0),
           (0.3, 0.6, 0.0, 0.0), (0.4, 0.8, 0.0, 0.0), (0.5, 1.0, 0.8, 1.0)]
 B_SETS = A_SETS[:5] + [(0.45, 0.9, 0.9, 1.0), (0.5, 1.0, 0.8, 1.0)]
@@ -50,6 +51,13 @@ DOC = """<?xml version="1.0" encoding="UTF-8"?>
       </IntensitySets>
       <DirtRainChance value="0.300000" /><DirtRainMin value="0.300000" /><DirtRainMax value="0.500000" />
     </Item>
+    <Item key="spawn_delta_test">
+      <Name>spawn_delta_test</Name>
+      <IntensitySets>
+        {a_sets}
+      </IntensitySets>
+      <DirtRainChance value="0.500000" /><DirtRainMin value="0.700000" /><DirtRainMax value="1.000000" />
+    </Item>
   </VehSpawnIntensities>
 </CGraphicsDefinitionsData>
 """.format(
@@ -63,11 +71,11 @@ DOC = """<?xml version="1.0" encoding="UTF-8"?>
 
 WANT = {
     "bands_with_mud": [0, 0, 0, 0, 0, 1, 2],
-    "entries": 3,
-    "rain_group_sizes": [1, 1, 1],
+    "entries": 4,
+    "rain_group_sizes": [2, 1, 1],
     "rain_groups": 3,
     "set_counts": [2, 7],
-    "signature_groups": [1, 1, 1],
+    "signature_groups": [2, 1, 1],
     "signatures": 3,
     "per_set_ranges": [
         {"DirtMax": [0.0, 0.3], "DirtMin": [-1.0, 0.1], "MudMax": [0.0, 0.0], "MudMin": [0.0, 0.0]},
@@ -94,6 +102,24 @@ class RecordsTest(unittest.TestCase):
             self.assertEqual(vsi.census(write_doc(tmp)), WANT)
 
 
+class GroupingTest(unittest.TestCase):
+    """The two group columns are where the docs' band-shape and rain figures come from, so they
+    need entries that really share a signature and a rain tuple, counted once per group, largest
+    group first."""
+
+    def test_shared_signatures_and_rain_are_merged_into_groups(self):
+        items = [{"key": "a", "sets": tuple(A_SETS), "rain": (0.5, 0.7, 1.0)},
+                 {"key": "b", "sets": tuple(A_SETS), "rain": (0.5, 0.7, 1.0)},
+                 {"key": "c", "sets": tuple(C_SETS), "rain": (0.3, 0.3, 0.5)}]
+        got = vsi.aggregate(items)
+        self.assertEqual(got["entries"], 3)
+        self.assertEqual(got["signatures"], 2)
+        self.assertEqual(got["signature_groups"], [2, 1])
+        self.assertEqual(got["rain_groups"], 2)
+        self.assertEqual(got["rain_group_sizes"], [2, 1])
+        self.assertEqual(got["bands_with_mud"], [0, 0, 0, 0, 0, 0, 1])
+
+
 class CliTest(unittest.TestCase):
     def run_tool(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -107,7 +133,8 @@ class CliTest(unittest.TestCase):
             self.assertEqual(status, 0, err)
             self.assertEqual(json.loads(out), WANT)
             # Entry keys and Name values are the table's own text: the aggregate never carries them.
-            for token in ("spawn_alpha_test", "spawn_beta_test", "spawn_gamma_test"):
+            for token in ("spawn_alpha_test", "spawn_beta_test", "spawn_gamma_test",
+                          "spawn_delta_test"):
                 self.assertNotIn(token, out)
                 self.assertNotIn(token, err)
 
