@@ -129,6 +129,27 @@ class TestSLshlB32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x23456780)
 
+def ref_s_lshr_b32(src: int, shift: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_lshr_b32 -> (result, scc)."""
+    sh = shift & 31
+    res = (src & MASK32) >> sh
+    scc = 1 if res != 0 else 0
+    return res, scc
+
+
+class TestSLshrB32Oracle(unittest.TestCase):
+    def test_basic_shifts(self) -> None:
+        self.assertEqual(ref_s_lshr_b32(16, 4), (1, 1))
+        self.assertEqual(ref_s_lshr_b32(0x12345678, 8), (0x00123456, 1))
+
+    def test_zero_result_and_scc(self) -> None:
+        self.assertEqual(ref_s_lshr_b32(0, 4), (0, 0))
+        self.assertEqual(ref_s_lshr_b32(1, 1), (0, 0))
+
+    def test_shift_count_masking(self) -> None:
+        self.assertEqual(ref_s_lshr_b32(0x10, 32), (0x10, 1))
+        self.assertEqual(ref_s_lshr_b32(0x10, 33), (0x08, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
