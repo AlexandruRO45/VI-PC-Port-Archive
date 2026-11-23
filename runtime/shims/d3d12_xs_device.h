@@ -35,6 +35,8 @@
 //   slot 13   CheckFeatureSupport keeps the PC signature, but a D3D12_OPTIONS request with a structure larger than
 //             the PC's (0x40 against 0x3C, measured on a retail console title) is answered from the PC runtime's
 //             structure with the extra bytes zeroed; the PC runtime refuses that size. See d3d12_console_feature.h.
+//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
+//             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
