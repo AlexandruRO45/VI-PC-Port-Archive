@@ -517,5 +517,60 @@ class TestVPermB32IEEE754(unittest.TestCase):
                 self.assertEqual(hw_res, ref_res)
 
 
+class TestVPermB32NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_perm_b32."""
+
+    def test_rejection_of_invalid_syntax(self):
+        lines_missing = [
+            "v_mov_b32 v1, 1",
+            "v_perm_b32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_perm_err", lines_missing)
+
+    def test_rejection_of_out_of_bounds_register(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 106)
+
+    def test_mutation_detection_swapped_sources(self):
+        def bad_oracle_swapped(s0, s1, sel):
+            # Swaps s0 and s1 in packed container
+            packed = ((s1 & MASK32) << 32) | (s0 & MASK32)
+            out = 0
+            for i in range(4):
+                sb = (sel >> (8 * i)) & 0xFF
+                if sb < 8:
+                    byte_val = (packed >> (8 * sb)) & 0xFF
+                else:
+                    byte_val = 0
+                out |= byte_val << (8 * i)
+            return out & MASK32
+
+        s0, s1 = 0x07060504, 0x03020100
+        self.assertNotEqual(ref_perm_b32(s0, s1, 0x03020100), bad_oracle_swapped(s0, s1, 0x03020100))
+
+    def test_mutation_detection_wrong_constant_code(self):
+        def bad_oracle_const(s0, s1, sel):
+            # Treats 12 as 0xFF instead of 0x00
+            out = 0
+            for i in range(4):
+                sb = (sel >> (8 * i)) & 0xFF
+                if sb == 12:
+                    byte_val = 0xFF
+                else:
+                    byte_val = 0x00
+                out |= byte_val << (8 * i)
+            return out & MASK32
+
+        s0, s1 = 0, 0
+        self.assertNotEqual(ref_perm_b32(s0, s1, 0x0C0C0C0C), bad_oracle_const(s0, s1, 0x0C0C0C0C))
+
+
 if __name__ == "__main__":
     unittest.main()
