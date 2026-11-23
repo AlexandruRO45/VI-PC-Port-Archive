@@ -280,5 +280,30 @@ class TestDSWriteB16RegisterAliasing(unittest.TestCase):
         self.assertEqual(state.vgprs[1], 0x0080)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Invariance
+# ==============================================================================
+
+class TestDSWriteB16StatusFlags(unittest.TestCase):
+    def test_scc_invariance(self):
+        state = ScalarThreadState()
+        interp = ScalarDSInterpreter()
+        state.scc = 1
+        state.vgprs[1] = 0x80
+        state.vgprs[2] = 0x1234
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=0)
+        interp.execute(state, inst)
+        # LDS operations leave SCC unchanged
+        self.assertEqual(state.scc, 1)
+
+    def test_exec_mask_invariance(self):
+        wave = SIMDWave(wave_size=64)
+        orig_mask = 0x1234_5678_9ABC_DEF0
+        wave.exec_mask = orig_mask
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=0)
+        wave.step(inst)
+        self.assertEqual(wave.exec_mask, orig_mask)
+
+
 if __name__ == '__main__':
     unittest.main()
