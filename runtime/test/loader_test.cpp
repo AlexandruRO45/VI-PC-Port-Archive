@@ -8,6 +8,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -682,9 +684,18 @@ bool g_use_fls = false;
 DWORD g_fls_index = FLS_OUT_OF_INDEXES;
 int g_fls_callbacks = 0;
 
+// DllMain's lpvReserved for its last DLL_PROCESS_ATTACH, and whether one was seen.
+void* g_attach_reserved = nullptr;
+bool g_attach_seen = false;
+
 void observe_notification(void* base, DWORD reason, void* reserved, bool tls) {
     g_notifications.push_back({base, reason, tls});
-    if (reserved) g_detach_state_live = false;
+    if (reason == DLL_PROCESS_ATTACH && !tls) {
+        g_attach_reserved = reserved;
+        g_attach_seen = true;
+    }
+    // ~Loader unmaps the image after the detach, which is FreeLibrary's case: lpvReserved is NULL there.
+    if (reason == DLL_PROCESS_DETACH && reserved) g_detach_state_live = false;
     if (reason != DLL_PROCESS_DETACH) return;
     for (const auto& m : g_live_modules) {
         MEMORY_BASIC_INFORMATION info{};
@@ -730,6 +741,8 @@ void reset_notifications() {
     g_fail_attach = false;
     g_use_fls = false;
     g_fls_callbacks = 0;
+    g_attach_reserved = nullptr;
+    g_attach_seen = false;
 }
 
 void expect_notifications(const char* what, const std::vector<Notification>& expected) {
@@ -859,6 +872,37 @@ void test_process_detach_without_entry() {
                          {{first_base, DLL_PROCESS_ATTACH, true}, {first_base, DLL_PROCESS_ATTACH, false},
                           {first_base, DLL_PROCESS_DETACH, true}, {first_base, DLL_PROCESS_DETACH, false}});
     reset_notifications();
+}
+
+// DllMain docs (learn.microsoft.com/windows/win32/dlls/dllmain): "If fdwReason is DLL_PROCESS_ATTACH, lpvReserved is
+// NULL for dynamic loads and non-NULL for static loads." Loader::load() from the host is the process-start graph (the
+// executable and the DLLs it imports), a run-time LoadLibrary of a bundled DLL is a dynamic load.
+void test_attach_reserved() {
+    reset_notifications();
+    try {
+        rt::Loader loader(g_dir);
+        loader.load(write_image(make_lifecycle_image()));
+        loader.initialise();
+        if (!g_attach_seen) failed("a static load's DllMain gets a non-NULL lpvReserved", "DllMain was not called");
+        else if (!g_attach_reserved) failed("a static load's DllMain gets a non-NULL lpvReserved", "lpvReserved was NULL");
+        else pass("a static load's DllMain gets a non-NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a static load's DllMain gets a non-NULL lpvReserved", e.what());
+    }
+
+    reset_notifications();
+    try {
+        write_image_as(make_lifecycle_image(), "attach_reserved_dynamic.dll");
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* h = loader.load_runtime_module("attach_reserved_dynamic.dll", 0, handled);
+        if (!handled || !h) failed("a run-time load's DllMain gets a NULL lpvReserved", "the run-time load failed");
+        else if (!g_attach_seen) failed("a run-time load's DllMain gets a NULL lpvReserved", "DllMain was not called");
+        else if (g_attach_reserved) failed("a run-time load's DllMain gets a NULL lpvReserved", "lpvReserved was non-NULL");
+        else pass("a run-time load's DllMain gets a NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
 }
 
 void test_process_detach_dependencies() {
@@ -1149,6 +1193,58 @@ void test_unwind_registration() {
 
 // An export whose address-table entry is past SizeOfImage (not a forwarder: outside the export directory) is
 // refused instead of being stored as base + rva, a pointer outside the mapping.
+// The address-to-module lookup the shim registry uses (on every C++ throw from a mapped image, and for trace and
+// stop lines) runs on whatever thread asks, while another thread may be inside load(). It used to walk the Loader's
+// module vector with no lock while load() appended to it. Without the fix this fails for certain only under
+// AddressSanitizer; here it checks that every answer given during 300 loads is right.
+void test_lookup_during_loads() {
+    const char* what = "the address lookup is right while another thread loads modules";
+    try {
+        rt::Loader loader(g_dir);
+        auto first = make_image();
+        auto* first_nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(first.data() + 0x80);
+        first_nt->OptionalHeader.ImageBase = 0x200000000ull;
+        rt::Module& anchor = loader.load(write_image(first));
+        const uint64_t inside = reinterpret_cast<uint64_t>(anchor.base) + 0x1004;
+
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned> lookups{0}, wrong{0};
+        std::thread reader([&] {
+            while (!stop.load()) {
+                uint64_t base = 0;
+                if (!rt::shims::mapped_image_base(inside, base) || base != reinterpret_cast<uint64_t>(anchor.base))
+                    ++wrong;
+                if (rt::shims::module_offset(inside).find("+0x1004") == std::string::npos) ++wrong;
+                uint64_t none = 0;
+                if (rt::shims::mapped_image_base(0x10, none)) ++wrong;  // in no image
+                ++lookups;
+            }
+        });
+        unsigned loaded = 0;
+        for (unsigned i = 1; i <= 300; ++i) {
+            auto img = make_image();
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(img.data() + 0x80);
+            nt->OptionalHeader.ImageBase = 0x200000000ull + i * 0x10000ull;
+            rt::Module& m = loader.load(write_image(img));
+            uint64_t base = 0;
+            if (rt::shims::mapped_image_base(reinterpret_cast<uint64_t>(m.base) + 0x1000, base) &&
+                base == reinterpret_cast<uint64_t>(m.base))
+                ++loaded;
+        }
+        while (lookups.load() < 1000) std::this_thread::yield();
+        stop = true;
+        reader.join();
+        if (wrong.load())
+            failed(what, std::to_string(wrong.load()) + " wrong answers in " + std::to_string(lookups.load()) + " lookups");
+        else if (loaded != 300)
+            failed(what, "only " + std::to_string(loaded) + " of 300 new modules were found by address");
+        else
+            pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_export_bounds() {
     auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
     nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
@@ -1249,6 +1345,7 @@ int main() {
         test_process_detach();
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
+        test_attach_reserved();
         test_process_detach_dependencies();
         test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
@@ -1256,6 +1353,7 @@ int main() {
         test_export_bounds();
         test_tls_directory_count();
         test_unwind_registration();
+        test_lookup_during_loads();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());
