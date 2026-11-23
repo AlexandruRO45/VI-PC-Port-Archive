@@ -14,8 +14,9 @@ several). A shim note then says whether the executable calls a runtime class tha
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
 `constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
 
-Output: Markdown, to stdout or --out (LF). Exit status 0 on success; 1 when a --gdk-calls file can't be read or
-the checklist cannot be written to --out; 2 when --out refers to an input report.
+Output: Markdown, to stdout or --out (LF). Keep reusable output files outside the scanned source locations.
+Exit status 0 on success; 1 when a --gdk-calls file can't be read or the checklist cannot be written to --out;
+2 when --out would overwrite a scanned source or an input report.
 Standard library only.
 Usage: `python -I tools/exe_checklist.py --help` lists the options.
 """
@@ -108,29 +109,37 @@ def doc_notes(path: str, rel: str) -> list[dict]:
     return notes
 
 
-def collect(root: str) -> list[dict]:
-    notes = []
+def source_paths(root: str):
+    """The C++ and Markdown inputs, including files that do not contain notes."""
     for d in SOURCE_DIRS:
         base = os.path.join(root, d)
         for dirpath, _dirs, files in sorted(os.walk(base)):
             for name in sorted(files):
                 if name.endswith(SOURCE_EXTS):
-                    path = os.path.join(dirpath, name)
-                    rel = os.path.relpath(path, root).replace(os.sep, "/")
-                    found = code_notes(path, rel)
-                    if not found:
-                        continue
-                    # The classes belong to the file, so parse them once and give every note from it the same list.
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        classes = sorted(served_classes(f.read()))
-                    for n in found:
-                        n["classes"] = classes
-                    notes += found
+                    yield os.path.join(dirpath, name)
     docs = os.path.join(root, "docs")
     if os.path.isdir(docs):
         for name in sorted(os.listdir(docs)):
             if name.endswith(".md"):
-                notes += doc_notes(os.path.join(docs, name), f"docs/{name}")
+                yield os.path.join(docs, name)
+
+
+def collect(root: str, paths=None) -> list[dict]:
+    notes = []
+    for path in source_paths(root) if paths is None else paths:
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        if path.endswith(".md"):
+            notes += doc_notes(path, rel)
+            continue
+        found = code_notes(path, rel)
+        if not found:
+            continue
+        # The classes belong to the file, so parse them once and give every note from it the same list.
+        with open(path, encoding="utf-8", errors="replace") as f:
+            classes = sorted(served_classes(f.read()))
+        for n in found:
+            n["classes"] = classes
+        notes += found
     return notes
 
 
@@ -187,10 +196,16 @@ def main(argv: list[str] | None = None) -> int:
     if a.out and os.path.isdir(a.out):
         print(f"error: --out path is a directory: {a.out}", file=sys.stderr)
         return 2
+    sources = None
     if a.out:
         for report in a.gdk_calls:
             if same_report_path(a.out, report):
                 ap.error(f"--out {a.out} would overwrite the --gdk-calls report {report}")
+        if os.path.exists(a.out):
+            sources = list(source_paths(a.root))
+            for source in sources:
+                if same_report_path(a.out, source):
+                    ap.error(f"--out {a.out} would overwrite the checklist source {source}")
     called = None
     if a.gdk_calls:
         try:
@@ -198,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError, AttributeError) as e:
             print(f"cannot read the gdk_runtime_calls report: {e}", file=sys.stderr)
             return 1
-    text = render(collect(a.root), called)
+    text = render(collect(a.root, sources), called)
     if a.out:
         try:
             with open(a.out, "w", encoding="utf-8", newline="\n") as f:

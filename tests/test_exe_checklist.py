@@ -116,6 +116,7 @@ class ExeChecklist(unittest.TestCase):
         with open(report, "w", encoding="utf-8") as f:
             json.dump({"images": [{"classes": [{"class_id": SAVE_CLASS.upper()}]}]}, f)
         out = os.path.join(self.root, "checklist.md")
+        Path(out).write_bytes(b"old checklist")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report, "--out", out]), 0)
         with open(out, "rb") as f:
@@ -161,10 +162,10 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
-    def assert_report_output_rejected(self, reports, output):
-        original = [report.read_bytes() for report in reports]
+    def assert_output_rejected(self, inputs, output, gdk_calls=()):
+        original = [path.read_bytes() for path in inputs]
         args = ["--root", self.root, "--out", str(output)]
-        for report in reports:
+        for report in gdk_calls:
             args.extend(["--gdk-calls", str(report)])
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
@@ -172,7 +173,7 @@ class ExeChecklist(unittest.TestCase):
                 ec.main(args)
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("would overwrite", stderr.getvalue())
-        self.assertEqual([report.read_bytes() for report in reports], original)
+        self.assertEqual([path.read_bytes() for path in inputs], original)
 
     def test_an_out_that_cannot_be_written_is_exit_1(self):
         # --out under a folder that does not exist was a FileNotFoundError traceback.
@@ -187,7 +188,7 @@ class ExeChecklist(unittest.TestCase):
         second = Path(self.root, "second.json")
         first.write_bytes(b'{"classes": []}')
         second.write_bytes(b'{"images": []}')
-        self.assert_report_output_rejected([first, second], second)
+        self.assert_output_rejected([first, second], second, gdk_calls=[first, second])
 
     def test_out_cannot_overwrite_a_hard_link_to_an_input_report(self):
         report = Path(self.root, "report.json")
@@ -197,7 +198,21 @@ class ExeChecklist(unittest.TestCase):
             os.link(report, alias)
         except (OSError, NotImplementedError) as err:
             self.skipTest(f"hard links unavailable: {err}")
-        self.assert_report_output_rejected([report], alias)
+        self.assert_output_rejected([report], alias, gdk_calls=[report])
+
+    def test_out_cannot_overwrite_a_scanned_markdown_file(self):
+        doc = Path(self.root, "docs", "demo.md")
+        self.assert_output_rejected([doc], doc)
+
+    def test_out_cannot_overwrite_a_hard_link_to_source_without_notes(self):
+        source = Path(self.root, "runtime", "shims", "plain.inl")
+        alias = Path(self.root, "checklist.md")
+        source.write_bytes(b"int demo();\n")
+        try:
+            os.link(source, alias)
+        except (OSError, NotImplementedError) as err:
+            self.skipTest(f"hard links unavailable: {err}")
+        self.assert_output_rejected([source], alias)
 
     def test_this_repository(self):
         notes = ec.collect(ROOT)
