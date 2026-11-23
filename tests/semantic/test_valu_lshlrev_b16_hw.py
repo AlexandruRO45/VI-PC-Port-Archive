@@ -318,3 +318,33 @@ class TestValuLshlrevB16ConditionCodes(unittest.TestCase):
         self.assertEqual(res, 0)
         self.assertEqual(scc, 0)
         self.assertEqual(vcc, 0)
+
+
+class TestValuLshlrevB16BitwiseEdgeCases(unittest.TestCase):
+    """Test suite for 16-bit float bit patterns and boundary checkerboard masks."""
+
+    def test_ieee754_half_precision_bit_patterns(self):
+        # Float16 bit patterns: +inf, -inf, qNaN, sNaN, +0, -0, min subnormal, max subnormal
+        cases = [
+            0x7C00,  # +inf
+            0xFC00,  # -inf
+            0x7E00,  # Quiet NaN
+            0x7C01,  # Signaling NaN
+            0x0000,  # +0.0
+            0x8000,  # -0.0
+            0x0001,  # Minimum subnormal
+            0x03FF,  # Maximum subnormal
+        ]
+        for pattern in cases:
+            for shift in (0, 1, 8, 15):
+                with self.subTest(pattern=hex(pattern), shift=shift):
+                    res = ref_lshlrev_b16(shift, pattern)
+                    expected = (pattern << shift) & MASK16
+                    self.assertEqual(res, expected)
+
+    def test_boundary_checkerboard_bitmasks(self):
+        checkerboards = [0x5555, 0xAAAA, 0x3333, 0xCCCC, 0x0F0F, 0xF0F0, 0x00FF, 0xFF00]
+        for cb in checkerboards:
+            for shift in (0, 1, 4, 8, 12, 15):
+                res = ref_lshlrev_b16(shift, cb)
+                self.assertEqual(res, (cb << shift) & MASK16)
