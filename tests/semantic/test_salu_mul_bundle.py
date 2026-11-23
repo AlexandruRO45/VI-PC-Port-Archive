@@ -416,5 +416,22 @@ class TestSMulHiI32IntegerOverflowExtremes(unittest.TestCase):
         # (-2^31) * (2^31 - 1) = -2^62 + 2^31 = 0xC0000000_80000000 -> high 32 bits is 0xC0000000
         self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0x7FFFFFFF), 0xC0000000)
 
+class TestSMulHiI32TranslatorIntegration(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available in this Python environment")
+        lines = [
+            "s_mov_b32 s0, 0xffffffff",
+            "s_mov_b32 s1, 0x5",
+            "s_mul_hi_i32 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_s_mul_hi_i32", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
