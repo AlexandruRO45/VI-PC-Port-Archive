@@ -335,8 +335,8 @@ class _Types:
             members = (self.copy_value(kind[1], item) for item in value)
         elif kind[0] == "struct":
             members = (self.copy_value(member, item) for member, item in zip(kind[1], value))
-        elif kind[0] == "vec" and isinstance(value, list):
-            return value.copy()
+        elif kind[0] == "vec" and isinstance(value, (list, tuple)):
+            return tuple(value)
         else:
             return value
         return type(value)(members)
@@ -614,7 +614,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             constants[res] = values[res] = types.zero(a[0])
             id_type[res] = a[0]
         elif op == "OpConstantComposite":           # a constant array or vector (e.g. %fmt_size_tab's table)
-            values[res] = [values[x] for x in a[1:]]
+            vals = [values[x] for x in a[1:]]
+            values[res] = tuple(vals) if types.t.get(a[0], (None,))[0] == "vec" else vals
             id_type[res] = a[0]
         elif op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
@@ -626,7 +627,10 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 pc_type[res] = pointee
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
-                var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
+                if types.t.get(pointee, (None,))[0] == "vec" and isinstance(init, (list, tuple)):
+                    var_box[res] = [tuple(init)]
+                else:
+                    var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
             elif cls == "Workgroup" and workgroup is not None and res in workgroup:
                 var_box[res] = workgroup[res]          # another invocation of the workgroup made it
             elif cls in ("Function", "Output", "Workgroup", "Private"):
@@ -652,8 +656,18 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
     check_structure(body)
 
     def deref(p):
+        if p[0] == "vec":
+            return deref(p[1])[p[2]]
         box, i = p
         return box[i]
+
+    def store_ptr(p, value):
+        if p[0] == "vec":
+            parent, i = p[1], p[2]
+            cur = deref(parent)
+            store_ptr(parent, cur[:i] + (value,) + cur[i + 1:])
+            return
+        p[0][p[1]] = value
 
     def psb_word(addr):
         """The flat memory holds one 32-bit word per 4-byte-aligned byte address. Another address is undefined
@@ -811,7 +825,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 container = deref(p)
                 if not isinstance(container, (list, tuple)) or not 0 <= idx < len(container):
                     raise UnsupportedConstruct("OpAccessChain into non-array or out of range")
-                p = (container, idx)
+                p = ("vec", p, idx) if isinstance(container, tuple) else (container, idx)
             pointers[res] = p
         elif op == "OpLoad":
             p = pointers[a[1]]
@@ -846,7 +860,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                     raise UnsupportedConstruct("PhysicalStorageBuffer store of a value that is not a 32-bit integer")
                 memory[psb_word(p[1])] = v
             else:
-                p[0][p[1]] = types.copy_value(id_type.get(a[1]), val(a[1]))
+                store_ptr(p, types.copy_value(id_type.get(a[1]), val(a[1])))
         elif op in _ATOMICS:
             # One invocation, so an atomic is read, combine, write; the result is the original value (SPIR-V spec,
             # 3.42.18). Operands: result type, pointer, scope, semantics(, unequal semantics), value(, comparator).
@@ -877,7 +891,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             if p[0] == "psb":
                 memory[p[1]] = new & MASK
             else:
-                p[0][p[1]] = new & MASK
+                store_ptr(p, new & MASK)
             values[res] = old
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
