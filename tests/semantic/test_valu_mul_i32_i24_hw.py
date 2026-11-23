@@ -208,5 +208,23 @@ class TestMul24ScalarInterpreter(unittest.TestCase):
         self.assertEqual(words[0], (-30) & MASK32)
 
 
+class TestMul24SimdInteraction(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for v_mul_i32_i24."""
+
+    def test_simd_vector_cndmask_selection(self):
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_mul_i32_i24 v0, v1, v2",    # 200
+            "v_mov_b32 v3, -5",
+            "v_mul_i32_i24 v1, v1, v3",    # -50
+            "v_cndmask_b32 v2, v0, v1, vcc",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mul24_ps(lines, "ps_mul24_simd")
+        self.assertEqual(words[0], 200)
+        self.assertEqual(words[1], (-50) & MASK32)
+
+
 if __name__ == '__main__':
     unittest.main()
