@@ -41,13 +41,13 @@ public partial class CanIRunView : UserControl
         Headline.Text = Loc.T("Checking your PC…");
         detected = await Task.Run(HardwareDetector.Detect);
         ShowSpecs();
-        if (!state.Settings.Current.AllowOnline) { OnlineOff(); return; }
+        if (!state.Settings.Current.AllowChecker) { OnlineOff(); return; }
         await LoadCheckerAsync();
     }
 
     void OnlineOff()
     {
-        Headline.Text = Loc.T("Online features are off in Launcher settings, so only your hardware is shown.");
+        Headline.Text = Loc.T("The Can I Run checker is off (Settings › Online), so only your hardware is shown.");
         HeadDot.Fill = (Brush)FindResource("Faint");
         CompareStatus.Text = "";
         Tiles.ItemsSource = null;
@@ -256,7 +256,7 @@ public partial class CanIRunView : UserControl
         {
             detected = await Task.Run(HardwareDetector.Detect);
             ShowSpecs();
-            if (!state.Settings.Current.AllowOnline) { OnlineOff(); return; }
+            if (!state.Settings.Current.AllowChecker) { OnlineOff(); return; }
             if (pageReady) await CompareAsync();
             else if (web == null) await LoadCheckerAsync();
             else web.CoreWebView2?.Reload();   // the page failed to load before: try it again

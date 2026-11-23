@@ -34,6 +34,9 @@
               <MenuItem x:Name="MenuCheck" Header="Check my game files" Tag="&#xE9D5;" Click="OnCheckFiles"/>
               <MenuItem x:Name="MenuDryRun" Header="Check the game's imports (dry run)" Tag="&#xE943;" Click="OnDryRun"/>
               <Separator/>
+              <MenuItem x:Name="MenuProgress" Header="Build progress" Tag="&#xE9D9;" Click="OnShowBuild"/>
+              <MenuItem Header="Build history" Tag="&#xE81C;" Click="OnShowHistory"/>
+              <Separator/>
               <MenuItem Header="Open the port's folder" Tag="&#xE838;" Click="OnOpenOutput"/>
               <MenuItem Header="Open build logs" Tag="&#xE7C3;" Click="OnOpenLogs"/>
               <MenuItem Header="Open the Leonida folder" Tag="&#xE8B7;" Click="OnOpenRepo"/>
@@ -52,6 +55,17 @@
           <StackPanel>
             <TextBlock x:Name="TileTitle" Text="Not built yet" Style="{StaticResource CaptionText}" FontSize="17"/>
             <TextBlock x:Name="TileDetail" Foreground="#BDBDBD" FontSize="11.5" TextWrapping="Wrap" Margin="0,2,0,0"/>
+            <Rectangle Height="1" Fill="#2A2A2A" Margin="0,9,0,8"/>
+            <UniformGrid Columns="2">
+              <StackPanel>
+                <TextBlock Text="PLAYTIME" Foreground="#8E8E8E" FontSize="10" FontWeight="Bold"/>
+                <TextBlock x:Name="Playtime" Foreground="#FFFFFF" FontSize="12.5" FontWeight="SemiBold"/>
+              </StackPanel>
+              <StackPanel>
+                <TextBlock Text="LAST PLAYED" Foreground="#8E8E8E" FontSize="10" FontWeight="Bold"/>
+                <TextBlock x:Name="LastPlayed" Foreground="#FFFFFF" FontSize="12.5" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+              </StackPanel>
+            </UniformGrid>
           </StackPanel>
         </Border>
         <Grid Height="260">

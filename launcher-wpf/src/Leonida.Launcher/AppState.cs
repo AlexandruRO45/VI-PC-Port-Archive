@@ -93,6 +93,6 @@ public sealed class AppState : Observable
     public static void Open(string target)
     {
         try { Process.Start(new ProcessStartInfo(target) { UseShellExecute = true }); }
-        catch (Exception e) { System.Windows.MessageBox.Show($"Could not open {target}:\n{e.Message}", "Leonida Launcher"); }
+        catch (Exception e) { _ = Popup.Show("Could not open it", $"{target}\n\n{e.Message}", problem: true); }
     }
 }

@@ -26,6 +26,10 @@ public sealed class Builds
     public event Action? Changed;
     /// <summary>Raised on the UI thread before a new run's lines start (the console clears).</summary>
     public event Action? NewRun;
+    /// <summary>Raised on the UI thread when a build has ended and is in the history.</summary>
+    public event Action<HistoryEntry>? BuildEnded;
+    /// <summary>Raised on the UI thread when the port has exited: (dry run, how long, how it ended).</summary>
+    public event Action<bool, TimeSpan, SessionOutcome>? PortEnded;
 
     public List<string> Problems(BuildOptions o)
     {
@@ -72,7 +76,7 @@ public sealed class Builds
     {
         var m = s.Monitor;
         var sh = m.Shaders;
-        state.History.Add(new HistoryEntry
+        var entry = new HistoryEntry
         {
             Id = id, Started = s.Started, Ended = s.Ended, Seconds = s.Elapsed.TotalSeconds, Outcome = s.Outcome, ExitCode = s.ExitCode,
             CommandLine = s.CommandLineText, Options = o.Clone(),
@@ -85,10 +89,12 @@ public sealed class Builds
             TranslateSeconds = m.TranslateStarted is DateTime t0
                 ? ((m.Stages.FirstOrDefault(x => x.Name == "shaders")?.Ended ?? s.Ended ?? DateTime.Now) - t0).TotalSeconds : null,
             PeakMemoryBytes = s.PeakMemory, LogPath = s.LogPath, OutFolder = m.OutFolder,
-        });
+        };
+        state.History.Add(entry);
         try { Directory.Delete(progress, true); } catch (Exception) { }   // counts only; the log is the record
         state.NotifyBuildFinished();
         Changed?.Invoke();
+        BuildEnded?.Invoke(entry);
     }
 
     public async Task StopAsync()
@@ -128,6 +134,21 @@ public sealed class Builds
         return p;
     }
 
+    void PortExited(BuildSession s, bool dryRun)
+    {
+        if (!dryRun && s.Outcome != SessionOutcome.CouldNotStart)
+        {
+            var c = state.Settings.Current;
+            c.PlaySeconds += s.Elapsed.TotalSeconds;
+            c.PlaySessions++;
+            c.LastPlayed = s.Ended ?? DateTime.Now;
+            c.LastPlaySeconds = s.Elapsed.TotalSeconds;
+            try { state.Settings.Save(); } catch (IOException) { }
+        }
+        Changed?.Invoke();
+        PortEnded?.Invoke(dryRun, s.Elapsed, s.Outcome);
+    }
+
     /// <summary>gta6rt.exe --run (or --dry-run) on the game's executable, with Settings › Play's options.</summary>
     public bool StartPort(bool dryRun)
     {
@@ -143,7 +164,7 @@ public sealed class Builds
         LastLogPath = session.LogPath;
         NewRun?.Invoke();
         session.Line += Lines.Enqueue;
-        session.Exited += _ => Application.Current.Dispatcher.BeginInvoke(() => Changed?.Invoke());
+        session.Exited += s => Application.Current.Dispatcher.BeginInvoke(() => PortExited(s, dryRun));
         Play = session;
         session.Start();
         Changed?.Invoke();

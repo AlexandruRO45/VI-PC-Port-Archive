@@ -66,7 +66,7 @@ public partial class HistoryView : UserControl
     void OnLog(object sender, RoutedEventArgs e)
     {
         if (List.SelectedItem is Row r && File.Exists(r.Entry.LogPath)) AppState.Open(r.Entry.LogPath);
-        else MessageBox.Show(Loc.T("That log file is gone."), "Leonida Launcher");
+        else _ = Popup.Show("Log not found", "That log file is gone.");
     }
 
     void OnReuse(object sender, RoutedEventArgs e)
@@ -74,9 +74,9 @@ public partial class HistoryView : UserControl
         if (List.SelectedItem is Row r) ReuseRequested?.Invoke(r.Entry.Options.Clone());
     }
 
-    void OnClear(object sender, RoutedEventArgs e)
+    async void OnClear(object sender, RoutedEventArgs e)
     {
-        if (MessageBox.Show(Loc.T("Clear the build history? The log files stay."), "Leonida Launcher", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
+        if (!await Popup.Ask("Clear history", "Clear the build history? The log files stay.", "Clear history", danger: true)) return;
         state.History.Clear();
         Show();
     }

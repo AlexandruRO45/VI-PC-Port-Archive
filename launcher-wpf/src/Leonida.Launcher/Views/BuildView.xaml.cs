@@ -82,10 +82,10 @@ public partial class BuildView : UserControl
         await Builds.Instance.StopAsync();
     }
 
-    void OnCancel(object sender, RoutedEventArgs e)
+    async void OnCancel(object sender, RoutedEventArgs e)
     {
-        if (MessageBox.Show(Window.GetWindow(this)!, Loc.T("End the build and every process it started now?\n\nStop lets it finish its step cleanly."),
-                            "Leonida Launcher", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+        if (await Popup.Ask("Cancel the build", "End the build and every process it started now?\n\nStop lets it finish its step cleanly.",
+                            "Cancel the build", "Keep building", danger: true))
             Builds.Instance.Cancel();
     }
 

@@ -10,7 +10,7 @@ namespace Leonida.Launcher;
 
 public partial class MainWindow : Window
 {
-    static readonly string[] Pages = ["home", "leonida", "build", "history", "caniru"];
+    static readonly string[] Pages = ["home", "leonida", "build", "history", "achievements", "caniru", "gpu"];
     readonly AppState state = AppState.Instance;
     readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(1) };
     bool syncing, closingAfterStop, reloading;
@@ -20,7 +20,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         UpdateAvatar();
-        VersionText.Text = "v" + (typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "1.0.1");
+        VersionText.Text = "v" + (typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "1.0.2");
         RestoreWindow();
         Loaded += async (_, _) =>
         {
@@ -40,13 +40,13 @@ public partial class MainWindow : Window
         };
         timer.Tick += (_, _) => Refresh();
         timer.Start();
-        Builds.Instance.Changed += () =>
-        {
-            Refresh();
-            if (Builds.Instance.Busy) return;
-            if (state.Settings.Current.NotifyWhenDone) Flash();
-            if (state.Settings.Current.SoundWhenDone) System.Media.SystemSounds.Asterisk.Play();
-        };
+        Builds.Instance.Changed += OnBuildsChanged;
+        Builds.Instance.BuildEnded += OnBuildEnded;
+        Builds.Instance.PortEnded += OnPortEnded;
+        Tray.Instance.OpenRequested += ShowFromTray;
+        Tray.Instance.StopRequested += OnTrayStop;
+        Tray.Instance.QuitRequested += OnTrayQuit;
+        TaskbarItemInfo = new System.Windows.Shell.TaskbarItemInfo();
         var homeTab = new RadioButton { Content = Loc.T("HOME"), Tag = "", GroupName = "home", Style = (Style)FindResource("SubNav"), Margin = new Thickness(11, 0, 11, 0) };
         homeTab.Checked += (_, _) => { if (!syncing) HomePage.ShowPage(""); };
         HomeTabs.Children.Add(homeTab);
@@ -79,8 +79,8 @@ public partial class MainWindow : Window
 
     void UpdateAvatar()
     {
-        AvatarButton.Content = Avatar.Make(state.Settings.Current.AvatarSeed, 36);   // the button is 44 with a 4 px ring margin
-        MenuAvatar.Content = Avatar.Make(state.Settings.Current.AvatarSeed, 38);
+        AvatarButton.Content = Avatar.Current(36);   // the button is 44 with a 4 px ring margin
+        MenuAvatar.Content = Avatar.Current(38);
     }
 
     void OnAvatar(object sender, RoutedEventArgs e)
@@ -140,19 +140,29 @@ public partial class MainWindow : Window
         LeonidaPage.Visibility = page == "leonida" ? Visibility.Visible : Visibility.Collapsed;
         BuildPage.Visibility = page == "build" ? Visibility.Visible : Visibility.Collapsed;
         HistoryPage.Visibility = page == "history" ? Visibility.Visible : Visibility.Collapsed;
+        AchievementsPage.Visibility = page == "achievements" ? Visibility.Visible : Visibility.Collapsed;
         SettingsPage.Visibility = page == "settings" ? Visibility.Visible : Visibility.Collapsed;
         CanIRunPage.Visibility = page == "caniru" ? Visibility.Visible : Visibility.Collapsed;
+        GpuPage.Visibility = page == "gpu" ? Visibility.Visible : Visibility.Collapsed;
         syncing = true;
-        var leonida = page is "leonida" or "build" or "history";
+        var leonida = page is "leonida" or "build" or "history" or "achievements";
         TopTabs.Visibility = leonida ? Visibility.Visible : Visibility.Collapsed;
         HomeTabs.Visibility = page == "home" ? Visibility.Visible : Visibility.Collapsed;
-        foreach (var t in new[] { TabLeonida, TabBuild, TabHistory }) t.IsChecked = false;
-        if (leonida) (page switch { "build" => TabBuild, "history" => TabHistory, _ => TabLeonida }).IsChecked = true;
+        // The tabs follow the page: the build pages show each other, Leonida and Achievements show each other.
+        var buildPages = page is "build" or "history";
+        TabAchievements.Visibility = buildPages ? Visibility.Collapsed : Visibility.Visible;
+        TabBuild.Visibility = TabHistory.Visibility = buildPages ? Visibility.Visible : Visibility.Collapsed;
+        TabLeonida.IsChecked = page == "leonida";
+        TabAchievements.IsChecked = page == "achievements";
+        TabBuild.IsChecked = page == "build";
+        TabHistory.IsChecked = page == "history";
         LibHome.IsChecked = page == "home";
         LibLeonida.IsChecked = leonida;
         LibCanIRun.IsChecked = page == "caniru";
+        LibGpu.IsChecked = page == "gpu";
         syncing = false;
         if (page == "caniru") CanIRunPage.Activate();
+        if (page == "gpu" && GpuPage.IsLoaded) _ = GpuPage.ActivateAsync();
         if (page == "leonida") LeonidaPage.Refresh();
         state.Settings.Current.LastPage = page;
     }
@@ -160,13 +170,14 @@ public partial class MainWindow : Window
     void OnTab(object sender, RoutedEventArgs e)
     {
         if (syncing) return;
-        ShowPage(sender == TabBuild ? "build" : sender == TabHistory ? "history" : "leonida");
+        ShowPage(sender == TabBuild ? "build" : sender == TabHistory ? "history" : sender == TabAchievements ? "achievements" : "leonida");
     }
 
     // Checked (mouse, keyboard, screen readers) and Click (clicking the entry that is already selected) both navigate.
     void OnLibHome(object sender, RoutedEventArgs e) { if (!syncing) { ShowPage("home"); HomePage.ShowPage(""); } }
     void OnLibLeonida(object sender, RoutedEventArgs e) { if (!syncing) ShowPage("leonida"); }
     void OnLibCanIRun(object sender, RoutedEventArgs e) { if (!syncing) ShowPage("caniru"); }
+    void OnLibGpu(object sender, RoutedEventArgs e) { if (!syncing) ShowPage("gpu"); }
 
     // ---------- sidebar ----------
 
@@ -177,10 +188,11 @@ public partial class MainWindow : Window
         state.Settings.Current.SidebarCollapsed = collapsed;
         SideColumn.Width = new GridLength(collapsed ? 78 : 270);
         var v = collapsed ? Visibility.Collapsed : Visibility.Visible;
-        BrandText.Visibility = LibraryHeader.Visibility = HomeText.Visibility = LibText.Visibility = CanText.Visibility = VersionText.Visibility = v;
+        BrandText.Visibility = LibraryHeader.Visibility = HomeText.Visibility = LibText.Visibility = CanText.Visibility = GpuText.Visibility = VersionText.Visibility = v;
         LibHome.ToolTip = collapsed ? Loc.T("Home") : null;
         LibLeonida.ToolTip = collapsed ? "Leonida" : null;
         LibCanIRun.ToolTip = collapsed ? Loc.T("Can I Run Leonida") : null;
+        LibGpu.ToolTip = collapsed ? Loc.T("GPU tests") : null;
         CollapseButton.ApplyTemplate();
         if (CollapseButton.Template.FindName("g", CollapseButton) is TextBlock g) g.Text = collapsed ? "" : "";
     }
@@ -239,12 +251,17 @@ public partial class MainWindow : Window
             double? pct = stage?.Name == "shaders" && sh is { Total: > 0, Done: int d, Total: int t } ? 100.0 * d / t : null;
             LibStatus.Text = Loc.F("Building · {0}", stage?.Name ?? Loc.T("Starting"));
             SetRing(pct, visible: !state.Settings.Current.SidebarCollapsed);
-            TabBuild.Content = Loc.T("BUILD") + (pct is double r ? $" {r:0}%" : " ●");
+            if (TaskbarItemInfo is { } tb)
+            {
+                tb.ProgressState = pct == null ? System.Windows.Shell.TaskbarItemProgressState.Indeterminate : System.Windows.Shell.TaskbarItemProgressState.Normal;
+                if (pct is double tp) tb.ProgressValue = tp / 100.0;
+            }
+            Tray.Instance.SetStatus(LibStatus.Text + (pct is double tt ? $" {tt:0}%" : ""));
         }
         else
         {
             SetRing(null, visible: false);
-            TabBuild.Content = Loc.T("BUILD") + (Builds.Instance.IsPlaying ? " ●" : "");
+            if (TaskbarItemInfo is { } tb) tb.ProgressState = System.Windows.Shell.TaskbarItemProgressState.None;
             var install = Builds.Instance.Install();
             LibStatus.Text = Loc.T(!state.HasRepo ? "Leonida folder not found"
                 : Builds.Instance.IsPlaying ? "Running"
@@ -252,6 +269,57 @@ public partial class MainWindow : Window
                 : install?.RuntimeBuilt == true ? "Built" : "Not built yet");
         }
         if (LeonidaPage.IsVisible) LeonidaPage.Refresh();
+    }
+
+    void OnBuildsChanged() => Refresh();
+
+    /// <summary>The end of a build: taskbar flash, sound and a Windows notification, as Settings › Builds says.</summary>
+    void OnBuildEnded(HistoryEntry e)
+    {
+        var c = state.Settings.Current;
+        if (c.NotifyWhenDone) Flash();
+        if (c.SoundWhenDone) (e.Outcome == SessionOutcome.Succeeded ? System.Media.SystemSounds.Asterisk : System.Media.SystemSounds.Exclamation).Play();
+        if (!c.ToastWhenDone || (IsVisible && IsActive)) return;
+        var took = Format.Duration(TimeSpan.FromSeconds(e.Seconds));
+        var (title, text, problem) = e.Outcome switch
+        {
+            SessionOutcome.Succeeded => (Loc.T("Leonida is built"), Loc.F("The build finished in {0}.", took), false),
+            SessionOutcome.Stopped => (Loc.T("Build stopped"), Loc.F("Stopped after {0}. Start it again to continue where it left off.", took), false),
+            SessionOutcome.Cancelled => (Loc.T("Build cancelled"), Loc.F("Cancelled after {0}.", took), true),
+            _ => (Loc.T("The build failed"), e.FailedStage is string st ? Loc.F("It failed in the {0} stage after {1}. The BUILD tab has the details.", st, took)
+                                                                      : Loc.F("It failed after {0}. The BUILD tab has the details.", took), true),
+        };
+        Tray.Instance.Notify(title, text, problem);
+    }
+
+    void OnPortEnded(bool dryRun, TimeSpan took, SessionOutcome outcome)
+    {
+        if (!IsVisible) { Tray.Instance.Unpin(); Close(); }   // closed to the tray while it ran: nothing is left to wait for
+    }
+
+    void ShowFromTray()
+    {
+        Show();
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Activate();
+        Tray.Instance.Unpin();
+    }
+
+    async void OnTrayStop()
+    {
+        await Builds.Instance.StopAsync();
+    }
+
+    async void OnTrayQuit()
+    {
+        if (Builds.Instance.Busy)
+        {
+            closingAfterStop = true;
+            await Builds.Instance.StopAsync();
+            await Task.Delay(300);
+        }
+        quitting = true;
+        Close();
     }
 
     void Flash()
@@ -270,6 +338,7 @@ public partial class MainWindow : Window
 
     protected override void OnPreviewKeyDown(System.Windows.Input.KeyEventArgs e)
     {
+        if (PopupHost.Children.Count > 0) { base.OnPreviewKeyDown(e); return; }   // Esc and Enter belong to the popup
         if (e.Key == System.Windows.Input.Key.Escape && Dialog.Visibility == Visibility.Visible) { Dialog.Close(); e.Handled = true; }
         else if (e.Key == System.Windows.Input.Key.Escape && SettingsPage.Visibility == Visibility.Visible) { CloseSettings(); e.Handled = true; }
         base.OnPreviewKeyDown(e);
@@ -305,25 +374,48 @@ public partial class MainWindow : Window
         Native.DwmSetWindowAttribute(hwnd, 33, ref round, sizeof(int));
     }
 
+    bool quitting;
+
     protected override async void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
         if (reloading) { base.OnClosing(e); return; }   // the new window carries on; nothing is stopped or saved twice
+        if (Builds.Instance.Busy && !closingAfterStop && !quitting && state.Settings.Current.CloseToTray)
+        {
+            // Keep building from the tray: the window hides, the icon shows what the build is doing.
+            e.Cancel = true;
+            SaveWindowBounds();
+            Hide();
+            Tray.Instance.Pin();
+            Refresh();
+            if (!state.Settings.Current.TrayExplained)
+            {
+                state.Settings.Current.TrayExplained = true;
+                try { state.Settings.Save(); } catch (IOException) { }
+                Tray.Instance.Notify(Loc.T("Leonida keeps going in the tray"),
+                    Loc.T(state.IsBuilding ? "The build goes on. Click the icon to open the launcher, or right-click it to stop the build."
+                                           : "The port goes on. Click the icon to open the launcher."), false);
+            }
+            return;
+        }
         if (Builds.Instance.Busy && !closingAfterStop)
         {
             e.Cancel = true;
-            if (MessageBox.Show(this, Loc.T(state.IsBuilding ? "A build is running. Stop it and close the launcher?\n\nA build stops the way Ctrl+C stops it and continues where it left off next time."
-                                                       : "The port is running. Stop it and close the launcher?"),
-                                "Leonida Launcher", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+            if (!await Popup.Ask(state.IsBuilding ? "A build is running" : "The port is running",
+                                 state.IsBuilding ? "A build is running. Stop it and close the launcher?\n\nA build stops the way Ctrl+C stops it and continues where it left off next time."
+                                                  : "The port is running. Stop it and close the launcher?",
+                                 "Stop and close", "Keep running")) return;
             closingAfterStop = true;
             await Builds.Instance.StopAsync();
             await Task.Delay(300);
             Close();
             return;
         }
-        SaveWindowBounds();
+        if (IsVisible) SaveWindowBounds();
         try { state.Settings.Save(); } catch (IOException) { }
         state.Session?.Dispose();
         Builds.Instance.Play?.Dispose();
+        GpuPage.Shutdown();
+        Tray.Instance.Dispose();
         base.OnClosing(e);
     }
 }

@@ -157,7 +157,7 @@ public partial class HomeView : UserControl
         peopleLoaded = true;
         PeopleNote.Text = Loc.T("Loading…");
         var cache = Path.Combine(AppPaths.Local, "contributors.json");
-        var online = state.Settings.Current.AllowOnline;
+        var online = state.Settings.Current.AllowGitHub;
         var fromGitHub = online ? await Contributors.LoadGitHubAsync(cache) : null;
         if (fromGitHub is { } g && g.list.Count > 0)
         {
@@ -173,7 +173,7 @@ public partial class HomeView : UserControl
                 contributors = await Contributors.LoadAsync(state.Repo);
                 source = ContributorSource.GitHistory;
                 PeopleNote.Text = Loc.T(online ? "GitHub can't be reached, so this is your checkout's git history (no profile pictures). AI assistants and bots are not listed."
-                                               : "Online features are off (Launcher settings), so this is your checkout's git history, without profile pictures.");
+                                               : "GitHub is off (Settings › Online), so this is your checkout's git history, without profile pictures.");
             }
             catch (Exception e) { PeopleNote.Text = "The contributor list could not be read: " + e.Message; peopleLoaded = false; }
         }

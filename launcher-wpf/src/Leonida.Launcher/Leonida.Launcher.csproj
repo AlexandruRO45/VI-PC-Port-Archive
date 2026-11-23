@@ -7,6 +7,8 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <!-- Only for the notification-area icon (Tray.cs); WPF has none. -->
+    <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -15,12 +17,18 @@
     <ApplicationIcon>Assets\leonida.ico</ApplicationIcon>
     <Product>Leonida Launcher</Product>
     <Description>Builds the Leonida PC port from your own copy of the game, and starts it.</Description>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- WebView2's WinForms half is not used; keeping its assembly out of the single-file bundle. -->
     <WebView2UseWinRT>false</WebView2UseWinRT>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WinForms' implicit usings would make Application, MessageBox, Button… ambiguous with WPF's. -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Leonida.Core\Leonida.Core.csproj" />
@@ -29,6 +37,8 @@
 
   <ItemGroup>
     <Resource Include="Assets\leonida.ico" />
+    <!-- Translations: one file per language (Languages/README.md). -->
+    <EmbeddedResource Include="Languages\*.json" LogicalName="Languages.%(Filename).json" />
     <!-- The logo the README shows, taken from the repository at build time (one copy of it). -->
     <Resource Include="..\..\..\assets\logo.png" Link="Assets\logo.png" />
   </ItemGroup>

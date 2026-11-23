@@ -69,14 +69,38 @@ public sealed class LauncherSettings
     /// <summary>"last" (where you left off), "home", "leonida" or "caniru".</summary>
     public string StartPage { get; set; } = "last";
     public bool StartCollapsed { get; set; }
-    /// <summary>GitHub profile pictures in Credits and the Can I Run checker; off, nothing is fetched.</summary>
-    public bool AllowOnline { get; set; } = true;
+    /// <summary>Credits from the GitHub API (names, commit counts, profile pictures); off, the checkout's git history.</summary>
+    public bool AllowGitHub { get; set; } = true;
+    /// <summary>The Can I Run checker web page; off, the page shows only this PC's hardware.</summary>
+    public bool AllowChecker { get; set; } = true;
+    /// <summary>1.0.0 and 1.0.1 had one switch for both; a settings file with it off turns both off. Never written.</summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public bool? AllowOnline
+    {
+        get => null;
+        set { if (value == false) { AllowGitHub = false; AllowChecker = false; } }
+    }
     public bool SoundWhenDone { get; set; }
+    /// <summary>A Windows notification when a build ends while the launcher is not in front.</summary>
+    public bool ToastWhenDone { get; set; } = true;
+    /// <summary>Closing the window during a build (or while the port runs) keeps it going from the tray.</summary>
+    public bool CloseToTray { get; set; } = true;
+    /// <summary>Set once the tray has explained itself, so the notice shows only the first time.</summary>
+    public bool TrayExplained { get; set; }
+    // Playtime: PLAY sessions of the port (dry runs don't count).
+    public double PlaySeconds { get; set; }
+    public int PlaySessions { get; set; }
+    public DateTime? LastPlayed { get; set; }
+    public double LastPlaySeconds { get; set; }
     public double ConsoleFontSize { get; set; } = 12.5;
     /// <summary>Build logs older than this many days are deleted when the launcher starts; 0 keeps them all.</summary>
     public int KeepLogsDays { get; set; } = 30;
     /// <summary>Picks the avatar's pattern and colours.</summary>
     public int AvatarSeed { get; set; } = Random.Shared.Next();
+    /// <summary>The GPU tests page's test-program folder (the one with vk_compute_test.exe), when not found by itself.</summary>
+    public string? GpuTestPrograms { get; set; }
+    /// <summary>Show the picture the user chose (a square copy in the settings folder) instead of the random one.</summary>
+    public bool AvatarCustom { get; set; }
 }
 
 /// <summary>What the user typed over the detected hardware on the Can I Run page (null: use the detection).</summary>

@@ -38,7 +38,7 @@ public partial class SettingsView : UserControl
         ("general", NavGeneral, PageGeneral, "General"), ("builds", NavBuilds, PageBuilds, "Builds"),
         ("online", NavOnline, PageOnline, "Online"), ("about", NavAbout, PageAbout, "About and files"),
         ("setup", NavSetup, PageSetup, "Your setup"), ("play", NavPlay, PagePlay, "Play"),
-        ("folders", NavFolders, PageFolders, "Folders and Python"),
+        ("folders", NavFolders, PageFolders, "Folders and Python"), ("disk", NavDisk, PageDisk, "Disk space"),
     ];
 
     bool switching;
@@ -58,6 +58,7 @@ public partial class SettingsView : UserControl
         switching = false;
         Pages.ScrollToTop();
         if (section == "setup") ShowChecks();
+        if (section == "disk") _ = ShowDiskAsync();
     }
 
     void OnSection(object sender, RoutedEventArgs e)
@@ -73,20 +74,23 @@ public partial class SettingsView : UserControl
         var c = state.Settings.Current;
         // Launcher
         LanguageBox.ItemsSource = Loc.Languages.Select(l => l.Name).ToList();
-        LanguageBox.SelectedIndex = Math.Max(0, Array.FindIndex(Loc.Languages, l => l.Code == c.Language));
+        LanguageBox.SelectedIndex = Math.Max(0, Loc.Languages.ToList().FindIndex(l => l.Code == c.Language));
         ThemeBox.ItemsSource = Theme.Choices.Select(t => Loc.T(t.Name)).ToList();
         ThemeBox.SelectedIndex = Math.Max(0, Array.FindIndex(Theme.Choices, t => t.Code == c.Theme));
         StartPageBox.ItemsSource = StartPages.Select(p => Loc.T(p.Name)).ToList();
         StartPageBox.SelectedIndex = Math.Max(0, Array.FindIndex(StartPages, p => p.Key == c.StartPage));
         StartCollapsed.IsChecked = c.StartCollapsed;
-        AllowOnline.IsChecked = c.AllowOnline;
+        AllowGitHub.IsChecked = c.AllowGitHub;
+        AllowChecker.IsChecked = c.AllowChecker;
         StopGracefully.IsChecked = c.StopGracefully;
         GraceBox.Text = c.StopGraceSeconds.ToString();
         NotifyDone.IsChecked = c.NotifyWhenDone;
         SoundDone.IsChecked = c.SoundWhenDone;
+        ToastDone.IsChecked = c.ToastWhenDone;
+        CloseToTray.IsChecked = c.CloseToTray;
         FontSlider.Value = c.ConsoleFontSize;
         KeepLogsBox.Text = c.KeepLogsDays.ToString();
-        AvatarPreview.Content = Avatar.Make(c.AvatarSeed, 44);
+        AvatarPreview.Content = Avatar.Current(44);
         // Leonida
         OverlayBox.Text = c.Play.Overlay ?? "";
         ModsBox.Text = c.Play.Mods ?? "";
@@ -111,10 +115,13 @@ public partial class SettingsView : UserControl
         var c = state.Settings.Current;
         c.StartPage = StartPages[Math.Max(0, StartPageBox.SelectedIndex)].Key;
         c.StartCollapsed = StartCollapsed.IsChecked == true;
-        c.AllowOnline = AllowOnline.IsChecked == true;
+        c.AllowGitHub = AllowGitHub.IsChecked == true;
+        c.AllowChecker = AllowChecker.IsChecked == true;
         c.StopGracefully = StopGracefully.IsChecked == true;
         c.NotifyWhenDone = NotifyDone.IsChecked == true;
         c.SoundWhenDone = SoundDone.IsChecked == true;
+        c.ToastWhenDone = ToastDone.IsChecked == true;
+        c.CloseToTray = CloseToTray.IsChecked == true;
         if (int.TryParse(GraceBox.Text, out var g) && g is >= 5 and <= 600) c.StopGraceSeconds = g;
         if (int.TryParse(KeepLogsBox.Text, out var d) && d is >= 0 and <= 3650) c.KeepLogsDays = d;
         Save();
@@ -154,17 +161,153 @@ public partial class SettingsView : UserControl
     void OnNewAvatar(object sender, RoutedEventArgs e)
     {
         state.Settings.Current.AvatarSeed = Random.Shared.Next();
+        state.Settings.Current.AvatarCustom = false;
         Save();
-        AvatarPreview.Content = Avatar.Make(state.Settings.Current.AvatarSeed, 44);
+        AvatarPreview.Content = Avatar.Current(44);
+        AvatarChanged?.Invoke();
+    }
+
+    async void OnUploadAvatar(object sender, RoutedEventArgs e)
+    {
+        var d = new OpenFileDialog
+        {
+            Title = Loc.T("Choose a picture"),
+            Filter = Loc.T("Pictures") + " (*.png;*.jpg;*.jpeg;*.bmp;*.gif)|*.png;*.jpg;*.jpeg;*.bmp;*.gif",
+        };
+        if (d.ShowDialog(Window.GetWindow(this)) != true) return;
+        try { Avatar.SaveCustom(d.FileName); }
+        catch (Exception ex)
+        {
+            await Popup.Show("Could not use that picture", ex.Message, problem: true);
+            return;
+        }
+        state.Settings.Current.AvatarCustom = true;
+        Save();
+        AvatarPreview.Content = Avatar.Current(44);
         AvatarChanged?.Invoke();
     }
 
     void Save() { try { state.Settings.Save(); } catch (IOException) { } }
 
-    void OnReset(object sender, RoutedEventArgs e)
+    // ================================================================ disk space
+
+    /// <summary>One row of the Disk space page; the size fills in when it has been measured.</summary>
+    public sealed class DiskRow(DiskEntry e) : System.ComponentModel.INotifyPropertyChanged
     {
-        if (MessageBox.Show(Window.GetWindow(this)!, Loc.T("Restore every launcher setting and build option to its default? Presets and recent folders go too; the build history and logs stay."),
-                            "Leonida Launcher", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        public DiskEntry Entry { get; } = e;
+        public string Title => Loc.T(Entry.Title);
+        public string Description => Loc.T(Entry.Description);
+        public string Path => Entry.Path;
+        public string Size => measured ? Format.Bytes(Entry.Bytes) : "…";
+        public string FileCount => measured ? Loc.F("{0:N0} files", Entry.Files) : Loc.T("measuring");
+        public string OpenText => Loc.T("Open");
+        public string DeleteText => Loc.T("Delete");
+        public Visibility DeleteVisibility => Entry.Deletable ? Visibility.Visible : Visibility.Collapsed;
+        public bool CanDelete => measured && Entry.Bytes > 0 && !Builds.Instance.Busy;
+        bool measured;
+        public void Measured() { measured = true; Changed(); }
+        public void Changed() => PropertyChanged?.Invoke(this, new(null));
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+    }
+
+    CancellationTokenSource? diskCancel;
+
+    async Task ShowDiskAsync()
+    {
+        diskCancel?.Cancel();
+        var cancel = (diskCancel = new CancellationTokenSource()).Token;
+        var o = state.Settings.Current.Build;
+        string outFolder = state.OutFolder(o), work = state.WorkFolder(o);
+        var rows = DiskUsage.Entries(outFolder, work, AppPaths.Logs, AppPaths.WebView).Select(e => new DiskRow(e)).ToList();
+        DiskList.ItemsSource = rows;
+        ShowDrive(outFolder, null);
+        long total = 0;
+        foreach (var r in rows)
+        {
+            try
+            {
+                var skip = r.Entry.Deletable ? null : work;   // the port's row leaves out the work folder, listed on its own
+                var (b, f) = await Task.Run(() => DiskUsage.Measure(r.Entry.Path, skip, cancel), cancel);
+                r.Entry.Bytes = b; r.Entry.Files = f;
+                r.Measured();
+                if (!r.Entry.Path.StartsWith(System.IO.Path.GetDirectoryName(AppPaths.Logs)!, StringComparison.OrdinalIgnoreCase)) total += b;
+                ShowDrive(outFolder, total);
+            }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    void ShowDrive(string folder, long? leonida)
+    {
+        try
+        {
+            var drive = new DriveInfo(System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(folder))!);
+            long size = drive.TotalSize, free = drive.AvailableFreeSpace, used = size - free, mine = Math.Min(leonida ?? 0, used);
+            DiskDrive.Text = Loc.F("{0} free of {1} on {2}", Format.Bytes(free), Format.Bytes(size), drive.Name.TrimEnd('\\'));
+            DiskSummary.Text = leonida is long l ? Loc.F("The build's files use {0} of it. A full build needs about 30 GB (everything: about 330 GB).", Format.Bytes(l))
+                                                 : Loc.T("Measuring what the build has written…");
+            BarLeonida.Width = new GridLength(mine, GridUnitType.Star);
+            BarOther.Width = new GridLength(used - mine, GridUnitType.Star);
+            BarFree.Width = new GridLength(free, GridUnitType.Star);
+        }
+        catch (Exception e) when (e is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            DiskDrive.Text = folder;
+            DiskSummary.Text = Loc.T("The drive could not be read.");
+        }
+    }
+
+    void OnDiskRefresh(object sender, RoutedEventArgs e) => _ = ShowDiskAsync();
+
+    void OnDiskOpen(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is DiskRow r && Directory.Exists(r.Path)) AppState.Open(r.Path);
+    }
+
+    async void OnDiskDelete(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not DiskRow r) return;
+        if (Builds.Instance.Busy) { await Popup.Show("Disk space", "Nothing can be deleted while a build or the port runs."); return; }
+        var o = state.Settings.Current.Build;
+        var roots = new[] { state.WorkFolder(o), AppPaths.Logs, AppPaths.WebView };
+        if (DiskUsage.RefuseDelete(r.Path, roots, o.Game) is string why)
+        {
+            await Popup.Show("Not deleted", Loc.F("The launcher won't delete {0}: {1}.", r.Path, Loc.T(why)), problem: true);
+            return;
+        }
+        var text = Loc.F("Delete {0} ({1})?", r.Title, Format.Bytes(r.Entry.Bytes)) + "\n\n" + (r.Entry.Warning != null ? Loc.T(r.Entry.Warning) : r.Description);
+        if (!await Popup.Ask("Delete files", text, Loc.F("Delete {0}", Format.Bytes(r.Entry.Bytes)), danger: true)) return;
+        var logs = r.Path.Equals(AppPaths.Logs, StringComparison.OrdinalIgnoreCase);
+        var failed = await Task.Run(() => DeleteFolder(r.Path, keepFolder: logs));
+        if (failed > 0) await Popup.Show("Disk space", Loc.F("{0} file(s) were in use and stay.", failed));
+        await ShowDiskAsync();
+    }
+
+    /// <summary>Deletes what is in a folder (and the folder, unless asked to keep it); files in use stay. Links are
+    /// removed, never followed.</summary>
+    static int DeleteFolder(string folder, bool keepFolder)
+    {
+        int failed = 0;
+        var dir = new DirectoryInfo(folder);
+        foreach (var f in dir.EnumerateFileSystemInfos())
+        {
+            try
+            {
+                if (f is DirectoryInfo d && !d.Attributes.HasFlag(FileAttributes.ReparsePoint)) failed += DeleteFolder(d.FullName, keepFolder: false);
+                else if (f is DirectoryInfo link) link.Delete();
+                else { f.Attributes = FileAttributes.Normal; f.Delete(); }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { failed++; }
+        }
+        if (!keepFolder && failed == 0)
+            try { dir.Delete(); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { failed++; }
+        return failed;
+    }
+
+    async void OnReset(object sender, RoutedEventArgs e)
+    {
+        if (!await Popup.Ask("Restore defaults", "Restore every launcher setting and build option to its default? Presets and recent folders go too; the build history and logs stay.",
+                             "Restore defaults", danger: true)) return;
         var language = state.Settings.Current.Language;
         state.Settings.Reset();
         Initialize();
@@ -248,10 +391,10 @@ public partial class SettingsView : UserControl
     void OnChooseRepo(object sender, RoutedEventArgs e)
     {
         if (Pick("Leonida", state.Repo) is not string f) return;
-        if (!RepoLocator.IsRepo(f)) { MessageBox.Show($"{f}: make_game.py?", "Leonida Launcher"); return; }
+        if (!RepoLocator.IsRepo(f)) { _ = Popup.Show("Not a Leonida folder", Loc.F("{0} has no make_game.py. Choose the folder with Build.bat.", f), problem: true); return; }
         state.Settings.Current.RepoRoot = f;
         Save();
-        MessageBox.Show(Loc.T("Restart Leonida Launcher to use this folder."), "Leonida Launcher");
+        _ = Popup.Show("Leonida folder", "Restart Leonida Launcher to use this folder.");
     }
 
     void OnBrowsePython(object sender, RoutedEventArgs e)

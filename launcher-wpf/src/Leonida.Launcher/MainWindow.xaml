@@ -129,6 +129,17 @@
               </StackPanel>
             </StackPanel>
           </RadioButton>
+          <RadioButton x:Name="LibGpu" AutomationProperties.Name="GPU tests" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibGpu" Checked="OnLibGpu" Margin="0,4,0,0">
+            <StackPanel Orientation="Horizontal">
+              <Border Width="38" Height="38" CornerRadius="3" Background="#1E1E1E">
+                <TextBlock Text="&#xE950;" FontFamily="{StaticResource Icons}" FontSize="18" Foreground="{StaticResource Pink}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <StackPanel x:Name="GpuText" Margin="12,0,0,0" VerticalAlignment="Center">
+                <TextBlock Text="GPU tests" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
+                <TextBlock Text="Test your card for Leonida" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
+              </StackPanel>
+            </StackPanel>
+          </RadioButton>
         </StackPanel>
       </DockPanel>
     </Border>
@@ -167,10 +178,13 @@
           <!-- Home's own tabs: one page per README section, shown only while Home is selected. -->
           <StackPanel x:Name="HomeTabs" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,44,90,0"
                       WindowChrome.IsHitTestVisibleInChrome="True" Visibility="Collapsed"/>
-          <!-- Leonida's own tabs: shown only while Library › Leonida is selected (Home and Can I Run are in the sidebar). -->
+          <!-- Leonida's tabs, only while Library › Leonida is selected (Home and Can I Run are in the sidebar). They follow
+               the page: LEONIDA and ACHIEVEMENTS on those two; LEONIDA, BUILD and HISTORY on the build pages, which the
+               ⋯ menu on the Leonida page opens. -->
           <StackPanel x:Name="TopTabs" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,42,90,0"
                       WindowChrome.IsHitTestVisibleInChrome="True">
-            <RadioButton x:Name="TabLeonida" Style="{StaticResource TopNav}" Content="LEONIDA" GroupName="top" Checked="OnTab" Margin="14,0"/>
+            <RadioButton x:Name="TabLeonida" Style="{StaticResource TopNav}" Content="LEONIDA" GroupName="top" Checked="OnTab" Click="OnTab" Margin="14,0"/>
+            <RadioButton x:Name="TabAchievements" Style="{StaticResource TopNav}" Content="ACHIEVEMENTS" GroupName="top" Checked="OnTab" Margin="14,0"/>
             <RadioButton x:Name="TabBuild" Style="{StaticResource TopNav}" Content="BUILD" GroupName="top" Checked="OnTab" Margin="14,0"/>
             <RadioButton x:Name="TabHistory" Style="{StaticResource TopNav}" Content="HISTORY" GroupName="top" Checked="OnTab" Margin="14,0"/>
           </StackPanel>
@@ -214,7 +228,9 @@
           <v:LeonidaView x:Name="LeonidaPage" Visibility="Collapsed"/>
           <v:BuildView x:Name="BuildPage" Visibility="Collapsed"/>
           <v:HistoryView x:Name="HistoryPage" Visibility="Collapsed"/>
+          <v:AchievementsView x:Name="AchievementsPage" Visibility="Collapsed"/>
           <v:CanIRunView x:Name="CanIRunPage" Visibility="Collapsed"/>
+          <v:GpuTestView x:Name="GpuPage" Visibility="Collapsed"/>
         </Grid>
       </DockPanel>
     </Grid>
@@ -224,6 +240,9 @@
 
     <!-- The build popup, over everything -->
     <v:BuildDialog x:Name="Dialog" Grid.ColumnSpan="2" Visibility="Collapsed"/>
+
+    <!-- Popup.cs: the launcher's own message boxes, over everything but the window buttons -->
+    <Grid x:Name="PopupHost" Grid.ColumnSpan="2" Visibility="Collapsed" Panel.ZIndex="15"/>
 
     <!-- Window buttons, above every page and popup -->
     <Border Grid.ColumnSpan="2" HorizontalAlignment="Right" VerticalAlignment="Top" Panel.ZIndex="20" Background="{StaticResource Ink}"

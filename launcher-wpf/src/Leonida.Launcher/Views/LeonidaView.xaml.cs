@@ -51,7 +51,7 @@ public partial class LeonidaView : UserControl
         else
         {
             action = MainAction.Build;
-            MainButton.Content = install?.RuntimeBuilt == true ? Loc.T("UPDATE BUILD") : (Loc.Polish ? "ZBUDUJ" : "BUILD");
+            MainButton.Content = install?.RuntimeBuilt == true ? Loc.T("UPDATE BUILD") : Loc.T("BUILD|button");
             Status.Text = !state.HasRepo ? Loc.T("Leonida.exe needs to be next to Build.bat in your Leonida folder (or choose the folder in Settings).")
                 : install?.RuntimeBuilt == true ? Why(install.WhyNotPlayable)
                 : Loc.T("Builds the PC port from your own copy of the game, on this PC.");
@@ -69,6 +69,12 @@ public partial class LeonidaView : UserControl
         LastBuild.Text = last == null ? Loc.T("never") : $"{Loc.T(last.Outcome.ToString()).ToLowerInvariant()}, {Ago(last.Ended ?? last.Started)}";
         TileTitle.Text = Loc.T(s is { IsRunning: true } ? "Building…" : install?.CanPlay == true ? "Ready to play" : install?.RuntimeBuilt == true ? "Built" : "Not built yet");
         TileDetail.Text = install?.OutFolder ?? "";
+        var c = state.Settings.Current;
+        Playtime.Text = c.PlaySessions == 0 ? Loc.T("not played yet")
+            : c.PlaySeconds < 60 ? Loc.T("under a minute") : Format.Duration(TimeSpan.FromSeconds(c.PlaySeconds));
+        LastPlayed.Text = c.LastPlayed is DateTime lp
+            ? Loc.F("{0} · {1}", Ago(lp), Format.Duration(TimeSpan.FromSeconds(Math.Max(1, c.LastPlaySeconds))))
+            : "—";
     }
 
     static string Ago(DateTime t)
@@ -104,7 +110,7 @@ public partial class LeonidaView : UserControl
         var problems = Builds.Instance.PlayProblems(dryRun);
         if (problems.Count > 0)
         {
-            MessageBox.Show(Window.GetWindow(this)!, Loc.T("Not ready to start:") + "\n\n• " + string.Join("\n• ", problems.Select(Why)), "Leonida Launcher");
+            _ = Popup.Show("Not ready to start", "Not ready to start:", problems.Select(Why), problem: true);
             return;
         }
         Builds.Instance.StartPort(dryRun);
@@ -113,6 +119,11 @@ public partial class LeonidaView : UserControl
 
     void OnMore(object sender, RoutedEventArgs e)
     {
+        // Build progress shows what a running build is at, so the menu says it before you open the page.
+        var run = state.Session is { IsRunning: true } r ? r : null;
+        var sh = run?.Monitor.Shaders;
+        var shaders = run?.Monitor.Stages.FirstOrDefault(x => x.State == StageState.Running)?.Name == "shaders";
+        MenuProgress.Header = Loc.T("Build progress") + (run == null ? "" : shaders && sh is { Total: > 0, Done: int d, Total: int t } ? $" · {100.0 * d / t:0}%" : " · " + Loc.T("running"));
         MoreMenu.PlacementTarget = MoreButton;
         MoreMenu.IsOpen = true;
     }
@@ -122,13 +133,15 @@ public partial class LeonidaView : UserControl
     void OnCheckFiles(object sender, RoutedEventArgs e) => BuildDialogRequested?.Invoke("check");
     void OnDryRun(object sender, RoutedEventArgs e) => Play(true);
     void OnTrouble(object sender, RoutedEventArgs e) => NavigateRequested?.Invoke("settings");
+    void OnShowBuild(object sender, RoutedEventArgs e) => NavigateRequested?.Invoke("build");
+    void OnShowHistory(object sender, RoutedEventArgs e) => NavigateRequested?.Invoke("history");
     void OnTile(object sender, MouseButtonEventArgs e) => OnOpenOutput(sender, e);
 
     void OnOpenOutput(object sender, RoutedEventArgs e)
     {
         var folder = Builds.Instance.Install()?.OutFolder;
         if (folder != null && Directory.Exists(folder)) AppState.Open(folder);
-        else MessageBox.Show(Loc.F("{0} does not exist yet: the first build makes it.", folder), "Leonida Launcher");
+        else _ = Popup.Show("Not built yet", Loc.F("{0} does not exist yet: the first build makes it.", folder));
     }
 
     void OnOpenLogs(object sender, RoutedEventArgs e) { Directory.CreateDirectory(AppPaths.Logs); AppState.Open(AppPaths.Logs); }

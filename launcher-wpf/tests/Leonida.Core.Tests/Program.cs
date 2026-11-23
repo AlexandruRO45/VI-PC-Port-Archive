@@ -286,6 +286,85 @@ Check(HardwareDetector.MemoryTypeName(26) == "DDR4" && HardwareDetector.MemoryTy
     }
 }
 
+// ---- settings: the one Online switch of 1.0.0/1.0.1 becomes GitHub + Can I Run checker
+{
+    var o = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+    var oldOff = System.Text.Json.JsonSerializer.Deserialize<LauncherSettings>("{\"AllowOnline\": false}", o)!;
+    Check(!oldOff.AllowGitHub && !oldOff.AllowChecker, "an old settings file with online features off turns GitHub and the checker off");
+    var oldOn = System.Text.Json.JsonSerializer.Deserialize<LauncherSettings>("{\"AllowOnline\": true}", o)!;
+    Check(oldOn.AllowGitHub && oldOn.AllowChecker, "an old settings file with online features on keeps both on");
+    var split = System.Text.Json.JsonSerializer.Deserialize<LauncherSettings>("{\"AllowGitHub\": false, \"AllowChecker\": true}", o)!;
+    Check(!split.AllowGitHub && split.AllowChecker, "the two online switches are read on their own");
+    Check(!System.Text.Json.JsonSerializer.Serialize(new LauncherSettings()).Contains("AllowOnline"), "the old switch is never written back");
+}
+
+// ---- Disk space: what the launcher may delete
+{
+    var root = Path.Combine(temp, "disk");
+    var work = Path.Combine(root, "out", "work");
+    var game = Path.Combine(root, "game");
+    Directory.CreateDirectory(Path.Combine(work, "shaders", "dxbc"));
+    Directory.CreateDirectory(Path.Combine(work, "pkg"));
+    File.WriteAllText(Path.Combine(work, "pkg", "MicrosoftGame.Config"), "<Game/>");
+    Directory.CreateDirectory(game);
+    Directory.CreateDirectory(Path.Combine(root, "elsewhere"));
+    string[] roots = [work];
+    Check(DiskUsage.RefuseDelete(Path.Combine(work, "shaders", "dxbc"), roots, game) == null, "a folder in the work folder may be deleted");
+    Check(DiskUsage.RefuseDelete(Path.Combine(root, "elsewhere"), roots, game) != null, "a folder outside the work folder is refused");
+    Check(DiskUsage.RefuseDelete(Path.Combine(root, "out"), roots, game) != null, "the folder holding the work folder is refused");
+    Check(DiskUsage.RefuseDelete(Path.Combine(work, "pkg"), roots, game) != null, "a folder with MicrosoftGame.Config in it is refused");
+    Check(DiskUsage.RefuseDelete(work, roots, work) != null, "the game copy is refused even when it is inside the work folder");
+    Check(DiskUsage.RefuseDelete(Path.Combine(work, "shaders"), roots, Path.Combine(work, "shaders", "dxbc")) != null, "a folder holding the game copy is refused");
+    Check(DiskUsage.RefuseDelete(Path.Combine(work + "-other"), roots, game) != null, "a sibling whose name starts with the work folder's is refused");
+    File.WriteAllBytes(Path.Combine(work, "shaders", "dxbc", "a.txt"), new byte[1000]);
+    var (bytes, files) = DiskUsage.Measure(Path.Combine(root, "out"), skip: work);
+    Check(bytes == 0 && files == 0, "the port's size leaves out the work folder inside it");
+    Check(DiskUsage.Measure(work).Bytes >= 1000, "the work folder's files are counted");
+}
+
+// ---- Language files
+{
+    var dir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "Leonida.Launcher", "Languages"));
+    var files = Directory.Exists(dir) ? Directory.GetFiles(dir, "*.json") : [];
+    Check(files.Length > 0, "the launcher has language files (" + dir + ")");
+    foreach (var f in files)
+    {
+        LanguageFile? lf = null;
+        try { lf = LanguageFile.Parse(File.ReadAllText(f)); } catch (FormatException e) { Check(false, $"{Path.GetFileName(f)} reads: {e.Message}"); continue; }
+        Check(lf.Code == Path.GetFileNameWithoutExtension(f), $"{Path.GetFileName(f)}: the code matches the file name");
+        var bad = lf.PlaceholderMismatches().ToList();
+        Check(bad.Count == 0, $"{Path.GetFileName(f)}: every translation keeps its {{0}} placeholders" + (bad.Count > 0 ? ": " + string.Join(" | ", bad.Take(5)) : ""));
+        Check(System.Globalization.CultureInfo.GetCultures(System.Globalization.CultureTypes.AllCultures).Any(c => c.Name == lf.Culture), $"{Path.GetFileName(f)}: culture {lf.Culture} exists");
+    }
+    bool Fails(string json) { try { LanguageFile.Parse(json); return false; } catch (FormatException) { return true; } }
+    Check(Fails("{\"code\":\"x y\",\"name\":\"a\",\"culture\":\"en-US\",\"strings\":{}}"), "a bad language code is refused");
+    Check(Fails("{\"code\":\"de\",\"name\":\"Deutsch\",\"culture\":\"de-DE\",\"strings\":{\"a\":1}}"), "a translation that is not text is refused");
+    Check(Fails("not json"), "a file that is not JSON is refused");
+    Check(LanguageFile.Placeholders("{0} of {1:N0}, {{literal}}").SequenceEqual([0, 1]), "placeholders are found, escaped braces are not");
+}
+
+// ---- GPU tests: the results block and the report
+{
+    string[] output =
+    [
+        "=== rdna2spirv.py ===", "  PASS  not_a_result  (before the block)",
+        "", "=== GPU TEST RESULTS ===",
+        "  PASS  cs_basic              ok", "  FAIL  cs_wave32_ballot      word 3: 0x1 != 0x0 (C:\\Users\\someone\\work\\x.spv)",
+        "  SKIP  ms_mesh               no VK_EXT_mesh_shader", "", "2/3 passed, 1 skipped",
+    ];
+    var r = GpuTests.Parse(output);
+    Check(r.Count == 3 && r[0] is { Name: "cs_basic", Outcome: GpuTestOutcome.Pass } && r[1].Outcome == GpuTestOutcome.Fail && r[2].Outcome == GpuTestOutcome.Skip,
+          "the GPU results block is read, and only it");
+    var report = GpuTests.Report("abc123def", "AMD Radeon RX 9070", "32.0.1", "Windows 11", null, r);
+    Check(report.StartsWith("Tested `abc123def` on AMD Radeon RX 9070, driver 32.0.1, Windows 11: **1 failed**"), "the report names the commit, card, driver and verdict");
+    Check(report.Contains("1/3 passed, 1 skipped") && report.Contains("`cs_wave32_ballot`"), "the report has the counts and each failure");
+    Check(!report.Contains("someone") && report.Contains("<path>"), "the report carries no local path");
+    var dir = Path.Combine(temp, "gpu", "runtime", "build", "Release");
+    Directory.CreateDirectory(dir);
+    File.WriteAllText(Path.Combine(dir, GpuTests.Marker), "");
+    Check(GpuTests.FindPrograms(Path.Combine(temp, "gpu")) == dir, "the test programs are found where docs/testing.md builds them");
+}
+
 try { Directory.Delete(temp, true); } catch (IOException) { }
 Console.WriteLine($"Leonida.Core.Tests: {checks} checks, {failures} failures");
 return failures;

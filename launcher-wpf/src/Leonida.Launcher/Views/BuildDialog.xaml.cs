@@ -216,9 +216,9 @@ public partial class BuildDialog : UserControl
         Advanced.IsExpanded = keepOpen;
     }
 
-    void OnSavePreset(object sender, RoutedEventArgs e)
+    async void OnSavePreset(object sender, RoutedEventArgs e)
     {
-        var name = Prompt.Ask(Window.GetWindow(this)!, "Save as preset", "Name:", $"Preset {state.Settings.Current.Presets.Count + 1}");
+        var name = await Popup.Input("Save as preset", "A name for these build options:", $"Preset {state.Settings.Current.Presets.Count + 1}", "Save");
         if (string.IsNullOrWhiteSpace(name)) return;
         state.Settings.Current.Presets.RemoveAll(p => p.Name == name.Trim());
         state.Settings.Current.Presets.Add(new Preset { Name = name.Trim(), Options = Read() });
@@ -228,7 +228,7 @@ public partial class BuildDialog : UserControl
 
     void OnDeletePreset(object sender, RoutedEventArgs e)
     {
-        if (PresetBox.SelectedIndex <= 0) { MessageBox.Show(Loc.T("Choose the preset in the list first."), "Leonida Launcher"); return; }
+        if (PresetBox.SelectedIndex <= 0) { _ = Popup.Show("Delete preset", "Choose the preset in the list first."); return; }
         state.Settings.Current.Presets.RemoveAt(PresetBox.SelectedIndex - 1);
         state.Settings.Save();
         ReloadPresets();

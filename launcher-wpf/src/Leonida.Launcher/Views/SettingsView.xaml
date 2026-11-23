@@ -115,6 +115,7 @@
           <RadioButton x:Name="NavSetup" Style="{StaticResource PageNav}" Tag="setup" Content="Your setup" Checked="OnSection" AutomationProperties.Name="Your setup"/>
           <RadioButton x:Name="NavPlay" Style="{StaticResource PageNav}" Tag="play" Content="Play" Checked="OnSection" AutomationProperties.Name="Play options"/>
           <RadioButton x:Name="NavFolders" Style="{StaticResource PageNav}" Tag="folders" Content="Folders and Python" Checked="OnSection" AutomationProperties.Name="Folders and Python"/>
+          <RadioButton x:Name="NavDisk" Style="{StaticResource PageNav}" Tag="disk" Content="Disk space" Checked="OnSection" AutomationProperties.Name="Disk space"/>
         </StackPanel>
       </DockPanel>
     </Border>
@@ -168,11 +169,12 @@
             <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
               <StackPanel Style="{StaticResource RowLeft}">
                 <TextBlock Text="Your avatar" Style="{StaticResource RowTitle}"/>
-                <TextBlock Text="A random picture for the avatar menu. Nothing about you is used." Style="{StaticResource RowText}"/>
+                <TextBlock Text="A random picture, or one of your own. Your picture stays on this PC; the launcher keeps a small square copy." Style="{StaticResource RowText}"/>
               </StackPanel>
               <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                 <ContentControl x:Name="AvatarPreview" Width="44" Height="44"/>
-                <Button Style="{StaticResource Small}" Content="New random avatar" Click="OnNewAvatar" Margin="14,0,0,0"/>
+                <Button Style="{StaticResource Small}" Content="Upload picture" Click="OnUploadAvatar" Margin="14,0,0,0" AutomationProperties.Name="Upload picture"/>
+                <Button Style="{StaticResource Small}" Content="Random" Click="OnNewAvatar" AutomationProperties.Name="New random avatar"/>
               </StackPanel>
             </Grid>
           </Border>
@@ -221,6 +223,24 @@
             </Grid>
           </Border>
           <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Windows notification" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="When a build ends while the launcher is not in front: built, stopped or failed, and how long it took." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="ToastDone" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Windows notification"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Keep running in the tray" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Closing the window during a build (or while the port runs) keeps it going from the notification area. Off: closing asks to stop it." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="CloseToTray" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Keep running in the tray"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
             <StackPanel>
               <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <StackPanel Style="{StaticResource RowLeft}">
@@ -254,14 +274,26 @@
 
         <!-- ===== Online ===== -->
         <StackPanel x:Name="PageOnline" Visibility="Collapsed">
+          <TextBlock Style="{StaticResource RowText}" Margin="0,6,0,6"
+                     Text="The launcher goes online only for these two. Builds, Play and the GPU tests never do."/>
           <Border Style="{StaticResource Row}">
             <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
               <StackPanel Style="{StaticResource RowLeft}">
-                <TextBlock Text="Online features" Style="{StaticResource RowTitle}"/>
-                <TextBlock Text="GitHub profile pictures and commit counts in Credits, and the Can I Run checker." Style="{StaticResource RowText}"/>
-                <TextBlock Text="Off: nothing is fetched; Credits uses your git history and Can I Run shows only your hardware." Style="{StaticResource RowText}"/>
+                <TextBlock Text="GitHub" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="Credits from api.github.com: everyone's commit count and profile picture, refreshed once a day." Style="{StaticResource RowText}"/>
+                <TextBlock Text="Off: Credits uses your checkout's git history, without profile pictures." Style="{StaticResource RowText}"/>
               </StackPanel>
-              <CheckBox Grid.Column="1" x:Name="AllowOnline" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Online features"/>
+              <CheckBox Grid.Column="1" x:Name="AllowGitHub" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="GitHub"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Can I Run checker" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="The community checker page, run in the background to compare your PC with every console on its list." Style="{StaticResource RowText}"/>
+                <TextBlock Text="Off: Can I Run Leonida shows only your hardware." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="AllowChecker" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Can I Run checker"/>
             </Grid>
           </Border>
         </StackPanel>
@@ -399,6 +431,66 @@
         </StackPanel>
 
         <!-- ===== Folders and Python ===== -->
+        <!-- ===== Disk space ===== -->
+        <StackPanel x:Name="PageDisk" Visibility="Collapsed">
+          <Border Style="{StaticResource Row}">
+            <StackPanel>
+              <DockPanel>
+                <Button DockPanel.Dock="Right" Style="{StaticResource Small}" Content="Measure again" Click="OnDiskRefresh" AutomationProperties.Name="Measure again"/>
+                <StackPanel>
+                  <TextBlock x:Name="DiskDrive" Style="{StaticResource RowTitle}" FontWeight="SemiBold"/>
+                  <TextBlock x:Name="DiskSummary" Style="{StaticResource RowText}"/>
+                </StackPanel>
+              </DockPanel>
+              <!-- The drive: Leonida's part, everything else, free -->
+              <Grid Height="10" Margin="0,14,0,0" Background="{DynamicResource CardAlt}">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition x:Name="BarLeonida" Width="0*"/>
+                  <ColumnDefinition x:Name="BarOther" Width="0*"/>
+                  <ColumnDefinition x:Name="BarFree" Width="1*"/>
+                </Grid.ColumnDefinitions>
+                <Rectangle Fill="{StaticResource Sunset}"/>
+                <Rectangle Grid.Column="1" Fill="{DynamicResource LineStrong}"/>
+              </Grid>
+              <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                <Rectangle Width="10" Height="10" Fill="{StaticResource Sunset}" VerticalAlignment="Center"/>
+                <TextBlock Text="Leonida" Style="{StaticResource RowText}" Margin="6,0,18,0"/>
+                <Rectangle Width="10" Height="10" Fill="{DynamicResource LineStrong}" VerticalAlignment="Center"/>
+                <TextBlock Text="Everything else" Style="{StaticResource RowText}" Margin="6,0,18,0"/>
+                <Rectangle Width="10" Height="10" Fill="{DynamicResource CardAlt}" Stroke="{DynamicResource Line}" VerticalAlignment="Center"/>
+                <TextBlock Text="Free" Style="{StaticResource RowText}" Margin="6,0,0,0"/>
+              </StackPanel>
+            </StackPanel>
+          </Border>
+          <ItemsControl x:Name="DiskList">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="0,16">
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="110"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel Margin="0,0,24,0" VerticalAlignment="Center">
+                      <TextBlock Text="{Binding Title}" FontSize="15" Foreground="{DynamicResource Heading}"/>
+                      <TextBlock Text="{Binding Description}" FontSize="12.5" Foreground="{DynamicResource SubText}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                      <TextBlock Text="{Binding Path}" FontSize="11" Foreground="{DynamicResource Faint}" FontFamily="{StaticResource Mono}" TextTrimming="CharacterEllipsis" Margin="0,4,0,0"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,16,0">
+                      <TextBlock Text="{Binding Size}" FontFamily="{StaticResource DisplayBold}" FontSize="20" Foreground="{DynamicResource Heading}" HorizontalAlignment="Right"/>
+                      <TextBlock Text="{Binding FileCount}" FontSize="11" Foreground="{DynamicResource Faint}" HorizontalAlignment="Right"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button Style="{StaticResource Small}" Content="{Binding OpenText}" Click="OnDiskOpen" Tag="{Binding}"/>
+                      <Button Style="{StaticResource Small}" Content="{Binding DeleteText}" Click="OnDiskDelete" Tag="{Binding}" Visibility="{Binding DeleteVisibility}"
+                              IsEnabled="{Binding CanDelete}"/>
+                    </StackPanel>
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <TextBlock Style="{StaticResource RowText}" Margin="0,14,0,0"
+                     Text="Deleting here never touches your game copy, the port itself or anything outside these folders. While a build runs, nothing can be deleted."/>
+        </StackPanel>
+
         <StackPanel x:Name="PageFolders" Visibility="Collapsed">
           <Border Style="{StaticResource Row}">
             <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
