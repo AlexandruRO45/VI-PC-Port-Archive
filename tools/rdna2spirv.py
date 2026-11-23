@@ -15519,6 +15519,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
                             {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]
                              for k in getattr(g, "uses_clock", ())}),
          "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
+         "fma_mode": "khr" if FMA_KHR else "exact" if FMA_EXACT else "glsl",
          "subgroup_size": 64 if g.wave64 else 32,
          # Which stages can ask for a 64-wide subgroup is the driver's requiredSubgroupSizeStages, not a fixed rule:
          # the AMD Windows driver (FRAGMENT | COMPUTE | TASK | MESH) and Mesa RADV on GFX10+ (COMPUTE | FRAGMENT |

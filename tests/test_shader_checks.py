@@ -979,12 +979,15 @@ class FmaFusedChecks(unittest.TestCase):
     """cs_fma_fused: strict single-rounded words under --fma khr, fused-or-split f32 under --fma glsl (Mesa RADV)."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
 
-    def run_fma(self, words, *, khr_index=False, code=0, raw_out=None):
+    def run_fma(self, words, *, khr_index=False, mode=None, code=0, raw_out=None):
         out = raw_out if raw_out is not None else "out[0..7] = " + " ".join(map(str, words)) + "\n"
         with tempfile.TemporaryDirectory() as tmp:
-            if khr_index:
+            meta = {"features": ["shaderFmaFloat32"]} if khr_index else {}
+            if mode:
+                meta["fma_mode"] = mode
+            if meta:
                 Path(tmp, "index.json").write_text(
-                    json.dumps({"cs_fma_fused": {"features": ["shaderFmaFloat32"]}}), encoding="utf-8")
+                    json.dumps({"cs_fma_fused": meta}), encoding="utf-8", newline="\n")
             with patch.dict(check.os.environ, {}, clear=False):
                 check.os.environ.pop("LEONIDA_FMA", None)
                 with patch.object(check, "run", return_value=(code, out)) as run:
@@ -992,13 +995,18 @@ class FmaFusedChecks(unittest.TestCase):
                 self.assertEqual(run.call_args.kwargs["env"]["VKC_SGPRS"], check.FMA_FUSED_ENV["VKC_SGPRS"])
         return res
 
+    def test_recorded_fma_mode_in_a_fresh_shell(self):
+        self.assertIn("word 0", self.run_fma(self.RADV_SPLIT, mode="exact"))
+        self.assertEqual(self.run_fma(check.FMA_FUSED, mode="exact"), "")
+        self.assertEqual(self.run_fma(self.RADV_SPLIT, mode="glsl"), "")
+
     def test_fused_passes_under_both_modes(self):
         self.assertEqual(self.run_fma(check.FMA_FUSED, khr_index=False), "")
         self.assertEqual(self.run_fma(check.FMA_FUSED, khr_index=True), "")
 
     def test_radv_split_passes_under_glsl_and_fails_under_khr(self):
         self.assertEqual(self.run_fma(self.RADV_SPLIT, khr_index=False), "")
-        ok, detail = check.judge_fma_fused(self.RADV_SPLIT, khr=False)
+        ok, detail = check.judge_fma_fused(self.RADV_SPLIT, "glsl")
         self.assertTrue(ok)
         self.assertIn("5/7 split", detail)
         problem = self.run_fma(self.RADV_SPLIT, khr_index=True)

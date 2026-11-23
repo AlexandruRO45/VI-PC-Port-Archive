@@ -46,7 +46,7 @@ from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, ma
 from check import barycentric_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
-from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
+from check import FMA_FUSED_ENV, judge_fma_fused, shader_fma_mode
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -973,8 +973,7 @@ def run_suite(a, work: str) -> int:
             elif rc != 0:
                 results.append((name, False, msg))
             else:
-                khr = os.environ.get("LEONIDA_FMA") == "khr"
-                ok, detail = judge_fma_fused(dump_words(msg), khr=khr)
+                ok, detail = judge_fma_fused(dump_words(msg), shader_fma_mode(index.get(name, {})))
                 results.append((name, ok, detail))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.

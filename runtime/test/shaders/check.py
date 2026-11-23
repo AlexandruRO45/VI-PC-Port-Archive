@@ -824,27 +824,24 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
     return failure(code, out, 2)
 
 
-def shader_features(spirv, name):
-    """The Vulkan feature names recorded for a shader in index.json, or an empty set."""
-    try:
-        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
-            feats = json.load(f).get(name, {}).get("features") or ()
-            return set(feats)
-    except (OSError, ValueError, TypeError):
-        return set()
+def shader_fma_mode(meta):
+    mode = meta.get("fma_mode")
+    if mode in ("exact", "khr", "glsl"):
+        return mode
+    if "shaderFmaFloat32" in (meta.get("features") or ()):
+        return "khr"
+    return os.environ.get("LEONIDA_FMA", "glsl")
 
 
-def judge_fma_fused(words, khr):
-    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr every word must be exact fused; under --fma glsl
-    each of the 7 f32 words may be either fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the
-    f16 round-to-odd word out[7] must always be exact 0x00007351."""
+def judge_fma_fused(words, mode):
     if not words or len(words) < 8:
         return False, "missing out[0..7] dump"
-    if khr:
+    if mode in ("khr", "exact"):
+        label = "OpFmaKHR" if mode == "khr" else "exact emulation"
         for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
             if got != want:
-                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} (OpFmaKHR)"
-        return True, "8/8 fused exact (OpFmaKHR)"
+                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} ({label})"
+        return True, f"8/8 fused exact ({label})"
     if words[7] != FMA_FUSED[7]:
         return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
     n_split = 0
@@ -862,10 +859,12 @@ def judge_fma_fused(words, khr):
 
 
 def fma_fused_test(tools, spirv):
-    """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr, fused-or-split f32 under --fma glsl)."""
     shader = os.path.join(spirv, "cs_fma_fused.spv")
-    khr = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
-           or os.environ.get("LEONIDA_FMA") == "khr")
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as source:
+            meta = json.load(source).get("cs_fma_fused", {})
+    except (OSError, ValueError):
+        meta = {}
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
                     env=dict(os.environ, **FMA_FUSED_ENV))
     if code == UNSUPPORTED:
@@ -877,7 +876,7 @@ def fma_fused_test(tools, spirv):
     if not m:
         return failure(code, out, 2)
     words = [int(x) for x in m.group(1).split()]
-    ok, detail = judge_fma_fused(words, khr=khr)
+    ok, detail = judge_fma_fused(words, shader_fma_mode(meta))
     return "" if ok else detail
 
 
