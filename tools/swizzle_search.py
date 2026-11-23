@@ -7,6 +7,7 @@ whose block-endpoint image is smoothest wins.
 Usage:
     python -I swizzle_search.py <blob> --bpe 8 --tile 65536 [--widths 1024,2048] [--tiles 48] [--out preview.png]
 numpy is imported lazily, so a plain import (and `--help`) works on a checkout without it.
+Usage: `python -I tools/swizzle_search.py --help` lists the options.
 """
 import argparse
 import itertools
