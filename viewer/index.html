@@ -237,8 +237,10 @@ addEventListener("keydown", e => {
   if (e.code === "KeyR") camera.position.fromArray(world.spawn);
   if (e.code === "KeyP" && !e.repeat) {
     const nextHash = formatCamHash(camera.position.toArray(), yaw, pitch);
-    if (nextHash) history.replaceState(null, "", nextHash);
-    navigator.clipboard?.writeText(location.href).catch(() => {});
+    if (nextHash) {
+      history.replaceState(null, "", nextHash);
+      navigator.clipboard?.writeText(location.href).catch(() => {});
+    }
   }
 });
 addEventListener("keyup", e => keys.delete(e.code));
