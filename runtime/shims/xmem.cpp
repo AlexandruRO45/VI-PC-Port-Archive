@@ -30,34 +30,35 @@
 namespace {
 
 constexpr size_t kAlign = 64;
+constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
-// gta6rt --trace FILE: the first XMemAlloc and the first XMemFree for each distinct raw attribute word go to the
+// gta6rt --trace FILE: the first XMemAlloc, XMemFree and XMemVirtualAlloc call for each distinct raw attribute word go to the
 // startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
 // bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
 // which would fill the file. Off: one relaxed load per call.
-void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<bool, uint64_t>> seen;
+    static std::set<std::pair<std::string, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({is_alloc, attributes}).second) return;
+        if (!seen.insert({api, attributes}).second) return;
     }
-    std::string fields = std::string("\"api\":\"") + (is_alloc ? "XMemAlloc" : "XMemFree") +
+    std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
-    if (is_alloc) fields += ",\"size\":" + std::to_string(size);
+    if (size != kNoSize) fields += ",\"size\":" + std::to_string(size);
     fields += ",\"caller\":" +
               rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
+    note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
     return _aligned_malloc(size ? size : 1, kAlign);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes(false, attributes, 0, _ReturnAddress());
+    note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
     _aligned_free(p);
 }
 
@@ -145,16 +146,22 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     return true;
 }
 
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+// The console's PAGE_GRAPHICS_* protection bits (winnt.h: PAGE_GRAPHICS_NOACCESS 0x800 .. PAGE_GRAPHICS_NOCACHE
+// 0x40000). The host refuses them with ERROR_INVALID_PARAMETER, and the D3D12 layer reads guest memory through the
+// CPU mapping, so only the CPU protection is applied. The retail executable passes 0x801 and 0x22004.
+constexpr DWORD kPageGraphicsMask = 0x0007F800;
+
+DWORD host_protect(DWORD p) {
+    const DWORD cpu = p & ~(kPageGraphicsMask | kConsoleProtectionTag);
+    return !cpu && (p & kPageGraphicsMask) ? PAGE_NOACCESS : cpu;
+}
+
+void* guest_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
     // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region. Nonzero attribute flags also fail until their host mapping is known.
+    // region.
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
-        return nullptr;
-    }
-    if (attributes != 0) {
-        SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
 
@@ -212,21 +219,15 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    return VirtualAlloc(address, size, host_type, protect & ~kConsoleProtectionTag);
+    return VirtualAlloc(address, size, host_type, host_protect(protect));
 }
 
-LPVOID WINAPI TitleVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    // An explicit console tag distinguishes guest page modes from overlapping Win32 flags such as MEM_PHYSICAL.
-    const bool console = (allocation_type & kConsoleAllocationTags) || (protect & kConsoleProtectionTag);
-    if (console && (allocation_type & kXmemPageModeMask)) {
-        // VirtualAlloc requires an explicit operation. Only the XMem API defaults to reserve and commit.
-        if (!(allocation_type & kVirtualAllocOperations)) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return nullptr;
-        }
-        return XMemVirtualAlloc(address, size, allocation_type, 0, protect);
-    }
-    return VirtualAlloc(address, size, allocation_type & ~kConsoleAllocationTags, protect & ~kConsoleProtectionTag);
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    // The attribute word is recorded, not applied, as for XMemAlloc: the host has no allocator ids or memory types.
+    // The retail executable passes 0x21, 0x3, 0x183, 0x283 and 0x181 and stops at an int3 when a reservation
+    // returns NULL, so refusing a nonzero word is not an option.
+    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+    return guest_virtual_alloc(address, size, allocation_type, protect);
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
@@ -282,6 +283,22 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
         }
     }
     return TRUE;
+}
+
+// The host has no console memory partitions or GPU protection flags. A title's CPU-backed allocation keeps
+// its Win32 intent after the console allocation and protection tags are removed.
+LPVOID WINAPI TitleVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, DWORD protect) {
+    // An explicit console tag distinguishes guest page modes from overlapping Win32 flags such as MEM_PHYSICAL.
+    const bool console = (allocation_type & kConsoleAllocationTags) || (protect & kConsoleProtectionTag);
+    if (console && (allocation_type & kXmemPageModeMask)) {
+        // VirtualAlloc requires an explicit operation. Only the XMem API defaults to reserve and commit.
+        if (!(allocation_type & kVirtualAllocOperations)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        return guest_virtual_alloc(address, size, allocation_type, protect);
+    }
+    return VirtualAlloc(address, size, allocation_type & ~kConsoleAllocationTags, host_protect(protect));
 }
 
 }  // namespace
