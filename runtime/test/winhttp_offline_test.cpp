@@ -365,6 +365,50 @@ int main() {
         check(connect(session, nullptr, 80, 0) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
               "a connection needs a server name");
 
+        // Handle creation argument validation (AirKyzzZ's finding).
+        SetLastError(0);
+        check(open(L"agent", 2, nullptr, nullptr, 0) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "WinHttpOpen rejects invalid access type");
+        SetLastError(0);
+        check(open(L"agent", WINHTTP_ACCESS_TYPE_NAMED_PROXY, nullptr, nullptr, 0) == nullptr &&
+                  GetLastError() == ERROR_INVALID_PARAMETER,
+              "WinHttpOpen rejects named proxy with null proxy string");
+        SetLastError(0);
+        check(open(L"agent", WINHTTP_ACCESS_TYPE_NAMED_PROXY, L"", nullptr, 0) == nullptr &&
+                  GetLastError() == ERROR_INVALID_PARAMETER,
+              "WinHttpOpen rejects named proxy with empty proxy string");
+        SetLastError(0);
+        check(open(L"agent", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0x1) == nullptr &&
+                  GetLastError() == ERROR_INVALID_PARAMETER,
+              "WinHttpOpen rejects invalid flags");
+
+        SetLastError(0);
+        check(connect(session, L"example.invalid", 80, 1) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "WinHttpConnect rejects non-zero reserved");
+        SetLastError(0);
+        check(connect(session, L"", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+              "WinHttpConnect rejects empty server name with ERROR_WINHTTP_INVALID_URL");
+        SetLastError(0);
+        check(connect(session, L"   ", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+              "WinHttpConnect rejects blank server name");
+        SetLastError(0);
+        check(connect(session, L"a b", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+              "WinHttpConnect rejects server name with spaces");
+        SetLastError(0);
+        check(connect(session, L"http://example.invalid", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+              "WinHttpConnect rejects scheme-prefixed server name");
+        SetLastError(0);
+        check(connect(session, L"example.invalid/path", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+              "WinHttpConnect rejects path-containing server name");
+        SetLastError(0);
+        check(connect(session, L"example.invalid:80", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+              "WinHttpConnect rejects port-containing server name");
+
+        SetLastError(0);
+        check(open_request(connection, L"GET", L"/", nullptr, nullptr, nullptr, 0x1) == nullptr &&
+                  GetLastError() == ERROR_INVALID_PARAMETER,
+              "WinHttpOpenRequest rejects invalid flags");
+
         check(close(request) != FALSE && close(connection) != FALSE && close(session) != FALSE,
               "the handles close, children first");
         SetLastError(0);

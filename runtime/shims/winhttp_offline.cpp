@@ -185,9 +185,40 @@ BOOL fail(DWORD error) {
     return FALSE;
 }
 
+bool is_invalid_server_name(LPCWSTR s) {
+    if (!s || !*s) return true;
+    bool in_brackets = false;
+    for (const wchar_t* p = s; *p; ++p) {
+        if (*p <= 32) return true;  // spaces, tabs, control characters are refused (ERROR_WINHTTP_INVALID_URL)
+        if (*p == L'[') in_brackets = true;
+        else if (*p == L']') in_brackets = false;
+        else if (!in_brackets) {
+            if (*p == L'/' || *p == L'\\' || *p == L':') return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
-HINTERNET WINAPI open_session(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD flags) {
+HINTERNET WINAPI open_session(LPCWSTR, DWORD access_type, LPCWSTR proxy_name, LPCWSTR, DWORD flags) {
+    if (access_type != WINHTTP_ACCESS_TYPE_DEFAULT_PROXY &&
+        access_type != WINHTTP_ACCESS_TYPE_NO_PROXY &&
+        access_type != WINHTTP_ACCESS_TYPE_NAMED_PROXY &&
+        access_type != WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (access_type == WINHTTP_ACCESS_TYPE_NAMED_PROXY && (!proxy_name || !*proxy_name)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    constexpr DWORD kAllowedSessionFlags = WINHTTP_FLAG_ASYNC | WINHTTP_FLAG_SECURE_DEFAULTS;
+    if ((flags & ~kAllowedSessionFlags) != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
     static std::once_flag once;
     std::call_once(once, [] {
         std::fprintf(stderr, "[rt] winhttp: offline; requests fail with ERROR_WINHTTP_CANNOT_CONNECT\n");
@@ -195,22 +226,34 @@ HINTERNET WINAPI open_session(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD flags) {
     return make_handle(Kind::Session, nullptr, (flags & WINHTTP_FLAG_ASYNC) != 0);
 }
 
-HINTERNET WINAPI open_connection(HINTERNET session, LPCWSTR server, INTERNET_PORT port, DWORD) {
+HINTERNET WINAPI open_connection(HINTERNET session, LPCWSTR server, INTERNET_PORT port, DWORD reserved) {
+    if (reserved != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (!server) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (is_invalid_server_name(server)) {
+        SetLastError(ERROR_WINHTTP_INVALID_URL);
+        return nullptr;
+    }
     DWORD error = 0;
     Handle* s = acquire(session, true, false, false, error);
     if (!s) {
         SetLastError(error);
         return nullptr;
     }
-    if (!server || !*server) {
-        release(s);
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return nullptr;
-    }
     return make_handle(Kind::Connect, s, s->async, server, port);  // keeps the reference on the session
 }
 
-HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD) {
+HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD flags) {
+    constexpr DWORD kAllowedRequestFlags = 0x008003CC;
+    if ((flags & ~kAllowedRequestFlags) != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
     DWORD error = 0;
     Handle* c = acquire(connection, false, true, false, error);
     if (!c) {
