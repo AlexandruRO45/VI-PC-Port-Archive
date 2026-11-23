@@ -146,6 +146,33 @@ class TestSAbsdiffI32ReferenceOracle(unittest.TestCase):
         res = oracle_s_absdiff_i32(0x5, 0x9)
         self.assertEqual(res, 0x4)
 
+class TestSAbsdiffI32ASTAndInterpreter(unittest.TestCase):
+    """Stage 2 for s_absdiff_i32: AST and deterministic scalar interpreter execution."""
+
+    def test_s_absdiff_i32_ast_and_execution(self):
+        ast_prog = ['s_absdiff_i32 s0, s2, s3'] + [
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_absdiff_i32", ast_prog)
+        for needle in ['SAbs', 'OpISub', '%scc']:
+            self.assertIn(needle, spv)
+
+        exec_prog = ['s_mov_b32 s1, 5', 's_mov_b32 s2, 9', 's_absdiff_i32 s0, s1, s2'] + [
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        words = run_salu_bundle_ps(exec_prog, "ps_exec_s_absdiff_i32")
+        self.assertEqual(words[0], 0x4)
+
 
 if __name__ == '__main__':
     unittest.main()
