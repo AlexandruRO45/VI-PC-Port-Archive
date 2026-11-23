@@ -236,9 +236,11 @@ def _check_spirv_structure(text):
         assert lbl in seen_labels, f"branch/merge references undefined label {lbl}"
 
 
-def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None, max_steps=2_000_000, reverse_order=False):
+def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None, max_steps=2_000_000, reverse_order=False,
+                           wg_id=(0, 0, 0), num_wg=(1, 1, 1)):
     """Execute a --wave64-emulate compute shader across all `lx * ly * lz` invocations with real shared
-    Workgroup memory and strict uniform OpControlBarrier checking. Returns `(memory, barrier_count)`."""
+    Workgroup memory and strict uniform OpControlBarrier checking. Returns `(memory, barrier_count)`.
+    `wg_id` / `num_wg` are what WorkgroupId / NumWorkgroups read; Private variables are per invocation."""
     _check_spirv_structure(spvasm)
     mod = _parse_module(spvasm)
     types = mod["types"]
@@ -305,12 +307,16 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 if res == "%local_id":
                     box = [coord]
                 elif res == "%wg_id":
-                    box = [(0, 0, 0)]
+                    box = [tuple(wg_id)]
+                elif res == "%num_wg":
+                    box = [tuple(num_wg)]
                 elif res == "%local_index":
                     box = [idx]
                 else:
                     box = [zero_of(pointee)]
                 ptrs[res] = (box, 0)
+            elif cls == "Private":
+                ptrs[res] = ([vals[init_id] if init_id in vals else zero_of(pointee)], 0)
             else:
                 raise NotImplementedError(f"global storage class {cls}")
         return {

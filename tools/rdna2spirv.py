@@ -78,6 +78,15 @@ FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPrese
 # in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
 # the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
 MESH_COMPUTE = False
+# --vs-compute: a wave64 vertex shader the wave64_halves analysis puts in tier C (not exact on a 32-wide subgroup) is
+# also built as a compute module, <name>.vs_compute.spv, so --wave64-emulate makes it exact on any subgroup size. One
+# workgroup is one 64-lane wave: invocation i of workgroup (x, y) is vertex x * 64 + i (v0, zero-based) of instance y
+# (v3). Lanes at or past the vertex count (push-constant dword 38) start inactive, as in the hardware's last wave.
+# Instead of its outputs, each invocation writes its position and params to slot y * (num_workgroups.x * 64) + x * 64
+# + i of a buffer whose device address is in push-constant dwords 36..37 (vs_compute_layout(); the VS's index entry
+# records it as "vs_compute"). A vertex shader then draws those slots (atom 2 of the plan in issue #94).
+VS_COMPUTE = False
+VS_COMPUTE_PASS = False  # set by build_vs_compute() while it translates the compute variant
 # --pc-tail-ubo: for devices with 128 bytes of push constants, Vulkan's minimum (AMD's Windows driver on RDNA2 iGPUs,
 # some Intel Arc drivers; D3D-14's push_constants_need_fallback). The push-constant block keeps s0..s31 (128 bytes).
 # The tail that follows them by default (dwords 32..35: heap base, code base; 36..37: the --mesh-compute output
@@ -148,6 +157,17 @@ def assign_f16_half_locations(f16_attrs, raw_locs, top=F16_HALF_TOP):
             f"--f16-interp-fallback: need {need} decoded-half locations, only {len(free)} free in 0..{top}"
         )
     return {n: (free[2 * k + 1], free[2 * k]) for k, n in enumerate(attrs)}
+
+
+def vs_compute_layout(params):
+    """Byte layout of one vertex's slot in the --vs-compute output buffer: position xyzw at 0, then one vec4 per param
+    location in ascending order, everything 16-byte aligned. The vertex count of the draw is push-constant dword 38
+    and the buffer's device address dwords 36..37 (the block grows from 144 to 156 bytes)."""
+    params = sorted(params)
+    return {"vertex_stride": 16 * (1 + len(params)), "position": 0,
+            "params": {n: 16 * (1 + k) for k, n in enumerate(params)},
+            "wave_lanes": 64, "push_constant_bytes": 4 * USER_SGPRS + 28,
+            "address_dwords": [USER_SGPRS + 4, USER_SGPRS + 5], "vertex_count_dword": USER_SGPRS + 6}
 
 
 def mesh_compute_layout(maxv, maxp, clip_count, cull_count, params):
@@ -338,6 +358,7 @@ class Gen:
         self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
         self.w64_scalar_spills = set()  # (vgpr, lane) pure scalar spill slots lowered to self.parked (SHADER-10)
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
+        self.vsc = False           # --vs-compute: this VS is being built as a compute module (VS_COMPUTE_PASS)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
         self.mini_segs = defaultdict(list)  # emulate_plan: mini_idx -> continuation segment ids
@@ -4932,11 +4953,16 @@ class Gen:
         self.uses_psb = True
         return self.lconsts[v]
 
+    def x_size(self):
+        """Workgroup size of an emulated wave64 shader: the compute or mesh header's, one wave for --vs-compute."""
+        return (64, 1, 1) if self.vsc else (self.cs or self.ms)["size"]
+
     def local_index(self):
         """LocalInvocationIndex of a compute or mesh shader invocation (thread i of its workgroup): the mesh shader
-        loads the built-in; a compute shader flattens LocalInvocationId with the group size from its header."""
+        and a --vs-compute VS load the built-in; a compute shader flattens LocalInvocationId with the group size from
+        its header."""
         li = self.tmp()
-        if self.stage == "ms":
+        if self.stage == "ms" or self.vsc:
             self.emit(f"{li} = OpLoad %uint %local_index")
             return li
         lid, x, y, z, lx, t1, t2 = (self.tmp() for _ in range(7))
@@ -4967,7 +4993,7 @@ class Gen:
         wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane; wave32
         pixel shaders use the lane within either 32-lane half."""
         lane = self.tmp()
-        if self.stage in ("cs", "ms"):
+        if self.stage in ("cs", "ms") or self.vsc:
             self.emit(f"{lane} = OpBitwiseAnd %uint {self.local_index()} {self.cu(63 if self.wave64 else 31)}")
         else:
             subgroup_lane = self.subgroup_lane()
@@ -7917,7 +7943,7 @@ class Gen:
             if slot and slot[1:] in self.parked:        # somewhere a mask is fetched back from this lane: keep ours
                 self.store_reg("sgpr", self.parked[slot[1:]], val)
             me, m, eq, old, r = (self.tmp() for _ in range(5))
-            if self.stage in ("cs", "ms") or self.wave32_fragment:
+            if self.stage in ("cs", "ms") or self.vsc or self.wave32_fragment:
                 # Wave32 fragments use their lane within either half of a wider Vulkan subgroup.
                 self.emit(f"{me} = OpCopyObject %uint {self.wave_lane()}")
             else:
@@ -14425,6 +14451,35 @@ def dedupe_types(text):
     return pattern.sub(lambda m: alias[m.group(0)], "\n".join(out))
 
 
+def vs_compute_epilogue(gen):
+    """--vs-compute: every invocation (active or not, so the slots of a partial last wave are written too) stores its
+    position and params to its vertex's slot: y * (num_workgroups.x * 64) + x * 64 + LocalInvocationIndex for
+    workgroup (x, y), at the offsets of gen.vsc_layout. Built before any constant is emitted (like the mesh one)."""
+    c, lay = gen.cu, gen.vsc_layout
+    L = ["%vxli = OpLoad %uint %local_index", "%vxwg = OpLoad %v3uint %wg_id", "%vxnw = OpLoad %v3uint %num_wg",
+         "%vxwx = OpCompositeExtract %uint %vxwg 0", "%vxwy = OpCompositeExtract %uint %vxwg 1",
+         "%vxnx = OpCompositeExtract %uint %vxnw 0",
+         f"%vxrow = OpIMul %uint %vxnx {c(64)}", "%vxiy = OpIMul %uint %vxwy %vxrow",
+         f"%vxx64 = OpIMul %uint %vxwx {c(64)}", "%vxs0 = OpIAdd %uint %vxiy %vxx64",
+         "%vxs = OpIAdd %uint %vxs0 %vxli",
+         pc_tail_chain("%vxa_lo_p", 5, c), pc_tail_chain("%vxa_hi_p", 6, c),
+         "%vxa_lo = OpLoad %uint %vxa_lo_p", "%vxa_hi = OpLoad %uint %vxa_hi_p",
+         "%vxa_l64 = OpUConvert %ulong %vxa_lo", "%vxa_h64 = OpUConvert %ulong %vxa_hi",
+         "%vxa_sh = OpShiftLeftLogical %ulong %vxa_h64 %c64_32", "%vxa = OpBitwiseOr %ulong %vxa_sh %vxa_l64",
+         "%vxs64 = OpUConvert %ulong %vxs", f"%vxso = OpIMul %ulong %vxs64 {gen.cl(lay['vertex_stride'])}",
+         "%vxb = OpIAdd %ulong %vxa %vxso"]
+    outs = [(lay["position"], "%out_pos")] + [(off, f"%out_param{n}") for n, off in sorted(lay["params"].items())]
+    for k, (off, var) in enumerate(outs):
+        L.append(f"%vxv{k} = OpLoad %v4float {var}")
+        for comp in range(4):
+            L += [f"%vxf{k}_{comp} = OpCompositeExtract %float %vxv{k} {comp}",
+                  f"%vxu{k}_{comp} = OpBitcast %uint %vxf{k}_{comp}",
+                  f"%vxo{k}_{comp} = OpIAdd %ulong %vxb {gen.cl(off + 4 * comp)}",
+                  f"%vxp{k}_{comp} = OpConvertUToPtr %_ptr_PSB_uint %vxo{k}_{comp}",
+                  f"OpStore %vxp{k}_{comp} %vxu{k}_{comp} Aligned 4"]
+    return "".join(f"         {line}\n" for line in L)
+
+
 def mesh_compute_epilogue(gen):
     """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
     writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
@@ -14546,6 +14601,7 @@ def assemble(gen):
     ms = gen.stage == "ms"
     gsx = gen.stage == "gs"
     msc = ms and MESH_COMPUTE
+    vsc = vs and gen.vsc
     # --f16-interp-fallback, mesh: the params whose decoded halves fit clear of this shader's params (Gen.f16_halves_of)
     if ms and not msc and F16_HALVES:
         for n in sorted(gen.ms_params):
@@ -14557,6 +14613,14 @@ def assemble(gen):
                                              gen.cull_count if gen.uses_cull else 0, gen.ms_params)
         # Built here, before any constant is emitted, so every constant it asks for gets declared.
         gen.msc_epilogue = mesh_compute_epilogue(gen)
+    if vsc:
+        if gen.uses_clip or gen.uses_cull or gen.uses_layer or gen.uses_viewport:
+            raise Unsupported("vs-compute: clip/cull distances, layer or viewport index are not modelled")
+        gen.outputs.setdefault("%out_pos", "pos0")
+        gen.vsc_layout = vs_compute_layout(int(t[5:]) for t in gen.outputs.values() if t.startswith("param"))
+        gen.vsc_epilogue = vs_compute_epilogue(gen)
+        for v in (0, 1, 64, 4 * USER_SGPRS + 24):
+            gen.cu(v)
     # --pc-tail-ubo: the uniform block exists only when the shader reads the tail (after the epilogue, which reads it).
     gen.uses_pc_tail = PC_TAIL_UBO and (gen.uses_heap or gen.uses_codebase or msc)
     if gen.emulate:
@@ -14568,9 +14632,9 @@ def assemble(gen):
         gen.uses_bcast_first = False
         x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
         x_zero = x_sink - x_mask           # mask and schedule words: zeroed before the first round
-        x_threads = (gen.cs or gen.ms)["size"]
+        x_threads = gen.x_size()
         x_threads = x_threads[0] * x_threads[1] * x_threads[2]
-        sx, sy, _ = (gen.cs or gen.ms)["size"]
+        sx, sy, _ = gen.x_size()
         for v in (0, 1, 2, 3, 6, 31, 63, 0x948, x_mask, x_sched, x_sink, x_sink + 1, x_zero - 1, x_threads,
                   x_waves, sx, sx * sy, 0xFFFFFFC0):
             gen.cu(v)
@@ -14584,9 +14648,10 @@ def assemble(gen):
         sx, sy, _ = gen.cs["size"]
         for v in (0, 1, 2, 3, 0x108, sx, sx * sy):
             gen.cu(v)
-    model = "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
+    model = "GLCompute" if vsc else "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
     ms_blk = ms and not msc and (gen.uses_clip or gen.uses_cull)
-    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index", "%base_vertex", "%base_instance"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
+    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index", "%base_vertex", "%base_instance"] if vs and not vsc else
+     ["%wg_id", "%num_wg", "%local_index"] if vsc else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
@@ -14674,7 +14739,7 @@ def assemble(gen):
             caps.append("StorageImageReadWithoutFormat")  # shaderStorageImageReadWithoutFormat: coherent image_load
         if 3 in gen.uses_store_views:
             caps.append("Image1D")
-    if vs:
+    if vs and not vsc:
         caps.append("DrawParameters")   # BaseVertex / BaseInstance (shaderDrawParameters), see the seeding of v0 / v3
     if gsx:
         caps.append("Geometry")
@@ -14716,6 +14781,8 @@ def assemble(gen):
            f"OpEntryPoint {model} %main \"main\" {' '.join(iface)}"]
     if cs:
         hdr.append("OpExecutionMode %main LocalSize {} {} {}".format(*gen.cs["size"]))
+    if vsc:
+        hdr.append("OpExecutionMode %main LocalSize 64 1 1")
     if gsx:
         hdr += ["OpExecutionMode %main Triangles", "OpExecutionMode %main Invocations 1",
                 "OpExecutionMode %main OutputTriangleStrip", f"OpExecutionMode %main OutputVertices {gen.gs['maxv']}"]
@@ -14740,11 +14807,14 @@ def assemble(gen):
             hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 64")
         hdr.append("OpExecutionMode %main DenormPreserve 16")
     dec = []
-    if vs:
+    if vs and not vsc:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
         dec.append("OpDecorate %instance_index BuiltIn InstanceIndex")
         dec.append("OpDecorate %base_vertex BuiltIn BaseVertex")
         dec.append("OpDecorate %base_instance BuiltIn BaseInstance")
+    if vsc:
+        dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %num_wg BuiltIn NumWorkgroups",
+                "OpDecorate %local_index BuiltIn LocalInvocationIndex"]
     if cs:
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %local_id BuiltIn LocalInvocationId"]
     if gsx:
@@ -14791,7 +14861,7 @@ def assemble(gen):
             dec.append("OpDecorate %out_layer BuiltIn Layer")
         if gen.uses_viewport:
             dec.append("OpDecorate %out_viewport BuiltIn ViewportIndex")
-    for name, tgt in gen.outputs.items():
+    for name, tgt in ({} if vsc else gen.outputs).items():   # --vs-compute: Private variables, no decorations
         if name == "%out_pos":
             dec.append("OpDecorate %out_pos BuiltIn Position")
         else:
@@ -14926,10 +14996,17 @@ def assemble(gen):
     if gen.partial_color_outputs:
         types.append("%initial_mrt = OpConstantNull %v4float")
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" + (" %initial_mrt" if n in gen.partial_color_outputs else "")
-             for n in gen.outputs]
+             for n in gen.outputs] if not vsc else \
+        [f"{n} = OpVariable %_ptr_Private_v4_vsc Private %null_v4f_vsc" for n in gen.outputs]
+    if vsc:
+        types += ["%_ptr_Private_v4_vsc = OpTypePointer Private %v4float", "%null_v4f_vsc = OpConstantNull %v4float",
+                  "%v3uint = OpTypeVector %uint 3", "%_ptr_Input_v3u = OpTypePointer Input %v3uint",
+                  "%_ptr_Input_uint_vsc = OpTypePointer Input %uint"]
+        gvars += ["%wg_id = OpVariable %_ptr_Input_v3u Input", "%num_wg = OpVariable %_ptr_Input_v3u Input",
+                  "%local_index = OpVariable %_ptr_Input_uint_vsc Input"]
     # Push constants: s0..s31 user data, then the tail: the 64-bit host address of the Xbox GPU VA window (heap
     # base), the code base and, with --mesh-compute, the output address. --pc-tail-ubo moves the tail to %pc_tail.
-    tail = ["%uint"] * (6 if msc else 4)
+    tail = ["%uint"] * (7 if vsc else 6 if msc else 4)
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
               " ".join(["%UserData = OpTypeStruct %arr_ud"] + ([] if PC_TAIL_UBO else tail)),
               "%_ptr_PC_UserData = OpTypePointer PushConstant %UserData",
@@ -15146,7 +15223,7 @@ def assemble(gen):
             gvars += ["%images_3d = OpVariable %_ptr_UC_rt_img3 UniformConstant"]
         if gen.uses_storage3d:
             gvars += ["%simages3d = OpVariable %_ptr_UC_rt_simg3 UniformConstant"]
-    if vs:
+    if vs and not vsc:
         gvars.append("%vertex_index = OpVariable %_ptr_Input_int Input")
         gvars.append("%instance_index = OpVariable %_ptr_Input_int Input")
         gvars.append("%base_vertex = OpVariable %_ptr_Input_int Input")
@@ -15197,7 +15274,17 @@ def assemble(gen):
                f"%ud{i} = OpLoad %uint %ud{i}p",
                f"%ud{i}s = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(i)}",
                f"OpStore %ud{i}s %ud{i}"]
-    if vs:
+    if vsc:
+        # --vs-compute: workgroup (x, y), invocation i is vertex x * 64 + i of instance y. A lane at or past the
+        # vertex count (push-constant dword 38) starts inactive, as the lanes past the end of the hardware's last wave.
+        fn += ["%vci = OpLoad %uint %local_index", "%vcw = OpLoad %v3uint %wg_id",
+               "%vcwx = OpCompositeExtract %uint %vcw 0", "%vcwy = OpCompositeExtract %uint %vcw 1",
+               f"%vcx64 = OpIMul %uint %vcwx {gen.cu(64)}", "%vcv = OpIAdd %uint %vcx64 %vci",
+               "%v0p = OpAccessChain %_ptr_Function_uint %vgpr %c0", "OpStore %v0p %vcv",
+               f"%v3p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(3)}", "OpStore %v3p %vcwy",
+               pc_tail_chain("%vcnp", 7, gen.cu), "%vcn = OpLoad %uint %vcnp",
+               "%vcin = OpULessThan %bool %vcv %vcn", "OpStore %active %vcin"]
+    elif vs:
         # The hardware's VS input VGPRs are zero-based: v0 is the vertex id without the draw's base vertex and v3
         # the instance id without its first instance (Mesa: ac.vertex_id = load_vertex_id_zero_base, the base in
         # the base_vertex SGPR; ac.instance_id = load_instance_id, the base in start_instance). Vulkan's
@@ -15437,6 +15524,8 @@ def assemble(gen):
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if msc:
         end_lock = gen.msc_epilogue + end_lock
+    elif vsc:
+        end_lock = gen.vsc_epilogue + end_lock
     elif ms:
         # All invocations reach the end: wait for the ALLOC_REQ write, declare the counts once (uniform), then each
         # thread writes the vertex and primitive it exported (index = LocalInvocationIndex).
@@ -16727,6 +16816,17 @@ def translate(path):
         g.emulate = True
         size = (g.cs or g.ms)["size"]
         g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
+    if VS_COMPUTE_PASS and stage == "vs":
+        if not g.wave64:
+            raise Unsupported("vs-compute: not a wave64 vertex shader")
+        if g.vertex_inputs:
+            raise Unsupported("vs-compute: Vulkan vertex inputs (a fetch program) are not modelled")
+        if PC_TAIL_UBO or F16_HALVES:
+            raise Unsupported("vs-compute: --pc-tail-ubo / --f16-interp-fallback not modelled")
+        g.vsc = True
+        g.emulate = True
+        g.x_lanes = 64
+        g.exec_static_true = False      # lanes past the vertex count start inactive
     insns = fold_far_branches(insns)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if stage == "ps":
@@ -17222,11 +17322,11 @@ def x_prologue(gen, threads):
     Shared by x_scheduler (round loop) and structured wave64 emulation (inline_all / structured_hybrid)."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
     _, x_mask, _, x_sink = gen.x_sizes()
-    sx, sy, _ = (gen.cs or gen.ms)["size"]
+    sx, sy, _ = gen.x_size()
     L = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
          "%done = OpVariable %_ptr_Function_bool Function %false"]
     # This invocation's place: index in the workgroup, lane and wave (the same split as Gen.wave_lane).
-    if gen.stage == "ms":
+    if gen.stage == "ms" or gen.vsc:
         L += ["%x_li = OpLoad %uint %local_index"]
     else:
         L += ["%x_lid = OpLoad %v3uint %local_id", "%x_lx = OpCompositeExtract %uint %x_lid 0",
@@ -17852,6 +17952,42 @@ def _run_spirv_tool(cmd, **kwargs):
         raise
 
 
+def wants_vs_compute(m):
+    """--vs-compute: a wave64 VS that wave64_halves puts in tier C, without Vulkan vertex inputs."""
+    return m.get("stage") == "vs" and m.get("wave64") and m.get("wave64_graphics") == "C" and not m.get("vertex_inputs")
+
+
+def build_vs_compute(path, name, a, m):
+    """--vs-compute: translate `path` again as an emulated compute module, <name>.vs_compute.spv next to the VS, and
+    record its layout in the VS's index entry `m` as "vs_compute" (or why it failed as "vs_compute_error"). The VS
+    itself is unchanged: a device with 64-wide subgroups keeps drawing with it."""
+    global VS_COMPUTE_PASS
+    VS_COMPUTE_PASS = True
+    try:
+        asm = translate(path)
+    except (Unsupported, IndexError, KeyError, ValueError) as e:
+        m["vs_compute_error"] = f"{type(e).__name__}: {e}"[:200]
+        return
+    finally:
+        VS_COMPUTE_PASS = False
+    g = translate.last_gen
+    sa = os.path.join(a.out, name + ".vs_compute.spvasm")
+    sv = os.path.join(a.out, name + ".vs_compute.spv")
+    with open(sa, "w", encoding="utf-8", newline="\n") as f:
+        f.write(asm)
+    r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler, validate=not a.no_validate)
+    if a.no_asm and os.path.exists(sa):
+        os.remove(sa)
+    if r.returncode != 0:
+        Path(sv).unlink(missing_ok=True)
+        m["vs_compute_error"] = "INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:150]
+        return
+    lay = dict(g.vsc_layout)
+    lay["params"] = {str(k): v for k, v in lay["params"].items()}
+    lay["module"] = name + ".vs_compute.spv"
+    m["vs_compute"] = lay
+
+
 def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True):
     """Keep the assembled module out of the final path until validation succeeds.
 
@@ -17993,6 +18129,10 @@ def main():
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
+    ap.add_argument("--vs-compute", action="store_true",
+                    help="also build each tier-C wave64 vertex shader (wave64_halves) as an emulated wave64 compute "
+                         "module, <name>.vs_compute.spv, that writes its vertices to a buffer (metadata: vs_compute), "
+                         "exact on 32-wide subgroups (issue #94)")
     ap.add_argument("--shader-clock", choices=("off", "khr"), default="off",
                     help="s_memtime / s_memrealtime: off = Unsupported (default), khr = OpReadClockKHR (needs "
                          "VK_KHR_shader_clock; feature shaderSubgroupClock / shaderDeviceClock in the metadata)")
@@ -18041,7 +18181,7 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV, VS_COMPUTE
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
@@ -18056,6 +18196,7 @@ def main():
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
+    VS_COMPUTE = a.vs_compute
     F16_HALVES = a.f16_interp_fallback
     OPT_SPIRV = a.opt
     if a.merge:
@@ -18172,6 +18313,8 @@ def main():
                 meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
+            if VS_COMPUTE and wants_vs_compute(meta[name]):
+                build_vs_compute(p, name, a, meta[name])
         else:
             if not write_asm:
                 with open(sa, "w", encoding="utf-8", newline="\n") as f:
