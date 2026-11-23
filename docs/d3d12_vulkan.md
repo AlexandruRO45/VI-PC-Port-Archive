@@ -3660,3 +3660,9 @@ The public Xbox graphics index retrieved for this document lists interfaces up t
 `ID3D12GraphicsCommandList7`; the shipped DLL names `Device11` and `CommandList8`, which the index does not cover.
 This is why the layer targets the Windows SDK's newer public chain rather than assuming the Xbox public index is
 complete.
+
+## InnerCoverage implementation and handoff
+
+[InnerCoverage contracts, synthetic underestimation-mask implementation and remaining ABI work](inner_coverage.md)
+distinguish the explicit-library runtime path from the bounded AMD-capable test fixture. The fixture does not
+enable a general runtime fallback or automatic Xbox input mapping.

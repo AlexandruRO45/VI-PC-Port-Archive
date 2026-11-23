@@ -391,6 +391,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(inner_coverage_mask_layout_test test/inner_coverage/mask_layout_test.cpp)
+  target_compile_features(inner_coverage_mask_layout_test PRIVATE cxx_std_20)
+  add_test(NAME inner_coverage_mask_layout COMMAND inner_coverage_mask_layout_test)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
 
@@ -1006,6 +1009,13 @@ if(NOT TARGET Vulkan::Headers)
   endif()
 endif()
 if(TARGET Vulkan::Headers)
+  # Standalone synthetic mask/capture contract, also buildable from test/inner_coverage.
+  add_executable(vk_inner_coverage test/inner_coverage/vk_inner_coverage.cpp)
+  target_link_libraries(vk_inner_coverage PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  target_include_directories(vk_inner_coverage PRIVATE test)
+  if(WIN32)
+    target_compile_definitions(vk_inner_coverage PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
   foreach(tool vk_harness vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
           vk_xdxr_build_test vk_queue_test vk_sandbox)
