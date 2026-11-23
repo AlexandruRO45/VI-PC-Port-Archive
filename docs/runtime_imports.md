@@ -258,8 +258,10 @@ documents (on the queue's completion port, the process queue when none is given:
 none after, and the three `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
 `XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
-calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
-The executable's first boot confirms them, or names the slots that differ.
+calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table). The executable links thunks for
+`IXUserImpl` slots 3-5, 7-14, 19-25 and 33-34 and `IXUserGamertagImpl` slot 3 (`tools/gdk_runtime_calls.py`, from the
+file alone): none of the slots logged on first use below, and of the offline failures only the token-and-signature
+trio (23-25). What the slots must answer is still **not measured**; that is the executable's first boot.
 - **Interfaces:** the class id doubles as `IXUserImpl`'s; `IXUserImpl2`-`6` answer with the same 50-slot vtable;
   `IXUserGamertagImpl` (`XUserGetGamertag`) is a second interface.
 - **The user:** one offline local user, always signed in. `XUserAddAsync` adds it with or without
@@ -301,7 +303,8 @@ The executable's first boot confirms them, or names the slots that differ.
 
 `xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
 
-`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout, also **not measured**:
+`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout; the game-license struct is measured
+on the executable, the rest is not:
 - **Interfaces:** the class id doubles as `IXStoreImpl`'s; `IXStoreImpl2`-`6` answer with the same 84-slot vtable.
 - **Offline answers:** the game license is active and not a trial; a package's license is acquirable and valid;
   there are no add-on licenses, no products in any query and no package updates. License-changed and license-lost
@@ -309,9 +312,14 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Not available offline:** purchases, consumables, license tokens, collections and purchase ids, downloads and
   every store UI fail before starting (`E_FAIL`, logged once). The docs' three unnamed slots and
   `XStoreIsAvailabilityPurchasable` (no documented signature) answer `E_NOTIMPL`.
-- **UNVERIFIED:** `STORE_SKU_ID_SIZE` = 18, `SKU_ID_SIZE` = 5 and `TRIAL_UNIQUE_ID_MAX_SIZE` = 64, which fix
-  `XStoreGameLicense` (104 bytes) and `XStoreCanAcquireLicenseResult` (12 bytes). The public pages give no values;
-  confirm them from the buffer the executable passes to `XStoreQueryGameLicenseResult` before a boot relies on it.
+- **Measured on the executable:** `XStoreGameLicense` is 104 bytes. The title's `XStoreQueryGameLicenseResult`
+  call passes a 104-byte stack buffer and reads the SKU id as a C string at +0x00, the three booleans at
+  +0x13..+0x15, the trial id as a C string at +0x1C and the expiration time at +0x60. That fixes
+  `STORE_SKU_ID_SIZE` = 18 and the 104-byte total.
+- **UNVERIFIED:** `SKU_ID_SIZE` = 5 and the exact `TRIAL_UNIQUE_ID_MAX_SIZE` = 64. The executable bounds the
+  trial id to at most 68 bytes (the expiration time is at +0x60) but reads it as a C string, so it does not name
+  the bound; 64 is the public source's value. It does not call either can-acquire slot (24-27), so
+  `XStoreCanAcquireLicenseResult` (12 bytes) is unmeasured.
 
 `xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 
@@ -328,15 +336,18 @@ The executable's first boot confirms them, or names the slots that differ.
   are no clients, and the connection-state registration hands out a token that never fires. Every per-client slot
   answers `E_GAMESTREAMING_NOT_INITIALIZED` (0x89245400), which a caller reading a bool sees as false (low byte
   0).
-- **ASSUMPTION:** the parameter lists of `XGameUiShowMessageDialogAsync` and
-  `XGameStreamingRegisterConnectionStateChanged`, from the GDK reference, not re-checked against the executable.
+- **Not reached by the executable:** the parameter lists of `XGameUiShowMessageDialogAsync` and
+  `XGameStreamingRegisterConnectionStateChanged` are the GDK reference's, and the executable has no caller to check
+  them against. `tools/gdk_runtime_calls.py` finds no thunk for the message dialog and none for any
+  `XGameStreamingImpl` or `XUserDeviceImpl` slot. Of `XGameUiImpl` it links slots 7-8 and 17-19 only: the profile
+  card and text entry, which fail before starting.
 
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
   closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
   endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
-  documented for desktop. **ASSUMPTION:** `APP_LOCAL_DEVICE_ID` is 32 bytes.
+  documented for desktop. `APP_LOCAL_DEVICE_ID` is taken to be 32 bytes; no caller in the executable confirms it.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
 `LEONIDA_HDR=1`.
@@ -367,8 +378,48 @@ xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; co
 
 So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
-`IXUserImpl6`. The executable's own set is still unmeasured. `tools/gdk_runtime_calls.py` gives it from the file
-(below), and `QueryApiImpl`'s log on the first boot.
+`IXUserImpl6`.
+
+### The retail executable's runtime classes (RT-5)
+
+`python -I tools/gdk_runtime_calls.py game_scarlett_master.exe` (from the file alone, nothing executed; `main`
+`1cc6e3c1`) finds one `QueryApiImpl` helper at RVA `0x55de048` and **161** `xgameruntime.lib` thunks that reach **17**
+runtime classes. 158 of the thunks are referenced from the image; three are present and unreferenced (one each in
+`XPackageImpl`, `XThreadingImpl` and `XAccessibilityImpl`).
+
+The executable does not import `xgameruntime.dll`. Its import table has no such module, so the thunks are linked into
+the image like `libHttpClient.GDK.dll`'s. The name occurs in the image as a UTF-16 string, which
+`tools/pe_inspect.py` lists among the run-time load candidates (a string is where to look, not proof of a
+`LoadLibrary`). The registry
+therefore needs no module name beyond the `xgameruntime.dll` it already has, which settles the assumption at the top of
+`runtime/shims/xgameruntime.cpp`.
+
+| Class | Thunks | Referenced | Served |
+|---|---:|---:|---|
+| `XAccessibilityImpl` | 10 | 9 | no |
+| `XAppCaptureImpl` | 1 | 1 | no |
+| `XLauncherImpl` | 3 | 3 | no |
+| `XDisplayImpl` | 1 | 1 | yes |
+| `XGameEventImpl` | 1 | 1 | yes |
+| `XGameImpl` | 2 | 2 | yes |
+| `XGameRuntimeFeatureImpl` | 1 | 1 | yes |
+| `XGameSaveImpl` | 20 | 20 | yes |
+| `XGameUiImpl` | 5 | 5 | yes |
+| `XNetworkingImpl` | 10 | 10 | yes |
+| `XPackageImpl` | 18 | 17 | yes |
+| `XPersistentLocalStorageImpl` | 2 | 2 | yes |
+| `XStoreImpl` | 44 | 44 | yes |
+| `XSystemAnalyticsImpl` | 1 | 1 | yes |
+| `XSystemImpl` | 3 | 3 | yes |
+| `XThreadingImpl` | 18 | 17 | yes |
+| `XUserImpl` | 21 | 21 | yes |
+
+"Served" is the tool's answer for the runtime sources at that commit. The three that are not: `XAccessibilityImpl`
+(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not), `XAppCaptureImpl` (slot 5,
+`XAppCaptureTakeScreenshot`) and `XLauncherImpl` (slots 3-5: `XLaunchUri` and the two display timeout-deferral calls).
+Open pull requests serve them: #4235, #4307 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
+executable calls, and the argument counts the tool estimates from the registers, are in the report the tool writes.
+`XErrorImpl`, which `XCurl.dll` and `libHttpClient.GDK.dll` call, is not among the executable's classes.
 
 ### Measuring which runtime classes a binary calls
 
