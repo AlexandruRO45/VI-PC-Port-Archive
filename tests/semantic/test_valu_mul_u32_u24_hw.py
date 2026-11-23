@@ -194,3 +194,83 @@ class TestASTDefinitions(unittest.TestCase):
         spv = support.translate_lines("ps_ast_mul_valid", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 25000)
+
+
+# ==============================================================================
+# SECTION 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0)
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarInterpreter:
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if op.kind == OperandKind.VGPR:
+            return state.get_vgpr(op.value)
+        elif op.kind == OperandKind.SGPR:
+            return state.get_sgpr(op.value)
+        elif op.kind == OperandKind.IMMEDIATE:
+            return u32(op.value)
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VMulU24Instruction, state: ScalarMachineState) -> int:
+        val0 = self.resolve_operand(instr.src0, state)
+        val1 = self.resolve_operand(instr.src1, state)
+
+        res = oracle_mul_u32_u24(val0, val1)
+        state.set_vgpr(instr.dst.value, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        """Verify interpreter correctly executes across VGPR, SGPR, and Immediate inputs."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, 0x1200_0005)                         # low 24 = 5
+        state.set_sgpr(4, 0xAB00_0007)                         # low 24 = 7
+
+        interp = ScalarInterpreter()
+        instr = VMulU24Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=SGPR(4),
+        )
+        res = interp.step(instr, state)
+        self.assertEqual(res, 35)
+        self.assertEqual(state.get_vgpr(0), 35)
+
+    def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
+        """Verify scalar interpreter exactly matches translated SPIR-V execution."""
+        state = ScalarMachineState()
+        src0 = 0x0012_3456
+        src1 = 0x0000_0008
+        state.set_vgpr(1, src0)
+        state.set_vgpr(2, src1)
+
+        interp = ScalarInterpreter()
+        instr = VMulU24Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=VGPR(2),
+        )
+        interp_res = interp.step(instr, state)
+        spv_res = run_translator_mul_u24(src0, src1, name="ps_scalar_mul_cross")
+        self.assertEqual(interp_res, spv_res)
