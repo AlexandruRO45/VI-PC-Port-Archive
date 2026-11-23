@@ -4,9 +4,10 @@
 registry or the host, and prints a report. It does **not** call `DllMain`, TLS callbacks or the entry point, so
 this page measures mapping and binding only; it does not claim the modules work.
 
-The game executable is still missing from the package available here. Every other PE that the package ships is
-present, and all of them are Xbox Series builds. Running the dry-run over those images is the closest thing to a
-loader test that does not need the executable.
+The game executable is not in the package. Every other PE that the package ships is present, and all of them are
+Xbox Series builds. Running the dry-run over those images is the closest thing to a loader test that does not need
+the executable; [The retail executable](#the-retail-executable-rt-5) below is the dry-run over the executable
+itself, supplied separately.
 
 ## Reproduce
 
@@ -88,6 +89,60 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 2 MiB, to move budget from the title's memory partition to the system's. A PC has no such partition, so the shim
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
+
+## The retail executable (RT-5)
+
+`game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
+`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`) is a PE32+ x86-64 image with no resource
+section. `gta6rt --dry-run` maps it at its preferred base together with the four package DLLs it imports, and
+exits 0 with nothing on stderr:
+
+```powershell
+$game = "D:\path\to\your\package"
+$scratch = Join-Path $env:TEMP 'leonida-overlay'
+runtime\build\gta6rt.exe --dry-run "D:\path\to\game_scarlett_master.exe" --game-dir $game --overlay $scratch
+```
+
+`--overlay` points the write overlay away from `<game-dir>\overlay`, so a dry run writes nothing into the package.
+Measured at `1cc6e3c1`, Windows 11, MSVC 14.44:
+
+| Image | Base | Size of image | Entry RVA | Shim | Host | Module | Unimplemented |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `game_scarlett_master.exe` | `0x140000000` | 184,995,840 | `0x56a1ec8` | 53 | 432 | 72 | **30** |
+| `XboxBvhBuilder.dll` | `0x180000000` | 909,312 | `0x227cc` | 5 | 52 | 0 | 0 |
+| `amd_fidelityfx_loader_xbox.dll` | relocated | 32,768 | `0x18d0` | 6 | 16 | 0 | 0 |
+| `libHttpClient.GDK.dll` | relocated | 999,424 | `0x11f0` | 28 | 170 | 0 | 0 |
+| `Bink2Scarlett.dll` | relocated | 278,528 | `0x2ac1c` | 5 | 55 | 0 | 0 |
+
+The 72 module imports are served by those four DLLs. The 30 unimplemented imports all fall under the dry-run's
+policy "other" (none is counted as returning an `HRESULT`), and they come from seven Xbox-only DLLs:
+
+| DLL | Unimplemented imports | What the names suggest (not measured) |
+|---|---:|---|
+| `xmem.dll` | 7: `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemIsToolsMemAvailable`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter` | the console's physical page and default allocation routines; `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` and `XMemTransferMemory` already bind |
+| `d3d12_xs.dll` | 1: `D3D12ConfigureVirtualMemoryX` | GPU virtual memory setup |
+| `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
+| `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
+| `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
+| `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
+| `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
+
+Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
+they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
+`xapu.dll`, `AcpHal.dll`) with no shim at all.
+
+`--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
+`DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
+again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
+unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
+
+What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
+reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
+that name exists), and an unimplemented import stops the run only if the title calls it
+([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
+host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
+which opens none.
 
 ## Console paths and the write overlay
 
@@ -378,8 +433,48 @@ xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; co
 
 So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
-`IXUserImpl6`. The executable's own set is still unmeasured. `tools/gdk_runtime_calls.py` gives it from the file
-(below), and `QueryApiImpl`'s log on the first boot.
+`IXUserImpl6`.
+
+### The retail executable's runtime classes (RT-5)
+
+`python -I tools/gdk_runtime_calls.py game_scarlett_master.exe` (from the file alone, nothing executed; `main`
+`1cc6e3c1`) finds one `QueryApiImpl` helper at RVA `0x55de048` and **161** `xgameruntime.lib` thunks that reach **17**
+runtime classes. 158 of the thunks are referenced from the image; three are present and unreferenced (one each in
+`XPackageImpl`, `XThreadingImpl` and `XAccessibilityImpl`).
+
+The executable does not import `xgameruntime.dll`. Its import table has no such module, so the thunks are linked into
+the image like `libHttpClient.GDK.dll`'s. The name occurs in the image as a UTF-16 string, which
+`tools/pe_inspect.py` lists among the run-time load candidates (a string is where to look, not proof of a
+`LoadLibrary`). The registry
+therefore needs no module name beyond the `xgameruntime.dll` it already has, which settles the assumption at the top of
+`runtime/shims/xgameruntime.cpp`.
+
+| Class | Thunks | Referenced | Served |
+|---|---:|---:|---|
+| `XAccessibilityImpl` | 10 | 9 | no |
+| `XAppCaptureImpl` | 1 | 1 | no |
+| `XLauncherImpl` | 3 | 3 | no |
+| `XDisplayImpl` | 1 | 1 | yes |
+| `XGameEventImpl` | 1 | 1 | yes |
+| `XGameImpl` | 2 | 2 | yes |
+| `XGameRuntimeFeatureImpl` | 1 | 1 | yes |
+| `XGameSaveImpl` | 20 | 20 | yes |
+| `XGameUiImpl` | 5 | 5 | yes |
+| `XNetworkingImpl` | 10 | 10 | yes |
+| `XPackageImpl` | 18 | 17 | yes |
+| `XPersistentLocalStorageImpl` | 2 | 2 | yes |
+| `XStoreImpl` | 44 | 44 | yes |
+| `XSystemAnalyticsImpl` | 1 | 1 | yes |
+| `XSystemImpl` | 3 | 3 | yes |
+| `XThreadingImpl` | 18 | 17 | yes |
+| `XUserImpl` | 21 | 21 | yes |
+
+"Served" is the tool's answer for the runtime sources at that commit. The three that are not: `XAccessibilityImpl`
+(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not), `XAppCaptureImpl` (slot 5,
+`XAppCaptureTakeScreenshot`) and `XLauncherImpl` (slots 3-5: `XLaunchUri` and the two display timeout-deferral calls).
+Open pull requests serve them: #4235, #4307 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
+executable calls, and the argument counts the tool estimates from the registers, are in the report the tool writes.
+`XErrorImpl`, which `XCurl.dll` and `libHttpClient.GDK.dll` call, is not among the executable's classes.
 
 ### Measuring which runtime classes a binary calls
 

@@ -344,6 +344,8 @@ CVT_F32_SAT_CASES = (
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
+# v_pk_mul_lo_u16 with a constant operand (cs_pk_mul_lo_const.asm), measured natively on RDNA2 (gfx1036); lanes 0 and 1.
+PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
 # cs_f16_frexp_ldexp.asm: every binary16 input x through v_frexp_mant_f16, v_frexp_exp_i16_f16 and v_ldexp_f16(x, S1)
 # with f16 denormals kept (docs/design.md, measured on gfx1036). One dispatch of 1024 groups per S1 below: zero, the
 # ends of the normal range, the denormal and flush edges, the clamp to [-64, 64] from both sides, and S1 words whose
@@ -678,10 +680,10 @@ def timed_out(name, limit):
             "LEONIDA_GPU_TEST_TIMEOUT sets the limit")
 
 
-def run(*cmd, env=None):
+def run(*cmd, env=None, cwd=None):
     limit = gpu_test_timeout()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
@@ -1202,6 +1204,19 @@ GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad
 # ps_texture_cl / ps_texture_b_cl (image_sample_cl / _b_cl) draw on the two-mip texture too: the left half reads mip 0 (red,
 # the top-left quadrant), the right half mip 1 (cyan) where the clamp is 1.
 CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl")
+
+
+def table_fetch_test(tools, spirv):
+    tool = os.path.abspath(os.path.join(tools, "vk_texture_test" + EXE))
+    with tempfile.TemporaryDirectory(prefix="table-fetch-") as tmp:
+        for mode in ("fetch-sint", "fetch-uint", "fetch-miss"):
+            raw = os.path.join(tmp, mode + ".raw")
+            code, output = run_readback(raw, run, tool, mode, raw, cwd=spirv)
+            if code == UNSUPPORTED:
+                return Skip(output.strip())
+            if code or f"{mode}: 4096 exact pixels" not in output:
+                return failure(code, output, 3)
+    return ""
 
 
 def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_grad_a16") -> str:
@@ -1857,6 +1872,8 @@ def main():
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
+    results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",
+                                                       expected_words=PK_MUL_LO_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
@@ -1891,6 +1908,7 @@ def main():
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
+    results.append(("ps_table_fetch", table_fetch_test(tools, spirv)))
     for name in GRADIENT_TESTS:
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
     for name, problem in results:
