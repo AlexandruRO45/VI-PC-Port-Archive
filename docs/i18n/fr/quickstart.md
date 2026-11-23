@@ -44,7 +44,7 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
 
 - **Votre propre copie** du paquet Xbox Series, version `1.0.2.1` : le dossier qui contient `MicrosoftGame.Config` et
   les archives `.rpf`, sous forme de fichiers lisibles sur le disque.
-- **Windows 10/11 x64**, avec environ **350 Go libres** pour les fichiers de travail. Ils peuvent aller sur un autre
+- **Windows 10/11 x64**, avec environ **400 Go libres** pour les fichiers de travail. Ils peuvent aller sur un autre
   disque avec `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (cochez « Add python.exe to PATH » à l'installation).
 - [SDK .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
