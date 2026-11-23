@@ -259,6 +259,17 @@ void virtual_hang_check_checks() {
         check(fired != -1 && fired <= 61200 + 31000, "and fires within 31 s of the last one when nothing moves after it");
     }
 
+    // The same with 20 ms of the title's own work between two compiles: that time counts toward the round, so the
+    // round ends inside the compiles, more than 2 s long, and the count starts again.
+    {
+        std::vector<Stall> compiles;
+        for (int i = 0; i < 52; ++i) compiles.push_back({4000 + 1120LL * i, 4000 + 1120LL * i + 1100});
+        const long long last_end = 4000 + 1120LL * 51 + 1100;
+        const long long fired = Sim(compiles).hang_check_fires(0, 400000);
+        check(fired > last_end, "nor during compiles with 20 ms between them");
+        check(fired != -1 && fired <= last_end + 31000, "and again within 31 s of the last one");
+    }
+
     // Recurring stalls: 2.5 s of work every 4 s, 20 times, then nothing. Rounds that a stall made longer than 2 s
     // start the count again, by the title's own rule; after the last stall the check fires within 31 s.
     {
