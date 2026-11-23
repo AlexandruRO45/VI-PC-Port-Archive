@@ -691,6 +691,10 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
+    if (params && params->dwSize < sizeof(CREATEFILE2_EXTENDED_PARAMETERS)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
     const Target t = open_target(name, access, disposition);
     if (t.error) {
         note_open_failure("CreateFile2", name, t.error, _ReturnAddress());

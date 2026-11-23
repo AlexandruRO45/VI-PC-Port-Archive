@@ -934,6 +934,20 @@ void run_checks(const std::filesystem::path& root) {
         const auto first_ex_a = resolve<FindFirstFileExAFn>("kernelbase.dll", "FindFirstFileExA");
         check(create2 && first_ex_w && first_ex_a, "CreateFile2 and FindFirstFileExA/W are registered");
 
+        write_path(package / "pkg.bin", "synthetic");
+        CREATEFILE2_EXTENDED_PARAMETERS bad{};
+        bad.dwSize = sizeof(bad) - 1;
+        HANDLE bad_open = create2(L"GAME:\\pkg.bin", GENERIC_WRITE, 0, OPEN_EXISTING, &bad);
+        const DWORD bad_error = GetLastError();
+        check(bad_open == INVALID_HANDLE_VALUE && bad_error == ERROR_INVALID_PARAMETER,
+              "CreateFile2 rejects a short parameter block");
+        if (bad_open != INVALID_HANDLE_VALUE) ::CloseHandle(bad_open);
+        check(!std::filesystem::exists(overlay / "pkg.bin"), "short parameters do not copy up the package file");
+        bad.dwSize = sizeof(bad);
+        bad_open = create2(L"GAME:\\pkg.bin", GENERIC_WRITE, 0, OPEN_EXISTING, &bad);
+        check(bad_open != INVALID_HANDLE_VALUE, "CreateFile2 accepts a correctly sized parameter block");
+        if (bad_open != INVALID_HANDLE_VALUE) ::CloseHandle(bad_open);
+
         // CreateFile2 reads an untouched package file without modifying it.
         write_path(package / "data" / "cf2_pkg.txt", "pkg-cf2");
         CREATEFILE2_EXTENDED_PARAMETERS ext{};
