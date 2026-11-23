@@ -1,7 +1,11 @@
 """Exercise guest-scene forwarding and persisted results without a native GPU run."""
+from argparse import Namespace
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+from io import StringIO
 import json
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import sys
@@ -88,6 +92,29 @@ class GuestSceneTests(unittest.TestCase):
         self.assertEqual(retry.stdout, b"")
         self.assertIn(b"empty", retry.stderr)
         self.assertEqual(hashlib.sha256(report.read_bytes()).digest(), hashlib.sha256(contents).digest())
+
+    def test_competing_run_leaves_active_output_alone(self):
+        self.scene_args()
+        out = self.cwd / "shared output"
+        logs = out / "logs"
+        logs.mkdir(parents=True)
+        active_log = logs / "full.stdout.log"
+        active_log.write_bytes(b"first run in progress\n")
+        args = Namespace(loader=self.cwd / "loader.txt", guest=self.cwd / "guest.txt",
+                         shaders=self.cwd / "shaders", wine=None, play_audio=False)
+        execute = runpy.run_path(str(self.producer))["execute"]
+        stderr, stdout = StringIO(), StringIO()
+
+        # The competing run passed argument validation before the first created logs/.
+        with redirect_stderr(stderr), redirect_stdout(stdout):
+            result = execute(args, out, temporary=False)
+
+        self.assertEqual(result, 2)
+        self.assertIn("--out", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(set(out.iterdir()), {logs})
+        self.assertEqual(set(logs.iterdir()), {active_log})
+        self.assertEqual(active_log.read_bytes(), b"first run in progress\n")
 
     def test_output_creation_failure(self):
         args = self.scene_args()

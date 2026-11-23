@@ -258,6 +258,12 @@ def negative_controls(session: Session, out: Path) -> dict:
 def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
     out.mkdir(parents=True, exist_ok=True)  # parse_args has checked that it is new or empty
     session = Session(args, out)
+    # Claim the output before entering the path that publishes a report on failure.
+    try:
+        session.logs.mkdir()
+    except FileExistsError:
+        print(f"error: --out is already in use: {out}", file=sys.stderr)
+        return 2
     report: dict = {"status": "fail", "frames": FRAMES, "headless": True, "wine": args.wine, "temporary": temporary,
                     "audio_mode": "winmm" if args.play_audio else "offline", "report": str(out / "report.json")}
     try:
@@ -267,7 +273,7 @@ def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
             "guest": {"path": str(args.guest), "sha256": sha256(args.guest.read_bytes())},
             "shaders": {"path": str(args.shaders), "files": len(shader_files), "tree_sha256": tree_hash(shader_files)},
             "scene.bin": sha256(scene_bytes())}
-        for sub in ("logs", "package", *MODES):
+        for sub in ("package", *MODES):
             (out / sub).mkdir()
         package = out / "package"
         write_new(package / "scene.bin", scene_bytes())
