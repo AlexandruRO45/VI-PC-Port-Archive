@@ -47,16 +47,20 @@ def load_names(archive, mount, use_cache=True):
             first = f.readline().rstrip("\r\n")
             if first == "# " + key:
                 return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in csv.DictReader(f)]
+    # Each lookup gets its own report and staging file: two runs at once must not remove or replace each other's.
+    # Without the cache, the report goes to the system temp folder: --no-cache doesn't touch the cache folder.
+    # A cache folder that can't be made, or exists but can't be written (read-only, an ACL), names without it.
+    fd = None
     if use_cache:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent)
         except OSError as e:
             print(f"can't keep the names in {cache.parent} ({e.strerror or e}); naming without the cache",
                   file=sys.stderr)
             use_cache = False
-    # Each lookup gets its own report and staging file: two runs at once must not remove or replace each other's.
-    # Without the cache, the report goes to the system temp folder: --no-cache doesn't touch the cache folder.
-    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent if use_cache else None)
+    if fd is None:
+        fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv")
     os.close(fd)
     tmp = Path(name)
     try:
@@ -69,14 +73,17 @@ def load_names(archive, mount, use_cache=True):
     finally:
         tmp.unlink(missing_ok=True)
     if use_cache:
-        fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
-        with open(fd, "w", encoding="utf-8", newline="") as f:
-            f.write("# " + key + "\n")
-            w = csv.writer(f, lineterminator="\n")
-            w.writerow(["path", "offset", "width", "height", "frames"])
-            for r in rows:
-                w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
-        os.replace(name, cache)
+        try:
+            fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
+            with open(fd, "w", encoding="utf-8", newline="") as f:
+                f.write("# " + key + "\n")
+                w = csv.writer(f, lineterminator="\n")
+                w.writerow(["path", "offset", "width", "height", "frames"])
+                for r in rows:
+                    w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
+            os.replace(name, cache)
+        except OSError as e:  # the names are already known: only keeping them for next time failed
+            print(f"can't keep the names in {cache} ({e.strerror or e})", file=sys.stderr)
     return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in rows]
 
 
