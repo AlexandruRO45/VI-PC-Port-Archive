@@ -288,5 +288,21 @@ class VFrexpMantF16SimdDivergenceTests(unittest.TestCase):
         for i in range(16, 32):
             self.assertEqual(wave.get_vgpr(i, 0), 0x12345678)
 
+class VFrexpMantF16TranslatorTests(unittest.TestCase):
+    def test_frexp_mant_f16_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v1, 0x3C00",
+            "v_frexp_mant_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_mant_f16_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, 0x3800)
+
+    def test_frexp_mant_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_frexp_mant_f16", ["v_frexp_mant_f16"])
+
 if __name__ == "__main__":
     unittest.main()
