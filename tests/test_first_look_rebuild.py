@@ -33,7 +33,7 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell diagnostics script")
 class FirstLookRebuildTest(unittest.TestCase):
-    def run_case(self, source_newer):
+    def run_case(self, source_newer, cache=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for folder in ("scripts", "tools", "runtime/build", "runtime/src"):
@@ -43,6 +43,8 @@ class FirstLookRebuildTest(unittest.TestCase):
             (root / "tools" / "pe_inspect.py").write_text(PE_INSPECT_STUB, encoding="utf-8", newline="\n")
             (root / "fixture.exe").write_bytes(b"MZ")
             loader = root / "runtime" / "build" / "gta6rt.exe"
+            if cache is not None:
+                (loader.parent / "CMakeCache.txt").write_text(cache, encoding="utf-8")
             source = root / "runtime" / "src" / "pe_loader.cpp"
             loader.write_bytes(b"")
             source.write_text("// source\n", encoding="utf-8")
@@ -54,16 +56,28 @@ class FirstLookRebuildTest(unittest.TestCase):
             env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
             run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                   "-Command", RUN], cwd=root, env=env, capture_output=True, text=True, timeout=60)
-            return (root / "scripts" / "built.txt").is_file(), run.stdout + run.stderr
+            return (root / "scripts" / "built.txt").is_file(), run.returncode, run.stdout + run.stderr
 
     def test_a_loader_older_than_the_sources_is_rebuilt(self):
-        built, out = self.run_case(source_newer=True)
+        built, _, out = self.run_case(source_newer=True)
         self.assertTrue(built, out)
         self.assertIn("rebuilding it first", out)
 
     def test_an_up_to_date_loader_is_used_as_it_is(self):
-        built, out = self.run_case(source_newer=False)
+        built, _, out = self.run_case(source_newer=False)
         self.assertFalse(built, out)
+
+    def test_incomplete_visual_studio_cache_names_the_missing_command(self):
+        generator = "CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022\n"
+        for command in ("", "CMAKE_COMMAND:INTERNAL=\n"):
+            with self.subTest(command=command):
+                built, code, out = self.run_case(source_newer=True, cache=generator + command)
+                self.assertNotEqual(code, 0, out)
+                self.assertFalse(built, out)
+                self.assertIn("CMakeCache.txt", out)
+                self.assertIn("Reconfigure", out)
+                self.assertIn("CMAKE_COMMAND", out)
+                self.assertNotIn("== Loader dry run", out)
 
 
 if __name__ == "__main__":
