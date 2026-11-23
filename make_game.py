@@ -1672,9 +1672,13 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         if os.path.isfile(ogg_done):
             # awc_opus.py leaves the files it no longer writes, and audio_wav.py keeps every WAV it finds.
             log("assets: no matching awc_opus.py fingerprint for the audio streams: exporting again")
-            for folder in (ogg, os.path.join(out, "audio", "wav")):
-                if os.path.isdir(folder):
-                    shutil.rmtree(folder)
+            stale = [f for f in (ogg, os.path.join(out, "audio", "wav")) if _linked(f) or os.path.isdir(f)]
+            for folder in stale:
+                if _linked(folder):
+                    fail(f"assets: {folder} is a link or junction, and the audio streams have to be exported again "
+                         "into a plain folder. Replace it with a folder (or remove it) and run again.")
+            for folder in stale:
+                shutil.rmtree(folder)
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
         py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))

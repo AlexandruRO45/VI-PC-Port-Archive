@@ -215,6 +215,28 @@ class AudioStageResumeTest(unittest.TestCase):
                     self.assertEqual(f.read(), make_game.ogg_marker() + " finished\n")
                 self.assertEqual(self.run_stage(), [])
 
+    def test_a_linked_audio_folder_stops_before_anything_is_removed(self):
+        self.run_stage()
+        self.write_ogg_marker("awc_opus.py finished\n")
+        previous = self.touch(self.audio, "ogg", "previous.ogg")
+        target = os.path.join(self.work, "elsewhere")
+        kept = self.touch(target, "kept.wav")
+        link = os.path.join(self.audio, "wav")
+        try:
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(target, link)
+            else:
+                os.symlink(target, link, target_is_directory=True)
+        except (OSError, ImportError, AttributeError) as e:
+            self.skipTest(f"cannot make a link here: {e}")
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            self.run_stage()
+        self.assertIn("link or junction", err.getvalue())
+        self.assertNotIn("awc_opus.py", self.ran)
+        self.assertTrue(os.path.isfile(previous))
+        self.assertTrue(os.path.isfile(kept))
+
     def test_editing_awc_opus_or_its_imports_exports_again(self):
         tools = os.path.join(self.work, "tools")
         os.makedirs(tools)
