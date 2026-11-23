@@ -427,6 +427,20 @@ class MainTest(unittest.TestCase):
                 for command, status in (("ok.py", "pass"), ("bad.py", "fail")):
                     self.assertEqual(text.count(f"| `same` | {status} | yes |"), commands.count(command))
 
+    def test_same_name_setups_keep_separate_fixture_verdicts(self):
+        entries = [
+            ctest_entry("blocked", self.command("ok.py"), {"FIXTURES_REQUIRED": ["bad_input"]}),
+            ctest_entry("allowed", self.command("ok.py"), {"FIXTURES_REQUIRED": ["good_input"]}),
+            ctest_entry("setup", self.command("bad.py"), {"FIXTURES_SETUP": ["bad_input"]}),
+            ctest_entry("setup", self.command("ok.py"), {"FIXTURES_SETUP": ["good_input"]}),
+        ]
+        code, out, _ = self.run_main(entries, "--require", "blocked", "--require", "allowed")
+        self.assertEqual(code, 1, out)
+        self.assertIn("[FAIL] blocked", out)
+        self.assertIn("failed fixture setup: setup", out)
+        self.assertIn("[PASS] allowed", out)
+        self.assertIn("2 passed, 2 failed, 0 skipped under Wine (4 tests)", out)
+
     def test_a_required_test_that_is_not_listed_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "absent")
         self.assertEqual(code, 1)
@@ -491,6 +505,33 @@ class MainTest(unittest.TestCase):
         code, _, err = self.run_main_json({"tests": ["binary", 3, None]})
         self.assertEqual(code, 2)
         self.assertIn("not the output of ctest", err)
+
+    def test_malformed_command_and_property_rows_are_rejected_before_launch(self):
+        for fields in (
+            {"command": "D:/win/root/artifact/ok.py"},
+            {"command": [42]},
+            {"command": [self.command("ok.py")[0], "embedded\0null"]},
+            {"properties": {"TIMEOUT": 10}},
+            {"properties": [{"name": "TIMEOUT"}]},
+            {"properties": [{"name": ["TIMEOUT"], "value": 10}]},
+            {"name": []},
+        ):
+            with self.subTest(fields=fields):
+                good = ctest_entry("ok", self.command("ok.py"))
+                with mock.patch.object(rwt, "DriveMap") as drive, \
+                        mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+                    code, _, err = self.run_main([good, good | fields])
+                self.assertEqual(code, 2)
+                self.assertIn("not the output of ctest", err)
+                drive.assert_not_called()
+                launch.assert_not_called()
+
+    def test_an_unbuilt_test_without_a_command_is_valid_inventory(self):
+        code, out, err = self.run_main([{"name": "unbuilt"}], "--require", "unbuilt")
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] unbuilt", out)
+        self.assertIn("no command", out)
+        self.assertEqual(err, "")
 
     def test_an_explicit_empty_tests_list_is_accepted(self):
         code, out, _ = self.run_main_json({"tests": []})
