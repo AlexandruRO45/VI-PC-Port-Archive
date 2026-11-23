@@ -543,12 +543,22 @@ class PaletteResolver:
 
     def __init__(self, component: dict, ped_by_name: dict[str, dict]):
         self.ped_by_name = ped_by_name
-        drawable = component.get("drawable") or {}
-        own = drawable.get("skeleton") or []
+        drawable = component.get("drawable")
+        if drawable is None:
+            drawable = {}
+        if not isinstance(drawable, dict):
+            raise SkinError("model.json has no drawable object")
+        own = drawable.get("skeleton")
+        if own is None:
+            own = []
+        if not isinstance(own, list):
+            raise SkinError("drawable skeleton must be a list of objects")
         self.own_skeleton = own
         self.own_by_name = {}
         self.by_hash: dict[int, tuple[str, str]] = {}
         for bone in own:
+            if not isinstance(bone, dict):
+                raise SkinError(f"drawable bone has no fields: {type(bone).__name__}")
             name = bone.get("name")
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)
