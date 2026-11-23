@@ -677,5 +677,65 @@ class TestSAddI32ConditionCodes(unittest.TestCase):
                 self.assertEqual(dst, expected_dst)
                 self.assertEqual(scc, expected_scc)
 
+class TestSAddI32IEEE754EdgeCases(unittest.TestCase):
+    """Unit tests verifying raw bitwise preservation of IEEE 754 bit patterns through s_add_i32."""
+
+    def test_signed_zeros(self) -> None:
+        pos_zero = struct.unpack("<I", struct.pack("<f", +0.0))[0]  # 0x00000000
+        neg_zero = struct.unpack("<I", struct.pack("<f", -0.0))[0]  # 0x80000000
+        self.assertEqual(pos_zero, 0x00000000)
+        self.assertEqual(neg_zero, 0x80000000)
+
+        # pos_zero + neg_zero: 0 + (-2^31) -> -2^31 (0x80000000), no overflow
+        dst, scc = ref_s_add_i32(pos_zero, neg_zero)
+        self.assertEqual(dst, 0x80000000)
+        self.assertEqual(scc, 0)
+
+        # neg_zero + neg_zero: (-2^31) + (-2^31) -> 0, negative overflow
+        dst, scc = ref_s_add_i32(neg_zero, neg_zero)
+        self.assertEqual(dst, 0x00000000)
+        self.assertEqual(scc, 1)
+
+    def test_infinities(self) -> None:
+        pos_inf = struct.unpack("<I", struct.pack("<f", float("inf")))[0]   # 0x7F800000
+        neg_inf = struct.unpack("<I", struct.pack("<f", float("-inf")))[0]  # 0xFF800000
+        self.assertEqual(pos_inf, 0x7F800000)
+        self.assertEqual(neg_inf, 0xFF800000)
+
+        # Integer addition of pos_inf bit pattern with 1
+        dst, scc = ref_s_add_i32(pos_inf, 1)
+        self.assertEqual(dst, 0x7F800001)  # Signaling NaN bit pattern
+        self.assertEqual(scc, 0)
+
+        # Integer addition of pos_inf + pos_inf -> 0xFF000000 (overflow)
+        dst, scc = ref_s_add_i32(pos_inf, pos_inf)
+        self.assertEqual(dst, 0xFF000000)
+        self.assertEqual(scc, 1)
+
+        # Integer addition of pos_inf + neg_inf -> 0x7F000000 (no overflow)
+        dst, scc = ref_s_add_i32(pos_inf, neg_inf)
+        self.assertEqual(dst, 0x7F000000)
+        self.assertEqual(scc, 0)
+
+    def test_subnormals_unflushed(self) -> None:
+        # Subnormal values must not be flushed to zero by integer SALU instructions
+        min_subnormal = 0x00000001
+        max_subnormal = 0x007FFFFF
+        dst, scc = ref_s_add_i32(min_subnormal, max_subnormal)
+        self.assertEqual(dst, 0x00800000)  # Min normal float bit pattern
+        self.assertEqual(scc, 0)
+
+    def test_nans_bitwise_preservation(self) -> None:
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        # No NaN canonicalization or trap in integer addition
+        dst, scc = ref_s_add_i32(qnan, 0x10)
+        self.assertEqual(dst, 0x7FC00010)
+        self.assertEqual(scc, 0)
+
+        dst, scc = ref_s_add_i32(snan, snan)
+        self.assertEqual(dst, 0xFF000002)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
