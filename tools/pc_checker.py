@@ -231,8 +231,9 @@ AMD_BASE = {
     8: {3: 100, 5: 120, 7: 135, 9: 150}, 9: {3: 115, 5: 140, 7: 155, 9: 190},
 }
 ULTRA_BASE = {3: 130, 5: 150, 7: 178, 9: 195}
-# Intel mobile/low-power suffix -> multiplier (first matching prefix wins)
-_MOBILE_MULT = [("hx", 1.0), ("hk", 0.9), ("h", 0.85), ("u", 0.55), ("p", 0.8),
+# Intel mobile/low-power suffix -> multiplier (first matching prefix wins). V is Core Ultra's low-power
+# laptop line (Lunar Lake), scored in the U class.
+_MOBILE_MULT = [("hx", 1.0), ("hk", 0.9), ("h", 0.85), ("u", 0.55), ("v", 0.55), ("p", 0.8),
                 ("g", 0.6), ("t", 0.8)]
 
 
@@ -259,7 +260,8 @@ def cpu_lookup(name: str):
     m = re.search(r"core\s*ultra\s*([3579])\s*(\d{3})([a-z]*)", s)
     if m:
         base = ULTRA_BASE[int(m[1])]
-        return (base if "k" in m[3] else base * 0.95), False
+        # A laptop suffix (H, U, V...) lowers the score as it does for the Core i names below.
+        return (base if "k" in m[3] else base * 0.95 * _mobile_mult(m[3])), False
 
     m = re.search(r"\bi([3579])[- ]?(\d{4,5})([a-z]{0,2})\d?\b", s)
     if m:

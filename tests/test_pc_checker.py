@@ -60,6 +60,24 @@ class CpuScore(unittest.TestCase):
     def test_ultra(self):
         self.assertEqual(pc.cpu_score("Intel Core Ultra 7 265K"), 178)
 
+    def test_ultra_desktop_scores_unchanged(self):
+        self.assertEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 9 285KF"), 195)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 7 265"), 178 * 0.95)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 5 245F"), 150 * 0.95)
+
+    def test_ultra_laptop_suffix_lowers_the_score(self):
+        # The same suffix rule as the Core i names: a laptop Core Ultra is not a desktop one.
+        self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 5 125U"), 150 * 0.95 * 0.55)
+        self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 7 155H"), 178 * 0.95 * 0.85)
+        self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 9 275HX"), 195 * 0.95)
+        # Lunar Lake's V parts are low-power laptop chips, scored in the U class.
+        self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 7 258V"), 178 * 0.95 * 0.55)
+        self.assertLess(pc.cpu_score("Intel Core Ultra 7 155H"), pc.cpu_score("Intel Core Ultra 7 265K"))
+
+    def test_low_power_ultra_laptop_is_weak(self):
+        _, _, rows = pc.evaluate(XBOX, "Intel(R) Core(TM) Ultra 5 125U", "NVIDIA GeForce RTX 3070", 32)
+        self.assertEqual(rows[0][1], pc.BELOW)
+
     def test_unknown(self):
         self.assertIsNone(pc.cpu_score("Mystery CPU"))
         self.assertIsNone(pc.cpu_score(""))
