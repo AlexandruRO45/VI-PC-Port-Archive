@@ -590,11 +590,16 @@ def spirv(path_or_text, out, work):
 
 # ---- running ----
 
+BUILD_CONFIGS = ("", "RelWithDebInfo", "Release", "MinSizeRel", "Debug")
+
+
 def harness(build):
-    for name in ("vk_harness.exe", "vk_harness"):
-        p = os.path.join(build, name)
-        if os.path.exists(p):
-            return p
+    for config in BUILD_CONFIGS:
+        directory = os.path.join(build, config) if config else build
+        for name in ("vk_harness.exe", "vk_harness"):
+            p = os.path.join(directory, name)
+            if os.path.isfile(p):
+                return p
     raise Unavailable(f"no vk_harness in {build}")
 
 

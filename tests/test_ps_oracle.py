@@ -345,5 +345,42 @@ class OnHardware(unittest.TestCase):
                     o.close()
 
 
+class HarnessLookup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.build = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def touch(self, *parts):
+        path = os.path.join(self.build, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").close()
+        return path
+
+    def test_missing_or_directory_raises_unavailable(self):
+        with self.assertRaises(P.Unavailable):
+            P.harness(self.build)
+        os.makedirs(os.path.join(self.build, "vk_harness.exe"))
+        os.makedirs(os.path.join(self.build, "RelWithDebInfo", "vk_harness.exe"))
+        with self.assertRaises(P.Unavailable):
+            P.harness(self.build)
+        msr = self.touch("MinSizeRel", "vk_harness.exe")
+        self.assertEqual(P.harness(self.build), msr)
+
+    def test_finds_in_cmake_config_subdirs(self):
+        dbg = self.touch("Debug", "vk_harness.exe")
+        self.assertEqual(P.harness(self.build), dbg)
+        msr = self.touch("MinSizeRel", "vk_harness.exe")
+        self.assertEqual(P.harness(self.build), msr)
+        rel = self.touch("Release", "vk_harness.exe")
+        self.assertEqual(P.harness(self.build), rel)
+        rwdi = self.touch("RelWithDebInfo", "vk_harness.exe")
+        self.assertEqual(P.harness(self.build), rwdi)
+        flat = self.touch("vk_harness")
+        self.assertEqual(P.harness(self.build), flat)
+
+
 if __name__ == "__main__":
     unittest.main()
