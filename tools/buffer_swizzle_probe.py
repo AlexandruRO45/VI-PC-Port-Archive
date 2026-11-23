@@ -9,6 +9,7 @@ Groups covered (docs/design.md, Swizzled buffer addressing):
     idxen_ignores_tid     idxen=1 ignores ADD_TID_ENABLE (linear & swizzled, address & bounds, load/typed/atomic)
     swizzle_activation    SWIZZLE_ENABLE=1 with idxen=0 and ADD_TID_ENABLE=0 stays linear and RAW in mode 3
     multi_dword_stepping  scratch swizzle (+4*IS) vs indexed swizzle (+4 linear, crossing IS), loads/stores & per-dword OOB
+                          and a 16-bit load and store crossing a dword in scratch swizzle (not measured yet)
     typed_and_atomic_x2   scratch swizzle suppresses typed >4B & atomic_*_x2 even in mode 2; indexed swizzle steps +4
     oob_mode3_soffset     OOB_SELECT 3 with active swizzle and stride != 0 checks (index + soffset) >= num_records
     offset_wrap           uint32(voff + inst_offset) wraps at 32 bits; RAW mode 3 uint64(off) + uint64(soff) does not
@@ -274,6 +275,36 @@ def build_cases():
             "s_waitcnt vmcnt(0)",
             "buffer_store_dwordx4 v[8:11], off, s[0:3], 0",
         ]), "indexed swizzle x2 store steps linearly by +4 (leaves +4*IS untouched)"),
+    ]
+
+    # 4b. 16-bit accesses that cross a dword in scratch swizzle: a ushort load or a short store at byte 3 of a lane's
+    # dword reaches one byte of the next dword. The translator's buffer_load_sub takes that byte from the next swizzled
+    # dword (+4*IS, as multi-dword accesses step); buffer_store_short writes it to the linear next dword (+4, the next
+    # lane's). Neither is measured natively yet: these two cases answer both on an RDNA2 GPU.
+    cases += [
+        Case("multi_dword_stepping", "scratch_swz_load_ushort_cross", [
+            "v_cmpx_eq_u32_e32 2, v0",
+            *_vsharp_lines(16, 4, 0, 0, swz=True, tid=True),           # IS=8, lane=2: dword 0 at 0x08, next at 0x28
+            "v_mov_b32 v1, 3",
+            "buffer_load_ushort v8, v1, s[4:7], 0 offen",              # byte 3 of 0x08 (0x5e) | byte 0 of 0x28 or 0x0c
+            "s_waitcnt vmcnt(0)",
+            "buffer_store_dword v8, off, s[0:3], 0",
+        ], "scratch swizzle ushort at byte 3: 0x285e if the second byte steps +4*IS, 0x0c5e if linear",
+            threads=4, words=1),
+
+        Case("multi_dword_stepping", "scratch_swz_store_short_cross", [
+            "v_cmpx_eq_u32_e32 5, v0",
+            *_vsharp_lines(16, 16, 1, 3, swz=True, tid=True),          # IS=16, lane=5: 0x14, next 0x54 (both in range)
+            "v_mov_b32 v1, 3", "v_mov_b32 v2, 0xcccc1234",
+            "buffer_store_short v2, v1, s[4:7], 0 offen",              # 0x34 to byte 3 of 0x14, 0x12 to 0x54 or 0x18
+            "s_waitcnt vmcnt(0)",
+            "buffer_load_dword v8, off, s[0:3], 0 offset:0x114",
+            "buffer_load_dword v9, off, s[0:3], 0 offset:0x118",
+            "buffer_load_dword v10, off, s[0:3], 0 offset:0x154",
+            "buffer_load_dword v11, off, s[0:3], 0 offset:0x158",
+            "s_waitcnt vmcnt(0)",
+            "buffer_store_dwordx4 v[8:11], off, s[0:3], 0",
+        ], "scratch swizzle short at byte 3: the high byte in 0x54 (+4*IS) or 0x18 (linear)", threads=8, words=4),
     ]
 
     # 5. Typed formats and buffer_atomic_*_x2 in indexed vs scratch swizzle
