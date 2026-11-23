@@ -496,7 +496,7 @@ def byte_count(text):
     try:
         value = int(text, 0)
     except ValueError:
-        raise argparse.ArgumentTypeError("must be at least 1") from None
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
     if value < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return value

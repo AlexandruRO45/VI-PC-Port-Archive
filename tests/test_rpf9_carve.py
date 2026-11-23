@@ -104,7 +104,9 @@ class CarveEdgeTest(unittest.TestCase):
             make_archive(arc)
             for flag, value, message in (("--start", "-1", "must be 0 or more"),
                                          ("--limit", "0", "must be at least 1"),
-                                         ("--limit", "-1", "must be at least 1")):
+                                         ("--limit", "-1", "must be at least 1"),
+                                         ("--limit", "abc", "invalid int value: 'abc'"),
+                                         ("--limit", "1.5", "invalid int value: '1.5'")):
                 out = os.path.join(tmp, "out")
                 p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only", flag, value],
                                    capture_output=True, text=True)
