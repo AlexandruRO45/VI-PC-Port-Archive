@@ -555,3 +555,45 @@ class TestSIMDDivergence(unittest.TestCase):
             else:
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0_in_place(self) -> None:
+        """Verify v0 = fmac(v0, v1) evaluated with v0 as both multiplier and accumulator."""
+        state = ScalarMachineState()
+        init_v0 = 0x4444_4000  # 2.0, hi=0x4444
+        v1_val = F16_TWO       # 2.0
+
+        state.set_vgpr(0, init_v0)
+        state.set_vgpr(1, v1_val)
+
+        interp = ScalarInterpreter()
+        instr = VFMAC16Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(1))
+        res = interp.step(instr, state)
+
+        # 2.0 * 2.0 + 2.0 = 6.0 (0x4600), hi preserved (0x4444)
+        self.assertEqual(res, 0x4444_4600)
+        self.assertEqual(state.get_vgpr(0), 0x4444_4600)
+
+        # Cross check with translated SPIR-V
+        spv_res = run_translator_fmac(init_v0, init_v0, v1_val, name="ps_alias_dst_src0")
+        self.assertEqual(res, spv_res)
+
+    def test_alias_dst_equals_src0_equals_src1(self) -> None:
+        """Verify v0 = v0 * v0 + v0."""
+        state = ScalarMachineState()
+        init_v0 = 0x5555_4000  # 2.0, hi=0x5555
+        state.set_vgpr(0, init_v0)
+
+        interp = ScalarInterpreter()
+        instr = VFMAC16Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(0))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 0x5555_4600)
+        self.assertEqual(state.get_vgpr(0), 0x5555_4600)
