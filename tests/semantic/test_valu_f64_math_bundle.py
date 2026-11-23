@@ -624,5 +624,24 @@ class VFrexpExpI32F64AstInterpreterTests(unittest.TestCase):
         wave.vgprs[0][2] = res
         self.assertEqual(wave.vgprs[0][2], 5)  # 16.0 = 0.5 * 2^5
 
+class VFrexpExpI32F64SimdIeeeTests(unittest.TestCase):
+    def test_frexp_exp_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x0F0F0F0F
+        for i in range(32):
+            wave.vgprs[i][2] = 0xEE
+            if (wave.exec_mask >> i) & 1:
+                wave.vgprs[i][2] = oracle_frexp_exp_i32_f64(f64_to_u64(2.0**i))
+        for i in range(32):
+            if (0x0F0F0F0F >> i) & 1:
+                self.assertEqual(wave.vgprs[i][2], i + 1)
+            else:
+                self.assertEqual(wave.vgprs[i][2], 0xEE)
+
+    def test_frexp_exp_specials(self):
+        # NaN and Inf return 0
+        self.assertEqual(oracle_frexp_exp_i32_f64(F64_QNAN), 0)
+        self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_INF), 0)
+
 if __name__ == "__main__":
     unittest.main()
