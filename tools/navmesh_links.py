@@ -584,6 +584,13 @@ def main(argv=None):
     if not os.path.exists(args.input):
         sys.stderr.write(f"error: input path not found: {args.input}\n")
         return 2
+    if os.path.isfile(args.input):
+        size = os.path.getsize(args.input)
+        if args.start >= size:
+            # max(first, start) would put scan_start past scan_end, so the run scans nothing and
+            # reports an all-zero census as if the archive were clean.
+            sys.stderr.write(f"error: --start {args.start} is past the end of the {size}-byte archive\n")
+            return 2
     if os.path.isdir(args.input) and (args.start != 0 or args.limit is not None):
         sys.stderr.write("error: --start and --limit only apply to RPF9 archive files\n")
         return 2
