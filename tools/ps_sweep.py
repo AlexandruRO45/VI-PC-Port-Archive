@@ -423,6 +423,8 @@ def depth_measurements(i, left, right):
                 data = f.read(pixels * 4 + 1)
         except FileNotFoundError:
             return {"depth_class": "missing"}
+        except OSError:
+            return {"depth_class": "incompatible"}
         if len(data) != pixels * 4:
             return {"depth_class": "incompatible"}
         count = sum(data[n:n + 4] != clear for n in range(0, len(data), 4))
@@ -442,6 +444,8 @@ def depth_measurements(i, left, right):
                     same_color = len(color) == color_size and color == second.read(color_size + 1)
             except FileNotFoundError:
                 return {"depth_class": "missing"}
+            except OSError:
+                return {"depth_class": "incompatible"}
             if len(zero) != len(data) or not same_color or rec.get("zero_samples_passed") != passed:
                 return {"depth_class": "incompatible"}
             fixed = follows = 0

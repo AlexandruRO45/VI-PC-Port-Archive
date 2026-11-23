@@ -341,6 +341,22 @@ class CompareCommand(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "0.raw"))
             self.assertEqual(ps_sweep.exact_pair(0, rec, rec), ("incompatible", []))
 
+    def test_unreadable_depth_readback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = {"code": 0, "targets": 1, "dir": tmp, "samples_passed": 0, "depth": True}
+            os.makedirs(os.path.join(tmp, "0.raw.depth"))
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
+
+    def test_unreadable_two_clear_depth_readback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pixels = ps_sweep.W * ps_sweep.H
+            with open(os.path.join(tmp, "0.raw.depth"), "wb") as plane:
+                plane.write(struct.pack("<f", 1.0) * pixels)   # untouched depth: passes with zero samples
+            os.makedirs(os.path.join(tmp, "0.raw.zero.depth"))
+            rec = {"code": 0, "targets": 1, "dir": tmp, "samples_passed": 0, "depth": True,
+                   "two_clear": True, "zero_samples_passed": 0}
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
     def test_integer_texture_fetch(self):
         from pathlib import Path
