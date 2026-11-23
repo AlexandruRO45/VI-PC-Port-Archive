@@ -300,3 +300,63 @@ class TestSaluAndn2B64SimdDivergence(unittest.TestCase):
         sdst_zero, scc_zero = ref_andn2_b64(even_lanes, even_lanes)
         self.assertEqual(sdst_zero, 0)
         self.assertEqual(scc_zero, 0)
+
+
+class TestSaluAndn2B64RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        # s[0:1] = s[0:1] & ~s[2:3]
+        state = ScalarRegisterState()
+        s0_val = 0x123456789ABCDEF0
+        s1_val = 0x00000000FFFFFFFF
+        state.write_sgpr_u64(0, s0_val)
+        state.write_sgpr_u64(2, s1_val)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B64,
+            dst=ASTOperand.sgpr(0, 2),
+            src0=ASTOperand.sgpr(0, 2),
+            src1=ASTOperand.sgpr(2, 2),
+        )
+        sdst, scc = state.execute(inst)
+        self.assertEqual(sdst, 0x1234567800000000)
+        self.assertEqual(state.sgpr[0], 0x00000000)
+        self.assertEqual(state.sgpr[1], 0x12345678)
+        self.assertEqual(scc, 1)
+
+    def test_dst_aliases_src1(self):
+        # s[2:3] = s[0:1] & ~s[2:3]
+        state = ScalarRegisterState()
+        s0_val = 0x123456789ABCDEF0
+        s1_val = 0x00000000FFFFFFFF
+        state.write_sgpr_u64(0, s0_val)
+        state.write_sgpr_u64(2, s1_val)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B64,
+            dst=ASTOperand.sgpr(2, 2),
+            src0=ASTOperand.sgpr(0, 2),
+            src1=ASTOperand.sgpr(2, 2),
+        )
+        sdst, scc = state.execute(inst)
+        self.assertEqual(sdst, 0x1234567800000000)
+        self.assertEqual(state.sgpr[2], 0x00000000)
+        self.assertEqual(state.sgpr[3], 0x12345678)
+        self.assertEqual(scc, 1)
+
+    def test_self_cancellation_aliasing(self):
+        # s[0:1] = s[0:1] & ~s[0:1] = 0
+        state = ScalarRegisterState()
+        state.write_sgpr_u64(0, 0x123456789ABCDEF0)
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B64,
+            dst=ASTOperand.sgpr(0, 2),
+            src0=ASTOperand.sgpr(0, 2),
+            src1=ASTOperand.sgpr(0, 2),
+        )
+        sdst, scc = state.execute(inst)
+        self.assertEqual(sdst, 0)
+        self.assertEqual(state.sgpr[0], 0)
+        self.assertEqual(state.sgpr[1], 0)
+        self.assertEqual(scc, 0)
