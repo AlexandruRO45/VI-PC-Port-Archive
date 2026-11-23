@@ -433,6 +433,9 @@ if(BUILD_TESTING)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
+  # DeviceState's border colour table and replaced views (runtime/src/descriptor_tables.h): pure stdlib.
+  add_executable(descriptor_tables_test test/descriptor_tables_test.cpp)
+  add_test(NAME descriptor_tables COMMAND descriptor_tables_test)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
