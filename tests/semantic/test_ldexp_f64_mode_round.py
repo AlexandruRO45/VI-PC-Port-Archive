@@ -157,6 +157,13 @@ class LdexpF64ModeRound(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(run(mode, [(0x3FF0000100000001 | sign, -1055)]), [0x0000000000080001 | sign])
 
+    def test_shift_beyond_significand_uses_signed_tiny_result(self):
+        sign_bit = 1 << 63
+        cases = ((RNE, 0, 0), (RNE, sign_bit, 0), (RUP, 0, 1), (RDN, sign_bit, 1))
+        for mode, sign, expected in cases:
+            with self.subTest(mode=mode, negative=bool(sign)):
+                self.assertEqual(run(mode, [(0x3FF8000000000000 | sign, -1076)]), [expected | sign])
+
     def test_s_round_mode_switch_uses_modified_sign(self):
         # Toward +inf saturates on negative overflow, then toward -inf goes to negative infinity.
         w = mrt0_words(translate_fixture("ps_ldexp_f64_directed"))
