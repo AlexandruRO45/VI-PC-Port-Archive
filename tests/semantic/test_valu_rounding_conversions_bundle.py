@@ -512,6 +512,13 @@ class TestVCvtU32F32SIMDAndIEEE(unittest.TestCase):
                 words = run_bundle_ps(lines, f"ps_ieee_v_cvt_u32_f32_{val:#x}")
                 self.assertEqual(words[0], exp)
 
+class TestVCvtU32F32TranslatorAndControls(unittest.TestCase):
+    """Stage 4 for v_cvt_u32_f32: translator integration and negative controls."""
+
+    def test_v_cvt_u32_f32_negative_controls(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_v_cvt_u32_f32", ["v_cvt_u32_f32", "s_endpgm"])
+
 
 if __name__ == '__main__':
     unittest.main()
