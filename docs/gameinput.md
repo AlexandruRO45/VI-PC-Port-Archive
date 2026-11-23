@@ -12,9 +12,15 @@ features. That path is tested without the game: `gameinput_host_test` (ctest `ga
 built against the SDK's `gameinput.lib` and checks that its `GameInput.dll` import binds to the host's copy, that
 `GameInputCreate` and `GetCurrentTimestamp` work from mapped code, and that `GetCurrentReading` answers; with a pad
 attached, `GetGamepadState` must succeed on the reading. It passes on Windows 11 build 26300 (GameInput 0.2309) without
-a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that binds to nothing fails it. The game executable is not available yet,
-so whether it imports GameInput this way, and under which
-module, is unverified (see [VERIFY](#verify)).
+a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that
+binds to nothing fails it.
+
+The retail executable does not import it that way: it imports GameInput **once, by ordinal**, from `GameInput.dll`
+(`Ordinal 1`, no name, `dumpbin //imports` over the 120,181,760-byte `game_scarlett_master.exe`). The registry
+matches export names and `#ordinal` symbols separately, so a name entry alone does not answer it and the loader fell
+through to the host's copy; the shim now registers `#1` for `gameinput.dll` as well, and `--dry-run` over the
+executable lists that import as `shim` instead of leaving it to the host. `gameinput_test` checks the ordinal resolves
+to the same function as the name.
 
 ## Building
 
@@ -490,9 +496,10 @@ as working; nothing measured them, and the `resistance` mode was not tried.
 
 These need the game executable or a test on hardware:
 
-- **Which API version and module.** The shim is GameInput v0 and registers `GameInputCreate` under `gameinput.dll`
-  and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
-  built against one of those, the vtables need a second set.
+- **Which API version.** The module is measured (`GameInput.dll`, ordinal 1) but the version is not: the shim is
+  GameInput v0 and registers `GameInputCreate` under `gameinput.dll` (name and `#1`) and `xgameruntime.dll`. GameInput
+  v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was built against one of those, the
+  vtables need a second set.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
   and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen.

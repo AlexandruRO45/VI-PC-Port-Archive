@@ -1622,6 +1622,10 @@ int main() {
     check(create != nullptr, "gameinput.dll!GameInputCreate is registered");
     check(rt::shims::find("xgameruntime.dll", "GameInputCreate") == reinterpret_cast<void*>(create),
           "xgameruntime.dll!GameInputCreate is the same function");
+    // The retail executable imports GameInput.dll ordinal 1, not the export name: the registry matches the ordinal
+    // symbol on its own, so it needs its own entry.
+    check(rt::shims::find("gameinput.dll", "#1") == reinterpret_cast<void*>(create),
+          "gameinput.dll!#1 (the executable's ordinal import) is the same function");
     if (!create) return 1;
 
     IGameInput* input = nullptr;
