@@ -424,5 +424,62 @@ class TestSIMDDivergence(unittest.TestCase):
         self.assertEqual(hw_bcnt, 32)
 
 
+# ==============================================================================
+# Register Aliasing and Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_src_with_exec(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.exec_mask = 0x12345678_9ABCDEF0
+        instr = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 6),
+            src0=Register64(RegKind.EXEC),
+        )
+        new_exec, d_saved, scc = interp.execute(instr, state)
+
+        self.assertEqual(new_exec, ALL64)
+        self.assertEqual(d_saved, 0x12345678_9ABCDEF0)
+        self.assertEqual(scc, 1)
+
+    def test_alias_dst_with_src(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_sgpr_pair(6, 0x55555555_55555555)
+        state.exec_mask = 0x00000000_FFFFFFFF
+
+        instr = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 6),
+            src0=Register64(RegKind.SGPR_PAIR, 6),
+        )
+        new_exec, d_saved, scc = interp.execute(instr, state)
+
+        self.assertEqual(new_exec, 0xAAAAAAAA_55555555)
+        self.assertEqual(d_saved, 0x00000000_FFFFFFFF)
+        self.assertEqual(state.get_sgpr_pair(6), 0x00000000_FFFFFFFF)
+
+    def test_unrelated_registers_preserved(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_sgpr_pair(0, 0x11111111_22222222)
+        state.set_sgpr_pair(10, 0x33333333_44444444)
+        state.exec_mask = 0x00000000_FFFFFFFF
+
+        instr = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 6),
+            src0=Register64(RegKind.SGPR_PAIR, 10),
+        )
+        interp.execute(instr, state)
+
+        self.assertEqual(state.get_sgpr_pair(0), 0x11111111_22222222)
+        self.assertEqual(state.get_sgpr_pair(10), 0x33333333_44444444)
+
+
 if __name__ == "__main__":
     unittest.main()
