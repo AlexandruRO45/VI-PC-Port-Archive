@@ -6,6 +6,7 @@ or unimportable file always makes it exit 1 with that file named, in parallel an
 import contextlib
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -51,6 +52,23 @@ class RunnerTest(unittest.TestCase):
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 0, out)
             self.assertIn("1 files, 2 tests, 0 files failed", out)
+
+    def test_mixed_case_names_match_serial_discovery(self):
+        for filename in ("Test_mixed.py", "test_extension.PY"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "test_control.py": PASS, filename: FAIL})
+                command = [sys.executable, "-m", "unittest", "discover", "-s", tmp]
+                serial = subprocess.run(command, capture_output=True, text=True)
+                code, out = run(tmp, "-j", "2")
+                self.assertEqual(code, serial.returncode, out)
+                if os.name == "nt":
+                    self.assertEqual(code, 1, out)
+                    self.assertIn(f"==== FAILED: {os.path.splitext(filename)[0]}", out)
+                    self.assertIn("boom-msg", out)
+                    self.assertIn("2 files, 3 tests, 1 files failed", out)
+                else:
+                    self.assertEqual(code, 0, out)
+                    self.assertIn("1 files, 2 tests, 0 files failed", out)
 
     def test_all_pass(self):
         with tempfile.TemporaryDirectory() as tmp:

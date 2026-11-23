@@ -11,6 +11,7 @@ Tests can run side by side because each writes only into its own temporary folde
 """
 import argparse
 import concurrent.futures
+import fnmatch
 import os
 import re
 import subprocess
@@ -22,8 +23,9 @@ def test_modules(directory):
     """Names of the top-level test files and package directories to schedule."""
     for _, dirs, files in os.walk(directory):
         packages = [name for name in dirs if os.path.isfile(os.path.join(directory, name, "__init__.py"))]
-        # The test*.py pattern also matches names unittest cannot import as modules.
-        standalone = [name for name in files if re.fullmatch(r"test\w*\.py", name)]
+        # unittest discovery applies both the platform glob and the module filename rule.
+        standalone = [name for name in files if fnmatch.fnmatch(name, "test*.py")
+                      and re.fullmatch(r"[_a-z]\w*\.py", name, re.IGNORECASE)]
         return sorted(packages + standalone)
     return []
 
@@ -31,7 +33,7 @@ def test_modules(directory):
 def run_module(directory, module, verbose):
     """Return (exit code, tests run, output). A code of None marks empty discovery."""
     path = os.path.join(directory, module)
-    selection = ["discover", "-s", path, "-t", directory] if os.path.isdir(path) else [module.removesuffix(".py")]
+    selection = ["discover", "-s", path, "-t", directory] if os.path.isdir(path) else [os.path.splitext(module)[0]]
     cmd = [sys.executable, "-m", "unittest", *selection, *(["-v"] if verbose else [])]
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
@@ -57,18 +59,19 @@ def main(argv=None):
     if not modules:
         print(f"no test*.py files in {directory}")
         return 1
+    files = {name: os.path.splitext(name)[0] for name in modules if not os.path.isdir(os.path.join(directory, name))}
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     # Start packages before standalone files because a package can contain several test files.
-    modules.sort(key=lambda m: (m.endswith(".py"), -os.path.getsize(os.path.join(directory, m))))
+    modules.sort(key=lambda m: (m in files, -os.path.getsize(os.path.join(directory, m))))
     scheduled = set(modules)
-    shadowed = sorted(name for name in modules if name.endswith(".py") and name.removesuffix(".py") in scheduled)
+    shadowed = sorted(name for name, module in files.items() if module in scheduled)
     if shadowed:
         print(f"test files shadowed by packages in {directory}: {', '.join(shadowed)}", file=sys.stderr)
         return 1
     start, total, failed = time.monotonic(), 0, []
     empty = 0
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        jobs = {pool.submit(run_module, directory, m, a.verbose): m.removesuffix(".py") for m in modules}
+        jobs = {pool.submit(run_module, directory, m, a.verbose): files.get(m, m) for m in modules}
         for job in concurrent.futures.as_completed(jobs):
             code, ran, out = job.result()
             total += ran
@@ -80,7 +83,7 @@ def main(argv=None):
             elif a.verbose:
                 print(f"==== {jobs[job]}\n{out}", flush=True)
     took = time.monotonic() - start
-    kind = "test targets" if any(not m.endswith(".py") for m in modules) else "files"
+    kind = "files" if len(files) == len(modules) else "test targets"
     summary = f"{len(modules)} {kind}, {total} tests, {len(failed)} {kind} failed in {took:.0f} s with {a.jobs} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
     if empty == len(modules):
