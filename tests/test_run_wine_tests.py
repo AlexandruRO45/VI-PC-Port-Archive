@@ -548,6 +548,31 @@ class MainTest(unittest.TestCase):
         self.assertIn("| `ok` | pass | yes |", text)
         self.assertIn("| `bad` | fail |  |", text)
 
+    def assert_summary_alias_is_rejected(self, entries, listing, summary):
+        before = listing.read_bytes()
+        with mock.patch.object(rwt, "run_test", return_value=("pass", "")) as run_test:
+            code, out, err = self.run_main(entries, "--summary", str(summary))
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("--summary must not name the --tests inventory", err)
+        self.assertEqual(listing.read_bytes(), before)
+        run_test.assert_not_called()
+
+    def test_summary_cannot_name_the_test_listing(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        listing = Path(self.list_tests(entries))
+        self.assert_summary_alias_is_rejected(entries, listing, listing)
+
+    def test_summary_cannot_use_a_hard_link_to_the_test_listing(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        listing = Path(self.list_tests(entries))
+        summary = self.root / "aliased-summary.md"
+        try:
+            os.link(listing, summary)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+        self.assert_summary_alias_is_rejected(entries, listing, summary)
+
     def test_a_summary_in_a_missing_folder_creates_it(self):
         summary = self.root / "missing" / "sub" / "summary.md"
         code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))],
