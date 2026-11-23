@@ -302,5 +302,40 @@ class TestValuCndmaskB32RegisterAliasing(unittest.TestCase):
         # When cond=1, v0 updates to other_val
         self.assertEqual(run_valu_cndmask_inplace_ps(init_val, other_val, cond_bit=1), other_val)
 
+# --- Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation ---
+
+def run_valu_cndmask_scc_ps(cond_bit: int, initial_scc: int) -> Tuple[int, int]:
+    """Verify SCC is preserved unmodified across v_cndmask_b32."""
+    lines = [
+        f"s_mov_b32 s0, {1 if initial_scc else 0}",
+        "s_cmp_eq_u32 s0, 1",  # set SCC
+        "s_mov_b32 s1, 0x11111111",
+        "s_mov_b32 s2, 0x22222222",
+        f"s_mov_b64 s[4:5], {1 if cond_bit else 0}",
+        "v_cndmask_b32_e64 v0, s1, s2, s[4:5]",
+        "s_cselect_b32 s6, 1, 0",  # read SCC
+        "v_mov_b32 v1, s6",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_cndmask_scc", lines)
+    words = mrt0_words(spv)
+    return words[0], words[1]
+
+
+class TestValuCndmaskB32ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation tests."""
+
+    def test_scc_preserved(self) -> None:
+        for scc in (0, 1):
+            for cond in (0, 1):
+                with self.subTest(scc=scc, cond=cond):
+                    res, out_scc = run_valu_cndmask_scc_ps(cond_bit=cond, initial_scc=scc)
+                    exp_res = 0x22222222 if cond else 0x11111111
+                    self.assertEqual(res, exp_res)
+                    self.assertEqual(out_scc, scc)
+
 if __name__ == "__main__":
     unittest.main()
