@@ -108,6 +108,9 @@ jobs:
       # The pinned SDL3 release: the same SHA-256 as URL_HASH in runtime/CMakeLists.txt. The SDL3 cache is keyed on it,
       # so a new pin starts from an empty cache.
       SDL3_TARBALL_SHA256: f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f
+      # Bump when the SDL3 build options in runtime/CMakeLists.txt change: the cache holds generated files and
+      # objects, and nothing else in its key notices a changed option.
+      SDL3_CACHE_SALT: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -237,13 +240,17 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $bin 'glslang.exe') -Destination (Join-Path $bin 'glslangValidator.exe')
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin -Encoding utf8
       # Every run that builds the shim compiles SDL3 from the pinned release. Cache the fetched sources and that
-      # build tree so a run with the same tarball and the same compiler reuses them; cl's version is in the key, so
-      # an image update does not restore objects an older toolset built.
-      - name: Read cl's version for the SDL3 cache key
-        id: cl-version
+      # build tree so a run with the same tarball and the same toolchain reuses them. The toolchain versions are in
+      # the key as well as the salt, so a new cl, CMake or Ninja, or a changed SDL3 build option, starts empty instead
+      # of reusing objects and generated files another toolchain wrote.
+      - name: Read the tool versions for the SDL3 cache key
+        id: sdl3-toolset
         shell: pwsh
         run: |
-          $version = ((& cl 2>&1 | Select-Object -First 1) -replace '\s+', '_')
+          $cl = (& cl 2>&1 | Select-Object -First 1)
+          $cmake = (& cmake --version | Select-Object -First 1)
+          $ninja = (& ninja --version)
+          $version = "$cl|$cmake|$ninja" -replace '[^0-9A-Za-z._-]+', '-'
           "version=$version" >> $env:GITHUB_OUTPUT
       - name: Cache the SDL3 fetch and build
         id: sdl3-cache
@@ -253,7 +260,7 @@ jobs:
             runtime/build/_deps/sdl3-src
             runtime/build/_deps/sdl3-subbuild
             runtime/build/_deps/sdl3-build
-          key: sdl3-3.4.20-${{ env.SDL3_TARBALL_SHA256 }}-${{ steps.cl-version.outputs.version }}
+          key: sdl3-3.4.20-${{ env.SDL3_TARBALL_SHA256 }}-${{ env.SDL3_CACHE_SALT }}-${{ steps.sdl3-toolset.outputs.version }}
       - name: Configure
         env:
           VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
