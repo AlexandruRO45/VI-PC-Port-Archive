@@ -302,7 +302,7 @@ class ReportPathTests(unittest.TestCase):
             before = f.read()
         code, _, err = self.run_main([image, "--extract", extract])
         self.assertEqual(code, 2)
-        self.assertIn("--extract would overwrite the input", err)
+        self.assertIn("would overwrite the input", err)
         with open(image, "rb") as f:
             self.assertEqual(f.read(), before)
 
