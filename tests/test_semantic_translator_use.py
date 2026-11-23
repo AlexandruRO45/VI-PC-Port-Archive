@@ -34,8 +34,6 @@ ALLOWLIST = {
     "test_interp.py": "self-test of spirv_mini_interp.py against hand-written SPIR-V",
     "test_spirv_wave_interp.py": "self-test of spirv_wave_interp.py against hand-written SPIR-V",
     "test_fixtures.py": "checks fixtures/disasm/*.s against regen_fixtures.py; the listing is the subject",
-    "test_alu_frexp.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
-    "test_alu_ldexp.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
 }
 
 # Debt from before this guard: files that model the answer instead of running the translator.  They are
@@ -75,7 +73,6 @@ DEBT = {
     "test_valu_frexp_exp_i32_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_frexp_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_frexp_mant_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_ldexp_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_lerp_u8.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_minmax_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_mul_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
