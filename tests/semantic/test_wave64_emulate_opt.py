@@ -1190,6 +1190,28 @@ class LocalExecFoldTests(unittest.TestCase):
         for lane in range(64):
             self.assertEqual(mem[lane * 4], 77, f"lane {lane}: wave ran region so m0=1 -> v5=77 everywhere")
 
+    def test_a_mask_pair_with_a_constant_half_is_still_a_mask(self):
+        # s[4:5] = lanes 0-4 of each wave (a compare result), then s5 = 0: the low word is still a lane mask and the
+        # high word is the constant 0, so lane_masks.kind answers MASK for the pair and the copy s[6:7] is a mask
+        # too. Its popcount is 5 in every lane; read as plain data each lane would see only its own bit.
+        insns = [
+            ("v_and_b32_e32 v8, 63, v0", 4),
+            ("v_cmp_gt_u32_e64 s[4:5], 5, v8", 8),
+            ("s_mov_b32 s5, 0", 4),
+            ("s_mov_b64 s[6:7], s[4:5]", 4),
+            ("s_bcnt1_i32_b64 s10, s[6:7]", 4),
+            ("v_mov_b32_e32 v1, s10", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v1, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        for local in ((64, 1, 1), (128, 1, 1)):
+            with self.subTest(local=local):
+                spv, _ = _translate_encoded("cs_mask_pair_const_half", insns, local, emulate=True)
+                mem, _ = run_emulated_workgroup(spv, local, push_constants=VSHARP + [0] * 28)
+                for lane in range(local[0]):
+                    self.assertEqual(mem[lane * 4], 5, f"lane {lane}")
+
     def test_single_store_acyclic_fold_orders_war_and_raw(self):
         # Acyclic single-store s_cbranch_execz regions fold inline (0 OpAtomicOr), while uniform pre/post
         # memory ordering protects both WAR (load before folded store) and RAW (folded store before load).
