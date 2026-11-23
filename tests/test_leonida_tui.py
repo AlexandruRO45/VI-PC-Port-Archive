@@ -406,5 +406,106 @@ class SetupDefaultsTest(unittest.TestCase):
         self.assertFalse(cfg.overlap)
 
 
+class PumpProcessTest(unittest.TestCase):
+    def test_child_closing_stdout_early_completes_without_killing_siblings(self):
+        import subprocess
+        import threading
+
+        lines = []
+
+        class FakeBoard:
+            def __init__(self):
+                self._stop = threading.Event()
+
+            def write(self, stage, line):
+                lines.append((stage, line))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "done.txt")
+            sibling = subprocess.Popen(
+                [sys.executable, "-I", "-c", "import time; time.sleep(30)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            child_code = (
+                "import os, sys, time\n"
+                "print('hello', flush=True)\n"
+                "sys.stdout.flush()\n"
+                "sys.stderr.flush()\n"
+                "os.close(1)\n"
+                "os.close(2)\n"
+                "time.sleep(0.8)\n"
+                "with open(sys.argv[1], 'w', encoding='utf-8', newline='\\n') as f:\n"
+                "    f.write('done')\n"
+                "os._exit(0)\n"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-I", "-c", child_code, marker],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+            )
+            leonida_tui.register_live_process(sibling)
+            try:
+                code = leonida_tui.pump_process(child, "shaders", FakeBoard())
+                self.assertEqual(code, 0)
+                self.assertEqual(lines, [("shaders", "hello")])
+                self.assertTrue(os.path.isfile(marker), "child was killed before finishing post-EOF work")
+                self.assertIsNone(sibling.poll(), "unrelated sibling process was killed")
+                self.assertIn(sibling, leonida_tui._live_procs)
+            finally:
+                leonida_tui.unregister_live_process(sibling)
+                if sibling.poll() is None:
+                    sibling.kill()
+                    sibling.wait(timeout=5)
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+
+    def test_board_stop_while_waiting_after_eof_terminates_child(self):
+        import subprocess
+        import threading
+        import time
+
+        class FakeBoard:
+            def __init__(self):
+                self._stop = threading.Event()
+
+            def write(self, stage, line):
+                pass
+
+        board = FakeBoard()
+        child_code = (
+            "import os, sys, time\n"
+            "sys.stdout.flush()\n"
+            "sys.stderr.flush()\n"
+            "os.close(1)\n"
+            "os.close(2)\n"
+            "time.sleep(30)\n"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-c", child_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+        timer = threading.Timer(0.25, board._stop.set)
+        timer.start()
+        t0 = time.monotonic()
+        try:
+            code = leonida_tui.pump_process(child, "shaders", board)
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 5.0)
+            self.assertNotEqual(code, 0)
+            self.assertIsNotNone(child.poll())
+        finally:
+            timer.cancel()
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()

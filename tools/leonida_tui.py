@@ -1120,6 +1120,11 @@ def capture_popen_kwargs() -> dict:
     return kw
 
 
+def _board_stopped(board: LeonidaBoard | None) -> bool:
+    stop = getattr(board, "_stop", None) if board is not None else None
+    return bool(stop is not None and stop.is_set())
+
+
 def pump_process(proc, stage: str | None, board: LeonidaBoard | None) -> int:
     """Read proc.stdout line-by-line into the stage console; return exit code."""
     register_live_process(proc)
@@ -1127,7 +1132,7 @@ def pump_process(proc, stage: str | None, board: LeonidaBoard | None) -> int:
         stream = proc.stdout
         if stream is not None:
             while True:
-                if board is not None and getattr(board, "_stop", None) is not None and board._stop.is_set():
+                if _board_stopped(board):
                     kill_live_processes()
                     break
                 raw = stream.readline()
@@ -1153,13 +1158,16 @@ def pump_process(proc, stage: str | None, board: LeonidaBoard | None) -> int:
                 stream.close()
             except OSError:
                 pass
-        try:
-            return proc.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            kill_live_processes()
+        while True:
+            if _board_stopped(board):
+                kill_live_processes()
+                try:
+                    return proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    return proc.poll() if proc.poll() is not None else 1
             try:
-                return proc.wait(timeout=2.0)
+                return proc.wait(timeout=0.2)
             except subprocess.TimeoutExpired:
-                return proc.poll() if proc.poll() is not None else 1
+                continue
     finally:
         unregister_live_process(proc)
