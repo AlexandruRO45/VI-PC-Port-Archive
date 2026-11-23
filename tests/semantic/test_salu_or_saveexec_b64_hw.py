@@ -139,5 +139,108 @@ class TestSOrSaveExecOracle(unittest.TestCase):
         self.assertIn("OpFunction", spv)
         self.assertIn("OpReturn", spv)
 
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegisterKind(Enum):
+    SGPR = auto()
+    VGPR = auto()
+    EXEC = auto()
+    VCC = auto()
+    SCC = auto()
+    LITERAL64 = auto()
+
+
+@dataclass(frozen=True)
+class RegOperand:
+    kind: RegisterKind
+    index: int = 0
+    size_bits: int = 64
+
+    def format(self) -> str:
+        if self.kind == RegisterKind.SGPR:
+            if self.size_bits == 64:
+                return f"s[{self.index}:{self.index + 1}]"
+            return f"s{self.index}"
+        elif self.kind == RegisterKind.VGPR:
+            if self.size_bits == 64:
+                return f"v[{self.index}:{self.index + 1}]"
+            return f"v{self.index}"
+        elif self.kind == RegisterKind.EXEC:
+            return "exec" if self.size_bits == 64 else "exec_lo"
+        elif self.kind == RegisterKind.VCC:
+            return "vcc" if self.size_bits == 64 else "vcc_lo"
+        elif self.kind == RegisterKind.SCC:
+            return "scc"
+        elif self.kind == RegisterKind.LITERAL64:
+            return f"{self.index:#x}"
+        return f"reg_{self.index}"
+
+
+@dataclass
+class SOrSaveExecB64Instruction:
+    dst: RegOperand
+    src0: RegOperand
+    opcode: str = "s_or_saveexec_b64"
+
+    def validate(self) -> None:
+        if self.opcode != "s_or_saveexec_b64":
+            raise ValueError(f"Invalid opcode {self.opcode}")
+        if self.dst.kind != RegisterKind.SGPR:
+            raise TypeError(f"Destination must be SGPR pair, got {self.dst.kind}")
+        if self.dst.size_bits != 64 or (self.dst.index % 2 != 0):
+            raise ValueError(f"Destination SGPR must be an even-aligned pair, got s[{self.dst.index}:{self.dst.index+1}]")
+        if self.dst.index > 102:
+            raise ValueError(f"Destination SGPR index out of range: s{self.dst.index}")
+        if self.src0.kind == RegisterKind.SGPR:
+            if self.src0.size_bits != 64 or (self.src0.index % 2 != 0):
+                raise ValueError(f"Source SGPR must be an even-aligned pair, got s[{self.src0.index}:{self.src0.index+1}]")
+
+    def emit_assembly(self) -> str:
+        self.validate()
+        return f"{self.opcode} {self.dst.format()}, {self.src0.format()}"
+
+
+class TestSOrSaveExecAST(unittest.TestCase):
+    """Unit tests for symbolic AST representation and validation."""
+
+    def test_ast_valid_sgpr_source(self):
+        instr = SOrSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        self.assertEqual(instr.emit_assembly(), "s_or_saveexec_b64 s[6:7], s[4:5]")
+
+    def test_ast_valid_vcc_source(self):
+        instr = SOrSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=10, size_bits=64),
+            src0=RegOperand(RegisterKind.VCC, size_bits=64)
+        )
+        self.assertEqual(instr.emit_assembly(), "s_or_saveexec_b64 s[10:11], vcc")
+
+    def test_ast_valid_exec_source(self):
+        instr = SOrSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=8, size_bits=64),
+            src0=RegOperand(RegisterKind.EXEC, size_bits=64)
+        )
+        self.assertEqual(instr.emit_assembly(), "s_or_saveexec_b64 s[8:9], exec")
+
+    def test_ast_misaligned_destination(self):
+        instr = SOrSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=5, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=6, size_bits=64)
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_ast_invalid_destination_kind(self):
+        instr = SOrSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        with self.assertRaises(TypeError):
+            instr.validate()
+
 if __name__ == "__main__":
     unittest.main()
