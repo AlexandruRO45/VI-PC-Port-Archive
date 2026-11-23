@@ -69,7 +69,9 @@ def _parse_spv(asm):
     gvars = {}       # %name -> (storage_class, elem_type)
     fvars = []       # [(%name, elem_type, init_id_or_None)]
     blocks = {}      # %label -> [(res, op, args), ...]
+    helpers = {}     # %fn -> ([%param, ...], [(res, op, args), ...]) for every function but %main
     cur = None
+    cur_fn = None
     in_main = False
 
     for raw in asm.splitlines():
@@ -84,10 +86,20 @@ def _parse_spv(asm):
 
         if op == "OpFunction":
             in_main = (res == "%main")
+            cur_fn = None if in_main else res
+            if cur_fn is not None:
+                helpers[cur_fn] = ([], [])
             continue
         if op == "OpFunctionEnd":
             in_main = False
             cur = None
+            cur_fn = None
+            continue
+        if cur_fn is not None:
+            if op == "OpFunctionParameter":
+                helpers[cur_fn][0].append(res)
+            elif op != "OpLabel":
+                helpers[cur_fn][1].append((res, op, args))
             continue
 
         if not in_main:
@@ -137,6 +149,38 @@ def _parse_spv(asm):
             continue
         if cur is not None:
             blocks[cur].append((res, op, args))
+
+    # --wave64-emulate's structured form calls single-block helpers (x_pre_mask_fn, x_pre_vote_fn) from %main.
+    # Inline each call where it stands, with its ids renamed per call site, so the lockstep interpreter below
+    # runs them as part of the calling block.
+    call_seq = 0
+    for label, insns in blocks.items():
+        inlined = []
+        for res, op, args in insns:
+            if op != "OpFunctionCall":
+                inlined.append((res, op, args))
+                continue
+            params, body = helpers[args[1]]
+            if len(params) != len(args) - 2:
+                raise NotImplementedError(f"OpFunctionCall {args[1]} with {len(args) - 2} arguments")
+            if any(fop in ("OpBranch", "OpBranchConditional", "OpSwitch", "OpVariable", "OpFunctionCall")
+                   for _, fop, _ in body):
+                raise NotImplementedError(f"OpFunctionCall of {args[1]}: only single-block helpers are inlined")
+            call_seq += 1
+            id_map = dict(zip(params, args[2:]))
+            for fres, fop, fargs in body:
+                fargs = [id_map.get(a, a) for a in fargs]
+                if fop == "OpReturnValue":
+                    inlined.append((res, "OpCopyObject", [args[0], fargs[0]]))
+                    break
+                if fop == "OpReturn":
+                    break
+                new_res = None
+                if fres is not None:
+                    new_res = f"%call{call_seq}_{fres[1:]}"
+                    id_map[fres] = new_res
+                inlined.append((new_res, fop, fargs))
+        blocks[label] = inlined
 
     def make_zero(ty_id):
         ty = types.get(ty_id)
@@ -1023,7 +1067,8 @@ class DivergentLoopBallotTests(unittest.TestCase):
             with self.subTest(mode=label):
                 spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    # The structured plan (wave64_emulate_opt) or the x_round fallback; either is emulation.
+                    self.assertIn(gen.control_flow, ("emulated wave64 structured", "emulated wave64 rounds"))
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
