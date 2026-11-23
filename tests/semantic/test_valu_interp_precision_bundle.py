@@ -76,6 +76,19 @@ class TestInterpP1F32Barycentric(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP1F32MultiChannel(unittest.TestCase):
+    def test_p1_f32_all_channels(self):
+        for chan in ("x", "y", "z", "w"):
+            code = [
+                f"v_interp_p1_f32 v2, v0, attr2.{chan}",
+                f"v_interp_p2_f32 v2, v1, attr2.{chan}",
+                "exp mrt0, v2, v2, v2, v2 done",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_p1_f32_ch_{chan}", code)
+            words = support.mrt0_words(spv)
+            self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
