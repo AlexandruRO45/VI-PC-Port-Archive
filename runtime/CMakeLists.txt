@@ -107,6 +107,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
+    shims/libhttpclient_offline.cpp
     shims/xmem.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
@@ -246,6 +247,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(winhttp_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(winhttp_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(winhttp_offline_test PRIVATE /OPT:NOREF)
+
+  add_executable(libhttpclient_offline_test
+    test/libhttpclient_offline_test.cpp
+    shims/libhttpclient_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(libhttpclient_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_link_libraries(libhttpclient_offline_test PRIVATE gta6rt_xtaskqueue)
+  target_compile_definitions(libhttpclient_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(libhttpclient_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(libhttpclient_offline_test PRIVATE /OPT:NOREF)
 
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
@@ -968,6 +980,10 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET libhttpclient_offline_test)
+    add_test(NAME libhttpclient_offline COMMAND libhttpclient_offline_test)
+    set_tests_properties(libhttpclient_offline PROPERTIES TIMEOUT 15)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
