@@ -15,10 +15,12 @@ record:
     record + 20  22 bytes            fixed flags/parameters
 
 `hash B` is Jenkins one-at-a-time over the lowercase name with spaces and punctuation mapped to `_`.
-The AWC stream id is `hash B & 0x1FFFFFFF`; the duration is the real song/ad length, while the AWC
-manifest reports twice that value because of a stereo-sample counting artifact. That mapping was
-checked against a package's AWC manifest: all 1,589 records resolve to a stream id and 1,584 of 1,589
-durations equal `manifest duration / 2` within 0.01 s.
+The AWC stream id is `hash B & 0x1FFFFFFF`; the duration is the real song/ad length. A descriptor
+counts decoded samples interleaved across its packet channels, twice this value when the TOC stereo
+bit is set, and `awc_manifest.py` divides that count to the per-channel duration, so its `duration_s`
+is directly comparable. That mapping was checked against a package's AWC manifest: all 1,589 records
+resolve to a stream id and 1,584 of 1,589 durations equal the manifest's per-channel duration within
+0.01 s.
 
 The config stores no per-track start offsets. It gives the station grouping as contiguous config-id
 ranges and station-local content-id lists, but the mix order is not stored; a continuous radio mix

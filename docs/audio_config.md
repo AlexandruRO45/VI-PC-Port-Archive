@@ -59,8 +59,9 @@ stride or a hard-coded stream offset.
 On the measured package:
 
 - **1,589 records**, 1,589 distinct ids, range `0xB422`–`0xBFC6`, 272,442.8 s total.
-- **1,584 of 1,589** durations equal `AWC manifest duration / 2` within 0.01 s. The five exceptions
-  are duplicate-title or placeholder hash collisions.
+- **1,584 of 1,589** durations equal the manifest's per-channel duration within 0.01 s — half the
+  descriptor's interleaved sample count, the number `awc_manifest.py` now reports as `duration_s`.
+  The five exceptions are duplicate-title or placeholder hash collisions.
 - **All 1,589** records map to an AWC stream id; the ids are the music streams exported by
   `tools/awc_opus.py`.
 - The records are grouped by contiguous id ranges that follow station order. The same config also
