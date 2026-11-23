@@ -182,7 +182,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         count += 1
         return f"%gsc_t{count}"
 
-    out = []
+    out = ["OpCapability Shader"]  # GLCompute needs it even if Geometry implied it in the input.
     entry_label = None
     cur_block = None
     emit_split = set()
@@ -191,7 +191,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     state = "header"        # header -> main_entry -> main_vars -> main -> other
     for ln in text.splitlines():
         s = ln.strip()
-        if s == "OpCapability Geometry":
+        if s in ("OpCapability Geometry", "OpCapability Shader"):
             continue
         m = re.match(r"OpEntryPoint Geometry (%\w+) (\"[^\"]*\")(.*)$", s)
         if m:
@@ -289,6 +289,9 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
             continue
         m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
+        if m and m.group(3) in out_vars:
+            out.append(s[:m.start(3)] + out_vars[m.group(3)] + s[m.end(3):])
+            continue
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)
             out.append(f"{m.group(1)} = OpBitcast {m.group(2)} {val}" if m.group(2) != uint

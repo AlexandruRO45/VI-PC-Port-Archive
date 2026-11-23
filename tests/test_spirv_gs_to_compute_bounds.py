@@ -234,6 +234,29 @@ def maybe_validate_spirv(spvasm):
 
 
 class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
+    def test_read_output_before_emit_with_implicit_shader_capability(self):
+        gs = _make_gs([
+            "%entry = OpLabel",
+            "OpStore %out_pos %v_a",
+            "%snapshot = OpLoad %v4float %out_pos Aligned 4",
+            "OpStore %out_pos %v_b",
+            "OpStore %out_pos %snapshot",
+            "OpEmitVertex",
+            "OpEndPrimitive",
+            "OpReturn",
+        ], max_verts=1, topology="OutputPoints").removeprefix("OpCapability Shader\n")
+        maybe_validate_spirv(gs)
+
+        out, _ = gsc.rewrite(gs)
+        self.assertIn("OpCapability Shader", out.splitlines())
+        self.assertIn("%snapshot = OpLoad %v4float %gsc_out0 Aligned 4", out.splitlines())
+        maybe_validate_spirv(out)
+
+        rec, meta = [None], [0, 0]
+        run_capture_spvasm(out, gid_x=0, prim_count=1, in_data=[], rec_buf=rec, meta_buf=meta)
+        self.assertEqual(rec, [(1.0, 0.0, 0.0, 1.0)])
+        self.assertEqual(meta, [1, 1])
+
     def test_over_emit_clamped_and_neighbor_primitive_uncorrupted(self):
         # OutputVertices = 3, but GS emits 5 vertices + OpEndPrimitive + OpReturn.
         gs = _make_gs([
