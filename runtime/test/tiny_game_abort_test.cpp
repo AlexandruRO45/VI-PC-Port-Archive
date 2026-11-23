@@ -11,6 +11,12 @@
 namespace {
 int failures = 0;
 
+// Wine's UCRT returns the CRT's abort code (3) from abort() instead of fail-fasting with 0xC0000409, so the
+// native arm cannot show the difference this test exists to show. The loader arm still must return 3.
+bool under_wine() {
+    return GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+}
+
 bool run(const std::wstring& exe, const std::wstring& args, const char* what, DWORD want) {
     std::wstring command = L"\"" + exe + L"\" " + args;
     STARTUPINFOW startup{};
@@ -64,7 +70,10 @@ int wmain(int argc, wchar_t** argv) {
         const std::wstring guest = L"hello 42 " + mode;
         const std::string native = std::string("native ") + c.mode;
         const std::string loaded = std::string("gta6rt ") + c.mode;
-        run(argv[2], guest, native.c_str(), c.native_code);
+        if (under_wine())
+            std::printf("skip %s native comparison: Wine's UCRT abort returns 3, not 0xC0000409\n", c.mode);
+        else
+            run(argv[2], guest, native.c_str(), c.native_code);
         run(argv[1], L"--run \"" + std::wstring(argv[2]) + L"\" -- " + guest, loaded.c_str(), c.loader_code);
     }
     if (failures) {
