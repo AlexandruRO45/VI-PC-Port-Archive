@@ -124,7 +124,9 @@ The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`
 [runtime_imports.md](runtime_imports.md)) keeps `XGameSave` data in
 `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with names
 %-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--with-packed]`
-writes payloads in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+writes payloads in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256). Without
+`--out` it writes where the runtime reads: `LEONIDA_SAVE_DIR` when it is set and not empty, else
+`%LOCALAPPDATA%\Leonida\saves`.
 `--with-packed` also imports `chives.dat`, the packed `SLAYER1` copy of the same save (below), as a blob of its own;
 without it only the plain payload is imported.
 

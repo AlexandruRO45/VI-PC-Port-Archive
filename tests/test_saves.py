@@ -1033,5 +1033,50 @@ class PackIndexValidationTest(unittest.TestCase):
         self.assertEqual(saves.pack_from_dir(self.extracted), saves.build_jsav(3, 0, [], [], []))
 
 
+class ImportDefaultFolderTest(unittest.TestCase):
+    """Without --out, import writes where the runtime reads: LEONIDA_SAVE_DIR before %LOCALAPPDATA%\\Leonida\\saves
+    (save_root() in runtime/shims/xgameruntime_gamesave.cpp). Every folder, LOCALAPPDATA included, is temporary."""
+
+    def _import(self, tmp, args, save_dir):
+        """Import one synthetic JSAV folder with LEONIDA_SAVE_DIR set to `save_dir` (None: unset); returns the
+        LOCALAPPDATA default root."""
+        story = os.path.join(tmp, "in", "story")
+        write(os.path.join(story, "SLOT0"), make_jsav()[0])
+        local = os.path.join(tmp, "localappdata")
+        env = {"LOCALAPPDATA": local}
+        if save_dir is not None:
+            env["LEONIDA_SAVE_DIR"] = save_dir
+        with mock.patch.dict(os.environ, env):
+            if save_dir is None:
+                os.environ.pop("LEONIDA_SAVE_DIR", None)
+            quiet(saves.import_saves, [story] + args)
+        return os.path.join(local, "Leonida", "saves")
+
+    def assertImported(self, root):
+        self.assertTrue(os.path.isfile(os.path.join(root, "local-user", "SLOT0", "SLOT0")), root)
+        self.assertTrue(os.path.isfile(os.path.join(root, "import-manifest.json")), root)
+
+    def test_leonida_save_dir_is_the_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = os.path.join(tmp, "custom saves")
+            fallback = self._import(tmp, [], save_dir)
+            self.assertImported(save_dir)
+            self.assertFalse(os.path.exists(fallback))
+
+    def test_explicit_out_wins_over_leonida_save_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir, out = os.path.join(tmp, "custom saves"), os.path.join(tmp, "explicit")
+            fallback = self._import(tmp, ["--out", out], save_dir)
+            self.assertImported(out)
+            self.assertFalse(os.path.exists(save_dir))
+            self.assertFalse(os.path.exists(fallback))
+
+    def test_unset_or_empty_leonida_save_dir_uses_localappdata(self):
+        # An empty variable counts as unset, as GetEnvironmentVariableW returning 0 does in the shim.
+        for save_dir in (None, ""):
+            with self.subTest(save_dir=save_dir), tempfile.TemporaryDirectory() as tmp:
+                self.assertImported(self._import(tmp, [], save_dir))
+
+
 if __name__ == "__main__":
     unittest.main()

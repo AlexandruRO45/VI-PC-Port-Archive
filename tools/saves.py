@@ -17,7 +17,8 @@ Commands
                                  copy the ASAV/JSAV payloads out of plain save folders into the on-disk layout
                                  of the runtime's offline XGameSave (runtime/shims/xgameruntime_gamesave.cpp):
                                  DIR/local-user/<container>/<blob>, names %-encoded the same way.
-                                 DIR defaults to %LOCALAPPDATA%\\Leonida\\saves (the shim's LEONIDA_SAVE_DIR default).
+                                 DIR defaults to where the shim reads: LEONIDA_SAVE_DIR when it is set and not empty,
+                                 else %LOCALAPPDATA%\\Leonida\\saves.
                                  VERIFY: container/blob names are a guess until the executable shows them; by default
                                  container = slot name (from the ASAV header), blob = payload file name. Use --map.
 """
@@ -513,6 +514,12 @@ def diff(pa, pb):
 
 
 # ---------------------------------------------------------------------------------------------- import
+def default_save_root():
+    """The folder the runtime's offline XGameSave reads (save_root() in runtime/shims/xgameruntime_gamesave.cpp):
+    LEONIDA_SAVE_DIR when it is set and not empty, else %LOCALAPPDATA%\\Leonida\\saves."""
+    return os.environ.get('LEONIDA_SAVE_DIR') or os.path.join(os.environ.get('LOCALAPPDATA', '.'), 'Leonida', 'saves')
+
+
 def xgs_encode(name):
     """Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp: keep
     [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte."""
@@ -611,7 +618,7 @@ def import_saves(args):
     if not folders:
         raise SystemExit('import: give one or more save folders')
     if out is None:
-        out = os.path.join(os.environ.get('LOCALAPPDATA', '.'), 'Leonida', 'saves')
+        out = default_save_root()
     root = os.path.join(out, 'local-user')
     manifest = {'note': 'VERIFY: container/blob names are a guess until the executable shows them',
                 'layout': '<LEONIDA_SAVE_DIR>/local-user/<container>/<blob>', 'entries': []}
