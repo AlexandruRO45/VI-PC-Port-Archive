@@ -77,7 +77,8 @@ inline float bloom_quantize(float c) { return std::floor(std::max(c - kBloomThre
 struct PostReference {
     std::vector<Color> lo, hi;            // bounds of the final colour, per channel; equal where certain
     std::vector<std::uint8_t> certain;
-    unsigned bloom_pixels = 0;            // certain pixels the bloom changes: what skipping the blur must change
+    std::vector<std::uint8_t> bloom;      // certain pixels the bloom changes: where skipping the blur must differ
+    unsigned bloom_pixels = 0;            // how many of them
     unsigned inexact = 0;                 // values where float and double disagree (0, by construction)
 };
 
@@ -129,7 +130,7 @@ inline PostReference post_reference(const Reference& ref) {
     detail::blur(qhi, hhi, true, out.inexact);
     detail::blur(hlo, vlo, false, out.inexact);
     detail::blur(hhi, vhi, false, out.inexact);
-    out.lo.resize(n), out.hi.resize(n), out.certain.resize(n);
+    out.lo.resize(n), out.hi.resize(n), out.certain.resize(n), out.bloom.resize(n);
     for (std::size_t i = 0; i < n; ++i) {
         bool certain = scene.candidates[i].empty(), changes = false;
         for (int ch = 0; ch < 4; ++ch) {
@@ -142,7 +143,8 @@ inline PostReference post_reference(const Reference& ref) {
             changes = changes || vlo[i][ch] != 0.0f;
         }
         out.certain[i] = certain;
-        out.bloom_pixels += certain && changes;
+        out.bloom[i] = certain && changes;
+        out.bloom_pixels += out.bloom[i];
     }
     return out;
 }
@@ -172,11 +174,20 @@ inline Comparison compare_post(const std::vector<Color>& gpu, const PostReferenc
     return c;
 }
 
-// How many certain pixels of a frame differ from the reference (the skipped-blur control must differ at exactly
-// ref.bloom_pixels of them).
+// How many certain pixels of a frame differ from the reference.
 inline unsigned certain_differences(const std::vector<Color>& frame, const PostReference& ref) {
     unsigned n = 0;
     for (std::size_t i = 0; i < frame.size(); ++i) n += ref.certain[i] && !detail::same(frame[i], ref.lo[i]);
+    return n;
+}
+
+// How many certain pixels break the skipped-blur prediction: a pixel the bloom changes that the frame leaves equal to
+// the reference, or a pixel the bloom leaves alone that the frame changes. A count alone would accept a mask of the
+// right size in the wrong place.
+inline unsigned misplaced_differences(const std::vector<Color>& frame, const PostReference& ref) {
+    unsigned n = 0;
+    for (std::size_t i = 0; i < frame.size(); ++i)
+        n += ref.certain[i] && bool(ref.bloom[i]) == detail::same(frame[i], ref.lo[i]);
     return n;
 }
 
