@@ -104,6 +104,46 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             self.assertIn("ERROR", r.stderr)
 
+    def test_json_naming_the_image_is_refused_before_the_scan(self):
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", exe],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertEqual(r.stdout, "")
+            self.assertIn("ERROR", r.stderr)
+            with open(exe, "rb") as f:
+                self.assertEqual(f.read(), data)
+
+    def test_json_naming_a_folder_is_one_error(self):
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", tmp],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("ERROR", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_in_a_missing_folder_is_one_error(self):
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            out = os.path.join(tmp, "missing", "report.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", out],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main()
