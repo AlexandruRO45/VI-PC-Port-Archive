@@ -628,8 +628,54 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(words[0], subnorm_scaled)
 
 
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_negative_dst_rejection(self):
+        with self.assertRaises(TypeError):
+            VCubemaF32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+
+    def test_out_of_bounds_register_rejection(self):
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_mutation_tie_break_inverted(self):
+        # If tie break mutated such that X beats Z, (2.0, 0.5, 2.0) would yield X instead of Z
+        # Test distinct sign between X and Z: (-2.0, 0.5, 2.0)
+        # Z should win: major = 2.0 -> 4.0
+        # If X won: major = -2.0 -> -4.0
+        s0 = f32_to_u32(-2.0)
+        s1 = f32_to_u32(0.5)
+        s2 = f32_to_u32(2.0)
+        correct = ref_cubema_f32(s0, s1, s2)
+        mutated_x_wins = f32_to_u32(-4.0)
+        self.assertEqual(correct, FOUR_F32)
+        self.assertNotEqual(correct, mutated_x_wins)
+
+    def test_mutation_multiplier_scale(self):
+        # Correct multiplier is 2.0. If mutated to 1.0 or 4.0:
+        correct = ref_cubema_f32(FOUR_F32, ONE_F32, TWO_F32)
+        self.assertEqual(correct, EIGHT_F32)
+        self.assertNotEqual(correct, FOUR_F32)
+        self.assertNotEqual(correct, f32_to_u32(16.0))
+
+    def test_mutation_omitted_clamp(self):
+        # 2.0 * 4.0 = 8.0, clamped must be 1.0
+        clamped = ref_cubema_f32(FOUR_F32, ONE_F32, TWO_F32, clamp=True)
+        unclamped = ref_cubema_f32(FOUR_F32, ONE_F32, TWO_F32, clamp=False)
+        self.assertEqual(clamped, ONE_F32)
+        self.assertEqual(unclamped, EIGHT_F32)
+        self.assertNotEqual(clamped, unclamped)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
