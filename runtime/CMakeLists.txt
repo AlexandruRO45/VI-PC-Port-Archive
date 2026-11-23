@@ -539,7 +539,7 @@ if(BUILD_TESTING)
 
     # Native Windows and --dry-run/--init/--run share original renamed fixtures, including an ACP-named import.
     if(NOT CMAKE_CROSSCOMPILING)
-      find_package(Python3 COMPONENTS Interpreter QUIET)
+      find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
       if(Python3_FOUND)
         add_test(NAME run_module_names COMMAND "${Python3_EXECUTABLE}" -I
           "${CMAKE_CURRENT_SOURCE_DIR}/test/check_module_names.py"
@@ -1100,7 +1100,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
     if(TARGET tiny_argv_default_a AND NOT CMAKE_CROSSCOMPILING)
-      find_package(Python3 COMPONENTS Interpreter QUIET)
+      find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
       if(Python3_FOUND)
         add_test(NAME run_argv_modes COMMAND "${Python3_EXECUTABLE}" -I
           "${CMAKE_CURRENT_SOURCE_DIR}/test/check_argv_modes.py"
@@ -1296,7 +1296,7 @@ if(TARGET Vulkan::Headers)
     file(MAKE_DIRECTORY "${LEONIDA_XDXR_OUT}")
     add_test(NAME xdxr_build COMMAND vk_xdxr_build_test "${LEONIDA_XDXR_OUT}")
     set_tests_properties(xdxr_build PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP xdxr_build_cases)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
       add_test(NAME xdxr_build_check COMMAND "${Python3_EXECUTABLE}" -I
                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_XDXR_OUT}" --rays 1000)
@@ -1461,7 +1461,7 @@ if(TARGET Vulkan::Headers)
   endif()
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
-  find_package(Python3 COMPONENTS Interpreter QUIET)
+  find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
   # The generator finds d3d12.h through INCLUDE, which a Developer Prompt sets. A cross build (for example
   # runtime/cmake/clang-cl-xwin.cmake) has no such prompt, so it is handed the header CMake finds.
   set(_stubs_header)
@@ -1592,7 +1592,7 @@ if(TARGET Vulkan::Headers)
     file(MAKE_DIRECTORY "${LEONIDA_D3D12_XDXR_OUT}")
     add_test(NAME d3d12_xdxr_rt COMMAND d3d12_xdxr_rt_test "${LEONIDA_D3D12_XDXR_OUT}")
     set_tests_properties(d3d12_xdxr_rt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FIXTURES_SETUP d3d12_xdxr_cases)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
       add_test(NAME d3d12_xdxr_rt_check COMMAND "${Python3_EXECUTABLE}" -I
                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_D3D12_XDXR_OUT}" --rays 1000)

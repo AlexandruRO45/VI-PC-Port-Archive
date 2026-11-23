@@ -2221,7 +2221,9 @@ def cmake_configure(build: str, *config: str, hint: str = "") -> None:
     """Configure runtime/ in build; the generator and build type are chosen only for a new build folder."""
     fresh = [] if os.path.isfile(os.path.join(build, "CMakeCache.txt")) else [
         *(["-G", "Ninja"] if shutil.which("ninja") else []), "-DCMAKE_BUILD_TYPE=RelWithDebInfo"]
-    run(["cmake", "-S", os.path.join(ROOT, "runtime"), "-B", build, *fresh, *config], hint=hint)
+    py = [] if any(arg.startswith("-DPython3_EXECUTABLE=") for arg in config) else [
+        f"-DPython3_EXECUTABLE={sys.executable}"]
+    run(["cmake", "-S", os.path.join(ROOT, "runtime"), "-B", build, *fresh, *py, *config], hint=hint)
 
 
 def cmake_build(build: str, targets: list, jobs: int, hint: str) -> None:
@@ -2283,7 +2285,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     else:
         log("runtime: building")
         run([windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-             os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs)])
+             os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs), "-Python", sys.executable])
         build = os.path.join(ROOT, "runtime", "build")
     artifacts = [os.path.join(build, name) for name in RUNTIME_FILES]
     for built in artifacts:

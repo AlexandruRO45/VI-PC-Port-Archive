@@ -6,7 +6,8 @@
 param(
     [switch]$Debug,
     [switch]$FetchSdl3,
-    [ValidateRange(1, 2147483647)][int]$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
+    [ValidateRange(1, 2147483647)][int]$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2)),
+    [string]$Python = ""
 )
 $ErrorActionPreference = "Stop"
 
@@ -59,9 +60,10 @@ $cfg = if ($Debug) { "Debug" } else { "RelWithDebInfo" }
 $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
 # With VULKAN_SDK set, a configure that still finds no Vulkan headers fails instead of dropping the Vulkan D3D12 device.
 $vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
+$py = if ($Python) { "`"-DPython3_EXECUTABLE=$Python`"" } else { "" }
 
 if ($cmake -and $ninja) {
-    $configure = "`"$cmake`" -S `"$src`" -B `"$out`" -G Ninja `"-DCMAKE_MAKE_PROGRAM=$ninja`" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk"
+    $configure = "`"$cmake`" -S `"$src`" -B `"$out`" -G Ninja `"-DCMAKE_MAKE_PROGRAM=$ninja`" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk $py"
     $build = "`"$cmake`" --build `"$out`" -j $jobs"
     # CALL reparses even quoted arguments and doubles a ^ in a checkout path.
     # A native executable returns directly; a PATH .cmd/.bat wrapper needs its own
