@@ -85,11 +85,13 @@ def fail(msg: str) -> "None":
 def require_folder(flag: str, path: str) -> None:
     """Fail before any work when a destination, or its nearest existing parent, is a file: os.makedirs would
     raise a traceback later, and with a separate --work the build reported success without creating --out."""
-    probe = path
+    if os.path.lexists(path) and not os.path.isdir(path):
+        fail(f"{flag} is not a folder: {path}")
+    probe = os.path.abspath(path)
     while not os.path.exists(probe):
         parent = os.path.dirname(probe)
         if parent == probe:
-            return
+            fail(f"{flag} cannot be created: {path}")
         probe = parent
     if not os.path.isdir(probe):
         fail(f"{flag} is not a folder: {path}")
@@ -648,8 +650,11 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if need.get("assets") and not wav and assets_exported(work):
         log(f"preflight: the assets are already exported in {work}; not counting their {need['assets']} GB")
         need["assets"] = 0
-    os.makedirs(work, exist_ok=True)
-    free_gb = shutil.disk_usage(work).free / 2**30
+    try:
+        os.makedirs(work, exist_ok=True)
+        free_gb = shutil.disk_usage(work).free / 2**30
+    except OSError as e:
+        fail(f"cannot create {work}: {e.strerror or e}")
     need_gb = sum(need.values())
     if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
@@ -1801,7 +1806,10 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     for built in artifacts:
         if not os.path.isfile(built):
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:
+        fail(f"cannot create {out}: {e.strerror or e}")
     for built in artifacts:
         # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
         # files are in place then, and copying a file onto itself raises SameFileError.
@@ -1893,7 +1901,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
              "cmake --build runtime/build/linux --parallel")
     spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:
+        fail(f"cannot create {out}: {e.strerror or e}")
     cache = os.path.join(out, "pipeline_cache.bin")
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")

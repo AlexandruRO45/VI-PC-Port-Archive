@@ -75,6 +75,30 @@ class DestinationTests(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "game"))
             self.assertEqual(make_game.main(), 0)
 
+    def test_nonexistent_root_is_rejected(self):
+        err = io.StringIO()
+        with patch.object(make_game.os.path, "exists", return_value=False), \
+             patch.object(make_game.os.path, "lexists", return_value=False), \
+             contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as raised:
+                make_game.require_folder("--work", os.path.join("Q:\\", "nonexistent", "work") if os.name == "nt" else "/nonexistent/work")
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("--work cannot be created", err.getvalue())
+
+    def test_preflight_makedirs_oserror_calls_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_work = os.path.join(tmp, "bad*dir") if os.name == "nt" else os.path.join(tmp, "uncreatable")
+            err = io.StringIO()
+            ctx = (patch.object(make_game.os, "makedirs", side_effect=OSError("invalid path"))
+                   if os.name != "nt" else contextlib.nullcontext())
+            with ctx, patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
+                 patch.object(make_game, "log"), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as raised:
+                    make_game.preflight(tmp, bad_work, ["runtime"], False)
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn("ERROR: cannot create", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
