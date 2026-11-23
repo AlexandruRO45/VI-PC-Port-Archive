@@ -317,6 +317,33 @@ class InflateTest(unittest.TestCase):
         with self.assertRaises(zlib.error):
             WC.inflate(GARBAGE_ZLIB, 0, len(GARBAGE_ZLIB))
 
+    def test_keep_true_preserves_short_stream_below_header_threshold(self):
+        payload = b"short tail!"  # 11 bytes, shorter than the 0x15-byte 0DRPz check threshold
+        comp = zlib.compress(payload)
+        self.assertEqual(
+            WC.inflate(comp, 0, len(comp), keep=True),
+            (payload, len(comp), True, False, len(payload), False),
+        )
+        self.assertEqual(
+            WC.inflate(comp, 0, len(comp), max_inflate=4, keep=True),
+            (payload[:4], len(comp), True, False, len(payload), True),
+        )
+        self.assertEqual(
+            WC.inflate(comp, 0, len(comp), max_inflate=0, keep=True),
+            (b"", len(comp), True, False, len(payload), True),
+        )
+        self.assertEqual(
+            WC.inflate(comp, 0, len(comp), keep=False),
+            (b"", len(comp), True, False, len(payload), False),
+        )
+
+    def test_inflate_respects_size_upper_bound(self):
+        comp = zlib.compress(TWI.make_resource(True))
+        buf = comp + b"\xaa" * 64
+        data, used, eof, is_meta, _, truncated = WC.inflate(buf, 0, len(comp) - 1, keep=True)
+        self.assertEqual((data, used, eof, is_meta, truncated), (b"", 0, False, False, False))
+        self.assertEqual(WC.inflate(buf, -1, len(buf), keep=True)[:4], (b"", 0, False, False))
+
 
 class RequiredLenTest(unittest.TestCase):
     def setUp(self):
@@ -430,6 +457,17 @@ class AssembleTest(unittest.TestCase):
         self.assertEqual(res["data"], blob[:0x620])
         self.assertEqual(res["raw_spans"], [(n0, 0x410 - 0x150), (n0 + 0x410 - 0x150, 0x620 - 0x410)])
         self.assertEqual((res["raw_system"], res["pages"], res["streams"]), (0x620 - 0x150, 3, 1))
+
+    def test_short_final_zlib_continuation_is_preserved(self):
+        blob = TWI.make_resource(True)[:0x620]  # ends right at the final referenced CMapData block
+        split_at = len(blob) - 12  # final zlib continuation is < 0x15 bytes
+        self.assertTrue(WC.needs_more(blob[:split_at]))
+        first, second = zlib.compress(blob[:split_at]), zlib.compress(blob[split_at:])
+        m = aligned(first, second)
+        res = WC.assemble(m, 0, len(m))
+        self.assertTrue(res["complete"] and res["joined"])
+        self.assertEqual(res["data"], blob)
+        self.assertEqual((res["streams"], res["pages"], res["inflated"]), (2, 2, len(blob)))
 
 
 class ResourceInspectionTest(unittest.TestCase):
@@ -657,6 +695,67 @@ class ClassifyGapsTest(unittest.TestCase):
         self.assertEqual(dup["content_extra_entities"], 2)
         self.assertEqual(dup["content_group_sample"], [[None, 2]])
         self.assertEqual(dup["name_groups"], 0)
+
+    def test_audit_gap_respects_gap_boundaries_and_counts_early_signature(self):
+        # 1. Unaligned zlib stream cut off at gap end `b` must not peek past `b` into the next covered span.
+        with self.subTest(case="peek_meta_past_gap_end"):
+            comp = zlib.compress(TWI.make_resource(True), level=0)
+            z_off = 0x43
+            gap_end = z_off + 12  # 7-byte zlib/stored header + 5 payload bytes (< 0x15)
+            data = bytearray(b"\x11" * (z_off + len(comp) + 16))
+            data[z_off:z_off + len(comp)] = comp
+            self.write(bytes(data))
+            r = WC.classify_gaps(self.arc, [[0, 0x40], [gap_end, len(data)]], [], [], 0x40, len(data))
+            self.assertEqual(r["missed_zlib_meta"], 0)
+            self.assertEqual(r["missed_zlib_offsets"], [])
+
+        # 2. Raw 0x7a resource whose header starts before gap start `a` must not read backward into [0, a).
+        blob = bytearray(TWI.make_resource(True))
+        struct.pack_into("<Q", blob, 8, TWI.ptr(0))
+        with self.subTest(case="raw_header_before_gap_start"):
+            buf_before = bytearray(b"\x11" * (0x38 + len(blob) + 16))
+            buf_before[0x38:0x38 + len(blob)] = blob  # 0DRPz lands at 0x48 inside [0x40, end)
+            self.write(bytes(buf_before))
+            r_before = WC.classify_gaps(self.arc, [[0, 0x40]], [], [], 0x40, len(buf_before))
+            self.assertEqual((r_before["gap_0drp"], r_before["raw_0drp"], r_before["gap_0drp_other"]), (1, 0, 1))
+
+        # 3. Raw 0x7a resource truncated by gap end `b` (scan_end) must not read past `b`.
+        with self.subTest(case="raw_payload_past_gap_end"):
+            buf_after = bytearray(b"\x11" * (0x40 + len(blob) + 16))
+            buf_after[0x40:0x40 + len(blob)] = blob
+            self.write(bytes(buf_after))
+            r_after = WC.classify_gaps(self.arc, [], [], [], 0x40, 0x100)
+            self.assertEqual((r_after["gap_0drp"], r_after["raw_0drp"], r_after["gap_0drp_other"]), (1, 0, 1))
+
+        # 4. 0DRPz within the first 16 bytes (start < 0) must still be counted in gap_0drp_other.
+        with self.subTest(case="early_signature_before_offset_0x10"):
+            early = b"\x11" * 4 + b"0DRPz" + b"\x11" * 0x37
+            self.write(early)
+            r_early = WC.classify_gaps(self.arc, [], [], [], 0, len(early))
+            self.assertEqual((r_early["gap_0drp"], r_early["raw_0drp"], r_early["gap_0drp_other"]), (1, 0, 1))
+
+    def test_audit_gap_detects_signatures_straddling_raw_segment_boundary(self):
+        # A 0DRPz signature or unaligned zlib header that straddles an internal raw_graphics boundary
+        # inside the same gap must not be split and missed.
+        blob = bytearray(TWI.make_resource(True))
+        struct.pack_into("<Q", blob, 8, TWI.ptr(0))
+        comp = zlib.compress(TWI.make_resource(True))
+        raw_start = 0x100
+        map_start = raw_start - 0x12  # 0DRPz sits at raw_start - 2 .. raw_start + 3
+        # Place the zlib stream cleanly after the raw map so they do not overwrite each other.
+        raw_len = max(0x40, (map_start + len(blob) + 0x20 - raw_start) & ~0x0F)
+        z_off = raw_start + raw_len - 1  # unaligned (odd) and 2-byte zlib header straddles raw_start + raw_len
+        total = z_off + len(comp) + 0x20
+        data = bytearray(b"\x33" * total)
+        data[map_start:map_start + len(blob)] = blob
+        data[z_off:z_off + len(comp)] = comp
+        self.write(bytes(data))
+        r = WC.classify_gaps(self.arc, [[0, 0x40]], [[raw_start, raw_len]], [], 0x40, total)
+        self.assertEqual((r["gap_0drp"], r["raw_0drp"], r["raw_maps"]), (1, 1, 1))
+        self.assertEqual(r["raw_0drp_offsets"], [map_start + 0x10])
+        self.assertEqual(r["missed_zlib_meta"], 1)
+        self.assertEqual(r["missed_zlib_offsets"], [z_off])
+        self.assertEqual(r["accounted"], r["span"])
 
 
 class ShardFileTest(unittest.TestCase):

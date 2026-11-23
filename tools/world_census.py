@@ -162,6 +162,8 @@ def inflate(m, s, size, max_inflate=CAP, keep=False):
     Returns (data, used, eof, is_meta, inflated, truncated). ``used`` is the stored compressed length;
     ``inflated`` counts the whole output even when only a 0x7a stream is kept.
     """
+    if s < 0 or s >= size:
+        return b"", 0, False, False, 0, False
     d = zlib.decompressobj()
     chunks = []
     kept = 0
@@ -172,7 +174,7 @@ def inflate(m, s, size, max_inflate=CAP, keep=False):
     truncated = False
     p = s
     while not d.eof and p < size:
-        piece = m[p:p + CHUNK]
+        piece = m[p:min(p + CHUNK, size)]
         if not piece:
             break
         produced = d.decompress(piece)
@@ -201,6 +203,11 @@ def inflate(m, s, size, max_inflate=CAP, keep=False):
             break
     if not d.eof:
         return b"", 0, False, False, inflated, False
+    if keep and not decided and carry:
+        take = bytes(carry[:max(0, max_inflate - kept)])
+        chunks.append(take)
+        kept += len(take)
+        truncated = len(take) < len(carry)
     used = p - s - len(d.unused_data)
     return b"".join(chunks), used, True, is_meta, inflated, truncated
 
@@ -460,15 +467,17 @@ def scan_shard(job, source_id=None):
 
 def _peek_meta(m, s, end):
     """True when a zlib stream at s inflates to a 0x7a header; used only to audit gaps."""
+    if s < 0 or s >= end:
+        return False
     d = zlib.decompressobj()
     out = bytearray()
     p = s
     while len(out) < 0x15 and p < end:
-        piece = m[p:p + 256]
+        piece = m[p:min(end, p + 256)]
         if not piece:
             break
         try:
-            out.extend(d.decompress(piece))
+            out.extend(d.decompress(piece, 0x15 - len(out)))
         except zlib.error:
             return False
         p += len(piece)
@@ -523,16 +532,14 @@ def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_en
                     start = max(pos, s0)
                     if start > pos:
                         _count_gap(m, pos, start, result)
-                        _audit_gap(m, pos, start, result, allow_zlib=True)
                     take = max(0, min(s1, a) - start)
                     if take:
                         result[kind] += take
-                        _audit_gap(m, start, start + take, result, allow_zlib=True)
                     pos = max(pos, start + take)
                     idx += 1
                 if pos < a:
                     _count_gap(m, pos, a, result)
-                    _audit_gap(m, pos, a, result, allow_zlib=True)
+                _audit_gap(m, cursor, a, result, allow_zlib=True)
             cursor = max(cursor, b)
     result["accounted"] = (result["covered"] + result["raw_graphics"] + result["raw_system"]
                            + result["zero_padding"] + result["unread"])
@@ -585,10 +592,10 @@ def _audit_gap(m, a, b, result, allow_zlib):
             if i + 4 < len(piece) and piece[i + 4] == VERSION:
                 result["gap_0drp"] += 1
                 start = at - 0x10
-                if start >= 0:
-                    head = m[start:start + 0x18]
+                if start >= max(0, a):
+                    head = m[start:min(b, start + 0x18)]
                     if len(head) == 0x18 and head[:8] == b"\0" * 8 and (struct.unpack_from("<Q", head, 8)[0] >> 28) == 5:
-                        row = WI.parse_resource(m[start:start + CAP])
+                        row = WI.parse_resource(m[start:min(b, start + CAP)])
                         if row is not None:
                             if row.get("kind") == "map":
                                 result["raw_maps"] += 1
@@ -601,6 +608,8 @@ def _audit_gap(m, a, b, result, allow_zlib):
                             result["gap_0drp_other"] += 1
                     else:
                         result["gap_0drp_other"] += 1
+                else:
+                    result["gap_0drp_other"] += 1
             q = i + 1
         if allow_zlib:
             q = 0
