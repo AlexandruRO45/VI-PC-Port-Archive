@@ -861,3 +861,37 @@ class TestDsBpermuteB32SIMDAndProperties(unittest.TestCase):
         ]
         res, _ = run_workgroup_lanes("ps_bperm_bcast", lines, lanes=4)
         self.assertEqual(res, [202, 202, 202, 202])
+
+
+# ------------------------------------------------------------------------------
+# ds_bpermute_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestDsBpermuteB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 256)
+
+    def test_boundary_extremes_hardware(self):
+        # Out-of-bounds byte addresses wrap modulo 32 lanes
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v1, 128",  # 128 // 4 = 32 -> wraps to lane 0
+            "v_add_nc_u32 v2, v0, 42",
+            "ds_bpermute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_bperm_wrap", lines, lanes=4)
+        self.assertEqual(res, [42, 42, 42, 42])
+
+    def test_spirv_opcode_lowering_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_lshlrev_b32 v1, 2, v0",
+            "ds_bpermute_b32 v4, v1, v0",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        _, spv = run_workgroup_lanes("ps_bperm_lowering", lines, lanes=4)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
