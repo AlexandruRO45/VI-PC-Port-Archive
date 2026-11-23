@@ -167,6 +167,36 @@ class FindTest(unittest.TestCase):
     def test_find_dumps_without_a_list_returns_as_before(self):
         self.assertEqual(self.find(None), [])
 
+    def test_find_dumps_lists_copies_in_sorted_order_whatever_the_listing_order(self):
+        root = os.path.join(self.tmp.name, "copies")
+        for name in ("copyA", "copyB", "copyC"):
+            os.makedirs(os.path.join(root, name))
+            with open(os.path.join(root, name, "MicrosoftGame.Config"), "wb") as f:
+                f.write(b"<Game/>")
+        real_scandir = os.scandir
+
+        class Listing:
+            """The real scandir as a context manager, its entries handed back in the order `order` picks."""
+            def __init__(self, path, order):
+                self.it, self.order = real_scandir(path), order
+
+            def __enter__(self):
+                return iter(self.order(list(self.it.__enter__())))
+
+            def __exit__(self, *exc):
+                return self.it.__exit__(*exc)
+
+        def names_with(order):
+            with patch("make_game.discovery_roots", return_value=[root]), \
+                    patch("make_game.match_version", return_value="1.0.2.1"), \
+                    patch("os.scandir", side_effect=lambda p: Listing(p, order)):
+                return [os.path.basename(d) for d, _ in make_game.find_dumps()]
+
+        forward = names_with(lambda entries: sorted(entries, key=lambda e: e.name))
+        backward = names_with(lambda entries: sorted(entries, key=lambda e: e.name, reverse=True))
+        self.assertEqual(forward, ["copyA", "copyB", "copyC"])
+        self.assertEqual(backward, forward)
+
     def test_find_flag_lists_containers_as_not_usable(self):
         def fake_find(containers=None):
             containers.append((self.xvc, make_game.xvd_header(self.xvc)))

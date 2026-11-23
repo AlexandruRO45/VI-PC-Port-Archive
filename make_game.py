@@ -514,7 +514,7 @@ def find_dumps(containers: list | None = None) -> list:
             return
         try:
             with os.scandir(d) as it:
-                entries = list(it)
+                entries = sorted(it, key=lambda e: e.name)
         except OSError:
             return
         subs = []
