@@ -21,6 +21,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 import cvt_norm_mods_probe as pr  # noqa: E402
+import mc_command  # noqa: E402
 from hw_oracle import asm, runner  # noqa: E402
 
 
@@ -206,6 +207,8 @@ class ReferenceModelTests(unittest.TestCase):
         llvm_mc = os.environ.get("LLVM_MC") or shutil.which("llvm-mc")
         if not llvm_mc or not os.path.isfile(llvm_mc):
             self.skipTest("llvm-mc not found")
+        if not mc_command.has_amdgpu([llvm_mc]):
+            self.skipTest(f"{llvm_mc} has no AMDGPU target (its --version lists no amdgcn)")
         for wave in (32, 64):
             kernels, _ = pr.build_jobs(list(pr.OPS), [wave])
             text, _, _ = asm.module_text(kernels, "gfx1036", wave=wave)

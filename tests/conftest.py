@@ -53,15 +53,6 @@ def _repair_stdin_handle():
 _repair_stdin_handle()      # before the llvm-mc probe below, which is the first child
 
 
-def _has_amdgpu(mc):
-    """True if this llvm-mc was built with the AMDGPU target (the official Windows release archives are not)."""
-    try:
-        r = subprocess.run(mc + ["--version"], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "amdgcn" in r.stdout
-
-
 def _find_llvm_mc():
     candidates = []
     env = os.environ.get("LLVM_MC")
@@ -78,7 +69,7 @@ def _find_llvm_mc():
     # Default location of the official Windows installer, which doesn't add LLVM to PATH unless asked to.
     candidates += [[p] for p in glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")]
     for c in candidates:
-        if c and _has_amdgpu(c):
+        if c and mc_command.has_amdgpu(c):
             return c
     return None
 

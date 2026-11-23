@@ -36,6 +36,7 @@ for p in (TOOLS, SEMANTIC):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import mc_command  # noqa: E402
 import rdna2_decode  # noqa: E402
 import rdna2spirv  # noqa: E402
 import shader_disasm  # noqa: E402
@@ -301,6 +302,9 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         mc = os.environ.get("LLVM_MC") or shutil.which("llvm-mc") or shutil.which("llvm-mc-18")
         if not mc:
             self.skipTest("llvm-mc not available")
+        if not mc_command.has_amdgpu([mc]):
+            # Without the target every fixture fails to assemble and is passed over, so 0 would be checked.
+            self.skipTest(f"{mc} has no AMDGPU target (its --version lists no amdgcn)")
         asms = sorted(glob.glob(os.path.join(ROOT, "runtime", "test", "shaders", "*.asm")))
         self.assertGreater(len(asms), 50)
 

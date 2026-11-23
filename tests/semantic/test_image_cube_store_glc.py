@@ -20,6 +20,7 @@ import tempfile
 import unittest
 
 import support
+import mc_command
 import rdna2spirv
 
 PS_EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
@@ -267,7 +268,11 @@ class SpirvValidation(unittest.TestCase):
                 validate_spirv(translate_stage(stage, lines))
 
 
-@unittest.skipUnless(llvm_mc_cmd() is not None, "needs llvm-mc or LLVM_MC")
+LLVM_MC = llvm_mc_cmd()
+
+
+@unittest.skipUnless(LLVM_MC is not None and mc_command.has_amdgpu(LLVM_MC),
+                     "needs an llvm-mc with the AMDGPU target (LLVM_MC or llvm-mc on PATH)")
 class LlvmMcRoundTrip(unittest.TestCase):
     def test_gfx1030_encode_decode_translate_and_validate(self):
         mc = llvm_mc_cmd()

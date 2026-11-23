@@ -92,6 +92,17 @@ def not_found(exe: str, error: OSError, flag: str | None = None) -> str:
             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
+def has_amdgpu(cmd: list) -> bool:
+    """True if this llvm-mc lists the amdgcn target in --version. The official Windows release archives have no
+    AMDGPU target and answer every amdgcn triple with "unable to get target"; an llvm-mc that cannot be started
+    is False too. Tests ask this before they skip, so one answer serves them all."""
+    try:
+        r = subprocess.run(cmd + ["--version"], capture_output=True, text=True, errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "amdgcn" in r.stdout
+
+
 def run(cmd: list, flag: str | None = None, **kwargs) -> subprocess.CompletedProcess:
     """subprocess.run for an llvm-mc command line; one that can't be started ends the tool with not_found()."""
     try:

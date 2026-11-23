@@ -187,5 +187,33 @@ class MissingLlvmMcTest(unittest.TestCase):
                 self.assertEqual("--llvm-mc" in p.stderr, name == "run_gpu_tests.py", p.stderr)
 
 
+class HasAmdgpuTest(unittest.TestCase):
+    """has_amdgpu() reads the registered targets from --version, so tests skip on the official Windows LLVM build
+    (x86 only, "unable to get target" for every amdgcn triple) instead of failing."""
+
+    def fake(self, targets: str) -> list:
+        body = ("import sys\n"
+                "assert sys.argv[1:] == ['--version'], sys.argv\n"
+                "print('LLVM version 23.1.6')\n"
+                "print('  Registered Targets:')\n"
+                f"print({targets!r})\n")
+        return [sys.executable, "-c", body]
+
+    def test_a_build_with_the_amdgpu_target(self):
+        self.assertTrue(mc_command.has_amdgpu(self.fake("    amdgcn     - AMD GCN GPUs\n    r600       - AMD GPUs HD2XXX-HD6XXX")))
+
+    def test_an_x86_only_build(self):
+        self.assertFalse(mc_command.has_amdgpu(self.fake("    x86-64     - 64-bit X86: EM64T and AMD64")))
+
+    def test_an_llvm_mc_that_cannot_be_started(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(mc_command.has_amdgpu([os.path.join(tmp, "no-llvm-mc.exe")]))
+
+    def test_an_llvm_mc_that_hangs(self):
+        with mock.patch.object(mc_command.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(["llvm-mc", "--version"], 60)):
+            self.assertFalse(mc_command.has_amdgpu(["llvm-mc"]))
+
+
 if __name__ == "__main__":
     unittest.main()
