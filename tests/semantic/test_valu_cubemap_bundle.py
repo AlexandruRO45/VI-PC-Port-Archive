@@ -118,5 +118,54 @@ class VCubeIdOracleTests(unittest.TestCase):
         # -Z -> face 5.0
         self.assertEqual(oracle_cubeid_f32(0.0, 0.0, -1.0), 5.0)
 
+class RegKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: float = 0.0
+
+
+@dataclass(frozen=True)
+class CubeInstructionAST:
+    mnemonic: str
+    dst: Operand
+    src_x: Operand
+    src_y: Operand
+    src_z: Operand
+
+
+class WavefrontSimdState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.exec_mask: int = (1 << lane_count) - 1
+        self.vgprs = [[0.0] * 64 for _ in range(lane_count)]
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: float):
+        self.vgprs[lane][reg_idx] = val
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> float:
+        return self.vgprs[lane][reg_idx]
+
+class VCubeIdAstTests(unittest.TestCase):
+    def test_cubeid_ast_construction(self):
+        ast = CubeInstructionAST(
+            "v_cubeid_f32",
+            Operand(RegKind.VGPR, index=3),
+            Operand(RegKind.VGPR, index=0),
+            Operand(RegKind.VGPR, index=1),
+            Operand(RegKind.VGPR, index=2),
+        )
+        self.assertEqual(ast.mnemonic, "v_cubeid_f32")
+        self.assertEqual(ast.dst.index, 3)
+        self.assertEqual(ast.src_x.index, 0)
+        self.assertEqual(ast.src_y.index, 1)
+        self.assertEqual(ast.src_z.index, 2)
+
 if __name__ == "__main__":
     unittest.main()
