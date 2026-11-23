@@ -678,6 +678,28 @@ def scene_image_path(image_directory, png_name):
     return os.path.join(image_directory, png_name)
 
 
+def check_distinct_scene_images(manifest, image_directory):
+    """Reject names that differ by case but resolve to the same input image."""
+    names_by_case = {}
+    for scene in manifest.scenes:
+        name = scene.png_name
+        possible_aliases = names_by_case.setdefault(name.casefold(), [])
+        if possible_aliases:
+            path = scene_image_path(image_directory, name)
+            for other in possible_aliases:
+                try:
+                    same_image = os.path.samefile(path, scene_image_path(image_directory, other))
+                except OSError:
+                    # The image reader owns the diagnostics for missing or inaccessible files.
+                    continue
+                if same_image:
+                    raise ToolError(
+                        f"manifest '{manifest.manifest_path}': PNG names {other!r} and {name!r} "
+                        f"refer to the same image in '{image_directory}'"
+                    )
+        possible_aliases.append(name)
+
+
 # ---------------------------------------------------------------------------
 # expect
 # ---------------------------------------------------------------------------
@@ -816,6 +838,7 @@ def command_expect(arguments):
     """Run the expect mode and return its exit code."""
     manifest = load_manifest(arguments.manifest)
     image_directory = resolve_image_directory(manifest, arguments.dir)
+    check_distinct_scene_images(manifest, image_directory)
     scene_outcomes = [
         verify_scene(scene, image_directory) for scene in manifest.scenes
     ]
@@ -1016,6 +1039,8 @@ def command_diff(arguments):
     reference_directory = resolve_image_directory(reference, arguments.reference_dir)
     candidate_directory = resolve_image_directory(candidate, arguments.candidate_dir)
     match_manifest_scenes(reference, candidate)
+    check_distinct_scene_images(reference, reference_directory)
+    check_distinct_scene_images(candidate, candidate_directory)
 
     print(f"reference: {reference.manifest_path}")
     print(f"  renderer '{reference.renderer}', adapter '{reference.adapter}'")
