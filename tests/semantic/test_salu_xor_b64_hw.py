@@ -117,5 +117,85 @@ class TestSaluXorB64Oracle(unittest.TestCase):
         self.assertEqual(scc01, scc10)
 
 
+class Opcode(Enum):
+    S_XOR_B64 = auto()
+
+
+class OperandKind(Enum):
+    SGPR = auto()
+    EXEC = auto()
+    VCC = auto()
+    LITERAL64 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    count: int = 2
+    value: int = 0
+
+    @classmethod
+    def sgpr(cls, index: int, count: int = 2) -> ASTOperand:
+        if count != 2:
+            raise ValueError(f"s_xor_b64 requires 64-bit register pair (count=2), got {count}")
+        if index < 0 or index > 104 or (index + count) > 106:
+            raise ValueError(f"SGPR index out of range: s[{index}:{index + count - 1}]")
+        if index % 2 != 0:
+            raise ValueError(f"SGPR pair must be 64-bit aligned (even index), got s{index}")
+        return cls(kind=OperandKind.SGPR, index=index, count=count)
+
+    @classmethod
+    def exec_mask(cls) -> ASTOperand:
+        return cls(kind=OperandKind.EXEC, count=2)
+
+    @classmethod
+    def vcc(cls) -> ASTOperand:
+        return cls(kind=OperandKind.VCC, count=2)
+
+    @classmethod
+    def literal64(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL64, count=2, value=u64(val))
+
+    @classmethod
+    def inline_const(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_CONST, count=2, value=u64(val))
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+
+    def disasm(self) -> str:
+        def fmt(op: ASTOperand) -> str:
+            if op.kind == OperandKind.SGPR:
+                return f"s[{op.index}:{op.index + 1}]"
+            if op.kind == OperandKind.EXEC:
+                return "exec"
+            if op.kind == OperandKind.VCC:
+                return "vcc"
+            return hex(op.value)
+        return f"s_xor_b64 {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}"
+
+
+class TestSaluXorB64AST(unittest.TestCase):
+    """Stage 2: AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_sgpr_pair(self) -> None:
+        dst = ASTOperand.sgpr(0)
+        src0 = ASTOperand.sgpr(2)
+        src1 = ASTOperand.sgpr(4)
+        inst = ASTInstruction(Opcode.S_XOR_B64, dst, src0, src1)
+        self.assertEqual(inst.disasm(), "s_xor_b64 s[0:1], s[2:3], s[4:5]")
+
+    def test_ast_odd_alignment_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            ASTOperand.sgpr(3)  # odd index must be rejected
+
+
 if __name__ == "__main__":
     unittest.main()
