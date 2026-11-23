@@ -70,6 +70,7 @@ jobs:
           python -B tests/dxcontainer_part_offsets_check.py
           python -B tests/layout_chunks_check.py
           python -B tests/dependency_paths_check.py
+          python -B tests/pe_package_preflight_check.py
           python -B tests/intake/paths_check.py
           python -B tests/shader_probe_check.py
           python -B tests/shader_census_check.py

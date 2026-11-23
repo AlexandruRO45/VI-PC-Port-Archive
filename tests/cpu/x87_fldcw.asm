@@ -207,4 +207,42 @@ cw_writes PROC FRAME
     ret
 cw_writes ENDP
 
+cw_fninit PROC FRAME
+    .endprolog
+    fldcw word ptr [rcx+48]
+    fld tbyte ptr [rcx+0]
+    fld tbyte ptr [rcx+16]
+    fcom st(1)
+    fninit
+    fnstsw ax
+    and ah, 47h
+    mov byte ptr [rdx+32], ah
+    mov eax, 0
+    fnstcw word ptr [rdx+34]
+    fld tbyte ptr [rcx+0]
+    fld tbyte ptr [rcx+16]
+    fdivp st(1), st
+    fstp tbyte ptr [rdx+0]
+    fldcw word ptr [rcx+50]
+    ret
+cw_fninit ENDP
+
+cw_finit PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+0]
+    fld st(0)
+    fld st(0)
+    fld st(0)
+    fld st(0)
+    fld st(0)
+    fld st(0)
+    fld st(0)
+    finit
+    fld tbyte ptr [rcx+0]
+    fsqrt
+    fstp tbyte ptr [rdx+0]
+    fnstcw word ptr [rdx+16]
+    ret
+cw_finit ENDP
+
 END

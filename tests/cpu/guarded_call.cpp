@@ -38,3 +38,7 @@ extern "C" __declspec(dllexport) std::uint32_t guarded_call_detail(word (*functi
     }
     return 0;
 }
+
+extern "C" __declspec(dllexport) BOOL host_has_avx() {
+    return IsProcessorFeaturePresent(PF_AVX_INSTRUCTIONS_AVAILABLE);
+}

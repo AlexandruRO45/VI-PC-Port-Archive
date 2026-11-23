@@ -112,6 +112,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/dxcontainer_part_offsets_check.py
 ./out/pe-env/bin/python -B tests/layout_chunks_check.py
 ./out/pe-env/bin/python -B tests/dependency_paths_check.py
+./out/pe-env/bin/python -B tests/pe_package_preflight_check.py
 ./out/pe-env/bin/python -B tests/intake/paths_check.py
 ./out/pe-env/bin/python -B tests/shader_probe_check.py
 ./out/pe-env/bin/python -B tests/shader_census_check.py

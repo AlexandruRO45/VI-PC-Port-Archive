@@ -372,6 +372,12 @@ if __name__ == "__main__":
         if record:
             Path(record).unlink(missing_ok=True)
         rejection_checks(native)
+        available = C.CDLL(str(Path(guard).resolve())).host_has_avx
+        available.argtypes = []
+        available.restype = C.c_int
+        if not available():
+            print("host lacks AVX; skipping native vector comparisons")
+            raise SystemExit(77)
         differential(native, lifted, optimized)
         faults(guard, native, lifted, optimized)
         mutation_controls(guard, mutants)

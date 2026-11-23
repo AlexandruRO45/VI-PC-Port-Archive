@@ -29,6 +29,9 @@ extern "C" __declspec(dllimport) void* XMemAlloc(SIZE_T bytes, ULONGLONG attribu
 extern "C" __declspec(dllimport) void XMemFree(void* allocation, ULONGLONG attributes);
 extern "C" __declspec(dllimport) void* XMemAllocDefault(SIZE_T bytes, ULONGLONG attributes);
 extern "C" __declspec(dllimport) void XMemFreeDefault(void* allocation, ULONGLONG attributes);
+extern "C" __declspec(dllimport) BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count,
+                                                                     PULONG_PTR pages);
+extern "C" __declspec(dllimport) BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages);
 extern "C" __declspec(dllimport) BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer);
 extern "C" __declspec(dllimport) BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics);
 
@@ -68,7 +71,8 @@ bool export_checks()
     if (!module) return false;
     unsigned found = 0;
     for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
-                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics"}) {
+                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics",
+                             "XMemAllocatePhysicalPages", "XMemFreePhysicalPages"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
     }
@@ -114,6 +118,115 @@ bool allocation_checks(decltype(&XMemAlloc) allocate, decltype(&XMemFree) releas
     release(nullptr, amd_word);
     return allocate(0, bink_word) == nullptr && allocate(64, bink_word | (ULONGLONG{1} << 40)) == nullptr &&
            allocate(512, (amd_word & ~(ULONGLONG{15} << 29)) | (ULONGLONG{7} << 29)) == nullptr;
+}
+
+// Synthetic page arrays only. The sentinel fills unused slots so a write past the count is seen.
+constexpr ULONG_PTR mem_64k_pages = 0x20400000;  // MEM_LARGE_PAGES | MEM_PHYSICAL
+constexpr ULONG_PTR page_capacity = ULONG_PTR{1} << 18;
+constexpr ULONG_PTR page_sentinel = 0xa5a5a5a5a5a5a5a5;
+
+using Pages = std::vector<ULONG_PTR>;
+
+// Allocates count pages into a fresh array with one sentinel slot after them.
+bool grant(ULONG_PTR count, Pages& pages)
+{
+    pages.assign(count + 1, page_sentinel);
+    ULONG_PTR inout = count;
+    SetLastError(ERROR_GEN_FAILURE);
+    if (!XMemAllocatePhysicalPages(mem_64k_pages, &inout, pages.data()) || inout != count ||
+        GetLastError() != ERROR_SUCCESS || pages[count] != page_sentinel) return false;
+    pages.pop_back();
+    return true;
+}
+
+bool freed(Pages pages)
+{
+    SetLastError(ERROR_GEN_FAILURE);
+    return XMemFreePhysicalPages(pages.size(), pages.data()) && GetLastError() == ERROR_SUCCESS;
+}
+
+// A refused release returns FALSE with ERROR_INVALID_PARAMETER and leaves the array as passed.
+bool refused_free(ULONG_PTR count, Pages pages)
+{
+    const auto before = pages;
+    SetLastError(ERROR_SUCCESS);
+    return !XMemFreePhysicalPages(count, pages.empty() ? nullptr : pages.data()) &&
+           GetLastError() == ERROR_INVALID_PARAMETER && pages == before;
+}
+
+// A refused allocation returns FALSE with the given error, sets the count to 0 and writes no page.
+bool refused_alloc(ULONG_PTR flags, ULONG_PTR count, DWORD error, bool null_pages = false)
+{
+    Pages pages(8, page_sentinel);
+    ULONG_PTR inout = count;
+    SetLastError(ERROR_SUCCESS);
+    return !XMemAllocatePhysicalPages(flags, &inout, null_pages ? nullptr : pages.data()) && inout == 0 &&
+           GetLastError() == error &&
+           std::all_of(pages.begin(), pages.end(), [](ULONG_PTR p) { return p == page_sentinel; });
+}
+
+bool physical_page_checks()
+{
+    // Valid grants: the count is unchanged, page numbers are nonzero, in range and unique.
+    Pages a, b, c;
+    if (!grant(4, a) || !grant(3, b) || !grant(1, c)) return false;
+    std::vector<ULONG_PTR> all(a);
+    all.insert(all.end(), b.begin(), b.end());
+    all.insert(all.end(), c.begin(), c.end());
+    std::sort(all.begin(), all.end());
+    if (all.front() == 0 || all.back() > page_capacity ||
+        std::adjacent_find(all.begin(), all.end()) != all.end()) return false;
+
+    // Wrong page count on release: one short, one long with a page of another grant appended, and a
+    // single page of a grant.
+    Pages long_a(a);
+    long_a.push_back(b[0]);
+    if (!refused_free(3, a) || !refused_free(5, long_a) || !refused_free(1, Pages{a[1]})) return false;
+    // Non-owner: page numbers that were never issued, zero, past the capacity, and a forged array
+    // mixing two grants without all of either.
+    const ULONG_PTR unissued = all.back() + 100;
+    if (!refused_free(1, Pages{unissued}) || !refused_free(1, Pages{0}) ||
+        !refused_free(1, Pages{page_capacity + 1}) || !refused_free(4, Pages{a[0], a[1], b[0], b[1]}))
+        return false;
+    // Duplicates: the right count, but one page twice and another missing.
+    if (!refused_free(4, Pages{a[0], a[0], a[2], a[3]})) return false;
+    // Zero count, null array and an overflowing count.
+    if (!refused_free(0, a) || !refused_free(4, Pages{}) || !refused_free(~ULONG_PTR{0}, a)) return false;
+
+    // Every refusal above left the grants intact: each releases exactly once, in any order, and two
+    // whole grants may go in one call.
+    Pages a_reversed(a.rbegin(), a.rend());
+    Pages b_and_c(b);
+    b_and_c.insert(b_and_c.end(), c.begin(), c.end());
+    if (!freed(a_reversed) || !freed(b_and_c)) return false;
+    // Double free: the same arrays again.
+    if (!refused_free(4, a) || !refused_free(3, b) || !refused_free(1, c)) return false;
+
+    // Allocation refusals: zero count, null count, null array, unknown flags, MEM_LARGE_PAGES or
+    // MEM_PHYSICAL alone, an extra bit and an upper bit, and counts above the capacity.
+    Pages untouched(2, page_sentinel);
+    SetLastError(ERROR_SUCCESS);
+    if (XMemAllocatePhysicalPages(mem_64k_pages, nullptr, untouched.data()) ||
+        GetLastError() != ERROR_INVALID_PARAMETER || untouched[0] != page_sentinel) return false;
+    for (ULONG_PTR flags : {ULONG_PTR{0}, ULONG_PTR{0x20000000}, ULONG_PTR{0x00400000},
+                            mem_64k_pages | 0x1000, mem_64k_pages | (ULONG_PTR{1} << 40)}) {
+        if (!refused_alloc(flags, 1, ERROR_INVALID_PARAMETER)) return false;
+    }
+    if (!refused_alloc(mem_64k_pages, 0, ERROR_INVALID_PARAMETER) ||
+        !refused_alloc(mem_64k_pages, 1, ERROR_INVALID_PARAMETER, true) ||
+        !refused_alloc(mem_64k_pages, page_capacity + 1, ERROR_INVALID_PARAMETER) ||
+        !refused_alloc(mem_64k_pages, ~ULONG_PTR{0}, ERROR_INVALID_PARAMETER)) return false;
+
+    // Exhaustion and cleanup: with all but one page granted, two pages fail with no partial grant,
+    // one page succeeds, and after both releases the whole capacity is available again.
+    Pages most, last, whole;
+    if (!grant(page_capacity - 1, most)) return false;
+    if (!refused_alloc(mem_64k_pages, 2, ERROR_NOT_ENOUGH_MEMORY) || !grant(1, last) ||
+        !refused_alloc(mem_64k_pages, 1, ERROR_NOT_ENOUGH_MEMORY)) return false;
+    if (!freed(last) || !freed(most) || !grant(page_capacity, whole) || !freed(whole)) return false;
+    std::printf("physical_pages: grants=3 refused_frees=14 refused_allocs=10 exhausted=2 capacity=%llu\n",
+                static_cast<unsigned long long>(page_capacity));
+    return true;
 }
 
 bool query_checks()
@@ -477,6 +590,8 @@ int main(int argc, char** argv)
         passed = allocation_checks(XMemAlloc, XMemFree);
     } else if (scenario == "default_allocation"sv) {
         passed = allocation_checks(XMemAllocDefault, XMemFreeDefault);
+    } else if (scenario == "physical_pages"sv) {
+        passed = physical_page_checks();
     } else if (scenario == "query"sv) {
         passed = query_checks();
     } else if (scenario == "working_set"sv) {

@@ -185,6 +185,9 @@ NAMES = {R.RAX: "rax", R.RCX: "rcx", R.RDX: "rdx", R.RBX: "rbx", R.RSP: "rsp", R
 # Integer argument registers in order. An entry takes the first three unless it is listed as "name:4".
 ARGUMENT_REGISTERS = (R.RCX, R.RDX, R.R8, R.R9)
 ARGUMENT_COUNTS = (3, 4)
+IMPORT_ARGUMENT_COUNTS = range(len(ARGUMENT_REGISTERS) + 1)
+IMPORT_RETURN_WIDTHS = (0, 1, 2, 4, 8)
+STACK_OUTPUT_WIDTHS = (1, 2, 4, 8)
 DEFAULT_ARGUMENTS = 3
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 NONVOLATILE = tuple(sorted(set(NAMES) - VOLATILE - {R.RSP}))  # RBX, RBP, RSI, RDI, R12-R15
@@ -1398,8 +1401,34 @@ class Frame:
     frame_limit = MAX_FRAME
     incoming_end = HOME_END
 
-    def __init__(self, function):
+    def __init__(self, function, edges):
         self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
+        self.output_calls = {}
+        self.output_addresses = {}
+        self.outputs = {}
+        for ip, host in function.host_calls.items():
+            if host.output is None:
+                continue
+            register, width = host.output
+            if ip not in function.calls or host.noreturn or register not in host.demands or width not in STACK_OUTPUT_WIDTHS:
+                raise ValueError(f"unsupported stack output contract at RVA {ip:#x}")
+            before = ip
+            while before not in edges and before != function.entry:
+                ins = function.ending.get(before)
+                if ins is None or ins.flow_control != FlowControl.NEXT:
+                    break
+                if (ins.mnemonic == M.LEA and ins.op0_register == register and ins.memory_base in (R.RSP, R.RBP)
+                        and ins.memory_index == R.NONE and not ins.has_segment_prefix):
+                    self.output_calls[ip] = (ins, register, width)
+                    self.output_addresses[ins.ip] = width
+                    break
+                if any(RegisterExt.full_register(used.register) == register
+                       or RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
+                       for used in INFO.info(ins).used_registers()):
+                    break
+                before = ins.ip
+            if ip not in self.output_calls:
+                raise ValueError(f"stack output call at RVA {ip:#x} needs a proven frame address")
         anchors, self.set_anchor = {function.entry: None}, set()
         work = [function.entry]
         while work:
@@ -1425,6 +1454,11 @@ class Frame:
         for ip in sorted(self.offsets):
             if function.instructions[ip].mnemonic == M.RET and self.offsets[ip]:
                 raise ValueError(f"stack not balanced at RET RVA {ip:#x}: RSP is entry RSP{self.offsets[ip]:+#x}")
+        for ip, (ins, _, width) in self.output_calls.items():
+            offset = self.accesses[ins.ip][0]
+            if offset < self.offsets[ip] + HOME_SIZE or offset % width:
+                raise ValueError(f"misaligned stack output or overlap with callee home space at RVA {ip:#x}")
+            self.outputs[ip] = (offset, width)
         low = min(self.offsets.values())
         self.start = low - (low + 8) % 16
         self.size = HOME_END - self.start
@@ -1474,6 +1508,13 @@ class Frame:
             self.adjustments.add(ip)
             return after, anchor
         info = INFO.info(ins)
+        if ip in self.output_addresses:
+            base = rsp if ins.memory_base == R.RSP else anchor
+            if base is None:
+                raise ValueError(f"stack output uses an unproven frame anchor at RVA {ip:#x}")
+            displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
+            self.access(ins, rsp, base + displacement, self.output_addresses[ip], False, False)
+            return rsp, anchor
         if any(RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
                for used in info.used_registers()):
             raise ValueError(f"dynamic frame at RVA {ip:#x}: {ins}")
@@ -1558,7 +1599,12 @@ def prove_frame(function, order, effects, frame):
             # bytes that ADD RSP and POP leave below RSP become 0. The rest of the frame, including this
             # function's own home space above entry RSP, is kept.
             index = frame.offsets[ip] - frame.start
-            return status, data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
+            data = data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
+            if ip in frame.outputs:
+                offset, width = frame.outputs[ip]
+                index = offset - frame.start
+                data = data[:index] + b"\1" * width + data[index + width:]
+            return status, data
         status, restored = dict(zip(SAVED, status)), None
         if ip in frame.accesses:
             offset, width, reads, writes = frame.accesses[ip]
@@ -1680,6 +1726,7 @@ class Binding(NamedTuple):
     link_name: str | None
     arguments: int
     return_bytes: int
+    output: tuple[int, int] | None = None
 
 
 class HostImport(NamedTuple):
@@ -1687,6 +1734,8 @@ class HostImport(NamedTuple):
     widths: tuple
     return_width: int
     noreturn: bool = False
+    # An explicitly bound synchronous import always initializes this output and does not retain its address.
+    output: tuple[int, int] | None = None
 
     @property
     def demands(self):
@@ -1786,7 +1835,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     bases = {(base, anchor) for *_, (_, _, base, anchor) in function.dispatches.values()}
     order = sorted(function.instructions)
     instructions = function.instructions
-    frame = Frame(function)
+    frame = Frame(function, edges)
     if internal and not function.unwound:
         # Without unwind data a function may not move RSP, so it cannot push, allocate or call.
         moved = sorted(ip for ip, offset in frame.offsets.items() if offset or ip in function.calls)
@@ -1816,13 +1865,22 @@ def lift_function(program, entry, symbol, arguments, internal):
         if ip in callees:
             callee = callees[ip]
             if isinstance(callee, HostImport):
-                call = f"{callee.symbol}({', '.join(lifter.reg(r) for r in callee.demands)})"
+                output = frame.output_calls.get(ip)
+                call_args = [lifter.slot(output[0]) if output and r == output[1] else lifter.reg(r)
+                             for r in callee.demands]
+                call = f"{callee.symbol}({', '.join(call_args)})"
             else:
                 call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
-            lifter.used.add(R.RAX)
             # A tail jump returns the callee's RAX; a call leaves it in RAX.
-            body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
-            effects[ip] = (dict(callee.demands), {}, set())
+            if isinstance(callee, HostImport) and callee.return_width == 0:
+                body[ip] = f"{call}; return 0;" if ip in function.tails else f"{call};"
+            else:
+                lifter.used.add(R.RAX)
+                body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
+            reads = dict(callee.demands)
+            if ip in frame.output_calls:
+                del reads[frame.output_calls[ip][1]]
+            effects[ip] = (reads, {}, set())
         elif ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
             body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
             effects[ip] = ({}, {}, set())
@@ -1848,6 +1906,8 @@ def lift_function(program, entry, symbol, arguments, internal):
         elif ip in frame.set_anchor:
             # Only the frame proof observes the anchor. No host pointer stands in for RBP.
             effects[ip] = ({}, {R.RBP: 8}, set())
+        elif ip in frame.output_addresses:
+            effects[ip] = ({}, {}, {full(ins.op0_register)})
         elif (ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register)
               and (not image_data or (ins.op0_register, ins.ip_rel_memory_address) in bases)):
             # A guest address is only usable as a jump-table base, which the switch replaces.
@@ -2193,8 +2253,12 @@ def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
     program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
     bound = () if binding is None else (binding,) if isinstance(binding, Binding) else tuple(binding)
     for item in bound:
-        if item.arguments not in ARGUMENT_COUNTS or item.return_bytes not in (0, 1, 2, 8):
+        if item.arguments not in IMPORT_ARGUMENT_COUNTS or item.return_bytes not in IMPORT_RETURN_WIDTHS:
             raise ValueError(f"unsupported binding of {item.symbol}")
+        if item.output is not None:
+            position, width = item.output
+            if not 1 <= position <= item.arguments or width not in STACK_OUTPUT_WIDTHS:
+                raise ValueError(f"invalid stack output argument or width for {item.symbol}")
     # With several bindings, each names one ordinary import of the image and a slot takes the binding of its import.
     imported = import_identities(pe) if len(bound) > 1 else {}
     by_import = {}
@@ -2226,7 +2290,12 @@ def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
             if not any(s.VirtualAddress <= slot and slot + 8 <= s.VirtualAddress + extent(s)
                        and s.Characteristics & SCN_READ for s in pe.sections):
                 raise ValueError(f"IAT slot RVA {slot:#x} is not 8 bytes of one readable section")
-            slots[slot], chosen[slot] = HostImport(symbol, (8,) * item.arguments, item.return_bytes), index
+            output = None
+            if item.output is not None:
+                position, width = item.output
+                output = (ARGUMENT_REGISTERS[position - 1], width)
+            slots[slot] = HostImport(symbol, (8,) * item.arguments, item.return_bytes, output=output)
+            chosen[slot] = index
             return slots[slot]
         program.import_resolver = resolve_slot
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
@@ -2245,13 +2314,14 @@ def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
         if symbol == other:
             raise ValueError(f"bindings {Path(earlier.provider).name}!{earlier.symbol} and "
                              f"{Path(item.provider).name}!{item.symbol} both declare the C name {symbol}")
-    declarations = "".join(f'\nextern "C" __declspec(dllimport) word {symbol}({", ".join(["word"] * item.arguments)});'
+    declarations = "".join(f'\nextern "C" __declspec(dllimport) {"word" if item.return_bytes else "void"} '
+                           f'{symbol}({", ".join(["word"] * item.arguments)});'
                            for symbol, item in lines) + "\n" if lines else ""
     return PRELUDE + declarations + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
 
 
 class BindingOption(argparse.Action):
-    """Records --bind, --link-name, --import-arguments and --return-bytes in command-line order."""
+    """Records options for each import in command-line order."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         # The canonical spelling: argparse also accepts an abbreviation such as --return.
@@ -2266,7 +2336,7 @@ def parse_binding_options(options):
         group = dict(options)  # the last value of each option counts
         if not binds:
             if group:
-                raise ValueError("--link-name, --import-arguments and --return-bytes require --bind")
+                raise ValueError("--link-name, --import-arguments, --return-bytes and --stack-output require --bind")
             return None
         groups = [group]
     else:
@@ -2285,8 +2355,9 @@ def parse_binding_options(options):
         if "--import-arguments" not in group or "--return-bytes" not in group:
             raise ValueError("--bind requires --import-arguments and --return-bytes")
         provider, symbol = group["--bind"]
+        output = group.get("--stack-output")
         found.append(Binding(Path(provider), symbol, group.get("--link-name"), group["--import-arguments"],
-                             group["--return-bytes"]))
+                             group["--return-bytes"], None if output is None else tuple(output)))
     return found[0] if len(found) == 1 else tuple(found)
 
 
@@ -2314,12 +2385,15 @@ if __name__ == "__main__":
                              "Repeat it to bind several imports, each followed by its own options below")
     parser.add_argument("--link-name", action=BindingOption,
                         help="local import-library symbol for an ordinal binding")
-    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS, action=BindingOption,
+    parser.add_argument("--import-arguments", type=int, choices=IMPORT_ARGUMENT_COUNTS, action=BindingOption,
                         help="integer arguments the bound import takes; stated by the binding, not derived from "
                              "the provider (required with --bind)")
-    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8), action=BindingOption,
+    parser.add_argument("--return-bytes", type=int, choices=IMPORT_RETURN_WIDTHS, action=BindingOption,
                         help="guaranteed low RAX bytes of the bound import's return, 0 for none; stated by "
                              "the binding, not derived from the provider (required with --bind)")
+    parser.add_argument("--stack-output", nargs=2, type=int, metavar=("ARG", "WIDTH"), action=BindingOption,
+                        help="1-based argument that the import fully writes before returning; WIDTH is 1, 2, "
+                             "4 or 8. It must not read the initial contents or retain the address")
     args = parser.parse_args()
     try:
         binding = parse_binding_options(args.binding_options)

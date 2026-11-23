@@ -290,7 +290,8 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     bit 0 selects the lossless R32G32B32A32_UINT readback target. Floating-point cases may instead
     append a zero flags byte and 64 mask bytes for per-channel NaN-class checks. Cases written without
     integer_rt or nan_mask keep the original 1280-byte format exactly. extra_constants sets bit 3 of
-    the flags byte and stores 512 bytes after it: the 256-byte buffers bound to b1 and b2.
+    the flags byte and stores 512 bytes after it: the 256-byte buffers bound to b1 and b2. It may be
+    combined with integer_rt.
     Bit 2 carries the title ranges and aliased buffers before any extra constants.
     The high nibble can hold an explicit RT0 mask for a floating-point case.
     """
@@ -306,8 +307,8 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
             raise ValueError("An explicit write mask requires a nonzero nibble and a plain floating-point render target")
         data.append(write_mask << 4)
     else:
-        if extra_constants is not None and (integer_rt or nan_mask is not None or title_memory is not None):
-            raise ValueError("Extra constant buffers are not combined with other trailer fields")
+        if extra_constants is not None and (nan_mask is not None or title_memory is not None):
+            raise ValueError("Extra constant buffers combine only with the integer render target flag")
         if extra_constants is not None and len(extra_constants) != 512:
             raise ValueError("The b1 and b2 buffers need exactly 512 bytes")
         if integer_rt and nan_mask is not None:
@@ -623,6 +624,143 @@ def with_three_constant_buffers() -> list[str]:
 
 def translate_three_buffers(instructions):
     return lower(instructions, 20, 24, [1, 2, 3, 4], **THREE_BUFFERS)
+
+
+# Two nested tables reached through table pointers: a 64-bit pointer at 0x50 of the texture table (b1's
+# descriptor sits at 0x20 of the table it addresses) and a 32-bit pointer at 0x8 of the table whose low
+# address word arrives in entry s9 (b2's descriptor sits at 0x10 of its table). b0 stays at 0x40.
+SMEM_POINTERS = ((20, 0x50, 2, 0x20), (9, 0x8, 1, 0x10))
+SMEM_POINTER_LOADS = [
+    "s_load_dwordx2 s[52:53], s[20:21], 0x50",
+    "s_mov_b32 s64, s9",
+    "s_mov_b32 s65, 0",
+    "s_load_dword s66, s[64:65], 0x8",
+    "s_mov_b32 s67, 0",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx4 s[56:59], s[52:53], 0x20",
+    "s_load_dwordx4 s[68:71], s[66:67], 0x10",
+]
+
+
+def smem_pointer_loads() -> list[str]:
+    """Export b1 word 2, b2 words 5 and 6, then b0 word 3, all through the integer render target."""
+    program = uncompressed_export([
+        "s_buffer_load_dword s72, s[56:59], 0x8",
+        "s_buffer_load_dwordx2 s[74:75], s[68:71], 0x14",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v12, s72",
+        "v_mov_b32_e32 v13, s74",
+        "v_mov_b32_e32 v14, s75",
+        "v_mov_b32_e32 v15, s44",
+    ])
+    descriptor = program.index("s_load_dwordx4 s[44:47], s[20:21], 0x40")
+    program[descriptor + 1:descriptor + 1] = SMEM_POINTER_LOADS
+    return program
+
+
+def translate_smem_pointers(instructions, pointers=SMEM_POINTERS):
+    return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                 pointer_constants=pointers)
+
+
+def check_smem_pointer_controls():
+    """s_load_dword and s_load_dwordx2 read only contract table pointers, at their width, after the wait."""
+    program = smem_pointer_loads()
+    source = translate_smem_pointers(program)
+    for text in ("cbuffer Constants1 : register(b1) { uint4 params1[16]; };",
+                 "cbuffer Constants2 : register(b2) { uint4 params2[16]; };",
+                 "params1[0].z", "params2[1].y", "params2[1].z", "params[0].w"):
+        assert text in source, text
+    assert "params1[1]" not in source and "params2[0]" not in source
+    # Exchanging the two contract entries exchanges b1 and b2 in the translation.
+    exchanged = translate_smem_pointers(program, SMEM_POINTERS[::-1])
+    assert exchanged != source and "params2[0].z" in exchanged and "params1[1].y" in exchanged
+
+    def changed(old, new):
+        assert old in program, old
+        return [new if line == old else line for line in program]
+
+    def without(old):
+        assert old in program, old
+        return [line for line in program if line != old]
+
+    # Mutated descriptor or pointer offsets are refused, not read from a neighbouring slot.
+    expect_value_error(translate_smem_pointers, changed("s_load_dwordx4 s[56:59], s[52:53], 0x20",
+                                                        "s_load_dwordx4 s[56:59], s[52:53], 0x30"),
+                       "Constant descriptor differs from binding contract")
+    expect_value_error(translate_smem_pointers, changed("s_load_dwordx4 s[68:71], s[66:67], 0x10",
+                                                        "s_load_dwordx4 s[68:71], s[66:67], 0x20"),
+                       "Constant descriptor differs from binding contract")
+    for old, new in (("s_load_dwordx2 s[52:53], s[20:21], 0x50", "s_load_dwordx2 s[52:53], s[20:21], 0x58"),
+                     ("s_load_dwordx2 s[52:53], s[20:21], 0x50", "s_load_dwordx2 s[52:53], s[20:21], null"),
+                     ("s_load_dword s66, s[64:65], 0x8", "s_load_dword s66, s[64:65], 0xc"),
+                     ("s_load_dword s66, s[64:65], 0x8", "s_load_dword s66, s[64:65], 0x9")):
+        expect_value_error(translate_smem_pointers, changed(old, new), "Table pointer differs from binding contract")
+    # The width is part of the contract: half of a 64-bit pointer, or a 64-bit read of a 32-bit one.
+    expect_value_error(translate_smem_pointers, changed("s_load_dwordx2 s[52:53], s[20:21], 0x50",
+                                                        "s_load_dword s52, s[20:21], 0x50"),
+                       "Table pointer differs from binding contract")
+    expect_value_error(translate_smem_pointers, changed("s_load_dword s66, s[64:65], 0x8",
+                                                        "s_load_dwordx2 s[66:67], s[64:65], 0x8"),
+                       "Table pointer differs from binding contract")
+    # The descriptor fetch waits for the pointer.
+    expect_value_error(translate_smem_pointers, without("s_waitcnt lgkmcnt(0)"),
+                       "Unresolved constant buffer binding")
+    # A table address that is itself a loaded pointer is not a contract table.
+    nested = program[:]
+    nested.insert(nested.index("s_waitcnt lgkmcnt(0)") + 1, "s_load_dword s80, s[52:53], 0x0")
+    expect_value_error(translate_smem_pointers, nested, "Unresolved table pointer address")
+    # A 32-bit pointer needs its zero high word; a 64-bit pointer keeps its loaded one.
+    expect_value_error(translate_smem_pointers, without("s_mov_b32 s67, 0"), "Unresolved constant buffer binding")
+    expect_value_error(translate_smem_pointers, without("s_mov_b32 s65, 0"), "Unresolved table pointer address")
+    clobbered = program[:]
+    clobbered.insert(clobbered.index("s_load_dwordx4 s[56:59], s[52:53], 0x20"), "s_mov_b32 s53, 0")
+    expect_value_error(translate_smem_pointers, clobbered, "Unresolved constant buffer binding")
+    # A pointer is an address, never a numeric value, and never a texture table.
+    numeric = program[:]
+    numeric.insert(numeric.index("v_mov_b32_e32 v15, s44"), "v_mov_b32_e32 v15, s52")
+    must_reject(translate_smem_pointers, numeric)
+    expect_value_error(translate_smem_pointers, changed("s_load_dwordx4 s[56:59], s[52:53], 0x20",
+                                                        "s_load_dwordx8 s[56:63], s[52:53], null"),
+                       "Texture address differs from binding contract")
+    # A write into a pointer register before its load completes.
+    overlap = program[:]
+    overlap.insert(overlap.index("s_mov_b32 s64, s9"), "s_mov_b32 s52, 0")
+    expect_value_error(translate_smem_pointers, overlap, "Unresolved scalar memory dependency")
+    # Unmodelled operand forms: SGPR offsets and cache modifiers.
+    for old, new in (("s_load_dword s66, s[64:65], 0x8", "s_load_dword s66, s[64:65], s3"),
+                     ("s_load_dword s66, s[64:65], 0x8", "s_load_dword s66, s[64:65], 0x8 glc"),
+                     ("s_load_dwordx2 s[52:53], s[20:21], 0x50", "s_load_dwordx2 s[52:53], s[20:21], 0x50 dlc")):
+        expect_value_error(translate_smem_pointers, changed(old, new), "Unsupported instruction")
+    # Odd or out-of-range registers.
+    for old, new in (("s_load_dwordx2 s[52:53], s[20:21], 0x50", "s_load_dwordx2 s[53:54], s[20:21], 0x50"),
+                     ("s_load_dwordx2 s[52:53], s[20:21], 0x50", "s_load_dwordx2 s[106:107], s[20:21], 0x50"),
+                     ("s_load_dword s66, s[64:65], 0x8", "s_load_dword s66, s[65:66], 0x8")):
+        expect_value_error(translate_smem_pointers, changed(old, new), "Invalid scalar load registers")
+    # Without a contract entry nothing resolves.
+    expect_value_error(lambda p: translate_smem_pointers(p, ()), program, "Table pointer differs from binding contract")
+    # With only the first entry, s9 names no table at all (an unknown entry register).
+    must_reject(translate_smem_pointers, program, SMEM_POINTERS[:1])
+    expect_value_error(lambda p: translate_smem_pointers(p, SMEM_POINTERS[1:]), program,
+                       "Table pointer differs from binding contract")
+    # Contract validation.
+    for pointers, message in (
+            (((20, 0x48, 2, 0x20),), "Table pointer overlaps a constant descriptor"),
+            (((20, 0x10, 2, 0x20),), "Table pointer overlaps a texture descriptor"),
+            (((20, 0x50, 2, 0x20), (20, 0x54, 1, 0x0)), "Table pointers overlap"),
+            (((20, 0x50, 2, 0x20), (20, 0x50, 1, 0x0)), "Pointer width differs between bindings"),
+            (((20, 0x50, 2, 0x20), (20, 0x50, 2, 0x28)), "Constant descriptors overlap"),
+            (((20, 0x50, 3, 0x20),), "Invalid pointer constant binding"),
+            (((20, 0x52, 2, 0x20),), "Invalid pointer constant binding"),
+            (((20, 0x50, 2, 0x22),), "Invalid pointer constant binding"),
+            (((24, 0x50, 2, 0x20),), "Invalid pointer constant binding"),
+            (((20, 0x50, 2),), "Invalid pointer constant binding")):
+        expect_value_error(lambda p, pointers=pointers: translate_smem_pointers(p, pointers), program, message)
+    # Two descriptors in one nested table share the pointer.
+    shared = program[:]
+    shared.insert(shared.index("s_load_dwordx4 s[68:71], s[66:67], 0x10"), "s_load_dwordx4 s[76:79], s[52:53], 0x40")
+    shared_source = translate_smem_pointers(shared, (*SMEM_POINTERS, (20, 0x50, 2, 0x40)))
+    assert "register(b3)" in shared_source
 
 
 def affine_coordinates() -> list[str]:
@@ -1651,6 +1789,54 @@ def check_three_buffer_draw(directory, compiler, renderer, backend):
     broken = subprocess.run([renderer, backend, "--check-pixel-case", shader, short], capture_output=True, text=True)
     if broken.returncode != 1 or "Expected two 256-byte constant buffers for b1 and b2" not in broken.stderr:
         raise AssertionError(f"A short extra-constant case was accepted\n{broken.stdout}\n{broken.stderr}")
+
+
+def check_smem_pointer_draw(directory, compiler, renderer, backend):
+    """Words read through the two nested-table pointers, compared bit for bit on R32G32B32A32_UINT."""
+    source = directory / "smem-pointers.hlsl"
+    shader = directory / "smem-pointers.cso"
+    program = smem_pointer_loads()
+    source.write_text(translate_smem_pointers(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    def buffers(b0_word3, b1_word2, b2_word5, b2_word6):
+        # Every other word is a sentinel naming its buffer and index, so a misread cannot pass.
+        data = [bytearray(struct.pack("<64I", *((tag << 16) | n for n in range(64))))
+                for tag in (0xb0b0, 0xb1b1, 0xb2b2)]
+        struct.pack_into("<I", data[0], 12, b0_word3)
+        struct.pack_into("<I", data[1], 8, b1_word2)
+        struct.pack_into("<2I", data[2], 20, b2_word5, b2_word6)
+        return bytes(data[0]), bytes(data[1] + data[2])
+
+    def write(name, words, expected):
+        first, extra = buffers(*words)
+        return write_case(directory / f"smem-pointers-{name}.case", first,
+                          tuple(as_float(word) for word in expected), integer_rt=True, extra_constants=extra)
+
+    # Quiet NaN payloads, a denormal, negative zero and all-ones words survive only a bit-exact path.
+    sets = ((0xdeadbeef, 0x7fc12345, 0x00000001, 0x80000000),
+            (0x00000000, 0xffffffff, 0x3f800000, 0x7fc00001))
+    cases = [(write(idx, words, (words[1], words[2], words[3], words[0])), "pass") for idx, words in enumerate(sets)]
+    # Reference controls: b1 and b2 exchanged, and b0 word 3 replaced by its sentinel.
+    words = sets[0]
+    exchanged_reads = (0xb2b20002, 0xb1b10005, 0xb1b10006, words[0])
+    cases.append((write("exchanged-ref", words, exchanged_reads), "mismatch"))
+    cases.append((write("sentinel-ref", words, (words[1], words[2], words[3], 0xb0b00003)), "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+    # Exchanging the two contract entries makes b1 serve the b2 reads and the reverse.
+    source.write_text(translate_smem_pointers(program, SMEM_POINTERS[::-1]), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(cases[0][0], "mismatch"), (cases[2][0], "pass")])
+    # A mutated buffer offset (word 3 instead of word 2) reads the sentinel and must mismatch.
+    mutated = [line.replace("s_buffer_load_dword s72, s[56:59], 0x8", "s_buffer_load_dword s72, s[56:59], 0xc")
+               for line in program]
+    assert mutated != program
+    source.write_text(translate_smem_pointers(mutated), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, [path for path, _ in cases[:2]])
+    if statuses != ["mismatch", "mismatch"]:
+        raise AssertionError(f"A mutated buffer offset escaped detection: {statuses}")
+    return 0
 
 
 def check_mad_draw(directory, compiler, renderer, backend):
@@ -9029,6 +9215,7 @@ def check_f16_round_controls():
 
 
 def check_controls(directory):
+    check_smem_pointer_controls()
     check_masked_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
@@ -10667,7 +10854,7 @@ def check_binary(directory, assembler, objcopy, library):
     check_f16_round_binary(directory, assembler, objcopy, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
-                (with_three_constant_buffers(), translate_three_buffers),
+                (with_three_constant_buffers(), translate_three_buffers), (smem_pointer_loads(), translate_smem_pointers),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
     fixtures.extend((align_integer_group(byte), translate_int) for byte in (False, True))
@@ -14816,7 +15003,7 @@ def main():
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64",
-                    "draw-f16-arith", "draw-f16-round", "draw-flat-scratch"):
+                    "draw-f16-arith", "draw-f16-round", "draw-flat-scratch", "draw-smem-pointers"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -14845,7 +15032,8 @@ def main():
                         "draw-exec-regions": check_masked_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
-                        "draw-flat-scratch": check_flat_scratch_draws}[mode]
+                        "draw-flat-scratch": check_flat_scratch_draws,
+                        "draw-smem-pointers": check_smem_pointer_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):

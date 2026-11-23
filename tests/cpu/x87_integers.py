@@ -305,7 +305,7 @@ def check_rejections():
         "fldenv": (attempt(f"{fld} d9 21 {fstp} c3"), "unsupported x87 operation"),
         "fyl2xp1": (attempt(f"{fld} d9 f9 {fstp} c3"), "unsupported x87 operation"),
         "fbld m80": (attempt(f"df 21 {fstp} c3"), "unsupported x87 operation"),
-        "fbstp m80": (attempt(f"{fld} df 32 c3"), "unsupported x87 operation"),
+        "fnsave m108": (attempt(f"{fld} dd 32 {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

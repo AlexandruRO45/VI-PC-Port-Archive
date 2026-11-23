@@ -25,7 +25,7 @@ The profile accepts:
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
-instruction outside the profile (including FLDCW, FNSTSW with a memory operand, environment access, a
+instruction outside the profile (including FLDCW, FNINIT, FBLD, FNSTSW with a memory operand, environment access, a
 popping form with ST(0) as the destination, and the undocumented FSTP, FXCH, FCOM and FCOMP alias
 encodings), a stack overflow or underflow, a depth that differs where control flow joins, an x87
 instruction it cannot reach from the entry through direct edges, and x87 state that is live at a call, a
@@ -39,11 +39,11 @@ CF on into the flags and registers they write. The integer lowering models PF on
 family and an 8-bit TEST or AND, so a reader of PF that another instruction may have written last is
 rejected. SAHF,
 JP and JNP are accepted only in such a function. C0, C2 and C3 are known after a comparison into the
-status word and unknown at the entry. FCOMI, FCOMIP, FUCOMI and FUCOMIP leave them as they were, and
-every other x87 instruction leaves them undefined, as the SDM states, including WAIT (so FSTSW AX, which
-is WAIT and FNSTSW AX, sees none of them), FNSTCW and FNSTSW itself; a call does too. TOP is the depth
-before FNSTSW subtracted from 8, modulo 8. C1, the exception flags, the stack fault and the busy bit are
-never known. FNSTSW AX leaves AX with only the known bits known. Any reader of AL, AH, AX, EAX or RAX that
+status word, FPREM, FPREM1 or FNINIT, and unknown at the entry. FCOMI, FCOMIP, FUCOMI and FUCOMIP leave them as
+they were, and every other x87 instruction leaves them undefined, as the SDM states, including WAIT (so
+FSTSW AX, which is WAIT and FNSTSW AX, sees none of them), FNSTCW and FNSTSW itself; a call does too. C1 is
+known only after FPREM, FPREM1 and FNINIT, until the next x87 instruction. TOP is the depth before FNSTSW
+subtracted from 8, modulo 8. The exception flags, the stack fault and the busy bit are never known. FNSTSW AX leaves AX with only the known bits known. Any reader of AL, AH, AX, EAX or RAX that
 sees an unknown bit is rejected, and so are a return, a call, an indirect branch and an external edge
 while AX holds one, except:
 - SAHF copies C0 to CF, C2 to PF, C3 to ZF and the busy bit to SF, each defined only when its bit is
@@ -60,6 +60,29 @@ bit 12 (the obsolete infinity control) is kept. Any other word, and a return wit
 than 0x027F, leaves the function through reject(status), the caller's statement, with a status from
 STATUS. Guest stores before that point stay done. A function that loads the control word must not
 contain a call, an indirect branch or an external edge, because the word may be live there.
+
+The checked entry also accepts FNINIT (and FINIT, which is WAIT and FNINIT). It loads control word
+0x037F, clears C0 to C3, and empties every register, so the depth after it is 0. Since every exception
+is masked, no exception is pending and WAIT does nothing. The function must then restore 0x027F before
+it returns, and it counts as loading the control word for the call and edge rule.
+
+FBSTP m80bcd stores ST(0), rounded to an integer by the rounding control, as 18 packed BCD digits and
+the sign of ST(0) (also for a value that rounds to zero), then pops. A NaN, an infinity, an unsupported
+encoding or a rounded magnitude of 10^18 or more stores the packed BCD indefinite, the masked
+invalid-operation response (x87_to_bcd in x87_soft.h). The checked entry also accepts FBLD m80bcd, which
+pushes the 18 digits exactly, with the sign from bit 7 of byte 9 and the other bits of that byte
+ignored. The SDM leaves the result undefined for a digit above 9, and the function leaves with status
+"bcddigit" there. The fixed profile rejects FBLD.
+
+The checked entry also accepts FPREM and FPREM1, which replace ST(0) by its remainder by ST(1) with the
+quotient truncated (FPREM) or rounded to nearest-even (FPREM1), and set C0, C3 and C1 to bits 2, 1 and 0
+of the quotient and C2 to 0 (x87_prem in x87_soft.h). Neither reads the control word. When the exponent
+of ST(0) exceeds that of ST(1) by 64 or more, the instruction reduces ST(0) only partially, by an amount
+the SDM leaves to the implementation, and sets C2; the function leaves with status "partial". A NaN
+result (a NaN or unsupported operand, an infinite ST(0) or a zero ST(1)) follows the arithmetic NaN
+rules, but the SDM does not give the status bits after it, so in a function with FNSTSW it leaves with
+status "nanremainder". The usual fmod loop, FPREM; FNSTSW AX; SAHF; JP back, is accepted; in an
+accepted run its back edge is never taken. The fixed profile rejects both instructions.
 """
 from pathlib import Path
 
@@ -78,7 +101,7 @@ X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FR
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM,
                      M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP,
-                     M.FXAM, M.FNOP, M.FNCLEX})
+                     M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT, M.FBLD, M.FBSTP})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
 STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP})
 STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2}
@@ -88,23 +111,28 @@ ICOMPARES = {M.FICOM: 0, M.FICOMP: 1}
 STATUS_WRITERS = STATUS_COMPARES | {M.FTST, M.FXAM, *ICOMPARES}
 # C3, C2 and C0 from x87_compare's result: 0 0 1 less, 1 0 0 equal, 0 0 0 greater, 1 1 1 unordered.
 COMPARE_SW = "x87_sw = static_cast<uint16_t>(r == 0 ? 0x0100 : r == 1 ? 0x4000 : r == 3 ? 0x4500 : 0);"
-# Status-word bits: C0, C2 and C3 (the comparison result), and TOP.
+# Status-word bits: C0, C2 and C3 (the comparison result), C1 (bit 0 of an FPREM quotient), and TOP.
 C_BITS = 0x4500
+C1_BIT = 0x0200
 TOP_BITS = 0x3800
 # The slots and the control word, which the fixed profile keeps at 0x027F.
 DECLARATION = "X87Value x87_slot[8]{}; const uint16_t x87_cw = 0x027f; (void)x87_cw;"
 # The checked entry's control word, which FLDCW changes.
 CHECKED_DECLARATION = "X87Value x87_slot[8]{}; uint16_t x87_cw = 0x027f;"
 # Profile-rejection statuses of the checked entry: an FLDCW operand with an exception unmasked, an FLDCW
-# operand with the reserved precision control 01, and a return with a control word other than 0x027F.
-STATUS = {"unmasked": 1, "precision": 2, "unrestored": 3}
+# operand with the reserved precision control 01, a return with a control word other than 0x027F, an FPREM
+# or FPREM1 that reduces only partially, and an FPREM or FPREM1 with a NaN result in a function that reads
+# the status word.
+STATUS = {"unmasked": 1, "precision": 2, "unrestored": 3, "partial": 4, "nanremainder": 5, "bcddigit": 6}
+# The checked entry's partial remainders.
+REMAINDERS = frozenset({M.FPREM, M.FPREM1})
 
 
 def declaration(body, checked=None):
     """The x87 locals of a lowered function: the slots, the control word and, in a function that compares
-    into the status word or stores it, C0, C2 and C3 of the status word."""
+    into the status word or stores it, the condition bits of the status word."""
     text = DECLARATION if checked is None else CHECKED_DECLARATION
-    if any(i.mnemonic in STATUS_WRITERS or i.mnemonic == M.FNSTSW for i in body):
+    if any(i.mnemonic in STATUS_WRITERS or i.mnemonic in REMAINDERS or i.mnemonic in (M.FNSTSW, M.FNINIT) for i in body):
         text += " uint16_t x87_sw = 0; (void)x87_sw;"
     return text
 
@@ -182,6 +210,8 @@ def _effect(i, depth, checked=None):
         raise ValueError(f"unsupported x87 encoding at {i.ip:#x}: {i}")
     if op in (M.FNSTCW, M.WAIT) or (op == M.FLDCW and checked is not None):  # no register stack access
         return depth
+    if op == M.FNINIT and checked is not None:  # every register becomes empty
+        return 0
     if op in (M.FNOP, M.FNCLEX, M.FXAM):  # no register stack change; FXAM also classifies an empty ST(0)
         return depth
     if op == M.FTST:
@@ -244,7 +274,7 @@ def _effect(i, depth, checked=None):
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth if op == M.FIST else depth - 1
-    if op == M.FSCALE:  # ST(0) scaled by ST(1); both stay on the stack
+    if op == M.FSCALE or (op in REMAINDERS and checked is not None):  # ST(0) and ST(1) stay on the stack
         if depth < 2:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth
@@ -298,6 +328,16 @@ def _effect(i, depth, checked=None):
         if depth <= i.op0_register - R.ST0 or depth < 2:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth - 1
+    if op == M.FBSTP or (op == M.FBLD and checked is not None):  # packed BCD m80
+        if i.op0_kind != K.MEMORY or i.memory_size != S.BCD:
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
+        if op == M.FBLD:
+            if depth == 8:
+                raise ValueError(f"x87 stack overflow at {i.ip:#x}: {i}")
+            return depth + 1
+        if depth == 0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth - 1
     raise ValueError(f"unsupported x87 operation at {i.ip:#x}: {i}")
 
 
@@ -307,7 +347,7 @@ def depths(body, exits, checked=None):
     index = {i.ip: i for i in body}
     depth = {body[0].ip: 0}
     work = [body[0].ip]
-    loads_cw = checked is not None and any(i.mnemonic == M.FLDCW for i in body)
+    loads_cw = checked is not None and any(i.mnemonic in (M.FLDCW, M.FNINIT) for i in body)
     while work:
         i = index[work.pop()]
         before = depth[i.ip]
@@ -477,6 +517,8 @@ def _after(i, s):
         ax |= _ax_access(i)[1]
     if op in STATUS_WRITERS:
         c = C_BITS
+    elif op in REMAINDERS or op == M.FNINIT:  # quotient bits and C2 = 0, or FNINIT clearing C0 to C3
+        c = C_BITS | C1_BIT
     elif op in COMPARES or not (is_x87(i) or call):  # FCOMI and integer instructions leave C0, C2 and C3
         c = s.c
     else:
@@ -555,16 +597,17 @@ def check_flags(body, exits):
                                  f"{i.ip:#x} -> {target:#x}")
 
 
-def statement(i, depth, address, checked=None, parity=False, read="load"):
+def statement(i, depth, address, checked=None, parity=False, read="load", status_word=False):
     """C++ for one profile instruction at a known stack depth; address() gives the memory operand. checked
     is the Checked entry's error channel, or None for the fixed control word. parity is whether the function
     declares the integer lowering's PF, which the FCOMI family then sets. read names the template that reads
     a memory operand: the integer lowering passes load_always for guest memory, which the compiler must read
-    even when the value is unused, and load for the function's own frame."""
-    return _statement(i, depth, address, checked, parity).replace("load<", f"{read}<")
+    even when the value is unused, and load for the function's own frame. status_word is whether the
+    function contains FNSTSW, the only reader of the status word."""
+    return _statement(i, depth, address, checked, parity, status_word).replace("load<", f"{read}<")
 
 
-def _statement(i, depth, address, checked, parity):
+def _statement(i, depth, address, checked, parity, status_word=False):
     op = i.mnemonic
     _effect(i, depth, checked)
     top = depth - 1  # ST(k) is x87_slot[top - k]
@@ -576,6 +619,8 @@ def _statement(i, depth, address, checked, parity):
                 f"if ((w & 0x3f) != 0x3f) {checked.leave('unmasked')} "
                 f"if ((w & 0x300) == 0x100) {checked.leave('precision')} "
                 "x87_cw = static_cast<uint16_t>((w & 0x1f3f) | 0x40); }  // fldcw")
+    if op == M.FNINIT:  # only the checked entry reaches this; the registers are empty from here on
+        return "x87_cw = 0x037f; x87_sw = 0;  // fninit"
     if op == M.WAIT:  # every exception is masked, so none is pending
         return ";  // wait"
     if op in (M.FNOP, M.FNCLEX):  # the profile keeps no exception flag, so clearing them changes nothing
@@ -630,6 +675,13 @@ def _statement(i, depth, address, checked, parity):
         chop = "true" if op == M.FISTTP else "false"
         return (f"{{ const word a = {address()}; "
                 f"store<{unsigned}>(a, static_cast<{unsigned}>(x87_to_integer(x87_slot[{top}], {bits}, {chop}, x87_cw))); }}")
+    if op == M.FBLD:  # only the checked entry reaches this; a digit above 9 leaves the function
+        return (f"{{ const word a = {address()}; if (!x87_from_bcd(load<uint64_t>(a), load<uint16_t>(a + 8), "
+                f"x87_slot[{depth}])) {checked.leave('bcddigit')} }}  // fbld")
+    if op == M.FBSTP:
+        return (f"{{ const word a = {address()}; uint64_t low; uint16_t high; "
+                f"x87_to_bcd(x87_slot[{top}], x87_cw, low, high); store<uint64_t>(a, low); "
+                "store<uint16_t>(a + 8, high); }  // fbstp")
     if op in IARITHMETIC:  # ST(0) = ST(0) op integer, the integer converted exactly as for FILD
         signed, unsigned, bits = INTEGERS[i.memory_size]
         name = next(n for n, v in vars(M).items() if v == op).lower()
@@ -637,6 +689,13 @@ def _statement(i, depth, address, checked, parity):
                 f"x87_from_integer(static_cast<{signed}>(load<{unsigned}>(a))), x87_cw); }}  // {name} m{bits}")
     if op == M.FSCALE:
         return f"x87_slot[{top}] = x87_scale(x87_slot[{top}], x87_slot[{top - 1}], x87_cw);"
+    if op in REMAINDERS:  # only the checked entry reaches this; C0, C3 and C1 are bits 2, 1 and 0 of q, C2 0
+        name, nearest = ("fprem1", "true") if op == M.FPREM1 else ("fprem", "false")
+        nan = f" if (q == x87_prem_nan) {checked.leave('nanremainder')}" if status_word else ""
+        return (f"{{ const int q = x87_prem(x87_slot[{top}], x87_slot[{top - 1}], {nearest}, x87_slot[{top}]); "
+                f"if (q == x87_prem_partial) {checked.leave('partial')}{nan} "
+                "x87_sw = static_cast<uint16_t>(q < 0 ? 0 : (q & 4 ? 0x0100 : 0) | (q & 2 ? 0x4000 : 0) | "
+                f"(q & 1 ? 0x0200 : 0)); }}  // {name}")
     if op == M.FXTRACT:  # ST(1) becomes the exponent and the pushed ST(0) the significand
         return (f"{{ X87Value e; const X87Value s = x87_xtract(x87_slot[{top}], e); "
                 f"x87_slot[{top}] = e; x87_slot[{depth}] = s; }}  // fxtract")

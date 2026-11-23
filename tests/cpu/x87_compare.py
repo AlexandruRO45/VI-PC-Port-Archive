@@ -352,7 +352,7 @@ def check_rejections():
         "fucompp with one value": (attempt(f"{fld} da e9 c3"), "x87 stack underflow"),
         "f2xm1": (attempt(f"{fld} d9 f0 dd d8 c3"), "unsupported x87 operation"),
         "fptan": (attempt(f"{fld} d9 f2 dd d8 c3"), "unsupported x87 operation"),
-        "fbstp m80": (attempt(f"{fld} df 31 dd d8 c3"), "unsupported x87 operation"),
+        "frstor m108": (attempt(f"{fld} dd 21 dd d8 c3"), "unsupported x87 operation"),
         "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "unsupported x87 operand"),
     }
     for case, (message, needle) in rejected.items():

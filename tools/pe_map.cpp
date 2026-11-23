@@ -11,6 +11,7 @@
 #include <sddl.h>
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,6 +121,51 @@ bool writable_section(const IMAGE_NT_HEADERS64* nt, std::uint64_t rva, std::uint
             return true;
     }
     return false;
+}
+
+// Windows x64 seeds the default /GS cookie from a load-config directory whose
+// legacy prefix includes SEHandlerCount. A shorter prefix or an unused cookie
+// leaves initialization to the image. Call after relocation and before guest code.
+const char* seed_security_cookie(const Image& image, const IMAGE_NT_HEADERS64* nt, MapStatus& status) {
+    const auto& dir = directory(nt, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG);
+    constexpr auto minimum = offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFCheckFunctionPointer);
+    constexpr auto guard_offset = offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags);
+    constexpr std::uint64_t default_cookie = 0x2b992ddfa232ull;
+    constexpr std::uint64_t value_mask = (1ull << 48) - 1;
+    if (!dir.VirtualAddress || dir.Size < minimum) return nullptr;
+    const auto* config = image.at<std::uint8_t>(dir.VirtualAddress, dir.Size);
+    status = MAP_FORMAT;
+    if (!config) return "load config outside image";
+    DWORD declared_size;
+    std::memcpy(&declared_size, config, sizeof(declared_size));
+    if (declared_size < minimum) return nullptr;
+    if (guard_offset + sizeof(DWORD) <= dir.Size && guard_offset + sizeof(DWORD) <= declared_size) {
+        DWORD flags;
+        std::memcpy(&flags, config + guard_offset, sizeof(flags));
+        if (flags & IMAGE_GUARD_SECURITY_COOKIE_UNUSED) return nullptr;
+    }
+    std::uint64_t address;
+    std::memcpy(&address, config + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie), sizeof(address));
+    if (!address) return nullptr;
+    const auto base = reinterpret_cast<std::uint64_t>(image.base);
+    if (address < base || address % alignof(std::uint64_t))
+        return "security cookie must be aligned and inside a writable image section";
+    const auto rva = address - base;
+    auto* target = image.at<std::uint64_t>(rva);
+    if (!target || !writable_section(nt, rva, sizeof(*target)))
+        return "security cookie must be aligned and inside a writable image section";
+    if (*target != default_cookie) return nullptr;
+    std::uint64_t random;
+    do {
+        if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&random), sizeof(random),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            status = MAP_INIT_FAILED;
+            return "cannot initialize the security cookie";
+        }
+        random &= value_mask;
+    } while (!random || random == default_cookie);
+    *target = random;
+    return nullptr;
 }
 
 // True if every page of [address, address + size) is committed and currently allows reads.
@@ -957,6 +1003,10 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
             }
         }
     }
+
+    MapStatus cookie_status = MAP_OK;
+    if (const char* reason = seed_security_cookie(image, nt, cookie_status))
+        return release(fail(cookie_status, "%s", reason));
 
     // Record the actual base in the mapped headers, as the Windows loader does.
     reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew)->OptionalHeader.ImageBase =

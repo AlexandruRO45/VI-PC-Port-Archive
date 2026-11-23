@@ -2127,7 +2127,8 @@ class TrackedVector(VectorRegisters):
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
-          title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None, half_denorm=None):
+          title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None, half_denorm=None,
+          pointer_constants=()):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     texture_offset is the aligned byte offset of t0 in the texture descriptor table.
@@ -2135,6 +2136,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     Each extra_constants entry is an (entry SGPR, byte offset) pair naming one further 16-byte
     descriptor; the entries map in order to b1 onward. The SGPR may be the texture table or another
     entry register that holds the low word of a table address.
+    Each pointer_constants entry is an (entry SGPR, pointer byte offset, pointer dwords, descriptor byte offset)
+    tuple naming one 16-byte descriptor in a nested table. The entry SGPR names a table as in extra_constants;
+    the pointer at that table offset is read by s_load_dwordx2 (2 dwords, a full 64-bit address) or by
+    s_load_dword (1 dword, a low word whose high word the program must set to 0). The descriptor sits at the
+    given offset of the table that pointer addresses. The entries map in order to the slots after extra_constants.
     title_ranges is the bound range count at t0, space1. flat_global_only
     requires every flat address to be global and excludes the scratch and LDS apertures.
     return_write_mask returns (source, RT0 mask). For partial compressed exports the caller
@@ -2205,6 +2211,38 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         constants[table, entry[1]] = f"params{slot}"
         scalar[f"s{entry[0]}"] = table
         lines.insert(0, f"cbuffer Constants{slot} : register(b{slot}) {{ float4 params{slot}[16]; }};")
+    # Nested tables: (parent table, pointer byte offset) -> pointer dwords. The low SGPR of a loaded pointer
+    # holds ("pointer_table", parent, offset); a 64-bit pointer's high SGPR holds ("pointer_high", parent, offset).
+    pointers = {}
+    integer_params = {"params"} if integer_export else set()
+    for slot, entry in enumerate(pointer_constants, len(extra_constants) + 1):
+        if (len(entry) != 4 or any(type(word) is not int for word in entry) or not 0 <= entry[0] <= 105
+                or entry[0] == interp_sgpr or entry[1] < 0 or entry[1] % 4 or entry[2] not in (1, 2)
+                or entry[3] < 0 or entry[3] % 4):
+            raise ValueError("Invalid pointer constant binding")
+        sgpr, pointer_offset, dwords, descriptor_offset = entry
+        parent = "texture_ptr" if sgpr == texture_sgpr else ("constant_table", sgpr)
+        if pointers.get((parent, pointer_offset), dwords) != dwords:
+            raise ValueError("Pointer width differs between bindings")
+        span = (pointer_offset, pointer_offset + 4 * dwords)
+        if any(other == parent and start != pointer_offset and start < span[1] and span[0] < start + 4 * width
+               for (other, start), width in pointers.items()):
+            raise ValueError("Table pointers overlap")
+        if any(other == parent and start < span[1] and span[0] < start + 16 for other, start in constants):
+            raise ValueError("Table pointer overlaps a constant descriptor")
+        if parent == "texture_ptr" and any(start < span[1] and span[0] < start + 32 for start in bindings):
+            raise ValueError("Table pointer overlaps a texture descriptor")
+        pointers[parent, pointer_offset] = dwords
+        table = ("pointer_table", parent, pointer_offset)
+        if any(other == table and abs(start - descriptor_offset) < 16 for other, start in constants):
+            raise ValueError("Constant descriptors overlap")
+        constants[table, descriptor_offset] = f"params{slot}"
+        if integer_export:
+            integer_params.add(f"params{slot}")
+        if parent != "texture_ptr":
+            scalar[f"s{sgpr}"] = parent
+        vector_type = "uint4" if integer_export else "float4"
+        lines.insert(0, f"cbuffer Constants{slot} : register(b{slot}) {{ {vector_type} params{slot}[16]; }};")
     pending = set()
     scc = None
     helpers = set()
@@ -2815,6 +2853,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
 
             if op == "s_addk_i32":
                 scc = f"((({operand} ^ alu{i}) & ({addend}u ^ alu{i}) & 0x80000000u) != 0u)"
+        elif m := match(r"(?:s_load_dwordx2 s\[(\d+):(\d+)\]|s_load_dword s(\d+)), s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
+            # A nested table pointer: only a contract slot read from a resolved table, with the full width.
+            first, last, single, low, high, imm = m.groups()
+            width = 1 if single is not None else 2
+            if single is not None:
+                first = last = single
+            if int(last) > 105 or int(first) % width or int(low) % 2 or int(high) > 105:
+                raise ValueError("Invalid scalar load registers")
+            dst = [f"s{n}" for n in registers(first, last, width)]
+            base = [f"s{n}" for n in registers(low, high, 2)]
+            offset = 0 if imm == "null" else int(imm, 16)
+            table = scalar.get(base[0])
+            if (pending.intersection(base) or scalar.get(base[1]) != 0
+                    or not (table == "texture_ptr" or isinstance(table, tuple) and table[0] == "constant_table")):
+                raise ValueError("Unresolved table pointer address")
+            if pointers.get((table, offset)) != width:
+                raise ValueError("Table pointer differs from binding contract")
+            if pending.intersection(dst):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            scalar[dst[0]] = ("pointer_table", table, offset)
+            if width == 2:
+                scalar[dst[1]] = ("pointer_high", table, offset)
+            pending.update(dst)
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:4], 2)
@@ -2844,6 +2905,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if descriptor:
                 resolved = (source[1] == 0
                             and (table == "texture_ptr" or isinstance(table, tuple) and table[0] == "constant_table"))
+                if isinstance(table, tuple) and table[0] == "pointer_table":
+                    # A 32-bit pointer needs an explicit zero high word; a 64-bit one its own loaded high word.
+                    high = 0 if pointers[table[1], table[2]] == 1 else ("pointer_high", table[1], table[2])
+                    resolved = source[1] == high
             else:
                 resolved = (isinstance(table, tuple) and table[0] == "cbv"
                             and source == [("cbv", table[1], n) for n in range(4)])
@@ -2862,7 +2927,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     scalar[f"s{n}"] = ("cbv", params, j)
                 else:
                     value = f"{params}[{word // 4}].{'xyzw'[word % 4]}"
-                    scalar[f"s{n}"] = ("uint", value) if integer_export and params == "params" else value
+                    scalar[f"s{n}"] = ("uint", value) if params in integer_params else value
                 pending.add(f"s{n}")
         elif m := match(r"scratch_(load|store)_dword(x[234])?\s+(.*)"):
             if title_ranges is not None:
@@ -4208,6 +4273,10 @@ def main():
     parser.add_argument("--extra-constant", type=lambda s: int(s, 0), nargs=2, action="append", default=[],
                         metavar=("SGPR", "OFFSET"),
                         help="Entry register and byte offset of a further descriptor; repeat for b1, b2 and onward")
+    parser.add_argument("--pointer-constant", type=lambda s: int(s, 0), nargs=4, action="append", default=[],
+                        metavar=("SGPR", "POINTER_OFFSET", "DWORDS", "OFFSET"),
+                        help="Entry register, byte offset and width (1 or 2 dwords) of a table pointer, then the byte"
+                             " offset of a descriptor in the table it addresses; maps after the --extra-constant slots")
     parser.add_argument("--half-denorm", choices=[HALF_DENORM_PRESERVE],
                         help="Declare the binary16 denormal state at shader entry; the plain binary16 VOP2 forms need it")
     parser.add_argument("--second-texture-offset", type=lambda s: int(s, 0), help="Byte offset of the t1 descriptor for a two-sample shader")
@@ -4221,6 +4290,7 @@ def main():
         source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor,
                        texture_offset=args.texture_offset, second_texture_offset=args.second_texture_offset,
                        extra_constants=[tuple(entry) for entry in args.extra_constant],
+                       pointer_constants=[tuple(entry) for entry in args.pointer_constant],
                        half_denorm=args.half_denorm)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")

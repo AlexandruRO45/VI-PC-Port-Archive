@@ -75,7 +75,7 @@ SIGNATURE = "static word fn_{:x}(Context& ctx, word sp, word rcx, word rdx, word
 
 def emit(pe, fn, imports):
     edges = fn.explore(imports, callback_calls=True)
-    frame = CodecFrame(fn)
+    frame = CodecFrame(fn, edges)
     check_call_sites(fn, frame.offsets)
     lifter = CodecLifter(pe)
     lifter.frame = {ip: offset for ip, (offset, *_) in frame.accesses.items()}
