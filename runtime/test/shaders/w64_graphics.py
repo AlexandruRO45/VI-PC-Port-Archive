@@ -46,6 +46,20 @@ import tempfile
 from pathlib import Path
 
 EXE = ".exe" if os.name == "nt" else ""
+
+
+def _harness_dir(tools):
+    """The directory `vk_harness` runs from: `tools` itself first, then its configuration subdirectories (a
+    Visual Studio build puts the executables in RelWithDebInfo/Debug, a Ninja build in the directory itself).
+    None when neither has the harness, so the caller can name both in its error."""
+    if os.path.isfile(os.path.join(tools, "vk_harness" + EXE)):
+        return tools
+    preferred = ("RelWithDebInfo", "Release", "Debug")
+    subs = sorted(os.listdir(tools)) if os.path.isdir(tools) else []
+    for name in [d for d in preferred if d in subs] + [d for d in subs if d not in preferred]:
+        if os.path.isfile(os.path.join(tools, name, "vk_harness" + EXE)):
+            return os.path.join(tools, name)
+    return None
 UNSUPPORTED = 77
 W = H = 64
 
@@ -456,11 +470,18 @@ def main(argv):
     spirv = os.path.join(argv[0], "spirv")
     tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
     start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
+    tools = os.path.abspath(tools)
     requested = argv[start:]
     unknown = [a for a in requested if a not in FIXTURES]
     if unknown:
         print(f"Unknown fixture name{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}", file=sys.stderr)
         return 1
+    harness_dir = _harness_dir(tools)
+    if not harness_dir:
+        print(f"vk_harness{EXE} not found in {tools} nor in its configuration subdirectories; "
+              f"build the vk_harness target first", file=sys.stderr)
+        return 1
+    tools = harness_dir
     names = requested or sorted(FIXTURES)
     failed = 0
     for name in names:
