@@ -130,12 +130,18 @@ class GamedataIndexTest(unittest.TestCase):
                     os.link(stream, alias)
                 except OSError as e:
                     self.skipTest(f"hard links unavailable: {e}")
-                p = self.run_tool(self.carve, flag, alias)
+                other_flag = "--csv" if flag == "--json" else "--json"
+                other = os.path.join(self.root, "other." + other_flag[2:])
+                with open(other, "wb") as f:
+                    f.write(b"previous report")
+                p = self.run_tool(self.carve, flag, alias, other_flag, other)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn("would overwrite the carved stream", p.stderr)
                 for name in (stream, alias):
                     with open(name, "rb") as f:
                         self.assertEqual(f.read(), original)
+                with open(other, "rb") as f:
+                    self.assertEqual(f.read(), b"previous report")
 
     def test_bad_targets_are_one_line(self):
         empty = os.path.join(self.root, "empty.rpf")

@@ -185,21 +185,35 @@ def carved_stream(address: str, directory: str):
     rpf9_carve.py writes one `<offset:012x>.bin` (or `.bk2`) per stream beside its index.json, so it is an input,
     not a place for a report; guarding only index.json left `--json`/`--csv` free to replace a carved stream.
     """
-    try:
-        report_stat = os.stat(address)
-    except (FileNotFoundError, NotADirectoryError):
+    match = carved_stream_alias((address,), (directory,))
+    return match[1] if match else None
+
+
+def carved_stream_alias(addresses, directories):
+    """Return a report path and a carved stream with the same file identity."""
+    reports = []
+    for address in addresses:
+        try:
+            reports.append((address, os.stat(address)))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+    if not reports:
         return None
-    with os.scandir(directory) as entries:
-        for entry in entries:
-            if not CARVED_STREAM.fullmatch(entry.name.lower()) or not entry.is_file():
-                continue
-            try:
-                # os.stat provides the file identity on Windows.
-                stream_stat = os.stat(entry.path)
-            except FileNotFoundError:
-                continue
-            if os.path.samestat(report_stat, stream_stat):
-                return entry.path
+    for directory in dict.fromkeys(directories):
+        if not directory or not os.path.isdir(directory):
+            continue
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not CARVED_STREAM.fullmatch(entry.name.lower()) or not entry.is_file():
+                    continue
+                try:
+                    # os.stat provides the file identity on Windows.
+                    stream_stat = os.stat(entry.path)
+                except FileNotFoundError:
+                    continue
+                for address, report_stat in reports:
+                    if os.path.samestat(report_stat, stream_stat):
+                        return address, entry.path
     return None
 
 
@@ -443,22 +457,20 @@ def main() -> int:
     protected = [a.target] if os.path.isfile(a.target) else [os.path.join(a.target, "index.json")]
     if a.carve_dir:
         protected.append(os.path.join(a.carve_dir, "index.json"))
-    for flag, path in (("--json", a.json), ("--csv", a.csv)):
-        if path:
-            if os.path.isdir(path):
-                ap.error(f"{flag} is a directory: {path}")
-            for input_path in protected:
-                if same_report_path(path, input_path):
-                    ap.error(f"{flag} would overwrite the input {input_path}")
-            for directory in (a.target, a.carve_dir):
-                if not directory or not os.path.isdir(directory):
-                    continue
-                try:
-                    stream = carved_stream(path, directory)
-                except OSError as e:
-                    ap.error(f"cannot inspect {e.filename or path}: {e.strerror or e}")
-                if stream:
-                    ap.error(f"{flag} would overwrite the carved stream {stream}")
+    reports = {path: flag for flag, path in (("--json", a.json), ("--csv", a.csv)) if path}
+    for path, flag in reports.items():
+        if os.path.isdir(path):
+            ap.error(f"{flag} is a directory: {path}")
+        for input_path in protected:
+            if same_report_path(path, input_path):
+                ap.error(f"{flag} would overwrite the input {input_path}")
+    try:
+        alias = carved_stream_alias(reports, (a.target, a.carve_dir))
+    except OSError as e:
+        ap.error(f"cannot inspect {e.filename or a.target}: {e.strerror or e}")
+    if alias:
+        path, stream = alias
+        ap.error(f"{reports[path]} would overwrite the carved stream {stream}")
     source = None
     try:
         if os.path.isdir(a.target):
