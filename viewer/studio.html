@@ -738,6 +738,10 @@ function loadModel(url, name, category, size) {
 
     currentMesh.position.sub(center);
     camera.position.set(maxDim * 1.5, maxDim * 1.2, maxDim * 1.8);
+    // Scale clipping with the fit so small details and large assets remain visible.
+    camera.near = maxDim / 100;
+    camera.far = maxDim * 100;
+    camera.updateProjectionMatrix();
     controls.target.set(0, 0, 0);
     controls.update();
   }, undefined, (err) => {
