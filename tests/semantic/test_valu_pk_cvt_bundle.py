@@ -1,195 +1,162 @@
 from __future__ import annotations
 
-"""Semantic reference oracle and architectural model for RDNA2 Packed Float16 Conversion & Packing Suite.
+"""Hardware-referenced semantic regression tests for RDNA2 packed float16 conversion & packing:
+  - v_cvt_pkrtz_f16_f32:  Packs two float32 values into two float16 values with round-toward-zero (RTZ)
+  - v_cvt_pknorm_i16_f16: Converts two float16 values to signed normalized 16-bit integers (snorm16)
+  - v_cvt_pknorm_u16_f16: Converts two float16 values to unsigned normalized 16-bit integers (unorm16)
+  - v_pack_b32_f16:       Packs two 16-bit halves selected by op_sel into one 32-bit dword
 
-Covers:
-- v_cvt_pkrtz_f16_f32: packs two float32 values into two float16 values with round-toward-zero (RTZ).
-- v_cvt_pknorm_i16_f16: converts two float16 values to signed normalized 16-bit integers (snorm16) packed into one dword.
-- v_cvt_pknorm_u16_f16: converts two float16 values to unsigned normalized 16-bit integers (unorm16) packed into one dword.
-- v_pack_b32_f16: packs two 16-bit halves selected by op_sel with optional abs and neg modifiers into one 32-bit dword.
-
-Zero game data, standard library Python only (python -I, struct, math, unittest).
+All tests in this suite compile real assembly listings through support.translate_lines(...)
+and execute the translated SPIR-V in spirv_mini_interp via support.mrt0_words.
+Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
 """
 
-from dataclasses import dataclass
-import enum
-import math
 import os
 import struct
 import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TESTS_DIR = os.path.dirname(HERE)
-for p in (HERE, TESTS_DIR):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+sys.dont_write_bytecode = True
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
-from support import translate_lines, mrt0_words  # noqa: E402
+import support  # noqa: E402
 
-MASK32 = 0xFFFFFFFF
-MASK16 = 0xFFFF
+MASK32: int = 0xFFFFFFFF
+MASK16: int = 0xFFFF
 
 
 def f32_to_bits(f: float) -> int:
-    return struct.unpack("<I", struct.pack("<f", f))[0]
+    """Pack Python float to IEEE 754 32-bit integer."""
+    try:
+        return struct.unpack("<I", struct.pack("<f", f))[0]
+    except OverflowError:
+        return 0x7F800000 if f > 0 else 0xFF800000
 
 
-def bits_to_f32(u: int) -> float:
-    return struct.unpack("<f", struct.pack("<I", u & MASK32))[0]
+def run_pk_binop(
+    op: str,
+    src0: str | int | float,
+    src1: str | int | float,
+    *,
+    name: str = "ps_pk_binop",
+    mods: str = "",
+    alias_dst: int | None = None,
+) -> int:
+    """Assemble, translate, and execute a 2-source packed conversion instruction."""
+    def fmt(s: str | int | float) -> str:
+        if isinstance(s, float):
+            return f"{f32_to_bits(s):#x}"
+        if isinstance(s, int):
+            return f"{s:#x}"
+        return str(s)
+
+    dst = f"v{alias_dst}" if alias_dst is not None else "v0"
+    mod_str = f" {mods}" if mods else ""
+    lines = [
+        f"v_mov_b32 v1, {fmt(src0)}",
+        f"v_mov_b32 v2, {fmt(src1)}",
+        f"{op} {dst}, v1, v2{mod_str}",
+        f"exp mrt0 {dst}, {dst}, {dst}, {dst} done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
 
-def f16_to_bits(f: float) -> int:
-    return struct.unpack("<H", struct.pack("<e", f))[0]
+def run_pk_simd(
+    op: str,
+    a0: int,
+    a1: int,
+    b0: int,
+    b1: int,
+    *,
+    name: str = "ps_pk_simd",
+    mods: str = "",
+) -> tuple[int, int]:
+    """Execute dual lane instruction to verify SIMD multi-lane execution."""
+    mod_str = f" {mods}" if mods else ""
+    lines = [
+        f"v_mov_b32 v1, {a0:#x}",
+        f"v_mov_b32 v2, {a1:#x}",
+        f"v_mov_b32 v3, {b0:#x}",
+        f"v_mov_b32 v4, {b1:#x}",
+        f"{op} v5, v1, v2{mod_str}",
+        f"{op} v6, v3, v4{mod_str}",
+        "exp mrt0 v5, v6, v5, v6 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0], words[1]
 
 
-def bits_to_f16(u: int) -> float:
-    return struct.unpack("<e", struct.pack("<H", u & MASK16))[0]
+# ==============================================================================
+# Suite 1: v_cvt_pkrtz_f16_f32 (Pack Two f32 to f16 with RTZ)
+# ==============================================================================
 
+class TestVCvtPkrtzF16F32(unittest.TestCase):
+    """v_cvt_pkrtz_f16_f32 tests."""
 
-class RegKind(enum.Enum):
-    VGPR = "vgpr"
-    SGPR = "sgpr"
-    IMM = "imm"
+    def test_basic_values(self) -> None:
+        """Basic 1.0 (0x3C00) and 2.0 (0x4000) packed into 0x40003C00."""
+        res1 = run_pk_binop("v_cvt_pkrtz_f16_f32", 1.0, 2.0, name="ps_pkrtz_ref1")
+        self.assertEqual(res1, 0x40003C00)
+        res2 = run_pk_binop("v_cvt_pkrtz_f16_f32", -1.0, 0.5, name="ps_pkrtz_ref2")
+        self.assertEqual(res2, 0x3800BC00)
 
+    def test_truncation_toward_zero(self) -> None:
+        """Round-toward-zero truncates fractional bits below f16 precision."""
+        res = run_pk_binop("v_cvt_pkrtz_f16_f32", 1.999999, 1.0, name="ps_pkrtz_ref_ttz")
+        self.assertEqual(res & 0x7C00, 0x3C00)
 
-@dataclass(frozen=True)
-class Operand:
-    kind: RegKind
-    index: int = 0
-    raw_val: int = 0
+    def test_signed_zeros(self) -> None:
+        """Signed zeros preserved in both halves."""
+        res1 = run_pk_binop("v_cvt_pkrtz_f16_f32", 0.0, -0.0, name="ps_pkrtz_ref_sz1")
+        self.assertEqual(res1, 0x80000000)
+        res2 = run_pk_binop("v_cvt_pkrtz_f16_f32", -0.0, 0.0, name="ps_pkrtz_ref_sz2")
+        self.assertEqual(res2, 0x00008000)
 
+    def test_saturation_above_max_normal(self) -> None:
+        """Values exceeding f16 max saturate to 0x7BFF / 0xFBFF under RTZ."""
+        res = run_pk_binop("v_cvt_pkrtz_f16_f32", 70000.0, -80000.0, name="ps_pkrtz_edge_sat")
+        self.assertEqual(res & 0xFFFF, 0x7BFF)
+        self.assertEqual((res >> 16) & 0xFFFF, 0xFBFF)
 
-@dataclass(frozen=True)
-class PackedInstructionAST:
-    mnemonic: str
-    dst: Operand
-    src0: Operand
-    src1: Operand
-    op_sel: tuple[int, int, int] = (0, 0, 0)
-    abs_mods: tuple[bool, bool] = (False, False)
-    neg_mods: tuple[bool, bool] = (False, False)
+    def test_infinities(self) -> None:
+        """+inf (0x7C00) and -inf (0xFC00)."""
+        res = run_pk_binop("v_cvt_pkrtz_f16_f32", float("inf"), float("-inf"), name="ps_pkrtz_edge_inf")
+        self.assertEqual(res & 0xFFFF, 0x7C00)
+        self.assertEqual((res >> 16) & 0xFFFF, 0xFC00)
 
+    def test_nans(self) -> None:
+        """NaN inputs produce quiet NaNs."""
+        res = run_pk_binop("v_cvt_pkrtz_f16_f32", float("nan"), float("nan"), name="ps_pkrtz_edge_nan")
+        self.assertEqual(res & 0x7E00, 0x7E00)
+        self.assertEqual((res >> 16) & 0x7E00, 0x7E00)
 
-class WavefrontSimdState:
-    def __init__(self, lane_count: int = 32):
-        self.lane_count = lane_count
-        self.exec_mask: int = (1 << lane_count) - 1
-        self.vgprs = [[0] * 64 for _ in range(lane_count)]
-
-    def set_vgpr(self, lane: int, reg_idx: int, val: int):
-        self.vgprs[lane][reg_idx] = val & MASK32
-
-    def get_vgpr(self, lane: int, reg_idx: int) -> int:
-        return self.vgprs[lane][reg_idx]
-
-# -----------------------------------------------------------------------------
-# Opcode 1: v_cvt_pkrtz_f16_f32
-# -----------------------------------------------------------------------------
-
-def ref_f32_to_f16_rtz(val: float | int) -> int:
-    u = val if isinstance(val, int) else f32_to_bits(float(val))
-    sign = (u >> 16) & 0x8000
-    exp = (u >> 23) & 0xFF
-    mant = u & 0x7FFFFF
-    if exp == 0xFF:
-        return (sign | 0x7E00 | ((mant >> 13) & 0x01FF)) if mant != 0 else (sign | 0x7C00)
-    if exp == 0:
-        return sign
-    unbiased = exp - 127
-    if unbiased > 15:
-        return sign | 0x7BFF
-    if unbiased < -24:
-        return sign
-    if unbiased < -14:
-        full_mant = (1 << 23) | mant
-        shift = -1 - unbiased
-        return sign | ((full_mant >> shift) & 0x03FF)
-    return sign | (((unbiased + 15) & 0x1F) << 10) | ((mant >> 13) & 0x03FF)
-
-
-def ref_cvt_pkrtz_f16_f32(s0: float | int, s1: float | int) -> int:
-    h0 = ref_f32_to_f16_rtz(s0)
-    h1 = ref_f32_to_f16_rtz(s1)
-    return ((h1 << 16) | h0) & MASK32
-
-
-class VCvtPkrtzF16F32OracleTests(unittest.TestCase):
-    def test_basic_values(self):
-        self.assertEqual(ref_cvt_pkrtz_f16_f32(1.0, 2.0), 0x40003C00)
-        self.assertEqual(ref_cvt_pkrtz_f16_f32(-1.0, 0.5), 0x3800BC00)
-
-    def test_truncation_toward_zero(self):
-        h = ref_f32_to_f16_rtz(1.999999)
-        self.assertEqual(h & 0x7C00, 0x3C00)
-
-    def test_signed_zeros(self):
-        self.assertEqual(ref_cvt_pkrtz_f16_f32(0.0, -0.0), 0x80000000)
-        self.assertEqual(ref_cvt_pkrtz_f16_f32(-0.0, 0.0), 0x00008000)
-
-class VCvtPkrtzF16F32AstTests(unittest.TestCase):
-    def test_ast_construction(self):
-        ast = PackedInstructionAST(
-            mnemonic="v_cvt_pkrtz_f16_f32",
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
+    def test_simd_dual_lanes(self) -> None:
+        """Verify dual lane SIMD execution."""
+        w0, w1 = run_pk_simd(
+            "v_cvt_pkrtz_f16_f32",
+            f32_to_bits(1.0), f32_to_bits(2.0),
+            f32_to_bits(3.0), f32_to_bits(4.0),
+            name="ps_pkrtz_simd",
         )
-        self.assertEqual(ast.mnemonic, "v_cvt_pkrtz_f16_f32")
-        self.assertEqual(ast.dst.index, 0)
-        self.assertEqual(ast.src0.index, 1)
-        self.assertEqual(ast.src1.index, 2)
+        self.assertEqual(w0, 0x40003C00)
+        self.assertEqual(w1, 0x44004200)
 
-def interpret_cvt_pkrtz_f16_f32(src0_val: int, src1_val: int) -> int:
-    return ref_cvt_pkrtz_f16_f32(src0_val, src1_val)
+    def test_register_aliasing(self) -> None:
+        """Register aliasing with destination operand."""
+        res_v1 = run_pk_binop("v_cvt_pkrtz_f16_f32", 1.0, 2.0, alias_dst=1, name="ps_pkrtz_alias_v1")
+        self.assertEqual(res_v1, 0x40003C00)
+        res_v2 = run_pk_binop("v_cvt_pkrtz_f16_f32", 1.0, 2.0, alias_dst=2, name="ps_pkrtz_alias_v2")
+        self.assertEqual(res_v2, 0x40003C00)
 
-
-class VCvtPkrtzF16F32ScalarInterpreterTests(unittest.TestCase):
-    def test_scalar_execution(self):
-        s0 = f32_to_bits(1.5)
-        s1 = f32_to_bits(-2.5)
-        res = interpret_cvt_pkrtz_f16_f32(s0, s1)
-        expected = (ref_f32_to_f16_rtz(-2.5) << 16) | ref_f32_to_f16_rtz(1.5)
-        self.assertEqual(res, expected)
-
-class VCvtPkrtzF16F32SimdDivergenceTests(unittest.TestCase):
-    def test_exec_masking(self):
-        wave = WavefrontSimdState(32)
-        wave.exec_mask = 0x55555555
-        for lane in range(32):
-            wave.set_vgpr(lane, 0, 0xDEADBEEF)
-            if (wave.exec_mask >> lane) & 1:
-                val0 = f32_to_bits(float(lane))
-                val1 = f32_to_bits(float(lane * 2))
-                wave.set_vgpr(lane, 0, interpret_cvt_pkrtz_f16_f32(val0, val1))
-        for lane in range(32):
-            if (wave.exec_mask >> lane) & 1:
-                exp = (ref_f32_to_f16_rtz(float(lane * 2)) << 16) | ref_f32_to_f16_rtz(float(lane))
-                self.assertEqual(wave.get_vgpr(lane, 0), exp)
-            else:
-                self.assertEqual(wave.get_vgpr(lane, 0), 0xDEADBEEF)
-
-class VCvtPkrtzF16F32EdgeCasesTests(unittest.TestCase):
-    def test_saturation_above_max_normal(self):
-        self.assertEqual(ref_f32_to_f16_rtz(65504.0), 0x7BFF)
-        self.assertEqual(ref_f32_to_f16_rtz(70000.0), 0x7BFF)
-        self.assertEqual(ref_f32_to_f16_rtz(1000000.0), 0x7BFF)
-        self.assertEqual(ref_f32_to_f16_rtz(-80000.0), 0xFBFF)
-
-    def test_infinities(self):
-        self.assertEqual(ref_f32_to_f16_rtz(float("inf")), 0x7C00)
-        self.assertEqual(ref_f32_to_f16_rtz(float("-inf")), 0xFC00)
-
-    def test_nans(self):
-        nan_bits = ref_f32_to_f16_rtz(float("nan"))
-        self.assertEqual(nan_bits & 0x7E00, 0x7E00)
-
-    def test_subnormals(self):
-        self.assertEqual(ref_f32_to_f16_rtz(0x00000001), 0x0000)
-        self.assertEqual(ref_f32_to_f16_rtz(0.00005) & 0x7C00, 0x0000)
-
-class VCvtPkrtzF16F32TranslatorTests(unittest.TestCase):
-    def test_translation_basic(self):
+    def test_spirv_structure(self) -> None:
+        """SPIR-V translation emits conversion logic."""
         lines = [
             "v_mov_b32 v1, 1.0",
             "v_mov_b32 v2, 2.0",
@@ -197,114 +164,77 @@ class VCvtPkrtzF16F32TranslatorTests(unittest.TestCase):
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_pkrtz_basic", lines)
-        word = mrt0_words(spv)[0]
+        spv = support.translate_lines("ps_structure_pkrtz", lines)
+        word = support.mrt0_words(spv)[0]
         self.assertEqual(word, 0x40003C00)
 
-    def test_translation_boundary_saturation(self):
-        lines = [
-            "v_mov_b32 v1, 70000.0",
-            "v_mov_b32 v2, -80000.0",
-            "v_cvt_pkrtz_f16_f32 v0, v1, v2",
-            "exp mrt0 v0, v0, v0, v0 done vm",
-            "s_endpgm",
-        ]
-        spv = translate_lines("ps_pkrtz_sat", lines)
-        word = mrt0_words(spv)[0]
-        self.assertEqual(word & 0xFFFF, 0x7BFF)
-        self.assertEqual((word >> 16) & 0xFFFF, 0xFBFF)
+    def test_mutation_detection(self) -> None:
+        """RTZ conversion order lo/hi is strictly distinguished."""
+        res = run_pk_binop("v_cvt_pkrtz_f16_f32", 1.0, 2.0, name="ps_pkrtz_mut")
+        self.assertEqual(res, 0x40003C00)
+        # Swapped operands yields 0x3C004000
+        self.assertNotEqual(res, 0x3C004000)
 
-# -----------------------------------------------------------------------------
-# Opcode 2: v_cvt_pknorm_i16_f16
-# -----------------------------------------------------------------------------
-
-def ref_norm16_i16(u: int) -> int:
-    f = bits_to_f16(u & MASK16)
-    if math.isnan(f):
-        return 0
-    cl = max(-1.0, min(1.0, f))
-    val = round(cl * 32767.0)
-    return val & MASK16
+    def test_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pkrtz", ["v_cvt_pkrtz_f16_f32 v0", "s_endpgm"])
 
 
-def ref_cvt_pknorm_i16_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0), dhi: bool = False) -> int:
-    h0 = (s0 >> (16 * sel[0])) & MASK16
-    h1 = (s1 >> (16 * sel[1])) & MASK16
-    n0 = ref_norm16_i16(h0)
-    n1 = ref_norm16_i16(h1)
-    res = (n1 << 16) | n0
-    if dhi:
-        res = (res << 16) & MASK32
-    return res & MASK32
+# ==============================================================================
+# Suite 2: v_cvt_pknorm_i16_f16 (Convert Two f16 to snorm16)
+# ==============================================================================
 
+class TestVCvtPknormI16F16(unittest.TestCase):
+    """v_cvt_pknorm_i16_f16 tests."""
 
-class VCvtPknormI16F16OracleTests(unittest.TestCase):
-    def test_cardinals(self):
-        res = ref_cvt_pknorm_i16_f16(0x3C00, 0xBC00)
+    def test_cardinals(self) -> None:
+        """1.0 (0x3C00) -> 0x7FFF (32767), -1.0 (0xBC00) -> 0x8001 (-32767)."""
+        res = run_pk_binop("v_cvt_pknorm_i16_f16", 0x3C00, 0xBC00, name="ps_pknorm_i16_card")
         self.assertEqual(res & 0xFFFF, 0x7FFF)
         self.assertEqual((res >> 16) & 0xFFFF, 0x8001)
 
-    def test_zero(self):
-        self.assertEqual(ref_cvt_pknorm_i16_f16(0x0000, 0x8000), 0x00000000)
+    def test_zero(self) -> None:
+        """0.0 and -0.0 convert to 0x00000000."""
+        res = run_pk_binop("v_cvt_pknorm_i16_f16", 0x0000, 0x8000, name="ps_pknorm_i16_zero")
+        self.assertEqual(res, 0x00000000)
 
-    def test_intermediate_scale(self):
-        res = ref_cvt_pknorm_i16_f16(0x3800, 0x3800)
+    def test_intermediate_scale(self) -> None:
+        """0.5 (0x3800) converts to ~0x4000 (16384)."""
+        res = run_pk_binop("v_cvt_pknorm_i16_f16", 0x3800, 0x3800, name="ps_pknorm_i16_scale")
         self.assertEqual(res & 0xFFFF, 0x4000)
         self.assertEqual((res >> 16) & 0xFFFF, 0x4000)
 
-class VCvtPknormI16F16AstTests(unittest.TestCase):
-    def test_ast_construction(self):
-        ast = PackedInstructionAST(
-            mnemonic="v_cvt_pknorm_i16_f16",
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
-            op_sel=(1, 0, 0),
-        )
-        self.assertEqual(ast.mnemonic, "v_cvt_pknorm_i16_f16")
-        self.assertEqual(ast.op_sel, (1, 0, 0))
+    def test_clamp_extremes(self) -> None:
+        """Inputs exceeding 1.0 or -1.0 clamp to snorm16 limits."""
+        res1 = run_pk_binop("v_cvt_pknorm_i16_f16", 0x4000, 0x7C00, name="ps_pknorm_i16_pos_sat")
+        self.assertEqual(res1, (0x7FFF << 16) | 0x7FFF)
+        res2 = run_pk_binop("v_cvt_pknorm_i16_f16", 0xC000, 0xFC00, name="ps_pknorm_i16_neg_sat")
+        self.assertEqual(res2, (0x8001 << 16) | 0x8001)
 
-def interpret_cvt_pknorm_i16_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0)) -> int:
-    return ref_cvt_pknorm_i16_f16(s0, s1, sel=sel)
+    def test_nan_produces_zero(self) -> None:
+        """NaN inputs produce 0."""
+        res = run_pk_binop("v_cvt_pknorm_i16_f16", 0x7E00, 0xFE00, name="ps_pknorm_i16_nan")
+        self.assertEqual(res, 0x00000000)
 
+    def test_op_sel_modifier(self) -> None:
+        """op_sel selects upper halfwords."""
+        s0 = (0xBC00 << 16) | 0x3C00  # hi: -1.0, lo: 1.0
+        s1 = (0x0000 << 16) | 0x3800  # hi: 0.0, lo: 0.5
+        # op_sel:[0,0,0] -> lo selects s0.lo (1.0 -> 0x7FFF), hi selects s1.lo (0.5 -> 0x4000)
+        res1 = run_pk_binop("v_cvt_pknorm_i16_f16", s0, s1, mods="op_sel:[0,0,0]", name="ps_pknorm_i16_sel1")
+        self.assertEqual(res1, (0x4000 << 16) | 0x7FFF)
+        # op_sel:[1,0,0] -> lo selects s0.hi (-1.0 -> 0x8001), hi selects s1.lo (0.5 -> 0x4000)
+        res2 = run_pk_binop("v_cvt_pknorm_i16_f16", s0, s1, mods="op_sel:[1,0,0]", name="ps_pknorm_i16_sel2")
+        self.assertEqual(res2, (0x4000 << 16) | 0x8001)
 
-class VCvtPknormI16F16ScalarInterpreterTests(unittest.TestCase):
-    def test_scalar_execution(self):
-        s0 = (0xBC00 << 16) | 0x3C00
-        s1 = (0x0000 << 16) | 0x3800
-        res = interpret_cvt_pknorm_i16_f16(s0, s1, sel=(0, 0))
-        self.assertEqual(res, (0x4000 << 16) | 0x7FFF)
+    def test_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        res_v1 = run_pk_binop("v_cvt_pknorm_i16_f16", 0x3C00, 0xBC00, alias_dst=1, name="ps_pknorm_i16_alias_v1")
+        self.assertEqual(res_v1, (0x8001 << 16) | 0x7FFF)
 
-        res_hi = interpret_cvt_pknorm_i16_f16(s0, s1, sel=(1, 0))
-        self.assertEqual(res_hi, (0x4000 << 16) | 0x8001)
-
-class VCvtPknormI16F16SimdDivergenceTests(unittest.TestCase):
-    def test_exec_masking(self):
-        wave = WavefrontSimdState(32)
-        wave.exec_mask = 0x0000FFFF
-        for lane in range(32):
-            wave.set_vgpr(lane, 0, 0x12345678)
-            if (wave.exec_mask >> lane) & 1:
-                wave.set_vgpr(lane, 0, interpret_cvt_pknorm_i16_f16(0x3C00, 0xBC00))
-        for lane in range(32):
-            if (wave.exec_mask >> lane) & 1:
-                self.assertEqual(wave.get_vgpr(lane, 0), (0x8001 << 16) | 0x7FFF)
-            else:
-                self.assertEqual(wave.get_vgpr(lane, 0), 0x12345678)
-
-class VCvtPknormI16F16EdgeCasesTests(unittest.TestCase):
-    def test_clamp_extremes(self):
-        self.assertEqual(ref_norm16_i16(0x4000), 0x7FFF)
-        self.assertEqual(ref_norm16_i16(0x7C00), 0x7FFF)
-        self.assertEqual(ref_norm16_i16(0xC000), 0x8001)
-        self.assertEqual(ref_norm16_i16(0xFC00), 0x8001)
-
-    def test_nan_produces_zero(self):
-        self.assertEqual(ref_norm16_i16(0x7E00), 0x0000)
-        self.assertEqual(ref_norm16_i16(0xFE00), 0x0000)
-
-class VCvtPknormI16F16TranslatorTests(unittest.TestCase):
-    def test_translation_basic(self):
+    def test_spirv_structure(self) -> None:
+        """SPIR-V translation structure verification."""
         lines = [
             "v_mov_b32 v1, 0x3C00",
             "v_mov_b32 v2, 0xBC00",
@@ -312,109 +242,73 @@ class VCvtPknormI16F16TranslatorTests(unittest.TestCase):
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_pknorm_i16_basic", lines)
-        word = mrt0_words(spv)[0]
+        spv = support.translate_lines("ps_structure_pknorm_i16", lines)
+        word = support.mrt0_words(spv)[0]
         self.assertEqual(word & 0xFFFF, 0x7FFF)
         self.assertEqual((word >> 16) & 0xFFFF, 0x8001)
 
-    def test_translation_opsel(self):
-        lines = [
-            "v_mov_b32 v1, 0x3C000000",
-            "v_mov_b32 v2, 0xBC000000",
-            "v_cvt_pknorm_i16_f16 v0, v1, v2 op_sel:[1,1,0]",
-            "exp mrt0 v0, v0, v0, v0 done vm",
-            "s_endpgm",
-        ]
-        spv = translate_lines("ps_pknorm_i16_opsel", lines)
-        word = mrt0_words(spv)[0]
-        self.assertEqual(word & 0xFFFF, 0x7FFF)
-        self.assertEqual((word >> 16) & 0xFFFF, 0x8001)
+    def test_mutation_detection(self) -> None:
+        """Signed snorm16 is strictly distinguished from unsigned unorm16."""
+        res = run_pk_binop("v_cvt_pknorm_i16_f16", 0xBC00, 0xBC00, name="ps_pknorm_i16_mut")
+        # snorm16 for -1.0 is 0x8001
+        self.assertEqual(res, (0x8001 << 16) | 0x8001)
+        # unorm16 clamps negative to 0x0000
+        self.assertNotEqual(res, 0x00000000)
 
-# -----------------------------------------------------------------------------
-# Opcode 3: v_cvt_pknorm_u16_f16
-# -----------------------------------------------------------------------------
-
-def ref_norm16_u16(u: int) -> int:
-    f = bits_to_f16(u & MASK16)
-    if math.isnan(f):
-        return 0
-    cl = max(0.0, min(1.0, f))
-    val = round(cl * 65535.0)
-    return val & MASK16
+    def test_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pknorm_i16", ["v_cvt_pknorm_i16_f16 v0", "s_endpgm"])
 
 
-def ref_cvt_pknorm_u16_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0), dhi: bool = False) -> int:
-    h0 = (s0 >> (16 * sel[0])) & MASK16
-    h1 = (s1 >> (16 * sel[1])) & MASK16
-    n0 = ref_norm16_u16(h0)
-    n1 = ref_norm16_u16(h1)
-    res = (n1 << 16) | n0
-    if dhi:
-        res = (res << 16) & MASK32
-    return res & MASK32
+# ==============================================================================
+# Suite 3: v_cvt_pknorm_u16_f16 (Convert Two f16 to unorm16)
+# ==============================================================================
 
+class TestVCvtPknormU16F16(unittest.TestCase):
+    """v_cvt_pknorm_u16_f16 tests."""
 
-class VCvtPknormU16F16OracleTests(unittest.TestCase):
-    def test_cardinals(self):
-        res = ref_cvt_pknorm_u16_f16(0x3C00, 0x3800)
+    def test_cardinals(self) -> None:
+        """1.0 (0x3C00) -> 0xFFFF, 0.5 (0x3800) -> ~0x8000 (32768)."""
+        res = run_pk_binop("v_cvt_pknorm_u16_f16", 0x3C00, 0x3800, name="ps_pknorm_u16_card")
         self.assertEqual(res & 0xFFFF, 0xFFFF)
         self.assertEqual((res >> 16) & 0xFFFF, 0x8000)
 
-    def test_zeros_and_negatives(self):
-        self.assertEqual(ref_cvt_pknorm_u16_f16(0x0000, 0xBC00), 0x00000000)
+    def test_zeros_and_negatives(self) -> None:
+        """0.0 and -1.0 (0xBC00) clamp to 0x00000000."""
+        res = run_pk_binop("v_cvt_pknorm_u16_f16", 0x0000, 0xBC00, name="ps_pknorm_u16_zero_neg")
+        self.assertEqual(res, 0x00000000)
 
-class VCvtPknormU16F16AstTests(unittest.TestCase):
-    def test_ast_construction(self):
-        ast = PackedInstructionAST(
-            mnemonic="v_cvt_pknorm_u16_f16",
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
-            op_sel=(0, 1, 0),
-        )
-        self.assertEqual(ast.mnemonic, "v_cvt_pknorm_u16_f16")
-        self.assertEqual(ast.op_sel, (0, 1, 0))
+    def test_clamping_extremes(self) -> None:
+        """Values > 1.0 clamp to 0xFFFF, negative values clamp to 0x0000."""
+        res1 = run_pk_binop("v_cvt_pknorm_u16_f16", 0x4000, 0x7C00, name="ps_pknorm_u16_pos_sat")
+        self.assertEqual(res1, 0xFFFFFFFF)
+        res2 = run_pk_binop("v_cvt_pknorm_u16_f16", 0xBC00, 0xFC00, name="ps_pknorm_u16_neg_sat")
+        self.assertEqual(res2, 0x00000000)
 
-def interpret_cvt_pknorm_u16_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0)) -> int:
-    return ref_cvt_pknorm_u16_f16(s0, s1, sel=sel)
+    def test_nan_produces_zero(self) -> None:
+        """NaN inputs produce 0."""
+        res = run_pk_binop("v_cvt_pknorm_u16_f16", 0x7E00, 0x7E00, name="ps_pknorm_u16_nan")
+        self.assertEqual(res, 0x00000000)
 
+    def test_op_sel_modifier(self) -> None:
+        """op_sel selects high halfwords."""
+        s0 = (0x3800 << 16) | 0x3C00  # hi: 0.5, lo: 1.0
+        s1 = (0x0000 << 16) | 0x3C00  # hi: 0.0, lo: 1.0
+        # op_sel:[0,0,0] -> lo selects s0.lo (1.0 -> 0xFFFF), hi selects s1.lo (1.0 -> 0xFFFF)
+        res1 = run_pk_binop("v_cvt_pknorm_u16_f16", s0, s1, mods="op_sel:[0,0,0]", name="ps_pknorm_u16_sel1")
+        self.assertEqual(res1, 0xFFFFFFFF)
+        # op_sel:[1,0,0] -> lo selects s0.hi (0.5 -> 0x8000), hi selects s1.lo (1.0 -> 0xFFFF)
+        res2 = run_pk_binop("v_cvt_pknorm_u16_f16", s0, s1, mods="op_sel:[1,0,0]", name="ps_pknorm_u16_sel2")
+        self.assertEqual(res2, (0xFFFF << 16) | 0x8000)
 
-class VCvtPknormU16F16ScalarInterpreterTests(unittest.TestCase):
-    def test_scalar_execution(self):
-        s0 = (0x3800 << 16) | 0x3C00
-        s1 = (0x0000 << 16) | 0x3C00
-        res = interpret_cvt_pknorm_u16_f16(s0, s1, sel=(0, 0))
-        self.assertEqual(res, 0xFFFFFFFF)
+    def test_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        res_v1 = run_pk_binop("v_cvt_pknorm_u16_f16", 0x3C00, 0x3800, alias_dst=1, name="ps_pknorm_u16_alias_v1")
+        self.assertEqual(res_v1, (0x8000 << 16) | 0xFFFF)
 
-        res_sel = interpret_cvt_pknorm_u16_f16(s0, s1, sel=(1, 0))
-        self.assertEqual(res_sel, (0xFFFF << 16) | 0x8000)
-
-class VCvtPknormU16F16SimdDivergenceTests(unittest.TestCase):
-    def test_exec_masking(self):
-        wave = WavefrontSimdState(32)
-        wave.exec_mask = 0xF0F0F0F0
-        for lane in range(32):
-            wave.set_vgpr(lane, 0, 0xCAFEBABE)
-            if (wave.exec_mask >> lane) & 1:
-                wave.set_vgpr(lane, 0, interpret_cvt_pknorm_u16_f16(0x3C00, 0x3800))
-        for lane in range(32):
-            if (wave.exec_mask >> lane) & 1:
-                self.assertEqual(wave.get_vgpr(lane, 0), (0x8000 << 16) | 0xFFFF)
-            else:
-                self.assertEqual(wave.get_vgpr(lane, 0), 0xCAFEBABE)
-
-class VCvtPknormU16F16EdgeCasesTests(unittest.TestCase):
-    def test_clamping_extremes(self):
-        self.assertEqual(ref_norm16_u16(0x4000), 0xFFFF)
-        self.assertEqual(ref_norm16_u16(0x7C00), 0xFFFF)
-        self.assertEqual(ref_norm16_u16(0xBC00), 0x0000)
-        self.assertEqual(ref_norm16_u16(0xFC00), 0x0000)
-
-    def test_nan_produces_zero(self):
-        self.assertEqual(ref_norm16_u16(0x7E00), 0x0000)
-
-class VCvtPknormU16F16TranslatorTests(unittest.TestCase):
-    def test_translation_basic(self):
+    def test_spirv_structure(self) -> None:
+        """SPIR-V translation structure verification."""
         lines = [
             "v_mov_b32 v1, 0x3C00",
             "v_mov_b32 v2, 0x3800",
@@ -422,114 +316,71 @@ class VCvtPknormU16F16TranslatorTests(unittest.TestCase):
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_pknorm_u16_basic", lines)
-        word = mrt0_words(spv)[0]
+        spv = support.translate_lines("ps_structure_pknorm_u16", lines)
+        word = support.mrt0_words(spv)[0]
         self.assertEqual(word & 0xFFFF, 0xFFFF)
         self.assertEqual((word >> 16) & 0xFFFF, 0x8000)
 
-    def test_translation_clamp_negative(self):
-        lines = [
-            "v_mov_b32 v1, 0xBC00",
-            "v_mov_b32 v2, 0xFC00",
-            "v_cvt_pknorm_u16_f16 v0, v1, v2",
-            "exp mrt0 v0, v0, v0, v0 done vm",
-            "s_endpgm",
-        ]
-        spv = translate_lines("ps_pknorm_u16_clamp", lines)
-        word = mrt0_words(spv)[0]
-        self.assertEqual(word, 0x00000000)
+    def test_mutation_detection(self) -> None:
+        """Unsigned unorm16 is strictly distinguished from signed snorm16."""
+        res = run_pk_binop("v_cvt_pknorm_u16_f16", 0xBC00, 0xBC00, name="ps_pknorm_u16_mut")
+        # unorm16 clamps negative to 0x00000000
+        self.assertEqual(res, 0x00000000)
+        # snorm16 would produce 0x80018001
+        self.assertNotEqual(res, (0x8001 << 16) | 0x8001)
 
-# -----------------------------------------------------------------------------
-# Opcode 4: v_pack_b32_f16
-# -----------------------------------------------------------------------------
-
-def ref_pack_half(w: int, sel: int, abs_mod: bool = False, neg_mod: bool = False) -> int:
-    h = (w >> (16 * sel)) & MASK16
-    if abs_mod:
-        h &= 0x7FFF
-    if neg_mod:
-        h ^= 0x8000
-    return h
+    def test_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pknorm_u16", ["v_cvt_pknorm_u16_f16 v0", "s_endpgm"])
 
 
-def ref_pack_b32_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0),
-                     abs_mods: tuple[bool, bool] = (False, False),
-                     neg_mods: tuple[bool, bool] = (False, False)) -> int:
-    h0 = ref_pack_half(s0, sel[0], abs_mods[0], neg_mods[0])
-    h1 = ref_pack_half(s1, sel[1], abs_mods[1], neg_mods[1])
-    return ((h1 << 16) | h0) & MASK32
+# ==============================================================================
+# Suite 4: v_pack_b32_f16 (Pack Two 16-bit Halves)
+# ==============================================================================
 
+class TestVPackB32F16(unittest.TestCase):
+    """v_pack_b32_f16 tests."""
 
-class VPackB32F16OracleTests(unittest.TestCase):
-    def test_basic_pack(self):
-        self.assertEqual(ref_pack_b32_f16(0x00003C00, 0x00004000), 0x40003C00)
-        self.assertEqual(ref_pack_b32_f16(0x12345678, 0x9ABCDEF0), 0xDEF05678)
+    def test_basic_pack(self) -> None:
+        """Pack low 16 bits of each operand into one 32-bit dword."""
+        res1 = run_pk_binop("v_pack_b32_f16", 0x00003C00, 0x00004000, name="ps_pack_ref1")
+        self.assertEqual(res1, 0x40003C00)
+        res2 = run_pk_binop("v_pack_b32_f16", 0x12345678, 0x9ABCDEF0, name="ps_pack_ref2")
+        self.assertEqual(res2, 0xDEF05678)
 
-    def test_op_sel(self):
+    def test_op_sel_permutations(self) -> None:
+        """op_sel specifies which 16-bit half is read from each source."""
         s0 = 0x11112222
         s1 = 0x33334444
-        self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(1, 0)), 0x44441111)
-        self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(0, 1)), 0x33332222)
-        self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(1, 1)), 0x33331111)
+        # [1,0,0]: lo from s0.hi (0x1111), hi from s1.lo (0x4444)
+        res1 = run_pk_binop("v_pack_b32_f16", s0, s1, mods="op_sel:[1,0,0]", name="ps_pack_sel1")
+        self.assertEqual(res1, 0x44441111)
+        # [0,1,0]: lo from s0.lo (0x2222), hi from s1.hi (0x3333)
+        res2 = run_pk_binop("v_pack_b32_f16", s0, s1, mods="op_sel:[0,1,0]", name="ps_pack_sel2")
+        self.assertEqual(res2, 0x33332222)
+        # [1,1,0]: lo from s0.hi (0x1111), hi from s1.hi (0x3333)
+        res3 = run_pk_binop("v_pack_b32_f16", s0, s1, mods="op_sel:[1,1,0]", name="ps_pack_sel3")
+        self.assertEqual(res3, 0x33331111)
 
-class VPackB32F16AstTests(unittest.TestCase):
-    def test_ast_construction(self):
-        ast = PackedInstructionAST(
-            mnemonic="v_pack_b32_f16",
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
-            op_sel=(0, 1, 0),
-            abs_mods=(True, False),
-            neg_mods=(False, True),
-        )
-        self.assertEqual(ast.mnemonic, "v_pack_b32_f16")
-        self.assertEqual(ast.abs_mods, (True, False))
-        self.assertEqual(ast.neg_mods, (False, True))
-
-def interpret_pack_b32_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0),
-                           abs_mods: tuple[bool, bool] = (False, False),
-                           neg_mods: tuple[bool, bool] = (False, False)) -> int:
-    return ref_pack_b32_f16(s0, s1, sel=sel, abs_mods=abs_mods, neg_mods=neg_mods)
-
-
-class VPackB32F16ScalarInterpreterTests(unittest.TestCase):
-    def test_scalar_execution(self):
-        res = interpret_pack_b32_f16(0xAAAA3C00, 0xBBBB4000)
-        self.assertEqual(res, 0x40003C00)
-
-class VPackB32F16SimdDivergenceTests(unittest.TestCase):
-    def test_exec_masking(self):
-        wave = WavefrontSimdState(32)
-        wave.exec_mask = 0xAAAAAAAA
-        for lane in range(32):
-            wave.set_vgpr(lane, 0, 0x0)
-            if (wave.exec_mask >> lane) & 1:
-                val = interpret_pack_b32_f16(lane, lane << 8)
-                wave.set_vgpr(lane, 0, val)
-        for lane in range(32):
-            if (wave.exec_mask >> lane) & 1:
-                exp = ((lane << 8) << 16) | lane
-                self.assertEqual(wave.get_vgpr(lane, 0), exp)
-            else:
-                self.assertEqual(wave.get_vgpr(lane, 0), 0x0)
-
-class VPackB32F16EdgeCasesTests(unittest.TestCase):
-    def test_modifiers_order(self):
-        h = ref_pack_half(0xBC00, sel=0, abs_mod=True, neg_mod=True)
-        self.assertEqual(h, 0xBC00)
-
-        h_abs = ref_pack_half(0xBC00, sel=0, abs_mod=True, neg_mod=False)
-        self.assertEqual(h_abs, 0x3C00)
-
-    def test_nan_payloads_preserved(self):
+    def test_nan_payloads_preserved(self) -> None:
+        """NaN bit patterns preserved verbatim."""
         qnan = 0x7E01
         snan = 0x7C01
-        res = ref_pack_b32_f16(qnan, snan)
+        res = run_pk_binop("v_pack_b32_f16", qnan, snan, name="ps_pack_nan")
         self.assertEqual(res, (snan << 16) | qnan)
 
-class VPackB32F16TranslatorTests(unittest.TestCase):
-    def test_translation_basic(self):
+    def test_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        s0 = 0x12345678
+        s1 = 0x9ABCDEF0
+        res_v1 = run_pk_binop("v_pack_b32_f16", s0, s1, alias_dst=1, name="ps_pack_alias_v1")
+        self.assertEqual(res_v1, 0xDEF05678)
+        res_v2 = run_pk_binop("v_pack_b32_f16", s0, s1, alias_dst=2, name="ps_pack_alias_v2")
+        self.assertEqual(res_v2, 0xDEF05678)
+
+    def test_spirv_structure(self) -> None:
+        """SPIR-V translation structure verification."""
         lines = [
             "v_mov_b32 v1, 0x12345678",
             "v_mov_b32 v2, 0x9ABCDEF0",
@@ -537,21 +388,62 @@ class VPackB32F16TranslatorTests(unittest.TestCase):
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_pack_basic", lines)
-        word = mrt0_words(spv)[0]
+        spv = support.translate_lines("ps_structure_pack", lines)
+        word = support.mrt0_words(spv)[0]
         self.assertEqual(word, 0xDEF05678)
 
-    def test_translation_opsel(self):
+    def test_mutation_detection(self) -> None:
+        """Halfword packing order is strictly distinguished."""
+        s0 = 0x12345678
+        s1 = 0x9ABCDEF0
+        res = run_pk_binop("v_pack_b32_f16", s0, s1, name="ps_pack_mut")
+        self.assertEqual(res, 0xDEF05678)
+        # Swapped operands yields 0x5678DEF0
+        self.assertNotEqual(res, 0x5678DEF0)
+
+    def test_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pack", ["v_pack_b32_f16 v0", "s_endpgm"])
+
+
+# ==============================================================================
+# Suite 5: Integration & Conversion Pipelines
+# ==============================================================================
+
+class TestVPkCvtPipelines(unittest.TestCase):
+    """Multi-instruction pipeline integration tests."""
+
+    def test_cvt_pkrtz_then_pack(self) -> None:
+        """Chained: v_cvt_pkrtz_f16_f32 -> v_pack_b32_f16."""
         lines = [
-            "v_mov_b32 v1, 0x12345678",
-            "v_mov_b32 v2, 0x9ABCDEF0",
-            "v_pack_b32_f16 v0, v1, v2 op_sel:[1,1,0]",
+            "v_mov_b32 v1, 1.0",
+            "v_mov_b32 v2, 2.0",
+            "v_mov_b32 v3, 3.0",
+            "v_mov_b32 v4, 4.0",
+            "v_cvt_pkrtz_f16_f32 v5, v1, v2",   # hi: 2.0 (0x4000), lo: 1.0 (0x3C00)
+            "v_cvt_pkrtz_f16_f32 v6, v3, v4",   # hi: 4.0 (0x4400), lo: 3.0 (0x4200)
+            "v_pack_b32_f16 v0, v5, v6 op_sel:[1,1,0]",  # lo: 2.0 (0x4000), hi: 4.0 (0x4400)
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_pack_opsel", lines)
-        word = mrt0_words(spv)[0]
-        self.assertEqual(word, 0x9ABC1234)
+        spv = support.translate_lines("ps_chain_pkrtz_pack", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x44004000)
+
+    def test_pknorm_chain(self) -> None:
+        """Chained: unpack f32, convert to pknorm."""
+        lines = [
+            "v_mov_b32 v1, 1.0",
+            "v_mov_b32 v2, -1.0",
+            "v_cvt_pkrtz_f16_f32 v3, v1, v2",   # hi: -1.0 (0xBC00), lo: 1.0 (0x3C00)
+            "v_cvt_pknorm_i16_f16 v0, v3, v3 op_sel:[0,1,0]",  # lo: 1.0 -> 0x7FFF, hi: -1.0 -> 0x8001
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_chain_pknorm", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], (0x8001 << 16) | 0x7FFF)
 
 
 if __name__ == "__main__":
