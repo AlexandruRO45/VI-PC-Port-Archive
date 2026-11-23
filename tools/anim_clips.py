@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_index  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 SYSTEM = 0x50000000
 CHANNEL_NAMES = ("static_quat", "static_vec3", "static_float", "raw_float", "quantize_float",
@@ -989,16 +990,6 @@ def decode_one(path, offset, frames):
     return d
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive", help="anim.rpf")
@@ -1024,7 +1015,7 @@ def main():
     if a.out:
         if os.path.isdir(a.out):
             ap.error(f"{a.out} is a directory, not a .json file")
-        if same_output_path(a.archive, a.out):
+        if same_report_path(a.archive, a.out):
             ap.error("output must not overwrite the input archive")
     try:
         if a.decode is not None:
