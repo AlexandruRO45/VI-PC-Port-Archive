@@ -65,6 +65,9 @@ class AssemblyOverPipes(unittest.TestCase):
             src, out = os.path.join(tmp, "in"), os.path.join(tmp, "out")
             os.makedirs(src)
             open(os.path.join(src, "cs_ok.s"), "w").close()
+            os.makedirs(out)
+            with open(os.path.join(out, "cs_ok.spvasm"), "w") as f:  # left by an earlier rejected run
+                f.write(BROKEN)
             status, _ = run_main(src, out, MINIMAL_CS)
             self.assertIn(status, (0, None))
             self.assertIn("cs_ok.spv", os.listdir(out))

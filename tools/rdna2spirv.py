@@ -17378,6 +17378,8 @@ def main():
             return 2
         if r.returncode == 0:
             valid += 1
+            if a.no_asm:  # a text left by an earlier rejected run, or a run without --no-asm, is stale now
+                Path(sa).unlink(missing_ok=True)
             try:
                 fssm_sidecar = os.path.join(a.fssm_dir, name + ".fssm") if a.fssm_dir else None
                 meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
