@@ -282,5 +282,33 @@ class TestVPkMaxU16SIMDDivergence(unittest.TestCase):
                 self.assertEqual(wave.lanes[lane][0], 0xCAFEBABE)
 
 
+class TestVPkMaxU16RegisterAliasing(unittest.TestCase):
+    """Register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = P(100, 400)
+        mach.vgprs[1] = P(200, 300)
+        # v0 = max(v0, v1)
+        mach.step(VPkMaxU16Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1)))
+        self.assertEqual(mach.vgprs[0], P(200, 400))
+        self.assertEqual(mach.vgprs[1], P(200, 300))
+
+    def test_dst_aliases_src1(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = P(100, 400)
+        mach.vgprs[1] = P(200, 300)
+        # v1 = max(v0, v1)
+        mach.step(VPkMaxU16Inst(Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1)))
+        self.assertEqual(mach.vgprs[1], P(200, 400))
+        self.assertEqual(mach.vgprs[0], P(100, 400))
+
+    def test_all_operands_aliased(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = P(1234, 5678)
+        mach.step(VPkMaxU16Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0)))
+        self.assertEqual(mach.vgprs[0], P(1234, 5678))
+
+
 if __name__ == '__main__':
     unittest.main()
