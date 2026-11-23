@@ -801,5 +801,56 @@ class TestValuCvtNormU16F32SIMD(unittest.TestCase):
             self.assertEqual(res[lane], 0x12345678)
             self.assertEqual(simd.get_vgpr_u32(0, lane), 0x12345678)
 
+
+# ---------------------------------------------------------------------------
+# Register aliasing and in-place operand preservation
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormU16F32Aliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_in_place_self_aliasing_low_half(self) -> None:
+        # v0 = 1.0f (0x3F800000)
+        self.interp.set_vgpr_u32(0, ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_u16_f32 v0.l, v0")
+        self.assertEqual(res & MASK16, 65535)
+        self.assertEqual(res >> 16, ONE_F32 >> 16)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (ONE_F32 & 0xFFFF0000) | 65535)
+
+    def test_in_place_self_aliasing_high_half(self) -> None:
+        # v0 = HALF_F32 (0x3F000000)
+        self.interp.set_vgpr_u32(0, HALF_F32)
+        res = self.interp.execute_asm("v_cvt_norm_u16_f32 v0.h, v0")
+        self.assertEqual(res >> 16, 32768)
+        self.assertEqual(res & MASK16, HALF_F32 & MASK16)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (32768 << 16) | (HALF_F32 & MASK16))
+
+    def test_distinct_registers_non_interference(self) -> None:
+        self.interp.set_vgpr_u32(0, 0xCAFEBABE)
+        self.interp.set_vgpr_u32(1, HALF_F32)
+        res = self.interp.execute_asm("v_cvt_norm_u16_f32 v0.l, v1")
+        self.assertEqual(res & MASK16, 32768)
+        self.assertEqual(res >> 16, 0xCAFE)
+        self.assertEqual(self.interp.get_vgpr_u32(1), HALF_F32)
+
+    def test_multi_instruction_aliased_pipeline(self) -> None:
+        self.interp.set_vgpr_u32(0, 0x11112222)
+        self.interp.set_vgpr_u32(1, ONE_F32)
+        self.interp.set_vgpr_u32(2, HALF_F32)
+
+        # Write low half of v0
+        self.interp.execute_asm("v_cvt_norm_u16_f32 v0.l, v1")
+        self.assertEqual(self.interp.get_vgpr_half(0, False), 65535)
+        self.assertEqual(self.interp.get_vgpr_half(0, True), 0x1111)
+
+        # Write high half of v0
+        self.interp.execute_asm("v_cvt_norm_u16_f32 v0.h, v2")
+        self.assertEqual(self.interp.get_vgpr_half(0, True), 32768)
+        self.assertEqual(self.interp.get_vgpr_half(0, False), 65535)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (32768 << 16) | 65535)
+
 if __name__ == "__main__":
     unittest.main()
