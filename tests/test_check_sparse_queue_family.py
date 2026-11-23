@@ -103,6 +103,21 @@ class RunPassTest(unittest.TestCase):
             with self.subTest(out=out), self.assertRaises(AssertionError):
                 self.run_dump_with(Completed(0xC0000005, out), DESTROY_TRACE)
 
+    def test_each_case_and_the_final_line_must_be_there_exactly_once(self) -> None:
+        # Review on #4900: a repeated case stood in for a missing one, and any line starting with the final line passed.
+        copy_row = next(ln for ln in PASS_OUT.splitlines(True) if "LAYER_MAP_COPY_" in ln)
+        direct_row = next(ln for ln in PASS_OUT.splitlines(True) if "LAYER_MAP_DIRECT_" in ln)
+        outputs = {"repeated case for a missing one": PASS_OUT.replace(copy_row, direct_row),
+                   "extra case": PASS_OUT + direct_row,
+                   "longer final line": PASS_OUT.replace("LAYER_FINAL PASS", "LAYER_FINAL PASSING"),
+                   "prefixed final line": PASS_OUT.replace("LAYER_FINAL PASS", "X LAYER_FINAL PASS"),
+                   "two final lines": PASS_OUT + "LAYER_FINAL PASS\n"}
+        for name, out in outputs.items():
+            with self.subTest(name), self.assertRaises(AssertionError):
+                self.run_with(Completed(0, out))
+            with self.subTest(name + ", allowed crash"), self.assertRaises(AssertionError):
+                self.run_dump_with(Completed(0xC0000005, out), DESTROY_TRACE)
+
     def test_api_dump_other_exit_codes_fail(self) -> None:
         for code in (1, 2, 0xC0000374, 0xC0000409):
             with self.subTest(code=hex(code)), self.assertRaises(AssertionError):

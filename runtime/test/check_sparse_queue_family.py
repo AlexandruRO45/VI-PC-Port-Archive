@@ -32,6 +32,8 @@ INDICES = re.compile(r"pQueueFamilyIndices\[(\d+)\]:\s+const uint32_t = (\d+)")
 # Each of the two runs gets 30 s, so both together stay inside the CTest TIMEOUT of 65 s (runtime/CMakeLists.txt).
 RUN_TIMEOUT = 30
 ACCESS_VIOLATION = 0xC0000005   # STATUS_ACCESS_VIOLATION, as Windows reports it in the exit code
+CASES = ["LAYER_MAP_COMPUTE_COPY_COMPUTE", "LAYER_MAP_COPY_COPY_COMPUTE", "LAYER_MAP_DIRECT_COPY_COMPUTE"]   # sorted
+FINAL = re.compile(r"^LAYER_FINAL PASS$", re.M)
 CALL_HEAD = re.compile(r"^(vk\w+)\(", re.M)
 CASE = re.compile(r"^RESULT (LAYER_MAP_(?:DIRECT|COPY|COMPUTE)_COPY_COMPUTE) PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536$", re.M)
 
@@ -157,7 +159,7 @@ def run_pass(exe: Path, env: Mapping[str, str], cwd: Path, trace_dir: Path | Non
         print(out[-7000:], file=sys.stderr)
         raise AssertionError(f"Leonida GPU test failed exit={run.returncode}")
     kinds = sorted(CASE.findall(out))
-    if len(kinds) != 3 or "LAYER_FINAL PASS" not in out:
+    if kinds != CASES or len(FINAL.findall(out)) != 1:
         raise AssertionError(f"GPU byte verification missing: cases={kinds}; tail={out[-2000:]}")
     if teardown_crash:
         print("NOTE: the api_dump run crashed in vkDestroyDevice (0xC0000005) after every case passed; "
