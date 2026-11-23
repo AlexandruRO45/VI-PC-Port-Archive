@@ -501,6 +501,23 @@ class TestValuFmaF32AST(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertAlmostEqual(bits_to_f32(words[0]), 0.75, places=6)
 
+class TestValuFmaF32ScalarExecution(unittest.TestCase):
+    """Stage 21: Scalar execution tests for v_fma_f32 clamp and omod."""
+
+    def test_fma_chained_accumulation(self):
+        # v3 = v0 * v1 + v2; v3 = v0 * v1 + v3
+        lines = [
+            "v_mov_b32 v0, 0x3e800000",  # 0.25
+            "v_mov_b32 v1, 0x3f000000",  # 0.5
+            "v_mov_b32 v2, 0x00000000",
+            "v_fma_f32 v3, v0, v1, v2 clamp",  # 0.125
+            "v_fma_f32 v3, v0, v1, v3 clamp",  # 0.25
+            "exp mrt0, v3, v3, v3, v3 done",
+            "s_endpgm",
+        ]
+        words = support.mrt0_words(support.translate_lines(next_test_id("ps_fma_chain"), lines))
+        self.assertAlmostEqual(bits_to_f32(words[0]), 0.25, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
