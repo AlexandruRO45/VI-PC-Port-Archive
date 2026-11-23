@@ -279,5 +279,38 @@ class TestLshlrevConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(words[2], 0x2222)
 
 
+class TestLshlrevBoundaryAndExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for v_lshlrev_b64."""
+
+    def test_ieee754_double_precision_bit_patterns(self):
+        patterns = [
+            (0x00000000_00000000, 1),   # +0.0
+            (0x80000000_00000000, 1),   # -0.0
+            (0x3FF00000_00000000, 2),   # +1.0
+            (0xBFF00000_00000000, 4),   # -1.0
+            (0x7FF00000_00000000, 8),   # +inf
+            (0xFFF00000_00000000, 16),  # -inf
+            (0x7FF80000_00000000, 32),  # qNaN
+            (0x7FF00000_00000001, 63),  # sNaN
+            (0x00000000_00000001, 1),   # smallest subnormal
+            (0xFFFFFFFF_FFFFFFFF, 63),  # all ones
+        ]
+        for idx, (v64, sh) in enumerate(patterns):
+            with self.subTest(v64=hex(v64), sh=sh):
+                exp_lo, exp_hi = v_lshlrev_b64_oracle(sh, v64)
+                lo32 = v64 & MASK32
+                hi32 = (v64 >> 32) & MASK32
+                lines = [
+                    f"v_mov_b32 v2, {lo32:#x}",
+                    f"v_mov_b32 v3, {hi32:#x}",
+                    f"v_lshlrev_b64 v[0:1], {sh}, v[2:3]",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_lshlrev_ps(lines, f"ps_lshlrev_ext_{idx}")
+                self.assertEqual(words[0], exp_lo)
+                self.assertEqual(words[1], exp_hi)
+
+
 if __name__ == '__main__':
     unittest.main()
