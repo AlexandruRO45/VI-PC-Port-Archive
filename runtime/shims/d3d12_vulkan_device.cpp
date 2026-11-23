@@ -382,6 +382,19 @@ bool rgba8_any_order(DXGI_FORMAT format) {
     }
 }
 
+// D3D12 allows RTV view casts between UNORM and UNORM_SRGB on typed 8-bit RGBA/BGRA/BGRX resources.
+bool is_unorm_srgb_rtv_pair(DXGI_FORMAT a, DXGI_FORMAT b) {
+    switch (a) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return b == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return b == DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return b == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return b == DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM: return b == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return b == DXGI_FORMAT_B8G8R8X8_UNORM;
+    default: return false;
+    }
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -407,12 +420,11 @@ bool is_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
 }
 
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
+// Format compatibility (including typeless 3D resources and view format casts) is validated by the caller.
 leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
                                const D3D12_RENDER_TARGET_VIEW_DESC* view) {
-    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || vulkan_format(resource.Format, false).typeless)
-        return {};
-    if (view && (view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D ||
-                 (view->Format != DXGI_FORMAT_UNKNOWN && view->Format != resource.Format))) return {};
+    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return {};
+    if (view && view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D) return {};
     const D3D12_TEX3D_RTV slices = view ? view->Texture3D : D3D12_TEX3D_RTV{0, 0, UINT_MAX};
     if (slices.MipSlice >= resource.MipLevels) return {};
     const UINT depth = std::max(1u, UINT(resource.DepthOrArraySize) >> slices.MipSlice);
@@ -454,7 +466,9 @@ struct TextureCreateInfo {
     TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
-        info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        const bool mutable_srgb_rt = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+                                     rgba8_any_order(desc.Format);
+        info.flags = (format.typeless || mutable_srgb_rt) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
         if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
             info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
         info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
@@ -5619,9 +5633,10 @@ public:
                 plane = desc->Texture2DArray.PlaneSlice;
                 view = {rid, desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         view_slices(rd, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize)};
-            } else if (msaa && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
+            } else if (desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
+                // D3D12 allows TEXTURE2DMS/TEXTURE2DMSARRAY RTVs on 1-sample TEXTURE2D resources too.
                 view = {rid, 0, 0, 1};
-            } else if (msaa && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) {
+            } else if (desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) {
                 // Multisample textures have one mip, so only the slice range is chosen (as for the DSV).
                 view = {rid, 0, desc->Texture2DMSArray.FirstArraySlice,
                         view_slices(rd, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize)};
@@ -5646,11 +5661,13 @@ public:
         // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view
         // format, so the reinterpretation is the typeless path's. Only a UNORM image is advertised,
         // as that is what the clear path reinterprets.
+        // Typed RGBA8/BGRA8/BGRX8 UNORM <-> UNORM_SRGB RTV casts are also valid in D3D12 without a castable list.
         const bool cast_listed = r && requested != rd.Format && rgba8_any_order(rd.Format) &&
                                  rgba8_any_order(requested) && r->lists_castable_format(requested);
         const bool listed = requested == rd.Format ||
                             (r && r->has_view_format_list() && r->allows_view_format(named.format));
-        if (typeless_color || cast_listed ||
+        const bool srgb_pair_cast = !(r && r->has_view_format_list()) && is_unorm_srgb_rtv_pair(rd.Format, requested);
+        if (typeless_color || cast_listed || srgb_pair_cast ||
             (requested != rd.Format && listed && rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
             const int family = leonida::detail::typeless_view_family(named.format);
             const bool same_family =

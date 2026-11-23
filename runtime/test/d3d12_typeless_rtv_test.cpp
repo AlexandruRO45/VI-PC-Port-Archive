@@ -725,13 +725,15 @@ int main() {
             if (!host_casts)
                 std::printf("typeless RTV: host has no relaxed format casting; the 2 castable 4x MSAA cases were "
                             "compared with an RGBA8_TYPELESS resource on the host\n");
-            // MSAA vs 1x view-dimension mismatches, out-of-range MSAA array slices, and unlisted castable formats.
+            // MSAA view-dimension mismatches (non-MS views on MSAA resources), out-of-range MSAA array slices,
+            // and unlisted castable formats. (1-sample TEXTURE2DMS is valid on D3D12.)
             D3D12_RENDER_TARGET_VIEW_DESC bad_msaa{};
             bad_msaa.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
             bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
             if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad_msaa, 1, 1, 4)) return 1;
-            bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
-            if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad_msaa, 1, 1, 1)) return 1;
+            bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            bad_msaa.Texture2DArray = {0, 0, 1, 0};
+            if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad_msaa, 1, 1, 4)) return 1;
             bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
             bad_msaa.Texture2DMSArray = {3, 2};
             if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad_msaa, 1, 4, 4)) return 1;
