@@ -105,6 +105,10 @@ class SqrtF64(unittest.TestCase):
         self.assertEqual(run("v_sqrt_f64_e64 v[4:5], 0x40100000"), bits(2.0))
         self.assertEqual(run("v_sqrt_f64 v[4:5], 0x3ff80000"), bits(math.sqrt(1.5)))
 
+    def test_a_whole_binary64_word_written_by_hand_is_that_value(self):
+        # wider than a dword: not a high dword (a low-word reading would build +0.0)
+        self.assertEqual(run("v_sqrt_f64 v[4:5], 0x4010000000000000"), bits(2.0))   # 4.0
+
     def test_random_operands(self):
         rng = random.Random(0x5A7F64)
         pool = [POS_ZERO, NEG_ZERO, POS_INF, NEG_INF, QNAN, MIN_SUBNORMAL, MIN_NORMAL, DBL_MAX, bits(1.0), bits(-1.0)]

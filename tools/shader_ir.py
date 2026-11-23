@@ -217,7 +217,9 @@ def parse_line(line):
         for src, spelling in zip(args[1:], parts[1:]):
             # LLVM prints inline integers in decimal and the separate literal dword in hex,
             # even for two sources with the same numeric value (e.g. 0x1 and 1).
-            if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
+            # A whole binary64 word written by hand (wider than a dword) is the value it spells, not a high dword.
+            if src["k"] == "imm" and -0x80000000 <= src["v"] <= 0xFFFFFFFF \
+                    and ("0x" in spelling or not -16 <= src["v"] <= 64):
                 src["f64_literal"] = True
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}
 

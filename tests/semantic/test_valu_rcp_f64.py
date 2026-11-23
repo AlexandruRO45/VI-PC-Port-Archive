@@ -106,6 +106,10 @@ class RcpF64(unittest.TestCase):
         self.assertEqual(run("v_rcp_f64_e64 v[4:5], 0x40100000"), bits(0.25))
         self.assertEqual(run("v_rcp_f64 v[4:5], 0xc0100000"), bits(-0.25))
 
+    def test_a_whole_binary64_word_written_by_hand_is_that_value(self):
+        # wider than a dword: not a high dword (a low-word reading would build +0.0)
+        self.assertEqual(run("v_rcp_f64 v[4:5], 0x4010000000000000"), bits(0.25))   # 4.0
+
     def test_random_operands(self):
         rng = random.Random(0x2CF64)
         pool = [POS_ZERO, NEG_ZERO, POS_INF, NEG_INF, QNAN, MIN_SUBNORMAL, MIN_NORMAL, DBL_MAX, bits(1.0), bits(-1.0)]
