@@ -227,5 +227,15 @@ class VMadI16TranslatorIntegrationTests(unittest.TestCase):
         self.assertNotEqual(mad_res, add_res)
         self.assertNotEqual(mad_res, ref_mul_lo_u16(a, b))
 
+class VMadU16OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_mad_u16."""
+
+    def test_basic_unsigned_mad(self):
+        self.assertEqual(ref_mad_u16(10, 20, 5), 205)
+
+    def test_unsigned_wrapping(self):
+        # 1000 * 100 + 50 = 100050 = 0x186D2 -> 0x86D2 = 34514
+        self.assertEqual(ref_mad_u16(1000, 100, 50), 34514)
+
 if __name__ == "__main__":
     unittest.main()
