@@ -117,6 +117,23 @@ class MetaToXmlPathsTest(unittest.TestCase):
             self.assertNotIn("pso ok", result.stdout)
             self.assertFalse(out.exists(), "the value is refused before the output folder is made")
 
+    def test_zero_limit_still_converts_every_blob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deps = build_stub_deps(root / "deps")
+            self.assertEqual(deps.returncode, 0, deps.stdout + deps.stderr)
+            carve, out = root / "carve", root / "out"
+            write_two_pso_blobs(carve)
+
+            result = subprocess.run(
+                [*POWERSHELL, "-File", str(SCRIPT), "-Carve", str(carve), "-Out", str(out),
+                 "-CodeWalker", str(root / "deps"), "-Limit", "0"],
+                capture_output=True, text=True, timeout=60,
+            )
+            # 0 is the default and means "every blob"; the new range must not turn it into a refusal.
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("pso ok 2 failed 0", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
