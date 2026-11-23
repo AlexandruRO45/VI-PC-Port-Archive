@@ -564,5 +564,27 @@ class TestSBfmB64Reference(unittest.TestCase):
         self.assertEqual(ref_bfm_b64(0, 10), 0)
 
 
+def step_scalar_bfm_b64(state: SaluState, instr: Instruction) -> None:
+    if instr.opcode != "s_bfm_b64":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    w = state.read_u32(instr.src0)
+    o = state.read_u32(instr.src1)
+    val = ref_bfm_b64(w, o)
+    state.write_u64(instr.dst.index_or_val, val)
+
+
+class TestSBfmB64ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for s_bfm_b64."""
+
+    def test_scalar_interpreter_execution(self):
+        state = SaluState()
+        state.write_u32(0, 8)
+        state.write_u32(1, 32)
+        instr = Instruction("s_bfm_b64", Operand.sgpr64(2), Operand.sgpr32(0), Operand.sgpr32(1))
+        step_scalar_bfm_b64(state, instr)
+        self.assertEqual(state.sgprs[2], 0)
+        self.assertEqual(state.sgprs[3], 0xFF)
+
+
 if __name__ == "__main__":
     unittest.main()
