@@ -585,6 +585,24 @@ class TestDsWriteB16SIMD(unittest.TestCase):
         for l in range(32):
             self.assertEqual(lds.read_u16(l * 4), 0xA000 + l)
 
+class TestDsWriteB16Translator(unittest.TestCase):
+    def test_translator_write_b16_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 0x12345678",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v3, 0x0000abcd",
+            "ds_write_b16 v1, v3 offset:2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v4, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "buffer_store_dword v4, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_write_b16_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 0xABCD5678)
+
 
 if __name__ == "__main__":
     unittest.main()
