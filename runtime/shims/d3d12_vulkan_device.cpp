@@ -2701,9 +2701,15 @@ public:
     // be above one. Viewport, scissor, topology, vertex strides, stencil reference and blend factor are dynamic,
     // set from the list's state at each draw.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+        // D3D12 permits shaderless PSOs. This path builds a complete Vulkan primitive-shading pipeline,
+        // which requires a vertex stage (VUID-VkGraphicsPipelineCreateInfo-stage-02096).
+        if (!desc.VS.BytecodeLength) {
+            log_once("Vulkan graphics pipelines require a vertex shader; stage", 0);
+            return E_NOTIMPL;
+        }
+        if (!desc.VS.pShaderBytecode) return E_INVALIDARG;
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
-        if (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength) return E_INVALIDARG;
         if (!device_.arena.mapped) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
             return E_NOTIMPL;
@@ -2787,7 +2793,7 @@ public:
                                                 desc.RasterizerState.SlopeScaledDepthBias,
                                                 desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
-            if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
+            if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // optional GS or PS
             stage.fssm = leonida::fssm_program(
                 {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
             if (stage.fssm.empty()) {
