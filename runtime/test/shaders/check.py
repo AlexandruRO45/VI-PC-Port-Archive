@@ -623,6 +623,8 @@ def start_failure(exe, err):
 # suite: each run gets a time limit, is killed when it runs out, and counts as a failure. LEONIDA_GPU_TEST_TIMEOUT
 # sets the limit in seconds; 0 turns it off.
 DEFAULT_GPU_TEST_TIMEOUT = 120.0
+# poll() accepts a signed 32-bit millisecond timeout. Round down to whole seconds.
+MAX_GPU_TEST_TIMEOUT = (2**31 - 1) // 1000
 
 
 def gpu_test_timeout():
@@ -637,6 +639,8 @@ def gpu_test_timeout():
         sys.exit(error)
     if not math.isfinite(limit):
         sys.exit(error)
+    if limit > MAX_GPU_TEST_TIMEOUT:
+        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT exceeds {MAX_GPU_TEST_TIMEOUT} seconds: {text!r}")
     return None if limit <= 0 else limit
 
 

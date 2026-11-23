@@ -40,6 +40,15 @@ class Limit(unittest.TestCase):
         self.assertIsNone(self.limit("0"))
         self.assertIsNone(self.limit("-1"))
 
+    def test_largest_portable_whole_second_timeout(self):
+        self.assertEqual(self.limit("2147483"), 2147483)
+        for value in ("2147484", "1e100"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.limit(value)
+                self.assertIn("LEONIDA_GPU_TEST_TIMEOUT", str(ctx.exception))
+                self.assertIn(value, str(ctx.exception))
+
     def test_non_numeric_or_non_finite_limit_is_an_error(self):
         for bad in ("soon", "nan", "inf", "-inf", "1e9999"):
             with self.subTest(bad=bad):
