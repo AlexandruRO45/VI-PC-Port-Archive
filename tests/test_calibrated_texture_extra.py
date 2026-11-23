@@ -2021,8 +2021,8 @@ class TestLocalDecoder(unittest.TestCase):
             (71, 64, 64, 6, 1, 4, None),   # aligned: bytes unchanged
             (71, 17, 13, 5, 2, 1, None),   # mode-1 array
             (98, 17, 13, 5, 2, 1, 4),      # mode-1 BC7 array, prefix
-            # mip 1 stores 129 blocks (2 tile columns) but shows 128: source pitch follows storage
-            (71, 1025, 9, 2, 2, 1, None),
+            # Mip 1 spans two tile rows and stores 129 columns of blocks, with 128 visible.
+            (71, 1025, 520, 2, 2, 1, None),
         ):
             with self.subTest(fmt=fmt, dims=(w, h, mips, faces, mode, count)):
                 tile = ttpf.tile_bytes(mode)
