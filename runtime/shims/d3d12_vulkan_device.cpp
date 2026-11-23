@@ -2836,7 +2836,8 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
 
 // CachedPSO as the PC runtime checks it before creating the PSO (src/cached_pso.h has the measured answers).
 HRESULT check_cached_pso(const leonida::cached_pso::Identity& identity, const leonida::cached_pso::Key& key,
-                         const D3D12_CACHED_PIPELINE_STATE& cached) {
+                         const D3D12_CACHED_PIPELINE_STATE& cached,
+                         HRESULT description_mismatch = E_INVALIDARG) {
     if (!cached.pCachedBlob) return S_OK;
     if (!cached.CachedBlobSizeInBytes) return E_INVALIDARG;
     using leonida::cached_pso::Check;
@@ -2845,6 +2846,7 @@ HRESULT check_cached_pso(const leonida::cached_pso::Identity& identity, const le
     case Check::accepted: return S_OK;
     case Check::other_adapter: return D3D12_ERROR_ADAPTER_NOT_FOUND;
     case Check::other_driver: return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    case Check::other_description: return description_mismatch;
     default: return E_INVALIDARG;
     }
 }
@@ -5898,7 +5900,8 @@ public:
         PipelineStream stream;
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
         leonida::cached_pso::Key key = pipeline_key(stream);
-        if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, stream.graphics.CachedPSO); FAILED(hr))
+        if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, stream.graphics.CachedPSO,
+                                                D3D12_ERROR_DRIVER_VERSION_MISMATCH); FAILED(hr))
             return d3d12_trace::result(method, hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());

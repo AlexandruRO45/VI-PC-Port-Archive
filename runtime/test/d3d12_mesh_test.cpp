@@ -222,7 +222,7 @@ int main() {
         EXPECT(create(device.p, cached_stream, cached_pso) == S_OK && cached_pso.p);
         Stream changed = cached_stream;
         changed.add(MaskSubobject{.inner = 0});
-        EXPECT(create(device.p, changed, refused) == E_INVALIDARG && !refused.p);
+        EXPECT(create(device.p, changed, refused) == D3D12_ERROR_DRIVER_VERSION_MISMATCH && !refused.p);
         Stream empty_cache = mesh_stream;
         empty_cache.add(CacheSubobject{.inner = {blob->GetBufferPointer(), 0}});
         EXPECT(create(device.p, empty_cache, refused) == E_INVALIDARG && !refused.p);
