@@ -23,7 +23,11 @@ extern "C" {
 
 // Exported by every msvcp140.dll, Windows' and Wine's; no longer declared by the 14.4x headers. The deadline is
 // absolute, in TIME_UTC seconds and nanoseconds, and the result uses _Thrd_result's values (0, or 2 on timeout).
+// Up to 14.38 (VS 17.8) <xthreads.h> still declares it, with a different spec, so take the header's declaration
+// there and let msvcprt.lib define it; declaring it again does not compile (C2556/C2371). 14.38 is _MSC_VER 1938.
+#if _MSC_VER >= 1940
 __declspec(dllimport) int __cdecl _Cnd_timedwait(_Cnd_t, _Mtx_t, const _timespec64*) noexcept;
+#endif
 
 _Thrd_result __stdcall _Cnd_timedwait_for_unchecked(_Cnd_t cond, _Mtx_t mtx, unsigned int ms) noexcept {
     _timespec64 deadline{};
@@ -43,6 +47,10 @@ _Thrd_result __stdcall _Cnd_timedwait_for(_Cnd_t cond, _Mtx_t mtx, unsigned int 
     return _Cnd_timedwait_for_unchecked(cond, mtx, ms);
 }
 
+// Up to 14.38 these six are declared by <xthreads.h> (without noexcept) and defined by msvcprt.lib's
+// sharedmutex.obj, the member this file exists to keep out of the link on 14.4x. Defining them again there
+// does not compile (C2382: different exception specification), so leave them to the CRT on 14.38.
+#if _MSC_VER >= 1940
 void __cdecl _Smtx_lock_exclusive(_Smtx_t* lock) noexcept {
     AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(lock));
 }
@@ -66,6 +74,7 @@ void __cdecl _Smtx_unlock_exclusive(_Smtx_t* lock) noexcept {
 void __cdecl _Smtx_unlock_shared(_Smtx_t* lock) noexcept {
     ReleaseSRWLockShared(reinterpret_cast<PSRWLOCK>(lock));
 }
+#endif
 
 void __stdcall _Thrd_sleep_for(unsigned long ms) noexcept {
     Sleep(ms);
