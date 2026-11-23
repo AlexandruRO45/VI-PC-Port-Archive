@@ -35,6 +35,7 @@ ACCESS_VIOLATION = 0xC0000005   # STATUS_ACCESS_VIOLATION, as Windows reports it
 CASES = ["LAYER_MAP_COMPUTE_COPY_COMPUTE", "LAYER_MAP_COPY_COPY_COMPUTE", "LAYER_MAP_DIRECT_COPY_COMPUTE"]   # sorted
 FINAL = re.compile(r"^LAYER_FINAL PASS$", re.M)
 CALL_HEAD = re.compile(r"^(vk\w+)\(", re.M)
+PRE_DUMP_MARK = "<before calling into implementation>"
 CASE = re.compile(r"^RESULT (LAYER_MAP_(?:DIRECT|COPY|COMPUTE)_COPY_COMPUTE) PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536$", re.M)
 
 
@@ -62,9 +63,13 @@ def check_trace(path: Path, expect_exclusive: bool) -> tuple[int, int]:
             raise AssertionError(f"incomplete or non-concurrent sparse buffer at line {i+1}: "
                                  f"{sharing}, count={n}, indices={indices}")
         records += 1
-    if records < 6 or records % 2:
+    # With pre_dump, api_dump writes each call twice, once before it (marked by PRE_DUMP_MARK) and once after; an
+    # api_dump without that setting (SDK 1.4.313) writes it once. One sparse buffer per case, so at least three calls.
+    pre_dump = any(row.strip() == PRE_DUMP_MARK for row in rows)
+    calls = records // 2 if pre_dump else records
+    if calls < len(CASES) or (pre_dump and records % 2):
         raise AssertionError(f"insufficient sparse VkBuffer create-info records: {records}")
-    return records // 2, records
+    return calls, records
 
 
 def main() -> int:

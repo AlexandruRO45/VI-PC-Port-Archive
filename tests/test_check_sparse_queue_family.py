@@ -149,7 +149,22 @@ class TraceTest(unittest.TestCase):
         record = (f"{checker.SPARSE_FLAGS})\nsharingMode: VkSharingMode = VK_SHARING_MODE_CONCURRENT\n"
                   "queueFamilyIndexCount: uint32_t = 12\n")
         record += "".join(f"pQueueFamilyIndices[{i}]: const uint32_t = {2*i}\n" for i in range(12))
-        self.assertEqual(self.check(record * 6), (3, 6))
+        self.assertEqual(self.check(checker.PRE_DUMP_MARK + "\n" + record * 6), (3, 6))
+
+    def test_trace_without_pre_dump_counts_each_record_once(self):
+        # SDK 1.4.313's api_dump has no pre_dump setting: a probe buffer and one per case give four records.
+        record = CONCURRENT_TRACE[:len(CONCURRENT_TRACE) // 6]
+        self.assertEqual(self.check(record * 4), (4, 4))
+        self.assertEqual(self.check(record * 3), (3, 3))
+        with self.assertRaises(AssertionError):
+            self.check(record * 2)
+
+    def test_pre_dump_trace_needs_both_records_of_every_call(self):
+        record = CONCURRENT_TRACE[:len(CONCURRENT_TRACE) // 6]
+        self.assertEqual(self.check(checker.PRE_DUMP_MARK + "\n" + record * 8), (4, 8))
+        for count in (4, 7):
+            with self.subTest(records=count), self.assertRaises(AssertionError):
+                self.check(checker.PRE_DUMP_MARK + "\n" + record * count)
 
     def test_each_sparse_buffer_must_supply_its_own_complete_array(self):
         for invalid in (CONCURRENT_TRACE.replace("Indices[1]", "Indices[0]", 1),
