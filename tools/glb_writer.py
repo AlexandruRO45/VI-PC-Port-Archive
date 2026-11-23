@@ -1268,11 +1268,17 @@ def write_instanced_glb(path: str, meshes: list[dict], materials: dict[str, dict
     return stats
 
 
-def read_glb_summary(data: bytes) -> dict:
+def read_glb_summary(data: bytes | bytearray | memoryview) -> dict:
     """Validate binary glTF 2.0 container headers/chunks and return parsed summary."""
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise GlbError("GLB data must be bytes-like")
-    buf = memoryview(data)
+    # An error traceback may outlive this call. Release our view even then, without
+    # releasing a caller-owned view or keeping its mapped file exported.
+    with memoryview(data) as buf:
+        return _read_glb_summary(buf)
+
+
+def _read_glb_summary(buf: memoryview) -> dict:
     actual_len = len(buf)
     if actual_len < 20:
         raise GlbError(f"GLB data too short: {actual_len} bytes")

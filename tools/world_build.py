@@ -31,6 +31,7 @@ import functools
 import hashlib
 import json
 import math
+import mmap
 import os
 import re
 import shutil
@@ -1349,10 +1350,16 @@ def _remove_stale_staging(out_dir: str) -> None:
 def _verify_staged_chunk(path: str, expected_size: int, glb_mod) -> None:
     """Raise GlbError unless the staged file is the complete GLB that write_glb reported."""
     with open(path, "rb") as f:
-        data = f.read()
-    if len(data) != expected_size:
-        raise glb_mod.GlbError(f"staged chunk {path} is {len(data)} bytes, expected {expected_size}")
-    glb_mod.read_glb_summary(data)
+        size = os.fstat(f.fileno()).st_size
+        if size != expected_size:
+            raise glb_mod.GlbError(f"staged chunk {path} is {size} bytes, expected {expected_size}")
+        if not size:  # Empty files cannot be mapped; keep the parser's existing error.
+            glb_mod.read_glb_summary(b"")
+            return
+        # Validation needs the JSON and chunk headers, not a copy of the binary payload.
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            with memoryview(mapped) as data:
+                glb_mod.read_glb_summary(data)
 
 
 def _publish_world(
