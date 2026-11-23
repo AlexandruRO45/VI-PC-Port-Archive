@@ -289,5 +289,71 @@ class TestValuRndneF32AST(unittest.TestCase):
             inst.validate()
 
 
+class VALURegisterState:
+    """Scalar architectural register state model for single-lane VALU execution."""
+
+    def __init__(self):
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+
+    def read_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.vgprs[op.reg_idx]
+        elif op.kind == OperandKind.SGPR:
+            return self.sgprs[op.reg_idx]
+        elif op.kind in (OperandKind.LITERAL32, OperandKind.INLINE_FLOAT):
+            return op.raw_bits
+        raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def write_vgpr(self, reg_idx: int, val: int) -> None:
+        self.vgprs[reg_idx] = u32(val)
+
+    def execute(self, inst: ASTInstruction) -> int:
+        inst.validate()
+        src_val = self.read_operand(inst.src0)
+        res = ref_rndne_f32(src_val, clamp=inst.clamp)
+        self.write_vgpr(inst.dst.reg_idx, res)
+        return res
+
+
+class TestValuRndneF32ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def test_interpreter_vgpr_source(self):
+        state = VALURegisterState()
+        state.vgprs[1] = f32_to_bits(2.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        res = state.execute(inst)
+        self.assertEqual(res, F32_TWO)
+        self.assertEqual(state.vgprs[0], F32_TWO)
+        self.assertEqual(state.vgprs[1], f32_to_bits(2.5))
+
+    def test_interpreter_sgpr_source(self):
+        state = VALURegisterState()
+        state.sgprs[4] = f32_to_bits(3.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(2), ASTOperand.sgpr(4))
+        res = state.execute(inst)
+        self.assertEqual(res, F32_FOUR)
+        self.assertEqual(state.vgprs[2], F32_FOUR)
+
+    def test_interpreter_clamp(self):
+        state = VALURegisterState()
+        state.vgprs[3] = f32_to_bits(-2.5)
+        inst = ASTInstruction(
+            Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(3), clamp=True
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, F32_POS_ZERO)
+        self.assertEqual(state.vgprs[0], F32_POS_ZERO)
+
+    def test_interpreter_unaffected_registers(self):
+        state = VALURegisterState()
+        state.vgprs[1] = f32_to_bits(1.5)
+        state.vgprs[7] = 0xDEADBEEF
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        state.execute(inst)
+        self.assertEqual(state.vgprs[7], 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
