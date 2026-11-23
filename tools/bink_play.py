@@ -47,9 +47,16 @@ def load_names(archive, mount, use_cache=True):
             first = f.readline().rstrip("\r\n")
             if first == "# " + key:
                 return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in csv.DictReader(f)]
-    cache.parent.mkdir(parents=True, exist_ok=True)
+    if use_cache:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"can't keep the names in {cache.parent} ({e.strerror or e}); naming without the cache",
+                  file=sys.stderr)
+            use_cache = False
     # Each lookup gets its own report and staging file: two runs at once must not remove or replace each other's.
-    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent)
+    # Without the cache, the report goes to the system temp folder: --no-cache doesn't touch the cache folder.
+    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent if use_cache else None)
     os.close(fd)
     tmp = Path(name)
     try:

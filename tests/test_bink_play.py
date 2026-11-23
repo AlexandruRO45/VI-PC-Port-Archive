@@ -105,6 +105,39 @@ class CacheTest(unittest.TestCase):
                                  "Stinger/STALE.bk2,4096,3840,2160,450\n", encoding="utf-8", newline="\n")
                 self.assertEqual(bink_play.load_names(archive, new)[0][0], "Stinger/NEW.bk2")
 
+    def test_no_cache_leaves_the_cache_folder_alone(self):
+        """--no-cache neither creates the cache folder nor needs it; without --no-cache, a cache folder that
+        can't be made (a file in its place) names the streams without the cache instead of failing."""
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            archive, mount = d / "movies.rpf", d / "common.rpf"
+            archive.write_bytes(b"x" * 16)
+            mount.write_bytes(b"y")
+            blocked = d / "Leonida"
+            blocked.write_bytes(b"a file where the cache folder goes")
+
+            def fake_names(argv):
+                Path(argv[argv.index("--out") + 1]).write_text(
+                    "source,offset,size,path,confidence,width,height,frames\n"
+                    "movies.rpf,4096,10,Stinger/INTRO_A.bk2,anchored,3840,2160,450\n", encoding="utf-8", newline="\n")
+                return 0
+
+            with mock.patch.object(bink_play.bink_names, "main", side_effect=fake_names), \
+                    mock.patch.object(sys, "stderr", new_callable=StringIO) as stderr:
+                with mock.patch.object(bink_play, "cache_path", return_value=d / "missing" / "bink_names.csv"):
+                    got = bink_play.load_names(archive, mount, use_cache=False)
+                    self.assertEqual(got[0][:2], ("Stinger/INTRO_A.bk2", 4096))
+                    self.assertFalse((d / "missing").exists(), "--no-cache made the cache folder")
+                with mock.patch.object(bink_play, "cache_path", return_value=blocked / "bink_names.csv"):
+                    self.assertEqual(bink_play.load_names(archive, mount, use_cache=False)[0][1], 4096)
+                    self.assertNotIn("without the cache", stderr.getvalue())
+                    self.assertEqual(bink_play.load_names(archive, mount)[0][1], 4096)
+                    self.assertIn("without the cache", stderr.getvalue())
+            self.assertTrue(blocked.is_file())
+            self.assertEqual(sorted(p.name for p in d.iterdir()), ["Leonida", "common.rpf", "movies.rpf"])
+
     def test_two_lookups_at_once_each_get_their_own_names(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
