@@ -8,8 +8,8 @@ import spirv_asm
 
 class MeshAllocSingleWriterTests(unittest.TestCase):
     def test_ms_alloc_req_single_writer_guard(self):
-        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) restricts OpStore %ms_counts to the wave's lowest active lane (not local_index == 0:
-        ms_wave_info_s3 sends the allocation from wave 1 only)."""
+        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) restricts OpStore %ms_counts to lane 0 of each 64-lane wave
+        (not local_index == 0: ms_wave_info_s3 sends the allocation from wave 1 only)."""
         for mesh_compute in (False, True):
             orig_mc = rdna2spirv.MESH_COMPUTE
             try:
@@ -28,12 +28,13 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
                 # 1. OpStore %ms_counts must be present
                 self.assertIn("OpStore %ms_counts", body_text)
 
-                # 2. The guard is the exec bit and the lowest active lane, never local_index
-                self.assertNotIn("%local_index", body_text)
-                self.assertRegex(body_text, r"%(\w+) = OpLoad %bool %active")
-                self.assertIn("OpGroupNonUniformBallotFindLSB", body_text)
-                self.assertIn("= OpLoad %uint %sg_lane", body_text)
-                self.assertRegex(body_text, r"= OpLogicalAnd %bool %(\w+) %(\w+)")
+                # 2. The guard is the lane within the wave: no exec bit, no subgroup operation (--wave64-emulate
+                #    refuses those), and not local_index == 0
+                self.assertRegex(body_text, r"%(\w+) = OpBitwiseAnd %uint %(\w+) %c3f")
+                self.assertRegex(body_text, r"%(\w+) = OpIEqual %bool %(\w+) %c0")
+                self.assertNotIn("OpGroupNonUniform", body_text)
+                self.assertNotIn("%sg_lane", body_text)
+                self.assertNotIn("%active", body_text)
 
                 # 3. Must have structured selection merge and conditional branch
                 self.assertRegex(body_text, r"OpSelectionMerge %(\w+) None\s+OpBranchConditional %(\w+) %(\w+) %(\w+)")
@@ -48,22 +49,17 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
                 # Build mock header
                 types_and_vars = [
                     "OpCapability Shader",
-                    "OpCapability GroupNonUniformBallot",
                     "OpCapability MeshShadingEXT" if not mesh_compute else "",
                     "OpMemoryModel Logical GLSL450",
-                    'OpEntryPoint GLCompute %main "main" %local_index %sg_lane' if mesh_compute else 'OpEntryPoint MeshEXT %main "main" %local_index %sg_lane',
+                    'OpEntryPoint GLCompute %main "main" %local_index' if mesh_compute else 'OpEntryPoint MeshEXT %main "main" %local_index',
                     "OpExecutionMode %main LocalSize 128 1 1",
                     "OpDecorate %local_index BuiltIn LocalInvocationIndex",
-                    "OpDecorate %sg_lane BuiltIn SubgroupLocalInvocationId",
                     "%void = OpTypeVoid",
                     "%bool = OpTypeBool",
                     "%uint = OpTypeInt 32 0",
                     "%_ptr_Input_uint = OpTypePointer Input %uint",
-                    "%c3 = OpConstant %uint 3",
-                    "%v4uint_bal = OpTypeVector %uint 4",
-                    "%_ptr_Private_bool = OpTypePointer Private %bool",
-                    "%active = OpVariable %_ptr_Private_bool Private",
-                    "%sg_lane = OpVariable %_ptr_Input_uint Input",
+                    "%c0 = OpConstant %uint 0",
+                    "%c3f = OpConstant %uint 63",
                     "%_ptr_Workgroup_uint = OpTypePointer Workgroup %uint",
                     "%_ptr_Function_uint = OpTypePointer Function %uint",
                     "%local_index = OpVariable %_ptr_Input_uint Input",

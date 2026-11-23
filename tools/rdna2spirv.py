@@ -6388,20 +6388,17 @@ class Gen:
                 raise Unsupported("gs sendmsg " + t)
             return
         if op == "s_sendmsg" and a and "MSG_GS_ALLOC_REQ" in a[0].get("t", "") and self.stage == "ms":
-            # SHADER-766: one store per wave, from its lowest active lane, to avoid SharedMemoryDataRace-RaceOnStore.
-            # The guard is the lane's exec bit, not local_index == 0: a wave that sends with exec set (ms_wave_info_s3
-            # sends only from wave 1) must still reach %ms_counts. The counts are uniform (SGPR m0), and all
+            # SHADER-766: one store per wave, from the wave's lane 0, to avoid SharedMemoryDataRace-RaceOnStore.
+            # s_sendmsg is scalar: it runs once per wave whatever exec is, and a wave that skips it (ms_wave_info_s3
+            # sends from wave 1 only, behind an s_cbranch) never reaches this code. So the guard is the lane within
+            # the 64-lane wave, not local_index == 0 (wave 0's lane 0 may not send) and not the exec bit; it also
+            # needs no subgroup operation, which --wave64-emulate refuses. The counts are uniform (SGPR m0), and all
             # invocations synchronize at the post-alloc barrier.
             m = self.tmp()
             self.emit(f"{m} = OpLoad %uint %m0")
-            self.uses_subgroup = self.uses_ballot = True
-            act, bal, lsb, lane, is_first, is_lead = (self.tmp() for _ in range(6))
-            self.emit(f"{act} = OpLoad %bool %active")
-            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
-            self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
-            self.emit(f"{lane} = OpLoad %uint %sg_lane")
-            self.emit(f"{is_first} = OpIEqual %bool {lane} {lsb}")
-            self.emit(f"{is_lead} = OpLogicalAnd %bool {act} {is_first}")
+            li, wave_lane, is_lead = self.local_index(), self.tmp(), self.tmp()
+            self.emit(f"{wave_lane} = OpBitwiseAnd %uint {li} {self.cu(63)}")
+            self.emit(f"{is_lead} = OpIEqual %bool {wave_lane} {self.cu(0)}")
             do_lbl, end_lbl = self.tmp() + "_alloc_do", self.tmp() + "_alloc_end"
             self.emit(f"OpSelectionMerge {end_lbl} None")
             self.emit(f"OpBranchConditional {is_lead} {do_lbl} {end_lbl}")
