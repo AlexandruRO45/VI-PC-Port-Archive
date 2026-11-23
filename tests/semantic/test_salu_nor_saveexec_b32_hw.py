@@ -230,5 +230,105 @@ class TestSNorSaveExecAST(unittest.TestCase):
         with self.assertRaises(TypeError):
             instr.validate()
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ScalarHardwareState32:
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    exec_lo: int = MASK32
+    scc: int = 0
+    vcc_lo: int = 0
+
+    def get_sgpr(self, index: int) -> int:
+        if index < 0 or index > 105:
+            raise ValueError(f"Invalid SGPR index: {index}")
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if index < 0 or index > 105:
+            raise ValueError(f"Invalid SGPR index: {index}")
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter32:
+    """Deterministic scalar instruction interpreter executing s_nor_saveexec_b32."""
+
+    @staticmethod
+    def step(instr: SNorSaveExecB32Instruction, state: ScalarHardwareState32) -> None:
+        instr.validate()
+        # Read source operand
+        if instr.src0.kind == RegisterKind.SGPR:
+            s0_val = state.get_sgpr(instr.src0.index)
+        elif instr.src0.kind == RegisterKind.EXEC_LO:
+            s0_val = state.exec_lo
+        elif instr.src0.kind == RegisterKind.VCC_LO:
+            s0_val = state.vcc_lo
+        elif instr.src0.kind == RegisterKind.LITERAL32:
+            s0_val = instr.src0.index & MASK32
+        else:
+            raise NotImplementedError(f"Unsupported source kind: {instr.src0.kind}")
+
+        new_exec, d, scc = s_nor_saveexec_b32_oracle(s0_val, state.exec_lo)
+        # Update destination SGPR with old EXEC_LO
+        state.set_sgpr(instr.dst.index, d)
+        # Update EXEC_LO and SCC
+        state.exec_lo = new_exec
+        state.scc = scc
+
+
+class TestSNorSaveExecScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter state transitions."""
+
+    def setUp(self):
+        self.state = ScalarHardwareState32()
+
+    def test_interpreter_step_basic(self):
+        self.state.set_sgpr(4, 0x0000_FFFF)
+        self.state.exec_lo = 0x00FF_00FF
+        self.state.scc = 0
+
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=32),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=32)
+        )
+        ScalarInterpreter32.step(instr, self.state)
+
+        # Destination must hold old EXEC_LO
+        self.assertEqual(self.state.get_sgpr(6), 0x00FF_00FF)
+        # EXEC_LO must be ~(0x0000_FFFF | 0x00FF_00FF) = 0xFF00_0000
+        self.assertEqual(self.state.exec_lo, 0xFF00_0000)
+        # SCC must be 1 because new EXEC_LO != 0
+        self.assertEqual(self.state.scc, 1)
+
+    def test_interpreter_step_zero_result(self):
+        self.state.set_sgpr(4, MASK32)
+        self.state.exec_lo = 0
+        self.state.scc = 1
+
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=32),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=32)
+        )
+        ScalarInterpreter32.step(instr, self.state)
+
+        self.assertEqual(self.state.get_sgpr(6), 0)
+        self.assertEqual(self.state.exec_lo, 0)
+        self.assertEqual(self.state.scc, 0)  # SCC cleared to 0
+
+    def test_interpreter_step_from_vcc_lo(self):
+        self.state.vcc_lo = 0x0F0F_0F0F
+        self.state.exec_lo = 0xF0F0_F0F0
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=12, size_bits=32),
+            src0=RegOperand(RegisterKind.VCC_LO, size_bits=32)
+        )
+        ScalarInterpreter32.step(instr, self.state)
+        self.assertEqual(self.state.get_sgpr(12), 0xF0F0_F0F0)
+        # ~(0x0F0F0F0F | 0xF0F0F0F0) = ~0xFFFFFFFF = 0
+        self.assertEqual(self.state.exec_lo, 0)
+        self.assertEqual(self.state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
