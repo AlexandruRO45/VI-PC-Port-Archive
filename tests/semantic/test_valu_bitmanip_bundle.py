@@ -242,6 +242,23 @@ class TestVBfeI32SIMDAndIEEE(unittest.TestCase):
         res = ref_v_bfe_i32(qnan, snan, 4)
         self.assertIsInstance(res, int)
 
+class TestVBfeI32Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 0x9abcdef0",
+            "v_mov_b32 v2, 0x55555555",
+            "v_bfe_i32 v3, v0, 8, 16",
+            "exp mrt0, v3, v3, v3, v3 done" if "v3" in "v_bfe_i32 v3, v0, 8, 16" else "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_v_bfe_i32", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3456)
+
 
 if __name__ == "__main__":
     unittest.main()
