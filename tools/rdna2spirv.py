@@ -11383,30 +11383,37 @@ class Gen:
         self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(uv)}")
         self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
-        # RDNA2 drops a store whose coordinate is outside the image (gfx1036, tools/hw_oracle: x = width, -1, y = height,
-        # -1, the row pitch and 1000 left every word unchanged); an out-of-range OpImageWrite is undefined in Vulkan.
         self.uses_query = True
-        qp, qi, qs = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{qp} = OpAccessChain %_ptr_UC_stv0_{di} %stv0_{di} {idx}")
-        self.emit(f"{qi} = OpLoad %stimg0_{di} {qp}")
-        self.emit(f"{qs} = OpImageQuerySize {'%int' if nc == 1 else '%v2int' if nc == 2 else '%v3int'} {qi}")
-        for ax in range(nc):
-            c, z, lt, both = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-            if nc == 1:
-                c, z = coords[0], qs
-            else:
-                self.emit(f"{c} = OpCompositeExtract %int {iv} {ax}")
-                self.emit(f"{z} = OpCompositeExtract %int {qs} {ax}")
-            self.emit(f"{lt} = OpULessThan %bool {c} {z}")
-            self.emit(f"{both} = OpLogicalAnd %bool {act} {lt}")
-            act = both
         L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
 
         def write(cls, texel):
             ip, img = self.tmp(), self.tmp()
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_stv{cls}_{di} %stv{cls}_{di} {idx}")
             self.emit(f"{img} = OpLoad %stimg{cls}_{di} {ip}")
+            # Other numeric-class bindings can hold a 1x1 fallback, so query the same typed view that receives
+            # this write rather than assuming the float view has its dimensions.
+            qs = self.tmp()
+            self.emit(f"{qs} = OpImageQuerySize {'%int' if nc == 1 else '%v2int' if nc == 2 else '%v3int'} {img}")
+            in_bounds = act
+            for ax in range(nc):
+                lt, both = self.tmp(), self.tmp()
+                if nc == 1:
+                    c, z = coords[0], qs
+                else:
+                    c, z = self.tmp(), self.tmp()
+                    self.emit(f"{c} = OpCompositeExtract %int {iv} {ax}")
+                    self.emit(f"{z} = OpCompositeExtract %int {qs} {ax}")
+                self.emit(f"{lt} = OpULessThan %bool {c} {z}")
+                self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {lt}")
+                in_bounds = both
+
+            store_do, store_end = self.tmp() + "_store", self.tmp() + "_store_end"
+            self.emit(f"OpSelectionMerge {store_end} None")
+            self.emit(f"OpBranchConditional {in_bounds} {store_do} {store_end}")
+            self.emit(f"{store_do} = OpLabel")
             self.emit(f"OpImageWrite {img} {iv} {texel}")
+            self.emit(f"OpBranch {store_end}")
+            self.emit(f"{store_end} = OpLabel")
 
         self.emit(f"OpSelectionMerge {L['end']} None")
         self.emit(f"OpBranchConditional {act} {L['do']} {L['end']}")

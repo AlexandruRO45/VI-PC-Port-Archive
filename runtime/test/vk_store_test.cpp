@@ -207,11 +207,12 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);
 
-    const uint32_t W = 8;
+    const uint32_t W = 8, FLOAT_VIEW_MIPS = 4;
     VkImage img[3]; VkImageView view[3];
     for (int k = 0; k < 3; k++) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1};
+        ii.mipLevels = k == 0 ? FLOAT_VIEW_MIPS : 1; ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
         ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -225,6 +226,14 @@ int main(int argc, char** argv) {
         vi.image = img[k]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[k];
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view[k]));
+    }
+    // A 1x1 float-view fallback in the slots for integer images catches a bounds query through the wrong class.
+    VkImageView float_small_view;
+    {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = img[0]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[0];
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, FLOAT_VIEW_MIPS - 1, 1, 0, 1};
+        CHECK(vkCreateImageView(dev, &vi, nullptr, &float_small_view));
     }
     VkImage wide; VkImageView wide_view;
     {
@@ -265,9 +274,9 @@ int main(int argc, char** argv) {
     // Set 0: binding 0 = sampled images, 1 = samplers, 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays.
     // Five elements each: index 0 stands for the runtime's fallback, image k is at index k + 1 and the 16x4 image at
     // index 4. Binding 0 holds each image's view in its own format (typed image_load reads the uint and sint ones
-    // through integer aliases); every element of a storage array holds the image of its class, so all of them are
-    // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
-    // and the volume, in every element.
+    // through integer aliases). The float storage array deliberately uses a 1x1 view at indices 2 and 3 while the
+    // corresponding uint/sint views remain 8x8; an integer image_store must query its selected typed view. Bindings
+    // 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image and the volume, in every element.
     constexpr uint32_t N = 5;
     VkDescriptorSetLayoutBinding b[8]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -307,7 +316,10 @@ int main(int argc, char** argv) {
     wr[1].dstBinding = 1; wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[1].pImageInfo = &smpi;
     wr[2].dstBinding = 2; wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &tbi;
     for (int k = 0; k < 3; k++) {
-        for (uint32_t e = 0; e < N; e++) dii[k][e] = {VK_NULL_HANDLE, view[k], VK_IMAGE_LAYOUT_GENERAL};
+        for (uint32_t e = 0; e < N; e++) {
+            VkImageView storage_view = k == 0 && (e == 2 || e == 3) ? float_small_view : view[k];
+            dii[k][e] = {VK_NULL_HANDLE, storage_view, VK_IMAGE_LAYOUT_GENERAL};
+        }
         wr[3 + k].dstBinding = 8 + k; wr[3 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         wr[3 + k].pImageInfo = dii[k]; wr[3 + k].descriptorCount = N;
     }
@@ -387,7 +399,7 @@ int main(int argc, char** argv) {
         ib[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
         ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         ib[k].srcQueueFamilyIndex = ib[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, k == 0 ? FLOAT_VIEW_MIPS : 1, 0, 1};
         if (filled && k > 0) {   // filled by a copy first
             ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         }
