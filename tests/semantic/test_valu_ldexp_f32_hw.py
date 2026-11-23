@@ -300,5 +300,77 @@ class TestVLdexpF32ScalarInterpreter(unittest.TestCase):
         ScalarVALUInterpreter.step(instr, self.state)
         self.assertEqual(self.state.vgprs[0], 0x3F80_0000)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# -----------------------------------------------------------------------------
+
+class SIMDWavefrontState:
+    """Models SIMD multi-lane register states across Wave32 and Wave64."""
+
+    def __init__(self, lanes: int = 64):
+        self.lanes = lanes
+        self.vgprs: List[List[int]] = [[0] * lanes for _ in range(256)]
+        self.exec_mask: int = (1 << lanes) - 1
+
+    def step(self, instr: VLdexpF32Instruction, s1_scale: int) -> None:
+        instr.validate()
+        d_idx = instr.dst.index
+        s0_idx = instr.src0.index
+        for lane in range(self.lanes):
+            if (self.exec_mask & (1 << lane)) != 0:
+                s0_val = self.vgprs[s0_idx][lane]
+                self.vgprs[d_idx][lane] = ref_ldexp_f32(s0_val, s1_scale)
+
+
+class TestVLdexpF32SIMDDivergence(unittest.TestCase):
+    """Unit tests for multi-lane divergence and active/inactive lane masking."""
+
+    def test_wave32_even_odd_mask_divergence(self):
+        simd = SIMDWavefrontState(lanes=32)
+        # Initialize v1 with 1.0f in all lanes, canary in v0
+        one = 0x3F80_0000
+        canary = 0xDEAD_BEEF
+        for lane in range(32):
+            simd.vgprs[1][lane] = one
+            simd.vgprs[0][lane] = canary
+
+        # Active mask: even lanes only (0x5555_5555)
+        simd.exec_mask = 0x5555_5555
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.SGPR, index=0),
+        )
+        simd.step(instr, s1_scale=1)  # 1.0f * 2^1 = 2.0f (0x4000_0000)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(simd.vgprs[0][lane], 0x4000_0000)
+            else:
+                self.assertEqual(simd.vgprs[0][lane], canary)
+
+    def test_wave64_divergence(self):
+        simd = SIMDWavefrontState(lanes=64)
+        one = 0x3F80_0000
+        canary = 0xCAFE_BABE
+        for lane in range(64):
+            simd.vgprs[1][lane] = one
+            simd.vgprs[0][lane] = canary
+
+        # Active mask: lower 32 lanes only
+        simd.exec_mask = 0x0000_0000_FFFF_FFFF
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.SGPR, index=0),
+        )
+        simd.step(instr, s1_scale=2)  # 1.0f * 2^2 = 4.0f (0x4080_0000)
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(simd.vgprs[0][lane], 0x4080_0000)
+            else:
+                self.assertEqual(simd.vgprs[0][lane], canary)
+
 if __name__ == "__main__":
     unittest.main()
