@@ -121,8 +121,10 @@ class _Writer:
             self.record(node, 0x40)
             self.out += bits
         elif kind == "vec3":
-            specials = node.get("float_special") or [None, None, None]
-            if not isinstance(value, list) or len(value) != 3 or len(specials) != 3:
+            specials = node.get("float_special")
+            if specials is None:
+                specials = [None, None, None]
+            if not isinstance(value, list) or len(value) != 3 or not isinstance(specials, list) or len(specials) != 3:
                 raise EncodeError("value", f"vec3 value {value!r}")
             bits = b"".join(self.float_bits(v, s if v is None else None) for v, s in zip(value, specials))
             self.record(node, 0x50)
@@ -133,8 +135,12 @@ class _Writer:
             if not isinstance(value, str):
                 raise EncodeError("value", f"string value {value!r}")
             raw = value.encode("utf-8")
-            if len(raw) > 0xFFFF or ("byte_length" in node and len(raw) != node["byte_length"]):
+            if len(raw) > 0xFFFF:
                 raise EncodeError("length", f"string of {len(raw)} bytes, recorded {node.get('byte_length')}")
+            if "byte_length" in node:
+                recorded = node["byte_length"]
+                if not isinstance(recorded, int) or isinstance(recorded, bool) or len(raw) != recorded:
+                    raise EncodeError("length", f"string of {len(raw)} bytes, recorded {recorded}")
             self.record(node, 0x60)
             self.out += struct.pack("<H", len(raw)) + raw
         else:
