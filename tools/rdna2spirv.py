@@ -8273,9 +8273,12 @@ class Gen:
         elif op in ("v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"):
             # v[d:d+1] = v[s:s+1] << / >> (src0 & 63): logical left, logical right, or arithmetic right (the sign
             # bit 63 is copied in).
-            sh, src = a[1], a[2]
-            if a[0].get("n") != 2:
+            if ins["op"].endswith(("_dpp", "_sdwa")) or mods or any(
+                    opnd.get("neg") or opnd.get("abs") or opnd.get("sext") for opnd in a):
+                raise Unsupported(op + " modifiers")
+            if len(a) != 3 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 2 or a[1].get("n", 1) != 1:
                 raise Unsupported(op + " operands")
+            sh, src = a[1], a[2]
             if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
                 lo, hi = self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
             elif src["k"] == "imm":
