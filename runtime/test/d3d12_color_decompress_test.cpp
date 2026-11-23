@@ -132,7 +132,10 @@ bool run_case(ID3D12Device* device, const Case& test) {
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer.Width = size;
-    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
     buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     heap.Type = D3D12_HEAP_TYPE_READBACK;
     Ref<ID3D12Resource> readback;
