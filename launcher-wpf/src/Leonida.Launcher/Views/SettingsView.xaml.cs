@@ -51,6 +51,8 @@ public partial class SettingsView : UserControl
         // Launcher
         LanguageBox.ItemsSource = Loc.Languages.Select(l => l.Name).ToList();
         LanguageBox.SelectedIndex = Math.Max(0, Array.FindIndex(Loc.Languages, l => l.Code == c.Language));
+        ThemeBox.ItemsSource = Theme.Choices.Select(t => Loc.T(t.Name)).ToList();
+        ThemeBox.SelectedIndex = Math.Max(0, Array.FindIndex(Theme.Choices, t => t.Code == c.Theme));
         StartPageBox.ItemsSource = StartPages.Select(p => Loc.T(p.Name)).ToList();
         StartPageBox.SelectedIndex = Math.Max(0, Array.FindIndex(StartPages, p => p.Key == c.StartPage));
         StartCollapsed.IsChecked = c.StartCollapsed;
@@ -103,6 +105,17 @@ public partial class SettingsView : UserControl
         state.Settings.Current.Language = code;
         Save();
         LanguageChanged?.Invoke();   // the window reloads in the new language
+    }
+
+    void OnTheme(object sender, SelectionChangedEventArgs e)
+    {
+        if (loading || ThemeBox.SelectedIndex < 0) return;
+        var code = Theme.Choices[ThemeBox.SelectedIndex].Code;
+        if (code == state.Settings.Current.Theme) return;
+        state.Settings.Current.Theme = code;
+        Save();
+        Theme.Apply(code);
+        LanguageChanged?.Invoke();   // the window reloads, so what code drew (README pages, lists) takes the new colours too
     }
 
     void OnFont(object sender, RoutedPropertyChangedEventArgs<double> e)

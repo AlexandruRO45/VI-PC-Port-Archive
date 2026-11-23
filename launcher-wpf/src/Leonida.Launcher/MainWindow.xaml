@@ -3,8 +3,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:v="clr-namespace:Leonida.Launcher.Views"
         Title="Leonida Launcher" Width="1465" Height="795" MinWidth="1100" MinHeight="680"
-        WindowStartupLocation="CenterScreen" Background="{StaticResource Paper}"
-        FontFamily="{StaticResource Body}" Foreground="{StaticResource Text}"
+        WindowStartupLocation="CenterScreen" Background="{DynamicResource Paper}"
+        FontFamily="{StaticResource Body}" Foreground="{DynamicResource Text}"
         Icon="Assets/leonida.ico" UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
   <WindowChrome.WindowChrome>
     <WindowChrome CaptionHeight="36" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
@@ -120,24 +120,24 @@
       <!-- Faded grayscale art behind every page: the sun, a skyline and palms. -->
       <Viewbox Stretch="UniformToFill" HorizontalAlignment="Right" VerticalAlignment="Bottom" IsHitTestVisible="False" Opacity="0.7">
         <Canvas Width="1600" Height="900">
-          <Ellipse Canvas.Left="900" Canvas.Top="90" Width="560" Height="560" Fill="#E3E3E3"/>
-          <Rectangle Canvas.Left="880" Canvas.Top="420" Width="600" Height="14" Fill="#F2F2F2"/>
-          <Rectangle Canvas.Left="880" Canvas.Top="470" Width="600" Height="18" Fill="#F2F2F2"/>
-          <Rectangle Canvas.Left="880" Canvas.Top="524" Width="600" Height="22" Fill="#F2F2F2"/>
-          <Rectangle Canvas.Left="880" Canvas.Top="582" Width="600" Height="26" Fill="#F2F2F2"/>
-          <Path Fill="#DCDCDC" Data="M0,900 L0,720 L60,720 L60,650 L120,650 L120,700 L170,700 L170,600 L230,600 L230,690 L300,690
+          <Ellipse Canvas.Left="900" Canvas.Top="90" Width="560" Height="560" Fill="{DynamicResource Art1}"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="420" Width="600" Height="14" Fill="{DynamicResource Paper}"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="470" Width="600" Height="18" Fill="{DynamicResource Paper}"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="524" Width="600" Height="22" Fill="{DynamicResource Paper}"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="582" Width="600" Height="26" Fill="{DynamicResource Paper}"/>
+          <Path Fill="{DynamicResource Art2}" Data="M0,900 L0,720 L60,720 L60,650 L120,650 L120,700 L170,700 L170,600 L230,600 L230,690 L300,690
                 L300,560 L330,540 L360,560 L360,700 L420,700 L420,630 L470,630 L470,710 L560,710 L560,610 L620,610 L620,680
                 L700,680 L700,520 L720,500 L740,520 L740,690 L820,690 L820,640 L880,640 L880,700 L960,700 L960,590 L1010,590
                 L1010,670 L1080,670 L1080,620 L1140,620 L1140,690 L1220,690 L1220,560 L1260,530 L1300,560 L1300,680 L1380,680
                 L1380,630 L1440,630 L1440,700 L1520,700 L1520,650 L1600,650 L1600,900 Z"/>
-          <Path Fill="#CFCFCF" Data="M1180,900 C1190,780 1215,640 1262,520 L1276,524 C1236,640 1214,780 1210,900 Z"/>
-          <Path Fill="#CFCFCF" Data="M1268,522 C1210,470 1130,470 1080,520 C1150,492 1210,500 1262,532 Z
+          <Path Fill="{DynamicResource Art3}" Data="M1180,900 C1190,780 1215,640 1262,520 L1276,524 C1236,640 1214,780 1210,900 Z"/>
+          <Path Fill="{DynamicResource Art3}" Data="M1268,522 C1210,470 1130,470 1080,520 C1150,492 1210,500 1262,532 Z
                 M1268,522 C1240,450 1180,410 1110,410 C1180,440 1226,480 1258,530 Z
                 M1268,522 C1300,450 1360,420 1430,430 C1360,448 1310,490 1276,532 Z
                 M1268,522 C1330,490 1410,500 1460,560 C1390,520 1330,516 1276,534 Z
                 M1268,522 C1270,460 1290,420 1330,390 C1300,440 1288,480 1278,528 Z"/>
-          <Path Fill="#D6D6D6" Data="M1440,900 C1446,800 1460,710 1490,640 L1500,643 C1474,712 1466,800 1462,900 Z"/>
-          <Path Fill="#D6D6D6" Data="M1494,640 C1450,606 1396,608 1360,640 C1410,622 1452,628 1490,650 Z
+          <Path Fill="{DynamicResource Art4}" Data="M1440,900 C1446,800 1460,710 1490,640 L1500,643 C1474,712 1466,800 1462,900 Z"/>
+          <Path Fill="{DynamicResource Art4}" Data="M1494,640 C1450,606 1396,608 1360,640 C1410,622 1452,628 1490,650 Z
                 M1494,640 C1520,592 1566,574 1610,584 C1566,594 1526,618 1500,650 Z
                 M1494,640 C1534,622 1586,632 1612,672 C1572,646 1532,644 1500,652 Z
                 M1494,640 C1474,596 1440,572 1400,566 C1446,584 1474,610 1490,648 Z"/>
@@ -179,7 +179,7 @@
                       <ContentControl x:Name="MenuAvatar" Width="38" Height="38"/>
                       <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
                         <TextBlock Text="Leonida Launcher" FontWeight="SemiBold" FontSize="14"/>
-                        <TextBlock x:Name="MenuVersion" FontSize="11.5" Foreground="#888888"/>
+                        <TextBlock x:Name="MenuVersion" FontSize="11.5" Foreground="{DynamicResource Faint}"/>
                       </StackPanel>
                     </StackPanel>
                   </MenuItem.Header>

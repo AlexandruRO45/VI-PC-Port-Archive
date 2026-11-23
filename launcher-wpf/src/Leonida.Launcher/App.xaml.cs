@@ -25,6 +25,7 @@ public partial class App : Application
         base.OnStartup(e);
         var settings = AppState.Instance.Settings.Current;
         Loc.Language = settings.Language;
+        Theme.Apply(settings.Theme);
         DeleteOldLogs(settings.KeepLogsDays);
         new MainWindow().Show();
     }

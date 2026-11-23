@@ -62,7 +62,7 @@ public static partial class Markdown
             FontFamily = new FontFamily("Segoe UI"),
             FontSize = fontSize,
             PagePadding = new Thickness(0),
-            Foreground = new SolidColorBrush(Color.FromRgb(0x1A, 0x1A, 0x1A)),
+            Foreground = Theme.Brush("Text"),
             TextAlignment = TextAlignment.Left,
             LineHeight = fontSize * 1.5,
         };
@@ -115,7 +115,7 @@ public static partial class Markdown
                 if (alert.Success) quote[0] = "**" + alert.Groups[1].Value[0] + alert.Groups[1].Value[1..].ToLowerInvariant() + ".** " + alert.Groups[2].Value;
                 var p = new Paragraph { Margin = new Thickness(0, 4, 0, 10), Padding = new Thickness(12, 4, 0, 4),
                     BorderBrush = (Brush)Application.Current.FindResource("Pink"), BorderThickness = new Thickness(3, 0, 0, 0),
-                    Foreground = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55)) };
+                    Foreground = Theme.Brush("SubText") };
                 AddInlines(p.Inlines, string.Join(" ", quote), onLink);
                 doc.Blocks.Add(p);
                 continue;
@@ -201,20 +201,20 @@ public static partial class Markdown
         }
         var header = Cells(rows[0]);
         var body = rows.Skip(1).Where(r => !Regex.IsMatch(r, @"^\|?\s*:?-{3,}")).Select(Cells).ToList();
-        var table = new Table { CellSpacing = 0, Margin = new Thickness(0, 4, 0, 14), BorderBrush = new SolidColorBrush(Color.FromRgb(0xD0, 0xD0, 0xD0)),
+        var table = new Table { CellSpacing = 0, Margin = new Thickness(0, 4, 0, 14), BorderBrush = Theme.Brush("Line"),
                                 BorderThickness = new Thickness(1), FontSize = fontSize - 1 };
         for (var c = 0; c < header.Count; c++)
             table.Columns.Add(new TableColumn { Width = c == 0 && header.Count > 1 ? new GridLength(1, GridUnitType.Star) : new GridLength(header.Count > 2 ? 1.6 : 3, GridUnitType.Star) });
         var group = new TableRowGroup();
         void AddRow(List<string> cells, bool head, bool shade)
         {
-            var row = new TableRow { Background = head ? Brushes.Black : shade ? new SolidColorBrush(Color.FromRgb(0xF6, 0xF6, 0xF6)) : Brushes.White };
+            var row = new TableRow { Background = head ? Brushes.Black : shade ? Theme.Brush("CardAlt") : Theme.Brush("CardBg") };
             for (var c = 0; c < header.Count; c++)
             {
                 var p = new Paragraph { Margin = new Thickness(0) };
                 AddInlines(p.Inlines, c < cells.Count ? cells[c] : "", onLink);
                 if (head) { p.Foreground = Brushes.White; p.FontWeight = FontWeights.SemiBold; }
-                row.Cells.Add(new TableCell(p) { Padding = new Thickness(10, 7, 10, 7), BorderBrush = new SolidColorBrush(Color.FromRgb(0xE2, 0xE2, 0xE2)),
+                row.Cells.Add(new TableCell(p) { Padding = new Thickness(10, 7, 10, 7), BorderBrush = Theme.Brush("Line"),
                                                  BorderThickness = new Thickness(0, 0, c < header.Count - 1 ? 1 : 0, 1) });
             }
             group.Rows.Add(row);
@@ -250,7 +250,7 @@ public static partial class Markdown
             if (m.Index > pos) target.Add(new Run(Decode(text[pos..m.Index])));
             if (m.Groups["code"].Success)
                 target.Add(new Run(m.Groups["code"].Value) { FontFamily = (FontFamily)Application.Current.FindResource("Mono"),
-                    FontSize = 12.5, Background = new SolidColorBrush(Color.FromRgb(0xEC, 0xEC, 0xEC)) });
+                    FontSize = 12.5, Background = Theme.Brush("Hover") });
             else if (m.Groups["bold"].Success)
             {
                 var b = new Bold();

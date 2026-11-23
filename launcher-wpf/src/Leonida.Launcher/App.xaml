@@ -17,6 +17,21 @@
       <SolidColorBrush x:Key="Text" Color="#141414"/>
       <SolidColorBrush x:Key="Muted" Color="#666666"/>
       <SolidColorBrush x:Key="Faint" Color="#8E8E8E"/>
+      <!-- More theme brushes (Theme.cs swaps all of them for dark; these are the light ones) -->
+      <SolidColorBrush x:Key="CardAlt" Color="#F6F6F6"/>
+      <SolidColorBrush x:Key="CardBorder" Color="#1A1A1A"/>
+      <SolidColorBrush x:Key="Heading" Color="#000000"/>
+      <SolidColorBrush x:Key="SubText" Color="#555555"/>
+      <SolidColorBrush x:Key="Hover" Color="#F2F2F2"/>
+      <SolidColorBrush x:Key="InputBg" Color="#FFFFFF"/>
+      <SolidColorBrush x:Key="InputBorder" Color="#9C9C9C"/>
+      <SolidColorBrush x:Key="MenuBg" Color="#FFFFFF"/>
+      <SolidColorBrush x:Key="MenuBorder" Color="#2E2E2E"/>
+      <SolidColorBrush x:Key="MenuHover" Color="#F2F2F2"/>
+      <SolidColorBrush x:Key="Art1" Color="#E3E3E3"/>
+      <SolidColorBrush x:Key="Art2" Color="#DCDCDC"/>
+      <SolidColorBrush x:Key="Art3" Color="#CFCFCF"/>
+      <SolidColorBrush x:Key="Art4" Color="#D6D6D6"/>
       <SolidColorBrush x:Key="SideText" Color="#FFFFFF"/>
       <SolidColorBrush x:Key="SideMuted" Color="#9B9B9B"/>
       <SolidColorBrush x:Key="SideHover" Color="#1C1C1C"/>
@@ -88,7 +103,7 @@
               <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True"><Setter Property="Foreground" Value="#3A3A3A"/></Trigger>
                 <Trigger Property="IsChecked" Value="True">
-                  <Setter Property="Foreground" Value="#000000"/>
+                  <Setter Property="Foreground" Value="{DynamicResource Heading}"/>
                   <Setter TargetName="t" Property="FontFamily" Value="{StaticResource DisplayBold}"/>
                   <Setter TargetName="bar" Property="Visibility" Value="Visible"/>
                 </Trigger>
@@ -170,7 +185,7 @@
       <Style x:Key="Bevel" TargetType="Button">
         <Setter Property="FontFamily" Value="{StaticResource DisplayBold}"/>
         <Setter Property="FontSize" Value="24"/>
-        <Setter Property="Foreground" Value="#000000"/>
+        <Setter Property="Foreground" Value="#000000"/>   <!-- the button stays white in both themes -->
         <Setter Property="Height" Value="58"/>
         <Setter Property="MinWidth" Value="250"/>
         <Setter Property="Padding" Value="22,0"/>
@@ -227,9 +242,9 @@
         </Setter>
       </Style>
       <Style x:Key="Outline" TargetType="Button" BasedOn="{StaticResource Dark}">
-        <Setter Property="Background" Value="#FFFFFF"/>
-        <Setter Property="Foreground" Value="{StaticResource Text}"/>
-        <Setter Property="BorderBrush" Value="{StaticResource LineStrong}"/>
+        <Setter Property="Background" Value="{DynamicResource CardBg}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource LineStrong}"/>
         <Setter Property="BorderThickness" Value="1"/>
       </Style>
       <Style x:Key="Danger" TargetType="Button" BasedOn="{StaticResource Dark}">
@@ -238,7 +253,7 @@
 
       <!-- A text link: "Having trouble? ↗". -->
       <Style x:Key="Link" TargetType="Button">
-        <Setter Property="Foreground" Value="{StaticResource Text}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
         <Setter Property="FontWeight" Value="SemiBold"/>
         <Setter Property="Cursor" Value="Hand"/>
         <Setter Property="Template">
@@ -304,8 +319,8 @@
 
       <!-- Cards: white, a thin border, and a black caption strip like a launcher tile. -->
       <Style x:Key="Card" TargetType="Border">
-        <Setter Property="Background" Value="{StaticResource CardBg}"/>
-        <Setter Property="BorderBrush" Value="#1A1A1A"/>
+        <Setter Property="Background" Value="{DynamicResource CardBg}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource CardBorder}"/>
         <Setter Property="BorderThickness" Value="1"/>
         <Setter Property="Effect" Value="{StaticResource SoftShadow}"/>
         <Setter Property="Margin" Value="0,0,0,18"/>
@@ -323,48 +338,140 @@
       <Style x:Key="H1" TargetType="TextBlock">
         <Setter Property="FontFamily" Value="{StaticResource DisplayBold}"/>
         <Setter Property="FontSize" Value="64"/>
-        <Setter Property="Foreground" Value="#000000"/>
+        <Setter Property="Foreground" Value="{DynamicResource Heading}"/>
       </Style>
       <Style x:Key="H2" TargetType="TextBlock">
         <Setter Property="FontFamily" Value="{StaticResource Display}"/>
         <Setter Property="FontSize" Value="22"/>
-        <Setter Property="Foreground" Value="#000000"/>
+        <Setter Property="Foreground" Value="{DynamicResource Heading}"/>
         <Setter Property="Margin" Value="0,0,0,10"/>
       </Style>
       <Style x:Key="Label" TargetType="TextBlock">
         <Setter Property="FontSize" Value="11.5"/>
         <Setter Property="FontWeight" Value="SemiBold"/>
-        <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Muted}"/>
         <Setter Property="Margin" Value="0,0,0,4"/>
       </Style>
       <Style x:Key="Hint" TargetType="TextBlock">
         <Setter Property="FontSize" Value="11.5"/>
-        <Setter Property="Foreground" Value="{StaticResource Faint}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Faint}"/>
         <Setter Property="TextWrapping" Value="Wrap"/>
         <Setter Property="Margin" Value="0,3,0,0"/>
       </Style>
 
       <Style TargetType="TextBox">
-        <Setter Property="Background" Value="#FFFFFF"/>
-        <Setter Property="BorderBrush" Value="{StaticResource LineStrong}"/>
-        <Setter Property="Foreground" Value="{StaticResource Text}"/>
+        <Setter Property="Background" Value="{DynamicResource InputBg}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource InputBorder}"/>
+        <Setter Property="CaretBrush" Value="{DynamicResource Text}"/>
+        <Setter Property="SelectionBrush" Value="{StaticResource Pink}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
         <Setter Property="Padding" Value="6,5"/>
         <Setter Property="FontSize" Value="13"/>
         <Setter Property="VerticalContentAlignment" Value="Center"/>
       </Style>
       <Style TargetType="CheckBox">
-        <Setter Property="Foreground" Value="{StaticResource Text}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
         <Setter Property="FontSize" Value="13"/>
         <Setter Property="Margin" Value="0,3,14,3"/>
         <Setter Property="VerticalContentAlignment" Value="Center"/>
       </Style>
+      <Style x:Key="ComboToggle" TargetType="ToggleButton">
+        <Setter Property="OverridesDefaultStyle" Value="True"/>
+        <Setter Property="Focusable" Value="False"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ToggleButton">
+              <Border x:Name="b" Background="{DynamicResource InputBg}" BorderBrush="{DynamicResource InputBorder}" BorderThickness="1" CornerRadius="3">
+                <TextBlock Text="&#xE70D;" FontFamily="{StaticResource Icons}" FontSize="10" Foreground="{DynamicResource Muted}"
+                           HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0"/>
+              </Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="{DynamicResource Heading}"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
       <Style TargetType="ComboBox">
         <Setter Property="FontSize" Value="13"/>
-        <Setter Property="Padding" Value="6,5"/>
+        <Setter Property="Padding" Value="8,5,30,5"/>
         <Setter Property="MinHeight" Value="30"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+        <Setter Property="Background" Value="{DynamicResource InputBg}"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ComboBox">
+              <Grid>
+                <ToggleButton Style="{StaticResource ComboToggle}" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"/>
+                <ContentPresenter x:Name="shown" IsHitTestVisible="False" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"
+                                  Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"/>
+                <TextBox x:Name="PART_EditableTextBox" Visibility="Collapsed" Margin="1,1,28,1" BorderThickness="0" Padding="7,4"
+                         Background="Transparent" Foreground="{TemplateBinding Foreground}" VerticalContentAlignment="Center"
+                         IsReadOnly="{TemplateBinding IsReadOnly}"/>
+                <Popup x:Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False">
+                  <Border Background="{DynamicResource MenuBg}" BorderBrush="{DynamicResource MenuBorder}" BorderThickness="1" CornerRadius="8"
+                          Margin="0,4,8,10" Padding="4" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}">
+                    <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="4" Opacity="0.25" Direction="270"/></Border.Effect>
+                    <ScrollViewer MaxHeight="{TemplateBinding MaxDropDownHeight}"><ItemsPresenter/></ScrollViewer>
+                  </Border>
+                </Popup>
+              </Grid>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsEditable" Value="True">
+                  <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
+                  <Setter TargetName="shown" Property="Visibility" Value="Collapsed"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.5"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
       </Style>
+      <Style TargetType="ComboBoxItem">
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ComboBoxItem">
+              <Border x:Name="b" Background="Transparent" CornerRadius="6" Padding="10,6"><ContentPresenter/></Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource MenuHover}"/></Trigger>
+                <Trigger Property="IsSelected" Value="True"><Setter Property="FontWeight" Value="SemiBold"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+      <!-- Lists (History): theme colours, a plain header -->
+      <Style TargetType="ListView">
+        <Setter Property="Background" Value="{DynamicResource CardBg}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+      </Style>
+      <Style TargetType="GridViewColumnHeader">
+        <Setter Property="Foreground" Value="{DynamicResource Muted}"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="GridViewColumnHeader">
+              <Border Background="{DynamicResource CardAlt}" BorderBrush="{DynamicResource Line}" BorderThickness="0,0,1,1" Padding="8,6">
+                <ContentPresenter/>
+              </Border>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+      <Style TargetType="ListBox">
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+      </Style>
+      <Style TargetType="ListBoxItem">
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+      </Style>
+      <Style TargetType="ListViewItem">
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+      </Style>
+
       <Style TargetType="Expander">
-        <Setter Property="Foreground" Value="{StaticResource Text}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
         <Setter Property="Margin" Value="0,0,0,6"/>
         <Setter Property="Padding" Value="0,8,0,4"/>
       </Style>
@@ -378,7 +485,7 @@
         <Setter Property="Template">
           <Setter.Value>
             <ControlTemplate TargetType="ContextMenu">
-              <Border Background="#FFFFFF" BorderBrush="#2E2E2E" BorderThickness="1" CornerRadius="12" Margin="10,4,14,16" Padding="6" MinWidth="250">
+              <Border Background="{DynamicResource MenuBg}" BorderBrush="{DynamicResource MenuBorder}" BorderThickness="1" CornerRadius="12" Margin="10,4,14,16" Padding="6" MinWidth="250">
                 <Border.Effect><DropShadowEffect BlurRadius="22" ShadowDepth="5" Opacity="0.22" Direction="270"/></Border.Effect>
                 <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle"/>
               </Border>
@@ -388,7 +495,7 @@
       </Style>
       <Style TargetType="MenuItem">
         <Setter Property="OverridesDefaultStyle" Value="True"/>
-        <Setter Property="Foreground" Value="#141414"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
         <Setter Property="FontFamily" Value="{StaticResource Body}"/>
         <Setter Property="FontSize" Value="13.5"/>
         <Setter Property="Cursor" Value="Hand"/>
@@ -398,14 +505,14 @@
               <Border x:Name="b" Background="Transparent" CornerRadius="8" Padding="12,9,18,9">
                 <StackPanel Orientation="Horizontal">
                   <TextBlock x:Name="icon" Text="{TemplateBinding Tag}" FontFamily="{StaticResource Icons}" FontSize="15" Width="22"
-                             Foreground="#6B6B6B" VerticalAlignment="Center"/>
+                             Foreground="{DynamicResource Muted}" VerticalAlignment="Center"/>
                   <ContentPresenter ContentSource="Header" RecognizesAccessKey="True" VerticalAlignment="Center" Margin="10,0,0,0"/>
                 </StackPanel>
               </Border>
               <ControlTemplate.Triggers>
                 <Trigger Property="Tag" Value="{x:Null}"><Setter TargetName="icon" Property="Visibility" Value="Collapsed"/></Trigger>
                 <Trigger Property="IsHighlighted" Value="True">
-                  <Setter TargetName="b" Property="Background" Value="#F2F2F2"/>
+                  <Setter TargetName="b" Property="Background" Value="{DynamicResource MenuHover}"/>
                   <Setter TargetName="icon" Property="Foreground" Value="{StaticResource Pink}"/>
                 </Trigger>
                 <Trigger Property="IsEnabled" Value="False">
@@ -420,7 +527,7 @@
       <Style x:Key="{x:Static MenuItem.SeparatorStyleKey}" TargetType="Separator">
         <Setter Property="Template">
           <Setter.Value>
-            <ControlTemplate TargetType="Separator"><Rectangle Height="1" Fill="#ECECEC" Margin="10,5"/></ControlTemplate>
+            <ControlTemplate TargetType="Separator"><Rectangle Height="1" Fill="{DynamicResource Line}" Margin="10,5"/></ControlTemplate>
           </Setter.Value>
         </Setter>
       </Style>

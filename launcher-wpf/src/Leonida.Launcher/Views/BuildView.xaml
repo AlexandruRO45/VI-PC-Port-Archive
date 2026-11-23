@@ -6,13 +6,13 @@
     <Style x:Key="Num" TargetType="TextBlock">
       <Setter Property="FontFamily" Value="{StaticResource DisplayBold}"/>
       <Setter Property="FontSize" Value="24"/>
-      <Setter Property="Foreground" Value="#000000"/>
+      <Setter Property="Foreground" Value="{DynamicResource Heading}"/>
       <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
     </Style>
     <Style x:Key="NumLabel" TargetType="TextBlock">
       <Setter Property="FontSize" Value="10"/>
       <Setter Property="FontWeight" Value="Bold"/>
-      <Setter Property="Foreground" Value="#7A7A7A"/>
+      <Setter Property="Foreground" Value="{DynamicResource Faint}"/>
     </Style>
     <Style x:Key="Small" TargetType="Button" BasedOn="{StaticResource Outline}">
       <Setter Property="Padding" Value="10,3"/>
@@ -25,7 +25,7 @@
     <!-- Nothing has run yet -->
     <StackPanel x:Name="Empty" VerticalAlignment="Center" HorizontalAlignment="Center" Margin="0,0,0,80">
       <TextBlock Text="NO BUILD RUNNING" Style="{StaticResource H1}" FontSize="52" HorizontalAlignment="Center"/>
-      <TextBlock x:Name="EmptyText" Text="Start one and follow every stage here." FontSize="15" Foreground="#555555" HorizontalAlignment="Center" Margin="0,4,0,26"/>
+      <TextBlock x:Name="EmptyText" Text="Start one and follow every stage here." FontSize="15" Foreground="{DynamicResource SubText}" HorizontalAlignment="Center" Margin="0,4,0,26"/>
       <Button Style="{StaticResource Bevel}" Content="BUILD…" Click="OnNewBuild" HorizontalAlignment="Center" MinWidth="260"/>
     </StackPanel>
 
@@ -54,7 +54,7 @@
             </Border>
             <TextBlock x:Name="Title" Margin="14,0,0,0" FontFamily="{StaticResource DisplayBold}" FontSize="30" VerticalAlignment="Center"/>
           </StackPanel>
-          <TextBlock x:Name="Operation" FontSize="13" Foreground="#444444" Margin="2,6,0,0" TextTrimming="CharacterEllipsis" MaxWidth="760" HorizontalAlignment="Left"/>
+          <TextBlock x:Name="Operation" FontSize="13" Foreground="{DynamicResource SubText}" Margin="2,6,0,0" TextTrimming="CharacterEllipsis" MaxWidth="760" HorizontalAlignment="Left"/>
         </StackPanel>
       </DockPanel>
 
@@ -77,7 +77,7 @@
       </ItemsControl>
 
       <!-- Measured numbers -->
-      <Border Grid.Row="2" x:Name="StatsPanel" Background="#FFFFFF" BorderBrush="#1A1A1A" BorderThickness="1" Margin="0,0,0,12" Effect="{StaticResource SoftShadow}">
+      <Border Grid.Row="2" x:Name="StatsPanel" Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}" BorderThickness="1" Margin="0,0,0,12" Effect="{StaticResource SoftShadow}">
         <Grid Margin="16,10">
           <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="230"/></Grid.ColumnDefinitions>
           <UniformGrid Columns="8">
@@ -92,7 +92,7 @@
           </UniformGrid>
           <Grid Grid.Column="1" Margin="14,0,0,0">
             <TextBlock Text="CPU · BUILD RAM (5 MIN)" Style="{StaticResource NumLabel}"/>
-            <Canvas x:Name="Chart" Margin="0,14,0,0" ClipToBounds="True" Background="#F6F6F6">
+            <Canvas x:Name="Chart" Margin="0,14,0,0" ClipToBounds="True" Background="{DynamicResource CardAlt}">
               <Polyline x:Name="CpuLine" Stroke="{StaticResource Pink}" StrokeThickness="1.8"/>
               <Polyline x:Name="MemLine" Stroke="{StaticResource Purple}" StrokeThickness="1.4" StrokeDashArray="3 2"/>
             </Canvas>
@@ -101,7 +101,7 @@
       </Border>
 
       <!-- Shader translation (only when the run has the shaders stage) -->
-      <Border Grid.Row="3" x:Name="ShaderPanel" Background="#FFFFFF" BorderBrush="#1A1A1A" BorderThickness="1" Margin="0,0,0,12" Effect="{StaticResource SoftShadow}">
+      <Border Grid.Row="3" x:Name="ShaderPanel" Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}" BorderThickness="1" Margin="0,0,0,12" Effect="{StaticResource SoftShadow}">
         <StackPanel>
           <Border Background="#000000" Padding="16,7">
             <DockPanel>
@@ -152,7 +152,7 @@
                 <Button x:Name="ExpandButton" Style="{StaticResource Small}" Content="&#xE740;" FontFamily="{StaticResource Icons}" Click="OnExpand" ToolTip="Make the console bigger"/>
               </StackPanel>
               <TextBlock Text="CONSOLE" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="15" VerticalAlignment="Center"/>
-              <TextBlock x:Name="ConsoleCount" Foreground="#888888" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Center"/>
+              <TextBlock x:Name="ConsoleCount" Foreground="{DynamicResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Center"/>
             </DockPanel>
           </Border>
           <ListBox x:Name="ConsoleList" Background="{StaticResource ConsoleBg}" BorderThickness="0" SelectionMode="Extended"
