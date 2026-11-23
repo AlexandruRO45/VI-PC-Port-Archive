@@ -1129,6 +1129,32 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
     return true;
 }
 
+bool same_console_path(LPCWSTR from, LPCWSTR to) {
+    std::vector<std::wstring> source_parts, destination_parts;
+    if (parse_console(from, source_parts) != Parsed::Console ||
+        parse_console(to, destination_parts) != Parsed::Console)
+        return false;
+    return same_entry(source_parts, destination_parts);
+}
+
+// Native self-copies open the source before rejecting the destination. Probe only for reading: even a copy that
+// requests a writable source must never open the package for writing or publish an overlay for this failure.
+DWORD self_copy_error(const std::filesystem::path& source, bool fail_if_exists) {
+    const HANDLE probe = ::CreateFileW(source.c_str(), GENERIC_READ,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (probe == INVALID_HANDLE_VALUE) return GetLastError();
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (!::GetFileInformationByHandle(probe, &information)) {
+        const DWORD error = GetLastError();
+        ::CloseHandle(probe);
+        return error;
+    }
+    ::CloseHandle(probe);
+    if (fail_if_exists) return ERROR_FILE_EXISTS;
+    return (information.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? ERROR_ACCESS_DENIED : ERROR_SHARING_VIOLATION;
+}
+
 // The source and destination a copy opens, or the error it fails with.
 bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::path& source,
                 std::filesystem::path& destination, DWORD& error) {
@@ -1139,6 +1165,12 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
     const Target t = read_target(from);
     if (t.error) {
         error = t.error;
+        return false;
+    }
+    // The package and overlay are different host files but represent one console file. Refuse equal logical names
+    // before preparing a destination or copying up a writable source; a host self-copy still uses the native API.
+    if (same_console_path(from, to)) {
+        error = self_copy_error(t.path, fail_if_exists);
         return false;
     }
     source = t.path;

@@ -49,6 +49,7 @@ using MoveFileAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR);
 using CopyFileWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, BOOL);
 using CopyFileAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, BOOL);
 using CopyFileExWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
+using CopyFileExAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
 using SetFileAttributesWFn = BOOL(WINAPI*)(LPCWSTR, DWORD);
 using SetFileAttributesAFn = BOOL(WINAPI*)(LPCSTR, DWORD);
@@ -179,6 +180,170 @@ bool host_renames_case(const std::filesystem::path& folder) {
 }
 
 void run_checks(const std::filesystem::path& root);
+
+struct CopyResult {
+    bool ok;
+    DWORD error;
+    unsigned callbacks;
+};
+
+DWORD CALLBACK count_copy_progress(LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, DWORD, DWORD,
+                                    HANDLE, HANDLE, LPVOID context) {
+    ++*static_cast<unsigned*>(context);
+    return PROGRESS_CONTINUE;
+}
+
+COPYFILE2_MESSAGE_ACTION CALLBACK count_copy2_progress(const COPYFILE2_MESSAGE*, PVOID context) {
+    ++*static_cast<unsigned*>(context);
+    return COPYFILE2_PROGRESS_CONTINUE;
+}
+
+CopyResult copy_for_test(bool mapped, unsigned api, const std::wstring& from, const std::wstring& to, DWORD flags) {
+    unsigned callbacks = 0;
+    BOOL ok = FALSE;
+    SetLastError(0);
+    // Console test names are ASCII. Native W counterparts keep the oracle independent of a non-ACP TEMP path.
+    const auto ascii = [](const std::wstring& path) {
+        std::string out;
+        for (wchar_t c : path) out.push_back(static_cast<char>(c));
+        return out;
+    };
+    const std::string narrow_from = ascii(from), narrow_to = ascii(to);
+    if (api == 0 || (!mapped && api == 1)) {
+        const auto fn = mapped ? resolve<CopyFileWFn>("kernel32.dll", "CopyFileW") : &::CopyFileW;
+        ok = fn(from.c_str(), to.c_str(), (flags & COPY_FILE_FAIL_IF_EXISTS) != 0);
+    } else if (api == 1) {
+        ok = resolve<CopyFileAFn>("kernel32.dll", "CopyFileA")(
+            narrow_from.c_str(), narrow_to.c_str(), (flags & COPY_FILE_FAIL_IF_EXISTS) != 0);
+    } else if (api == 2 || (!mapped && api == 3)) {
+        const auto fn = mapped ? resolve<CopyFileExWFn>("kernel32.dll", "CopyFileExW") : &::CopyFileExW;
+        ok = fn(from.c_str(), to.c_str(), &count_copy_progress, &callbacks, nullptr, flags);
+    } else if (api == 3) {
+        ok = resolve<CopyFileExAFn>("kernel32.dll", "CopyFileExA")(
+            narrow_from.c_str(), narrow_to.c_str(), &count_copy_progress, &callbacks, nullptr, flags);
+    } else {
+        const auto fn = mapped ? resolve<CopyFile2Fn>("kernel32.dll", "CopyFile2") :
+            reinterpret_cast<CopyFile2Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CopyFile2"));
+        if (fn) {
+            COPYFILE2_EXTENDED_PARAMETERS parameters{};
+            parameters.dwSize = sizeof(parameters);
+            parameters.dwCopyFlags = flags;
+            parameters.pProgressRoutine = &count_copy2_progress;
+            parameters.pvCallbackContext = &callbacks;
+            const HRESULT result = fn(from.c_str(), to.c_str(), &parameters);
+            return {SUCCEEDED(result), FAILED(result) ? static_cast<DWORD>(HRESULT_CODE(result)) : 0, callbacks};
+        }
+        // Hosts without CopyFile2 use the same native CopyFileExW oracle as the shim's fallback.
+        ok = ::CopyFileExW(from.c_str(), to.c_str(), nullptr, nullptr, nullptr, flags);
+    }
+    return {ok != FALSE, ok ? 0 : GetLastError(), callbacks};
+}
+
+void check_self_copies(const std::filesystem::path& root) {
+    enum State { Ordinary, ReadOnly, Locked, ReadOnlyLocked, Missing, MissingParent, Directory, Deleted };
+    const char* names[] = {"CopyFileW", "CopyFileA", "CopyFileExW", "CopyFileExA", "CopyFile2"};
+    const char* states[] = {"ordinary", "read-only", "locked", "read-only locked", "missing", "missing parent",
+                            "directory", "deleted"};
+    unsigned number = 0;
+    constexpr DWORD copy_flags[] = {0, COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_OPEN_SOURCE_FOR_WRITE,
+                                    COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_OPEN_SOURCE_FOR_WRITE};
+    for (unsigned api = 0; api < 5; ++api) {
+        check(rt::shims::find("kernel32.dll", names[api]) != nullptr, names[api]);
+        for (DWORD flags : copy_flags) {
+            if (api < 2 && (flags & COPY_FILE_OPEN_SOURCE_FOR_WRITE)) continue;
+            for (bool in_overlay : {false, true}) {
+                for (unsigned state = Ordinary; state <= Deleted; ++state) {
+                    if (in_overlay && state >= Missing) continue;
+                    for (bool alias : {false, true}) {
+                        const auto folder = root / "self-copy" / std::to_string(number++);
+                        const auto package = folder / "package", overlay = folder / "overlay", host = folder / "host";
+                        const auto package_source = package / "sub" / "self.txt";
+                        const auto overlay_source = overlay / "sub" / "self.txt";
+                        const auto native_source = host / "sub" / "self.txt";
+                        std::filesystem::create_directories(package);
+                        std::filesystem::create_directories(host);
+                        if (state != MissingParent) {
+                            std::filesystem::create_directories(package / "sub");
+                            std::filesystem::create_directories(host / "sub");
+                        }
+                        const bool package_file = state < Missing || state == Deleted;
+                        if (package_file) write_path(package_source, "package");
+                        if (state < Missing) {
+                            write_path(native_source, in_overlay ? "overlay" : "package");
+                            if (in_overlay) write_path(overlay_source, "overlay");
+                        }
+                        if (state == Directory) {
+                            std::filesystem::create_directories(package_source);
+                            std::filesystem::create_directories(native_source);
+                        }
+                        rt::fs::configure(package, overlay);
+                        if (state == Deleted)
+                            check(resolve<DeleteFileWFn>("kernel32.dll", "DeleteFileW")(L"GAME:\\sub\\self.txt") != FALSE,
+                                  "self-copy deleted-source fixture");
+                        const auto visible_source = in_overlay ? overlay_source : package_source;
+                        const bool read_only = state == ReadOnly || state == ReadOnlyLocked;
+                        if (read_only)
+                            check(SetFileAttributesW(visible_source.c_str(), FILE_ATTRIBUTE_READONLY) &&
+                                      SetFileAttributesW(native_source.c_str(), FILE_ATTRIBUTE_READONLY),
+                                  "self-copy read-only fixture");
+                        HANDLE held_native = INVALID_HANDLE_VALUE, held_mapped = INVALID_HANDLE_VALUE;
+                        if (state == Locked || state == ReadOnlyLocked) {
+                            held_native = ::CreateFileW(native_source.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                                                         0, nullptr);
+                            held_mapped = ::CreateFileW(visible_source.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                                                         0, nullptr);
+                            check(held_native != INVALID_HANDLE_VALUE && held_mapped != INVALID_HANDLE_VALUE,
+                                  "self-copy exclusive-source fixtures");
+                        }
+                        const std::wstring from = L"GAME:\\sub\\self.txt";
+                        const std::wstring to = alias ? L"g:/sub/../sub/./SELF.TXT" : from;
+                        const auto native_to = alias ? host / "sub" / ".." / "sub" / "." / "SELF.TXT" : native_source;
+                        const CopyResult native = copy_for_test(false, api, native_source.native(), native_to.native(), flags);
+                        const CopyResult mapped = copy_for_test(true, api, from, to, flags);
+                        if (held_native != INVALID_HANDLE_VALUE) ::CloseHandle(held_native);
+                        if (held_mapped != INVALID_HANDLE_VALUE) ::CloseHandle(held_mapped);
+                        char label[192];
+                        std::snprintf(label, sizeof(label), "%s self-copy: %s, flags=%lu, overlay=%d, alias=%d",
+                                      names[api], states[state], flags, in_overlay, alias);
+                        check(!native.ok && !mapped.ok && mapped.error == native.error, label);
+                        check((!package_file || read_path(package_source) == "package") &&
+                                  (in_overlay ? read_path(overlay_source) == "overlay" :
+                                                !std::filesystem::exists(overlay / "sub")),
+                              "self-copy preserves package/overlay bytes and creates no overlay parent");
+                        check(mapped.callbacks == 0, "self-copy rejected before copying sends no progress callback");
+
+                        if (state == Ordinary && alias) {
+                            const CopyResult native_other = copy_for_test(
+                                false, api, native_source.native(), (host / "sub" / "other.txt").native(), flags);
+                            const CopyResult mapped_other = copy_for_test(
+                                true, api, from, L"G:\\sub\\other.txt", flags);
+                            check(native_other.ok && mapped_other.ok &&
+                                      read_path(overlay / "sub" / "other.txt") == (in_overlay ? "overlay" : "package") &&
+                                      read_path(package_source) == "package",
+                                  "a distinct destination still copies the visible source into the overlay");
+                        }
+                        if (read_only) {
+                            SetFileAttributesW(visible_source.c_str(), FILE_ATTRIBUTE_NORMAL);
+                            SetFileAttributesW(native_source.c_str(), FILE_ATTRIBUTE_NORMAL);
+                            SetFileAttributesW(overlay_source.c_str(), FILE_ATTRIBUTE_NORMAL);
+                        }
+                    }
+                }
+            }
+        }
+        // A host self-copy still reaches the native API, including its own CopyFile2 error callback.
+        if (api != 1 && api != 3) {
+            const auto source = root / "host-self-copy" / (std::to_string(api) + ".txt");
+            write_path(source, "host");
+            const CopyResult native = copy_for_test(false, api, source.native(), source.native(), 0);
+            const CopyResult mapped = copy_for_test(true, api, source.native(), source.native(), 0);
+            check(!mapped.ok && mapped.error == native.error && mapped.callbacks == native.callbacks &&
+                      read_path(source) == "host",
+                  "a host self-copy preserves native errors, callbacks, and bytes");
+        }
+    }
+    rt::fs::configure({}, {});
+}
 
 }  // namespace
 
@@ -1340,6 +1505,8 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
     }
+
+    check_self_copies(root);
 }
 
 }  // namespace

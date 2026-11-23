@@ -134,7 +134,13 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
   `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
 - `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
-  overlay; fail-if-exists counts a name only the package has. Either side can be a host path. `CopyFile2` checks its
+  overlay; fail-if-exists counts a name only the package has. Equal logical console paths, including `GAME:`/`G:`
+  aliases, case differences and normalized `.`/`..` components, fail before creating an overlay file or parent:
+  source-open errors take precedence, then fail-if-exists, then a read-only destination, then the native self-copy
+  sharing error. Existing overlay bytes and package bytes are preserved. This is a self-copy check, not general
+  rollback after a later copy failure. As with other errors detected before the host copy starts, `CopyFile2`
+  returns the HRESULT without synthesizing an error progress callback; native Windows may issue one. Either side
+  can be a host path, and host self-copies retain native behavior. `CopyFile2` checks its
   parameter block before preparing the destination: one shorter than `COPYFILE2_EXTENDED_PARAMETERS` is
   `E_INVALIDARG` and writes nothing, as Windows answers. Where the host has no `CopyFile2` (Wine 9, whose loader binds
   the import to a stub that aborts the process), the shim copies with `CopyFileExW` instead: the flags both calls
