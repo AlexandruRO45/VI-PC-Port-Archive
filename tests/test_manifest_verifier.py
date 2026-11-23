@@ -16,6 +16,7 @@ import posixpath
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -850,6 +851,129 @@ class TestStableHashing(unittest.TestCase):
             self.assertTrue(f.read(1))
         with self.assertRaisesRegex(OSError, "changed while hashing"):
             mv.sha256_file(path)
+
+
+class CacheTests(unittest.TestCase):
+    """--cache: reuse the verdict for a file whose size, mtime and ctime did not change since it hashed OK."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.game = os.path.join(self.root, "game")
+        os.makedirs(self.game, exist_ok=True)
+        self.payloads = {"a.bin": b"A" * 100, "sub/b.bin": b"B" * 200, "c.bin": b"C" * 300}
+        for rel, data in self.payloads.items():
+            path = os.path.join(self.game, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            self.age(rel)
+        self.manifest = os.path.join(self.root, "manifest.json")
+        self.write_manifest()
+        self.cache = os.path.join(self.root, "cache.json")
+
+    def age(self, rel: str, seconds: float = 10.0) -> None:
+        path = os.path.join(self.game, *rel.split("/"))
+        st = os.stat(path)
+        when = time.time_ns() - int(seconds * 1_000_000_000)
+        os.utime(path, ns=(when, when))
+
+    def write_manifest(self, extra: dict | None = None) -> None:
+        entries = {rel: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                   for rel, data in self.payloads.items()}
+        doc = {"files": entries}
+        if extra:
+            doc.update(extra)
+        with open(self.manifest, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2)
+
+    def verify(self, **kwargs):
+        kwargs.setdefault("jobs", 1)
+        kwargs.setdefault("cache_path", self.cache)
+        return mv.verify_manifest(self.game, self.manifest, **kwargs)
+
+    def cached_files(self) -> dict:
+        with open(self.cache, encoding="utf-8") as f:
+            return json.load(f)["files"]
+
+    def test_second_run_hashes_nothing(self) -> None:
+        first = self.verify()
+        self.assertTrue(first.passed)
+        self.assertEqual(first.cached_count, 0)
+        self.assertEqual(first.bytes_verified, sum(len(d) for d in self.payloads.values()))
+        self.assertEqual(set(self.cached_files()), set(self.payloads))
+
+        second = self.verify()
+        self.assertTrue(second.passed)
+        self.assertEqual(second.cached_count, len(self.payloads))
+        self.assertEqual(second.bytes_cached, sum(len(d) for d in self.payloads.values()))
+        self.assertEqual(second.bytes_verified, 0)
+        self.assertEqual(second.elapsed_seconds >= 0, True)
+
+    def test_same_size_rewrite_is_still_caught(self) -> None:
+        self.assertTrue(self.verify().passed)
+        rel = "a.bin"
+        path = os.path.join(self.game, rel)
+        with open(path, "wb") as f:
+            f.write(b"Z" * len(self.payloads[rel]))
+        report = self.verify()
+        self.assertFalse(report.passed)
+        self.assertEqual(report.hash_mismatch, [rel])
+        self.assertEqual(report.cached_count, len(self.payloads) - 1)
+        self.assertEqual(report.bytes_verified, len(self.payloads[rel]))
+
+    def test_touched_file_is_hashed_again(self) -> None:
+        self.assertTrue(self.verify().passed)
+        self.age("c.bin", seconds=1.0)
+        report = self.verify()
+        self.assertTrue(report.passed)
+        self.assertEqual(report.cached_count, len(self.payloads) - 1)
+        self.assertEqual(report.bytes_verified, len(self.payloads["c.bin"]))
+
+    def test_a_fresh_file_is_not_cached(self) -> None:
+        fresh = "fresh.bin"
+        self.payloads[fresh] = b"F" * 64
+        with open(os.path.join(self.game, fresh), "wb") as f:
+            f.write(self.payloads[fresh])
+        self.write_manifest()
+        self.assertTrue(self.verify().passed)
+        self.assertNotIn(fresh, self.cached_files())
+        self.assertEqual(len(self.cached_files()), len(self.payloads) - 1)
+
+    def test_broken_cache_is_ignored_and_replaced(self) -> None:
+        with open(self.cache, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        report = self.verify()
+        self.assertTrue(report.passed)
+        self.assertEqual(report.cached_count, 0)
+        self.assertEqual(set(self.cached_files()), set(self.payloads))
+
+    def test_a_different_manifest_drops_the_cache(self) -> None:
+        self.assertTrue(self.verify().passed)
+        self.write_manifest({"created": "a later run"})
+        report = self.verify()
+        self.assertTrue(report.passed)
+        self.assertEqual(report.cached_count, 0)
+        self.assertEqual(report.bytes_verified, sum(len(d) for d in self.payloads.values()))
+
+    def test_cache_inside_the_game_folder_is_not_new(self) -> None:
+        self.cache = os.path.join(self.game, ".verify-cache.json")
+        report = self.verify(strict=True)
+        self.assertTrue(report.passed)
+        self.assertEqual(report.untracked, [])
+        self.assertTrue(os.path.isfile(self.cache))
+
+    def test_json_output_reports_the_cached_counts(self) -> None:
+        self.assertTrue(self.verify().passed)
+        proc = subprocess.run([sys.executable, "-I", TOOL, self.game, "--manifest", self.manifest,
+                               "--cache", self.cache, "--json", "--quiet"],
+                              capture_output=True, text=True, errors="replace")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["cached_count"], len(self.payloads))
+        self.assertEqual(doc["bytes_cached"], sum(len(d) for d in self.payloads.values()))
+        self.assertEqual(doc["bytes_verified"], 0)
 
 
 if __name__ == "__main__":
