@@ -250,5 +250,40 @@ class SMinU32TranslatorTests(unittest.TestCase):
         self.assertEqual(words[0], 10)
         self.assertEqual(words[1], 1)  # 10 < 0xFFFFFFFF -> SCC = 1
 
+# -----------------------------------------------------------------------------
+# Opcode 3: s_max_i32
+# -----------------------------------------------------------------------------
+def oracle_max_i32(s0: int, s1: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_max_i32: returns (result_u32, scc)."""
+    xi = s32(s0)
+    yi = s32(s1)
+    val = xi if xi > yi else yi
+    scc = 1 if xi > yi else 0
+    return u32(val), scc
+
+
+class SMaxI32OracleTests(unittest.TestCase):
+    def test_max_i32_basic(self):
+        # max(10, 20) = 20, SCC = 0 (10 > 20 is False)
+        res, scc = oracle_max_i32(10, 20)
+        self.assertEqual(res, 20)
+        self.assertEqual(scc, 0)
+
+        # max(20, 10) = 20, SCC = 1 (20 > 10 is True)
+        res, scc = oracle_max_i32(20, 10)
+        self.assertEqual(res, 20)
+        self.assertEqual(scc, 1)
+
+    def test_max_i32_negatives(self):
+        # max(-5, -20) = -5, SCC = 1 (-5 > -20)
+        res, scc = oracle_max_i32(u32(-5), u32(-20))
+        self.assertEqual(res, u32(-5))
+        self.assertEqual(scc, 1)
+
+    def test_max_i32_ties(self):
+        res, scc = oracle_max_i32(u32(-7), u32(-7))
+        self.assertEqual(res, u32(-7))
+        self.assertEqual(scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
