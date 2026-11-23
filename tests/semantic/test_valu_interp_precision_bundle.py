@@ -166,6 +166,18 @@ class TestInterpMovF32Reference(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpMovF32VertexSel(unittest.TestCase):
+    def test_mov_f32_vertex_params(self):
+        for vsel in ("p0", "p10", "p20"):
+            code = [
+                f"v_interp_mov_f32 v2, {vsel}, attr1.x",
+                "exp mrt0, v2, v2, v2, v2 done",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_mov_f32_{vsel}", code)
+            words = support.mrt0_words(spv)
+            self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
