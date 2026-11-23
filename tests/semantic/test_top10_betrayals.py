@@ -153,6 +153,16 @@ class Top10Betrayals(unittest.TestCase):
                                + ["v_max_f64 v[0:1], -v[2:3], |v[4:5]|"]), 0x7FF0000000000000)
 
 
+    def test_f64_literal_is_high_half(self):
+        one5 = d64(2, dbits(1.5))
+        self.assertEqual(run64(one5 + ["v_min_f64 v[0:1], 0xe8c2d219, v[2:3]"]), 0xE8C2D21900000000)
+        self.assertEqual(run64(one5 + ["v_max_f64 v[0:1], v[2:3], 0x40100000"]), dbits(4.0))
+        self.assertEqual(run64(one5 + ["v_mul_f64 v[0:1], 0x40080000, v[2:3]"]), dbits(4.5))
+        self.assertEqual(run64(one5 + ["v_fma_f64 v[0:1], v[2:3], 0x40000000, 0x3ff80000"]), dbits(4.5))
+        self.assertEqual(run64(["v_fract_f64 v[0:1], 0x40040000"]), dbits(0.5))
+        self.assertEqual(run(["v_cvt_i32_f64 v0, 0xc0140000"]), 0xFFFFFFFB)
+        self.assertEqual(run(["v_cvt_u32_f64 v0, 0x40450000"]), 42)
+
     def test_fma_legacy_f32(self):
         vals = [0.0, -0.0, 1.5, -2.25, 3.0, float("inf"), bits_f32(0x3A83126F), 0.5]
         for x in vals:

@@ -1,39 +1,40 @@
-"""v_cvt_i32_f64 and v_cvt_u32_f64 are not implemented in tools/rdna2spirv.py. v_cvt_f64_i32 and v_cvt_f64_u32 are
-since #2521, and tests/semantic/test_int32_to_f64.py runs them through the translator.
-
-The previous version of this file tested a private Python model of the four conversions and never called the
-translator, so it passed whatever the translator did.  Until the ops are lowered, the honest test is that the
-translator refuses each of them by name (instead of emitting wrong code); when one gets implemented, this test fails
-and is replaced by a run through the translator against the ISA semantics (exact int->f64, truncating f64->int with
-saturation, NaN -> 0).
-"""
+"""v_cvt_i32_f64 / v_cvt_u32_f64 through the translator: truncate toward zero, saturate, NaN -> 0."""
 import os
+import struct
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import support  # noqa: E402
-import rdna2spirv  # noqa: E402
 
-CASES = [
-    ("v_cvt_i32_f64", "v_cvt_i32_f64_e32 v2, v[0:1]"),
-    ("v_cvt_u32_f64", "v_cvt_u32_f64_e32 v2, v[0:1]"),
-    ("v_cvt_i32_f64", "v_cvt_i32_f64_e64 v2, -|v[0:1]|"),
-]
+INF, NAN = float("inf"), float("nan")
+I32 = [(5.75, 5), (-5.75, -5), (-0.5, 0), (2147483647.9, 2147483647), (3e9, 2147483647),
+       (-3e9, -2147483648), (INF, 2147483647), (-INF, -2147483648), (NAN, 0)]
+U32 = [(5.75, 5), (-0.5, 0), (-7.0, 0), (4294967295.5, 4294967295), (5e9, 4294967295), (INF, 4294967295),
+       (-INF, 0), (NAN, 0)]
 
 
-class CvtIntF64Unsupported(unittest.TestCase):
-    def test_each_op_is_refused_by_name(self):
-        for name, ins in CASES:
-            with self.subTest(ins=ins):
-                lines = ["v_mov_b32 v1, 5", ins, "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]
-                with self.assertRaises(rdna2spirv.Unsupported) as refused:
-                    support.translate_lines("ps_cvt_int_f64", lines)
-                self.assertEqual(str(refused.exception), name)
+def convert(op, value, mods=""):
+    low, high = struct.unpack("<II", struct.pack("<d", value))
+    lines = [f"v_mov_b32 v0, {low:#x}", f"v_mov_b32 v1, {high:#x}", f"{op} v2, {mods or 'v[0:1]'}",
+             "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]
+    return support.mrt0_words(support.translate_lines("ps_cvt_int_f64", lines))[0]
 
-    def test_a_listing_without_them_still_translates(self):
-        lines = ["v_mov_b32 v1, 5", "v_cvt_f32_i32_e32 v2, v1", "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]
-        self.assertIn("OpFunction", support.translate_lines("ps_cvt_i32_ok", lines))
+
+class CvtIntF64(unittest.TestCase):
+    def test_i32(self):
+        for value, want in I32:
+            with self.subTest(value=value):
+                self.assertEqual(convert("v_cvt_i32_f64", value), want & 0xFFFFFFFF)
+
+    def test_u32(self):
+        for value, want in U32:
+            with self.subTest(value=value):
+                self.assertEqual(convert("v_cvt_u32_f64", value), want)
+
+    def test_abs_neg(self):
+        self.assertEqual(convert("v_cvt_i32_f64_e64", 7.5, "-|v[0:1]|"), (-7) & 0xFFFFFFFF)
+        self.assertEqual(convert("v_cvt_u32_f64_e64", -7.5, "|v[0:1]|"), 7)
 
 
 if __name__ == "__main__":
