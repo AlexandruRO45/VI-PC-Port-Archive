@@ -580,6 +580,12 @@ STORE_WORDS = {
     "cs_imgatomic": (dict(enumerate([0x54, 0xFFFFFF9D, 0x06, 0xF067, 0x97, 0xFFFFFFF0, 0x6A, 0x6B,
                                      0xC8, 0x6D, 0x05, 0xFFFFFFF0, 0x70, 0xC0FFEE, 0x72, 0x7A, 0xB4])),
                      dict(enumerate([*range(100, 115), 7])), {}),
+    # The six 2D atomics cs_imgatomic leaves out: swap, inc, dec, fmin, fmax and fcmpswap. The texel afterwards
+    # (uint image) and the returned old value (sint image) of cases 0..7; the float cases are seeded by a swap in the
+    # fixture, so their input bits are fixed there (derivations in the .asm header).
+    "cs_imgatomic_ext": (dict(enumerate([0xDEADBEEF, 0x66, 0x64, 0x3F800000, 0x40400000, 0x40000000, 0x6A, 0x40000000])),
+                         dict(enumerate([0x64, 0x65, 0x66, 0x40000000, 0x3F800000, 0x3F800000, 0x6A, 0x7FC00000])),
+                         {}),
     # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
     "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
                        {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
