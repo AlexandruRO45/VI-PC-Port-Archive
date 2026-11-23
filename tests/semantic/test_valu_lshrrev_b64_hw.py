@@ -374,5 +374,57 @@ class TestVLshrrevB64SIMDDivergence(unittest.TestCase):
                 self.assertEqual(res[i], expected_inactive)
 
 
+class TestVLshrrevB64RegisterAliasing(unittest.TestCase):
+    """Register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_dst_aliases_src(self):
+        val = 0xABCDEF0112345678
+        self.rf.write_vgpr64(2, val)
+        self.rf.vgprs[4] = 8
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 2, size=2),
+            shift=Operand(RegType.VGPR, 4, size=1),
+            src=Operand(RegType.VGPR, 2, size=2),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = val >> 8
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[2], expected & MASK32)
+        self.assertEqual(self.rf.vgprs[3], (expected >> 32) & MASK32)
+
+    def test_dst_aliases_shift(self):
+        val = 0x8899AABBCCDDEEFF
+        self.rf.write_vgpr64(4, val)
+        self.rf.vgprs[2] = 16
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 2, size=2),
+            shift=Operand(RegType.VGPR, 2, size=1),
+            src=Operand(RegType.VGPR, 4, size=2),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = val >> 16
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[2], expected & MASK32)
+        self.assertEqual(self.rf.vgprs[3], (expected >> 32) & MASK32)
+
+    def test_hw_translator_aliasing(self):
+        val = 0xABCDEF0112345678
+        lines = [
+            f"v_mov_b32 v0, {val & MASK32:#x}",
+            f"v_mov_b32 v1, {(val >> 32) & MASK32:#x}",
+            "v_mov_b32 v2, 8",
+            "v_lshrrev_b64 v[0:1], v2, v[0:1]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_lshr64_alias", lines)
+        words = support.mrt0_words(spv)
+        hw_res = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(hw_res, val >> 8)
+
+
 if __name__ == "__main__":
     unittest.main()
