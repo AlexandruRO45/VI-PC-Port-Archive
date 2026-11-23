@@ -750,5 +750,20 @@ class TestVPkMaxU16SIMDAndBoundaries(unittest.TestCase):
         res = eval_pk16("v_pk_max_u16", a, b)
         self.assertIsInstance(res, int)
 
+class TestVPkMaxU16TranslatorIntegration(unittest.TestCase):
+    """Translator integration and syntax controls for v_pk_max_u16."""
+
+    def test_translated_matches_oracle(self) -> None:
+        a = 0x0005_000A
+        b = 0x0002_0003
+        exp_res = eval_pk16("v_pk_max_u16", a, b)
+        got_res = run_translated_pk16("v_pk_max_u16", a, b)
+        self.assertEqual(got_res, exp_res)
+
+    def test_syntax_rejection_missing_operand(self) -> None:
+        prog = ["v_pk_max_u16 v0, v1", "s_endpgm"]
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            support.translate_lines("ps_v_pk_max_u16_syntax_err", prog)
+
 if __name__ == "__main__":
     unittest.main()
