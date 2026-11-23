@@ -3,6 +3,7 @@
 Endpoints and palette colours are computed in floating point. The averages can differ from GPU readback
 when the hardware quantizes the decoded RGB values.
 numpy is imported lazily, so `--help` works on a checkout without it.
+Usage: `python -I tools/bc_feature.py --help` lists the options.
 """
 
 from __future__ import annotations
