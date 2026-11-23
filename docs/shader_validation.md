@@ -212,8 +212,10 @@ Setup on Windows, about 800 MB and no admin rights:
 Setup on Linux, without ROCm. `tools/hw_oracle/hw_oracle_drm.c` submits each kernel as a raw compute dispatch
 through the kernel driver (`libdrm_amdgpu`), so nothing sits between the instructions and the GPU:
 
-- **GPU.** GFX10 only, which is RDNA1 and RDNA2 (compute engine version 10); the launcher answers anything else
-  with exit 77. Name the render node, for example `LEONIDA_HW_DRM_NODE=/dev/dri/renderD129`
+- **GPU.** Compute engine versions 10, 11 and 12: RDNA1 and RDNA2, RDNA3 and RDNA3.5, RDNA4; the launcher answers
+  anything else with exit 77. Dispatched here: an RX 9070 (RDNA4, gfx1201, engine 12.0), 583 f32 programs, 0
+  mismatches. GFX11 has no hardware datapoint of ours: its stream is libdrm's own gfx11 dispatch test. Name the
+  render node, for example `LEONIDA_HW_DRM_NODE=/dev/dri/renderD129`
   (`ls -l /dev/dri/by-path` shows which node is which PCI device). There is no default device, so a raw command
   stream never goes to a GPU by accident.
 - **Not the GPU you are looking at.** A raw stream bypasses the Vulkan driver, and a kernel that hangs makes the
@@ -225,7 +227,11 @@ through the kernel driver (`libdrm_amdgpu`), so nothing sits between the instruc
 - **Access.** Your user must be able to open the render node (the `render` or `video` group on most
   distributions).
 - **The command stream** is libdrm's own compute dispatch test for GFX10 (`amdgpu_test_dispatch_memset`), with what
-  belongs to the kernel put in: its entry point, its group size, and what its kernel descriptor says.
+  belongs to the kernel put in: its entry point, its group size, and what its kernel descriptor says. Engines 11
+  and 12 branch only in the preamble, which is the gfx11 init of the same libdrm test
+  (`tests/amdgpu/shader_test_util.c`); the indexed cu-mask writes stop at engine 11, because GFX12 keeps its
+  `COMPUTE_STATIC_THREAD_MGMT_SE*` at their reset value (AMD's `gfx12_merged_default.h`; PAL and RADV leave them
+  there, and PAL's `gfx12CmdUtil.cpp` still writes the registers with plain `SET_SH_REG`).
   - `COMPUTE_PGM_RSRC1`, `COMPUTE_PGM_RSRC2` and the wave size are read out of the descriptor in the assembled
     object, so the `.amdhsa_*` directives take effect as they do under the HIP runtime: register counts, float
     rounding and denormal modes, IEEE mode, DX10 clamp. A test checks that an f32 rounding mode set there changes
