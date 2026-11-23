@@ -4025,7 +4025,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
                                         &set0, 0, nullptr);
             }
-            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            // The generated stages of the geometry fallback (SHADER-1092) read their parameters past the block:
+            // the pipeline's layout declares exactly this many bytes. Every other dispatch pushes the block.
+            if (!dispatch->tail_words) {
+                vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
+                                  &data);
+            } else {
+                std::vector<std::uint8_t> push_bytes(sizeof(data) + std::size_t(4) * dispatch->tail_words);
+                std::memcpy(push_bytes.data(), &data, sizeof(data));
+                std::memcpy(push_bytes.data() + sizeof(data), dispatch->tail.data(),
+                            std::size_t(4) * dispatch->tail_words);
+                vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                 std::uint32_t(push_bytes.size()), push_bytes.data());
+            }
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];

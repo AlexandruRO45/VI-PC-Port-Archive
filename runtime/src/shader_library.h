@@ -718,6 +718,17 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    // The --gs-compute capture layout (tools/spirv_gs_to_compute.py's contract; index.json's gs_compute), for a
+    // geometry shader that can also run on a device without the geometry stage (SHADER-1092). Zero when absent.
+    // gs_input_locations is the GS's input slot order as the lowering declares it (position first, then
+    // locations ascending); the position slot is marked with kGsPositionSlot.
+    static constexpr std::uint32_t kGsPositionSlot = 0xFFFFFFFF;
+    std::uint32_t gs_verts_in = 0;      // input primitive's vertices (3: triangles)
+    std::uint32_t gs_max_verts = 0;      // OutputVertices
+    std::uint32_t gs_num_inputs = 0;     // input slots, also the capture input's vec4s per vertex
+    std::uint32_t gs_num_outputs = 0;    // output slots, also the record's vec4s per emitted vertex
+    std::vector<std::uint32_t> gs_input_locations;  // per input slot: its location, or kGsPositionSlot
+    bool gs_capture() const { return gs_verts_in != 0; }
 };
 
 class ShaderLibrary {
@@ -813,6 +824,16 @@ public:
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
         auto path = dir_;
         path += "/" + entry.name + ".spv";
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        return read_spirv_words(file, file.tellg());
+    }
+
+    // The words of one of a shader's sidecar modules -- a generated stage published next to the module, as
+    // tools/spirv_gs_to_compute.py and tools/gs_compute_stages.py write them (suffix includes ".spv") -- or
+    // empty when it is missing. The geometry fallback (SHADER-1092) resolves its stages this way.
+    std::vector<std::uint32_t> spirv_sidecar(const ShaderEntry& entry, const char* suffix) const {
+        auto path = dir_;
+        path += "/" + entry.name + suffix;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         return read_spirv_words(file, file.tellg());
     }
@@ -913,6 +934,28 @@ private:
                     if (!end || *end != '\0') continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
                 }
+            }
+            // --gs-compute (SHADER-1092): the capture layout the layer's geometry fallback needs. The input
+            // slots are parsed in their declared order, the position slot marked kGsPositionSlot.
+            if (const Json* gs = meta.find("gs_compute"); gs && gs->kind == Json::Kind::object) {
+                e.gs_verts_in = u32(gs->find("verts_in"));
+                e.gs_max_verts = u32(gs->find("max_verts"));
+                e.gs_num_inputs = u32(gs->find("num_inputs"));
+                if (const Json* o = gs->find("outputs"); o && o->kind == Json::Kind::array)
+                    e.gs_num_outputs = std::uint32_t(o->array.size());
+                if (const Json* in = gs->find("inputs"); in && in->kind == Json::Kind::array) {
+                    for (const Json& item : in->array) {
+                        if (item.kind != Json::Kind::string) break;
+                        if (item.string == "position")
+                            e.gs_input_locations.push_back(ShaderEntry::kGsPositionSlot);
+                        else if (item.string.rfind("location ", 0) == 0)
+                            e.gs_input_locations.push_back(
+                                std::strtoul(item.string.c_str() + 9, nullptr, 10));
+                        else
+                            break;
+                    }
+                }
+                if (e.gs_input_locations.size() != e.gs_num_inputs) e.gs_input_locations.clear();
             }
             if (const Json* l = meta.find("literal_samplers"); l && l->kind == Json::Kind::array) {
                 for (const Json& item : l->array) {

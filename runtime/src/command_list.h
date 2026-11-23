@@ -373,10 +373,14 @@ struct ResolveSubresource {
 };
 
 // Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
-// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5).
+// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5). tail holds
+// generated stages' own parameters, pushed after the 144-byte block (the geometry fallback's passes, SHADER-1092):
+// tail_words dwords at push-constant bytes 144..; a pipeline that takes them declares the larger range.
 struct Dispatch {
     std::uintptr_t pipeline;
     std::array<std::uint32_t, 32> user_data;
+    std::array<std::uint32_t, 28> tail{};
+    std::uint32_t tail_words = 0;
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t z;
