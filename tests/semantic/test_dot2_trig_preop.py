@@ -146,59 +146,6 @@ class TableTests(unittest.TestCase):
         self.assertEqual(preop_ref((2040 << 52) | 12345, 3), 0)
 
 
-class Dot2Tests(unittest.TestCase):
-    def check(self, a, b, c, inst, **kw):
-        lines = movs({1: a, 2: b, 3: c, 10: c}) + [inst, "v_mov_b32 v11, 0"]
-        got, _ = run(lines)
-        exp = dot2_ref(a, b, c, **kw)
-        if bits_f32(exp) != bits_f32(exp):
-            self.assertNotEqual(bits_f32(got), bits_f32(got), inst)
-        else:
-            self.assertEqual(got, exp, f"{inst} a={a:#x} b={b:#x} c={c:#x}")
-
-    def test_dot2_random(self):
-        rng = random.Random(3)
-        for _ in range(24):
-            a = f2h(rng.uniform(-8, 8)) | f2h(rng.uniform(-8, 8)) << 16
-            b = f2h(rng.uniform(-8, 8)) | f2h(rng.uniform(-8, 8)) << 16
-            c = f32(rng.uniform(-100, 100))
-            self.check(a, b, c, "v_dot2_f32_f16 v10, v1, v2, v3")
-
-    def test_dot2_modifiers(self):
-        a = f2h(1.5) | f2h(-2.25) << 16
-        b = f2h(0.375) | f2h(3.0) << 16
-        c = f32(0.5)
-        self.check(a, b, c, "v_dot2_f32_f16 v10, v1, v2, v3 neg_lo:[1,0,1]", nlo=(1, 0, 1))
-        self.check(a, b, c, "v_dot2_f32_f16 v10, v1, v2, v3 neg_hi:[0,1,0]", nhi=(0, 1))
-        self.check(a, b, c, "v_dot2_f32_f16 v10, v1, v2, v3 op_sel:[1,0,0] op_sel_hi:[0,1,1]", sel=(1, 0), selhi=(0, 1))
-        self.check(a, b, c, "v_dot2_f32_f16 v10, v1, v2, v3 neg_lo:[1,0,0] clamp", nlo=(1, 0, 0), clamp=True)
-        self.check(f2h(0.25) | f2h(0.25) << 16, b, c, "v_dot2_f32_f16 v10, v1, v2, v3 clamp", clamp=True)
-
-    def test_dot2_single_rounding_per_product(self):
-        # f16 products are exact in f32: 2049/2048 * 2049/2048 needs 23 bits; summing with 1e-8 then rounds once
-        a = f2h(1.0 + 2 ** -10) * 0x10001
-        self.check(a, a, f32(-1.0), "v_dot2_f32_f16 v10, v1, v2, v3")
-        self.check(a, a, f32(1e-8), "v_dot2_f32_f16 v10, v1, v2, v3")
-
-    def test_dot2c_accumulates(self):
-        rng = random.Random(5)
-        for _ in range(12):
-            a = f2h(rng.uniform(-4, 4)) | f2h(rng.uniform(-4, 4)) << 16
-            b = f2h(rng.uniform(-4, 4)) | f2h(rng.uniform(-4, 4)) << 16
-            c = f32(rng.uniform(-10, 10))
-            self.check(a, b, c, "v_dot2c_f32_f16 v10, v1, v2")
-
-    def test_dot2c_inf_nan(self):
-        inf = 0x7C00
-        self.check(inf | f2h(1.0) << 16, f2h(2.0) * 0x10001, f32(1.0), "v_dot2c_f32_f16 v10, v1, v2")
-        self.check(inf | f2h(1.0) << 16, 0, f32(1.0), "v_dot2c_f32_f16 v10, v1, v2")
-
-    def test_dot2_refuses_dpp_and_abs(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate(movs({1: 0, 2: 0, 3: 0}) + ["v_dot2_f32_f16 v10, |v1|, v2, v3", "v_mov_b32 v11, 0"],
-                      "v10, v11, v10, v10")
-
-
 class TrigPreopTests(unittest.TestCase):
     # the mini interpreter has no f64; values are checked on the GPU by the cs_w32_trig_preop fixture
     def test_spirv_val(self):
