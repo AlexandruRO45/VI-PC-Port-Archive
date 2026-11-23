@@ -57,6 +57,15 @@ def split_windows_command(raw: str) -> list[str]:
     return args
 
 
+def _batch_wrapper(resolved: str | None) -> str | None:
+    """`resolved` (what shutil.which found for an extensionless path) when it is a Windows .bat/.cmd, else None.
+
+    Windows can start an .exe without its suffix, but a batch wrapper needs its full name."""
+    if os.name == "nt" and resolved and resolved.lower().endswith((".bat", ".cmd")):
+        return resolved
+    return None
+
+
 def split_command(raw: str) -> list[str]:
     """Split a command line without eating the backslashes of a Windows path (POSIX shlex would)."""
     raw = raw.strip()
@@ -67,16 +76,20 @@ def split_command(raw: str) -> list[str]:
     if ("/" in raw or "\\" in raw) and (resolved := shutil.which(raw)):
         # A path whose extension is left out (C:\Program Files\LLVM\bin\llvm-mc): Windows finds llvm-mc.exe
         # for it, but it is no file under that exact name, so it used to be split at its spaces.
-        # Windows can start the .exe without its suffix, but a batch wrapper needs its full name.
-        if os.name == "nt" and resolved.lower().endswith((".bat", ".cmd")):
-            return [resolved]
-        return [raw]
+        return [_batch_wrapper(resolved) or raw]
     try:
-        return split_windows_command(raw) if os.name == "nt" else shlex.split(raw)
+        args = split_windows_command(raw) if os.name == "nt" else shlex.split(raw)
     except ValueError as e:
         # shader_disasm.py calls mc_command() at import time: a bad LLVM_MC must give one clear line,
         # not a ValueError traceback before any tool's own argument parsing runs.
         raise SystemExit(f"LLVM_MC: invalid command line {raw!r}: {e}") from None
+    first = args[0] if args else ""
+    if os.name == "nt" and ("/" in first or "\\" in first) and not os.path.isfile(first):
+        # A quoted path, or one followed by arguments ("C:\llvm tools\llvm-mc" --version), is split here, so its
+        # first word needs the same wrapper lookup as a whole-value path above. A bare name ("wsl") is not
+        # looked up.
+        args[0] = _batch_wrapper(shutil.which(first)) or first
+    return args
 
 
 def mc_command(raw: str | None = None) -> list:

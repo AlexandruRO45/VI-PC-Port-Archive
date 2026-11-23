@@ -107,6 +107,35 @@ class SplitCommandTest(unittest.TestCase):
                     result = mc_command.run(mc_command.mc_command(command), capture_output=True, text=True, check=True)
                     self.assertEqual(result.stdout.strip(), "synthetic-wrapper")
 
+    @unittest.skipUnless(os.name == "nt", "Windows command wrapper")
+    def test_windows_cmd_wrapper_named_in_quotes(self):
+        # A quoted value is a command line, not one path: its first word needs the wrapper's full name too.
+        with tempfile.TemporaryDirectory(prefix="llvm tools ") as tmp:
+            path = os.path.join(tmp, "llvm-mc")
+            with open(path + ".cmd", "w", encoding="ascii", newline="\r\n") as f:
+                f.write("@echo synthetic-wrapper %*\n")
+            for command, args in ((f'"{path}"', ""),
+                                  (f'"{path}" --version -triple=amdgcn--amdpal', " --version -triple=amdgcn--amdpal"),
+                                  (f'"{path}.cmd" --version', " --version")):
+                with self.subTest(command=command):
+                    result = mc_command.run(mc_command.mc_command(command), capture_output=True, text=True, check=True)
+                    self.assertEqual(result.stdout.strip(), "synthetic-wrapper" + args)
+
+    def test_first_word_of_a_command_line_keeps_a_batch_wrappers_suffix(self):
+        typed = "C:\\llvm tools\\llvm-mc"
+
+        def which(found):
+            # Like shutil.which, only the path itself resolves, never the whole command line around it.
+            return lambda name: found if name == typed else None
+
+        with mock.patch.object(mc_command.os, "name", "nt"), \
+                mock.patch.object(mc_command.os.path, "isfile", return_value=False):
+            with mock.patch.object(mc_command.shutil, "which", side_effect=which(typed + ".CMD")):
+                self.assertEqual(mc_command.split_command(f'"{typed}" --version'), [typed + ".CMD", "--version"])
+            # An .exe starts without its suffix, so the first word stays as typed.
+            with mock.patch.object(mc_command.shutil, "which", side_effect=which(typed + ".EXE")):
+                self.assertEqual(mc_command.split_command(f'"{typed}" --version'), [typed, "--version"])
+
     def test_command_line_is_still_split_when_its_first_word_is_on_path(self):
         # Only a value with a directory part is tried as one path: "wsl -d Ubuntu ..." stays a command line
         # whatever is on PATH, and a bare name is not looked up at all.
