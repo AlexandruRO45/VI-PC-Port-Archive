@@ -1046,7 +1046,7 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
 
 ## Reproduce
 
-The assets stage runs the Rust batch converter after the strict pool export. For a matching Xbox 1.0.2.1 package it loads the bundled version-1 calibration and 161 asset-key recipes. Across 55 pools, all 51,156 BCPack catalog entries produced complete mip chains. Fitted BC6H endpoints can affect color even when the output is a structurally valid DDS. The signed BC6H format also requires a signed floating-point decoder for previews. The manifest records the decoder version and any unresolved entries. See the [build and export instructions](../tools/bcpack_calibration/README.md).
+The assets stage runs the Rust batch converter after the strict pool export. For a matching Xbox 1.0.2.1 package it loads the bundled version-1 calibration and 163 asset-key recipes. Across 55 pools, all 51,156 BCPack catalog entries produced complete mip chains. Fitted BC6H endpoints can affect color even when the output is a structurally valid DDS. The signed BC6H format also requires a signed floating-point decoder for previews. The manifest records the decoder version and any unresolved entries. See the [build and export instructions](../tools/bcpack_calibration/README.md).
 
 `tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
 enabled in strict confirmed-history mode by default), and `tools/bcpack_history_calib.py`

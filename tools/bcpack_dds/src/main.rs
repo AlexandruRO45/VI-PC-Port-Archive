@@ -69,6 +69,8 @@ struct EntryFit {
     #[serde(default)]
     bc1_endpoints: BTreeMap<u8, [u8; 6]>,
     #[serde(default)]
+    bc4_endpoints: blocks::Seeds<[u8; 2]>,
+    #[serde(default)]
     bc5_endpoints: blocks::Seeds<[u8; 4]>,
     #[serde(default)]
     bc6h_endpoints: blocks::Seeds<[[u16; 4]; 3]>,
@@ -414,12 +416,18 @@ impl Mode<'_> {
                     bc3.alpha.as_slice().try_into()?,
                 )?
             }
-            Mode::Fitted(profile, name, _) if codec == Codec::Bc4 => {
+            Mode::Fitted(profile, name, fit) if codec == Codec::Bc4 => {
                 let seeds = profile
                     .bc4
                     .get(*name)
                     .ok_or("profile has no fitted BC4 table for this entry")?;
-                blocks::decode_fitted_bc4(packed, length, seeds)?
+                if let Some(fit) = fit.filter(|fit| !fit.bc4_endpoints.is_empty()) {
+                    let mut fitted = seeds.clone();
+                    fitted.extend(fit.bc4_endpoints.iter().map(|(&slot, &end)| (slot, end)));
+                    blocks::decode_fitted_bc4(packed, length, &fitted)?
+                } else {
+                    blocks::decode_fitted_bc4(packed, length, seeds)?
+                }
             }
             Mode::Fitted(profile, _, entry) if codec == Codec::Bc5 => {
                 let mut seeds = profile.bc5.clone();
