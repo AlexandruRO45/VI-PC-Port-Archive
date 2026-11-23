@@ -16,12 +16,16 @@ are also what a shader reads through s_getpc_b64 (the code base) at that offset.
 The stage comes from the name's prefix. Mesh shaders (ms_) also need a DXBC container with their PSV0, which this
 doesn't make; geometry shaders (gs_) get gs_tri's signatures (gs_container).
 The comment at the top of each .asm says which test program to run on the result and what it should print.
-With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
-VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
+With LEONIDA_FMA=khr (or glsl, or exact), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
+VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77), --fma glsl, or --fma exact
+(a single rounding built from plain f32 ops, for a driver that splits GLSL Fma and has no VK_KHR_shader_fma).
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
 inputs, and check.py reports it as SKIP.
+With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
+heap base and code base in a uniform block at set 1), for devices whose maxPushConstantsSize is 128; set it for
+check.py too, whose test programs then bind that block (runtime/test/vk_pc_tail.h).
 """
 import json
 import os
@@ -97,6 +101,8 @@ def cs_fssm_extra(path):
 
 
 def shader_source(name):
+    if name == "ps_mullit":
+        return "../../../tests/semantic/fixtures/ps_mullit"
     return "vs_clip" if name in CLIP_CASES else name
 
 
@@ -159,12 +165,15 @@ def translate_tests(work, names):
         cmd.append("--wave64-emulate")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
-    if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR
+    if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma (default), OpFmaKHR, or emulated
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
+    # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
+    if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
+        cmd.append("--pc-tail-ubo")
     return subprocess.run(cmd).returncode
 
 
@@ -178,7 +187,8 @@ def main():
     out = Path(sys.argv[1])
     available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
-    unknown = sorted(set(names) - set(available))
+    # mullit_readback.py uses the CPU semantic fixture as an explicit build target.
+    unknown = sorted(set(names) - set(available) - {"ps_mullit"})
     if unknown:
         sys.exit("Unknown test shaders: " + ", ".join(unknown))
     skipped = [n for n in names if n.startswith("ms_")]
