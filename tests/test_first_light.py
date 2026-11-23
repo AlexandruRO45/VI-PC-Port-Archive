@@ -487,6 +487,23 @@ class OracleTests(unittest.TestCase):
     def test_accepts_the_expected_image(self):
         check_image(self.image(), self.manifest)
 
+    def test_textured_coverage_rejects_nonfinite_manifest_clear(self):
+        rgba = [0.25, 0.75, 0.0, 1.0]
+        raw = struct.pack("<16f", *(rgba + [CLEAR] * 12))
+        manifest = {
+            "width": 2, "height": 2, "min_coverage": 0.5,
+            "centre_pixel": [0, 0], "centre_rgba": rgba,
+        }
+        for value in ("NaN", "1e999", "-1e999"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(AssertionError, "manifest clear must be finite"):
+                    check_image(raw, manifest | {"clear": json.loads(value)})
+
+        manifest["min_coverage"] = 0.25
+        for clear in ({}, {"clear": CLEAR}):
+            with self.subTest(clear=clear):
+                self.assertEqual(check_image(raw, manifest | clear)["covered"], 1)
+
     def test_rejects_an_all_opaque_image(self):
         with self.assertRaises(AssertionError):
             check_image(self.image(fill=0.5), self.manifest)

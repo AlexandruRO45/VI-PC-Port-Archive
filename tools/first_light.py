@@ -697,6 +697,8 @@ def check_image(data: bytes, manifest: dict) -> dict:
         )
     pixels = struct.unpack(f"<{len(data) // 4}f", data)
     clear_val = manifest.get("clear", CLEAR)
+    if isinstance(clear_val, float) and not math.isfinite(clear_val):
+        raise AssertionError("manifest clear must be finite")
     textured = (
         manifest.get("texture") is not None
         or manifest.get("centre_rgba") is not None
