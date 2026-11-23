@@ -6324,57 +6324,102 @@ class Gen:
             # else X.   face: +X0 -X1 +Y2 -Y3 +Z4 -Z5
             #   +X: sc=-z tc=-y   -X: sc=+z tc=-y   +Y: sc=+x tc=+z   -Y: sc=+x tc=-z   +Z: sc=+x tc=-y   -Z: sc=-x tc=-y
             #   cubema = 2 * (signed major-axis coordinate)
-            x, y, z = (self.src_f(t) for t in a[1:4])
-            ax, ay, az = (self.tmp() for _ in range(3))
-            for t, s in ((ax, x), (ay, y), (az, z)):
-                self.emit(f"{t} = OpExtInst %float %glsl FAbs {s}")
-            zx, zy, zmaj, yx, ymaj = (self.tmp() for _ in range(5))
-            self.emit(f"{zx} = OpFOrdGreaterThanEqual %bool {az} {ax}")
-            self.emit(f"{zy} = OpFOrdGreaterThanEqual %bool {az} {ay}")
-            self.emit(f"{zmaj} = OpLogicalAnd %bool {zx} {zy}")
-            self.emit(f"{yx} = OpFOrdGreaterThanEqual %bool {ay} {ax}")
-            nz = self.tmp()
-            self.emit(f"{nz} = OpLogicalNot %bool {zmaj}")
-            self.emit(f"{ymaj} = OpLogicalAnd %bool {nz} {yx}")
+            # Measured natively on gfx1036 (game MODE, 4 x 13^3 operand triples over NaN, inf, +-0, denormals and
+            # normals): the compares are float compares that a NaN fails and that read a denormal as zero, "less than
+            # zero" is false for a NaN and for -0 or a denormal, and sc/tc/id/ma take the raw source words (a NaN or a
+            # denormal passes through, neg/abs move the sign bit). All of it is done on the magnitude bits here so it
+            # does not depend on how a driver compiles an ordered compare of a NaN or flushes a denormal.
+            sign = self.cu(0x80000000)
 
-            def neg(v):
-                n = self.tmp()
-                self.emit(f"{n} = OpFNegate %float {v}")
-                return n
+            def word(t):
+                u = self.src_u({k: v for k, v in t.items() if k not in ("abs", "neg")})
+                if t.get("abs"):
+                    g = self.tmp()
+                    self.emit(f"{g} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+                    u = g
+                if t.get("neg"):
+                    g = self.tmp()
+                    self.emit(f"{g} = OpBitwiseXor %uint {u} {sign}")
+                    u = g
+                return u
 
-            def lt0(v):
-                b = self.tmp()
-                self.emit(f"{b} = OpFOrdLessThan %bool {v} %f0")
-                return b
+            def bsel(c, t, f):
+                r_ = self.tmp()
+                self.emit(f"{r_} = OpSelect %bool {c} {t} {f}")
+                return r_
+
+            def usel(c, t, f):
+                r_ = self.tmp()
+                self.emit(f"{r_} = OpSelect %uint {c} {t} {f}")
+                return r_
+
+            def band(p, q):
+                r_ = self.tmp()
+                self.emit(f"{r_} = OpLogicalAnd %bool {p} {q}")
+                return r_
+
+            def ucmp(opname, p, q):
+                r_ = self.tmp()
+                self.emit(f"{r_} = {opname} %bool {p} {q}")
+                return r_
+
+            def flip(u):
+                r_ = self.tmp()
+                self.emit(f"{r_} = OpBitwiseXor %uint {u} {sign}")
+                return r_
+
+            def magnitude(u):
+                m_, den = self.tmp(), None
+                self.emit(f"{m_} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+                den = ucmp("OpULessThan", m_, self.cu(0x00800000))
+                return usel(den, self.cu(0), m_)
+
+            xu, yu, zu = (word(t) for t in a[1:4])
+            mx, my, mz = (magnitude(u) for u in (xu, yu, zu))
+            nx, ny, nz = (ucmp("OpUGreaterThan", m_, self.cu(0x7F800000)) for m_ in (mx, my, mz))
+
+            def ge(ma_, na, mb_, nb):          # |a| >= |b| as a float compare: false when either is NaN
+                ok = ucmp("OpUGreaterThanEqual", ma_, mb_)
+                nn = self.tmp()
+                self.emit(f"{nn} = OpLogicalOr %bool {na} {nb}")
+                nnn = self.tmp()
+                self.emit(f"{nnn} = OpLogicalNot %bool {nn}")
+                return band(ok, nnn)
+
+            def lt0(u, m_, n_):                # u < 0.0: sign set, not a (flushed) zero, not a NaN
+                sgw = self.tmp()
+                self.emit(f"{sgw} = OpBitwiseAnd %uint {u} {sign}")
+                sg = ucmp("OpINotEqual", sgw, self.cu(0))
+                nz = ucmp("OpINotEqual", m_, self.cu(0))
+                nn = self.tmp()
+                self.emit(f"{nn} = OpLogicalNot %bool {n_}")
+                return band(band(sg, nz), nn)
+
+            zmaj = band(ge(mz, nz, mx, nx), ge(mz, nz, my, ny))
+            nzm = self.tmp()
+            self.emit(f"{nzm} = OpLogicalNot %bool {zmaj}")
+            ymaj = band(nzm, ge(my, ny, mx, nx))
+            xneg, yneg, zneg = lt0(xu, mx, nx), lt0(yu, my, ny), lt0(zu, mz, nz)
 
             def pick(zv, yv, xv):
-                t1, t2 = self.tmp(), self.tmp()
-                self.emit(f"{t1} = OpSelect %float {ymaj} {yv} {xv}")
-                self.emit(f"{t2} = OpSelect %float {zmaj} {zv} {t1}")
-                return t2
+                return usel(zmaj, zv, usel(ymaj, yv, xv))
 
-            def sel(c, t, f):
-                r = self.tmp()
-                self.emit(f"{r} = OpSelect %float {c} {t} {f}")
-                return r
-            xn, yn, zn = lt0(x), lt0(y), lt0(z)
-            if op == "v_cubema_f32":
-                # Measured natively on RDNA2 (gfx1036, wave32 & wave64, all 4 IEEE/DX10_CLAMP modes):
-                # v_cubema_f32 returns +0.0 (never -0.0) whenever the selected major axis is ±0.0,
-                # while preserving NaNs and signed non-zero major-axis values.
-                m = pick(z, y, x)
-                is_z, m2, r = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{is_z} = OpFOrdEqual %bool {m} %f0")
-                self.emit(f"{m2} = OpFMul %float {m} {self.fconst(2.0)}")
-                self.emit(f"{r} = OpSelect %float {is_z} %f0 {m2}")
-            elif op == "v_cubeid_f32":
-                r = pick(sel(zn, self.fconst(5.0), self.fconst(4.0)), sel(yn, self.fconst(3.0), self.fconst(2.0)),
-                         sel(xn, self.fconst(1.0), self.fconst(0.0)))
+            if op == "v_cubeid_f32":
+                def fc(v):
+                    return self.cu(struct.unpack("<I", struct.pack("<f", v))[0])
+                r = pick(usel(zneg, fc(5.0), fc(4.0)), usel(yneg, fc(3.0), fc(2.0)), usel(xneg, fc(1.0), fc(0.0)))
             elif op == "v_cubesc_f32":
-                r = pick(sel(zn, neg(x), x), x, sel(xn, z, neg(z)))
+                r = pick(usel(zneg, flip(xu), xu), xu, usel(xneg, zu, flip(zu)))
+            elif op == "v_cubetc_f32":
+                r = pick(flip(yu), usel(yneg, flip(zu), zu), flip(yu))
             else:
-                r = pick(neg(y), sel(yn, neg(z), z), neg(y))
-            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+                # 2 * the major coordinate, +0 for a (flushed) zero; a NaN stays a NaN
+                mm = pick(mz, my, mx)
+                mu = pick(zu, yu, xu)
+                twice = self.tmp()
+                self.emit(f"{twice} = OpFMul %float {self.tof(mu)} {self.fconst(2.0)}")
+                r = usel(ucmp("OpIEqual", mm, self.cu(0)), self.cu(0), self.tou(twice))
+            self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)) if mods else r)
         elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
             # Count of set bits in the mask for lanes below this one (lo: lanes 0-31, hi: lanes 32-63), plus src1.
             self.uses_subgroup = True

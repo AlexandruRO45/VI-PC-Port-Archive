@@ -286,26 +286,37 @@ def cvt_pk_u8(x, byte, base):
 
 
 def cube(op, x, y, z):
-    """V_CUBEID/SC/TC/MA_F32 (ISA pseudocode; comparisons are float compares, so -0 < 0 is false)."""
-    if is_nan(x) or is_nan(y) or is_nan(z):
-        raise NotModelled("cube of NaN")
-    ax, ay, az = (abs(to_frac(v)) if not is_inf(v) else math.inf for v in (x, y, z))
-    lt0 = lambda v: sign(v) and not is_zero(v)        # noqa: E731
-    if az >= ax and az >= ay:
+    """V_CUBEID/SC/TC/MA_F32, as measured on gfx1036 in the game's MODE over 4 x 13^3 operand triples (NaN, infinities,
+    +-0, denormals, normals): the compares are float compares that a NaN fails and that read a denormal as zero, "less
+    than zero" is false for a NaN, -0 and a denormal, sc/tc/id take the raw source words (a NaN or a denormal passes
+    through) and ma is 2 * the major coordinate, +0 for a flushed zero."""
+    def mag(w):
+        m = w & 0x7FFFFFFF
+        return 0 if m < 0x00800000 else m                # a NaN stays above 0x7f800000
+
+    mx, my, mz = mag(x), mag(y), mag(z)
+    nx, ny, nz = (m > 0x7F800000 for m in (mx, my, mz))
+    ge = lambda ma, na, mb, nb: ma >= mb and not na and not nb          # noqa: E731
+    lt0 = lambda w, m, n: bool(w & 0x80000000) and m != 0 and not n      # noqa: E731
+    if ge(mz, nz, mx, nx) and ge(mz, nz, my, ny):
         major = "z"
-    elif ay >= ax:
+    elif ge(my, ny, mx, nx):
         major = "y"
     else:
         major = "x"
     if op == "v_cubeid_f32":
-        face = {"z": 5 if lt0(z) else 4, "y": 3 if lt0(y) else 2, "x": 1 if lt0(x) else 0}[major]
+        face = {"z": 5 if lt0(z, mz, nz) else 4, "y": 3 if lt0(y, my, ny) else 2, "x": 1 if lt0(x, mx, nx) else 0}[major]
         return bits(float(face))
     if op == "v_cubesc_f32":
-        return {"z": neg(x) if lt0(z) else x, "y": x, "x": z if lt0(x) else neg(z)}[major]
+        return {"z": neg(x) if lt0(z, mz, nz) else x, "y": x, "x": z if lt0(x, mx, nx) else neg(z)}[major]
     if op == "v_cubetc_f32":
-        return {"z": neg(y), "y": neg(z) if lt0(y) else z, "x": neg(y)}[major]
-    m = {"z": z, "y": y, "x": x}[major]
-    return 0 if is_zero(m) else mul(bits(2.0), m)
+        return {"z": neg(y), "y": neg(z) if lt0(y, my, ny) else z, "x": neg(y)}[major]
+    m, mm = {"z": (z, mz), "y": (y, my), "x": (x, mx)}[major]
+    if mm == 0:
+        return 0
+    if mm > 0x7F800000:
+        return QNAN                                        # a NaN stays a NaN; its payload is not modelled
+    return mul(bits(2.0), m)
 
 
 def cmp_class(x, mask):
