@@ -846,7 +846,14 @@ def translator_flags_setting(fallbacks: tuple[str, ...]) -> str:
     return " ".join(fallbacks)
 
 
+# The revision of shader_disasm.py's decoding check (DECODER_CHECKS). It is part of the disassembly signature, so a
+# work folder disassembled before the check existed (by an llvm-mc it now refuses, e.g. 22.1.2) is disassembled again
+# and the check runs. Change it whenever DECODER_CHECKS changes.
+DISASSEMBLY_CHECK = "exact decoding, LLVM 23.1.0+ (SHADER-804)"
+
+
 def llvm_mc_signature() -> str:
+    """The llvm-mc command, its --version output and DISASSEMBLY_CHECK: listings made under another one are redone."""
     command = mc_command()
     command[0] = shutil.which(command[0]) or command[0]
     try:
@@ -858,7 +865,7 @@ def llvm_mc_signature() -> str:
         fallback = f"exit code {result.returncode}" if result.returncode else "no version printed"
         detail = (result.stderr.strip().splitlines() or [fallback])[0]
         fail(f"Could not read the llvm-mc version. Check LLVM_MC: {detail}")
-    return json.dumps([command, version])
+    return json.dumps([command, version, DISASSEMBLY_CHECK])
 
 
 def unpacked_shader_stems(dxbc: str) -> set[str] | None:

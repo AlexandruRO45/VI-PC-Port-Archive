@@ -22,6 +22,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import make_game  # noqa: E402
+import fake_llvm_mc  # noqa: E402
 import fspx_unpack  # noqa: E402
 import shader_meta  # noqa: E402
 from test_fspx_unpack import kind0, make_dxbc, make_fspx, program, psv0  # noqa: E402
@@ -184,7 +185,7 @@ class FspxStage(unittest.TestCase):
     def test_failed_disassembly_leaves_no_marker_and_is_retried(self):
         mc = os.path.join(self.tmp.name, "fake_mc.py")
         with open(mc, "w", encoding="utf-8", newline="\n") as f:
-            f.write("import sys\nsys.stderr.write('error: disassembly stopped\\n')\nsys.exit(23)\n")
+            f.write(fake_llvm_mc.GOOD + "sys.stderr.write('error: disassembly stopped\\n')\nsys.exit(23)\n")
         real_py = make_game.py
 
         def run_tool(tool, *args):
@@ -205,7 +206,7 @@ class FspxStage(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
             self.assertEqual(os.listdir(os.path.join(self.unpacked, "disasm")), [])
             with open(mc, "w", encoding="utf-8", newline="\n") as f:
-                f.write("print('\\ts_endpgm')\n")
+                f.write(fake_llvm_mc.GOOD + "print('\\ts_endpgm')\n")
             self.calls = []
             make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
             self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py", "rdna2spirv.py"])

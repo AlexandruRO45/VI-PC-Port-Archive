@@ -28,7 +28,7 @@ body:
     attributes:
       label: System
       description: OS, CPU, GPU and driver version, and the Python, LLVM and Vulkan SDK versions if the build failed.
-      placeholder: Windows 11 24H2, Ryzen 5 7600, RX 7800 XT (Adrenalin 25.10.1), Python 3.12.7, LLVM 21.1.8, Vulkan SDK 1.4.328
+      placeholder: Windows 11 24H2, Ryzen 5 7600, RX 7800 XT (Adrenalin 25.10.1), Python 3.12.7, LLVM 23.1.6, Vulkan SDK 1.4.328
     validations:
       required: true
   - type: dropdown

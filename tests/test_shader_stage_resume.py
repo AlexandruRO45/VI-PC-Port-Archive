@@ -146,6 +146,27 @@ class ShaderStageResumeTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.SHARD_PLAN)))
                 self.assertEqual(self.run_stage(), [])
 
+    def test_a_folder_disassembled_before_the_decoding_check_is_disassembled_again(self):
+        wrapper = os.path.join(self.work, "fake llvm-mc.py")
+        with open(wrapper, "w", encoding="utf-8") as f:
+            f.write("import sys\nassert sys.argv[1:] == ['--version']\nprint('LLVM version 22.1.2')\n")
+        command = f'"{sys.executable}" "{wrapper}"'
+        with mock.patch.object(make_game, "llvm_mc_signature", self.real_llvm_mc_signature), \
+                mock.patch.dict(os.environ, {"LLVM_MC": command}):
+            self.run_stage()
+            done = os.path.join(self.dxbc, "disasm.done")
+            with open(done, encoding="utf-8") as f:
+                marker = json.load(f)
+            # What the build before the check wrote: the same llvm-mc, signed with its command and version only.
+            if isinstance(marker, dict):
+                marker["llvm"] = json.dumps(json.loads(marker["llvm"])[:2])
+            else:
+                marker = marker[:2]
+            with open(done, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(marker) + "\n")
+            self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+            self.assertEqual(self.run_stage(), [])
+
     def test_llvm_change_leaves_no_completion_markers_if_disassembly_stops(self):
         self.run_stage()
         self.touch(self.spirv, make_game.SHARD_PLAN)
