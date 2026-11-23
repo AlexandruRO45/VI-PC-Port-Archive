@@ -203,6 +203,10 @@ def main(argv=None) -> int:
         return 2
     if a.out:
         out = os.path.abspath(a.out)
+        if os.path.isdir(out):
+            ap.error(f"--out is a folder, not a report file: {a.out}")
+        if os.path.exists(out) and os.path.samefile(out, a.src):
+            ap.error(f"--out must not overwrite the source: {a.out}")
         try:    # preflight: a mistyped folder should not fail after the archive has been walked
             os.makedirs(os.path.dirname(out), exist_ok=True)
         except OSError as e:

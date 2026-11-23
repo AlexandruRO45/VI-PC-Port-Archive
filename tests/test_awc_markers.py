@@ -213,6 +213,19 @@ class ScanTest(unittest.TestCase):
         self.assertIn("cannot be written to", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_out_that_is_a_folder_or_the_source_is_refused(self):
+        # --out <folder> was a PermissionError traceback and --out <source bank> replaced the bank.
+        bank = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
+        for out, reason in ((self.tmp.name, "is a folder"), (bank, "must not overwrite the source")):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    awc_markers.main([bank, "--out", out])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn(reason, stderr.getvalue())
+        with open(bank, "rb") as f:
+            self.assertTrue(f.read().startswith(b"ADAT"))    # the bank is still a bank
+
     def test_runs_under_python_dash_i(self):
         path = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
         proc = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True, timeout=120)
