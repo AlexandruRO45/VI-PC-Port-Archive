@@ -86,5 +86,60 @@ class TestVCvtF32U32Reference(unittest.TestCase):
                 self.assertEqual(got, ref_cvt_f32_u32(val))
 
 
+class RegType(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    val: int = 0
+
+    def format(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        return f"{self.val:#x}"
+
+
+@dataclasses.dataclass(frozen=True)
+class VCvtF32U32Inst:
+    dst: Operand
+    src0: Operand
+
+    def emit_asm(self) -> str:
+        return f"v_cvt_f32_u32 {self.dst.format()}, {self.src0.format()}"
+
+
+class TestVCvtF32U32AST(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self):
+        inst = VCvtF32U32Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+        )
+        self.assertEqual(inst.emit_asm(), "v_cvt_f32_u32 v0, v1")
+
+    def test_ast_with_literal(self):
+        inst = VCvtF32U32Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.IMM, 0, 100),
+        )
+        self.assertEqual(inst.emit_asm(), "v_cvt_f32_u32 v0, 0x64")
+
+    def test_ast_immutability(self):
+        inst = VCvtF32U32Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            inst.dst = Operand(RegType.VGPR, 2)  # type: ignore
+
+
 if __name__ == '__main__':
     unittest.main()
