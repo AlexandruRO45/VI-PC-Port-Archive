@@ -6946,10 +6946,13 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
                     "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
-                    "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
+                    "image_sample_c_cl_o", "image_sample_c_b_cl_o",
+                    "image_sample_d_o", "image_sample_d_cl_o", "image_sample_d_o_g16", "image_sample_d_cl_o_g16") or \
+                op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
-                    "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
+                    "image_sample_d", "image_sample_d_cl", "image_sample_d_g16", "image_sample_d_cl_g16",
+                    "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
@@ -12460,7 +12463,7 @@ class Gen:
             self.uses_tex_array = True
         if ncoord == 1:
             self.uses_tex_1d = True
-        if is3d and op in ("image_sample_d", "image_sample_d_cl") and ("tfe" in mods or "lwe" in mods):
+        if is3d and op.startswith("image_sample_d") and ("tfe" in mods or "lwe" in mods):
             raise Unsupported(op + " 3D gradient status")
         grad_width = 3 if is3d else min(ncoord, 2)  # an array layer has no derivative
         # Cube loads use the same 2D-array view (sampled or storage) and integer layer as array loads.
@@ -12501,11 +12504,13 @@ class Gen:
                 extras = op[len("image_gather4"):]
             else:
                 extras = ""
-            w_off = 1 if op.endswith("_o") else 0
+            a16_g16 = extras.endswith("_g16")
+            extras = extras[:-4] if a16_g16 else extras
+            w_off = 1 if extras.endswith("_o") else 0
             extras = extras[:-2] if w_off else extras
             extras = extras[:-3] if extras.endswith("_cl") else extras      # the clamp is packed with the coordinates
             w_bias = 1 if extras in ("_b", "_c_b") else 0
-            w_grad = 2 * grad_width if extras in ("_d", "_d_cl") else 0
+            w_grad = (2 * ((grad_width + 1) // 2) if a16_g16 else 2 * grad_width) if extras == "_d" else 0
             whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
             unpacked = []
             for i, c in enumerate(coords):
@@ -12708,14 +12713,17 @@ class Gen:
                     comps.append(comp)
                 self.store_gather_taps(vdata["r"], comps, d16)
                 return
-            kind = op[len("image_sample"):]          # '', '_lz', '_l', '_b', '_c_lz', '_d', '_d_cl' (+ '_o')
+            kind = op[len("image_sample"):]          # '', '_lz', '_l', '_b', '_c_lz', '_d', '_d_cl' (+ '_o', '_g16')
+            g16 = kind.endswith("_g16")
+            if g16:
+                kind = kind[:-4]
             off = None
             if kind.endswith("_o"):
                 # _o: the first address dword packs signed 6-bit texel offsets, x = [5:0], y = [13:8], z = [21:16]
                 # (GFX10 MIMG address order: offset, bias, z-compare, derivatives, coordinates). Mapped to the
                 # SPIR-V Offset operand; Vulkan only guarantees offsets within minTexelOffset..maxTexelOffset.
                 kind = kind[:-2]
-                raw, f = coords[0], f[1:]
+                raw, coords, f = coords[0], coords[1:], f[1:]
                 n_off = 3 if is3d else (1 if ncoord == 1 else 2)
                 parts = []
                 for k in range(n_off):
@@ -12740,23 +12748,49 @@ class Gen:
             # Address order after the offset: bias, z-compare, gradients, coordinates, LOD, clamp.
             bias = None
             if kind in ("_b", "_c_b"):
-                bias, f = f[0], f[1:]
+                bias, coords, f = f[0], coords[1:], f[1:]
             ref = None
             if kind.startswith("_c"):
-                ref, f = f[0], f[1:]
+                ref, coords, f = f[0], coords[1:], f[1:]
             grads = None
             if kind == "_d":
                 # Address order: all dP/dx components, all dP/dy components, then the coordinates.
-                if len(f) < 2 * grad_width + ncoord:
-                    raise Unsupported(op + " coords")
-                if grad_width == 1:
-                    grads = (f[0], f[1])
+                # For _g16, dP/dx and dP/dy are each packed independently as f16 pairs:
+                # 1D: (dx, _) and (dy, _) [2 VGPRs]; 2D/2D_ARRAY/CUBE: (dx.x, dx.y) and (dy.x, dy.y) [2 VGPRs];
+                # 3D: (dx.x, dx.y), (dx.z, _) and (dy.x, dy.y), (dy.z, _) [4 VGPRs].
+                if g16:
+                    gw = (grad_width + 1) // 2
+                    if len(f) < 2 * gw + ncoord:
+                        raise Unsupported(op + " coords")
+
+                    def unpack_g16(words):
+                        v2_0 = self.tmp()
+                        self.emit(f"{v2_0} = OpExtInst %v2float %glsl UnpackHalf2x16 {words[0]}")
+                        if grad_width == 1:
+                            g = self.tmp()
+                            self.emit(f"{g} = OpCompositeExtract %float {v2_0} 0")
+                            return g
+                        if grad_width == 2:
+                            return v2_0
+                        v2_1, gz, g = self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{v2_1} = OpExtInst %v2float %glsl UnpackHalf2x16 {words[1]}")
+                        self.emit(f"{gz} = OpCompositeExtract %float {v2_1} 0")
+                        self.emit(f"{g} = OpCompositeConstruct %v3float {v2_0} {gz}")
+                        return g
+
+                    grads = (unpack_g16(coords[:gw]), unpack_g16(coords[gw:2 * gw]))
+                    coords, f = coords[2 * gw:], f[2 * gw:]
                 else:
-                    gx, gy = self.tmp(), self.tmp()
-                    self.emit(f"{gx} = OpCompositeConstruct %v{grad_width}float {' '.join(f[:grad_width])}")
-                    self.emit(f"{gy} = OpCompositeConstruct %v{grad_width}float {' '.join(f[grad_width:2 * grad_width])}")
-                    grads = (gx, gy)
-                f = f[2 * grad_width:]
+                    if len(f) < 2 * grad_width + ncoord:
+                        raise Unsupported(op + " coords")
+                    if grad_width == 1:
+                        grads = (f[0], f[1])
+                    else:
+                        gx, gy = self.tmp(), self.tmp()
+                        self.emit(f"{gx} = OpCompositeConstruct %v{grad_width}float {' '.join(f[:grad_width])}")
+                        self.emit(f"{gy} = OpCompositeConstruct %v{grad_width}float {' '.join(f[grad_width:2 * grad_width])}")
+                        grads = (gx, gy)
+                    coords, f = coords[2 * grad_width:], f[2 * grad_width:]
             if clamp:
                 # The clamp is the component right after the coordinates. Under a16 an f16 pad may follow it, so
                 # it isn't the last one there (taking the last one read that pad until 2026-11-21).
@@ -12797,7 +12831,7 @@ class Gen:
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
-            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
+            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b", "_d"):
                 raise Unsupported(op)
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
             # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
@@ -12815,7 +12849,7 @@ class Gen:
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 fb_lod = bias_lod if (not implicit and kind in ("_b", "_c_b")) else lod
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, fb_lod, bias,
-                                                       a[3])
+                                                       a[3], grads=grads, minlod=minlod)
                 off = None
 
             def opnd(mask, args):
@@ -12829,10 +12863,14 @@ class Gen:
                     vals.append(minlod)
                 return f" {'|'.join(masks)} {' '.join(vals)}" if masks else ""
             if kind == "_d":
+                masks, vals = ["Grad"], [grads[0], grads[1]]
+                if off is not None:
+                    masks.append("Offset")
+                    vals.append(off)
                 if minlod is not None:
-                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
-                else:
-                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads[0]} {grads[1]}")
+                    masks.append("MinLod")
+                    vals.append(minlod)
+                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} {'|'.join(masks)} {' '.join(vals)}")
             elif grads_fb is not None and not kind.startswith("_c"):
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad{'|MinLod' if minlod else ''} "
                           f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
@@ -13611,11 +13649,13 @@ class Gen:
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
 
-    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op):
+    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op,
+                          grads=None, minlod=None):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
 
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
-        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
+        for _l, log2(max(|dx*size0|, |dy*size0|)) (clamped by minlod if present) for _d, and OpImageQueryLod's for
+        implicit samples (plus the bias for _b), rounded the way the S#'s
         MIP_FILTER (word 2 [27:26]) selects a level and clamped to the image's levels: floored for linear, nearest
         with a tie rounding up (floor(lod + 0.5), as an RTX 5070 samples LOD 0.5 at mip 1 and image_query_probe.py
         records for RDNA2) for point and for the value 3, which the runtime also samples as nearest, and 0 for
@@ -13633,6 +13673,7 @@ class Gen:
         spatial = n_off                                   # 1D: 1, 2D / 2D array: 2, 3D: 3 (array layer excluded)
         vf = {1: "%float", 2: "%v2float", 3: "%v3float"}[spatial]
         vi = {1: "%int", 2: "%v2int", 3: "%v3int"}[spatial]
+        qtype = "%int" if ncoord == 1 else "%v3int" if ncoord == 3 else "%v2int"
         uvs = uv
         if ncoord > spatial:                              # 2D array: the spatial part of (u, v, layer)
             uvs = self.tmp()
@@ -13640,6 +13681,28 @@ class Gen:
         level_f = None
         if kind == "_l":
             level_f = lod if lod is not None else "%f0"
+        elif kind == "_d" and grads is not None:
+            sz0 = self.tmp()
+            self.emit(f"{sz0} = OpImageQuerySizeLod {qtype} {img} {ci(0)}")
+            if qtype == "%v3int" and spatial == 2:
+                sz0s = self.tmp()
+                self.emit(f"{sz0s} = OpVectorShuffle %v2int {sz0} {sz0} 0 1")
+                sz0 = sz0s
+            sz0f, dxt, dyt, lx, ly, rho, rhoc, lg = (self.tmp() for _ in range(8))
+            self.emit(f"{sz0f} = OpConvertSToF {vf} {sz0}")
+            self.emit(f"{dxt} = OpFMul {vf} {grads[0]} {sz0f}")
+            self.emit(f"{dyt} = OpFMul {vf} {grads[1]} {sz0f}")
+            norm_op = "FAbs" if spatial == 1 else "Length"
+            self.emit(f"{lx} = OpExtInst %float %glsl {norm_op} {dxt}")
+            self.emit(f"{ly} = OpExtInst %float %glsl {norm_op} {dyt}")
+            self.emit(f"{rho} = OpExtInst %float %glsl FMax {lx} {ly}")
+            self.emit(f"{rhoc} = OpExtInst %float %glsl FMax {rho} %f1")
+            self.emit(f"{lg} = OpExtInst %float %glsl Log2 {rhoc}")
+            level_f = lg
+            if minlod is not None:
+                lm = self.tmp()
+                self.emit(f"{lm} = OpExtInst %float %glsl FMax {level_f} {minlod}")
+                level_f = lm
         elif implicit:
             q, qx = self.tmp(), self.tmp()
             self.emit(f"{q} = OpImageQueryLod %v2float {si} {uvs}")

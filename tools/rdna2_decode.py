@@ -363,31 +363,28 @@ def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
     if name.startswith("image_atomic_"):
         return (base + 1) // 2 if a16 else base
     # Separate 32-bit address components (offset, bias, z-compare, derivatives) from a16-packable coords/lod/clamp.
-    has_o = name.endswith("_o") or "_o_" in name
-    base_name = name[:-2] if name.endswith("_o") else name
-    has_cl = base_name.endswith("_cl")
-    if has_cl:
-        base_name = base_name[:-3]
-    fixed32 = 1 if has_o else 0
-    if "_b" in base_name and not base_name.startswith("image_bvh"):
-        fixed32 += 1
-    if "_c" in base_name and not base_name.startswith(("image_atomic", "image_get")):
-        fixed32 += 1
-    if "_d" in base_name and not base_name.startswith(("image_atomic", "image_get")):
-        fixed32 += 2 * _MIMG_GRAD_COORDS.get(dim, 2)
+    fixed32 = 0
     packable = base
-    if "_l" in base_name and "_lz" not in base_name and not base_name.startswith(
-            ("image_load", "image_store", "image_atomic", "image_get")):
-        packable += 1
-    if has_cl:
-        packable += 1
-    if base_name in ("image_load_mip", "image_store_mip"):
+    if name.startswith(("image_sample", "image_gather4")):
+        toks = set(name.split("_")[2:])
+        if "o" in toks:
+            fixed32 += 1
+        if "b" in toks:
+            fixed32 += 1
+        if "c" in toks:
+            fixed32 += 1
+        if "d" in toks or "cd" in toks:
+            g = _MIMG_GRAD_COORDS.get(dim, 2)
+            fixed32 += 2 * ((g + 1) // 2) if "g16" in toks else 2 * g
+        if "l" in toks:
+            packable += 1
+        if "cl" in toks:
+            packable += 1
+    elif "_mip" in name:
         packable += 1
     if a16:
-        # On GFX10, a16 packs coordinates (and lod/clamp after coords) two 16-bit values per VGPR; clamp/lod
-        # after 2D coords starts a new VGPR when coords are even (e.g., 2D + cl -> 1 + 1 = 2 VGPRs).
-        packed = (base + 1) // 2 + (packable - base)
-        return fixed32 + packed
+        # On GFX10, a16 packs coordinates (and lod/clamp/mip after coords) two 16-bit values per VGPR.
+        return fixed32 + (packable + 1) // 2
     return fixed32 + packable
 
 
