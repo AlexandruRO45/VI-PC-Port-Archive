@@ -271,11 +271,47 @@ KNOWN_FOLDERS = ("{374DE290-123F-4565-9164-39C4925E467B}", "{B4BFCC3A-DB2C-424C-
                  "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}")
 
 
-def known_folders() -> list:
-    """Windows: where Downloads, Desktop and Documents really are (SHGetKnownFolderPath). Empty elsewhere, and
-    without the ones the shell can't report."""
-    if os.name != "nt":
+# xdg-user-dirs (freedesktop.org): the same three folders on Linux desktops, named in the user's language when the
+# account was created (~/Téléchargements, ~/Escritorio, ~/Arbeitsfläche...) and movable with xdg-user-dirs-update.
+XDG_USER_DIRS = ("XDG_DOWNLOAD_DIR", "XDG_DESKTOP_DIR", "XDG_DOCUMENTS_DIR")
+
+
+def xdg_user_dirs() -> list:
+    """POSIX: Downloads, Desktop and Documents as $XDG_CONFIG_HOME/user-dirs.dirs (default ~/.config) names them.
+    Each line is XDG_<NAME>_DIR="$HOME/<path>" or an absolute path, shell-quoted, and the last line for a name wins;
+    one set to $HOME itself means the folder is turned off. Empty when the file is missing or unreadable; a line it
+    can't use is left out."""
+    home = os.path.expanduser("~")
+    config = os.environ.get("XDG_CONFIG_HOME", "")
+    if not os.path.isabs(config):   # the spec ignores a relative XDG_CONFIG_HOME
+        config = os.path.join(home, ".config")
+    try:
+        with open(os.path.join(config, "user-dirs.dirs"), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
         return []
+    found = {}
+    for line in lines:
+        m = re.match(r'\s*(XDG_[A-Z]+_DIR)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$', line)
+        if not m or m.group(1) not in XDG_USER_DIRS:
+            continue
+        value = re.sub(r"\\(.)", r"\1", m.group(2))
+        if value == "$HOME" or value.startswith("$HOME/"):
+            path = os.path.join(home, value[len("$HOME/"):].strip("/"))
+        elif value.startswith("/"):
+            path = value
+        else:
+            continue
+        found[m.group(1)] = os.path.normpath(path)   # a shell sources the file: the last line for a name wins
+    found = {k: p for k, p in found.items() if p != os.path.normpath(home)}
+    return [found[k] for k in XDG_USER_DIRS if k in found]
+
+
+def known_folders() -> list:
+    """Where Downloads, Desktop and Documents really are. Windows: what the shell reports (SHGetKnownFolderPath),
+    without the ones it can't. Elsewhere: the xdg-user-dirs folders (xdg_user_dirs()), empty without that file."""
+    if os.name != "nt":
+        return xdg_user_dirs()
     import ctypes
     import uuid
     from ctypes import wintypes

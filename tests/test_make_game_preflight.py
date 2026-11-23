@@ -723,11 +723,66 @@ class GameDiscoveryTest(unittest.TestCase):
         self.write_probes(package)
         self.assertEqual(self.discover(known=(self.downloads, self.desktop)), [(package, self.version)])
 
+    def write_user_dirs(self, text, config=None):
+        config = config or os.path.join(self.home, ".config")
+        os.makedirs(config, exist_ok=True)
+        with open(os.path.join(config, "user-dirs.dirs"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+
+    def user_dirs(self, config_home=""):
+        with mock.patch("os.path.expanduser", return_value=self.home), \
+             mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home}):
+            return make_game.xdg_user_dirs()
+
+    def test_xdg_user_dirs_of_a_localized_desktop(self):
+        # What xdg-user-dirs-update writes for a French account, plus a Documents folder moved to another disk.
+        self.write_user_dirs(
+            "# This file is written by xdg-user-dirs-update\n"
+            'XDG_DESKTOP_DIR="$HOME/Bureau"\n'
+            'XDG_DOWNLOAD_DIR="$HOME/Downloads"\n'
+            'XDG_TEMPLATES_DIR="$HOME/Modèles"\n'
+            'XDG_DOCUMENTS_DIR="/data/Mes \\"Documents\\""\n'
+            'XDG_MUSIC_DIR="$HOME/Musique"\n'
+            'XDG_DOWNLOAD_DIR="$HOME/Téléchargements/"\n')   # a shell sources the file: the last line wins
+        self.assertEqual(self.user_dirs(), [os.path.join(self.home, "Téléchargements"),
+                                            os.path.join(self.home, "Bureau"),
+                                            os.path.normpath('/data/Mes "Documents"')])
+
+    def test_xdg_user_dirs_left_out(self):
+        # $HOME turns a folder off; a relative or unquoted value is not one xdg-user-dirs writes.
+        self.write_user_dirs('XDG_DESKTOP_DIR="$HOME"\nXDG_DOWNLOAD_DIR="$HOME/"\n'
+                             'XDG_DOCUMENTS_DIR="Documents"\nXDG_DOCUMENTS_DIR=$HOME/Docs\n')
+        self.assertEqual(self.user_dirs(), [])
+
+    def test_xdg_user_dirs_config_home(self):
+        self.assertEqual(self.user_dirs(), [])   # no file
+        elsewhere = os.path.join(self.home, "elsewhere")
+        self.write_user_dirs('XDG_DESKTOP_DIR="$HOME/Escritorio"\n', config=elsewhere)
+        self.write_user_dirs('XDG_DESKTOP_DIR="$HOME/Bureau"\n')
+        self.assertEqual(self.user_dirs(elsewhere), [os.path.join(self.home, "Escritorio")])
+        # The spec ignores a relative XDG_CONFIG_HOME: ~/.config is read instead.
+        self.assertEqual(self.user_dirs("elsewhere"), [os.path.join(self.home, "Bureau")])
+
+    def test_find_searches_a_localized_downloads_folder(self):
+        # ~/Téléchargements/Jeux/GTA VI is three levels below the home folder: only a Downloads root reaches it.
+        downloads = os.path.join(self.home, "Téléchargements")
+        package = os.path.join(downloads, "Jeux", "GTA VI")
+        self.write_probes(package)
+        self.write_user_dirs('XDG_DOWNLOAD_DIR="$HOME/Téléchargements"\n')
+        with mock.patch.object(make_game.os, "name", "posix"), \
+             mock.patch("os.path.expanduser", return_value=self.home), \
+             mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
+            known = make_game.known_folders()
+        self.assertEqual(known, [downloads])
+        self.assertEqual(self.discover(), [])
+        self.assertEqual(self.discover(known=known), [(package, self.version)])
+
     def test_known_folders_from_the_shell(self):
-        folders = make_game.known_folders()
         if os.name != "nt":
-            self.assertEqual(folders, [])
+            with mock.patch.object(make_game, "xdg_user_dirs", return_value=["/home/a/Bureau"]):
+                self.assertEqual(make_game.known_folders(), ["/home/a/Bureau"])
             return
+        folders = make_game.known_folders()
         self.assertEqual(len(folders), len(make_game.KNOWN_FOLDERS))
         for folder in folders:
             self.assertTrue(os.path.isabs(folder), folder)
