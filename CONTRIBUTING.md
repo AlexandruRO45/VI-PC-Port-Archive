@@ -11,7 +11,7 @@ Thanks for helping. A few rules keep the project safe to host:
 - **No keys, decryption or protection workarounds**, and no links to where to get them. The tools only read files
   that are already plain on disk.
 - Short excerpts needed to explain a format (a few header bytes, one instruction sequence) are fine in docs and
-  comments.
+  comments, but not from the executable: the rule above still applies.
 
 ## Before you start
 
