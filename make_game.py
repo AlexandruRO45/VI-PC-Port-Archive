@@ -72,6 +72,7 @@ from mc_command import mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from build_freshness import binary_is_stale  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -898,7 +899,9 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
-    if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
+    checker = pipeline_check_exe() if "pipelines" in stages and os.name != "nt" else None
+    # A configured build folder keeps its binaries across git pull, so a checker older than the sources is rebuilt (#7148).
+    if "pipelines" in stages and os.name != "nt" and (not checker or binary_is_stale(checker, ROOT)):
         build_pipeline_check(jobs)
         if not pipeline_check_exe():
             fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "

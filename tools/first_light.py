@@ -50,6 +50,7 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 from compute_fixture import find_test_program  # noqa: E402
+from build_freshness import binary_is_stale  # noqa: E402
 
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
@@ -585,6 +586,16 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
     return found
 
 
+def rebuild_if_stale(harness: str) -> None:
+    """A build folder keeps its vk_harness across git pull; one older than the sources is rebuilt, not trusted (#7148)."""
+    if not binary_is_stale(harness, ROOT):
+        return
+    build = os.path.dirname(harness)
+    print(f"first_light: {harness} is older than the runtime sources, rebuilding vk_harness", file=sys.stderr)
+    if subprocess.run(["cmake", "--build", build, "--target", "vk_harness"]).returncode != 0:
+        raise SystemExit(f"vk_harness is out of date and rebuilding it failed: fix the build in {build}, or pass --harness")
+
+
 def find_harness(explicit: str | None) -> str:
     executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
     build = os.path.join(ROOT, "runtime", "build")
@@ -595,6 +606,8 @@ def find_harness(explicit: str | None) -> str:
         *(os.path.join(folder, executable) for folder in build_dirs),
     ):
         if candidate and os.path.isfile(candidate):
+            if candidate not in (explicit, os.environ.get("LEONIDA_VK_HARNESS")):
+                rebuild_if_stale(candidate)
             return candidate
     for folder in build_dirs:
         configured = find_test_program(folder, "vk_harness")
