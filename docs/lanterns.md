@@ -447,9 +447,11 @@ several queues and worker threads, every frame. `lanterns_scale.cpp` (with `lant
   queue waits for both queues' frame f, and the CPU waits for the direct queue's frame f - 2 before it records into
   frame f's allocators, descriptor ring and readback buffer. Every Wait and Signal must succeed.
 - the direct queue's part of a frame is submitted first, its Waits before the Signals they wait for (D3D12 allows
-  it, and a title's queues do it); the copy and compute parts follow. After use, the direct queue zeroes the records
-  and particles it took from them, so a frame that does not wait draws nothing there and differs from frame 1. Without
-  the direct queue's two Waits, frames differ from frame 2 on.
+  it, and a title's queues do it); the copy and compute parts follow. They also wait for a fence the CPU signals only
+  when it starts the next frame (or waits for this one), so they always run late. After use, the direct queue zeroes
+  the records and particles it took from them. A direct queue that skipped its Waits would reach its reads before the
+  copy and compute queues had written, draw nothing there, and differ from frame 1: without its two Waits, every frame
+  from frame 2 on differs.
 
 How the check works. Every frame draws the same thing, so every readback (the three targets and both particle sets)
 must be byte for byte the first frame's. Frame 1 is checked against the CPU reference at every pixel (certain pixels
