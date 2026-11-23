@@ -105,7 +105,7 @@ $dryRunExitCode = $LASTEXITCODE
 $report = Get-Content -LiteralPath (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
 $todo = $report.imports | Where-Object { $_.where -eq "shim" } | Sort-Object { -$_.functions.Count }
 $lines = foreach ($t in $todo) { "{0,-40} {1,5}" -f $t.dll, $t.functions.Count }
-Set-Content -LiteralPath (Join-Path $out "shim-todo.txt") -Value $lines
+Set-Content -LiteralPath (Join-Path $out "shim-todo.txt") -Value $lines -Encoding utf8
 Write-Host "`n== Shim to-do (DLL, function count)"
 $lines
 $enc = $report.sections | Where-Object { $_.looks_encrypted } | ForEach-Object { $_.name }
