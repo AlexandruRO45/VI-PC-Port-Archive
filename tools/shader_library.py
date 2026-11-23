@@ -26,6 +26,9 @@ Usage:
 
 DIR/library.json gets the header, both pipeline tables (stage -> program name) and the per-program stage. Programs
 are named lib_<stage>_<index>. The output is game data and must stay in the user's work folder.
+
+`--save` may not name the input: it would replace the archive with the smaller library taken from it, so that run
+exits 2 instead.
 """
 import argparse
 import json
