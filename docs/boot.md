@@ -1,10 +1,14 @@
 # First boot: the runbook and the two traces
 
-**Status: `--dry-run` and `--init` have been run on the retail executable; `--run` has not.** The package in the
+**Status: `--dry-run`, `--init` and `--run` have all been run on the retail executable, but `--run` does not reach
+device creation on `main` alone.** The package in the
 repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the dry-run on an executable supplied
 separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
-([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
+([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)). A `--run` on `main` maps the package, runs
+those callbacks and reaches the title's own setup, then ends in an exception before any D3D12 call, and which
+exception varies from run to run; the boot-chain PRs that carry it further, and the stop each one clears, are in
+[`retail_boot_chain.md`](retail_boot_chain.md). So this page is still the procedure and the
 trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the
 network off. Nothing here quotes game data; a real trace stays on the player's machine.
 
