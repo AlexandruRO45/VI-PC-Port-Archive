@@ -8067,10 +8067,20 @@ class Gen:
             x, y, z = vals
             ty, pfx = ("%int", "S") if signed else ("%uint", "U")
             if "med3" in op:
-                lo_, hi_, m = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{lo_} = OpExtInst {ty} %glsl {pfx}Min {x} {y}")
-                self.emit(f"{hi_} = OpExtInst {ty} %glsl {pfx}Max {x} {y}")
-                self.emit(f"{m} = OpExtInst {ty} %glsl {pfx}Clamp {z} {lo_} {hi_}")
+                # The median of three 16-bit values is their sum minus the smallest and the largest (no overflow in 32
+                # bits). A clamp, or a min/max/select form of the median, with one operand a constant came out as the
+                # wrong operand on the AMD Windows driver (26.10.1, Radeon iGPU): v_med3_i16 of 17, -32768, 29 gave
+                # -32768 where the median is 17. The sum form and the min3/max3 forms are right there.
+                a1, mn, a2, mx, s1, s2, s3 = (self.tmp() for _ in range(7))
+                m = self.tmp()
+                self.emit(f"{a1} = OpExtInst {ty} %glsl {pfx}Min {x} {y}")
+                self.emit(f"{mn} = OpExtInst {ty} %glsl {pfx}Min {a1} {z}")
+                self.emit(f"{a2} = OpExtInst {ty} %glsl {pfx}Max {x} {y}")
+                self.emit(f"{mx} = OpExtInst {ty} %glsl {pfx}Max {a2} {z}")
+                self.emit(f"{s1} = OpIAdd {ty} {x} {y}")
+                self.emit(f"{s2} = OpIAdd {ty} {s1} {z}")
+                self.emit(f"{s3} = OpISub {ty} {s2} {mn}")
+                self.emit(f"{m} = OpISub {ty} {s3} {mx}")
             else:
                 m0, m = self.tmp(), self.tmp()
                 fn = pfx + ("Min" if "min3" in op else "Max")
