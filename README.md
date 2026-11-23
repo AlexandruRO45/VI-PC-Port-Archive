@@ -120,7 +120,9 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 
 **Is this PC strong enough?** `python -I tools/pc_checker.py --cli` detects the CPU, GPU and RAM and compares them
 with the reference profiles before a long build: `--profile 1`, the default, is an Xbox Series X PC equivalent and
-`--profile 2` a 1080p Low community estimate. `python -I tools/pc_checker.py --check --json` prints the same verdict
+`--profile 2` a 1080p Low community estimate. On Windows the RAM line also names the memory generation (DDR4, DDR5)
+from the SMBIOS memory type, so a capacity that just misses a profile is not mistaken for the wrong generation.
+`python -I tools/pc_checker.py --check --json` prints the same verdict
 as JSON and returns it as an exit code (0 good, 1 weak, 2 unknown).
 
 **Low disk space:** the ~400 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
