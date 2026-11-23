@@ -93,10 +93,12 @@ int main(int argc, char** argv) {
     const uint32_t levels = two_mip ? 2 : 1;
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
-    // Fixed shader only: fetch (0,0) is in bounds on both the fallback and the integer image.
+    // Fixed shaders only. The mixed modes also size the fallback for their two coordinates.
     const bool fetch_uint = argc >= 2 && !std::strcmp(argv[1], "fetch-uint");
     const bool fetch_miss = argc >= 2 && !std::strcmp(argv[1], "fetch-miss");
-    const bool fetch = fetch_uint || fetch_miss || (argc >= 2 && !std::strcmp(argv[1], "fetch-sint"));
+    const bool mixed_swap = argc >= 2 && !std::strcmp(argv[1], "fetch-mixed-swap");
+    const bool mixed = mixed_swap || (argc >= 2 && !std::strcmp(argv[1], "fetch-mixed"));
+    const bool fetch = mixed || fetch_uint || fetch_miss || (argc >= 2 && !std::strcmp(argv[1], "fetch-sint"));
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
     // dref_c / dref_c_b: image_sample_c / image_sample_c_b (implicit LOD, bias), same texture and expected results.
     const char* dref_ps = nullptr;
@@ -135,14 +137,14 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(fetch ? "ps_table_fetch.spv" : cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
+        fs_path = find_spv(mixed ? "ps_table_fetch_mixed.spv" : fetch ? "ps_table_fetch.spv" : cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
         const int out_arg = cube || dref || fetch ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss|fetch-mixed|fetch-mixed-swap] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
@@ -311,6 +313,14 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
+    auto float_key = leonida::make_tsharp_key(tsharp);
+    if (mixed) {
+        float_key[1] = leonida::gfx10::format_from_vulkan(VK_FORMAT_R16G16_SFLOAT) << 20;
+        // Exchange whole keys so the selected alias always agrees with the bound view.
+        auto* keys = static_cast<char*>(heapp) + tsharp_va;
+        std::memcpy(keys + (mixed_swap ? 0 : 32), float_key.data(), 32);
+        std::memcpy(keys + (mixed_swap ? 32 : 0), tsharp, 32);
+    }
     if (two_mip)  // The gather test loads its S# from the four words just after the T#.
         std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
@@ -320,6 +330,7 @@ int main(int argc, char** argv) {
     // The heap already holds the original key. Change only the registered key for the miss control.
     if (fetch_miss) tsharp[7] ^= 1;
     desc_table.insert(tsharp, 1);
+    if (mixed) desc_table.insert(float_key, 2);
     desc_table.insert(ssharp, 1);
     const auto table = desc_table.build_gpu_buffer(true);
     VkBuffer tb; VkDeviceMemory tbm; void* tbp;
@@ -359,7 +370,11 @@ int main(int argc, char** argv) {
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
-    if (fetch) texels[0] = 0x4df82282u;
+    if (fetch && !mixed) texels[0] = 0x4df82282u;
+    if (mixed) {
+        texels[2 * TW + 1] = 0x00002282u;
+        texels[4 * TW + 3] = 0x0000f877u;
+    }
     // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
     if (signed_mips)
         for (auto& texel : texels) texel &= 0x80808080u;
@@ -377,19 +392,28 @@ int main(int argc, char** argv) {
             for (uint32_t l = 0; l < CUBE_LAYERS; l++)
                 cubes[(l * TW + y) * TW + x] = (x * 32u) | ((y * 32u) << 8) | ((l * 20u) << 16) | (255u << 24);
         }
-    const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format,
-                              VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
-    VkImage timg[4]; VkImageView tview[4];
-    CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
+    const VkFormat tfmt[5] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format,
+                              VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16_SFLOAT};
+    VkImage timg[5]; VkImageView tview[5]{};
+    const uint32_t fallback_side = mixed ? TW : 1;
+    CHECK(make_tex(fallback_side, fallback_side, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
     CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[2], &timg[2], &tview[2]));
     CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
+    if (mixed) CHECK(make_tex(TW, TW, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[4], &timg[4], &tview[4]));
     VkBuffer up; VkDeviceMemory upm; void* upp;
-    const VkDeviceSize texture_offset = 256;
+    const VkDeviceSize texture_offset = TW * TW * sizeof(uint32_t);
     const VkDeviceSize texture_bytes = texels.size() * sizeof(uint32_t);
     const VkDeviceSize cube_offset = texture_offset + texture_bytes;
-    CHECK(make_buffer(cube_offset + cubes.size() * sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up, &upm, &upp));
-    std::memcpy(upp, &magenta, sizeof(magenta));
+    const VkDeviceSize float_offset = cube_offset + cubes.size() * sizeof(uint32_t);
+    CHECK(make_buffer(float_offset + (mixed ? TW * TW * sizeof(uint32_t) : 0), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up, &upm, &upp));
+    std::fill_n(static_cast<uint32_t*>(upp), fallback_side * fallback_side, magenta);
+    if (mixed) {
+        auto* halves = reinterpret_cast<uint32_t*>(static_cast<char*>(upp) + float_offset);
+        std::fill_n(halves, TW * TW, 0u);
+        halves[2 * TW + 1] = 0xbc003400u;  // (0.25, -1)
+        halves[4 * TW + 3] = 0xc0003a00u;  // (0.75, -2)
+    }
     std::memcpy(static_cast<char*>(upp) + texture_offset, texels.data(), texture_bytes);
     std::memcpy(static_cast<char*>(upp) + cube_offset, cubes.data(), cubes.size() * sizeof(uint32_t));
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -441,28 +465,30 @@ int main(int argc, char** argv) {
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = 1; fbi.pAttachments = &rtv; fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
-    // Descriptor set: binding 0 images[2], 1 samplers[2], 2 hash table, 3 2D-array images[2].
+    // Descriptor set: binding 0 fallback and live images, 1 samplers[2], 2 hash table, 3 2D-array images[2].
+    const uint32_t image_count = mixed ? 3 : 2;
     VkDescriptorSetLayoutBinding b[4]{};
-    b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, image_count, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[3] = {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dli.bindingCount = 4; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
-    VkDescriptorPoolSize ps[3]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4}, {VK_DESCRIPTOR_TYPE_SAMPLER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolSize ps[3]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, image_count + 2}, {VK_DESCRIPTOR_TYPE_SAMPLER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpi.maxSets = 1; dpi.poolSizeCount = 3; dpi.pPoolSizes = ps;
     VkDescriptorPool dp; CHECK(vkCreateDescriptorPool(dev, &dpi, nullptr, &dp));
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
     VkDescriptorSet ds; CHECK(vkAllocateDescriptorSets(dev, &dai, &ds));
-    VkDescriptorImageInfo ii2[2]{{VK_NULL_HANDLE, tview[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                 {VK_NULL_HANDLE, tview[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkDescriptorImageInfo ii2[3]{{VK_NULL_HANDLE, tview[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                 {VK_NULL_HANDLE, tview[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                 {VK_NULL_HANDLE, tview[4], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkDescriptorImageInfo ai2[2]{{VK_NULL_HANDLE, tview[2], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                  {VK_NULL_HANDLE, tview[3], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkDescriptorImageInfo si2[2]{{smp[0]}, {smp[1]}};
     VkDescriptorBufferInfo tbi{tb, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet wr[4]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; }
-    wr[0].dstBinding = 0; wr[0].descriptorCount = 2; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = ii2;
+    wr[0].dstBinding = 0; wr[0].descriptorCount = image_count; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = ii2;
     wr[1].dstBinding = 1; wr[1].descriptorCount = 2; wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[1].pImageInfo = si2;
     wr[2].dstBinding = 2; wr[2].descriptorCount = 1; wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &tbi;
     wr[3].dstBinding = 3; wr[3].descriptorCount = 2; wr[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[3].pImageInfo = ai2;
@@ -517,9 +543,9 @@ int main(int argc, char** argv) {
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cai.commandPool = pool; cai.commandBufferCount = 1;
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHECK(vkBeginCommandBuffer(cmd, &cbi));
-    const VkDeviceSize up_offset[4] = {0, texture_offset, 0, cube_offset};
-    const uint32_t up_size[4] = {1, texture_side, 1, TW}, up_layers[4] = {1, 1, 1, CUBE_LAYERS};
-    for (int t = 0; t < 4; t++) {
+    const VkDeviceSize up_offset[5] = {0, texture_offset, 0, cube_offset, float_offset};
+    const uint32_t up_size[5] = {fallback_side, texture_side, 1, TW, TW}, up_layers[5] = {1, 1, 1, CUBE_LAYERS, 1};
+    for (int t = 0; t < (mixed ? 5 : 4); t++) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.image = timg[t];
         const uint32_t mip_levels = t == 1 ? levels : 1;
@@ -632,12 +658,15 @@ int main(int argc, char** argv) {
         // The PS converts each raw VGPR word as a signed integer. On a miss magenta's
         // UNORM 1.0 channels therefore export float(0x3f800000).
         const float fallback_one = static_cast<float>(0x3f800000);
-        const float expected[] = {
+        const float single_expected[] = {
             fetch_miss ? fallback_one : fetch_uint ? 130.f : -126.f,
             fetch_miss ? 0.f : 34.f,
             fetch_miss ? fallback_one : fetch_uint ? 248.f : -8.f,
             fetch_miss ? fallback_one : 77.f
         };
+        const float mixed_expected[] = {-126.f, 34.f, 1061158912.f, -1073741824.f};
+        const float swapped_expected[] = {1048576000.f, -1082130432.f, 119.f, -8.f};
+        const float* expected = mixed_swap ? swapped_expected : mixed ? mixed_expected : single_expected;
         const auto* pixels = static_cast<const float*>(rbp);
         for (uint32_t i = 0; i < W * H * 4; ++i) {
             if (pixels[i] != expected[i % 4]) {

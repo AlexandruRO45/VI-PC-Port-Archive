@@ -1094,10 +1094,11 @@ GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad
 CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl")
 
 
-def table_fetch_test(tools, spirv):
+def table_fetch_test(tools, spirv, mixed=False):
     tool = os.path.abspath(os.path.join(tools, "vk_texture_test" + EXE))
     with tempfile.TemporaryDirectory(prefix="table-fetch-") as tmp:
-        for mode in ("fetch-sint", "fetch-uint", "fetch-miss"):
+        modes = ("fetch-mixed", "fetch-mixed-swap") if mixed else ("fetch-sint", "fetch-uint", "fetch-miss")
+        for mode in modes:
             raw = os.path.join(tmp, mode + ".raw")
             code, output = run_readback(raw, run, tool, mode, raw, cwd=spirv)
             if code == UNSUPPORTED:
@@ -1793,6 +1794,7 @@ def main():
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
+    results.append(("ps_table_fetch_mixed", table_fetch_test(tools, spirv, mixed=True)))
     results.append(("ps_table_fetch", table_fetch_test(tools, spirv)))
     for name in GRADIENT_TESTS:
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
