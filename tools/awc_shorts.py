@@ -112,6 +112,18 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_shorts: error: source does not exist: {a.src}", file=sys.stderr)
         return 2
+    if not os.path.isdir(a.src):
+        # A named file that holds no bank is a wrong path or format, not an empty result (awc_manifest.py refuses
+        # the same input); a directory scan keeps reporting 0 banks because an empty folder is a valid answer.
+        try:
+            with open(a.src, "rb") as f:
+                magic = f.read(4)
+        except OSError as e:
+            print(f"awc_shorts: cannot read {a.src}: {e.strerror or e}", file=sys.stderr)
+            return 1
+        if magic != b"ADAT":
+            print(f"awc_shorts: error: {a.src}: holds no AWC bank", file=sys.stderr)
+            return 2
     try:
         banks = _banks(a.src)
     except OSError as e:
