@@ -6,8 +6,9 @@ Each tool carries its own copy of Jenkins one-at-a-time, so nothing stopped one 
 the name differently. Two did: audio_config hashed the lowercased UTF-8 bytes, and world_names encoded
 to UTF-8 first and then lower-cased the bytes (bytes.lower() only folds ASCII). Both gave a different
 32-bit hash for any non-ASCII character, which surfaces as a stream id no bank stores or a name hash
-that never resolves, with no error anywhere. This test imports every copy in tools/ and compares it
-with the dictionary the rest of the pipeline is pinned to.
+that never resolves, with no error anywhere. A third, find_hash_lookup, kept the UTF-8 form, so this
+test failed on main until it was aligned. This test imports every copy in tools/ and compares it with
+the dictionary the rest of the pipeline is pinned to.
 
 Synthetic names only; no game data.
 """
@@ -33,7 +34,8 @@ NAMES = [
 
 # The modules whose name a reviewer would expect here: a rename must not turn the loop below into a
 # test of nothing.
-EXPECTED = ("anim_index", "audio_config", "awc_names", "hashdict", "mission_tables", "world_names")
+EXPECTED = ("anim_index", "audio_config", "awc_names", "find_hash_lookup", "hashdict", "mission_tables",
+            "world_names")
 
 
 def string_hash_copies():
