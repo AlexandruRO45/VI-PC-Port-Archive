@@ -285,6 +285,23 @@ class TestPermLane16Oracle(unittest.TestCase):
         self.assertIn("OpGroupNonUniformShuffle", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestPermLane16AST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        lanes = [i * 2 for i in range(64)]
+        s1 = 0x00000000
+        s2 = 0x00000000
+        out = model_permlane16(lanes, s1, s2, xor16=False)
+        for i in range(16):
+            self.assertEqual(out[i], 0)
+        for i in range(16, 32):
+            self.assertEqual(out[i], 32)
+
+    def test_translator_permlane16_ast(self):
+        prog = ["s_mov_b32 s3, 0", "s_mov_b32 s4, 0", "v_permlane16_b32 v2, v3, s3, s4", "s_endpgm"]
+        spv = support.translate_lines("cs_p16_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpBitFieldUExtract", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
