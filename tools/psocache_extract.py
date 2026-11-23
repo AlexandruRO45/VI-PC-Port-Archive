@@ -18,7 +18,7 @@ How the search stays bounded and deterministic:
    shader_index*8 + meta_size + code_size``. The tool appends following streams after at most 1 MiB of zero
    padding until exactly that many inflated bytes exist. A stream that would overshoot, a missing stream, or a
    missing header is reported with the byte counts, not guessed.
-4. The file is written to ``--out``, which must be inside the system temporary directory, and then checked with
+4. The file is written to ``out``, which must be inside the system temporary directory, and then checked with
    ``psocache_inspect.inspect``. The exit code is 0 only when that model holds.
 
 Usage:
@@ -184,7 +184,7 @@ def extract(
 ):
     """Find, carve and validate the cache. Returns ``(archive_index, report, search)`` or raises NotFound."""
     if not inside_tempdir(out):
-        raise ValueError("--out must be a file inside the temporary directory")
+        raise ValueError("the out path must be inside the temporary directory")
     paths = archives(source)
     left = budget
     spent = 0
