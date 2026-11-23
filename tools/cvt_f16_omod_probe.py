@@ -365,17 +365,41 @@ def evaluate_results(modes: list[str], waves: list[int], meta, raw_results) -> d
     }
 
 
-def write_report(path: str, doc: dict) -> bool:
-    """Write JSON report with LF line endings, creating parent folders."""
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, report):
+    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1)
-            f.write("\n")
+            json.dump(report, f, indent=1)
     except OSError as e:
-        print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
-        return False
-    return True
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
 
 
 def self_test() -> int:
@@ -430,8 +454,11 @@ def main(argv=None) -> int:
     if bad_modes or bad_waves or not modes or not wave_tokens:
         ap.error("unknown or empty: " + ", ".join(bad_modes + bad_waves or ["--modes/--waves"]))
     waves = [int(w) for w in wave_tokens]
-    if a.json and os.path.isdir(a.json):
-        ap.error(f"--json {a.json} is a folder, not a file")
+    if a.json is not None:
+        err = validate_json_path(a.json)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
 
     from hw_oracle import asm, runner
 
@@ -464,8 +491,11 @@ def main(argv=None) -> int:
         "inputs": len(INPUTS),
         **summary,
     }
-    if a.json and not write_report(a.json, report):
-        return 2
+    if a.json is not None:
+        err = write_json_report(a.json, report)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
 
     if summary["harness_errors"]:
         for err in summary["harness_errors"][:5]:
