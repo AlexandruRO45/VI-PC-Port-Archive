@@ -282,17 +282,27 @@ BOOL WINAPI get_module_handle_ex_w(DWORD flags, LPCWSTR name, HMODULE* out) {
         }
         return GetModuleHandleExW(flags, name, out);
     }
-    const std::string path = narrow(name);
-    if (HMODULE h = owned_handle(path)) {
-        if (out) *out = h;
-        return TRUE;
-    }
-    const std::string dll = module_name(path);
-    if (!dll.empty())
-        if (void* h = find_loaded_bundled_module(dll)) {
-            if (out) *out = reinterpret_cast<HMODULE>(h);
+    if (ascii_basename(name)) {
+        const std::string path = narrow(name);
+        if (HMODULE h = owned_handle(path)) {
+            if (out) *out = h;
             return TRUE;
         }
+        const std::string dll = module_name(path);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module(dll)) {
+                if (out) *out = reinterpret_cast<HMODULE>(h);
+                return TRUE;
+            }
+    } else {
+        // Outside ASCII: by the wide basename, as get_module_handle_w does.
+        const std::wstring dll = module_name_w(name);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module_w(dll)) {
+                if (out) *out = reinterpret_cast<HMODULE>(h);
+                return TRUE;
+            }
+    }
     return GetModuleHandleExW(flags, name, out);
 }
 
