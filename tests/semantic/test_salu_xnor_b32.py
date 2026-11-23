@@ -332,5 +332,111 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(interp_res, trans_res)
         self.assertEqual(state.scc, trans_scc)
 
+
+# ==============================================================================
+# SECTION 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDWaveState:
+    wave_size: int = 32
+    exec_mask: int = MASK32
+    vgprs: List[Dict[int, int]] = field(default_factory=list)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+    scc: int = 0
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"wave_size must be 32 or 64, got {self.wave_size}")
+        if not self.vgprs:
+            self.vgprs = [dict() for _ in range(self.wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[lane].get(idx, 0)
+
+    def set_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[lane][idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class SIMDWaveInterpreter:
+    """Interprets SALU instruction in the context of a SIMD Wave (Wave32 or Wave64).
+
+    Architectural Rule (AMD RDNA2 ISA):
+      Scalar ALU instructions execute ONCE per wave on the scalar execution unit.
+      Unlike VALU instructions which only write active lanes according to EXEC,
+      SALU instructions execute unconditionally across all lanes, reading SGPRs
+      and writing their destination SGPR / SCC regardless of the vector EXEC mask.
+    """
+
+    def step_salu(self, instr: SXnorB32Instruction, wave: SIMDWaveState) -> int:
+        val0 = wave.get_sgpr(instr.src0.value) if instr.src0.kind == OperandKind.SGPR else u32(instr.src0.value)
+        val1 = wave.get_sgpr(instr.src1.value) if instr.src1.kind == OperandKind.SGPR else u32(instr.src1.value)
+
+        res, scc = ref_s_xnor_b32(val0, val1)
+        wave.set_sgpr(instr.dst.value, res)
+        wave.scc = scc
+        return res
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_salu_uniformity_under_divergent_exec_mask(self) -> None:
+        """Verify SALU s_xnor_b32 executes uniformly even when EXEC has inactive lanes."""
+        # Wave32 with only lane 0 and lane 31 active
+        mask = (1 << 0) | (1 << 31)
+        wave = SIMDWaveState(wave_size=32, exec_mask=mask)
+        wave.set_sgpr(0, 0x11111111)
+        wave.set_sgpr(1, 0x11111111)
+
+        interp = SIMDWaveInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(2), src0=SGPR(0), src1=SGPR(1))
+        res = interp.step_salu(instr, wave)
+
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(wave.get_sgpr(2), 0xFFFFFFFF)
+        self.assertEqual(wave.scc, 1)
+
+    def test_salu_under_zero_exec_mask(self) -> None:
+        """Verify SALU s_xnor_b32 executes even when EXEC == 0 (all lanes divergent/inactive)."""
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x00000000)
+        wave.set_sgpr(0, 0xAAAAAAAA)
+        wave.set_sgpr(1, 0x55555555)
+
+        interp = SIMDWaveInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(2), src0=SGPR(0), src1=SGPR(1))
+        res = interp.step_salu(instr, wave)
+
+        # 0xAAAAAAAA xnor 0x55555555 = 0
+        self.assertEqual(res, 0x00000000)
+        self.assertEqual(wave.get_sgpr(2), 0x00000000)
+        self.assertEqual(wave.scc, 0)
+
+    def test_wave32_lane_mask_equivalence_check(self) -> None:
+        """Verify using s_xnor_b32 to compute bitwise equivalence between two lane ballot masks."""
+        ballot_a = 0b11001100_10101010_11110000_00001111
+        ballot_b = 0b11000000_10101111_11110000_00111111
+        expected_agreement = ~(ballot_a ^ ballot_b) & MASK32
+
+        wave = SIMDWaveState(wave_size=32, exec_mask=MASK32)
+        wave.set_sgpr(4, ballot_a)
+        wave.set_sgpr(5, ballot_b)
+
+        interp = SIMDWaveInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(6), src0=SGPR(4), src1=SGPR(5))
+        res = interp.step_salu(instr, wave)
+
+        self.assertEqual(res, expected_agreement)
+        self.assertEqual(wave.get_sgpr(6), expected_agreement)
+
 if __name__ == "__main__":
     unittest.main()
