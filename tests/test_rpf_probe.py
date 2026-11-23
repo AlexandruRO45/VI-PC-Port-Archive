@@ -170,6 +170,20 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.rows(), [])
         self.assertIn("0 archives", out)
 
+    def test_no_report_is_written_without_out(self):
+        """--out has no default: the survey prints and nothing is created, so a run never writes into the checkout."""
+        self.write("a.rpf", archive_bytes())
+        out = io.StringIO()
+        old_file = probe.__file__
+        probe.__file__ = os.path.join(self.tmp, "tools", "rpf_probe.py")
+        try:
+            with mock.patch("sys.argv", ["rpf_probe.py", self.game]), contextlib.redirect_stdout(out):
+                self.assertEqual(probe.main(), 0)
+        finally:
+            probe.__file__ = old_file
+        self.assertIn("1 archives", out.getvalue())
+        self.assertEqual(os.listdir(self.tmp), ["game"])
+
     def assert_input_refused(self, destination, archive):
         with open(archive, "rb") as f:
             before = f.read()
