@@ -673,5 +673,41 @@ class TestInterpP1lvF16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[3], f32_to_bits(2.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p1lv_f16 SIMD & Low/High Halves
+# ------------------------------------------------------------------------------
+
+class SIMDWaveInterpP1lvF16:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VInterpP1lvF16Instruction, p0: float, p1: float):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                i_coord = bits_to_f32(self.vgprs[insn.src0.index][lane])
+                self.vgprs[insn.dst.index][lane] = ref_interp_p1lv_f16(i_coord, p0, p1)
+
+
+class TestInterpP1lvF16SIMD(unittest.TestCase):
+    def test_simd_execution(self):
+        wave = SIMDWaveInterpP1lvF16(wave_size=32)
+        for lane in range(32):
+            wave.vgprs[0][lane] = f32_to_bits(float(lane) * 0.1)
+
+        insn = VInterpP1lvF16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 3),
+            src0=RegisterOperand(OperandType.VGPR, 0),
+            attr=AttrOperand(0, "x"),
+            accum=RegisterOperand(OperandType.VGPR, 10),
+        )
+        wave.step(insn, 1.0, 5.0)
+
+        for lane in range(32):
+            expected = ref_interp_p1lv_f16(float(lane) * 0.1, 1.0, 5.0)
+            self.assertEqual(wave.vgprs[3][lane], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
