@@ -1,5 +1,6 @@
 """Synthetic export windows and keyed model observations."""
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -54,7 +55,7 @@ class VerifyTest(unittest.TestCase):
                      "status": "candidate", "placements": 3}
         predictions = self.write("lookup", {"archive": "source.rpf", "candidates": [candidate]})
         children = [{"Name": "twin.#dr", "Offset": 0x3010, "Drawable": drawable}
-                    for drawable in (0x200, 0x700)]
+                    for drawable in (0, 0x700)]
         first = self.write("first", {"src": "source.rpf", "Scan": {"Start": 0, "Length": 0x5000},
                                      "Items": children})
         second = self.write("second", {"src": "source.rpf", "Scan": {"Start": 0x2010, "Length": 0x2000},
@@ -70,6 +71,18 @@ class VerifyTest(unittest.TestCase):
                 self.assertEqual(row["duplicate_observations"], repeats)
                 self.assertEqual(row["distinct_drawable_children"], 2)
                 self.assertEqual(result, verifier.verify(predictions, [*manifests, first]))
+
+    def test_reject_invalid_drawable_offsets(self):
+        predictions = self.write("lookup", {"archive": "source.rpf", "candidates": []})
+        for drawable in ([1], {"x": 1}, False, -1, 1.0, "1"):
+            with self.subTest(drawable=drawable):
+                manifest = self.write("manifest.json", {"src": "source.rpf", "Scan": {},
+                                                        "Items": [{"Name": "one.#dr", "Offset": 16,
+                                                                   "Drawable": drawable}]})
+                with self.assertRaises(ValueError) as error:
+                    verifier.verify(predictions, [manifest])
+                self.assertIn(os.path.normcase(os.path.realpath(manifest)), str(error.exception))
+                self.assertIn("Drawable", str(error.exception))
 
     def test_reject_unrelated_archive_and_bad_bounds(self):
         predictions = self.write("lookup", {"archive": "source.rpf", "candidates": []})

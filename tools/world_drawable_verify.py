@@ -45,6 +45,9 @@ def verify(predictions, manifests):
             offset = item.get("Offset")
             if type(offset) is not int or offset < 0 or (bounded and not start <= offset < start + length):
                 raise ValueError(f"{path}: invalid item offset for scan")
+            drawable = item.get("Drawable")
+            if drawable is not None and (type(drawable) is not int or drawable < 0):
+                raise ValueError(f"{path}: invalid Drawable offset")
         index = world_build.model_name_index([("", item) for item in export["Items"]], world_names)
         for h, entries in index.items():
             for _, item, key in entries:
