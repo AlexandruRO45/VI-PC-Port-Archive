@@ -1,10 +1,10 @@
 # The retail boot chain: what stops `gta6rt --run`, in order
 
-**Status: measured on one machine, 2026-11-23. A measurement for RT-5, not a claim; RT-5 stays with its owners
-on the coordination issue.** Each row is the first failure with every fix above it in place. Nothing here quotes
-the executable: no addresses, offsets, IID values or bytes; only export names, public SDK types, vtable slot
-numbers, call shapes and counts. [boot.md](boot.md) has the runbook that produced the traces; #6715 maps the same
-executable under `--dry-run`.
+**Status: measured on two machines, 2026-11-23 — the setup named below, and plain `main` with nothing merged
+locally, in §1.1. A measurement for RT-5, not a claim; RT-5 stays with its owners on the coordination issue.**
+Each row is the first failure with every fix above it in place. Nothing here quotes the executable: no addresses,
+offsets, IID values or bytes; only export names, public SDK types, vtable slot numbers, call shapes and counts.
+[boot.md](boot.md) has the runbook that produced the traces; #6715 maps the same executable under `--dry-run`.
 
 Setup: `main` `1cc6e3c12` with #6709, #4531, #6582, #4313, #4348 and #2490 merged locally, plus the local
 stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX 4090 (driver 617.42),
@@ -14,8 +14,8 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 
 | # | Stop | What clears it |
 |---|---|---|
-| 1 | The first `XMemVirtualAlloc` calls: two 64 KiB reserve forms, then 2 MiB pages | #6709, #4531 |
-| 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. #6843 measures the attribute words; no PR changes the check yet |
+| 1 | The first `XMemVirtualAlloc` calls: two 64 KiB reserve forms, then 2 MiB pages | #6709, #4531, both still open. On plain `main` this row no longer appears as a failure: #6908 and #6919 are merged, and a run with nothing merged locally records all five startup requests and continues past them (§1.1) |
+| 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. That change has since landed as #6908, with the 2 MiB pages and placeholders from #6919; #6843 measured the attribute words and was closed without landing. §1.1 |
 | 3 | `xgameruntime.lib`'s thunk treats a missing `XErrorReport` as fatal | #6582 |
 | 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 |
 | 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
@@ -36,6 +36,39 @@ stand-in) and the first descriptor heap.
 Without a debugger, the unhandled `int3` of a fatal assert ends the process with `C0000374` (heap corruption) or
 `C0000005` during teardown, not `80000003`. An exit code of `C0000374` from `--run` can be such an assert, not a
 heap bug.
+
+## 1.1 Plain `main` on a second GPU, nothing merged locally
+
+Setup: `main` `dde82f27e`; the RDNA2 iGPU of a desktop 7800X3D, `gfx1036`, Windows driver 32.0.21045.29003;
+`LEONIDA_D3D12=vulkan`, `LEONIDA_UNIMPLEMENTED=stop`, MSVC `RelWithDebInfo`. No local stand-ins and no unmerged
+pull request. A 1.0.2.1 package copy, 120,181,760 bytes, run four times with `--run` and `--trace-d3d12`. Checked
+first that between the build these traces come from and this `main`, the only files that change under `runtime/`
+are `shims/d3d12_com.cpp`, `shims/d3d12_vulkan_device.cpp` and two tests, so the `xmem.cpp` and loader in the
+traces are the ones on `main`.
+
+What the traces hold: the four package modules the loader maps — the imported ones with no copy on the host — and
+the executable; the four `DllMain` calls returning success; then five `xmem_attributes` events, `XMemVirtualAlloc`
+with attribute word `0x21` and 25769803776 bytes, `0x3` with the same size, `0x183` with 1228931072, `0x283` with
+2305818624 and `0x181` with 20971520. Nothing in the traces reports an import refused while binding; one run's
+log does report the title asking the loader for an export the shims do not serve, `XErrorReport` on
+`xgameruntime.dll` through `GetProcAddress`, and that run continues past it. The run continues past all five
+requests, so rows 1 and 2 are not what stops a plain `main` run here. What it stops on has the
+shape of row 4: the title reads its module-index-0 TLS cell and gets −1. The same stop as the chain above, on a
+different card, with none of the fixes rows 1 to 3 name in place.
+
+What these traces cannot say, which limits what the rows above can be read as: `xmem_attributes` carries the api
+name, the attribute word, the size and the caller, and not the `allocationType` argument, so the two 64 KiB
+reserve forms of row 1 cannot be told apart from a trace, and a refused allocation is only visible through what
+the title does next. #6733 records refusals and #8008 records physical page requests; neither is in these runs.
+Row 3 is not tested here either: `xgameruntime.dll` is not mapped in these runs, the shims serve it, so there is
+no `xgameruntime.lib` thunk in which a missing `XErrorReport` could be fatal. What the stop behind row 4 reads
+before it faults, and what the title's own soft assert does with that result, is written up instruction by
+instruction on the coordination issue.
+
+Reading a trace, one caution: an `exception` event is not always the title's. These runs hold an access violation
+inside the host's `GameInput.dll` reading `0x10`, a fraction of a millisecond before the title's own fault, with
+host frames only in its stack. An `exception` belongs to the title when its stack holds frames of the mapped
+title.
 
 ## 2. Physical pages (`xmem.dll`)
 
