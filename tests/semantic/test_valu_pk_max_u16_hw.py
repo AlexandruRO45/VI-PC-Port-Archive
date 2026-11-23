@@ -111,6 +111,14 @@ class TestVPkMaxU16Reference(unittest.TestCase):
                 got = run_hw_pk_max_u16("v_pk_max_u16 v0, v1, v2", {"v1": s0, "v2": s1})
                 self.assertEqual(got, ref_pk_max_u16(s0, s1))
 
+    def test_translator_hw_pk_max_u16_op_sel(self):
+        if support is None or getattr(support, "translate_lines", None) is None:
+            self.skipTest("support/rdna2spirv requires Python 3.10+ (dict | None union syntax)")
+        s0 = P(10, 20)
+        s1 = P(30, 40)
+        got = run_hw_pk_max_u16("v_pk_max_u16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,1]", {"v1": s0, "v2": s1})
+        self.assertEqual(got, ref_pk_max_u16(s0, s1, op_sel=(1, 0), op_sel_hi=(0, 1)))
+
 
 class RegType(enum.Enum):
     VGPR = "vgpr"
@@ -342,5 +350,43 @@ class TestVPkMaxU16IEEE754(unittest.TestCase):
         self.assertEqual(ref_pk_max_u16(P(pos_inf, pos_inf), P(qnan, qnan)), P(qnan, qnan))
 
 
-if __name__ == '__main__':
+class TestVPkMaxU16NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection."""
+
+    def test_clamp_accepted_as_noop_by_translator(self):
+        # Per #4082, VOP3P clamp on v_pk_max_u16 is accepted as a hardware no-op.
+        if support is None or getattr(support, "translate_lines", None) is None:
+            self.skipTest("support/rdna2spirv requires Python 3.10+ (dict | None union syntax)")
+        seeds = {"v1": P(10, 20), "v2": P(5, 50)}
+        plain = run_hw_pk_max_u16("v_pk_max_u16 v0, v1, v2", seeds)
+        clamped = run_hw_pk_max_u16("v_pk_max_u16 v0, v1, v2 clamp", seeds)
+        self.assertEqual(plain, clamped)
+        self.assertEqual(clamped, ref_pk_max_u16(seeds["v1"], seeds["v2"]))
+
+    def test_invalid_modifier_rejected_by_translator(self):
+        # Float-only modifier neg_lo is rejected on packed integer ops
+        if support is None or getattr(support, "translate_lines", None) is None:
+            self.skipTest("support/rdna2spirv requires Python 3.10+ (dict | None union syntax)")
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_invalid_mod", ["v_pk_max_u16 v0, v1, v2 neg_lo:[1,0]", "s_endpgm"])
+
+    def test_mutation_signed_vs_unsigned_comparison(self):
+        # Mutation: signed comparison treating 0x8000 as negative (-32768)
+        def mutated_signed_max(s0, s1):
+            s0_lo = s0 & MASK16
+            s1_lo = s1 & MASK16
+            i0 = s0_lo - 65536 if s0_lo >= 32768 else s0_lo
+            i1 = s1_lo - 65536 if s1_lo >= 32768 else s1_lo
+            m = max(i0, i1)
+            return m & MASK16
+
+        # 0x8000 vs 0x0000: unsigned max is 0x8000; signed max is 0x0000
+        correct = ref_pk_max_u16(0x8000, 0x0000) & MASK16
+        mutant = mutated_signed_max(0x8000, 0x0000)
+        self.assertEqual(correct, 0x8000)
+        self.assertEqual(mutant, 0x0000)
+        self.assertNotEqual(correct, mutant)
+
+
+if __name__ == "__main__":
     unittest.main()
