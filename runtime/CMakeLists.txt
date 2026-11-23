@@ -610,6 +610,13 @@ if(BUILD_TESTING)
     set_target_properties(tiny_bundled_load PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    add_executable(tiny_xmem_physical test/fixtures/tiny_xmem_physical.cpp)
+    target_link_libraries(tiny_xmem_physical PRIVATE xmem_stub)
+    target_compile_definitions(tiny_xmem_physical PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_xmem_physical PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(tiny_xmem_physical PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_library(tiny_startup_cmdline_dll SHARED test/fixtures/tiny_startup_cmdline.cpp)
     target_compile_definitions(tiny_startup_cmdline_dll PRIVATE STARTUP_CMDLINE_DLL)
     add_executable(tiny_startup_cmdline test/fixtures/tiny_startup_cmdline.cpp)
@@ -1106,6 +1113,7 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_bundled_load COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_bundled_load>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_bundled.cmake")
+    add_test(NAME run_tiny_xmem_physical COMMAND gta6rt --run $<TARGET_FILE:tiny_xmem_physical>)
     # atexit handlers, static destructors and the ways out, compared with the same program run natively.
     add_test(NAME run_tiny_atexit COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_atexit>"
