@@ -521,7 +521,10 @@ def test_vs_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     shader.validate(spvasm)
     assert "OpCapability ClipDistance" in spvasm
     assert "OpCapability CullDistance" not in spvasm
-    assert "OpDecorate %out_clip BuiltIn ClipDistance" in spvasm
+    # Position and the distances are members of one Block output: Qualcomm's driver ignores a standalone one.
+    assert "OpDecorate %vs_vtx_blk Block" in spvasm
+    assert "OpMemberDecorate %vs_vtx_blk 0 BuiltIn Position" in spvasm
+    assert "OpMemberDecorate %vs_vtx_blk 1 BuiltIn ClipDistance" in spvasm
     assert f"%arr_clip = OpTypeArray %float %c{n_comp}" in spvasm
     chains = re.findall(r"OpAccessChain %_ptr_Output_float %out_clip %c(\d+)", spvasm)
     assert [int(x) for x in chains] == list(range(n_comp))
@@ -574,6 +577,8 @@ def test_vs_clip_and_cull_distances_across_pos1_pos2(make_shader):
     assert "OpCapability CullDistance" in spvasm
     assert "%arr_clip = OpTypeArray %float %c2" in spvasm
     assert "%arr_cull = OpTypeArray %float %c3" in spvasm
+    assert "OpMemberDecorate %vs_vtx_blk 1 BuiltIn ClipDistance" in spvasm
+    assert "OpMemberDecorate %vs_vtx_blk 2 BuiltIn CullDistance" in spvasm
     clip_chains = re.findall(r"OpAccessChain %_ptr_Output_float %out_clip %c(\d+)", spvasm)
     cull_chains = re.findall(r"OpAccessChain %_ptr_Output_float %out_cull %c(\d+)", spvasm)
     assert [int(x) for x in clip_chains] == [0, 1]

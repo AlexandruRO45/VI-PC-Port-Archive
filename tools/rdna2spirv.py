@@ -13885,7 +13885,10 @@ def assemble(gen):
             gen.cu(v)
     model = "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
     ms_blk = ms and not msc and (gen.uses_clip or gen.uses_cull)
-    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index", "%base_vertex", "%base_instance"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
+    # A VS that exports clip or cull distances declares them with Position in a gl_PerVertex block: Qualcomm's
+    # Adreno driver ignores a standalone BuiltIn ClipDistance output variable (vs_clip, vs_clip_param4).
+    vs_blk = vs and (gen.uses_clip or gen.uses_cull)
+    iface = [n for n in gen.outputs if not (vs_blk and n == "%out_pos")] + (["%vs_vtx"] if vs_blk else []) + list(gen.inputs) + (["%vertex_index", "%instance_index", "%base_vertex", "%base_instance"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
@@ -13909,10 +13912,6 @@ def assemble(gen):
     if gen.writes_depth:
         iface += ["%out_depth"]
     if vs:
-        if gen.uses_clip:
-            iface += ["%out_clip"]
-        if gen.uses_cull:
-            iface += ["%out_cull"]
         if gen.uses_layer:
             iface += ["%out_layer"]
         if gen.uses_viewport:
@@ -14081,18 +14080,21 @@ def assemble(gen):
             dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
             dec += [f"OpDecorate %ms_out_f16h{n}_{h} Location {gen.f16_half_locs[n][h]}" for n in ms_halves
                     for h in (0, 1)]
-    if vs:
+    if vs_blk:
+        dec += ["OpDecorate %vs_vtx_blk Block", "OpMemberDecorate %vs_vtx_blk 0 BuiltIn Position"]
         if gen.uses_clip:
-            dec.append("OpDecorate %out_clip BuiltIn ClipDistance")
+            dec.append("OpMemberDecorate %vs_vtx_blk 1 BuiltIn ClipDistance")
         if gen.uses_cull:
-            dec.append("OpDecorate %out_cull BuiltIn CullDistance")
+            dec.append(f"OpMemberDecorate %vs_vtx_blk {2 if gen.uses_clip else 1} BuiltIn CullDistance")
+    if vs:
         if gen.uses_layer:
             dec.append("OpDecorate %out_layer BuiltIn Layer")
         if gen.uses_viewport:
             dec.append("OpDecorate %out_viewport BuiltIn ViewportIndex")
     for name, tgt in gen.outputs.items():
         if name == "%out_pos":
-            dec.append("OpDecorate %out_pos BuiltIn Position")
+            if not vs_blk:
+                dec.append("OpDecorate %out_pos BuiltIn Position")
         else:
             dec.append(f"OpDecorate {name} Location {int(''.join(ch for ch in tgt if ch.isdigit()))}")
     for name, n in gen.inputs.items():
@@ -14222,7 +14224,7 @@ def assemble(gen):
     if gen.partial_color_outputs:
         types.append("%initial_mrt = OpConstantNull %v4float")
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" + (" %initial_mrt" if n in gen.partial_color_outputs else "")
-             for n in gen.outputs]
+             for n in gen.outputs if not (vs_blk and n == "%out_pos")]
     # Push constants: s0..s31 user data, then the tail: the 64-bit host address of the Xbox GPU VA window (heap
     # base), the code base and, with --mesh-compute, the output address. --pc-tail-ubo moves the tail to %pc_tail.
     tail = ["%uint"] * (6 if msc else 4)
@@ -14410,11 +14412,13 @@ def assemble(gen):
         if gen.uses_clip:
             types += [f"%arr_clip = OpTypeArray %float {gen.cu(gen.clip_count)}",
                       "%_ptr_Out_arr_clip = OpTypePointer Output %arr_clip"]
-            gvars += ["%out_clip = OpVariable %_ptr_Out_arr_clip Output"]
         if gen.uses_cull:
             types += [f"%arr_cull = OpTypeArray %float {gen.cu(gen.cull_count)}",
                       "%_ptr_Out_arr_cull = OpTypePointer Output %arr_cull"]
-            gvars += ["%out_cull = OpVariable %_ptr_Out_arr_cull Output"]
+        if vs_blk:
+            fields = ["%v4float"] + (["%arr_clip"] if gen.uses_clip else []) + (["%arr_cull"] if gen.uses_cull else [])
+            types += [f"%vs_vtx_blk = OpTypeStruct {' '.join(fields)}", "%_ptr_Out_vs_vtx_blk = OpTypePointer Output %vs_vtx_blk"]
+            gvars += ["%vs_vtx = OpVariable %_ptr_Out_vs_vtx_blk Output"]
         if gen.uses_layer or gen.uses_viewport:
             types += ["%_ptr_Output_int = OpTypePointer Output %int"]
             if gen.uses_layer:
@@ -14489,6 +14493,14 @@ def assemble(gen):
                f"%ud{i} = OpLoad %uint %ud{i}p",
                f"%ud{i}s = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(i)}",
                f"OpStore %ud{i}s %ud{i}"]
+    if vs_blk:
+        # The standalone names the exports use are pointers into the %vs_vtx block members.
+        if "%out_pos" in gen.outputs:
+            fn.append(f"%out_pos = OpAccessChain %_ptr_Output_v4 %vs_vtx {gen.cu(0)}")
+        if gen.uses_clip:
+            fn.append(f"%out_clip = OpAccessChain %_ptr_Out_arr_clip %vs_vtx {gen.cu(1)}")
+        if gen.uses_cull:
+            fn.append(f"%out_cull = OpAccessChain %_ptr_Out_arr_cull %vs_vtx {gen.cu(2 if gen.uses_clip else 1)}")
     if vs:
         # The hardware's VS input VGPRs are zero-based: v0 is the vertex id without the draw's base vertex and v3
         # the instance id without its first instance (Mesa: ac.vertex_id = load_vertex_id_zero_base, the base in
