@@ -12,6 +12,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 
@@ -60,7 +61,16 @@ struct ArenaSize {
 //     invalid Vulkan, while one under 16 MiB is only small (and no conformant device reports under 1 GiB).
 inline ArenaSize decide_arena_size(const char* env, const ArenaLimits& limits, VkDeviceSize allocation_overhead = 0) {
     VkDeviceSize megabytes = kArenaDefaultMiB;
-    if (env && *env) megabytes = std::clamp<VkDeviceSize>(std::strtoull(env, nullptr, 10), kArenaMinMiB, kArenaMaxMiB);
+    if (env && *env) {
+        const char* p = env;
+        while (*p && std::isspace(static_cast<unsigned char>(*p))) ++p;
+        if (*p == '-') {
+            // strtoull wraps leading '-' to a huge unsigned value (~UINT64_MAX), which would clamp to 4095 MiB.
+            megabytes = kArenaMinMiB;
+        } else {
+            megabytes = std::clamp<VkDeviceSize>(std::strtoull(p, nullptr, 10), kArenaMinMiB, kArenaMaxMiB);
+        }
+    }
     ArenaSize size;
     size.requested = size.bytes = megabytes * kArenaMiB;
     VkDeviceSize by_buffer = size.requested, by_allocation = size.requested;
