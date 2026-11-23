@@ -138,5 +138,120 @@ class TestSaluOrn2B32Oracle(unittest.TestCase):
                 )
                 self.assertEqual(res, expected_res)
 
+class RegKind(enum.Enum):
+    SGPR = "sgpr"
+    VGPR = "vgpr"
+    LITERAL = "literal"
+    INLINE_INT = "inline_int"
+
+
+@dataclasses.dataclass(frozen=True)
+class RegOperand:
+    """Representation of an RDNA2 register or constant operand."""
+    kind: RegKind
+    index_or_val: int
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.SGPR:
+            if not (0 <= self.index_or_val <= 105):
+                raise ValueError(f"SGPR index out of range [0, 105]: {self.index_or_val}")
+        elif self.kind == RegKind.VGPR:
+            if not (0 <= self.index_or_val <= 255):
+                raise ValueError(f"VGPR index out of range [0, 255]: {self.index_or_val}")
+
+    def format_asm(self) -> str:
+        if self.kind == RegKind.SGPR:
+            return f"s{self.index_or_val}"
+        elif self.kind == RegKind.VGPR:
+            return f"v{self.index_or_val}"
+        elif self.kind == RegKind.LITERAL:
+            return f"{u32(self.index_or_val):#x}"
+        elif self.kind == RegKind.INLINE_INT:
+            return str(self.index_or_val)
+        return str(self.index_or_val)
+
+
+class Opcode(enum.Enum):
+    S_ORN2_B32 = "s_orn2_b32"
+    S_MOV_B32 = "s_mov_b32"
+
+
+@dataclasses.dataclass(frozen=True)
+class SALUInstruction:
+    """AST node representing a Scalar ALU instruction."""
+    opcode: Opcode
+    sdst: RegOperand
+    ssrc0: RegOperand
+    ssrc1: RegOperand | None = None
+
+    def __post_init__(self) -> None:
+        if self.sdst.kind != RegKind.SGPR:
+            raise ValueError("Destination of SALU instruction must be an SGPR")
+        if self.opcode == Opcode.S_ORN2_B32:
+            if self.ssrc1 is None:
+                raise ValueError("s_orn2_b32 requires two source operands")
+            literals = sum(1 for op in (self.ssrc0, self.ssrc1) if op is not None and op.kind == RegKind.LITERAL)
+            if literals > 1:
+                raise ValueError("SOP2 encoding cannot have more than one literal pool")
+
+    def format_asm(self) -> str:
+        if self.opcode == Opcode.S_ORN2_B32:
+            assert self.ssrc1 is not None
+            return f"{self.opcode.value} {self.sdst.format_asm()}, {self.ssrc0.format_asm()}, {self.ssrc1.format_asm()}"
+        elif self.opcode == Opcode.S_MOV_B32:
+            return f"{self.opcode.value} {self.sdst.format_asm()}, {self.ssrc0.format_asm()}"
+        return f"{self.opcode.value} {self.sdst.format_asm()}"
+
+
+class TestSaluOrn2B32AST(unittest.TestCase):
+    """Unit tests for AST definitions and instruction formatting."""
+
+    def test_ast_reg_formatting(self) -> None:
+        self.assertEqual(RegOperand(RegKind.SGPR, 5).format_asm(), "s5")
+        self.assertEqual(RegOperand(RegKind.VGPR, 12).format_asm(), "v12")
+        self.assertEqual(RegOperand(RegKind.LITERAL, 0x12345678).format_asm(), "0x12345678")
+        self.assertEqual(RegOperand(RegKind.INLINE_INT, 0).format_asm(), "0")
+
+    def test_ast_instruction_formatting(self) -> None:
+        inst = SALUInstruction(
+            opcode=Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        self.assertEqual(inst.format_asm(), "s_orn2_b32 s0, s1, s2")
+
+    def test_ast_instruction_with_literal(self) -> None:
+        inst = SALUInstruction(
+            opcode=Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 4),
+            ssrc0=RegOperand(RegKind.SGPR, 5),
+            ssrc1=RegOperand(RegKind.LITERAL, 0xCAFEBABE),
+        )
+        self.assertEqual(inst.format_asm(), "s_orn2_b32 s4, s5, 0xcafebabe")
+
+    def test_ast_validation_errors(self) -> None:
+        # Invalid SGPR index
+        with self.assertRaises(ValueError):
+            RegOperand(RegKind.SGPR, 106)
+        with self.assertRaises(ValueError):
+            RegOperand(RegKind.SGPR, -1)
+        # SALU destination cannot be VGPR
+        with self.assertRaises(ValueError):
+            SALUInstruction(
+                opcode=Opcode.S_ORN2_B32,
+                sdst=RegOperand(RegKind.VGPR, 0),
+                ssrc0=RegOperand(RegKind.SGPR, 1),
+                ssrc1=RegOperand(RegKind.SGPR, 2),
+            )
+        # Two literals in one SOP2 instruction rejected
+        with self.assertRaises(ValueError):
+            SALUInstruction(
+                opcode=Opcode.S_ORN2_B32,
+                sdst=RegOperand(RegKind.SGPR, 0),
+                ssrc0=RegOperand(RegKind.LITERAL, 0x1234),
+                ssrc1=RegOperand(RegKind.LITERAL, 0x5678),
+            )
+
 if __name__ == "__main__":
     unittest.main()
