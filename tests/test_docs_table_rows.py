@@ -22,16 +22,15 @@ def is_table_separator(line: str) -> bool:
 def find_orphan_table_rows(lines: list[str]) -> list[int]:
     """Return 1-based line numbers of `|`-prefixed rows that have neither a preceding `|` row nor a separator."""
     orphans = []
+    prev_nonblank = ""
     for i, line in enumerate(lines):
-        if not line.startswith("|"):
-            continue
-        prev = next((x for x in reversed(lines[:i]) if x.strip()), "")
-        if prev.startswith("|"):
-            continue
-        nxt = next((x for x in lines[i + 1:i + 3] if x.strip()), "")
-        if is_table_separator(nxt):
-            continue  # this is a table header followed by its separator
-        orphans.append(i + 1)
+        if line.startswith("|"):
+            if not prev_nonblank.startswith("|"):
+                nxt = next((x for x in lines[i + 1:i + 3] if x.strip()), "")
+                if not is_table_separator(nxt):
+                    orphans.append(i + 1)
+        if line.strip():
+            prev_nonblank = line
     return orphans
 
 
