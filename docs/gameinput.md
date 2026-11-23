@@ -29,6 +29,12 @@ SDL3 is available in one of these ways:
 - **A local copy of that tarball**: extract it and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=<path to SDL3-3.4.20>`; it is
   built the same way, without a download.
 
+In a cross build (the clang-cl + xwin toolchain on Linux or macOS), the fetched SDL3 is built without its libusb
+hidapi backend. On Windows that backend reaches only a device that has a WinUSB driver installed for it. A cross build
+would also link the build host's libusb into the Windows build: on a Mac with Homebrew's libusb, configure used to stop
+in SDL's import-library check. `-DLEONIDA_SDL3_LIBUSB=ON` turns the backend back on
+(`runtime/cmake/sdl3_fetch_options.cmake`).
+
 Without any of these, or with `-DLEONIDA_SDL3=OFF`, configure prints a message and `gta6rt` is built without the shim:
 it has no `GameInputCreate`, as before, so the loader binds it to the host's `GameInput.dll` or the unimplemented
 thunk. `gameinput_test` and `gameinput_probe` are not built, and CTest lists `gameinput` as not run (disabled) rather
