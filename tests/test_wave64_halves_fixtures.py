@@ -183,17 +183,37 @@ def test_vs_probe_and_radv_perftest(monkeypatch):
     assert w64_graphics.VS_RECORDS * 4 >= 0x100 + 4 * w64_graphics.VS_VERTICES   # the atomic's slots end below the records
 
 
-def test_live_lane_need_skips_on_a_narrow_stage_and_runs_on_a_wide_one(tmp_path, monkeypatch):
-    # The skip is keyed on the measured live width, not on the reported subgroup size or on whether a size could be required.
-    name = "ps_w64_a_one_lane"
+def _narrow_stage(tmp_path, monkeypatch, name, words, live):
+    # A device with subgroups 8..32 that could not be held to 32 or 64 (no forced run applied): only the default draw.
     (tmp_path / (name + ".spv")).write_bytes(b"")
-    words = [w64_graphics.FIXTURES[name][1](i) for i in range(64 * 64)]
     monkeypatch.setattr(w64_graphics, "draw", lambda tools, spirv, n, size, tmp: (words, None, False if size else None))
-    monkeypatch.setitem(w64_graphics.NEEDS_LIVE_LANES, name, 32)
-    monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: 16)
-    skip = w64_graphics.check("tools", str(tmp_path), name)
-    assert isinstance(skip, w64_graphics.Skip) and "16 live lanes" in skip and "needs 32" in skip
-    monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: 32)
-    assert w64_graphics.check("tools", str(tmp_path), name) == ""
-    monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: None)   # probe could not run: judged
-    assert w64_graphics.check("tools", str(tmp_path), name) == ""
+    monkeypatch.setattr(w64_graphics, "_device_min", [8])
+    monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: live)
+    return w64_graphics.check("tools", str(tmp_path), name)
+
+
+def test_cross_row_channels_are_judged_only_where_the_live_width_covers_them(tmp_path, monkeypatch):
+    name = "ps_w64_a_bpermute"                                   # r2 reads lane L ^ 16
+    good = [w64_graphics.FIXTURES[name][1](i) for i in range(64 * 64)]
+    garbage = [(a, b, 4456512, d) for a, b, c, d in good]       # only r2 wrong, as on a 16-live-lane stage
+    r = _narrow_stage(tmp_path, monkeypatch, name, garbage, 16)
+    assert isinstance(r, w64_graphics.Skip) and "16 live lanes" in r and "r2" in r and "need 32" in r
+    assert _narrow_stage(tmp_path, monkeypatch, name, good, 16).startswith("SKIP")
+    # the same words on a stage that has the lanes are a failure
+    assert "differ from the derived words" in _narrow_stage(tmp_path, monkeypatch, name, garbage, 32)
+    assert _narrow_stage(tmp_path, monkeypatch, name, good, 32) == ""
+    # a within-row channel is still asserted on the narrow stage
+    bad = [(a + 1, b, c, d) for a, b, c, d in good]
+    r = _narrow_stage(tmp_path, monkeypatch, name, bad, 16)
+    assert not isinstance(r, w64_graphics.Skip) and "differ from the derived words" in r
+
+
+def test_a_fixture_without_cross_row_channels_is_judged_in_full_on_a_narrow_stage(tmp_path, monkeypatch):
+    name = "ps_w64_a_one_lane"
+    good = [w64_graphics.FIXTURES[name][1](i) for i in range(64 * 64)]
+    assert _narrow_stage(tmp_path, monkeypatch, name, good, 16) == ""
+    r = _narrow_stage(tmp_path, monkeypatch, name, [(0, 0, 0, 0)] * (64 * 64), 16)
+    assert r and not isinstance(r, w64_graphics.Skip)
+    # the probe cannot run: skipped as before
+    r = _narrow_stage(tmp_path, monkeypatch, name, good, None)
+    assert isinstance(r, w64_graphics.Skip) and "could not measure" in r
