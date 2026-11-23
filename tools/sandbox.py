@@ -26,11 +26,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import sandbox_scene  # noqa: E402
 
-VS_LAYOUT = (r"s_load_dwordx4 s\[\d+:\d+\], s\[8:9\], (?:null|0)\b", r"s_load_dwordx4 s\[\d+:\d+\], s\[8:9\], 0x40\b",
-             r"s_load_dwordx4 s\[\d+:\d+\], s\[8:9\], 0x60\b", r"s_buffer_load_dwordx16 s\[\d+:\d+\], s\[\d+:\d+\], 0x160\b",
-             r"s_buffer_load_dwordx4 s\[\d+:\d+\], s\[\d+:\d+\], 0x30\b")
+# llvm-mc and the Python disassembler can print the same byte offset in different bases.
+VS_LAYOUT = (
+    r"s_load_dwordx4 s\[\d+:\d+\], s\[8:9\], (?:null|0)\b",
+    r"s_load_dwordx4 s\[\d+:\d+\], s\[8:9\], (?:0x40|64)\b",
+    r"s_load_dwordx4 s\[\d+:\d+\], s\[8:9\], (?:0x60|96)\b",
+    r"s_buffer_load_dwordx16 s\[\d+:\d+\], s\[\d+:\d+\], (?:0x160|352)\b",
+    r"s_buffer_load_dwordx4 s\[\d+:\d+\], s\[\d+:\d+\], (?:0x30|48)\b",
+)
+PS_LAYOUT = (
+    r"s_load_dwordx8 s\[\d+:\d+\], s\[8:9\], (?:0x20|32)\b",
+    r"\bimage_sample\b",
+    r"\bexp mrt0\b",
+)
 SKY = bytes((140, 173, 217))   # vk_sandbox's clear colour (0.55, 0.68, 0.85) in 8 bits
-PS_LAYOUT = (r"s_load_dwordx8 s\[\d+:\d+\], s\[8:9\], 0x20\b", r"\bimage_sample\b", r"\bexp mrt0\b")
 
 
 def _signature(entry):

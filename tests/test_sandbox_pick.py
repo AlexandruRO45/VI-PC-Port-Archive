@@ -63,6 +63,25 @@ class PickPair(unittest.TestCase):
                           "bindings": [0, 1, 2]}, PS_TEXT)
         self.assertEqual(self.names(), ("a_vs", "b_ps"))
 
+    def test_decimal_load_offsets(self):
+        # The Python decoder prints small offsets in decimal and keeps 0x160 in hex.
+        vs = VS_TEXT.replace("0x40", "64").replace("0x60", "96").replace("0x30", "48")
+        ps = PS_TEXT.replace("0x20", "32")
+        vs_entry = {"stage": "vs", "input_signature": VS_SIG, "user_sgpr_reads": PTR8, "bindings": []}
+        ps_entry = {"stage": "ps", "input_signature": PS_SIG, "user_sgpr_reads": PTR8, "bindings": [0, 1, 2]}
+        pair = ("a_vs", "b_ps")
+        cases = (
+            ("Python listing", vs, ps, pair),
+            ("all decimal", vs.replace("0x160", "352").replace("null", "0"), ps, pair),
+            ("different vertex offset", vs.replace(", 64\n", ", 640\n"), ps, None),
+            ("different pixel offset", vs, ps.replace(", 32\n", ", 20\n"), None),
+        )
+        for label, vs_text, ps_text, expected in cases:
+            with self.subTest(label=label):
+                self.add("a_vs", vs_entry, vs_text)
+                self.add("b_ps", ps_entry, ps_text)
+                self.assertEqual(self.names(), expected)
+
     def test_rejects_wrong_layout_and_signature(self):
         self.add("a_vs", {"stage": "vs", "input_signature": VS_SIG, "user_sgpr_reads": PTR8, "bindings": []},
                  VS_TEXT.replace("0x160", "0x100"))
