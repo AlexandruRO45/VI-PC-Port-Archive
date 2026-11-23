@@ -16,8 +16,8 @@ against `--main` (default `origin/main`), using one history scan for the whole b
   .rst) make the verdict `duplicates`; a block in code is listed, since equal lines in two functions are ordinary.
 - `conflict`: whether `git merge-tree` reports a conflict (the duplicate check is then on the conflicted tree).
 
-Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
-tree matches main, as after a multi-commit squash merge), `duplicates`, `conflict` or `clean`.
+Verdict per PR: `already-merged` (a prior merge exists and either the conflict-free merged tree matches main or
+every PR-side patch is already on main with no new merge commits), `duplicates`, `conflict` or `clean`.
 Exit 0 when every PR is clean, 1 when any is not, 2 on a usage or git error. Read-only: `merge-tree --write-tree`
 writes only objects, no refs. Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`.
 """
@@ -152,7 +152,12 @@ def check(repo, main, number, ref, min_length, merges):
     unchanged = not conflict and tree == rev_tree(repo, main)
     dups = {} if unchanged else duplicates(repo, main, tree, min_length)
     text_dups = {p: v for p, v in dups.items() if p.lower().endswith(TEXT_SUFFIXES)}
-    if merges and (total == on_main or unchanged):
+    patches_match = total == on_main
+    if merges and patches_match and not unchanged:
+        # git cherry skips merge commits, which can contain changes of their own.
+        new_merge = git(repo, "rev-list", "--merges", "--max-count=1", f"{main}..{ref}", "--")
+        patches_match = not new_merge.stdout.strip()
+    if merges and (unchanged or patches_match):
         verdict = "already-merged"
     elif text_dups:
         verdict = "duplicates"
