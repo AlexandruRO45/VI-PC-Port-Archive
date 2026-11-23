@@ -262,5 +262,21 @@ class VSubCoU32TranslatorIntegrationTests(unittest.TestCase):
         subrev_res, _ = ref_subrev_co_u32(a, b)
         self.assertNotEqual(sub_res, subrev_res)
 
+class VSubrevCoU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_subrev_co_u32."""
+
+    def test_basic_reverse_subtraction(self):
+        d, b = ref_subrev_co_u32(20, 50)
+        self.assertEqual(d, 30)
+        self.assertEqual(b, 0)
+
+        d2, b2 = ref_subrev_co_u32(50, 20)
+        self.assertEqual(d2, 0xFFFFFFE2)
+        self.assertEqual(b2, 1)
+
+    def test_asymmetry_against_sub(self):
+        a, b = 100, 40
+        self.assertEqual(ref_subrev_co_u32(a, b), ref_sub_co_u32(b, a))
+
 if __name__ == "__main__":
     unittest.main()
