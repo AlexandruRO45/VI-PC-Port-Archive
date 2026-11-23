@@ -28,6 +28,7 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_console_feature.h"
 #include "d3d12_trace.h"
+#include "d3d12_xs_alloc_size.h"
 #include "presentx_capture.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -2474,6 +2475,80 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
 template <std::size_t... I>
 void fill_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&proxy_slot<static_cast<unsigned>(I)>) ), ...);
+}
+
+// ---- Struct-returning device methods: the console title calls them with the C ABI ----
+//
+// The PC vtable (MSVC C++) takes `this` in RCX and, for a struct return, the hidden return pointer in RDX. The console
+// title does not. Measured with the retail game_scarlett_master.exe 1.0.2.1 under gta6rt --run: its first
+// GetCustomHeapProperties call (device slot 26) is `rcx = return buffer on the caller's stack, rdx = the device,
+// r8 = node mask 1, r9 = heap type` (DEFAULT, then UPLOAD), and it reads the result from that buffer. That is the C
+// convention, where a struct wider than 8 bytes comes back through a hidden *first* argument (an 8-byte one comes back
+// in RAX, which is what the heap proxy's slots 9/10 already measured). The generic forwarder took the return buffer
+// for the device and crashed on its vtable.
+//
+// The runtime's own code and tests still call the proxy through d3d12.h, in the PC form, so these thunks accept both,
+// as the heap proxy's 9/10 do: whichever of the first two arguments is the device proxy (its first word is the proxy
+// vtable) is `this`, and the other is the return buffer. A return buffer never starts with that vtable pointer: the
+// C-form caller hands over uninitialised memory to be written, and the PC-form caller is this runtime. The buffer is
+// returned in RAX, as both conventions require.
+//   slot 25 GetResourceAllocationInfo -> D3D12_RESOURCE_ALLOCATION_INFO (16 bytes): same rule as slot 26 (inferred,
+//           no call site measured yet)
+//   slot 26 GetCustomHeapProperties   -> D3D12_HEAP_PROPERTIES (20 bytes): measured
+// Not changed: slot 43 GetAdapterLuid (an 8-byte LUID; by the same rule the title would expect it in RAX, but no call
+// site is measured yet, so it still forwards in the PC form).
+void** get_vtable();
+
+struct StructReturnCall {
+    DeviceProxy* self;
+    void* ret;
+};
+
+StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
+    void** const vtable = get_vtable();
+    if (a0 && *reinterpret_cast<void***>(a0) == vtable)  // PC form: this, return buffer
+        return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1)};
+    return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
+}
+
+// The size the PC device saturates a total at (docs/d3d12_vulkan.md, GetResourceAllocationInfo).
+constexpr UINT64 kSizeSaturated = 0xFFFFFFFFFFFF0000ull;
+
+void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
+                                                std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
+    note_slot(25);
+    const StructReturnCall call = struct_return_call(a0, a1);
+    ID3D12Device* const real = call.self->real;
+    D3D12_RESOURCE_ALLOCATION_INFO info =
+        real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
+    // A render target takes whole console tiles, which the PC device's size does not (d3d12_xs_alloc_size.h). The
+    // total grows by what each render target lacks on its own, so the placement of the others stays as the PC lays it.
+    if (info.SizeInBytes != UINT64_MAX) {
+        const UINT64 extra = console_render_target_extra(descs, static_cast<UINT>(count), [&](UINT i) {
+            return real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), 1, &descs[i]).SizeInBytes;
+        });
+        if (extra) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 25: render target sizes padded to console tiles, +%llu B on "
+                             "%llu B for %u description(s)\n",
+                             static_cast<unsigned long long>(extra),
+                             static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned>(count));
+            info.SizeInBytes = extra > kSizeSaturated - info.SizeInBytes ? kSizeSaturated : info.SizeInBytes + extra;
+        }
+    }
+    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
+    return call.ret;
+}
+
+void* WINAPI proxy_get_custom_heap_properties(std::uint64_t a0, std::uint64_t a1, std::uint64_t node_mask,
+                                              std::uint64_t heap_type) {
+    note_slot(26);
+    const StructReturnCall call = struct_return_call(a0, a1);
+    *static_cast<D3D12_HEAP_PROPERTIES*>(call.ret) = call.self->real->GetCustomHeapProperties(
+        static_cast<UINT>(node_mask), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(heap_type)));
+    return call.ret;
 }
 
 void** get_vtable() {
