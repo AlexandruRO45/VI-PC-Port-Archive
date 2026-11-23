@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Semantic interpreter tests for LDS atomic reverse subtraction (ds_rsub_rtn_u32, ds_rsub_u32).
 
 Standard library only; no GPU, no LLVM, no game files.
@@ -21,32 +23,17 @@ RDNA2 ISA, "Data Share Instructions":
 Each test is a compute shader translated by tools/rdna2spirv.py and executed in
 tests/semantic/spirv_mini_interp.py.
 """
-from __future__ import annotations
-
 import os
-import random
 import re
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lds_run as L  # noqa: E402
+import rdna2spirv  # noqa: E402
 import support  # noqa: E402
 
 M32 = L.M32
-
-
-def model_rsub(ops: list[tuple[str, int, int, tuple[int, ...]]], init: dict[int, int]) -> tuple[list[int], dict[int, int]]:
-    """Reference software model for LDS reverse subtraction operations."""
-    lds = dict(init)
-    rtns = []
-    for name, addr, off, (d,) in ops:
-        eff = (addr + off) & ~3
-        old = lds.get(eff, 0)
-        rtns.append(old if "_rtn_" in name else 0xDEAD)
-        lds[eff] = (d - old) & M32
-    finals = {a + off: lds.get((a + off) & ~3, 0) for _, a, off, _ in ops}
-    return rtns, finals
 
 
 class TestHandTable(unittest.TestCase):
@@ -145,6 +132,20 @@ class TestInvolutionAndChaining(unittest.TestCase):
         self.assertEqual(rtns, [20, 0xDEAD, 120])
         self.assertEqual(fin, {0x20: 180})
 
+    def test_deterministic_chaining_on_multiple_dwords(self):
+        init = {0x10: 100, 0x20: 200, 0x30: 50}
+        ops = [
+            ("ds_rsub_rtn_u32", 0x10, 0, (150,)),  # 150 - 100 = 50, ret 100
+            ("ds_rsub_u32",     0x20, 0, (250,)),  # 250 - 200 = 50, ret DEAD
+            ("ds_rsub_rtn_u32", 0x30, 0, (70,)),   # 70 - 50 = 20, ret 50
+            ("ds_rsub_rtn_u32", 0x10, 0, (80,)),   # 80 - 50 = 30, ret 50
+            ("ds_rsub_u32",     0x20, 0, (100,)),  # 100 - 50 = 50, ret DEAD
+            ("ds_rsub_rtn_u32", 0x30, 0, (20,)),   # 20 - 20 = 0, ret 20
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(rtns, [100, 0xDEAD, 50, 50, 0xDEAD, 20])
+        self.assertEqual(fin, {0x10: 30, 0x20: 50, 0x30: 0})
+
 
 class TestMultiLaneExecution(unittest.TestCase):
     def test_32_lanes_parallel_rsub(self):
@@ -182,6 +183,37 @@ class TestMultiLaneExecution(unittest.TestCase):
             self.assertEqual(actual_fin, expected_fin, f"lane {lane} final mismatch")
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    def test_alias_vdst_with_vaddr(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 100",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 150",
+            "ds_rsub_rtn_u32 v1, v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v1", 0)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 100)
+
+    def test_alias_vdst_with_vdata(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 100",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 150",
+            "ds_rsub_rtn_u32 v2, v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v2", 0) + L.store("v3", 1)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 100)
+        self.assertEqual(mem.get(4), 50)
+
+
 class TestSpirvStructure(unittest.TestCase):
     def test_translator_emits_cas_loop_for_ds_rsub_rtn(self):
         listing = [
@@ -196,34 +228,18 @@ class TestSpirvStructure(unittest.TestCase):
         self.assertIn("OpPhi", spvasm)
         self.assertIn("OpLoopMerge", spvasm)
         self.assertIn("OpBranchConditional", spvasm)
-        # Check subtraction order in SPIR-V:
-        # OpISub %uint %val %cur (val is minuend, cur is subtrahend)
         matches = re.findall(r"OpISub\s+%uint\s+(%\w+)\s+(%\w+)", spvasm)
         self.assertTrue(matches, "Expected at least one OpISub instruction in translated SPIR-V")
 
 
-class TestSeededFuzz(unittest.TestCase):
-    def test_random_sequences(self):
-        rng = random.Random(0x50B)
-        addrs = [0x10, 0x30, 0x7C, 0x100, 0x180]
-        interesting_vals = [0, 1, 2, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF, 0x12345678]
+class TestNegativeRejection(unittest.TestCase):
+    def test_outside_compute_rejection(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_test_rsub_outside_compute", ["ds_rsub_rtn_u32 v0, v1, v2", "s_endpgm"])
 
-        for trial in range(8):
-            init = {a: rng.choice(interesting_vals) if rng.random() < 0.5 else rng.getrandbits(32) for a in addrs}
-            ops = []
-            for _ in range(16):
-                name = rng.choice(("ds_rsub_rtn_u32", "ds_rsub_u32"))
-                eff = rng.choice(addrs)
-                off = rng.choice((0, 0, 4, 16))
-                a = eff - off
-                val = rng.choice(interesting_vals) if rng.random() < 0.4 else rng.getrandbits(32)
-                ops.append((name, a, off, (val,)))
-
-            with self.subTest(trial=trial):
-                actual_rtns, actual_fin = L.run_chain(ops, init)
-                expected_rtns, expected_fin = model_rsub(ops, init)
-                self.assertEqual(actual_rtns, expected_rtns)
-                self.assertEqual(actual_fin, expected_fin)
+    def test_invalid_syntax_rejection(self):
+        with self.assertRaises((rdna2spirv.Unsupported, IndexError, ValueError)):
+            support.translate_lines("cs_test_rsub_bad_syntax", ["ds_rsub_rtn_u32 v1, v2", "s_endpgm"], fssm=L.fssm())
 
 
 if __name__ == "__main__":

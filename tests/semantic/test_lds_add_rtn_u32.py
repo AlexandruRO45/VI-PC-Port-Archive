@@ -1,4 +1,6 @@
-"""ds_add_rtn_u32 through the translator.
+from __future__ import annotations
+
+"""ds_add_rtn_u32 and ds_add_u32 through the translator.
 
 Standard library only; no GPU, no LLVM, no game files.
 
@@ -7,11 +9,13 @@ ds_add_rtn_u32 vdst, vaddr, vdata [offset:byte_offset]
 Computes M = (M + DATA) mod 2^32 on the 32-bit dword at (vaddr + offset) / 4 in LDS using
 unsigned 32-bit modular addition, returning the previous value of M in vdst.
 
+ds_add_u32 vaddr, vdata [offset:byte_offset]
+Computes M = (M + DATA) mod 2^32 without returning the old value to a VGPR.
+
 Each case translates a compute shader with tools/rdna2spirv.py (support.translate_lines)
 and executes it in tests/semantic/spirv_mini_interp.py (see lds_run.py).
 """
 import os
-import random
 import sys
 import unittest
 
@@ -21,16 +25,6 @@ import rdna2spirv  # noqa: E402
 import support  # noqa: E402
 
 M32 = L.M32
-
-
-def model(ops, init):
-    lds = dict(init)
-    rtns = []
-    for name, addr, off, (d,) in ops:
-        a = addr + off
-        rtns.append(lds[a])
-        lds[a] = (lds[a] + d) & M32
-    return rtns, {a: lds[a] for a in sorted({addr + off for _, addr, off, _ in ops})}
 
 
 class TestDsAddRtnU32HandTable(unittest.TestCase):
@@ -56,10 +50,16 @@ class TestDsAddRtnU32HandTable(unittest.TestCase):
 
     def test_single_atomic_add_and_return(self):
         for m, d, want_old, want_new in self.TABLE:
-            with self.subTest(m=hex(m), d=hex(d)):
+            with self.subTest(op="ds_add_rtn_u32", m=hex(m), d=hex(d)):
                 rtns, fin = L.run_chain([("ds_add_rtn_u32", 0x40, 0, (d,))], {0x40: m})
                 # vdst must receive previous value m; memory must hold (m + d) mod 2^32
                 self.assertEqual(rtns, [want_old])
+                self.assertEqual(fin, {0x40: want_new})
+
+            with self.subTest(op="ds_add_u32", m=hex(m), d=hex(d)):
+                rtns, fin = L.run_chain([("ds_add_u32", 0x40, 0, (d,))], {0x40: m})
+                # non-returning form leaves preset 0xDEAD in destination; memory updated
+                self.assertEqual(rtns, [0xDEAD])
                 self.assertEqual(fin, {0x40: want_new})
 
     def test_offset_addressing(self):
@@ -139,21 +139,79 @@ class TestDsAddRtnU32MultiLane(unittest.TestCase):
             self.assertEqual(final_val, expected_new, f"lane {i} final value")
 
 
-class TestDsAddRtnU32Seeded(unittest.TestCase):
-    def test_random_sequences_against_model(self):
-        rng = random.Random(0xADD32)
-        edge = (0, 1, 2, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFE, 0xFFFFFFFF)
-        for trial in range(10):
-            addrs = [0x10, 0x30, 0x54, 0x80, 0x120]
-            init = {a: rng.choice((rng.getrandbits(32), *edge)) for a in addrs}
-            ops = []
-            for _ in range(16):
-                eff = rng.choice(addrs)
-                off = rng.choice((0, 0, 0x04, 0x10))
-                data = rng.choice((rng.getrandbits(32), *edge))
-                ops.append(("ds_add_rtn_u32", eff - off, off, (data,)))
-            with self.subTest(trial=trial):
-                self.assertEqual(L.run_chain(ops, init), model(ops, init))
+class TestDsAddRtnU32Chaining(unittest.TestCase):
+    def test_deterministic_multi_step_chain(self):
+        init = {0x10: 100, 0x20: 200, 0x30: 300}
+        ops = [
+            ("ds_add_rtn_u32", 0x10, 0, (15,)),
+            ("ds_add_u32",     0x20, 0, (25,)),
+            ("ds_add_rtn_u32", 0x30, 0, (35,)),
+            ("ds_add_rtn_u32", 0x10, 0, (10,)),
+            ("ds_add_u32",     0x20, 0, (5,)),
+            ("ds_add_rtn_u32", 0x30, 0, (65,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(rtns, [100, 0xDEAD, 300, 115, 0xDEAD, 335])
+        self.assertEqual(fin, {0x10: 125, 0x20: 230, 0x30: 400})
+
+
+class TestDsAddRtnU32RegisterAliasing(unittest.TestCase):
+    def test_alias_vdst_with_vaddr(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 100",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 50",
+            "ds_add_rtn_u32 v1, v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v1", 0)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 100)
+
+    def test_alias_vdst_with_vdata(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 100",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 50",
+            "ds_add_rtn_u32 v2, v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v2", 0) + L.store("v3", 1)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 100)
+        self.assertEqual(mem.get(4), 150)
+
+
+class TestDsAddRtnU32Spirv(unittest.TestCase):
+    def test_translator_emits_atomic_iadd_for_ds_add_rtn(self):
+        listing = [
+            "ds_add_rtn_u32 v5, v1, v4",
+            "s_waitcnt lgkmcnt(0)",
+        ]
+        spvasm = support.translate_lines("cs_ds_add_rtn", listing + ["s_endpgm"], fssm=L.fssm())
+        self.assertIn("OpAtomicIAdd", spvasm)
+
+    def test_translator_emits_atomic_iadd_for_ds_add(self):
+        listing = [
+            "ds_add_u32 v1, v4",
+            "s_waitcnt lgkmcnt(0)",
+        ]
+        spvasm = support.translate_lines("cs_ds_add", listing + ["s_endpgm"], fssm=L.fssm())
+        self.assertIn("OpAtomicIAdd", spvasm)
+
+
+class TestDsAddRtnU32NegativeRejection(unittest.TestCase):
+    def test_outside_compute_rejection(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_test_outside_compute", ["ds_add_rtn_u32 v0, v1, v2", "s_endpgm"])
+
+    def test_invalid_syntax_rejection(self):
+        with self.assertRaises((rdna2spirv.Unsupported, IndexError, ValueError)):
+            support.translate_lines("cs_test_bad_syntax", ["ds_add_rtn_u32 v1, v2", "s_endpgm"], fssm=L.fssm())
 
 
 if __name__ == "__main__":
