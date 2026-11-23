@@ -2127,10 +2127,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         a.id = draw.depth.resource;
         if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
         if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
+        // Each Vulkan depth/stencil format has its own image view compatibility class.
+        if (a.binding.format != pipeline->depth_format ||
+            (a.binding.aspects & pipeline->depth_aspects) != pipeline->depth_aspects)
+            return ReplayResult::invalid_draw;
         if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
-        ResourceBinding viewed = a.binding;
-        viewed.format = pipeline->depth_format;
-        a.view = vk.image_view(viewed, a.range);
+        a.view = vk.image_view(a.binding, a.range);
         if (!a.view) return ReplayResult::unsupported;
         shrink(a.binding, draw.depth, a.range);
     }

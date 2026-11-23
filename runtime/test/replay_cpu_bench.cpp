@@ -629,6 +629,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "FAIL frame: counts differ between runs\n");
             ++failures;
         }
+
+        // A D32-only PSO cannot create a D32 view of a D32+S8 image, even for a depth-only draw.
+        auto& depth_image = scene.resources.at(Scene::depth);
+        depth_image.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        depth_image.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        auto vk = scene.vk;
+        bool requested_depth_view = false;
+        vk.image_view = [&](const ResourceBinding& binding, const VkImageSubresourceRange& range) {
+            requested_depth_view |= binding.image == depth_image.image;
+            return scene.vk.image_view(binding, range);
+        };
+        CommandList mismatched_depth;
+        if (!draw(mismatched_depth, 0, false) || !mismatched_depth.close() ||
+            prepare(mismatched_depth, resolve, vk, prepared) != ReplayResult::invalid_draw || requested_depth_view) {
+            std::fprintf(stderr, "FAIL depth attachment: an incompatible depth view was not refused\n");
+            ++failures;
+        }
         std::printf("replay_cpu_bench self-test: %zu kinds and a %zu-command frame recorded and replayed, %s\n",
                     std::size(kinds), f.commands, failures ? "FAILED" : "ok");
         return failures ? 1 : 0;
