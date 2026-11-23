@@ -182,6 +182,20 @@ class Inflate(unittest.TestCase):
         self.assertEqual(mp.inflate_chain(io.BytesIO(b"\x00" * 64), 0), [])
 
 
+class Wave64Mode(unittest.TestCase):
+    def test_explicit_choices_do_not_probe_the_gpu(self):
+        self.assertTrue(mp.wave64_mode("on"))
+        self.assertFalse(mp.wave64_mode("off"))
+
+    def test_auto_follows_the_probe_and_emulates_when_it_cannot_tell(self):
+        from unittest import mock
+        answers = (('{"native64": true}', False), ('{"native64": false}', True), ("not json", True), ("", True))
+        for stdout, emulate in answers:
+            with self.subTest(stdout=stdout), mock.patch.object(mp.subprocess, "run") as run:
+                run.return_value = mock.Mock(stdout=stdout)
+                self.assertEqual(mp.wave64_mode("auto"), emulate)
+
+
 class FixtureShader(unittest.TestCase):
     def test_fragment_shader_writes_the_colour(self):
         for value in mp.COLOR:

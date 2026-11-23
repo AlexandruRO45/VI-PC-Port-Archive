@@ -48,6 +48,11 @@ matrix M: the transpose of M, row by row. Measured: the other order draws nothin
   silhouette edge** (an edge only one triangle has). IoU alone is not enough: a camera 3 degrees off still gives
   0.98 on this drawable. An edge two triangles share is not in the edge band, because one of them covers the pixel
   either way; a mismatch there is a crack or an overlap.
+- **Subgroup mode.** The mesh shader is wave64. `--wave64-emulate auto` (the default) translates it natively only
+  where the GPU can require 64-wide mesh subgroups (`tools/vk_subgroup_info.py` `native64`, as `make_game.py`
+  decides) and otherwise with `--wave64-emulate`; the mode is printed with the result and kept in the output's
+  `manifest.json`. A native draw whose required size the GPU refuses fails instead of running at another size. On
+  the 760M both modes give byte-identical frames in both poses.
 - The camera is a perspective view of the bounding sphere from a chosen yaw and pitch. A pose that clips a vertex is
   refused, so the CPU side needs no clipper.
 

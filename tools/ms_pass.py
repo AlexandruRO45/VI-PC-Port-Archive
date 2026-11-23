@@ -329,8 +329,23 @@ def passed(result: dict) -> bool:
 
 # ------------------------------------------------------------------------------------------------ the run
 
-def translate_ms(work: str, sha: str) -> str:
-    """Translate the one container whose FSSM is `sha` with this checkout's translator; return the .spv path."""
+def wave64_mode(choice: str) -> bool:
+    """Whether to translate with --wave64-emulate. "auto" asks tools/vk_subgroup_info.py, as make_game.py does: a
+    wave64 mesh shader runs natively only where the GPU can require 64-wide mesh subgroups (`native64`)."""
+    if choice in ("on", "off"):
+        return choice == "on"
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")], capture_output=True,
+                           text=True, timeout=60)
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return True
+    return not info.get("native64")
+
+
+def translate_ms(work: str, sha: str, emulate: bool = False) -> str:
+    """Translate the one container whose FSSM is `sha` with this checkout's translator (with --wave64-emulate when
+    `emulate`); return the .spv path."""
     with open(os.path.join(work, "shaders", "spirv", "index.json"), encoding="utf-8") as f:
         stems = [k for k, v in json.load(f).items() if v.get("fssm_sha256") == sha]
     if len(stems) != 1:
@@ -351,26 +366,38 @@ def translate_ms(work: str, sha: str) -> str:
     fl.run([os.path.join(TOOLS, "shader_disasm.py"), os.path.join(dxbc, "fssm"), "--out",
             os.path.join(dxbc, "disasm"), "--mcpu", "gfx1013"])
     spirv = os.path.join(base, "spirv")
-    fl.run([os.path.join(TOOLS, "rdna2spirv.py"), os.path.join(dxbc, "disasm"), "--out", spirv])
+    fl.run([os.path.join(TOOLS, "rdna2spirv.py"), os.path.join(dxbc, "disasm"), "--out", spirv]
+           + (["--wave64-emulate"] if emulate else []))
     with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
         meta = json.load(f).get(stems[0])
     if not meta or meta.get("fssm_sha256") != sha or meta.get("stage") != "ms":
         raise SystemExit("the translator did not produce the expected mesh shader")
+    if bool(meta.get("wave64_emulated")) != emulate:
+        raise SystemExit(f"the translation is {'' if meta.get('wave64_emulated') else 'not '}wave64-emulated, "
+                         f"expected {'emulated' if emulate else 'native'}")
     return os.path.join(spirv, stems[0] + ".spv")
 
 
-def draw(harness: str, ms: str, out: str, spec: dict, heap: bytes, sgprs: list[int], width: int, height: int):
+def draw(harness: str, ms: str, out: str, spec: dict, heap: bytes, sgprs: list[int], width: int, height: int,
+         emulate: bool = False):
+    """Draw once. A native wave64 module needs the GPU to require 64-wide mesh subgroups; an emulated one runs at
+    whatever size the GPU picks, so no size is requested."""
     fs_asm, fs_spv = os.path.join(out, "fs.spvasm"), os.path.join(out, "fs.spv")
     with open(fs_asm, "w", encoding="utf-8", newline="\n") as f:
         f.write(FS_ASM)
     subprocess.run(["spirv-as", "--target-env", "vulkan1.2", fs_asm, "-o", fs_spv], check=True)
-    env = dict(os.environ, VKH_MESH="1", VKH_SUBGROUP_SIZE=str(spec["subgroup_size"]),
-               VKH_SGPRS=",".join(hex(x) for x in sgprs), VKH_HEAP=heap_env(heap))
+    env = dict(os.environ, VKH_MESH="1", VKH_SGPRS=",".join(hex(x) for x in sgprs), VKH_HEAP=heap_env(heap))
+    env.pop("VKH_SUBGROUP_SIZE", None)
+    if not emulate:
+        env["VKH_SUBGROUP_SIZE"] = str(spec["subgroup_size"])
     raw = os.path.join(out, "image.raw")
     r = subprocess.run([harness, ms, fs_spv, raw, str(width), str(height)], env=env, timeout=120,
                        capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"vk_harness exited {r.returncode}: {r.stderr.strip()[-500:]}")
+    if not emulate and "not available" in r.stderr:
+        raise SystemExit(f"this GPU can't require {spec['subgroup_size']}-wide subgroups for the native wave64 module "
+                         "(vk_harness: 'not available'); run with --wave64-emulate on")
     return raw
 
 
@@ -390,6 +417,9 @@ def main(argv=None) -> int:
     ap.add_argument("--list", action="store_true", help="list static drawables, smallest first, and exit")
     ap.add_argument("--run", action="store_true", help="draw and compare")
     ap.add_argument("--check", action="store_true", help="compare the draw in --out again and fail if it differs")
+    ap.add_argument("--wave64-emulate", choices=("auto", "on", "off"), default="auto",
+                    help="translate the mesh shader with --wave64-emulate: auto (default) does when the GPU can't "
+                         "require 64-wide mesh subgroups (tools/vk_subgroup_info.py), as make_game.py does")
     ap.add_argument("--controls", action="store_true",
                     help="with --run, also run three negative controls that must fail (wrong camera, swapped axes, "
                          "a V# in the wrong table slot)")
@@ -428,16 +458,20 @@ def main(argv=None) -> int:
     heap, layout = build_heap(spec, d["vertex_block"], d["meshlet_group"], view_proj_words(m))
     out = a.out or os.path.join(a.work, "ms_pass", "out")
     os.makedirs(out, exist_ok=True)
-    ms = translate_ms(a.work, sha)
-    draw(fl.find_harness(a.harness), ms, out, spec, heap, sgpr_words(spec, layout), a.width, a.height)
-    man = {"fssm_sha256": sha, "width": a.width, "height": a.height, "yaw": a.yaw, "pitch": a.pitch,
+    emulate = wave64_mode(a.wave64_emulate)
+    a.emulate = emulate
+    ms = translate_ms(a.work, sha, emulate)
+    draw(fl.find_harness(a.harness), ms, out, spec, heap, sgpr_words(spec, layout), a.width, a.height, emulate)
+    mode = "wave64 emulated" if emulate else f"native wave64 (required subgroup {spec['subgroup_size']})"
+    man = {"fssm_sha256": sha, "subgroup_mode": mode, "width": a.width, "height": a.height, "yaw": a.yaw,
+           "pitch": a.pitch,
            "vertices": d["vertices"], "triangles": len(d["triangles"]), "meshlets": d["meshlets"],
            "axis_word": d["axis"], "triangles_2d": tris2d}
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(man, f)
     result = check_folder(out, man)
     print(f"{d['vertices']} vertices, {len(d['triangles'])} triangles, {d['meshlets']} meshlet, axis word "
-          f"{d['axis']}: {summary(result)}")
+          f"{d['axis']}, {mode}: {summary(result)}")
     ok = passed(result)
     if a.controls:
         ok = run_controls(a, d, m, lo, hi, spec, ms, out) and ok
@@ -455,7 +489,7 @@ def run_controls(a, d, m, lo, hi, spec, ms, out) -> bool:
     heap[slot + 16:slot + 32], heap[slot:slot + 16] = heap[slot:slot + 16], bytes(16)   # V# one slot too far
     wrong = os.path.join(out, "control_wrong_slot")
     os.makedirs(wrong, exist_ok=True)
-    draw(fl.find_harness(a.harness), ms, wrong, spec, heap, sgpr_words(spec, layout), a.width, a.height)
+    draw(fl.find_harness(a.harness), ms, wrong, spec, heap, sgpr_words(spec, layout), a.width, a.height, a.emulate)
     controls.append(("meshlet V# in the next table slot", m, d["positions"],
                      read_raw(os.path.join(wrong, "image.raw"), a.width, a.height)))
     all_failed = True
