@@ -361,6 +361,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_f16_pack_mods": (0x4400b400, 0xc4003400, 0x4400c200, 0xb400b400),
               # SDWA src_sel on a float inline constant in an f16 op (measured on gfx1036)
               "ps_sdwa_f16_const": (0xaaaa3800, 0xaaaa1c00, 0xaaaa3e00, 0xaaaa73f0),
+              # f16 denormal operands of v_mul_f16 kept (ps_mul_f16_denorm.asm, SHADER-526)
+              "ps_mul_f16_denorm": (0x00000400, 0x00008400, 0x00002bfe, 0x00002c00),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
