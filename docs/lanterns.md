@@ -42,7 +42,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 |---|---|---|
 | [1](#stage-1) | Five indexed, instanced draws with a depth buffer | Depth test off changes the predicted pixels |
 | [3](#stage-3-compute-on-a-second-queue) | A compute queue moves the points of light; the frame waits on its fence | Point states and records equal the CPU's; the points move the predicted pixels |
-| [5](#stage-5-an-fp16-target-and-a-bloom-post-process) | An fp16 target, then a wave64 bloom with LDS and `s_barrier` | Skipping the blur changes the predicted pixels |
+| [5](#stage-5-an-fp16-target-and-a-bloom-post-process) | An fp16 target, then a bloom whose waves share LDS across an `s_barrier` | Skipping the blur changes the predicted pixels |
 | [6](#stage-6-compressed-textures-with-mip-chains) | BC1 and BC7 textures with full mip chains, trilinear and explicit-LOD sampling | Two mips down leaves the predicted pixels' bounds |
 | [8](#stage-8-a-shadow-map) | A D32 shadow map with PSO depth bias, sampled with 2x2 PCF | The map cleared to far changes the predicted pixels |
 
@@ -174,13 +174,17 @@ Lanterns stage 3: PASS, 97675 and 97664 of 98304 pixels exact, 256 points exact 
 The stage-3 frame after 48 compute steps is drawn into an `R16G16B16A16_FLOAT` target. Then a post-process runs on
 the same direct queue (`lanterns_post.h`):
 
-- Two wave64 compute passes blur what is brighter than a threshold, first along rows and then along columns. Each
-  group is 128 lanes in two waves that share LDS across an `s_barrier`. The row pass reads the scene through a T#
-  with `image_load`.
+- Two compute passes blur what is brighter than a threshold, first along rows and then along columns. Each group
+  is 128 lanes sharing LDS across an `s_barrier`. The row pass reads the scene through a T# with `image_load`.
+- The row pass is wave32 (four waves), and every sample a lane sums was loaded by a lane of another wave (lane i
+  loads sample i + 64 mod 128; the halos come from the other half too). The second half also walks four dependent
+  fetches before its write, so its write lands late. Only the `s_barrier` orders those writes before the reads.
+- The column pass is wave64 (two waves), translated with `--wave64-emulate`. The emulation runs a wave64 program in
+  rounds that already put every LDS write before a later LDS read, so there a missing `s_barrier` cannot show; that
+  is why the row pass, the one whose barrier is measured, is wave32.
 - A fullscreen pixel shader reads `SV_Position`, the scene texel and the blur, and writes their sum into an
   `R32G32B32A32_FLOAT` target.
 
-The wave64 shaders are translated with `--wave64-emulate`.
 
 How the check works:
 
@@ -189,8 +193,9 @@ How the check works:
 - The point states and instance records must equal the CPU's, as in stage 3.
 - Control: the composite with the blur skipped must change exactly the certain pixels the reference says the bloom
   changes, and at least 1,000 of them.
-- Measured, not required: the row pass without its `s_barrier` (a race the reference cannot predict). It changed 0
-  certain pixels on the test machine.
+- Measured, not required: the row pass without its `s_barrier` (a race the reference cannot predict). On the test
+  machine it changed 8,449 to 14,849 certain pixels in five runs; the same shader without the barrier in place of
+  the real one fails the stage.
 
 ```
 Lanterns stage 5: PASS, fp16 scene 97664 of 97664 certain pixels exact, bloom composite 82563 of 82563 certain pixels exact and 15741 bounded pixels within bounds, skipping the blur changed 15113 pixels as predicted

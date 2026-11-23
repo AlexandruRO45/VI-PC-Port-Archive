@@ -26,8 +26,8 @@
 //
 // Stage 5: the stage-3 frame after two rounds of rise steps (the points drawn directly, their instances written by
 // the compute shader) into an R16G16B16A16_FLOAT target, then a
-// post-process on the same direct queue (lanterns_post.h): two wave64 compute passes, each 128 lanes in two waves
-// sharing LDS across an s_barrier, blur what is brighter than a threshold along rows (reading the scene through a T#
+// post-process on the same direct queue (lanterns_post.h): two compute passes (wave32 rows, wave64 columns), each 128
+// lanes in several waves sharing LDS across an s_barrier, blur what is brighter than a threshold along rows (reading the scene through a T#
 // with image_load) and then columns; a fullscreen pixel shader reads SV_Position, the scene texel and the blur, and
 // writes the sum into an R32G32B32A32_FLOAT target. The fp16 scene and the final frame are compared with the CPU
 // (exact where certain, within bounds where the scene's edges leave it uncertain). Control: the composite with the

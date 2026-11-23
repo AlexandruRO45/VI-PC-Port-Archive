@@ -1,8 +1,8 @@
 // Lanterns stage 5: the post-process and its CPU reference. The scene is drawn into an R16G16B16A16_FLOAT target, as
 // a game draws into an HDR target. Then:
-//   cs_lanterns_bloom_h  (wave64, 128 lanes: two waves sharing LDS) keeps what is brighter than kBloomThreshold,
+//   cs_lanterns_bloom_h  (wave32, 128 lanes: four waves sharing LDS) keeps what is brighter than kBloomThreshold,
 //                        quantized to 1/kBloomSteps, and blurs it along rows with the 9-tap binomial filter;
-//   cs_lanterns_bloom_v  (the same, along columns) blurs that result;
+//   cs_lanterns_bloom_v  (wave64, two waves, along columns) blurs that result;
 //   ps_lanterns_composite (fullscreen, SV_Position) adds the blur times kBloomGain to the scene, into the final target.
 // The arithmetic is exact by construction: a quantized value is a small integer (q < 64), each blur sums integer
 // multiples of it (weights 1..70, total 256), so both sums are integers below 2^20, and the composite adds an
