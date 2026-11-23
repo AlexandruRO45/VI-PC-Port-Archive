@@ -138,12 +138,11 @@ Cross-tabulated against the skip table:
 
 **Codec, not DXGI format, decides what a decoder can finish.** The table above splits entries by
 where their BCPack chunks sit, not by which BCPack mode they use, so it does not say how much of
-the catalog a decoder limited to BC1–BC5 loses. Reading each entry's per-mip codec set from the
-same catalogs (`tools/ttpf_mips.py` descriptors over the 57 pools: 357,115 entries, 0 refused)
+the catalog a decoder limited to BC1–BC5 loses. Reading each entry's per-mip codec set from the same catalogs (`tools/ttpf_mips.py scan` over the 57 pools: 357,115 entries, 0 refused)
 gives **3,270 entries that touch a BC6H or BC7 chunk at some mip** and **752 that are BC6H/BC7 at
-every mip**. Only those 752 are out of reach of a strict BC1–BC5 path, so `rpf9dump`'s reader can
+every mip**. Only those 752 are out of reach of a strict BC1–BC5 path, so a decoder limited to BC1–BC5 can
 complete at most 356,363 entries; its BC7 chunks are 583 strict of 5,167 (§5 below). The
-descriptor's DXGI format is not a substitute for this count: formats 95–98 name 53,637 entries
+descriptor's DXGI format is not a substitute for this count: formats 95–99 name 53,637 entries
 (1,000 BC6H_UF16, 25 BC6H_SF16, 0 BC7_UNORM, 52,612 BC7_UNORM_SRGB), most of which carry zlib/raw
 mips as well and export fine.
 
