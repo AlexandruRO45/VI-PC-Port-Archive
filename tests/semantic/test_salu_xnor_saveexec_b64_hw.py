@@ -524,5 +524,46 @@ class TestConditionCodes(unittest.TestCase):
         self.assertEqual(hw_scc1, 1)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestBitwiseBoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    F64_POS_ZERO: int = 0x00000000_00000000
+    F64_NEG_ZERO: int = 0x80000000_00000000
+    F64_POS_INF: int = 0x7FF00000_00000000
+    F64_NEG_INF: int = 0xFFF00000_00000000
+    F64_QNAN: int = 0x7FF80000_00000000
+    F64_SNAN: int = 0x7FF00000_00000001
+    F64_MIN_SUBNORMAL: int = 0x00000000_00000001
+    F64_MAX_SUBNORMAL: int = 0x000FFFFF_FFFFFFFF
+
+    def test_float64_bit_patterns_as_masks(self) -> None:
+        patterns = [
+            self.F64_POS_ZERO,
+            self.F64_NEG_ZERO,
+            self.F64_POS_INF,
+            self.F64_NEG_INF,
+            self.F64_QNAN,
+            self.F64_SNAN,
+            self.F64_MIN_SUBNORMAL,
+            self.F64_MAX_SUBNORMAL,
+        ]
+
+        for p in patterns:
+            with self.subTest(pattern=hex(p)):
+                new_exec, d_saved, scc = ref_s_xnor_saveexec_b64(p, ALL64)
+                self.assertEqual(new_exec, p)
+                self.assertEqual(d_saved, ALL64)
+                self.assertEqual(scc, int(p != 0))
+
+                hw_exec, hw_scc, hw_bcnt, _ = run_hw_xnor_saveexec(p, ALL64)
+                self.assertEqual(hw_exec, p)
+                self.assertEqual(hw_scc, int(p != 0))
+                self.assertEqual(hw_bcnt, 64)
+
+
 if __name__ == "__main__":
     unittest.main()
