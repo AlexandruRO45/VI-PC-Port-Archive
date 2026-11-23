@@ -232,5 +232,41 @@ class TestInterpP1F32HardwareTranslator(unittest.TestCase):
         self.assertEqual(len(words), 4)
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p2_f32 Reference Oracle
+# ------------------------------------------------------------------------------
+
+def ref_interp_p2_f32(j_coord: float, p0: float, p2: float, p1_accum: float, clamp: bool = False) -> int:
+    """Computes D = p1_accum + j * (P2 - P0)."""
+    d2 = f32_round(p2 - p0)
+    m2 = f32_round(d2 * j_coord)
+    res = f32_round(p1_accum + m2)
+    if clamp:
+        res = max(0.0, min(1.0, res))
+    return f32_to_bits(res)
+
+
+class TestInterpP2F32Oracle(unittest.TestCase):
+    def test_barycentric_triangle_vertices(self):
+        p0, p1, p2 = 1.0, 5.0, 9.0
+        # Vertex 0: (i=0, j=0) -> P0 = 1.0
+        acc0 = bits_to_f32(ref_interp_p1_f32(0.0, p0, p1))
+        self.assertEqual(ref_interp_p2_f32(0.0, p0, p2, acc0), f32_to_bits(1.0))
+
+        # Vertex 1: (i=1, j=0) -> P1 = 5.0
+        acc1 = bits_to_f32(ref_interp_p1_f32(1.0, p0, p1))
+        self.assertEqual(ref_interp_p2_f32(0.0, p0, p2, acc1), f32_to_bits(5.0))
+
+        # Vertex 2: (i=0, j=1) -> P2 = 9.0
+        acc2 = bits_to_f32(ref_interp_p1_f32(0.0, p0, p1))
+        self.assertEqual(ref_interp_p2_f32(1.0, p0, p2, acc2), f32_to_bits(9.0))
+
+    def test_clamp_modifier(self):
+        # Value > 1.0 clamped to 1.0
+        self.assertEqual(ref_interp_p2_f32(0.5, 0.0, 4.0, 1.0, clamp=True), f32_to_bits(1.0))
+        # Value < 0.0 clamped to 0.0
+        self.assertEqual(ref_interp_p2_f32(0.5, 0.0, -10.0, 0.0, clamp=True), f32_to_bits(0.0))
+
+
 if __name__ == '__main__':
     unittest.main()
