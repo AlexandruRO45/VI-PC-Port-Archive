@@ -1436,8 +1436,9 @@ bool depth_stencil_family(DXGI_FORMAT format) {
 }
 
 // ALLOW_RENDER_TARGET: the host refuses the families below and accepts the rest, D32_FLOAT, D16_UNORM,
-// R9G9B9E5_SHAREDEXP and NV12 among them. R32G32B32 is the driver's answer (refused by both AMD drivers measured,
-// accepted by WARP); it is refused here, since Vulkan drivers rarely render to it.
+// R9G9B9E5_SHAREDEXP and NV12 among them (Windows 10's runtime refuses R9G9B9E5_SHAREDEXP on every adapter, WARP
+// included). R32G32B32 is the driver's answer (refused by both AMD drivers measured, accepted by WARP); it is refused
+// here, since Vulkan drivers rarely render to it.
 bool render_target_family(DXGI_FORMAT format) {
     switch (format_family(format)) {
         case DXGI_FORMAT_R32G32B32_TYPELESS:

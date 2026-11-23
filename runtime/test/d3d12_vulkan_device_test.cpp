@@ -4334,7 +4334,9 @@ int compare_invalid_arguments(ID3D12Device* ours) {
     // host's answers follow the format family (the same on the three adapters measured), except R32G32B32, which is
     // the driver's. Whether the layer can make an attachment of a format is its Vulkan driver's answer, so only the
     // host refusing what the layer accepts is a mismatch; the other way round (D32_FLOAT and D16_UNORM as render
-    // targets, the R32/R16 colour formats as depth buffers on the drivers measured) is printed.
+    // targets, the R32/R16 colour formats as depth buffers on the drivers measured) is printed. Windows 10's runtime
+    // refuses an R9G9B9E5_SHAREDEXP render target on every adapter (RX 7900 XT and WARP, both with no RENDER_TARGET
+    // in FORMAT_SUPPORT, build 19045), where Windows 11 hosts accept it as the layer does on a driver that renders it.
     for (int f = 1; f <= 99; ++f) {
         const DXGI_FORMAT format = DXGI_FORMAT(f);
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -4354,6 +4356,9 @@ int compare_invalid_arguments(ID3D12Device* ours) {
                 std::printf("invalid arguments format %d %s: the host accepts it, this Vulkan driver can't\n", f, what);
                 continue;
             }
+            if (format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET &&
+                windows10_refusal("format 67 RT", host.p, a, b))
+                continue;
             ++mismatches;
             std::fprintf(stderr, "invalid arguments format %d %s: ours 0x%08lx, host 0x%08lx\n", f, what, a, b);
         }
