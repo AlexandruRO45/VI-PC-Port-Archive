@@ -1205,12 +1205,14 @@ void run_checks(const std::filesystem::path& root) {
         check(through != INVALID_HANDLE_VALUE && read_handle(through) == "ok", "an ordinary dotted name under GAME: is not reserved");
         if (through != INVALID_HANDLE_VALUE) ::CloseHandle(through);
 
-        // A package that itself sits on drive G: is reached by host paths, which must stay host paths.
+        // A package that itself sits on drive G: is reached by host paths. They are not read as the console's G:
+        // (that would look for leonida_missing_package inside the package): a path under --game-dir names the
+        // package's own file, by the GAME: rules. The drive does not exist here, so only the lookup is checked.
         rt::fs::configure(L"G:\\leonida_missing_package", L"G:\\leonida_missing_overlay");
         SetLastError(0);
         check(attributes_w(L"G:\\leonida_missing_package\\data.txt") == INVALID_FILE_ATTRIBUTES &&
                   GetLastError() != ERROR_INVALID_NAME,
-              "a path under a configured G: game folder is a host path");
+              "a path under a configured G: game folder is not read as the console drive G:");
         // No roots configured: nothing to map G: and T: onto, so they are host paths.
         rt::fs::configure({}, {});
         SetLastError(0);
@@ -1436,6 +1438,15 @@ void run_checks(const std::filesystem::path& root) {
         check(h != INVALID_HANDLE_VALUE && read_handle(h) == "host",
               "a host path with .. that stays inside reads the overlay copy");
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const std::filesystem::path moved = package / "host" / "moved.txt";
+        check(move_ex_w(L"GAME:\\host\\file.txt", moved.c_str(), 0) != FALSE && !std::filesystem::exists(moved) &&
+                  read_path(overlay / "host" / "moved.txt") == "host" && read_path(in_package) == "package",
+              "a move from GAME: to a host path inside the game folder stays in the overlay");
+        const std::filesystem::path away = root / "away.txt";
+        SetLastError(0);
+        check(move_ex_w(L"GAME:\\host\\moved.txt", away.c_str(), 0) == FALSE &&
+                  GetLastError() == ERROR_NOT_SAME_DEVICE && !std::filesystem::exists(away),
+              "a move from GAME: to a host path outside the game folder is ERROR_NOT_SAME_DEVICE");
     }
 }
 
