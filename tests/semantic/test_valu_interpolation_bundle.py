@@ -371,5 +371,29 @@ class TestInterpP2F32HardwareTranslator(unittest.TestCase):
         self.assertEqual(len(words), 4)
 
 
+# ------------------------------------------------------------------------------
+# v_interp_mov_f32 Reference Oracle
+# ------------------------------------------------------------------------------
+
+def ref_interp_mov_f32(vsel: str, p0: float, p1: float = 0.0, p2: float = 0.0) -> int:
+    """Direct attribute access: p0 -> P0, p10 -> P1 - P0, p20 -> P2 - P0."""
+    if vsel == "p0":
+        return f32_to_bits(p0)
+    elif vsel == "p10":
+        return f32_to_bits(f32_round(p1 - p0))
+    elif vsel == "p20":
+        return f32_to_bits(f32_round(p2 - p0))
+    raise ValueError(f"Unknown vertex select: {vsel}")
+
+
+class TestInterpMovF32Oracle(unittest.TestCase):
+    def test_provoking_vertex(self):
+        self.assertEqual(ref_interp_mov_f32("p0", 42.0), f32_to_bits(42.0))
+
+    def test_attribute_deltas(self):
+        self.assertEqual(ref_interp_mov_f32("p10", 10.0, 25.0), f32_to_bits(15.0))
+        self.assertEqual(ref_interp_mov_f32("p20", 10.0, 0.0, 30.0), f32_to_bits(20.0))
+
+
 if __name__ == '__main__':
     unittest.main()
