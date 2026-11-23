@@ -1237,13 +1237,17 @@ if(TARGET Vulkan::Headers)
       add_test(NAME ${test} COMMAND ${test}_test)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
-    # A missing or truncated module is rejected before Vulkan starts (no GPU needed), not passed on to the driver.
+    # A missing, truncated or non-SPIR-V file is rejected before Vulkan starts (no GPU needed), not passed on to the
+    # driver. The text file is 32 bytes, so only the magic check rejects it.
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_truncated.spv" "0302")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_text.spv" "a text file, not a SPIR-V module")
     add_test(NAME vk_compute_test_missing_spv
              COMMAND vk_compute_test "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_missing.spv" 1 dump)
     add_test(NAME vk_compute_test_truncated_spv
              COMMAND vk_compute_test "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_truncated.spv" 1 dump)
-    set_tests_properties(vk_compute_test_missing_spv vk_compute_test_truncated_spv PROPERTIES
+    add_test(NAME vk_compute_test_text_spv
+             COMMAND vk_compute_test "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_text.spv" 1 dump)
+    set_tests_properties(vk_compute_test_missing_spv vk_compute_test_truncated_spv vk_compute_test_text_spv PROPERTIES
                          PASS_REGULAR_EXPRESSION "not a SPIR-V module")
     # The XDXR BVH builder: the GPU writes every case, then tools/xdxr_bvh.py validates and traces them.
     set(LEONIDA_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_build_cases")

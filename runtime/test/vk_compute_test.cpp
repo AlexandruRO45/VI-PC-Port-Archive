@@ -97,6 +97,28 @@ static uint32_t spirv_local_size(const std::vector<char>& code, uint32_t local[3
     return w[1];
 }
 
+// A module the driver can be given: whole words, the SPIR-V magic and a version in the 5-word header, an
+// instruction stream in which every instruction has a non-zero word count and ends inside the file, and
+// OpFunctionEnd as the last instruction (a compute module ends with its functions). This rejects a missing file, a
+// file that is not SPIR-V, and a module cut off anywhere but between two whole functions; vkCreateShaderModule with
+// any of these is invalid usage, and RADV crashes on them (SIGSEGV). spirv-val is the full check.
+static bool spirv_well_formed(const std::vector<char>& code) {
+    if (code.size() < 20 || code.size() % 4) return false;
+    const std::size_t n = code.size() / 4;
+    std::vector<uint32_t> w(n);
+    std::memcpy(w.data(), code.data(), n * 4);
+    if (w[0] != 0x07230203u || w[1] == 0) return false;
+    constexpr uint32_t kOpFunctionEnd = 56;
+    uint32_t last_op = 0;
+    for (std::size_t i = 5; i < n;) {
+        const uint32_t len = w[i] >> 16;
+        if (!len || len > n - i) return false;
+        last_op = w[i] & 0xFFFFu;
+        i += len;
+    }
+    return last_op == kOpFunctionEnd;
+}
+
 static bool next_item(const char*& s) {
     if (!*s) return true;
     return *s++ == ',' && *s;
@@ -198,14 +220,14 @@ static int run(int argc, char** argv) {
         }
         out_words = uint32_t(n);
     }
-    // Read the module before Vulkan starts, so a missing or truncated file is reported here instead of reaching
-    // vkCreateShaderModule with codeSize 0 (invalid usage; RADV crashes with SIGSEGV). Same check as vk_store_test.
+    // Check the module before Vulkan starts, so a missing, truncated or wrong file is reported here instead of
+    // reaching vkCreateShaderModule (see spirv_well_formed).
     std::vector<char> code;
     {
         std::ifstream f(argv[1], std::ios::binary);
         code.assign(std::istreambuf_iterator<char>(f), {});
     }
-    if (code.size() < 20 || code.size() % 4) {
+    if (!spirv_well_formed(code)) {
         std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]);
         return 2;
     }
