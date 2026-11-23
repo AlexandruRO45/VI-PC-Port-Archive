@@ -7,15 +7,18 @@ argparse option leaves `python -I tools/x.py --old` in a README or guide that no
 
 1. a `--flag` anywhere in a Markdown page appears as a string in some tracked non-Markdown source file;
 2. in a fenced command that starts `python [-I] tools/x.py` (or `scripts/`, or `make_game.py`), every flag appears in
-   that script (a script that builds flags as `"--" + name` is skipped; `--help` is argparse's own);
+   the script that parses it, including the producer of a forwarded development CLI subcommand (a script that builds
+   flags as `"--" + name` is skipped; `--help` is argparse's own);
 3. in a fenced command running a PowerShell script (`scripts/` or `tools/`), every flag appears in that script's
    `param()` block.
 
 Reads tracked files only; no game files.
 """
+import json
 import os
 import re
 import subprocess
+import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -156,9 +159,9 @@ def fenced_commands(text):
     return out
 
 
-def tool_flag_mismatches(pages, sources):
+def tool_flag_mismatches(pages, sources, forwarders):
     """[(page:line, tool, flag)] for fenced commands running one tool with a flag its source lacks.
-    `sources` maps a tool path to its text."""
+    `sources` maps a tool path to its text. `forwarders` maps (wrapper, subcommand) to the producer path."""
     out = []
     for page, text in sorted(pages.items()):
         for n, cmd in fenced_commands(text):
@@ -166,10 +169,14 @@ def tool_flag_mismatches(pages, sources):
             if not m or m.group(1) not in sources:
                 continue
             tool = m.group(1)
-            if '"--" +' in sources[tool] or "'--' +" in sources[tool]:
+            args = cmd[m.end():].split(maxsplit=1)
+            if args:
+                tool = forwarders.get((tool, args[0]), tool)
+            source = sources[tool]
+            if '"--" +' in source or "'--' +" in source:
                 continue
             for flag in sorted(set(FLAG.findall(cmd))):
-                if flag not in FOREIGN and flag not in sources[tool]:
+                if flag not in FOREIGN and flag not in source:
                     out.append((f"{page}:{n}", tool, flag))
     return out
 
@@ -203,13 +210,31 @@ class DocsCliFlags(unittest.TestCase):
                               "```\npython -I tools/x.py --real --old \\\n    --more\npython -I tools/y.py --old\n```\n"}
         self.assertEqual(unknown_flags(pages, '"--real" "--more" "--old"'), [("docs/a.md:1", "--gone")])
         sources = {"tools/x.py": 'add("--real") add("--more")', "tools/y.py": 'add("--old")'}
-        self.assertEqual(tool_flag_mismatches(pages, sources), [("docs/a.md:3", "tools/x.py", "--old")])
+        self.assertEqual(tool_flag_mismatches(pages, sources, {}), [("docs/a.md:3", "tools/x.py", "--old")])
         sources["tools/x.py"] += ' "--" + name'
-        self.assertEqual(tool_flag_mismatches(pages, sources), [])
+        self.assertEqual(tool_flag_mismatches(pages, sources, {}), [])
 
         ps1_pages = {"docs/b.md": "```\n.\\scripts\\test.ps1 -ValidParam -BadParam\n```\n"}
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
         self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
+
+    def test_forwarded_flags_belong_to_the_selected_producer(self):
+        pages = {"docs/a.md": "```\n"
+                              "python -I scripts/wrapper.py discover --json\n"
+                              "python -I scripts/wrapper.py trace --log\n"
+                              "python -I scripts/wrapper.py scene --guest\n"
+                              "python -I scripts/wrapper.py trace --guest\n"
+                              "python -I scripts/wrapper.py scene --json --removed\n"
+                              "```\n"}
+        sources = {"scripts/wrapper.py": 'add("--json")', "tools/trace.py": 'add("--log")',
+                   "scripts/scene.py": 'add("--guest")'}
+        forwarders = {("scripts/wrapper.py", "trace"): "tools/trace.py",
+                      ("scripts/wrapper.py", "scene"): "scripts/scene.py"}
+        self.assertEqual(tool_flag_mismatches(pages, sources, forwarders), [
+            ("docs/a.md:5", "tools/trace.py", "--guest"),
+            ("docs/a.md:6", "scripts/scene.py", "--json"),
+            ("docs/a.md:6", "scripts/scene.py", "--removed"),
+        ])
 
     def test_docs_name_existing_flags(self):
         files = tracked_files()
@@ -224,7 +249,10 @@ class DocsCliFlags(unittest.TestCase):
         files = tracked_files()
         sources = {p: read(p) for p in files if p.endswith(".py") and (p.startswith(("tools/", "scripts/")) or p == "make_game.py")}
         pages = {p: read(p) for p in files if p.endswith(".md") and p not in OTHER_PROJECTS}
-        bad = tool_flag_mismatches(pages, sources)
+        wrapper = "scripts/dev.py"
+        discovery = subprocess.check_output([sys.executable, "-I", wrapper, "discover", "--json"], cwd=ROOT)
+        forwarders = {(wrapper, entry["id"]): entry["path"] for entry in json.loads(discovery)["tools"]}
+        bad = tool_flag_mismatches(pages, sources, forwarders)
         self.assertEqual(bad, [], "fenced commands using a flag their script lacks: " +
                          "; ".join(f"{where} {tool} {flag}" for where, tool, flag in bad))
 
