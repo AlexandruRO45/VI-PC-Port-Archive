@@ -43,10 +43,13 @@ draw_phase:
     call qword ptr [__imp_draw_request]
     test eax, eax
     jz success
+    cmp eax, 14
+    jae draw_single
     cmp eax, 10
     jae draw_texture
     cmp eax, 6
     jae draw_two
+draw_single:
     mov ecx, eax
     call qword ptr [__imp_draw_frame]
     test eax, eax

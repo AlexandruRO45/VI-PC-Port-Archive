@@ -3793,3 +3793,16 @@ ctest --preset dev --no-tests=error -R '^pixel_aot_vop3_ternary_int_(warp|hardwa
 Python-only controls check explicit reference words and translator acceptance.
 Those controls do not establish GPU execution; the command above must pass on
 the named backend before recording readback evidence.
+
+### Two shadow frames from the EXE entry
+
+The native, mapped and AOT runners use the existing translated shadow scene. The
+second frame shifts the caster four pixels while retaining the device, pipeline
+states, descriptor heap, camera depth and color target. Two light depth maps
+remain live so the second camera pass can deliberately select the first one.
+The fixture compares all 4,096 color pixels and 4,096 light-depth texels of each
+frame against the CPU reference, checks four owned surface releases after the
+GPU fence, and verifies exit code 42. The stale binding changes only the
+second color frame and is checked against its own reference.
+
+Run `ctest --preset release --no-tests=error -R '^cpu_shim_shadow_(warp|hardware)$' -V`.

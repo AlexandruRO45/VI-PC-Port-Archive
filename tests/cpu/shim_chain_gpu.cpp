@@ -1,3 +1,6 @@
+#include "../desktop_gpu.h"
+#include <cstdlib>
+#include <filesystem>
 // Run the translated compute -> mesh -> pixel chain for one EXE-requested frame.
 //
 // This repeats the sequence of `offscreen_check --compute-mesh-texture`
@@ -129,15 +132,6 @@ ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 bytes, D3D12_HEAP_TYP
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags = flags;
     return committed(device, desc, heap, state);
-}
-
-void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
-                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
-    list->ResourceBarrier(1, &barrier);
 }
 
 template<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Kind, typename T>
@@ -382,6 +376,27 @@ bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsign
             mismatches += std::memcmp(published.data() + 4 * i, expected_frame + 4 * i, 4) != 0;
         return true;
     } catch (Failure) {
+        return false;
+    }
+}
+
+bool shim_shadow_gpu(bool stale, std::vector<unsigned char>& output)
+{
+    try {
+        const auto* path = std::getenv("X2W_SHIM_CHAIN_DIR");
+        if (!path || !*path) return false;
+        const auto directory = std::filesystem::path(path);
+        auto device = create_device();
+        if (!check_mesh_shadow_draw(device.Get(), (directory / "mesh.dxil").string().c_str(),
+                                    (directory / "receiver.dxil").string().c_str(),
+                                    (directory / "caster.dxil").string().c_str(),
+                                    (directory / "frames.case").string().c_str(), stale, &output))
+            ExitProcess(77);
+        return true;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return false;
+    } catch (const Failure&) {
         return false;
     }
 }

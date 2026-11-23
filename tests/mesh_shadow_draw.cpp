@@ -97,7 +97,8 @@ unsigned count_mismatches(const char* rows, const D3D12_PLACED_SUBRESOURCE_FOOTP
 }
 
 bool check_mesh_shadow_draw(ID3D12Device* device, const char* mesh_path, const char* receiver_path,
-                            const char* caster_path, const char* case_path, bool stale)
+                            const char* caster_path, const char* case_path, bool stale,
+                            std::vector<unsigned char>* frames)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
     check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options)), "Query mesh tier");
@@ -116,7 +117,7 @@ bool check_mesh_shadow_draw(ID3D12Device* device, const char* mesh_path, const c
     const auto filter = D3D12_FILTER(header[3]);
     const auto func = D3D12_COMPARISON_FUNC(header[4]);
     // Light draws for the previous and the current shadow map, then the receiver and the lit caster.
-    const UINT draws = previous + current + 2;
+    const UINT draws = previous + current + (frames ? 4 : 2);
     if (side == 0 || side > 256 || previous == 0 || current == 0 || draws > 16)
         throw std::runtime_error("Invalid shadow case header");
     const UINT image_bytes = side * side * 4;
@@ -124,7 +125,7 @@ bool check_mesh_shadow_draw(ID3D12Device* device, const char* mesh_path, const c
     const size_t traces_at = inputs_at + size_t(draws) * draw_bytes;
     const size_t image_at = traces_at + size_t(draws) * trace_stride;
     const size_t depth_at = image_at + image_bytes;
-    if (input.size() != depth_at + image_bytes) throw std::runtime_error("Shadow case size does not match its header");
+    if (input.size() != (frames ? image_at : depth_at + image_bytes)) throw std::runtime_error("Shadow case size does not match its header");
     const auto mesh = read_file(mesh_path);
     const auto receiver = read_file(receiver_path);
     const auto caster = read_file(caster_path);
@@ -199,7 +200,7 @@ bool check_mesh_shadow_draw(ID3D12Device* device, const char* mesh_path, const c
         dsv[i] = {dsv_heap->GetCPUDescriptorHandleForHeapStart().ptr + i * dsv_step};
         device->CreateDepthStencilView(depths[i].Get(), &dsv_view, dsv[i]);
     }
-    D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+    D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     check(device->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&srv_heap)), "Create shadow map heap");
     D3D12_SHADER_RESOURCE_VIEW_DESC map_view{};
@@ -207,13 +208,26 @@ bool check_mesh_shadow_draw(ID3D12Device* device, const char* mesh_path, const c
     map_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     map_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     map_view.Texture2D.MipLevels = 1;
-    const UINT bound_map = stale ? 0 : 1;
-    device->CreateShaderResourceView(depths[bound_map].Get(), &map_view, srv_heap->GetCPUDescriptorHandleForHeapStart());
+    const UINT srv_step = device->GetDescriptorHandleIncrementSize(srv_desc.Type);
+    for (UINT i = 0; i < 2; ++i) {
+        auto handle = srv_heap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += i * srv_step;
+        device->CreateShaderResourceView(depths[i].Get(), &map_view, handle);
+    }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT color_footprint{}, depth_footprint{};
     UINT64 color_size = 0, depth_size = 0;
     device->GetCopyableFootprints(&color_desc, 0, 1, 0, &color_footprint, nullptr, nullptr, &color_size);
     device->GetCopyableFootprints(&depth_desc, 0, 1, 0, &depth_footprint, nullptr, nullptr, &depth_size);
+    const auto align_placement = [](UINT64 size) {
+        constexpr UINT64 alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        return (size + alignment - 1) / alignment * alignment;
+    };
+    const UINT64 color_stride = align_placement(color_size), depth_stride = align_placement(depth_size);
+    if (frames) {
+        color_size += color_stride;
+        depth_size += depth_stride;
+    }
     const UINT trace_bytes = draws * trace_stride;
     auto color_readback = make_buffer(device, color_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     auto depth_readback = make_buffer(device, depth_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -252,39 +266,80 @@ bool check_mesh_shadow_draw(ID3D12Device* device, const char* mesh_path, const c
         mesh_list->DispatchMesh(1, 1, 1);
         ++draw;
     };
-    // Pass 1: light-space depth only, first the previous map, then the current one.
-    for (UINT map = 0; map < 2; ++map) {
-        list->OMSetRenderTargets(1, &rtv, FALSE, &dsv[map]);
-        list->ClearDepthStencilView(dsv[map], D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        for (UINT i = 0; i < (map ? current : previous); ++i) dispatch();
-    }
-    for (UINT map = 0; map < 2; ++map)
-        transition(list, depths[map].Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    // Pass 2: the receiver samples the bound map, then the lit caster.
-    ID3D12DescriptorHeap* heaps[]{srv_heap.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetGraphicsRootDescriptorTable(4, srv_heap->GetGPUDescriptorHandleForHeapStart());
-    list->OMSetRenderTargets(1, &rtv, FALSE, &dsv[2]);
-    list->ClearRenderTargetView(rtv, clear_color.Color, 0, nullptr);
-    list->ClearDepthStencilView(dsv[2], D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    list->SetPipelineState(receiver_pass.Get());
-    dispatch();
-    list->SetPipelineState(caster_pass.Get());
-    dispatch();
-    std::printf("light_draws=%u+%u camera_draws=2 bound_map=%s\n", previous, current, stale ? "previous" : "current");
+    for (UINT frame = frames ? 0u : 1u; frame < 2; ++frame) {
+        // The standalone fixture renders both light maps before its single camera pass.
+        for (UINT map = frames ? frame : 0u; map <= frame; ++map) {
+            draw = map ? previous : 0;
+            list->SetPipelineState(light_pass.Get());
+            list->OMSetRenderTargets(1, &rtv, FALSE, &dsv[map]);
+            list->ClearDepthStencilView(dsv[map], D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            for (UINT i = 0; i < (map ? current : previous); ++i) dispatch();
+            transition(list, depths[map].Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        ID3D12DescriptorHeap* heaps[]{srv_heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        auto bound = srv_heap->GetGPUDescriptorHandleForHeapStart();
+        if (frame && !stale) bound.ptr += srv_step;
+        list->SetGraphicsRootDescriptorTable(4, bound);
+        list->OMSetRenderTargets(1, &rtv, FALSE, &dsv[2]);
+        list->ClearRenderTargetView(rtv, clear_color.Color, 0, nullptr);
+        list->ClearDepthStencilView(dsv[2], D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        draw = previous + current + (frames ? 2 * frame : 0);
+        list->SetPipelineState(receiver_pass.Get());
+        dispatch();
+        list->SetPipelineState(caster_pass.Get());
+        dispatch();
 
+        auto color_copy = color_footprint, depth_copy = depth_footprint;
+        if (frames && frame) {
+            color_copy.Offset += color_stride;
+            depth_copy.Offset += depth_stride;
+        }
+        transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_to_readback(list, target.Get(), color_readback.Get(), color_copy);
+        transition(list, depths[frame].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_to_readback(list, depths[frame].Get(), depth_readback.Get(), depth_copy);
+        if (frames && !frame) {
+            transition(list, target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            transition(list, depths[frame].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+    }
     transition(list, trace.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(trace_readback.Get(), 0, trace.Get(), 0, trace_bytes);
-    transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    copy_to_readback(list, target.Get(), color_readback.Get(), color_footprint);
-    transition(list, depths[1].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    copy_to_readback(list, depths[1].Get(), depth_readback.Get(), depth_footprint);
     commands.submit_and_wait(device);
 
     check(trace_readback->Map(0, nullptr, &mapped), "Map shadow trace");
     const bool trace_ok = std::memcmp(mapped, input.data() + traces_at, trace_bytes) == 0;
     trace_readback->Unmap(0, &empty);
+    if (!trace_ok) throw std::runtime_error("Mesh export trace mismatch");
+    if (frames) {
+        auto append = [&](ID3D12Resource* readback, D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint, UINT64 stride) {
+            check(readback->Map(0, nullptr, &mapped), "Map shadow frames");
+            auto* source = static_cast<const unsigned char*>(mapped) + footprint.Offset;
+            for (UINT frame = 0; frame < 2; ++frame) {
+                for (UINT y = 0; y < side; ++y) {
+                    const auto* row = source + frame * stride + y * footprint.Footprint.RowPitch;
+                    frames->insert(frames->end(), row, row + side * 4);
+                }
+            }
+            readback->Unmap(0, &empty);
+        };
+        append(color_readback.Get(), color_footprint, color_stride);
+        append(depth_readback.Get(), depth_footprint, depth_stride);
+        unsigned releases = 0;
+        auto release = [&](ComPtr<ID3D12Resource>& surface) {
+            if (surface) {
+                surface.Reset();
+                ++releases;
+            }
+        };
+        for (auto& depth : depths) release(depth);
+        release(target);
+        frames->push_back(static_cast<unsigned char>(releases));
+        return true;
+    }
+    std::printf("light_draws=%u+%u camera_draws=2 bound_map=%s\n", previous, current, stale ? "previous" : "current");
     check(color_readback->Map(0, nullptr, &mapped), "Map shadow color");
     const unsigned mismatches = count_mismatches(static_cast<const char*>(mapped), color_footprint,
                                                  input.data() + image_at, side);
@@ -295,7 +350,6 @@ bool check_mesh_shadow_draw(ID3D12Device* device, const char* mesh_path, const c
     depth_readback->Unmap(0, &empty);
     std::printf("pixels=%u mismatches=%u\n", side * side, mismatches);
     std::printf("shadow_map_texels=%u shadow_map_mismatches=%u\n", side * side, depth_mismatches);
-    if (!trace_ok) throw std::runtime_error("Mesh export trace mismatch");
     if (depth_mismatches) throw std::runtime_error("Shadow map reference mismatch");
     if (mismatches) throw std::runtime_error("Draw reference mismatch");
     return true;
