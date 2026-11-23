@@ -383,5 +383,14 @@ class SCbranchVccnzOracleTests(unittest.TestCase):
     def test_vcc_zero(self):
         self.assertFalse(ref_oracle_vccnz(0))
 
+class SCbranchVccnzAstTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = BranchInstructionAST(
+            mnemonic="s_cbranch_vccnz",
+            target_offset=6,
+        )
+        self.assertEqual(ast.mnemonic, "s_cbranch_vccnz")
+        self.assertEqual(ast.target_offset, 6)
+
 if __name__ == '__main__':
     unittest.main()
