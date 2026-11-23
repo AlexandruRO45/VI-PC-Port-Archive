@@ -294,5 +294,20 @@ class TestDsReadI8HardwareTranslator(unittest.TestCase):
         self.assertEqual(L.out(mem, 0, 0), 0xFFFF_FF85)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_u16 Reference Oracle
+# ------------------------------------------------------------------------------
+
+class TestDsReadU16Oracle(unittest.TestCase):
+    def setUp(self):
+        self.lds = LDSMemory()
+
+    def test_read_u16_zero_extension(self):
+        self.lds.write_u16(0, 0xABCD)
+        self.assertEqual(self.lds.read_u16(0), 0xABCD)
+        self.lds.write_u16(2, 0xFFFF)
+        self.assertEqual(self.lds.read_u16(2), 0xFFFF)
+
+
 if __name__ == '__main__':
     unittest.main()
