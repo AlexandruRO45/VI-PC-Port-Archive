@@ -1367,6 +1367,9 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
     translated = os.path.join(spirv, "index.json")
     settings_file = os.path.join(spirv, "fspx_build.json")
     if not os.path.isfile(dll):
+        # A work folder used before with a package that had the DLL still holds that run's index, and the runtime
+        # loads <shaders>/fspx/index.json whenever it is there. Without the index the old modules are not found.
+        drop(translated, settings_file)
         log(f"shaders: no {FSPX_DLL} in the game folder, so no FSPX programs to translate")
         return
     settings = fspx_settings(dll, mc_signature, emulate, fallbacks)

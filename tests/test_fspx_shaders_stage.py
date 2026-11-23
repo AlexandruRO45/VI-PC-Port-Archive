@@ -261,6 +261,27 @@ class FspxStage(unittest.TestCase):
         self.assertEqual(self.run_step(), [])
         self.assertFalse(os.path.exists(self.spirv))
 
+    def test_a_dll_that_is_gone_takes_the_old_index_with_it(self):
+        """A work folder reused for a package without the DLL: the runtime loads <shaders>/fspx/index.json whenever
+        it exists, so the index of the earlier run must not stay, and the DLL coming back runs the step again."""
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        index, settings = os.path.join(self.spirv, "index.json"), os.path.join(self.spirv, "fspx_build.json")
+        self.assertTrue(os.path.isfile(index) and os.path.isfile(settings))
+        os.remove(self.dll)
+        logs = []
+        with mock.patch.object(make_game, "py", self.fake_py), mock.patch.object(make_game, "log", logs.append):
+            self.calls = []
+            make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+        self.assertEqual(self.calls, [])
+        self.assertFalse(os.path.exists(index))
+        self.assertFalse(os.path.exists(settings))
+        self.assertEqual(logs, [f"shaders: no {make_game.FSPX_DLL} in the game folder, so no FSPX programs to "
+                                "translate"])
+        self.assertEqual(self.run_step(), [])                      # and again, with nothing left to remove
+        self.write_dll(program())
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertTrue(os.path.isfile(index) and os.path.isfile(settings))
+
     def test_each_input_change_runs_it_again(self):
         self.run_step()
         self.assertEqual(self.run_step(signature="llvm-mc 24"), ["fspx_unpack.py", "rdna2spirv.py"])
