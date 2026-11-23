@@ -49,6 +49,7 @@ class CliHelpTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
                 self.assertNotIn("Traceback", proc.stderr)
                 self.assertIn("usage:", proc.stdout.lower())
+                self.assertIn(name, proc.stdout.lower())
 
     def test_every_cli_tool_answers_dash_dash_help(self):
         self.loop("--help")
@@ -68,6 +69,7 @@ class CliHelpTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
                     self.assertNotIn("Traceback", proc.stderr)
                     self.assertIn("usage:", proc.stdout.lower())
+                    self.assertIn(name, proc.stdout.lower())
 
     def test_help_works_from_an_unrelated_cwd(self):
         self.loop_from_tempdir("--help")
