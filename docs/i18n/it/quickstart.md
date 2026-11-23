@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentazione in inglese ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) è la **fonte di riferimento**. Questa guida raccoglie solo le istruzioni
-> stabili di configurazione e compilazione (sincronizzata con il commit `49475796`). Per lo stato quotidiano del
+> stabili di configurazione e compilazione (sincronizzata con il commit `aa2988cc`). Per lo stato quotidiano del
 > progetto consulta il [`README.md`](../../../README.md).
 
 ## Che cos'è Leonida
@@ -41,7 +41,11 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
     ```
 
     Lo script richiede `git` e gli strumenti C++ di Visual Studio (vedi sotto), imposta `LLVM_MC` per il tuo
-    utente e ti chiede di aprire un nuovo terminale per caricare la variabile.
+    utente e ti chiede di aprire un nuovo terminale per caricare la variabile. Richiede circa 20-40 minuti.
+  - Più rapido, se usi [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools` (la sua build
+    per Windows include il target AMDGPU; [`docs/testing.md`](../../testing.md) ha usato la versione 23.1.6), poi
+    imposta `LLVM_MC` con il percorso completo del `llvm-mc.exe` installato (con l'ambiente attivo, `where llvm-mc`
+    te lo mostra).
   - In alternativa, installa `llvm-21` in WSL (Ubuntu) e imposta la variabile con il comando completo, nella
     stessa sessione PowerShell da cui avvierai `make_game.py`:
 
@@ -56,6 +60,17 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
   che gli SDK più vecchi non dichiarano).
 - [ffmpeg](https://ffmpeg.org/download.html) nel `PATH` *(facoltativo: decodifica gli stream XMA2 ed è
   obbligatorio con `--wav`)*.
+
+### Poco spazio su disco
+
+I circa 400 GB servono per la build completa. Per *eseguire* il port, `--stages check,shaders,runtime` richiede
+circa 30 GB: la fase `assets` (circa 370 GB) serve solo per gli strumenti sugli asset, e `--wav` aggiunge diverse
+volte la dimensione degli Ogg Opus (il controllo iniziale te lo propone quando è la fase `assets` a non entrare).
+`--work` e `--out` possono stare su un altro disco. Il runtime usa il pacchetto direttamente dove si trova, quindi
+se il disco del pacchetto è in sola lettura serve `gta6rt --overlay <cartella scrivibile>` (`--overlay` è
+un'opzione di `gta6rt`, non di `make_game.py`). Non cancellare i file `.s` in `work/shaders/dxbc/disasm`: se li
+elimini insieme a `work/shaders/spirv/index.json`, la fase `shaders` può risultare completata con zero shader. Una
+cartella `disasm` che è un collegamento simbolico viene rifiutata quando la fase deve svuotarla.
 
 ## Come compilare
 
@@ -74,7 +89,7 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
 
 Lo script cerca da solo la tua copia del gioco: Download, Desktop, Documenti (anche dove Windows li sposta, per
 esempio in OneDrive), Giochi, la cartella utente e la radice di ogni disco, fino a due livelli di profondità.
-Riconosce la versione da poche dimensioni di file, senza leggere nulla di grande. Se hai più copie ti chiede
+Riconosce la versione dalle dimensioni di pochi file, senza leggere niente di pesante. Se hai più copie ti chiede
 quale usare, e se non ne trova nessuna ti chiede di incollare il percorso della cartella. Prima di partire
 verifica che tutto il necessario sia installato e che ci sia abbastanza spazio libero, e ti elenca in un colpo
 solo ciò che manca. Il risultato va in `Documents\Leonida`. Se la build viene interrotta, riprende da dove si era
@@ -96,31 +111,52 @@ python -I make_game.py --wave64-emulate off            # auto (predefinito), on 
 ```
 
 Le fasi vengono eseguite in quest'ordine: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
-`pipelines` crea ogni shader tradotto sul driver della tua GPU e salva una cache delle pipeline, così al primo
-avvio non devono essere compilati. La traduzione degli shader è il passaggio più lungo: usa `--jobs` processi
-(per impostazione predefinita metà dei thread della CPU).
+`pipelines` crea ogni shader tradotto sul driver della tua GPU, controlla che venga compilato, segnala quelli che
+deve saltare e salva una cache delle pipeline in `pipeline_cache.bin`, accanto a `gta6rt.exe` in `--out`. All'avvio
+il runtime la usa per precaricare la propria cache delle pipeline Vulkan, se è stata creata sullo stesso
+dispositivo. La traduzione degli shader è il passaggio più lungo: usa `--jobs` processi (per impostazione
+predefinita metà dei thread della CPU).
 
-- **`--wave64-emulate`**: traduce gli shader compute e mesh wave64 in modo che siano esatti con qualunque
-  dimensione di subgruppo. Le GPU NVIDIA e Intel hanno subgruppi da 32 lane e ne hanno bisogno. Il valore
-  predefinito `auto` interroga `vulkaninfo` (parte del Vulkan SDK) e attiva l'emulazione a meno che ogni GPU
-  non dichiari subgruppi da 64, oppure quando non riesce a stabilirlo. Resta spenta quando la GPU del runtime è
-  una scheda o iGPU RDNA2 (RX 6000, grafica integrata Ryzen 6000/7000/9000) con il driver AMD per Windows, che
-  esegue wave64 in modo nativo. La modalità viene salvata accanto agli shader tradotti, e cambiarla li traduce
-  di nuovo. Vedi «Wave64 emulation» in [`docs/design.md`](../../design.md).
+- **`--wave64-emulate`**: decide se gli shader compute e mesh wave64 vengono tradotti in modo da essere esatti
+  con qualunque dimensione di subgruppo. Le GPU NVIDIA e Intel hanno subgruppi da 32 lane e ne hanno bisogno.
+  Il valore predefinito `auto` interroga `vulkaninfo` (parte del Vulkan SDK) e attiva l'emulazione se anche una
+  sola GPU non ha subgruppi da 64 o se la loro dimensione è sconosciuta. Controlla anche che la GPU del runtime
+  possa eseguire gli shader compute e mesh a 64 lane; con `--mesh-compute` basta il supporto per i compute. Con il
+  driver AMD per Windows, `auto` usa wave64 nativo su RDNA1 e RDNA2 quando la GPU del runtime lo supporta, anche
+  se un'altra GPU è a 32 lane o se `vulkaninfo` non è disponibile, perché quel driver può andare in crash con il
+  codice LDS emulato (#857). Sulle RDNA1 senza mesh shader la scelta si basa sulla fase compute, che può eseguire
+  wave64 anche senza il supporto nativo ai mesh shader. La modalità viene salvata accanto agli shader tradotti, e
+  cambiarla li traduce di nuovo; di solito `auto` riesce a riusare gli shader già emulati, mentre l'eccezione per
+  il driver AMD su Windows li ricostruisce in modalità nativa. Usa `--wave64-emulate on` per forzare l'emulazione
+  oppure `off` per forzare wave64 nativo. Vedi «Wave64 emulation» in [`docs/design.md`](../../design.md).
 - **Opzioni di ripiego** (inoltrate al traduttore, salvate accanto agli shader; cambiarle li traduce di nuovo):
-  `--no-float-controls`, `--bary-fallback` (GPU senza `VK_KHR_fragment_shader_barycentric`),
-  `--texel-offset-fallback` (GPU senza `VK_KHR_maintenance8`) e `--mesh-compute` (GPU senza
-  `VK_EXT_mesh_shader`). Sono documentate in [`docs/design.md`](../../design.md).
+  `--no-float-controls` (toglie `SignedZeroInfNanPreserve`, per i dispositivi su cui il controllo delle pipeline
+  salta uno shader senza `shaderSignedZeroInfNanPreserveFloat32`), `--bary-fallback` (GPU senza
+  `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (GPU senza `VK_KHR_maintenance8`) e
+  `--mesh-compute` (GPU senza `VK_EXT_mesh_shader`). Sono documentate in [`docs/design.md`](../../design.md).
+- **Ripetizioni automatiche**: la build registra quale comando e quale versione di `llvm-mc` hanno prodotto il
+  disassemblato, quali sorgenti del traduttore hanno prodotto gli shader e quale decoder (il commit di
+  `third_party/rpf9-explorer` e i sorgenti di `tools/rpf9dump`) ha esportato modelli e texture di ogni archivio.
+  Se uno di questi cambia, rifà solo il lavoro interessato: disassemblaggio e traduzione, solo la traduzione,
+  oppure l'export di quell'archivio. Le cartelle di lavoro più vecchie, senza queste informazioni, vengono
+  aggiornate una volta dopo l'aggiornamento del progetto.
 - **`--work`**: conviene puntarlo a un disco con almeno 400 GB liberi.
-- **`--wav`**: disattivato di default perché il WAV PCM a 16 bit occupa molto più dell'Ogg Opus.
+- **`--wav`**: disattivato di default perché il WAV PCM a 16 bit occupa diverse volte più dell'Ogg Opus. Decodifica
+  gli stream Ogg Opus in `work\assets\audio\wav` dopo l'elaborazione dei banchi audio; quando una build riprende,
+  i file WAV già presenti vengono saltati.
 - **Linux e Wine/Proton**: `make_game.py` funziona anche su Linux. Per la fase `runtime` fuori da Windows passa
   `--runtime-build <cartella>` con una build Windows (`gta6rt.exe` e `gta6rt_tls_host.dll`, per esempio
   l'artefatto `runtime-windows` della CI scompattato): lo script copia i file in `--out` e scrive `gta6rt.sh`,
   che avvia `gta6rt.exe` con `wine` (o con il Wine indicato dalla variabile `WINE`; per Proton, il suo
   `files/bin/wine`). La stessa opzione salta la compilazione anche su Windows. In alternativa, su Linux la fase
-  `runtime` può cross-compilare il loader con clang-cl e lld-link (LLVM 19+, esclusi 22.1.7 e 22.1.8) contro
-  l'SDK di Windows preparato da [xwin](https://github.com/Jake-Shadle/xwin): vedi
-  [`docs/testing.md`](../../testing.md#the-windows-runtime-on-linux-under-wine-or-proton).
+  `runtime` cross-compila il loader in `runtime/build/windows` con clang-cl e lld-link (LLVM 19+, esclusi 22.1.7 e
+  22.1.8; nomi semplici, oppure tutti e cinque gli strumenti LLVM con lo stesso suffisso di versione, come
+  `clang-cl-21`) contro il CRT MSVC e l'SDK di Windows preparati da [xwin](https://github.com/Jake-Shadle/xwin), in
+  `XWIN_DIR` oppure in `~/.local/share/xwin-sdk`: vedi
+  [`docs/testing.md`](../../testing.md#the-windows-runtime-on-linux-under-wine-or-proton). Senza questi strumenti
+  la fase viene esclusa da quelle predefinite, e se la richiedi ti elenca cosa manca prima di iniziare. Su Linux la
+  fase `pipelines` usa `vk_pipeline_check` (in `runtime/build/linux` o `runtime/build`) e, se manca, lo compila da
+  sola prima di qualsiasi altro lavoro.
 
 ## Problemi comuni
 
@@ -142,7 +178,9 @@ avvio non devono essere compilati. La traduzione degli shader è il passaggio pi
    di aprire la pull request.
 2. Esegui i test pertinenti con input sintetici. Per esempio, per il verificatore dei manifest:
    `python -I tests/test_manifest_verifier.py` dalla radice del repository. La suite del traduttore si esegue
-   con `python -m unittest discover -s tests/semantic -v`.
+   con `python -m unittest discover -s tests/semantic -v`. I file di test senza blocco `__main__` o con
+   `import pytest` (richiedono i pacchetti in `tests/requirements.txt`) si eseguono invece con
+   `python -m pytest tests/test_<nome>.py`, come descritto in [`AGENTS.md`](../../../AGENTS.md).
 3. Nella pull request indica l'ID dell'attività, cosa hai provato e, se hai eseguito test GPU, quale GPU e
    quale driver. Le regole sono in [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se hai usato un assistente
    IA, dichiaralo nella pull request, come richiesto da [`AGENTS.md`](../../../AGENTS.md).
