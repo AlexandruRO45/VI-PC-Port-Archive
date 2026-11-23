@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import struct
 import subprocess
 import sys
@@ -69,6 +70,29 @@ def speech_bank(sid, samples, marker_chunk, payload=b"\0" * 64):
 
 
 class MusicCueSheetTest(unittest.TestCase):
+    def test_failed_cli_rerun_clears_previous_regions(self):
+        from rsc8_audio import MARKER_VALUE_START, MARKER_VALUE_END
+
+        cues = event(1, MARKER_VALUE_START, 10) + event(1, MARKER_VALUE_END, 30)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "music.awc"
+            out = Path(tmp) / "out"
+            sheet = out / "music" / "cue_regions.json"
+            args = [sys.executable, "-I", Path(TOOL).with_name("awc_opus.py"), src, out, "--cue-sheet", "--jobs", "1"]
+            for failure in ("parse", "write"):
+                with self.subTest(failure=failure):
+                    src.write_bytes(music_bank(7, 200, 0xFC, cues))
+                    subprocess.run(args, check=True, capture_output=True)
+                    self.assertEqual(json.loads(sheet.read_bytes())["regions"][0]["file"], "00000007.ogg")
+                    if failure == "parse":
+                        src.write_bytes(b"invalid bank")
+                    else:
+                        src.write_bytes(music_bank(8, 200, 0xFC, cues))
+                        (sheet.parent / "00000008.ogg").mkdir()
+                    result = subprocess.run(args, capture_output=True)
+                    self.assertEqual(result.returncode, 0 if failure == "parse" else 1)
+                    self.assertEqual(json.loads(sheet.read_bytes()), {"sample_rate": 48000, "regions": []})
+
     def test_exported_frame_coordinates_and_ambiguous_inputs(self):
         import awc_opus
         from rsc8_audio import MARKER_VALUE_START as start, MARKER_VALUE_END as end, parse_adat_header_bytes

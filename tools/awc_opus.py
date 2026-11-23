@@ -373,11 +373,21 @@ def music_cue_regions(data, frame_limits):
     return rows
 
 
+def write_cue_sheet(sheet, rows):
+    payload = {"sample_rate": 48000, "regions": rows}
+    write_file(sheet, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+
+
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_sheet: bool = False):
+    od = bank_output_dir(path, out_dir)
+    if cue_sheet:
+        sheet = os.path.join(od, "cue_regions.json")
+        if os.path.exists(sheet):
+            # A skipped bank or interrupted channel write must not leave last run's regions current.
+            write_cue_sheet(sheet, [])
     with open(path, "rb") as f:
         d = f.read()
     streams, music = parse_awc(d)
-    od = bank_output_dir(path, out_dir)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     channel_counts = Counter()
@@ -424,10 +434,8 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
             frame_limits.pop(stream["id"], None)
         verified = {cid: limit for cid, limit in frame_limits.items() if channel_counts[cid] == 1}
         rows = music_cue_regions(d, verified)
-        sheet = os.path.join(od, "cue_regions.json")
-        if rows or os.path.exists(sheet):
-            payload = {"sample_rate": 48000, "regions": rows}
-            write_file(sheet, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+        if rows:
+            write_cue_sheet(sheet, rows)
     return counts
 
 
