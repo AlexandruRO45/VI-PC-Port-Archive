@@ -112,6 +112,14 @@ def run_atomic(kind: str, mem_init: int, data_val: int, glc: bool = True,
 
 
 class GlobalAtomicFloatSemantics(unittest.TestCase):
+    def test_signaling_nan_is_sanitized_before_minmax(self):
+        for kind, finite in (("fmin", NEG_ONE), ("fmax", TWO)):
+            with self.subTest(kind=kind):
+                old, final = run_atomic(kind, SNAN, finite)
+                self.assertEqual((old, final), (SNAN, finite))
+                old, final = run_atomic(kind, ONE, SNAN)
+                self.assertEqual((old, final), (ONE, ONE))
+
     def test_fmin_fmax_standard_values(self):
         cases = [
             # (kind, init_mem, data, expected_final)

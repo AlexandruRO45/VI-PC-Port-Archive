@@ -129,7 +129,7 @@ class LdsCasAtomics(unittest.TestCase):
     def test_float_min_max_edge_cases(self):
         pos0, neg0 = 0x00000000, 0x80000000
         one, neg2, half = 0x3F800000, 0xC0000000, 0x3F000000
-        pinf, ninf, qnan = 0x7F800000, 0xFF800000, 0x7FC00001
+        pinf, ninf, qnan, snan = 0x7F800000, 0xFF800000, 0x7FC00001, 0x7F800001
         cases = [
             ("min_f32", one, half, half),
             ("min_f32", half, one, half),
@@ -140,6 +140,8 @@ class LdsCasAtomics(unittest.TestCase):
             ("min_f32", one, ninf, ninf),
             ("min_f32", qnan, one, one),
             ("min_f32", one, qnan, one),
+            ("min_f32", snan, one, one),
+            ("min_f32", one, snan, one),
             ("max_f32", one, half, one),
             ("max_f32", half, one, one),
             ("max_f32", neg2, one, one),
@@ -149,6 +151,8 @@ class LdsCasAtomics(unittest.TestCase):
             ("max_f32", one, ninf, one),
             ("max_f32", qnan, one, one),
             ("max_f32", one, qnan, one),
+            ("max_f32", snan, one, one),
+            ("max_f32", one, snan, one),
         ]
         for stem, m, d, expected in cases:
             with self.subTest(op=stem, m=hex(m), d=hex(d)):

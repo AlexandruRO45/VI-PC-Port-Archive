@@ -2688,6 +2688,7 @@ class Gen:
         """Shared CAS loop for 32-bit float atomic min/max (global_atomic_{fmin,fmax} and buffer_atomic_{fmin,fmax}).
         Returns the pre-op uint word on taken lanes and 0 on skipped lanes (caller writes via self.dst so inactive
         lanes keep their destination VGPR untouched)."""
+        nan_val = self._f32_nan_predicate(None, val_f)
         lbl_do, lbl_hdr, lbl_cont, lbl_exit, lbl_end = (
             self.tmp() + s for s in ("_do", "_hdr", "_cont", "_exit", "_end"))
         pre = self.current_label_placeholder()
@@ -2700,11 +2701,11 @@ class Gen:
         self.emit(f"{init} = OpAtomicLoad %uint {p} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpBranch {lbl_hdr}")
         self.emit(f"{lbl_hdr} = OpLabel")
-        cur, cur_f, new_f, new_u, got, done = (self.tmp() for _ in range(6))
+        cur, cur_f, new_u, got, done = (self.tmp() for _ in range(5))
         self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
         self.emit(f"{cur_f} = OpBitcast %float {cur}")
         glsl_op = "NMin" if kind == "fmin" else "NMax"
-        self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
+        new_f = self.nminmax_f32(glsl_op, cur_f, val_f, nan_y=nan_val)
         self.emit(f"{new_u} = OpBitcast %uint {new_f}")
         self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {new_u} {cur}")
         self.emit(f"{done} = OpIEqual %bool {got} {cur}")
@@ -4872,9 +4873,11 @@ class Gen:
             addr = self.src_u(ad)
             val = self.src_u(dat)
             val_f = None
+            nan_val = None
             if name in ("ds_min_f32", "ds_max_f32"):
                 val_f = self.tmp()
                 self.emit(f"{val_f} = OpBitcast %float {val}")
+                nan_val = self._f32_nan_predicate(None, val_f)
 
             def cas(p):
                 entry_lbl = self.current_label_placeholder()
@@ -4901,10 +4904,10 @@ class Gen:
                     new_u = self.tmp()
                     self.emit(f"{new_u} = OpISub %uint {val} {cur}")
                 else:
-                    cur_f, new_f, new_u = self.tmp(), self.tmp(), self.tmp()
+                    cur_f, new_u = self.tmp(), self.tmp()
                     self.emit(f"{cur_f} = OpBitcast %float {cur}")
                     glsl_op = "NMin" if name == "ds_min_f32" else "NMax"
-                    self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
+                    new_f = self.nminmax_f32(glsl_op, cur_f, val_f, nan_y=nan_val)
                     self.emit(f"{new_u} = OpBitcast %uint {new_f}")
                 done = self.tmp()
                 self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_u} {cur}")
@@ -6401,16 +6404,18 @@ class Gen:
         if sel is None:
             nan_x, nan_y, nan_z = preds
             nan_lo = self._nminmax_nan_result(nan_x, nan_y)
-            nan_hi = nan_lo
-            nan_m1 = self._nminmax_nan_result(nan_z, nan_lo)
-            nan_m = self._nminmax_nan_result(nan_m1, nan_hi)
             lo = self.nminmax_f32("NMin", x, y, nan_x=nan_x, nan_y=nan_y)
-            hi = self.nminmax_f32("NMax", x, y, nan_x=nan_x, nan_y=nan_y)
-            m1 = self.nminmax_f32("NMax", z, lo, nan_x=nan_z, nan_y=nan_lo)
-            m = self.nminmax_f32("NMin", m1, hi, nan_x=nan_m1, nan_y=nan_hi)
+            hi, m1, m = (self.tmp() for _ in range(3))
+            # These values feed only the median arm, which is selected when no operand is NaN. Keep
+            # those ExtInsts raw; only lo and the min3 fallback below need the sNaN workaround.
+            self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
+            self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
+            self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
         else:
-            lo, hi, m1, m = (self.tmp() for _ in range(4))
-            self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
+            nan_x, nan_y, nan_z = preds
+            nan_lo = self._nminmax_nan_result(nan_x, nan_y)
+            lo = self.nminmax_f32("NMin", x, y, nan_x=nan_x, nan_y=nan_y)
+            hi, m1, m = (self.tmp() for _ in range(3))
             self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
             self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
             self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
@@ -6425,8 +6430,7 @@ class Gen:
             mn1 = self._select_nan_first(lo, x, preds[1])
             mn = self.nminmax_f32("NMin", mn1, z, nan_x=nan_lo, nan_y=preds[2])
         else:
-            mn = self.tmp()
-            self.emit(f"{mn} = OpExtInst %float %glsl NMin {lo} {z}")
+            mn = self.nminmax_f32("NMin", lo, z, nan_x=nan_lo, nan_y=preds[2])
         r = self.tmp()
         self.emit(f"{r} = OpSelect %float {nan} {mn} {m}")
         return r
@@ -8669,7 +8673,14 @@ class Gen:
                 if "add" in op:
                     r = self.sum_toward_zero2(vx, vy, r)
             else:
-                self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
+                op_name = "NMax" if "max" in op else "NMin"
+                comps = []
+                for lane in (0, 1):
+                    x, y = self.tmp(), self.tmp()
+                    self.emit(f"{x} = OpCompositeExtract %float {vx} {lane}")
+                    self.emit(f"{y} = OpCompositeExtract %float {vy} {lane}")
+                    comps.append(self.nminmax_f32(op_name, x, y))
+                self.emit(f"{r} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
             if "clamp" in mods:
                 c = self.tmp()
                 z2, o2 = self.tmp(), self.tmp()
@@ -8805,9 +8816,10 @@ class Gen:
                 r = self.med3_f(vals, a[1:4], sel)
             else:
                 f = "NMax" if "max" in op else "NMin"   # a NaN operand gives the other one (docs/design.md)
-                m, r = self.tmp(), self.tmp()
-                self.emit(f"{m} = OpExtInst %float %glsl {f} {vals[0]} {vals[1]}")
-                self.emit(f"{r} = OpExtInst %float %glsl {f} {m} {vals[2]}")
+                nan = [self._f32_nan_predicate(None, v) for v in vals]
+                first = self.nminmax_f32(f, vals[0], vals[1], nan_x=nan[0], nan_y=nan[1])
+                r = self.nminmax_f32(f, first, vals[2],
+                                     nan_x=self._nminmax_nan_result(nan[0], nan[1]), nan_y=nan[2])
             self._finish_f16_minmax_out(a[0], r, mods, dhi, all_nan, h0_mod)  # opsel-capable VOP3: keeps the other half
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
             # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
@@ -9057,7 +9069,9 @@ class Gen:
                     self.emit(f"{ny} = OpFNegate %float {vals[1]}")
                     r = self.sum_toward_zero(vals[0], ny, r)
             else:
-                self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if 'max' in op else 'NMin'} {vals[0]} {vals[1]}")
+                nan0, nan1 = (self._f32_nan_predicate(None, v) for v in vals)
+                r = self.nminmax_f32("NMax" if "max" in op else "NMin", vals[0], vals[1],
+                                     nan_x=nan0, nan_y=nan1)
                 self._finish_f16_minmax_out(a[0], r, mods, dhi, all_nan, h0_mod)
             if k:
                 r = self.clamp_f16(r, mods)
@@ -13400,6 +13414,7 @@ class Gen:
             if op in ("image_atomic_fmin", "image_atomic_fmax"):
                 val_f = self.tmp()
                 self.emit(f"{val_f} = OpBitcast %float {val}")
+                nan_val = self._f32_nan_predicate(None, val_f)
             init = self.tmp()
             self.emit(f"{init} = OpAtomicLoad %uint {tp} {sc} {sem}")
             lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
@@ -13420,10 +13435,10 @@ class Gen:
                 self.emit(f"{step} = OpISub %uint {cur} {self.cu(1)}")
                 self.emit(f"{new_u} = OpSelect %uint {wrap} {val} {step}")
             else:
-                cur_f, new_f, new_u = self.tmp(), self.tmp(), self.tmp()
+                cur_f, new_u = self.tmp(), self.tmp()
                 self.emit(f"{cur_f} = OpBitcast %float {cur}")
                 glsl_op = "NMin" if op == "image_atomic_fmin" else "NMax"
-                self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
+                new_f = self.nminmax_f32(glsl_op, cur_f, val_f, nan_y=nan_val)
                 self.emit(f"{new_u} = OpBitcast %uint {new_f}")
             done = self.tmp()
             self.emit(f"{got} = OpAtomicCompareExchange %uint {tp} {sc} {sem} {sem} {new_u} {cur}")

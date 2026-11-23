@@ -129,7 +129,7 @@ class BufferAtomicFminmax(unittest.TestCase):
     def test_fmin_fmax_values_glc_and_non_glc(self):
         pos0, neg0 = 0x00000000, 0x80000000
         one, neg2, half = 0x3F800000, 0xC0000000, 0x3F000000
-        pinf, ninf, qnan = 0x7F800000, 0xFF800000, 0x7FC00001
+        pinf, ninf, qnan, snan = 0x7F800000, 0xFF800000, 0x7FC00001, 0x7F800001
         cases = [
             ("fmin", one, half, half),
             ("fmin", half, one, half),
@@ -140,6 +140,8 @@ class BufferAtomicFminmax(unittest.TestCase):
             ("fmin", one, ninf, ninf),
             ("fmin", qnan, one, one),
             ("fmin", one, qnan, one),
+            ("fmin", snan, neg2, neg2),
+            ("fmin", one, snan, one),
             ("fmax", one, half, one),
             ("fmax", half, one, one),
             ("fmax", neg2, one, one),
@@ -149,6 +151,8 @@ class BufferAtomicFminmax(unittest.TestCase):
             ("fmax", one, ninf, one),
             ("fmax", qnan, one, one),
             ("fmax", one, qnan, one),
+            ("fmax", snan, one, one),
+            ("fmax", one, snan, one),
         ]
         for kind, m, d, expected in cases:
             with self.subTest(op=kind, m=hex(m), d=hex(d)):

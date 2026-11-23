@@ -636,7 +636,7 @@ class TestNaNPropagation(unittest.TestCase):
             assert _SRC_PATH is not None
         for op, sources in (
             ("v_min_f32", 2), ("v_max_f32", 2), ("v_min3_f32", 3),
-            ("v_max3_f32", 3), ("v_med3_f32", 3),
+            ("v_max3_f32", 3),
         ):
             with self.subTest(op=op):
                 moves = [f"\tv_mov_b32 v{i}, {SNAN if i == 1 else (ONE if i == 2 else TWO):#x}"
@@ -664,6 +664,20 @@ class TestNaNPropagation(unittest.TestCase):
                 for parts in ext_ops:
                     for operand in parts[-2:]:
                         self.assertIn(operand, sanitized, f"raw NaN-capable operand reaches NMin/NMax: {' '.join(parts)}")
+
+        # med3's median arm is discarded whenever a NaN is present. Sanitize only the first min and the min3
+        # fallback; its NMax/NMin median chain is safe to leave raw and avoids redundant selects per instruction.
+        if _TMP_DIR is None or _SRC_PATH is None:
+            setUpModule()
+            assert _SRC_PATH is not None
+        with open(_SRC_PATH, "w", encoding="utf-8") as f:
+            f.write("; test_med3_sanitization\n\tv_med3_f32 v0, v1, v2, v3\n"
+                    "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n")
+        med3 = rdna2spirv.translate(_SRC_PATH)
+        med3_ext = [line for line in med3.splitlines()
+                    if "OpExtInst %float %glsl NMin" in line or "OpExtInst %float %glsl NMax" in line]
+        self.assertEqual(len(med3_ext), 5)
+        self.assertEqual(sum("OpSelect %float" in line and "%f0" in line for line in med3.splitlines()), 4)
 
     def test_both_nan_returns_quiet_nan(self) -> None:
         got_min = run_f32_2op("v_min_f32", QNAN_PAYLOAD, QNAN_PAYLOAD_B)

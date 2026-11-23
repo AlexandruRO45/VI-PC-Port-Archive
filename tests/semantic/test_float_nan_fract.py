@@ -470,6 +470,18 @@ class AllNaNSrc0PayloadTests(unittest.TestCase):
                 self.assertEqual(run_op(f"{op} v0, -v1, v2", (snan, NAN_A)), snan ^ SIGN_BIT32)
                 self.assertEqual(run_op(f"{op} v0, |v1|, v2", (snan, NAN_A)), snan)
 
+    def test_f16_minmax_sanitizes_signaling_nan_operands(self):
+        snan = 0x7C01
+        one = 0x3C00
+        qnan = 0x7E01
+        self.assertEqual(run_op("v_min_f16_e32 v0, v1, v2", (snan, one)), one)
+        self.assertEqual(run_op("v_max_f16_e32 v0, v1, v2", (snan, one)), one)
+        for op in ("v_min3_f16", "v_max3_f16", "v_med3_f16"):
+            with self.subTest(op=op):
+                self.assertEqual(run_op(f"{op} v0, v1, v2, v3", (snan, qnan, one)), one)
+        # The packed op handles each widened half independently.
+        self.assertEqual(run_op("v_pk_min_f16 v0, v1, v2", (0x7C013C00, 0x40003C00)), 0x40003C00)
+
     def test_non_nan_constant_fast_path(self):
         # f16_bits emits 1 OpUGreaterThan (%float |x| > inf); all-NaN tracking adds 0 when a constant is non-NaN.
         for line, reg_line, extra_gt in (
@@ -492,6 +504,22 @@ class AllNaNSrc0PayloadTests(unittest.TestCase):
         spv_min3_f32 = translate_text(LOAD + "v_min3_f32 v0, v1, v2, 1.0\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
         # Both dynamic operands in the first pair are classified so sNaN cannot reach NMin as operand 0.
         self.assertEqual(spv_min3_f32.count("OpIsNan"), 2)
+
+        for line in (
+            "v_min_f16_e32 v0, v1, v2",
+            "v_min3_f16 v0, v1, v2, v3",
+            "v_pk_min_f16 v0, v1, v2",
+        ):
+            with self.subTest(line=line):
+                spv = translate_text(LOAD + line + "\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+                safe = {parts[0] for raw in spv.splitlines() if (parts := raw.split()) and len(parts) == 7
+                        and parts[1:4] == ["=", "OpSelect", "%float"] and parts[5] == "%f0"}
+                ext = [raw.split() for raw in spv.splitlines()
+                       if "OpExtInst %float %glsl NMin" in raw or "OpExtInst %float %glsl NMax" in raw]
+                self.assertTrue(ext)
+                for parts in ext:
+                    self.assertTrue(all(value in safe for value in parts[-2:]),
+                                    f"raw NaN-capable operand reaches NMin/NMax: {' '.join(parts)}")
 
     def test_spirv_val_all_nan_variants(self):
         import shutil
