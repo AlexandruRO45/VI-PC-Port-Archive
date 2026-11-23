@@ -47,12 +47,13 @@ outside the image, non-zero process settings, dynamic relocations, CHPE, an encl
   bind to the host's own copies at run time ([runtime_imports.md](runtime_imports.md)), so none of the six DLLs
   gta6rt actually maps carries one.
 
-## Not measured: the executable
+## Measured: the executable
 
-The executable is not in the package available here. For the executable alone, the process settings would have
-applied on the console. A non-zero `ProcessHeapFlags`, `CriticalSectionDefaultTimeout` or heap threshold is a
-difference in behaviour that no shim currently reproduces, and `load_config.py` lists each one. Run it with the
-executable:
+`game_scarlett_master.exe` 1.0.2.1 (own copy; size and SHA-256 match `docs/runtime_imports.md`): a 312-byte load
+config and **0 attention lines**. Every process setting and `DependentLoadFlags` is 0, so gta6rt drops no setting
+the title asked for. All five pointer slots (CFG check/dispatch, XFG check/dispatch/table dispatch) hold
+own-code defaults, and `GuardFlags` is 0: the executable is not CFG-instrumented. The cookie holds the linker's
+default, and there are no dynamic relocations, CHPE, enclave or EH-continuation table. Reproduce:
 
 ```powershell
 python -I tools/load_config.py "D:\path\to\game_scarlett_master.exe"
