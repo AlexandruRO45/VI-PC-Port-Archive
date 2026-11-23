@@ -126,7 +126,7 @@ class GlobalAtomics(unittest.TestCase):
     def test_rejected_forms(self):
         for line in ("global_atomic_add_x2 v[4:5], v1, v[2:3], s[0:1] glc", "global_atomic_inc_x2 v[4:5], v1, v[2:3], s[0:1] glc",
                      "global_atomic_fmin_x2 v[4:5], v1, v[2:3], s[0:1] glc",
-                     "global_atomic_add v5, v1, v2, s[0:1] glc slc",
+                     "global_atomic_add v5, v1, v2, s[0:1] glc lds",
                      "global_atomic_cmpswap v5, v1, v2, s[0:1] glc"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):

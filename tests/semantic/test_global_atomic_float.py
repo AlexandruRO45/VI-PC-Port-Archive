@@ -7,7 +7,7 @@ Verifies the CAS loop lowering (OpAtomicCompareExchange + GLSL.std.450 NMin/NMax
   - Addressing modes: saddr SGPR pair, saddr='off' with 64-bit vaddr, and signed 12-bit offsets (-2048..2044).
   - EXEC masking: inactive lanes bypass the CAS loop entirely, leave memory untouched, and retain vdst.
   - Multi-lane CAS contention: multiple active lanes racing on a single shared memory location.
-  - Rejection of invalid modifiers (slc, dlc, lds), operand counts, and multi-dword registers.
+  - Rejection of invalid modifiers (lds, unknown flags), operand counts, and multi-dword registers.
   - Dependency analysis (read_before_write_vgprs).
 
 Note on hardware fidelity (measured natively on gfx1036 for #2361 by @Pierre-Kookis):
@@ -279,9 +279,8 @@ class GlobalAtomicFloatSemantics(unittest.TestCase):
     def test_rejected_forms(self):
         invalid_instructions = [
             # Unsupported modifiers
-            "global_atomic_fmin v5, v1, v2, s[0:1] slc glc",
-            "global_atomic_fmax v5, v1, v2, s[0:1] dlc glc",
             "global_atomic_fmin v5, v1, v2, s[0:1] lds glc",
+            "global_atomic_fmax v5, v1, v2, s[0:1] tfe glc",
             # Multi-dword registers
             "global_atomic_fmin_x2 v[4:5], v1, v[2:3], s[0:1] glc",
             "global_atomic_fmax v5, v1, v[2:3], s[0:1] glc",

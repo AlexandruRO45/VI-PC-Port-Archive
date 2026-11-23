@@ -191,8 +191,8 @@ class GlobalAtomicIncDec(unittest.TestCase):
         for line in (
             "global_atomic_inc_x2 v[4:5], v1, v[2:3], s[0:1] glc",
             "global_atomic_dec_x2 v[4:5], v1, v[2:3], s[0:1] glc",
-            "global_atomic_inc v5, v1, v2, s[0:1] glc slc",
-            "global_atomic_dec v5, v1, v2, s[0:1] glc dlc",
+            "global_atomic_inc v5, v1, v2, s[0:1] glc lds",
+            "global_atomic_dec v5, v1, v2, s[0:1] glc tfe",
             "global_atomic_inc v1, v2, s[0:1] glc",
         ):
             with self.subTest(line=line):

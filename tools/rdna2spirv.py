@@ -2697,9 +2697,10 @@ class Gen:
         return old
 
     def global_atomic(self, op, a, mods):
-        """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: a 32-bit atomic at the global_* address
-        (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without it there is no
-        vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory
+        """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc] [slc] [dlc]: a 32-bit atomic at the
+        global_* address (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without
+        it there is no vdst. slc/dlc are cache-policy hints (no-ops here because all emitted OpAtomic* already use
+        Scope::Device); lds and unknown modifiers stay Unsupported. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory
         and keep vdst; active unaligned lanes (addr % 4 != 0, or addr % 8 != 0 for _x2) leave memory untouched and
         write 0 / (0, 0) to vdst (measured natively on gfx1036). and/or/xor/swap_x2 work on a 64-bit element (two
         dwords, low first) as one 32-bit atomic per dword, with no Int64 atomics. That leaves the same memory for a
@@ -2716,7 +2717,7 @@ class Gen:
         is_inc_dec = kind in ("inc", "dec", "csub")
         fcmp = kind == "fcmpswap"           # float compare: see float_cmpswap_loop
         known = kind in self.BUF_ATOMICS or is_inc_dec or fcmp
-        if not known or any(m in mods for m in ("slc", "dlc", "lds")):
+        if not known or any(m not in ("glc", "slc", "dlc") and not m.startswith("offset:") for m in mods):
             raise Unsupported(op if not known else op + " form")
         rtn = "glc" in mods
         if len(a) != (4 if rtn else 3):
@@ -2757,10 +2758,11 @@ class Gen:
             self.dst(vdst, old)
 
     def global_atomic_float(self, op, kind, a, mods):
-        """global_atomic_{fmin,fmax} [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: 32-bit float min/max at the
-        global_* address via a CAS loop (OpAtomicCompareExchange + GLSL.std.450 NMin/NMax, so no shader float atomic
-        extension is needed). Inactive lanes don't touch memory and keep vdst; active unaligned lanes write 0."""
-        if any(m in mods for m in ("slc", "dlc", "lds")):
+        """global_atomic_{fmin,fmax} [vdst,] vaddr, vdata, saddr|off [offset:N] [glc] [slc] [dlc]: 32-bit float
+        min/max at the global_* address via a CAS loop (OpAtomicCompareExchange + GLSL.std.450 NMin/NMax, so no shader
+        float atomic extension is needed). Inactive lanes don't touch memory and keep vdst; active unaligned lanes
+        write 0."""
+        if any(m not in ("glc", "slc", "dlc") and not m.startswith("offset:") for m in mods):
             raise Unsupported(op + " form")
         rtn = "glc" in mods
         if len(a) != (4 if rtn else 3):
@@ -2780,7 +2782,7 @@ class Gen:
 
     def global_atomic_x2(self, op, kind, a, mods):
         """global_atomic_{and,or,xor,swap}_x2 (see global_atomic): one 32-bit atomic per dword of the element."""
-        if any(m in mods for m in ("slc", "dlc", "lds")):
+        if any(m not in ("glc", "slc", "dlc") and not m.startswith("offset:") for m in mods):
             raise Unsupported(op + " form")
         rtn = "glc" in mods
         if len(a) != (4 if rtn else 3):
