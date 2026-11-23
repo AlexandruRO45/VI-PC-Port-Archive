@@ -168,6 +168,18 @@ class TestSSubI32OverflowAndSCC(unittest.TestCase):
     def test_sub_zero_no_overflow(self) -> None:
         self.assertEqual(ref_s_sub_i32(0x80000000, 0), (0x80000000, 0))
 
+class TestSSubI32Translator(unittest.TestCase):
+    def test_translator_s_sub_i32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0x80000000",
+            "s_sub_i32 s5, s4, 1",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_sub_i32")
+        for l in range(32):
+            self.assertEqual(results[l], 0x7FFFFFFF)
+
 
 if __name__ == "__main__":
     unittest.main()
