@@ -108,5 +108,57 @@ class TestDSWriteB16ReferenceOracle(unittest.TestCase):
         self.assertEqual(self.lds.read_u32(0x44), 0x2222_22BB)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class OperandType(Enum):
+    VGPR = auto()
+
+
+@dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self):
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclass(frozen=True)
+class DSWriteB16Instruction:
+    vaddr: VGPR
+    vdata: VGPR
+    offset: int = 0
+
+    def __post_init__(self):
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"LDS offset out of range [0, 65535]: {self.offset}")
+
+
+class TestDSWriteB16AST(unittest.TestCase):
+    def test_valid_ast_construction(self):
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=4)
+        self.assertEqual(inst.vaddr.name, "v1")
+        self.assertEqual(inst.vdata.name, "v2")
+        self.assertEqual(inst.offset, 4)
+
+    def test_invalid_vgpr_index(self):
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+
+    def test_invalid_offset(self):
+        with self.assertRaises(ValueError):
+            DSWriteB16Instruction(vaddr=VGPR(0), vdata=VGPR(1), offset=-1)
+        with self.assertRaises(ValueError):
+            DSWriteB16Instruction(vaddr=VGPR(0), vdata=VGPR(1), offset=65536)
+
+
 if __name__ == '__main__':
     unittest.main()
