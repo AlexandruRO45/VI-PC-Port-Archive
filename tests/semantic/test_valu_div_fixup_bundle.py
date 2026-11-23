@@ -250,5 +250,23 @@ class TestVDivScaleF32HardwareTranslator(unittest.TestCase):
             support.translate_lines("ps_scale_unsupported", lines)
 
 
+def ref_div_fmas_f32(s0: float, s1: float, s2: float, vcc_bit: int = 0) -> float:
+    """Reference mathematical oracle for RDNA2 v_div_fmas_f32."""
+    val = s0 * s1 + s2
+    if vcc_bit == 0:
+        return val
+    return val * (2.0 ** 64) if abs(s2) >= 2.0 else val * (2.0 ** -64)
+
+
+class TestVDivFmasF32Reference(unittest.TestCase):
+    """Reference oracle unit tests for v_div_fmas_f32."""
+
+    def test_reference_vcc_zero(self):
+        self.assertEqual(ref_div_fmas_f32(2.0, 3.0, 4.0, 0), 10.0)
+
+    def test_reference_vcc_one_scale_up(self):
+        self.assertAlmostEqual(ref_div_fmas_f32(1.0, 1.0, 2.0, 1), 3.0 * (2.0 ** 64), delta=1e10)
+
+
 if __name__ == "__main__":
     unittest.main()
