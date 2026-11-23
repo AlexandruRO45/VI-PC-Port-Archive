@@ -159,6 +159,8 @@ def parse_instruction(line: str) -> InstructionAST:
     mnemonic = parts[0]
     if not (mnemonic.startswith("v_cndmask_b32")):
         raise ValueError(f"Unexpected opcode: {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError(f"Missing operands for {mnemonic}")
     operands = [op.strip() for op in parts[1].split(",")]
     if len(operands) == 3:
         return InstructionAST(
@@ -352,6 +354,37 @@ class TestValuCndmaskB32IEEE754BitPatterns(unittest.TestCase):
             with self.subTest(f0=hex(f0), f1=hex(f1)):
                 self.assertEqual(run_valu_cndmask_ps(f0, f1, 0), f0)
                 self.assertEqual(run_valu_cndmask_ps(f0, f1, 1), f1)
+
+# --- Section 8: Negative Controls, Syntax Rejection, and Mutation Detection ---
+
+class TestValuCndmaskB32NegativeAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection tests."""
+
+    def test_rejection_invalid_syntax(self) -> None:
+        invalid = [
+            "v_cndmask_b32",
+            "v_cndmask_b32 v0",
+            "v_cndmask_b32 v0, v1",
+            "v_cndmask_b32 v0, v1, v2, v3, v4",
+        ]
+        for line in invalid:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_instruction(line)
+
+    def test_mutation_inverted_condition(self) -> None:
+        """Mutant 1: Inverted condition selection (selecting src0 on cond=1)."""
+        def mutant_cndmask(s0: int, s1: int, cond: int) -> int:
+            return s0 if cond else s1
+
+        self.assertNotEqual(mutant_cndmask(0x11, 0x22, 1), ref_v_cndmask_b32(0x11, 0x22, 1))
+
+    def test_mutation_bitwise_and_masking(self) -> None:
+        """Mutant 2: Bitwise AND with mask instead of mux selection."""
+        def mutant_and(s0: int, s1: int, cond: int) -> int:
+            return s1 & cond
+
+        self.assertNotEqual(mutant_and(0x11111111, 0x22222222, 1), ref_v_cndmask_b32(0x11111111, 0x22222222, 1))
 
 if __name__ == "__main__":
     unittest.main()
