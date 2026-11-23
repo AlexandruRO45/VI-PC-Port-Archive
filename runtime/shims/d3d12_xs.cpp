@@ -117,6 +117,149 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+// LEONIDA_DRED=1: device-removed diagnostics for the PC device behind the proxy. DRED (auto-breadcrumbs and page
+// faults) is switched on before the device is created; a fence waits for UINT64_MAX, the value D3D12 gives every
+// fence of a removed device, and a thread then prints the removal reason, each command list's operations around the
+// last one the GPU completed, and the page-fault address with the allocations near it.
+bool dred_requested() {
+    char value[8] = {};
+    size_t length = 0;
+    return getenv_s(&length, value, "LEONIDA_DRED") == 0 && length > 1 && std::strcmp(value, "0") != 0;
+}
+
+void enable_dred() {
+    using GetDebugInterfaceFn = decltype(&::D3D12GetDebugInterface);
+    static auto get = reinterpret_cast<GetDebugInterfaceFn>(host("D3D12GetDebugInterface"));
+    ID3D12DeviceRemovedExtendedDataSettings* settings = nullptr;
+    if (!get || FAILED(get(__uuidof(ID3D12DeviceRemovedExtendedDataSettings), reinterpret_cast<void**>(&settings))) ||
+        !settings) {
+        std::fprintf(stderr, "[rt] d3d12_xs: LEONIDA_DRED: DRED settings not available on this host\n");
+        return;
+    }
+    settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    settings->Release();
+    std::fprintf(stderr, "[rt] d3d12_xs: LEONIDA_DRED: auto-breadcrumbs and page-fault reporting on\n");
+}
+
+void print_dred_allocations(const char* what, const D3D12_DRED_ALLOCATION_NODE* node) {
+    for (int n = 0; node && n < 16; node = node->pNext, ++n)
+        std::fprintf(stderr, "[rt] d3d12_xs: DRED   %s allocation type %d name %ls\n", what,
+                     static_cast<int>(node->AllocationType), node->ObjectNameW ? node->ObjectNameW : L"(none)");
+}
+
+void report_device_removed(ID3D12Device* device) {
+    const HRESULT reason = device->GetDeviceRemovedReason();
+    std::fprintf(stderr, "[rt] d3d12_xs: DRED: device removed, reason 0x%08lx\n", static_cast<unsigned long>(reason));
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (FAILED(device->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), reinterpret_cast<void**>(&dred))) ||
+        !dred) {
+        std::fprintf(stderr, "[rt] d3d12_xs: DRED: no ID3D12DeviceRemovedExtendedData (was DRED on?)\n");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs))) {
+        int lists = 0;
+        for (const auto* node = crumbs.pHeadAutoBreadcrumbNode; node && lists < 32; node = node->pNext, ++lists) {
+            const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+            if (done >= node->BreadcrumbCount) continue;  // this list finished: not where the GPU stopped
+            std::fprintf(stderr, "[rt] d3d12_xs: DRED list %ls on queue %ls: %u of %u operations completed\n",
+                         node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed)",
+                         node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)", done,
+                         node->BreadcrumbCount);
+            // shortcut: ops are printed as D3D12_AUTO_BREADCRUMB_OP numbers (d3d12.h names them), not as names.
+            const UINT first = done > 4 ? done - 4 : 0;
+            const UINT last = done + 4 < node->BreadcrumbCount ? done + 4 : node->BreadcrumbCount - 1;
+            for (UINT i = first; i <= last; ++i)
+                std::fprintf(stderr, "[rt] d3d12_xs: DRED   op %u: %d%s\n", i, static_cast<int>(node->pCommandHistory[i]),
+                             i == done ? "  <- first not completed" : "");
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && fault.PageFaultVA) {
+        std::fprintf(stderr, "[rt] d3d12_xs: DRED page fault at GPU VA 0x%llx\n",
+                     static_cast<unsigned long long>(fault.PageFaultVA));
+        print_dred_allocations("existing", fault.pHeadExistingAllocationNode);
+        print_dred_allocations("recently freed", fault.pHeadRecentFreedAllocationNode);
+    }
+    dred->Release();
+    std::fflush(stderr);
+}
+
+void watch_device_removal(ID3D12Device* device) {
+    ID3D12Fence* fence = nullptr;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence))))
+        return;
+    HANDLE removed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!removed || FAILED(fence->SetEventOnCompletion(UINT64_MAX, removed))) {
+        if (removed) CloseHandle(removed);
+        fence->Release();
+        return;
+    }
+    // One watcher per device, stopped and released by an atexit handler: a thread still calling into the device while
+    // the process tears d3d12.dll down ends the process with an error code.
+    struct Watch {
+        ID3D12Device* device;
+        ID3D12Fence* fence;
+        HANDLE removed;
+        HANDLE stop;
+        HANDLE thread;
+    };
+    static std::atomic<Watch*> watches[4] = {};
+    static std::atomic<int> watch_count{0};
+    const int index = watch_count.fetch_add(1);
+    HANDLE stop = index < 4 ? CreateEventW(nullptr, TRUE, FALSE, nullptr) : nullptr;
+    if (!stop) {
+        CloseHandle(removed);
+        fence->Release();
+        return;
+    }
+    device->AddRef();
+    auto* watch = new Watch{device, fence, removed, stop, nullptr};
+    watch->thread = CreateThread(
+        nullptr, 0,
+        [](void* p) -> DWORD {
+            auto* w = static_cast<Watch*>(p);
+            // The fence event, or the reason itself every 20 ms: a title that stops itself right after a removed
+            // device can end the process before the fence's event is delivered.
+            const HANDLE wake[2] = {w->removed, w->stop};
+            DWORD woke = WAIT_TIMEOUT;
+            while ((woke = WaitForMultipleObjects(2, wake, FALSE, 20)) == WAIT_TIMEOUT &&
+                   w->device->GetDeviceRemovedReason() == S_OK) {
+            }
+            if (woke != WAIT_OBJECT_0 + 1) report_device_removed(w->device);
+            return 0;
+        },
+        watch, 0, nullptr);
+    if (!watch->thread) {
+        CloseHandle(stop);
+        CloseHandle(removed);
+        fence->Release();
+        device->Release();
+        delete watch;
+        return;
+    }
+    watches[index].store(watch);
+    static const bool registered = [] {
+        std::atexit([] {
+            for (auto& slot : watches) {
+                Watch* w = slot.exchange(nullptr);
+                if (!w) continue;
+                SetEvent(w->stop);
+                WaitForSingleObject(w->thread, 1000);
+                CloseHandle(w->thread);
+                CloseHandle(w->stop);
+                CloseHandle(w->removed);
+                w->fence->Release();
+                w->device->Release();
+                delete w;
+            }
+        });
+        return true;
+    }();
+    (void)registered;
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
@@ -189,9 +332,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
     if (!create) return result(method, E_NOTIMPL);
 
+    const bool dred = dred_requested();
+    if (dred) enable_dred();
     ID3D12Device* real = nullptr;
     HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
                         reinterpret_cast<void**>(&real));
+    if (SUCCEEDED(hr) && real && dred) watch_device_removal(real);
     if (FAILED(hr) || !real) {
         if (real) real->Release();
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
