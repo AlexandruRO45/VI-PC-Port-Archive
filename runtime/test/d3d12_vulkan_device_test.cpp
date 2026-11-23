@@ -3346,10 +3346,10 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: upload buffer in COPY_DEST", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST);
-         }},
+         }, nullptr, false, true},
         {"committed: readback buffer in GENERIC_READ", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_READBACK}, buffer_desc(256), D3D12_RESOURCE_STATE_GENERIC_READ);
-         }},
+         }, nullptr, false, true},
         {"committed: upload buffer with UAV", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;

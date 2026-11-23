@@ -1558,10 +1558,13 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     // ALLOW_UNORDERED_ACCESS, on buffers and textures alike. GetHeapProperties still reports the flag.
     if ((UINT(heap_flags) & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) && !uav)
         return "ALLOW_SHADER_ATOMICS without ALLOW_UNORDERED_ACCESS";
-    // The native runtimes accept COMMON for buffers on upload and readback heaps, despite their usual operational
-    // states. Keep resource creation permissive for those states; UAV access remains unsupported on either heap.
-    if ((heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK) && uav)
-        return "UAV access in an upload or readback heap";
+    // COMMON is zero, so it passes each heap's state mask while other unsupported states remain refused.
+    if (heap.Type == D3D12_HEAP_TYPE_UPLOAD &&
+        (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_GENERIC_READ))))
+        return "upload heap state or UAV";
+    if (heap.Type == D3D12_HEAP_TYPE_READBACK &&
+        (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
+        return "readback heap state or UAV";
 
     if (const char* why = initial_state_refusal(buffer, flags, state, acceleration_structures)) return why;
 
