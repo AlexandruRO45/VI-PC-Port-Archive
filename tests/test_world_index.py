@@ -109,6 +109,13 @@ def make_resource(map_file=True):
     return bytes(b)
 
 
+def retype_member(b, index, ty, table=0x300):
+    """Set the type byte of the index-th member in the entity (table=0x300) or map (0x3A0) schema."""
+    b = bytearray(b)
+    b[table + 16 * index + 8] = ty
+    return bytes(b)
+
+
 def make_rpf_streams(parts, start=0x40):
     """A minimal RPF9-looking file: header word + compressed parts, 16-byte aligned."""
     out = bytearray(start)
@@ -145,6 +152,29 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(row["position_min"], [1.5, 2.5, 3.5])
         self.assertEqual(row["lod"], {"LOD": 1})
         self.assertEqual(row["lod_dist_min"], 250.0)
+
+    def test_a_member_with_the_wrong_shape_is_rejected(self):
+        # #5601: a scalar position, a vector archetypeName and a vector LOD level reached the aggregates as a
+        # float (``p[i]``) or an unhashable list (set.add / the LOD_NAMES lookup).
+        self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 1, 0x21)))
+        self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 0, 0x32)))
+        self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 7, 0x34)))
+
+    def test_a_scalar_map_extent_is_rejected(self):
+        # An extent goes through _r4(), which iterates the value.
+        self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 3, 0x21, table=0x3A0)))
+
+    def test_unvalidated_schema_writes_no_row_and_no_traceback(self):
+        path = os.path.join(self.dir, "bad.bin")
+        with open(path, "wb") as f:
+            f.write(retype_member(make_resource(), 1, 0x21))
+        out = os.path.join(self.dir, "out.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out]), 0)
+        self.assertNotIn("Traceback", err.getvalue())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["summary"]["resources"], 0)
 
     def test_non_map_resource_is_meta(self):
         row = WI.parse_resource(make_resource(map_file=False))

@@ -251,6 +251,18 @@ def parse_resource(b, collect=None):
 
     em = structs[ENTITY][1]
     mm = structs[MAPDATA][1]
+    # The aggregates below read these members as fixed shapes: position and the four extents are three floats, the
+    # archetype name and the LOD level are hashed or used as keys. A schema that declares another type is a
+    # different layout, and indexing or hashing that value would fail, so reject it as unvalidated (#5601).
+    for key in ("archetypeName", "lodLevel"):
+        m = em.get(FIELD[key])
+        if m is not None and m[1] in (0x32, 0x33, 0x34):
+            return None
+    for key in ("position", "streamingExtentsMin", "streamingExtentsMax",
+                "entitiesExtentsMin", "entitiesExtentsMax"):
+        m = (em if key == "position" else mm).get(FIELD[key])
+        if m is not None and m[1] not in (0x32, 0x33):
+            return None
     map_name, ordinals, parents = None, {}, ()
     if getattr(collect, "placement_ids", False):
         map_name, ordinals, parents = _placement_tables(b, blocks, structs[MAPDATA], structs[ENTITY])
