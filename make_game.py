@@ -1141,6 +1141,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
     settings_file = os.path.join(spirv, "fspx_build.json")
     if not os.path.isfile(dll):
         log(f"shaders: no {FSPX_DLL} in the game folder, so no FSPX programs to translate")
+        drop(translated, settings_file)
         return
     settings = fspx_settings(dll, mc_signature, emulate, fallbacks)
     if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):

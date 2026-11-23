@@ -232,6 +232,24 @@ class FspxStage(unittest.TestCase):
         self.assertEqual(self.run_step(), [])
         self.assertFalse(os.path.exists(self.spirv))
 
+    def test_missing_dll_drops_outputs_from_the_previous_run(self):
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        index = os.path.join(self.spirv, "index.json")
+        settings = os.path.join(self.spirv, "fspx_build.json")
+        self.assertTrue(os.path.isfile(index))
+        self.assertTrue(os.path.isfile(settings))
+
+        os.remove(self.dll)
+        self.assertEqual(self.run_step(), [])
+        self.assertFalse(os.path.exists(index))
+        self.assertFalse(os.path.exists(settings))
+
+        self.write_dll(program())
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertTrue(os.path.isfile(index))
+        self.assertTrue(os.path.isfile(settings))
+
     def test_each_input_change_runs_it_again(self):
         self.run_step()
         self.assertEqual(self.run_step(signature="llvm-mc 24"), ["fspx_unpack.py", "rdna2spirv.py"])
