@@ -562,5 +562,25 @@ class TestVDivFixupF64Reference(unittest.TestCase):
         self.assertEqual(ref_div_fixup_f64(2.5, 2.0, 5.0), 2.5)
 
 
+def step_scalar_div_fixup_f64(state: ValuDivState, dst: int, s0: int, s1: int, s2: int) -> None:
+    v0 = state.read_f64(Operand.vgpr(s0, 2))
+    v1 = state.read_f64(Operand.vgpr(s1, 2))
+    v2 = state.read_f64(Operand.vgpr(s2, 2))
+    res = ref_div_fixup_f64(v0, v1, v2)
+    state.write_f64(dst, res)
+
+
+class TestVDivFixupF64ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_div_fixup_f64."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuDivState()
+        state.write_f64(2, 2.5)
+        state.write_f64(4, 2.0)
+        state.write_f64(6, 5.0)
+        step_scalar_div_fixup_f64(state, dst=0, s0=2, s1=4, s2=6)
+        self.assertEqual(state.read_f64(Operand.vgpr(0, 2)), 2.5)
+
+
 if __name__ == "__main__":
     unittest.main()
