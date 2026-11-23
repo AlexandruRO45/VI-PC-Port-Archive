@@ -92,6 +92,44 @@ def require_folder(flag: str, path: str) -> None:
         fail(f"{flag} is not a folder: {path}")
 
 
+# Defender's Controlled Folder Access (ransomware protection). EnableControlledFolderAccess: 1 blocks; 2-4 audit or
+# guard only disk sectors. A group policy, when it sets the value, decides over the local setting.
+CFA_KEYS = (r"SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Controlled Folder Access",
+            r"SOFTWARE\Microsoft\Windows Defender\Windows Defender Exploit Guard\Controlled Folder Access")
+
+
+def controlled_folder_access() -> bool:
+    """Windows: whether Controlled Folder Access blocks programs it doesn't trust, python.exe among them, from writing
+    to Documents, Desktop, Pictures and the other protected folders. A blocked mkdir fails with WinError 2 ("cannot
+    find the file specified"), not access denied, so the error alone doesn't say why."""
+    if os.name != "nt":
+        return False
+    import winreg
+    for key in CFA_KEYS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+                return winreg.QueryValueEx(k, "EnableControlledFolderAccess")[0] == 1
+        except OSError:
+            continue
+    return False
+
+
+def make_folder(flag: str, path: str) -> None:
+    """os.makedirs, failing in one line instead of a traceback, with Controlled Folder Access named when it is on:
+    with the default --out (Documents\\Leonida) it blocks the build before anything is written."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        hint = ""
+        if controlled_folder_access():
+            hint = ("\nWindows Security's Controlled Folder Access (ransomware protection) is on: it stops Python "
+                    "from creating folders in Documents and the other protected folders. Build outside them, e.g. "
+                    "--out \"D:\\Leonida\" (and move --work too if you set it), or allow python.exe under Windows "
+                    "Security > Virus & threat protection > Ransomware protection > Allow an app through Controlled "
+                    "folder access.")
+        fail(f"can't create the {flag} folder {path}: {e.strerror or e}{hint}")
+
+
 def below_normal() -> None:
     """Keep the PC usable while a long build runs."""
     if os.name == "nt":
@@ -644,7 +682,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         if done_gb:
             log(f"preflight: {done_gb} GB of assets are already exported in {work}; not counting them")
             need["assets"] = max(0, need["assets"] - done_gb)
-    os.makedirs(work, exist_ok=True)
+    make_folder("--work", work)
     free_gb = shutil.disk_usage(work).free / 2**30
     need_gb = sum(need.values())
     if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
@@ -1720,7 +1758,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     for built in artifacts:
         if not os.path.isfile(built):
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
-    os.makedirs(out, exist_ok=True)
+    make_folder("--out", out)
     for built in artifacts:
         # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
         # files are in place then, and copying a file onto itself raises SameFileError.
@@ -1799,7 +1837,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
              "cmake --build runtime/build/linux --parallel")
     spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
-    os.makedirs(out, exist_ok=True)
+    make_folder("--out", out)
     cache = os.path.join(out, "pipeline_cache.bin")
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")

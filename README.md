@@ -98,8 +98,9 @@ It finds your copy of the game by itself: it looks in Downloads, Desktop, Docume
 such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
 version from a few file sizes, without reading anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
 folder. Before starting it checks that everything below is installed and that there is enough free space, and it
-lists anything missing in one go. The result goes to `Documents\Leonida`. A stopped build continues where it left
-off.
+lists anything missing in one go. The result goes to `Documents\Leonida`; if Windows Security's Controlled Folder
+Access (ransomware protection) is on, it blocks Python there, so build elsewhere with `--out`. A stopped build
+continues where it left off.
 
 Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` archives, as plain files.
 

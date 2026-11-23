@@ -1085,5 +1085,57 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
                     os.rmdir(link)
 
 
+class MakeFolderTest(PreflightTestBase):
+    """A folder the build can't create fails in one line; Controlled Folder Access, whose block reads as WinError 2,
+    is named with the way around it."""
+
+    def blocked(self, cfa: bool) -> str:
+        missing = FileNotFoundError(2, "The system cannot find the file specified")
+        with mock.patch("os.makedirs", side_effect=missing), \
+             mock.patch("make_game.controlled_folder_access", return_value=cfa):
+            return self.assert_fails(make_game.make_folder, "--work", os.path.join("Documents", "Leonida", "work"),
+                                     match="can't create the --work folder")
+
+    def test_controlled_folder_access_is_named_with_the_way_around_it(self):
+        err = self.blocked(cfa=True)
+        self.assertIn("Controlled Folder Access", err)
+        self.assertIn("--out", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_other_failures_name_only_the_error(self):
+        err = self.blocked(cfa=False)
+        self.assertIn("cannot find the file specified", err)
+        self.assertNotIn("Controlled Folder Access", err)
+
+    def fake_registry(self, values: dict):
+        """A winreg whose keys hold EnableControlledFolderAccess = values[key]; other keys don't exist."""
+        class Key:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def open_key(_root, path):
+            if path not in values:
+                raise FileNotFoundError(path)
+            return Key(path)
+
+        reg = mock.Mock(HKEY_LOCAL_MACHINE=object(), OpenKey=open_key,
+                        QueryValueEx=lambda key, name: (values[key.path], 4))
+        return mock.patch.dict(sys.modules, {"winreg": reg})
+
+    def test_controlled_folder_access_reads_policy_before_local_setting(self):
+        policy, local = make_game.CFA_KEYS
+        cases = [({local: 1}, True), ({local: 2}, False),   # 2 = audit mode: logs, doesn't block
+                 ({policy: 0, local: 1}, False), ({policy: 1, local: 0}, True), ({}, False)]
+        for values, expected in cases:
+            with self.subTest(values=values), mock.patch("os.name", "nt"), self.fake_registry(values):
+                self.assertIs(make_game.controlled_folder_access(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
