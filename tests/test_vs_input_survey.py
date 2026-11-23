@@ -54,6 +54,11 @@ def build(root):
 
 def test_vs_input_survey():
     """Runs under pytest (CI's translator-tests job) and as a plain script."""
+    tool = os.path.join(ROOT, "scripts", "vs_input_survey.py")
+
+    def cli(*args):
+        return subprocess.run([sys.executable, "-I", tool, *args], capture_output=True, text=True)
+
     with tempfile.TemporaryDirectory() as tmp:
         dx = build(tmp)
         r = V.survey(dx)
@@ -69,20 +74,29 @@ def test_vs_input_survey():
                                 "fetch call, attributes from v4 up": 1, "reads neither v0 nor a fetch call": 1},
               "each shader lands in exactly one family")
 
-        with open(os.path.join(dx, "disasm", "a_vs.s"), "a", encoding="utf-8") as f:
+        out = cli(dx)
+        check(out.returncode == 0 and "layout: legacy (non-NGG) VS" in out.stdout,
+              "complete legacy listings yield a legacy verdict")
+
+        os.remove(os.path.join(dx, "disasm", "b_vs.s"))
+        out = cli(dx)
+        check(out.returncode == 0 and "layout: unknown (some vertex shader listings are missing)" in out.stdout,
+              "partial coverage without NGG markers leaves the layout unknown")
+
+        with open(os.path.join(dx, "disasm", "a_vs.s"), "a", encoding="utf-8", newline="\n") as f:
             f.write("\texp prim v0, off, off, off done\n")
-        out = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "vs_input_survey.py"), dx],
-                             capture_output=True, text=True)
+        out = cli(dx)
         check(out.returncode == 0 and "exp prim 1" in out.stdout and "NGG markers present" in out.stdout,
-              "a primitive export flips the verdict away from legacy")
+              "a primitive export proves NGG markers are present even with partial coverage")
         check("a_vs" not in out.stdout and "c_vs" not in out.stdout, "the summary prints counts, not shader names")
 
+        for name in ("a_vs", "c_vs", "d_vs"):
+            os.remove(os.path.join(dx, "disasm", name + ".s"))
+        out = cli(dx)
+        check(out.returncode == 0 and "layout: unknown (no vertex shader listings read)" in out.stdout,
+              "missing all vertex listings leaves the layout unknown")
+
     # bad inputs and outputs: one error line, exit 2, no traceback, and index.json is never overwritten
-    tool = os.path.join(ROOT, "scripts", "vs_input_survey.py")
-
-    def cli(*args):
-        return subprocess.run([sys.executable, "-I", tool, *args], capture_output=True, text=True)
-
     with tempfile.TemporaryDirectory() as tmp:
         d = os.path.join(tmp, "dxbc")
         os.mkdir(d)
@@ -108,8 +122,11 @@ def test_vs_input_survey():
             r = cli(d)
             check(r.returncode == 2 and "Traceback" not in r.stderr and len(r.stderr.strip().splitlines()) == 1,
                   f"index.json {what}: one error line, exit 2")
-        with open(idx, "w") as f:
+        with open(idx, "w", encoding="utf-8", newline="\n") as f:
             f.write("[]")
+        r = cli(d)
+        check(r.returncode == 0 and "layout: unknown (no vertex shader listings read)" in r.stdout,
+              "an empty index leaves the layout unknown")
         r = cli(d, "--json", os.path.join(plain, "sub", "r.json"))
         check(r.returncode == 2 and "Traceback" not in r.stderr, "--json under a regular file: one error, exit 2")
         r = cli(d, "--json", idx)

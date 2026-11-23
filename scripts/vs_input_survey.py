@@ -168,8 +168,15 @@ def main():
     print(f"exports: pos0 {m.get('exp pos0', 0)}, param {m.get('exp param', 0)}; fetch call {m.get('fetch call', 0)}")
     print("input VGPRs read before written (v0..v15):", r["input_vgprs_read"])
     print("families:", r["families"])
-    legacy = not (m.get("exp prim") or m.get("s_sendmsg") or m.get("v_mbcnt"))
-    print("layout:", "legacy (non-NGG) VS" if legacy else "NGG markers present: check the VS input layout")
+    if m.get("exp prim") or m.get("s_sendmsg") or m.get("v_mbcnt"):
+        layout = "NGG markers present: check the VS input layout"
+    elif r["missing_listings"] == r["vertex_shaders"]:
+        layout = "unknown (no vertex shader listings read)"
+    elif r["missing_listings"]:
+        layout = "unknown (some vertex shader listings are missing)"
+    else:
+        layout = "legacy (non-NGG) VS"
+    print("layout:", layout)
     if a.json:
         try:
             with open(a.json, "w", encoding="utf-8", newline="\n") as f:
