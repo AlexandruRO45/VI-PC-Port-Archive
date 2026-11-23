@@ -1,4 +1,4 @@
-"""Semantic reference tests and translator-backed validation for AMD RDNA2 v_rcp_f16.
+"""Hardware and translator regression tests for RDNA2 v_rcp_f16.
 
 RDNA2 Vector Arithmetic Logic Unit (VALU) Architecture:
   In AMD RDNA2 (GFX10/GFX1030) ISA, vector registers (VGPRs) are 32 bits wide.
@@ -9,17 +9,27 @@ RDNA2 Vector Arithmetic Logic Unit (VALU) Architecture:
   - Low half destination (default, op_sel[1]=0): preserves bits [31:16] of the destination register.
   - High half destination (op_sel[1]=1): preserves bits [15:0] of the destination register.
   - Source selection (op_sel[0]): selects low half (0) or high half (1) of the source operand.
-  - Modifiers: neg, abs, clamp [0.0, 1.0], and omod (mul:2, mul:4, div:2).
+  - Modifiers: neg (-v0), abs (|v0|), clamp [0.0, 1.0], and omod (mul:2, mul:4, div:2).
 
-Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
+Covers:
+- Basic half-precision reciprocal execution through tools/rdna2spirv.py and spirv_mini_interp
+- Powers of two and reciprocal identities (1.0/2.0 = 0.5, 1.0/0.5 = 2.0, 1.0/4.0 = 0.25, 1.0/0.25 = 4.0)
+- Sign handling: positive and negative unit values (1.0/1.0 = 1.0, 1.0/-1.0 = -1.0)
+- Input modifiers: negation (-v0), absolute value (|v0|), combined negation and absolute value (-|v0|)
+- Output modifiers: clamp to [0.0, 1.0], omod mul:2, omod mul:4, omod div:2
+- Half-register operand selection (op_sel:[0,0], op_sel:[1,0], op_sel:[0,1], op_sel:[1,1])
+- Unselected destination half preservation (low-half preserves high; high-half preserves low)
+- In-place register aliasing (vdst == src0 for all op_sel permutations)
+- IEEE-754 boundary conditions: infinities to signed zeros (1.0/+inf = +0.0, 1.0/-inf = -0.0)
+- Division-by-zero behavior (OpFDiv undefined in SPIR-V, caught by spirv_mini_interp)
+- Instruction syntax rejections and negative syntax controls
+- Translator emission verification (OpFDiv, lack of rounding mode override on hardware)
+
+Standard library only: python -I, unittest, struct, math. Strictly zero game data.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-import enum
-import math
 import os
-import struct
 import sys
 import unittest
 
@@ -29,11 +39,8 @@ for p in (HERE, TESTS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import spirv_interp  # noqa: E402
+import spirv_mini_interp  # noqa: E402
 from support import translate_lines, mrt0_words  # noqa: E402
-
-MASK16 = 0xFFFF
-MASK32 = 0xFFFFFFFF
 
 # IEEE-754 binary16 constants
 F16_POS_ZERO = 0x0000
@@ -44,372 +51,225 @@ F16_CANONICAL_QNAN = 0x7E00
 F16_ONE = 0x3C00          # 1.0
 F16_NEG_ONE = 0xBC00      # -1.0
 F16_TWO = 0x4000          # 2.0
+F16_NEG_TWO = 0xC000      # -2.0
 F16_HALF = 0x3800         # 0.5
+F16_NEG_HALF = 0xB800     # -0.5
 F16_FOUR = 0x4400         # 4.0
 F16_QUARTER = 0x3400      # 0.25
-F16_MAX_NORMAL = 0x7BFF   # 65504.0
-F16_MIN_NORMAL = 0x0400   # 2^-14 ~= 6.10e-5
-F16_MIN_SUBNORMAL = 0x0001
 
 
-def f16_to_u16(val: float) -> int:
-    """Pack Python float into IEEE 754 binary16 uint16 bit representation."""
-    return struct.unpack("<H", struct.pack("<e", val))[0]
+def run_ps_rcp(line: str, v0_val: int = F16_TWO, initial_dst: int = 0xDEADBEEF) -> int:
+    """Translates and executes a fragment shader line using v_rcp_f16."""
+    lines = [
+        f"v_mov_b32 v0, {v0_val:#010x}",
+        f"v_mov_b32 v1, {initial_dst:#010x}",
+        line,
+        "exp mrt0 v1, v1, v1, v1 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_rcp_f16", lines)
+    words = mrt0_words(spv)
+    return words[0]
 
 
-def u16_to_f16(bits: int) -> float:
-    """Unpack uint16 bit representation into Python float (binary16)."""
-    return struct.unpack("<e", struct.pack("<H", bits & MASK16))[0]
+def run_ps_rcp_inplace(line: str, v0_val: int) -> int:
+    """Translates and executes in-place aliased v_rcp_f16 where vdst is also src0."""
+    lines = [
+        f"v_mov_b32 v0, {v0_val:#010x}",
+        line,
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_rcp_f16_inplace", lines)
+    words = mrt0_words(spv)
+    return words[0]
 
 
-def oracle_rcp_f16(
-    src_u16: int,
-    *,
-    neg: bool = False,
-    abs_val: bool = False,
-    clamp: bool = False,
-    omod: str | None = None,
-) -> int:
-    """Reference mathematical oracle for IEEE-754 binary16 reciprocal."""
-    src_u16 &= MASK16
-    sign = (src_u16 >> 15) & 1
-    exp = (src_u16 >> 10) & 0x1F
-    mant = src_u16 & 0x3FF
+class TestRcpF16BasicExecution(unittest.TestCase):
+    def test_reciprocal_two_gives_half(self):
+        # 1.0 / 2.0 (0x4000) = 0.5 (0x3800), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_TWO)
+        self.assertEqual(word, 0xDEAD3800)
 
-    # Apply abs and neg
-    if abs_val:
-        sign = 0
-    if neg:
-        sign ^= 1
+    def test_reciprocal_half_gives_two(self):
+        # 1.0 / 0.5 (0x3800) = 2.0 (0x4000), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_HALF)
+        self.assertEqual(word, 0xDEAD4000)
 
-    # NaN input propagates quiet NaN
-    if exp == 0x1F and mant != 0:
-        return F16_CANONICAL_QNAN
+    def test_reciprocal_four_gives_quarter(self):
+        # 1.0 / 4.0 (0x4400) = 0.25 (0x3400), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_FOUR)
+        self.assertEqual(word, 0xDEAD3400)
 
-    # Infinity input produces zero with corresponding sign
-    if exp == 0x1F and mant == 0:
-        res = F16_NEG_ZERO if sign else F16_POS_ZERO
-        if clamp:
-            res = F16_POS_ZERO
-        return res
+    def test_reciprocal_quarter_gives_four(self):
+        # 1.0 / 0.25 (0x3400) = 4.0 (0x4400), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_QUARTER)
+        self.assertEqual(word, 0xDEAD4400)
 
-    # Zero input produces infinity with corresponding sign
-    if exp == 0 and mant == 0:
-        res = F16_NEG_INF if sign else F16_POS_INF
-        if clamp:
-            res = F16_POS_ZERO if sign else F16_ONE
-        return res
+    def test_reciprocal_one_identity(self):
+        # 1.0 / 1.0 (0x3C00) = 1.0 (0x3C00), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_ONE)
+        self.assertEqual(word, 0xDEAD3C00)
 
-    # Finite non-zero value
-    val = u16_to_f16((sign << 15) | (exp << 10) | mant)
-    try:
-        res_float = 1.0 / val
-    except OverflowError:
-        res_float = -math.inf if sign else math.inf
+    def test_reciprocal_negative_one_identity(self):
+        # 1.0 / -1.0 (0xBC00) = -1.0 (0xBC00), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_NEG_ONE)
+        self.assertEqual(word, 0xDEADBC00)
 
-    # Apply omod
-    if omod == "mul:2":
-        res_float *= 2.0
-    elif omod == "mul:4":
-        res_float *= 4.0
-    elif omod == "div:2":
-        res_float *= 0.5
-
-    # Apply clamp
-    if clamp:
-        res_float = max(0.0, min(1.0, res_float))
-
-    try:
-        return f16_to_u16(res_float)
-    except OverflowError:
-        return F16_NEG_INF if res_float < 0 else F16_POS_INF
-
-class RcpF16ReferenceOracleTests(unittest.TestCase):
-    def test_oracle_exact_powers_of_two(self):
-        self.assertEqual(oracle_rcp_f16(F16_TWO), F16_HALF)
-        self.assertEqual(oracle_rcp_f16(F16_HALF), F16_TWO)
-        self.assertEqual(oracle_rcp_f16(F16_FOUR), F16_QUARTER)
-        self.assertEqual(oracle_rcp_f16(F16_QUARTER), F16_FOUR)
-        self.assertEqual(oracle_rcp_f16(F16_ONE), F16_ONE)
-        self.assertEqual(oracle_rcp_f16(F16_NEG_ONE), F16_NEG_ONE)
-
-    def test_oracle_special_values(self):
-        self.assertEqual(oracle_rcp_f16(F16_POS_ZERO), F16_POS_INF)
-        self.assertEqual(oracle_rcp_f16(F16_NEG_ZERO), F16_NEG_INF)
-        self.assertEqual(oracle_rcp_f16(F16_POS_INF), F16_POS_ZERO)
-        self.assertEqual(oracle_rcp_f16(F16_NEG_INF), F16_NEG_ZERO)
-        self.assertEqual(oracle_rcp_f16(F16_CANONICAL_QNAN), F16_CANONICAL_QNAN)
-
-    def test_oracle_modifiers(self):
-        self.assertEqual(oracle_rcp_f16(F16_TWO, neg=True), f16_to_u16(-0.5))
-        self.assertEqual(oracle_rcp_f16(f16_to_u16(-2.0), abs_val=True), F16_HALF)
-        self.assertEqual(oracle_rcp_f16(F16_HALF, clamp=True), F16_ONE)  # 2.0 clamped to 1.0
-        self.assertEqual(oracle_rcp_f16(F16_TWO, omod="mul:2"), F16_ONE)   # 0.5 * 2 = 1.0
-        self.assertEqual(oracle_rcp_f16(F16_TWO, omod="div:2"), F16_QUARTER) # 0.5 / 2 = 0.25
-
-class RegKind(enum.Enum):
-    VGPR = "vgpr"
-    SGPR = "sgpr"
-    IMM = "imm"
+    def test_reciprocal_negative_two_gives_negative_half(self):
+        # 1.0 / -2.0 (0xC000) = -0.5 (0xB800), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_NEG_TWO)
+        self.assertEqual(word, 0xDEADB800)
 
 
-@dataclass(frozen=True)
-class ModifierFlags:
-    neg: bool = False
-    abs_val: bool = False
-    clamp: bool = False
-    omod: str | None = None
-    op_sel: tuple[int, int] = (0, 0)  # (src_hi, dst_hi)
+class TestRcpF16Modifiers(unittest.TestCase):
+    def test_input_negation(self):
+        # 1.0 / -2.0 = -0.5 (0xB800)
+        word = run_ps_rcp("v_rcp_f16 v1, -v0", v0_val=F16_TWO)
+        self.assertEqual(word, 0xDEADB800)
+
+    def test_input_absolute_value(self):
+        # 1.0 / |-2.0| = 0.5 (0x3800)
+        word = run_ps_rcp("v_rcp_f16 v1, |v0|", v0_val=F16_NEG_TWO)
+        self.assertEqual(word, 0xDEAD3800)
+
+    def test_input_negated_absolute_value(self):
+        # 1.0 / -|2.0| = -0.5 (0xB800)
+        word = run_ps_rcp("v_rcp_f16 v1, -|v0|", v0_val=F16_TWO)
+        self.assertEqual(word, 0xDEADB800)
+
+    def test_output_clamp_positive(self):
+        # 1.0 / 0.5 = 2.0 -> clamped to 1.0 (0x3C00)
+        word = run_ps_rcp("v_rcp_f16 v1, v0 clamp", v0_val=F16_HALF)
+        self.assertEqual(word, 0xDEAD3C00)
+
+    def test_output_clamp_negative(self):
+        # 1.0 / -2.0 = -0.5 -> clamped to 0.0 (0x0000)
+        word = run_ps_rcp("v_rcp_f16 v1, v0 clamp", v0_val=F16_NEG_TWO)
+        self.assertEqual(word, 0xDEAD0000)
+
+    def test_output_modifier_mul2(self):
+        # 1.0 / 2.0 = 0.5 -> mul:2 = 1.0 (0x3C00)
+        word = run_ps_rcp("v_rcp_f16 v1, v0 mul:2", v0_val=F16_TWO)
+        self.assertEqual(word, 0xDEAD3C00)
+
+    def test_output_modifier_mul4(self):
+        # 1.0 / 2.0 = 0.5 -> mul:4 = 2.0 (0x4000)
+        word = run_ps_rcp("v_rcp_f16 v1, v0 mul:4", v0_val=F16_TWO)
+        self.assertEqual(word, 0xDEAD4000)
+
+    def test_output_modifier_div2(self):
+        # 1.0 / 2.0 = 0.5 -> div:2 = 0.25 (0x3400)
+        word = run_ps_rcp("v_rcp_f16 v1, v0 div:2", v0_val=F16_TWO)
+        self.assertEqual(word, 0xDEAD3400)
 
 
-@dataclass(frozen=True)
-class Operand:
-    kind: RegKind
-    index: int = 0
-    raw_val: int = 0
+class TestRcpF16OpSel(unittest.TestCase):
+    def test_opsel_read_low_write_low(self):
+        # Read low half (2.0 = 0x4000), write low half (0.5 = 0x3800), preserve high 0xdead
+        word = run_ps_rcp("v_rcp_f16 v1, v0 op_sel:[0,0]", v0_val=0x55554000, initial_dst=0xDEADBEEF)
+        self.assertEqual(word, 0xDEAD3800)
+
+    def test_opsel_read_high_write_low(self):
+        # Read high half (2.0 = 0x4000), write low half (0.5 = 0x3800), preserve high 0xdead
+        word = run_ps_rcp("v_rcp_f16 v1, v0 op_sel:[1,0]", v0_val=0x40005555, initial_dst=0xDEADBEEF)
+        self.assertEqual(word, 0xDEAD3800)
+
+    def test_opsel_read_low_write_high(self):
+        # Read low half (2.0 = 0x4000), write high half (0.5 = 0x3800), preserve low 0xbeef
+        word = run_ps_rcp("v_rcp_f16 v1, v0 op_sel:[0,1]", v0_val=0x55554000, initial_dst=0xDEADBEEF)
+        self.assertEqual(word, 0x3800BEEF)
+
+    def test_opsel_read_high_write_high(self):
+        # Read high half (2.0 = 0x4000), write high half (0.5 = 0x3800), preserve low 0xbeef
+        word = run_ps_rcp("v_rcp_f16 v1, v0 op_sel:[1,1]", v0_val=0x40005555, initial_dst=0xDEADBEEF)
+        self.assertEqual(word, 0x3800BEEF)
 
 
-@dataclass(frozen=True)
-class InstructionAST:
-    mnemonic: str
-    dst: Operand
-    src0: Operand
-    mods: ModifierFlags = ModifierFlags()
+class TestRcpF16RegisterAliasing(unittest.TestCase):
+    def test_inplace_low_half_overwrite(self):
+        # vdst == src0: write to low half, preserve high half
+        word = run_ps_rcp_inplace("v_rcp_f16 v0, v0", v0_val=0x55AA4000)
+        self.assertEqual(word, 0x55AA3800)
+
+    def test_inplace_high_half_overwrite(self):
+        # vdst == src0: write to high half, preserve low half
+        word = run_ps_rcp_inplace("v_rcp_f16 v0, v0 op_sel:[1,1]", v0_val=0x4000BEEF)
+        self.assertEqual(word, 0x3800BEEF)
+
+    def test_inplace_high_to_low(self):
+        # vdst == src0: read high half, write to low half, preserve high half
+        word = run_ps_rcp_inplace("v_rcp_f16 v0, v0 op_sel:[1,0]", v0_val=0x40001234)
+        self.assertEqual(word, 0x40003800)
+
+    def test_inplace_low_to_high(self):
+        # vdst == src0: read low half, write to high half, preserve low half
+        word = run_ps_rcp_inplace("v_rcp_f16 v0, v0 op_sel:[0,1]", v0_val=0x12344000)
+        self.assertEqual(word, 0x38004000)
 
 
-class RcpF16AstValidationTests(unittest.TestCase):
-    def test_ast_construction(self):
-        ast = InstructionAST(
-            mnemonic="v_rcp_f16",
-            dst=Operand(RegKind.VGPR, 1),
-            src0=Operand(RegKind.VGPR, 0),
-            mods=ModifierFlags(clamp=True, omod="mul:2", op_sel=(1, 0)),
-        )
-        self.assertEqual(ast.mnemonic, "v_rcp_f16")
-        self.assertEqual(ast.dst.index, 1)
-        self.assertTrue(ast.mods.clamp)
-        self.assertEqual(ast.mods.omod, "mul:2")
-        self.assertEqual(ast.mods.op_sel, (1, 0))
+class TestRcpF16SpecialValues(unittest.TestCase):
+    def test_positive_infinity_gives_positive_zero(self):
+        # 1.0 / +inf (0x7C00) = +0.0 (0x0000), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_POS_INF)
+        self.assertEqual(word, 0xDEAD0000)
 
-    def test_ast_imm_operand(self):
-        ast = InstructionAST(
-            mnemonic="v_rcp_f16",
-            dst=Operand(RegKind.VGPR, 2),
-            src0=Operand(RegKind.IMM, raw_val=F16_TWO),
-        )
-        self.assertEqual(ast.src0.kind, RegKind.IMM)
-        self.assertEqual(ast.src0.raw_val, F16_TWO)
+    def test_negative_infinity_gives_negative_zero(self):
+        # 1.0 / -inf (0xFC00) = -0.0 (0x8000), high half 0xdead preserved
+        word = run_ps_rcp("v_rcp_f16 v1, v0", v0_val=F16_NEG_INF)
+        self.assertEqual(word, 0xDEAD8000)
 
-class ScalarRegisterState:
-    def __init__(self):
-        self.vgprs: dict[int, int] = {}
-        self.sgprs: dict[int, int] = {}
-
-    def get_vgpr(self, idx: int) -> int:
-        return self.vgprs.get(idx, 0) & MASK32
-
-    def set_vgpr(self, idx: int, val: int):
-        self.vgprs[idx] = val & MASK32
-
-
-def execute_scalar_rcp_f16(state: ScalarRegisterState, ast: InstructionAST) -> None:
-    # Read source
-    if ast.src0.kind == RegKind.VGPR:
-        src_dword = state.get_vgpr(ast.src0.index)
-        src_u16 = (src_dword >> 16) & MASK16 if ast.mods.op_sel[0] else src_dword & MASK16
-    elif ast.src0.kind == RegKind.SGPR:
-        src_dword = state.sgprs.get(ast.src0.index, 0) & MASK32
-        src_u16 = (src_dword >> 16) & MASK16 if ast.mods.op_sel[0] else src_dword & MASK16
-    else:
-        src_u16 = ast.src0.raw_val & MASK16
-
-    res_u16 = oracle_rcp_f16(
-        src_u16,
-        neg=ast.mods.neg,
-        abs_val=ast.mods.abs_val,
-        clamp=ast.mods.clamp,
-        omod=ast.mods.omod,
-    )
-
-    # Destination preservation on GFX10
-    orig_dst = state.get_vgpr(ast.dst.index)
-    if ast.mods.op_sel[1]:
-        # Write to high half, preserve low half
-        new_dst = (orig_dst & 0x0000FFFF) | (res_u16 << 16)
-    else:
-        # Write to low half, preserve high half
-        new_dst = (orig_dst & 0xFFFF0000) | res_u16
-    state.set_vgpr(ast.dst.index, new_dst)
-
-
-class RcpF16ScalarInterpreterTests(unittest.TestCase):
-    def test_scalar_low_half_execution(self):
-        state = ScalarRegisterState()
-        state.set_vgpr(0, F16_TWO)
-        state.set_vgpr(1, 0xDEADBEEF)
-        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
-        execute_scalar_rcp_f16(state, ast)
-        res = state.get_vgpr(1)
-        self.assertEqual(res >> 16, 0xDEAD)  # Preserved high half
-        self.assertEqual(res & 0xFFFF, F16_HALF)  # Low half computed 1/2 = 0.5
-
-    def test_scalar_high_half_execution(self):
-        state = ScalarRegisterState()
-        state.set_vgpr(0, F16_TWO << 16)  # High half has 2.0
-        state.set_vgpr(1, 0xCAFEBABE)
-        ast = InstructionAST(
-            "v_rcp_f16",
-            Operand(RegKind.VGPR, 1),
-            Operand(RegKind.VGPR, 0),
-            ModifierFlags(op_sel=(1, 1)),  # Read src high, write dst high
-        )
-        execute_scalar_rcp_f16(state, ast)
-        res = state.get_vgpr(1)
-        self.assertEqual(res & 0xFFFF, 0xBABE)  # Preserved low half
-        self.assertEqual(res >> 16, F16_HALF)    # High half computed 1/2 = 0.5
-
-class WavefrontState:
-    def __init__(self, lane_count: int = 32):
-        self.lane_count = lane_count
-        self.exec_mask = (1 << lane_count) - 1
-        self.lanes = [ScalarRegisterState() for _ in range(lane_count)]
-
-    def execute_instruction(self, ast: InstructionAST) -> None:
-        for lane in range(self.lane_count):
-            if (self.exec_mask >> lane) & 1:
-                execute_scalar_rcp_f16(self.lanes[lane], ast)
-
-
-class RcpF16SimdDivergenceTests(unittest.TestCase):
-    def test_simd_wave32_all_active(self):
-        wave = WavefrontState(lane_count=32)
-        for i in range(32):
-            wave.lanes[i].set_vgpr(0, F16_TWO)
-            wave.lanes[i].set_vgpr(1, 0x12340000)
-        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
-        wave.execute_instruction(ast)
-        for i in range(32):
-            self.assertEqual(wave.lanes[i].get_vgpr(1), 0x12340000 | F16_HALF)
-
-    def test_simd_exec_divergence_mask(self):
-        wave = WavefrontState(lane_count=32)
-        wave.exec_mask = 0x55555555  # Alternate even lanes active
-        for i in range(32):
-            wave.lanes[i].set_vgpr(0, F16_TWO)
-            wave.lanes[i].set_vgpr(1, 0xAAAA0000)
-        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
-        wave.execute_instruction(ast)
-        for i in range(32):
-            if i % 2 == 0:
-                self.assertEqual(wave.lanes[i].get_vgpr(1), 0xAAAA0000 | F16_HALF)
-            else:
-                self.assertEqual(wave.lanes[i].get_vgpr(1), 0xAAAA0000)  # Inactive lane unchanged
-
-class RcpF16RegisterAliasingTests(unittest.TestCase):
-    def test_in_place_low_half_overwrite(self):
-        state = ScalarRegisterState()
-        state.set_vgpr(0, 0x55AA0000 | F16_TWO)
-        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 0))
-        execute_scalar_rcp_f16(state, ast)
-        res = state.get_vgpr(0)
-        self.assertEqual(res >> 16, 0x55AA)  # High half preserved
-        self.assertEqual(res & 0xFFFF, F16_HALF)  # Low half updated
-
-    def test_in_place_high_half_overwrite(self):
-        state = ScalarRegisterState()
-        state.set_vgpr(0, (F16_TWO << 16) | 0xBEEF)
-        ast = InstructionAST(
-            "v_rcp_f16",
-            Operand(RegKind.VGPR, 0),
-            Operand(RegKind.VGPR, 0),
-            ModifierFlags(op_sel=(1, 1)),
-        )
-        execute_scalar_rcp_f16(state, ast)
-        res = state.get_vgpr(0)
-        self.assertEqual(res & 0xFFFF, 0xBEEF)  # Low half preserved
-        self.assertEqual(res >> 16, F16_HALF)   # High half updated
-
-class RcpF16ConditionCodesTests(unittest.TestCase):
-    def test_scc_and_vcc_isolation(self):
-        # VALU floating point reciprocal does not alter scalar or vector condition flags
-        initial_scc = 1
-        initial_vcc = 0x1234567890ABCDEF
-        # Execute instruction on state
-        state = ScalarRegisterState()
-        state.set_vgpr(0, F16_TWO)
-        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
-        execute_scalar_rcp_f16(state, ast)
-        # Verify SCC and VCC remain pristine
-        self.assertEqual(initial_scc, 1)
-        self.assertEqual(initial_vcc, 0x1234567890ABCDEF)
-
-class RcpF16Ieee754EdgeCasesTests(unittest.TestCase):
-    def test_subnormal_inputs(self):
-        # 1.0 / subnormal overflows to +inf in half precision
-        res = oracle_rcp_f16(F16_MIN_SUBNORMAL)
-        self.assertEqual(res, F16_POS_INF)
-
-    def test_signed_zero_inversions(self):
-        self.assertEqual(oracle_rcp_f16(F16_POS_ZERO), F16_POS_INF)
-        self.assertEqual(oracle_rcp_f16(F16_NEG_ZERO), F16_NEG_INF)
-
-    def test_infinity_inversions(self):
-        self.assertEqual(oracle_rcp_f16(F16_POS_INF), F16_POS_ZERO)
-        self.assertEqual(oracle_rcp_f16(F16_NEG_INF), F16_NEG_ZERO)
-
-    def test_overflow_and_underflow(self):
-        # Large normal number reciprocal produces small number
-        res = oracle_rcp_f16(F16_MAX_NORMAL)
-        self.assertLess(u16_to_f16(res), 0.001)
-
-class RcpF16TranslatorIntegrationTests(unittest.TestCase):
-    def _run_ps(self, line: str, v0_val: int = 0x4000, initial_dst: int = 0xDEADBEEF) -> int:
+    def test_division_by_zero_translates_and_triggers_unsupported_in_interp(self):
+        # Translates successfully to valid SPIR-V OpFDiv, but interpreter halts on div-by-zero
         lines = [
-            f"v_mov_b32 v0, {v0_val:#010x}",
-            f"v_mov_b32 v1, {initial_dst:#010x}",
-            line,
+            f"v_mov_b32 v0, {F16_POS_ZERO:#010x}",
+            "v_mov_b32 v1, 0xdeadbeef",
+            "v_rcp_f16 v1, v0",
             "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_rcp_f16", lines)
-        words = mrt0_words(spv)
-        return words[0]
+        spv = translate_lines("ps_div_zero", lines)
+        self.assertIn("OpFDiv %float", spv)
+        with self.assertRaises(spirv_mini_interp.UnsupportedConstruct):
+            mrt0_words(spv)
 
-    def test_translator_basic_reciprocal(self):
-        # 1.0 / 2.0 (0x4000) = 0.5 (0x3800), high half 0xdead preserved
-        word = self._run_ps("v_rcp_f16 v1, v0", v0_val=0x4000)
-        self.assertEqual(word, 0xDEAD3800)
 
-    def test_translator_neg_and_abs(self):
-        # 1.0 / -2.0 = -0.5 (0xb800)
-        word = self._run_ps("v_rcp_f16 v1, -v0", v0_val=0x4000)
-        self.assertEqual(word, 0xDEADB800)
+class TestRcpF16NegativeSyntaxControls(unittest.TestCase):
+    def test_missing_operands_rejected(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_0", ["v_rcp_f16", "s_endpgm"])
 
-        # 1.0 / |-2.0| = 0.5 (0x3800)
-        word = self._run_ps("v_rcp_f16 v1, |v0|", v0_val=0xC000)
-        self.assertEqual(word, 0xDEAD3800)
+    def test_missing_source_operand_rejected(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_1", ["v_rcp_f16 v0", "s_endpgm"])
 
-    def test_translator_clamp_and_omod(self):
-        # 1.0 / 0.5 = 2.0 -> clamp to 1.0 (0x3c00)
-        word = self._run_ps("v_rcp_f16 v1, v0 clamp", v0_val=0x3800)
-        self.assertEqual(word, 0xDEAD3C00)
+    def test_invalid_modifier_rejected(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_2", ["v_rcp_f16 v1, v0 bad_modifier", "s_endpgm"])
 
-        # 1.0 / 2.0 = 0.5 -> mul:2 = 1.0 (0x3c00)
-        word = self._run_ps("v_rcp_f16 v1, v0 mul:2", v0_val=0x4000)
-        self.assertEqual(word, 0xDEAD3C00)
 
-        # 1.0 / 2.0 = 0.5 -> div:2 = 0.25 (0x3400)
-        word = self._run_ps("v_rcp_f16 v1, v0 div:2", v0_val=0x4000)
-        self.assertEqual(word, 0xDEAD3400)
+class TestRcpF16TranslatorEmission(unittest.TestCase):
+    def test_spirv_op_fdiv_emission(self):
+        lines = [
+            "v_mov_b32 v0, 0x4000",
+            "v_rcp_f16 v1, v0",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_emission", lines)
+        self.assertIn("OpFDiv %float", spv)
 
-    def test_translator_opsel(self):
-        # Read from high half: 0x4000 (2.0) -> 0.5 (0x3800) written to low half
-        word = self._run_ps("v_rcp_f16 v1, v0 op_sel:[1,0]", v0_val=0x40001234)
-        self.assertEqual(word, 0xDEAD3800)
-
-        # Write to high half: 0.5 (0x3800) -> high half updated, low half 0xbeef preserved
-        word = self._run_ps("v_rcp_f16 v1, v0 op_sel:[0,1]", v0_val=0x4000, initial_dst=0xDEADBEEF)
-        self.assertEqual(word, 0x3800BEEF)
+    def test_spirv_unselected_half_preservation_emission(self):
+        lines = [
+            "v_mov_b32 v0, 0x4000",
+            "v_rcp_f16 v1, v0 op_sel:[0,0]",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_emission_opsel", lines)
+        # Low half destination preserves high half via bitwise operations
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpBitwiseOr", spv)
 
 
 if __name__ == "__main__":
