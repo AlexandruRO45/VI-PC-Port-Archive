@@ -413,5 +413,23 @@ class TestDsReadI16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[2], 0xFFFF_FFFE)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_i16 SIMD Divergence & Sign Extension
+# ------------------------------------------------------------------------------
+
+class TestDsReadI16SIMD(unittest.TestCase):
+    def test_simd_divergent_signed_halfwords(self):
+        wave = SIMDWaveDS(wave_size=32)
+        for i in range(32):
+            val = 0x8000 + i * 10
+            wave.lds.write_u16(i * 2, val)
+            wave.vgprs[1][i] = i * 2
+
+        for i in range(32):
+            wave.vgprs[2][i] = wave.lds.read_i16(wave.vgprs[1][i])
+            expected = (0x8000 + i * 10 - 65536) & MASK32
+            self.assertEqual(wave.vgprs[2][i], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
