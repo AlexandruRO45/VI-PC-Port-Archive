@@ -1024,11 +1024,11 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             values[res] = not val(a[1])
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
-            if types.t[a[0]] == ("float", 64):
-                if op != "OpFMul":
-                    raise UnsupportedConstruct(f"{op} on binary64")
-                values[res] = x * y
-                continue
+            result_type = types.t[a[0]]
+            component_type = types.t[result_type[1]] if result_type[0] == "vec" else result_type
+            binary64 = component_type == ("float", 64)
+            if binary64 and op != "OpFMul":
+                raise UnsupportedConstruct(f"{op} on binary64")
 
             def _fdiv(p, q):
                 # SPIR-V leaves OpFDiv by zero undefined: refuse it, as the interpreter does for every undefined case
@@ -1040,7 +1040,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
 
             fn = {"OpFAdd": (lambda p, q: f32(ieee_nan(p + q, p, q))),
                   "OpFSub": (lambda p, q: f32(ieee_nan(p - q, p, q))),
-                  "OpFMul": (lambda p, q: f32(ieee_nan(p * q, p, q))), "OpFDiv": _fdiv}[op]
+                  "OpFMul": (lambda p, q: ieee_nan(p * q, p, q) if binary64 else f32(ieee_nan(p * q, p, q))),
+                  "OpFDiv": _fdiv}[op]
             if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
                     isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
                 values[res] = tuple(fn(p, q) for p, q in zip(x, y))

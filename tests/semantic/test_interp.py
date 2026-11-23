@@ -64,6 +64,44 @@ def run_word(body):
 
 
 class InterpreterTests(unittest.TestCase):
+    def test_binary64_vector_multiply_preserves_each_component(self):
+        values = (16777217.0, 1e200, 1e-200, -0.0)
+        for count in (2, 3, 4):
+            with self.subTest(count=count):
+                declarations = ["%double = OpTypeFloat 64",
+                                f"%dv = OpTypeVector %double {count}",
+                                "%u2 = OpTypeVector %uint 2",
+                                "%pu2 = OpTypePointer Output %u2",
+                                "%two = OpConstant %double 2"]
+                names = [f"%out{i}" for i in range(count)]
+                for i, value in enumerate(values[:count]):
+                    declarations += [f"%d{i} = OpConstant %double {value!r}",
+                                     f"%out{i} = OpVariable %pu2 Output"]
+                constructs = ["%lhs = OpCompositeConstruct %dv " +
+                                 " ".join(f"%d{i}" for i in range(count)),
+                                 "%rhs = OpCompositeConstruct %dv " + " ".join(["%two"] * count)]
+                header = HEADER.replace("OpCapability Shader", "OpCapability Shader\nOpCapability Float64")
+                header = header.replace('"main" %out', '"main" %out ' + " ".join(names))
+                header = header.replace("%main = OpFunction", "\n".join(declarations) + "\n%main = OpFunction")
+                body = constructs + ["%product = OpFMul %dv %lhs %rhs"]
+                for i in range(count):
+                    body += [f"%r{i} = OpCompositeExtract %double %product {i}",
+                             f"%b{i} = OpBitcast %u2 %r{i}", f"OpStore %out{i} %b{i}"]
+                outputs = si.run_fragment(header + "\n".join(body) + "\n" + FOOTER)
+                for i, value in enumerate(values[:count]):
+                    self.assertEqual(outputs[f"%out{i}"], struct.unpack("<2I", struct.pack("<d", value * 2)))
+
+    def test_unsupported_binary64_vector_arithmetic_is_refused(self):
+        for op in ("OpFAdd", "OpFSub", "OpFDiv"):
+            with self.subTest(op=op):
+                declarations = ("%double = OpTypeFloat 64\n%dv = OpTypeVector %double 2\n"
+                                "%one = OpConstant %double 1\n")
+                header = HEADER.replace("%main = OpFunction", declarations + "%main = OpFunction")
+                header = header.replace("OpCapability Shader", "OpCapability Shader\nOpCapability Float64")
+                body = f"%ones = OpCompositeConstruct %dv %one %one\n%r = {op} %dv %ones %ones\n"
+                with self.assertRaisesRegex(si.UnsupportedConstruct, "binary64"):
+                    si.run_fragment(header + body + FOOTER)
+
     def test_bitfield_extract(self):
         # SPIR-V: Count 0 gives 0; SExtract replicates the field's top bit; UExtract zero-extends.
         self.assertEqual(run_word("%res = OpBitFieldSExtract %uint %cF0 %c2 %c4\n"), 0xFFFFFFFC)   # 0b1100 -> -4
