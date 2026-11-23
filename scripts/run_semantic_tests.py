@@ -8,7 +8,8 @@ It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
-line, and exits 1 if a file fails or none is found. Standard library only.
+line, and exits 1 if a file fails, none is found, or a folder cannot be read (a package that chmod 000 or a denied
+ACL hides can hold failing files, so it is an error and not a skip). Standard library only.
 """
 import argparse
 import concurrent.futures
@@ -20,10 +21,19 @@ import sys
 import time
 
 
+def _raise(error):
+    """os.walk's onerror: a folder it cannot list is an error, not a folder to skip."""
+    raise error
+
+
 def test_modules(directory):
-    """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only)."""
+    """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only).
+
+    os.walk skips a folder it cannot list (its onerror defaults to ignore), which would hide every test below a
+    chmod 000 package or a denied ACL, so that error is raised instead and main reports it.
+    """
     names = []
-    for base, dirs, files in os.walk(directory):
+    for base, dirs, files in os.walk(directory, onerror=_raise):
         dirs[:] = sorted(d for d in dirs if os.path.isfile(os.path.join(base, d, "__init__.py")))
         prefix = os.path.relpath(base, directory).replace(os.sep, ".")
         for name in sorted(files):
@@ -51,7 +61,12 @@ def main(argv=None):
     if a.jobs <= 1:
         return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
                                 *(["-v"] if a.verbose else [])])
-    modules = test_modules(directory)
+    try:
+        modules = test_modules(directory)
+    except OSError as error:
+        print(f"cannot read {getattr(error, 'filename', None) or directory}: {error.strerror or error}")
+        return 1
+
     if not modules:
         print(f"no test*.py files in {directory}")
         return 1
