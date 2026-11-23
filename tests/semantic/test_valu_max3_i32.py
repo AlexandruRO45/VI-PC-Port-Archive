@@ -453,5 +453,79 @@ class TestVMax3I32SIMD(unittest.TestCase):
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.get_vgpr(lane, 0), sentinel)
 
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestVMax3I32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self) -> None:
+        """Verify in-place update when dst is src0: v0 = max3(v0, v1, v2)."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, (-50) & MASK32)
+        state.set_vgpr(1, 10)
+        state.set_vgpr(2, 5)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(1), src2=VGPR(2))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 10)
+        self.assertEqual(state.get_vgpr(0), 10)
+
+    def test_alias_dst_equals_src1(self) -> None:
+        """Verify in-place update when dst is src1: v0 = max3(v1, v0, v2)."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, 100)
+        state.set_vgpr(1, (-10) & MASK32)
+        state.set_vgpr(2, 50)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(0), src2=VGPR(2))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 100)
+        self.assertEqual(state.get_vgpr(0), 100)
+
+    def test_alias_dst_equals_src2(self) -> None:
+        """Verify in-place update when dst is src2: v0 = max3(v1, v2, v0)."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, 75)
+        state.set_vgpr(1, 10)
+        state.set_vgpr(2, 20)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(0))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 75)
+        self.assertEqual(state.get_vgpr(0), 75)
+
+    def test_alias_all_registers_same(self) -> None:
+        """Verify idempotent in-place update when dst and all sources share one register: v0 = max3(v0, v0, v0)."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, (-999) & MASK32)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(0), src2=VGPR(0))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, (-999) & MASK32)
+        self.assertEqual(state.get_vgpr(0), (-999) & MASK32)
+
+    def test_alias_two_sources_same(self) -> None:
+        """Verify behavior when two sources share a register: v0 = max3(v1, v1, v2)."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, (-20) & MASK32)
+        state.set_vgpr(2, (-5) & MASK32)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(1), src2=VGPR(2))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, (-5) & MASK32)
+        self.assertEqual(state.get_vgpr(0), (-5) & MASK32)
+
 if __name__ == "__main__":
     unittest.main()
