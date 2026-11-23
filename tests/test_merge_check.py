@@ -213,6 +213,32 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(r["commits"], {"total": 1, "on_main": 0})
 
+    def test_changes_made_only_in_a_new_merge_commit_are_not_already_merged(self):
+        base = self.git("rev-parse", "main")
+        self.pr_branch("first", base, "\n" + PARAGRAPH)
+        self.merge(11, "first")
+
+        self.git("checkout", "-q", "-b", "side", base)
+        self.write("docs/side.md", "An unrelated change already on main.\n")
+        self.commit("side work")
+        self.git("checkout", "-q", "main")
+        self.merge(12, "side")
+
+        self.git("checkout", "-q", "-b", "follow-up", "first")
+        self.git("merge", "--no-ff", "-m", "Merge already-landed branches", "side")
+        code, [result] = self.run_check("11=follow-up")
+        self.assertEqual((code, result["verdict"]), (1, "already-merged"))
+
+        self.write("docs/merge-note.md", "This content exists only in the new merge commit.\n")
+        self.git("add", "--", "docs/merge-note.md")
+        self.git("commit", "-q", "--amend", "--no-edit")
+        self.assertEqual(self.git("cherry", "main", "follow-up"), "")
+
+        code, [result] = self.run_check("11=follow-up")
+        self.assertEqual(result["commits"], {"total": 0, "on_main": 0})
+        self.assertTrue(result["merges"])
+        self.assertEqual((code, result["verdict"]), (0, "clean"))
+
     def test_one_or_two_repeated_lines_are_not_reported(self):
         base = self.git("rev-parse", "main")
         self.pr_branch("first", base, "\nself.assertEqual(result.returncode, 0, result.stdout + result.stderr)\n")
