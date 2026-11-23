@@ -304,5 +304,49 @@ class ReportPathTests(unittest.TestCase):
                 self.assertEqual(f.read(), b"keep me")
 
 
+    def test_an_unwritable_report_is_refused_before_the_probe(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "not_a_folder")
+            with open(blocker, "wb") as f:
+                f.write(b"keep me")
+            err = io.StringIO()
+            with mock.patch.object(runner, "open_oracle") as oracle:
+                with redirect_stderr(err):
+                    rc = pr.main(["--formats", "unorm8", "--json", os.path.join(blocker, "r.json")])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            oracle.assert_not_called()
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
+
+    def test_no_report_file_is_left_when_the_oracle_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "r.json")
+            err = io.StringIO()
+            with mock.patch.object(runner, "open_oracle", side_effect=runner.Unavailable("no hardware")), \
+                    redirect_stderr(err):
+                rc = pr.main(["--formats", "unorm8", "--json", report])
+            self.assertEqual(rc, 77, err.getvalue())
+            self.assertFalse(os.path.exists(report))
+
+    def test_an_existing_report_survives_a_failed_probe(self):
+        class FailingOracle(FakeOracle):
+            def run(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "r.json")
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write("old report\n")
+            buf = io.StringIO()
+            with mock.patch.object(runner, "open_oracle", return_value=FailingOracle()):
+                with redirect_stdout(buf):
+                    rc = pr.main(["--formats", "unorm8", "--json", report])
+            self.assertEqual(rc, 2, buf.getvalue())
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "old report\n")
+
+
 if __name__ == "__main__":
     unittest.main()

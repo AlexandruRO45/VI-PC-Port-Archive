@@ -41,6 +41,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -303,6 +304,23 @@ def main(argv=None):
         ap.error("unknown or empty: " + ", ".join(bad or ["--formats/--waves"]))
     if a.json and os.path.isdir(a.json):
         ap.error(f"--json {a.json} is a folder, not a file")
+    if a.json:
+        # Probe the report path before the hardware sweep: a bad path must not cost the whole run, and an
+        # existing report stays intact until the run succeeds. A missing path is checked by creating a throwaway
+        # file in its folder, so an early exit (77, harness error) leaves no 0-byte report behind (tupacfan04's
+        # review of #4711).
+        try:
+            parent = os.path.dirname(os.path.abspath(a.json))
+            os.makedirs(parent, exist_ok=True)
+            if os.path.exists(a.json):
+                with open(a.json, "r+", encoding="utf-8"):
+                    pass
+            else:
+                with tempfile.NamedTemporaryFile(dir=parent, prefix=".d16-report-", delete=True):
+                    pass
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e}", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
