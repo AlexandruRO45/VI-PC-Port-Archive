@@ -596,6 +596,32 @@ Three more parameters hold sRGB colour-like textures on map materials and are no
 a tiling detail layer next to the two-layer `lyr0diffusetex`/`lyr1diffusetex` blend). `tinttexture` holds an
 ID/palette map on most materials and is not a base colour outside terrain.
 
+Whole map export (`tools/texture_slot_formats.py <work>/assets --archive levels`): every material texture binding of
+the 343,327 `levels` models (20,128,930 bindings, 115 parameters), each texture counted once per parameter and its
+format taken from where its 64-bit `Id64` resolves exactly (a texture pool `AssetKey`, else an embedded `Key`). The
+stored 32-bit name hash is only a fallback candidate (35 textures over all parameters; not counted below). The
+formats agree with the sample above. The last column is over the whole export (382,781 models, 124 parameters): most
+BC5 normal maps are outside the map.
+
+| Parameter | Textures | Exact | Unresolved | Formats (DXGI: textures) | Whole export: BC5 in this slot |
+|---|---:|---:|---:|---|---:|
+| `0xC8E8C282` `diffusetex` | 81,355 | 79,969 | 1,381 | 72: 63,445, 99: 13,654, 78: 2,788, 65: 33, 8 more | 1 |
+| `0x1E77BF4C` `bumptex` | 49,375 | 47,981 | 1,392 | 71: 46,581, 98: 1,196, 83: 190, 4 more | 1,817 |
+| `0xC6F46E79` `speculartex` | 53,470 | 51,909 | 1,558 | 71: 48,006, 98: 3,801, 28: 89, 5 more | 1 |
+| `0x739E3D0D` `speculartex2` | 11,427 | 10,372 | 1,049 | 98: 6,498, 71: 3,833, 65: 19, 5 more | 0 |
+| `0x3FB7964F` `tinttexture` | 1,841 | 1,828 | 12 | 72: 1,549, 99: 176, 78: 95, 4 more | 0 |
+| `0xC075F9B6` `lookuptexture` | 1,720 | 1,704 | 14 | 71: 992, 98: 706, 4 more | 0 |
+| `0x7485DAFB` (name not found) | 2,031 | 1,995 | 35 | 99: 1,153, 72: 699, 78: 106, 4 more | 0 |
+| `0x17D3B5C2` (name not found) | 91 | 91 | 0 | 72: 87, 95: 2, 77: 1, 99: 1 | 0 |
+| `0x6994EF3F` (name not found) | 62 | 58 | 3 | 99: 52, 95: 2, 4 more | 0 |
+| `0x2C8D7182` (name not found) | 111,572 | 8 | 111,564 | 91: 3, 72: 2, 29: 1, 71: 1 | 0 |
+
+"Exact" includes keys found with two formats in different pools (at most 2 per parameter), which are left out of
+the format tally; textures whose name hash is on more than one entry (at most 1 per parameter here) are neither
+exact nor unresolved. `0x2C8D7182` is bound on 1,010,957 map bindings, but almost none of its 111,572 keys is a pool
+or embedded texture; hypothesis: it names a texture made or streamed at run time, not one in the exported pools.
+The full per-parameter report, for the map and for the whole export, is the tool's `--json` output.
+
 ## BCPack block structure and limits
 
 A BCPack chunk is not a self-describing container. The container gives it a decoded (virtual)
