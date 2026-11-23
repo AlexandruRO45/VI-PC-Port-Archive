@@ -87,6 +87,7 @@ def main() -> int:
             "lunarg_api_dump.pre_dump = true\n"
             "lunarg_api_dump.detailed = true\n",
             encoding="utf-8",
+            newline="\n",
         )
         dump_env, validation_env = pass_envs(os.environ, path)
         # Two runs, one layer each. SDK 1.4.363's api_dump reads the VkDevice's dispatch key after the call down the
