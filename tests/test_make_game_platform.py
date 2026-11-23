@@ -378,6 +378,11 @@ class RuntimePackagingTest(unittest.TestCase):
         seen = start(os.path.join(moved, "gta6rt.cmd"), "--dry-run")
         self.assertEqual(seen["env"].get("LEONIDA_SHADERS"),
                          os.path.join(moved, "Shader cache 100% '$HOME'", "shaders", "spirv"))
+        # Passthrough after the move: the arguments stay as given, and shader_path.txt's old absolute path is not used.
+        seen = start(os.path.join(moved, "gta6rt.cmd"), "--run", "other.exe", "--trace", "t.jsonl")
+        self.assertEqual(seen.get("argv"), ["--run", "other.exe", "--trace", "t.jsonl"])
+        self.assertEqual(seen["env"], {"LEONIDA_SHADERS": os.path.join(moved, "Shader cache 100% '$HOME'",
+                                                                       "shaders", "spirv")})
 
     def test_runtime_records_shader_work_directory(self):
         self.write_artifact("gta6rt_tls_host.dll", b"TLS host")

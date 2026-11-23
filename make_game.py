@@ -2094,8 +2094,15 @@ def windows_launcher(out: str, work: str, image: str) -> str:
     if path_is_within(shaders, os.path.abspath(out)):
         recorded = literal(os.path.join(os.path.abspath(out), ""))
         relative = literal(os.path.relpath(shaders, out))
-        moved_catalog = (f'if /i not "%here%"=="{recorded}" if not defined LEONIDA_SHADERS '
-                         f'set "LEONIDA_SHADERS=%here%{relative}"\n')
+        # Before the mode dispatch, so a passthrough run of a moved port finds its shaders too. The names are UTF-8
+        # and are compared in code page 65001, which is then put back.
+        moved_catalog = ('rem If the whole port folder moved, its shaders moved with it.\n'
+                         'set "cp="\n'
+                         'for /f "tokens=2 delims=:." %%C in (\'chcp\') do set "cp=%%C"\n'
+                         'if defined cp chcp 65001 >nul\n'
+                         f'if /i not "%here%"=="{recorded}" if not defined LEONIDA_SHADERS '
+                         f'set "LEONIDA_SHADERS=%here%{relative}"\n'
+                         'if defined cp chcp %cp% >nul\n')
     # The generated rem lines must not expand anything: cmd expands %-references before it recognizes rem, so an
     # argument reference in a comment would put the caller's text (quotes, &, |, >) into the parsed line. The two
     # second-argument checks below are explained here instead: %~2 is empty both without a second argument and with
@@ -2105,7 +2112,7 @@ rem Starts gta6rt.exe, as gta6rt.sh does under Wine. --dry-run, --init or --run 
 rem game_path.txt, the port's overlay for writes and the Vulkan backend; other arguments go to gta6rt.exe as given.
 setlocal EnableExtensions DisableDelayedExpansion
 set "here=%~dp0"
-rem Package mode only for the mode on its own; an explicitly empty second argument also passes through.
+{moved_catalog}rem Package mode only for the mode on its own; an explicitly empty second argument also passes through.
 if not "%~2"=="" goto pass
 if "%2"==\"\"\"\" goto pass
 if "%~1"=="--dry-run" goto package
@@ -2120,7 +2127,7 @@ if defined cp chcp 65001 >nul
 set "game="
 set /p game=<"%here%game_path.txt"
 set "image={literal(image)}"
-{moved_catalog}if defined cp chcp %cp% >nul
+if defined cp chcp %cp% >nul
 if not defined game goto no_game
 rem pushd, not cd /d: a UNC package folder gets a temporary drive letter, which popd removes again.
 pushd "%game%" || exit /b 1
