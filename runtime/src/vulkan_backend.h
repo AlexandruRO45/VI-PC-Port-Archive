@@ -32,6 +32,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1961,15 +1962,17 @@ public:
         std::vector<std::shared_ptr<void>> retired;
         {
             std::lock_guard state(state_mutex_);
-            if (must_hold()) {
+            if (!must_hold()) {
+                ok = submit(VK_NULL_HANDLE, fence, value);
+            } else if (context_.is_device_lost()) {
+                ok = false;
+            } else {
                 Deferred op;
                 op.kind = Deferred::Kind::signal;
                 op.fence = fence;
                 op.value = value;
                 if (pin) op.pins.push_back(pin());
                 hold(std::move(op));
-            } else {
-                ok = submit(VK_NULL_HANDLE, fence, value);
             }
             drain_pins(retired);
         }
@@ -2005,6 +2008,7 @@ public:
         std::vector<std::shared_ptr<void>> retired;
         std::lock_guard state(state_mutex_);
         drain_pins(retired);  // destroyed after the lock (reverse declaration order)
+        if (context_.is_device_lost()) return;
         if (!held_.empty()) {  // behind the held work, so behind it in the queue's labels too
             Deferred op;
             op.kind = Deferred::Kind::marker;
@@ -2667,9 +2671,22 @@ private:
             break;
         }
         retire_pins(op.pins, submitted_);  // the fence it signals, the pipeline states: until its submission is done
-        waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
-        wait_values_.insert(wait_values_.end(), later_values.begin(), later_values.end());
-        for (auto& pin : later_pins) wait_pins_.push_back(std::move(pin));
+        // Unconsumed waits (after a failed op or a marker) stay ahead of any later held operations in queue order,
+        // before waits queued after held_ was built.
+        if (!waits_.empty() && !held_.empty()) {
+            Deferred& next = held_.front();
+            next.waits.insert(next.waits.begin(), waits_.begin(), waits_.end());
+            next.wait_values.insert(next.wait_values.begin(), wait_values_.begin(), wait_values_.end());
+            next.wait_pins.insert(next.wait_pins.begin(), std::make_move_iterator(wait_pins_.begin()),
+                                  std::make_move_iterator(wait_pins_.end()));
+            waits_ = std::move(later_waits);
+            wait_values_ = std::move(later_values);
+            wait_pins_ = std::move(later_pins);
+        } else {
+            waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
+            wait_values_.insert(wait_values_.end(), later_values.begin(), later_values.end());
+            for (auto& pin : later_pins) wait_pins_.push_back(std::move(pin));
+        }
     }
 
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
@@ -2684,7 +2701,12 @@ private:
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
                 context_.holds().held_changed(-1);
-                if (!context_.is_device_lost()) run(op);
+                if (!context_.is_device_lost()) {
+                    run(op);
+                } else {
+                    retire_pins(op.pins, 0);
+                    retire_pins(op.wait_pins, 0);
+                }
                 released = true;
             }
             drain_pins(retired);

@@ -314,8 +314,9 @@ int main() {
 
         // 3b. The same for a batch held behind a Wait with no submitted Signal (queue_holds.h): its submission
         //     fails when the CPU Signal releases it, the failure is reported through take_held_failure(), and its
-        //     waits stay for the next submission, as when the call is not held. A Signal queued behind the failed
-        //     batch still runs.
+        //     waits stay for the next submission, as when the call is not held: if a held Signal sits right behind it,
+        //     that Signal consumes the wait so it cannot run ahead on the GPU; if no held op follows, the retry
+        //     carries the wait.
         {
             VulkanFence gate(context, 0), after(context, 0);
             EXPECT(gate.semaphore() != VK_NULL_HANDLE && after.semaphore() != VK_NULL_HANDLE);
@@ -331,11 +332,36 @@ int main() {
             EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);   // held: the Signal is not submitted yet
             EXPECT(queue_a.signal(after.semaphore(), 1));                  // held behind it
             EXPECT(after.completed() == 0 && queue_a.take_held_failure() == ReplayResult::success);
+            driver::captured_wait_count.store(0);
+            driver::captured_wait_sem.store(0);
+            driver::captured_wait_val.store(0);
+            driver::capture_next_waits.store(true);
             driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
             EXPECT(gate.signal(1));                                        // releases the batch on this thread
             EXPECT(queue_a.take_held_failure() == ReplayResult::unsupported);
             EXPECT(queue_a.take_held_failure() == ReplayResult::success);  // reported once
             EXPECT(queue_a.idle() && after.completed() == 1);              // the Signal behind it still signaled
+            EXPECT(driver::captured_wait_count.load() == 1);               // the held Signal carried (gate, 1)
+            EXPECT(driver::captured_wait_sem.load() == reinterpret_cast<std::uintptr_t>(gate.semaphore()));
+            EXPECT(driver::captured_wait_val.load() == 1);
+
+            driver::captured_wait_count.store(0);
+            driver::capture_next_waits.store(true);
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
+            EXPECT(queue_a.idle());
+            EXPECT(driver::captured_wait_count.load() == 0);
+            std::uint64_t got = 0;
+            std::memcpy(&got, dst_ptr, sizeof(got));
+            EXPECT(got == pattern);
+
+            VulkanFence gate2(context, 0);
+            EXPECT(gate2.semaphore() != VK_NULL_HANDLE);
+            std::memset(dst_ptr, 0, sizeof(pattern));
+            queue_a.wait(gate2.semaphore(), 1);
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
+            driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            EXPECT(gate2.signal(1));
+            EXPECT(queue_a.take_held_failure() == ReplayResult::unsupported);
 
             driver::captured_wait_count.store(0);
             driver::captured_wait_sem.store(0);
@@ -343,10 +369,9 @@ int main() {
             driver::capture_next_waits.store(true);
             EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
             EXPECT(queue_a.idle());
-            EXPECT(driver::captured_wait_count.load() == 1);   // the failed batch's wait on (gate, 1) came along
-            EXPECT(driver::captured_wait_sem.load() == reinterpret_cast<std::uintptr_t>(gate.semaphore()));
+            EXPECT(driver::captured_wait_count.load() == 1);   // the failed batch's wait on (gate2, 1) came along
+            EXPECT(driver::captured_wait_sem.load() == reinterpret_cast<std::uintptr_t>(gate2.semaphore()));
             EXPECT(driver::captured_wait_val.load() == 1);
-            std::uint64_t got = 0;
             std::memcpy(&got, dst_ptr, sizeof(got));
             EXPECT(got == pattern);
             std::printf("queue/query sync: failed held batch reported, its wait kept for the retry, Signal behind it ran\n");
