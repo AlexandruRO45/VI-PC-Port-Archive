@@ -165,5 +165,21 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
         self.assertEqual(lo, 0x3c00) # NMin returns non-NaN
         self.assertEqual(hi, 0x4000) # min(Inf, 2.0) = 2.0
 
+    def test_v_pk_min_f16_translator_integration_and_negative_controls(self):
+        lines = [
+            "v_mov_b32 v1, 0x40003c00", # hi: 2.0, lo: 1.0
+            "v_mov_b32 v2, 0x42004000", # hi: 3.0, lo: 2.0
+            "v_pk_min_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_v_pk_min_f16", lines)
+        out = mrt0_words(spv)[0]
+        self.assertEqual(out, 0x40003c00)
+
+        # Negative control
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_pk_min", ["v_pk_min_f16 v0", "s_endpgm"])
+
 if __name__ == '__main__':
     unittest.main()
