@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Discover development tools in this Leonida checkout."""
+"""Use development tools from this Leonida checkout."""
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+GUEST_SCENE = "scripts/run_guest_scene.py"
 TOOLS = (
     (
         "boot-trace",
@@ -15,7 +18,7 @@ TOOLS = (
     ),
     (
         "guest-scene",
-        "scripts/run_guest_scene.py",
+        GUEST_SCENE,
         (
             "Python 3",
             "gta6rt and tiny_guest_draw built with LEONIDA_GUEST_SCENE (static SDL3)",
@@ -47,12 +50,40 @@ def discover() -> dict:
     }
 
 
+def guest_scene(args: list[str]) -> int:
+    # Only enforce the persistent output option here. The runner parses the original argv.
+    parser = argparse.ArgumentParser(prog="dev.py guest-scene", add_help=False, allow_abbrev=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("--out", metavar="PATH")
+    options, _ = parser.parse_known_args(args)
+    if not options.help and not options.out:
+        parser.error("--out PATH is required to keep the scene results")
+
+    producer = ROOT / GUEST_SCENE
+    if not producer.is_file():
+        print(f"error: {GUEST_SCENE} is missing; use a complete Leonida checkout", file=sys.stderr)
+        return 2
+    try:
+        return subprocess.run(
+            [sys.executable, "-I", str(producer), *args],
+            cwd=Path.cwd(),
+        ).returncode
+    except OSError as exc:
+        print(f"error: could not run {GUEST_SCENE}: {exc}", file=sys.stderr)
+        return 2
+
+
 def main() -> int:
+    argv = sys.argv[1:]
+    if argv[:1] == ["guest-scene"]:
+        return guest_scene(argv[1:])
+
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     inventory = commands.add_parser("discover", help="list producer scripts and their requirements")
     inventory.add_argument("--json", action="store_true", help="write a JSON inventory to stdout")
-    args = parser.parse_args()
+    commands.add_parser("guest-scene", help="run the synthetic guest scene with a required --out")
+    args = parser.parse_args(argv)
 
     result = discover()
     if args.json:
