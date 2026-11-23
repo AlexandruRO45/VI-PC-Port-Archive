@@ -170,7 +170,7 @@ class ClassifyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "a.rpf")
             with open(path, "wb") as fh:
-                fh.write(struct.pack("<II", 0, 16) + bytes(8) + zlib.compress(data))
+                fh.write(struct.pack("<4sI", b"9FPR", 16) + bytes(8) + zlib.compress(data))
             rows, _ = story_index.scan_rpf(path)
         self.assertEqual([(r["signature"], r["count"]) for r in rows], [("clip-stream", 3)])
 
@@ -421,6 +421,24 @@ class ArchiveTest(unittest.TestCase):
         rows, summary = story_index.scan_rpf(empty)
         self.assertEqual(rows, [])
         self.assertEqual((summary["files"], summary["span"]), (0, 0))
+
+    def test_cli_rejects_nonempty_files_without_an_rpf9_header(self):
+        source = os.path.join(self.root, "bad.rpf")
+        out = os.path.join(self.root, "bad.json")
+        cases = {
+            "wrong magic": struct.pack("<4sI", b"JUNK", 8) + zlib.compress(psin()),
+            "short header": b"9FPR" + bytes(3),
+        }
+        for name, data in cases.items():
+            with self.subTest(name=name):
+                with open(source, "wb") as f:
+                    f.write(data)
+                result = subprocess.run([sys.executable, "-I", TOOL, source, out, "--quiet"],
+                                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("not an RPF9 archive", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(os.path.exists(out))
 
     def test_cli_rejects_bad_ranges(self):
         out = os.path.join(self.root, "bad.json")

@@ -167,10 +167,16 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     rows = []
     t0 = time.time()
     with open(path, "rb") as fh:
-        # mmap refuses an empty file; an empty buffer walks the same code and finds no streams
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) if os.fstat(fh.fileno()).st_size else b""
+        if os.fstat(fh.fileno()).st_size:
+            header = fh.read(8)
+            if len(header) < 8 or header[:4] not in (b"9FPR", b"RPF9"):
+                raise ValueError("not an RPF9 archive")
+            first = struct.unpack_from("<I", header, 4)[0]
+            m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        else:
+            # mmap refuses an empty file; keep its empty scan result.
+            m, first = b"", 0
         size = len(m)
-        first = struct.unpack_from("<I", m, 4)[0] if size >= 8 else 0
         pos = start if start is not None else first
         if not 0 <= pos <= size:
             if size:
