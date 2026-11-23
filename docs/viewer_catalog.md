@@ -59,8 +59,10 @@ Anything else leaves the window partial: a full disk, a `--max-new` pause, an ex
 failed. The ready models stay in the catalog, the exit code is nonzero unless the run only paused, and the status
 message says `levels windows complete: N/M`. The next run exports every incomplete window again from scratch and
 reuses GLBs it already wrote, so an interruption at any point is safe. If a crash happens between the checkpoint and
-the cleanup, the leftover staging folder is removed on the next run. Changing `--window-mib` or the archive size
-discards the checkpoint. A window that cannot be exported is reported and the others still run.
+the cleanup, the leftover staging folder is removed on the next run. Before using a manifest, the builder verifies
+that it names the requested source and exact byte range. A change to the source size, modification time, or window
+size invalidates the checkpoint. Use a fresh catalog for the changed run. A window that cannot be exported is
+reported and the others still run.
 
 Coverage limits: a window is a raw slice of the archive, so a resource that straddles a window edge may not be
 recovered. Those candidates are counted in the status message as `window candidates not recovered` and are not

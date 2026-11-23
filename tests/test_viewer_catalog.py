@@ -264,10 +264,11 @@ class CatalogTests(unittest.TestCase):
         (root / "0-5").mkdir(parents=True)
         other = self.root / "x" / "windows" / "other"
         other.mkdir()
-        for bad in (other, root, root / "0-5" / "..", self.root / "x"):
+        for bad in (other, root, root / "0-5" / "..", root / "not-a-window", self.root / "x"):
             with self.assertRaises(OSError):
                 viewer_catalog.release(bad, root)
         self.assertTrue(other.is_dir() and root.is_dir())
+        viewer_catalog.release(root / "5-5", root)
         viewer_catalog.release(root / "0-5", root)
         self.assertFalse((root / "0-5").exists())
 

@@ -608,12 +608,12 @@ def check_window_manifest(manifest: Path, source: Path, start: int, length: int)
 
 def release(folder: Path, root: Path) -> None:
     """Delete one owned window staging folder: exactly <root>/<start>-<length>, root = <exports>/windows/<stem>."""
-    if not folder.exists():
-        return
     if (folder.parent != root or not re.fullmatch(r"\d+-\d+", folder.name) or root.parent.name != "windows"
             or folder.resolve() != folder or root.resolve() != root or linked(root) or linked(root.parent)):
         raise OSError(f"refusing to delete {folder}: not an owned window staging folder")
     safe_destination(folder, root)
+    if not folder.exists():
+        return
     for directory, subdirs, files in os.walk(folder):
         if any(linked(Path(directory) / name) for name in subdirs + files):
             raise OSError(f"refusing linked entry in window staging: {folder}")
@@ -631,7 +631,7 @@ def export_windows(catalog: Catalog, args, relative: str, source: Path, work: Pa
     record = catalog.windows.get(relative)
     if record and any(record.get(name) != value for name, value in identity.items()):
         catalog.issue("stale window checkpoint refused",
-                      f"{relative} changed since {STATE_NAME} was written; remove that file to start over")
+                      f"{relative} or its window size changed since {STATE_NAME} was written; use a fresh catalog")
         return True
     if not record:
         record = catalog.windows[relative] = {**identity, "completed": []}
@@ -657,6 +657,7 @@ def export_windows(catalog: Catalog, args, relative: str, source: Path, work: Pa
             folder.mkdir(parents=True, exist_ok=True)
             export_models(command, source, folder, reserve, window=(start, length))
             manifest = folder / stem / "models" / "manifest.json"
+            safe_destination(manifest, folder)
             if not manifest.is_file():
                 raise OSError(f"rpf9dump did not publish a manifest for {source.name} window {start}")
             check_window_manifest(manifest, source, start, length)
