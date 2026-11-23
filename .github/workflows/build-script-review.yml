@@ -1,0 +1,31 @@
+name: Build-script review
+
+on: pull_request
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-script-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Summarize added lines for human review
+        # The first parent is the base used to construct this PR's test merge.
+        run: |
+          reporter=scripts/review_build_changes.py
+          if ! git cat-file -e "HEAD^1:$reporter"; then
+            echo "The base commit does not yet contain the build-script reporter." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git show "HEAD^1:$reporter" > "$RUNNER_TEMP/build-review.py"
+          python3 -I "$RUNNER_TEMP/build-review.py" HEAD^1 HEAD \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
