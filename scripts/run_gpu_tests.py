@@ -115,7 +115,7 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
         flag="--llvm-mc",
         input=raw,
         capture_output=True,
-        text=True,
+        text=True, errors="replace",
     )
     if p.returncode != 0:
         raise RuntimeError(f"llvm-mc failed on {name}:\n{p.stderr}")
@@ -149,7 +149,7 @@ def spirv_as(asm_text: str, out_spv: str, assembler: str = "spirv-as") -> None:
             f.write(spv_bytes)
         return
     p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
-                       input=asm_text, capture_output=True, text=True)
+                       input=asm_text, capture_output=True, text=True, errors="replace")
     if p.returncode != 0:
         raise RuntimeError(f"spirv-as failed for {out_spv}:\n{p.stderr}")
 
@@ -295,7 +295,7 @@ def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
     # gpu=False (the translator over the whole suite) runs without a limit.
     limit = gpu_test_timeout() if gpu else None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
@@ -337,7 +337,7 @@ def _device_per_vertex():
         answer = None
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, errors="replace", timeout=60)
             answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass

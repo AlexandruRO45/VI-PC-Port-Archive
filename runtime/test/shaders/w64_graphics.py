@@ -260,7 +260,7 @@ def _draw_heap(tools, spirv, name, size, tmp):
         vs, records = os.path.join(spirv, "vs_ids.spv"), VS_VERTICES // 3
     # The triangles have zero area (a GS fixture emits no primitive), so no pixel is drawn and any fragment shader does.
     cmd = [os.path.join(tools, "vk_harness" + EXE), vs, os.path.join(spirv, "ps_w64_a_skip.spv"), str(raw)]
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env, timeout=120)
     out = r.stdout + r.stderr
     if r.returncode == UNSUPPORTED:
         return None, "unsupported: " + out.strip().splitlines()[-1]
@@ -316,7 +316,7 @@ def draw(tools, spirv, name, size, tmp):
         env["VKH_HEAP_DUMP"] = str(heap)
     cmd = [os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"), os.path.join(spirv, name + ".spv"),
            str(raw)]
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env, timeout=120)
     out = r.stdout + r.stderr
     if r.returncode == UNSUPPORTED:
         return None, "unsupported: " + out.strip().splitlines()[-1], None

@@ -648,7 +648,7 @@ def timed_out(name, limit):
 def run(*cmd, env=None, cwd=None):
     limit = gpu_test_timeout()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
@@ -1078,7 +1078,7 @@ def mesh_w64x_test(tools, spirv, name):
         harness = os.path.join(tools, "vk_harness" + EXE)
         limit = gpu_test_timeout()
         try:
-            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, env=env, timeout=limit)
+            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, errors="replace", env=env, timeout=limit)
         except subprocess.TimeoutExpired:
             return timed_out(harness, limit)
         except OSError as e:

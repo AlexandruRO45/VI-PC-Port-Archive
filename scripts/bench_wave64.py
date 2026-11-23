@@ -35,7 +35,7 @@ def build(work, name, emulate, llvm_mc):
     env.pop("LEONIDA_W64_EMULATE", None)
     if emulate:
         env["LEONIDA_W64_EMULATE"] = "1"
-    r = subprocess.run([sys.executable, "-I", BUILD_PY, out, name], env=env, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-I", BUILD_PY, out, name], env=env, capture_output=True, text=True, errors="replace")
     if r.returncode:
         sys.exit(r.stdout + r.stderr)
     return os.path.join(out, "spirv", name + ".spv")
@@ -59,7 +59,7 @@ def run(tools, spv, groups, reps, driver, emulate):
     if not emulate:
         args.append("--require-wave64")
     try:
-        r = subprocess.run(args, env=env, capture_output=True, text=True)
+        r = subprocess.run(args, env=env, capture_output=True, text=True, errors="replace")
     except OSError as e:
         return None, f"{args[0]}: {e}", None
     out = r.stdout + r.stderr

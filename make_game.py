@@ -1019,7 +1019,7 @@ def dotnet_sdk_ok() -> bool:
     if not shutil.which("dotnet"):
         return False
     try:
-        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
@@ -1638,7 +1638,7 @@ def runtime_gpu_info() -> dict:
     """tools/vk_subgroup_info.py's answer for the GPU the runtime would use; {} when it can't tell."""
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60)
         info = json.loads(r.stdout.strip().splitlines()[-1])
         return info if isinstance(info, dict) and "error" not in info else {}
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
@@ -1650,7 +1650,7 @@ def runtime_gpu_per_vertex():
     driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60)
         v = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
@@ -1925,7 +1925,7 @@ def compute_decoder_digest() -> str:
     # there; hash third_party/rpf9-explorer/Core as well if such copies need it.
     git = shutil.which("git")
     if git and os.path.exists(os.path.join(sub, ".git")):
-        r = subprocess.run([git, "-C", sub, "rev-parse", "HEAD"], capture_output=True, text=True)
+        r = subprocess.run([git, "-C", sub, "rev-parse", "HEAD"], capture_output=True, text=True, errors="replace")
         pin = r.stdout.strip() if r.returncode == 0 else ""
         # An edit to a tracked submodule file that is not committed changes the decoder but not HEAD.
         # shortcut: new untracked files in the submodule are not seen; hash them too if that comes up.
@@ -2486,7 +2486,7 @@ def checker_supports(exe: str, *options: str) -> bool:
     2) before touching Vulkan. Builds before --inflight-file don't reject unknown arguments, so asking is the only way
     to tell."""
     try:
-        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     usage = (r.stdout or "") + (r.stderr or "")
