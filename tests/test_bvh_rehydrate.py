@@ -266,5 +266,26 @@ class TestErrorsAndCli(unittest.TestCase):
             self.assertIn("rehydrated", text.getvalue())
 
 
+class ParentTableBounds(unittest.TestCase):
+    """A parent entry outside [64, offsetToElements) must not overwrite the header or a leaf/node record."""
+
+    def test_zero_parent_offset_does_not_clobber_the_header(self):
+        src = bytearray(0x100)
+        flags = 0x01000005 | 0x80000000
+        src[:64] = header(0x100, 0, (0, 0, 0, 1, 1, 1), 0x80, ptr(0x40, R.BOX16), 0x40, 0, flags=flags)
+        out = R.rehydrate(bytes(src), [])
+        # Only the dehydrated bit is cleared; the rest of flags survives.
+        self.assertEqual(struct.unpack_from("<I", out, 0)[0], flags & ~R.FLAG_DEHYDRATED)
+
+    def test_entry_at_offset_to_elements_is_skipped(self):
+        # offsetToParents = offsetToElements => the first unit points at the leaf area, not the parent table.
+        src = bytearray(0x200)
+        src[:64] = header(0x200, 0, (0, 0, 0, 1, 1, 1), 0x80, ptr(0x40, R.BOX16), 0x40, 0x40)
+        hdr = R.Header(src)
+        self.assertIsNone(hdr.parent_entry_in_table(0x40, len(src)))
+        out = R.rehydrate(bytes(src), [])
+        self.assertEqual(struct.unpack_from("<I", out, 0x40)[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

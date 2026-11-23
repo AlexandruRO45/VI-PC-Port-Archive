@@ -170,6 +170,17 @@ class Header:
         unit = ((node_offset - self.offset_to_elements) & M32) >> 6
         return (self.offset_to_parents + 4 * unit) & M32
 
+    def parent_entry_in_table(self, node_offset, size):
+        """parent_entry(), or None when it falls outside the parent table [64, offset_to_elements).
+
+        A signed offsetToParents, or offsetToParents 0 with the first unit, wraps into the header; an
+        entry at or past offsetToElements would overwrite a rehydrated leaf or node instead.
+        """
+        entry = self.parent_entry(node_offset)
+        if entry < 64 or entry + 4 > self.offset_to_elements or entry + 4 > size:
+            return None
+        return entry
+
 
 def rotation(index):
     """Rotation index -> 3x3 matrix Rz * Ry * Rx, each angle a multiple of pi/8, products rounded to float32."""
@@ -395,8 +406,8 @@ def write_box_groups(src, dst, hdr, start, count, wide):
             me = (at >> 6) << 3 | (BOX32 if wide else BOX16)
             for child in children:
                 if (child & 6) == 4 or ((child & 7) == TRI0 and hdr.flags & FLAG_UPDATABLE):
-                    entry = hdr.parent_entry(((child >> 3) << 6) & M32)
-                    if entry + 4 <= len(dst):
+                    entry = hdr.parent_entry_in_table(((child >> 3) << 6) & M32, len(dst))
+                    if entry is not None:
                         struct.pack_into("<I", dst, entry, me)
 
 
@@ -414,8 +425,8 @@ def rehydrate(dehydrated, geometries, header_offset=0):
         raise ValueError("the kept header bytes (%d) run past the input" % kept)
     dst[:kept] = src[:kept]
     struct.pack_into("<I", dst, 0, hdr.flags & ~FLAG_DEHYDRATED & M32)
-    root_entry = hdr.parent_entry(((hdr.root >> 3) << 6) & M32)
-    if root_entry + 4 <= len(dst):
+    root_entry = hdr.parent_entry_in_table(((hdr.root >> 3) << 6) & M32, len(dst))
+    if root_entry is not None:
         struct.pack_into("<I", dst, root_entry, INVALID)
     write_leaves(src, dst, hdr, list(geometries), LeafFrame(hdr))
     if hdr.root & 7 in (BOX16, BOX32):
