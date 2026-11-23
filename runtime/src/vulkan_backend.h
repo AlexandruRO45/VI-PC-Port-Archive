@@ -1678,6 +1678,7 @@ public:
     std::uint64_t bind_sparse_ordered(VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
                                       std::shared_ptr<const void> keepalive = {}) {
         if (!buffer || binds.empty()) return 0;
+        std::lock_guard state(state_mutex_);  // as update_tiles: submitted_, waits_ and the pending binds are shared
         PendingBindings pending;
         pending.keepalive = std::move(keepalive);
         return submit_sparse_binds(buffer, binds, std::move(pending));
@@ -1686,7 +1687,10 @@ public:
     // This queue's timeline semaphore: work submitted outside execute() orders itself against binds by waiting on it
     // at a ticket, and by handing its own semaphore to the queue's next submission.
     VkSemaphore timeline() const { return progress_; }
-    std::uint64_t submitted_ticket() const { return submitted_; }
+    std::uint64_t submitted_ticket() {
+        std::lock_guard state(state_mutex_);
+        return submitted_;
+    }
     std::uint64_t completed_ticket() const { return completed(); }
 
 private:

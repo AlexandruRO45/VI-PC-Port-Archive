@@ -154,6 +154,14 @@ public:
         return freed;
     }
 
+    // Whether `id` is a page allocate() handed out and release() has not taken back.
+    bool allocated(PageId id) const {
+        std::lock_guard lock(mutex_);
+        if (id == kNoPage || page_chunk(id) >= chunks_.size()) return false;
+        const auto& chunk = chunks_[page_chunk(id)];
+        return chunk.memory && chunk.used[page_index(id)];
+    }
+
     VkDeviceMemory memory(PageId id) const {
         std::lock_guard lock(mutex_);
         return chunks_[page_chunk(id)].memory;
@@ -251,7 +259,7 @@ private:
 };
 
 // The sparse arena: console VA = offset, device address fixed for its lifetime. Its pages come from one PagePool,
-// which must outlive it.
+// which must outlive it, and one PageMapper changes it. Destroy it once the queue has finished with it.
 class PagedRegion {
 public:
     PagedRegion() = default;
@@ -415,8 +423,11 @@ public:
                 if (range.type != PageRangeType::incrementing) return false;
                 if (std::uint64_t(range.start_page_in_pool) + range.page_count > pool->second.size()) return false;
                 if (page + range.page_count > region_.page_count()) return false;
-                for (std::uint32_t i = 0; i < range.page_count; ++i)
-                    changes.emplace_back(page + i, pool->second[range.start_page_in_pool + i]);
+                for (std::uint32_t i = 0; i < range.page_count; ++i) {
+                    const PageId id = pool->second[range.start_page_in_pool + i];
+                    if (!pool_.allocated(id)) return false;  // released (or never ours): binding it would bind freed memory
+                    changes.emplace_back(page + i, id);
+                }
                 page += range.page_count;
             }
         }
@@ -426,10 +437,11 @@ public:
     // ClearPageMappingsX: unbind [va, va + pages); reads return 0 afterwards.
     bool clear_page_mappings(std::uint64_t va, std::uint64_t pages, const SubmitBinds& submit) {
         std::lock_guard lock(mutex_);
-        if (va % kPageSize || va / kPageSize + pages > region_.page_count()) return false;
+        const std::uint64_t first = va / kPageSize;
+        if (va % kPageSize || first > region_.page_count() || pages > region_.page_count() - first) return false;
         std::vector<PagedRegion::Change> changes;
         changes.reserve(std::size_t(pages));
-        for (std::uint64_t i = 0; i < pages; ++i) changes.emplace_back(va / kPageSize + i, kNoPage);
+        for (std::uint64_t i = 0; i < pages; ++i) changes.emplace_back(first + i, kNoPage);
         return commit(changes, submit);
     }
 

@@ -296,13 +296,34 @@ int main() {
         if (strict) EXPECT(first == 0 && last == 0);
         std::printf("INFO cleared page reads 0x%08x/0x%08x\n", first, last);
     }
-    EXPECT(!mapper.copy_page_mappings_batch(handle + 99, {}, submit));  // unknown pool
+    // Refused calls bind nothing.
     {
-        const PageMappingRange bad{PageRangeType::incrementing, 2, 15};  // runs past the pool's 16 pages
+        const auto submits = mapper.stats().submits;
+        EXPECT(!mapper.copy_page_mappings_batch(handle + 99, {}, submit));  // unknown pool
+        const PageMappingRange bad{PageRangeType::incrementing, 2, 15};     // runs past the pool's 16 pages
         const PageMappingBatch batch{kConsolePage * kPageSize, &bad, 1};
         EXPECT(!mapper.copy_page_mappings_batch(handle, {&batch, 1}, submit));
-        const PageMappingBatch unaligned{kConsolePage * kPageSize + 4096, &bad, 1};
+        const PageMappingRange one{PageRangeType::incrementing, 1, 0};
+        const PageMappingRange two{PageRangeType::incrementing, 2, 0};
+        const PageMappingBatch unaligned{kConsolePage * kPageSize + 4096, &one, 1};
         EXPECT(!mapper.copy_page_mappings_batch(handle, {&unaligned, 1}, submit));
+        const PageMappingBatch past_end{region.size(), &one, 1};
+        EXPECT(!mapper.copy_page_mappings_batch(handle, {&past_end, 1}, submit));
+        const PageMappingBatch across_end{region.size() - kPageSize, &two, 1};
+        EXPECT(!mapper.copy_page_mappings_batch(handle, {&across_end, 1}, submit));
+        EXPECT(!mapper.clear_page_mappings(kPageSize, UINT64_MAX, submit));  // the end wraps around
+        EXPECT(!mapper.clear_page_mappings(region.size() + kPageSize, 1, submit));
+        // A pool that lists a page the pool has taken back, no page, or a page it never had.
+        std::vector<PageId> stale;
+        EXPECT(pool.allocate(1, stale));
+        pool.release(stale);
+        for (PageId id : {stale[0], kNoPage, PageId(0x00ffffff)}) {
+            const auto listed = mapper.register_page_pool({id});
+            const PageMappingBatch at{kConsolePage * kPageSize, &one, 1};
+            EXPECT(!mapper.copy_page_mappings_batch(listed, {&at, 1}, submit));
+            EXPECT(mapper.unregister_page_pool(listed));
+        }
+        EXPECT(mapper.stats().submits == submits);
     }
 
     // Coalescing and bind cost.
@@ -431,6 +452,23 @@ int main() {
     const VkDeviceSize freed = pool.trim(queue.completed_ticket());
     std::printf("INFO trim freed %.0f MiB; %u chunk(s) left\n", double(freed) / (1 << 20), pool.chunk_count());
     EXPECT(pool.chunk_count() == 0);
+
+    // trim() keeps a chunk until the last bind that referenced it has completed.
+    {
+        std::vector<PageId> one;
+        EXPECT(pool.allocate(1, one));
+        const auto one_pool = mapper.register_page_pool(one);
+        const PageMappingRange range{PageRangeType::incrementing, 1, 0};
+        const PageMappingBatch batch{kScratch * kPageSize, &range, 1};
+        EXPECT(mapper.copy_page_mappings_batch(one_pool, {&batch, 1}, submit));
+        EXPECT(mapper.clear_page_mappings(kScratch * kPageSize, 1, submit));
+        const std::uint64_t last = queue.submitted_ticket();
+        pool.release(one);
+        EXPECT(pool.trim(last - 1) == 0);
+        gpu.wait_queue(last);
+        EXPECT(pool.trim(queue.completed_ticket()) == kChunkSize);
+        EXPECT(mapper.unregister_page_pool(one_pool));
+    }
 
     // A region destroyed with a page still mapped gives its chunk back to trim(), as one cleared first does.
     for (bool clear : {true, false}) {
