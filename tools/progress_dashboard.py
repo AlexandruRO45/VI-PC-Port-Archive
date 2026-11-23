@@ -373,7 +373,7 @@ def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
     root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
     if root.tag not in ("testsuite", "testsuites"):
-        raise ValueError(f"expected JUnit root testsuite or testsuites, got {root.tag!r}")
+        raise ValueError("expected JUnit root testsuite or testsuites")
     suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
     out = []
     for suite in suites:
