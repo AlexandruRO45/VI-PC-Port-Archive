@@ -105,6 +105,10 @@ class ShaderStats(unittest.TestCase):
         r = self.run_stats(COMPLETE, details=False)
         self.assertEqual((r.returncode, r.stderr, r.stdout), (0, "", COMPLETE_SUMMARY))
 
+    def test_utf8_bom_before_header_is_accepted(self):
+        r = self.run_stats(COMPLETE, header="\ufeffname,stage,statistic,value")
+        self.assertEqual((r.returncode, r.stderr, r.stdout), (0, "", COMPLETE_DETAILS + COMPLETE_SUMMARY))
+
     def test_other_driver_statistics_are_shown_raw_not_interpreted(self):
         rows = ["ps_flat,ps,Foo count (bytes),123", 'ps_flat,ps,"Bar, total",18446744073709551615',
                 "ps_flat,ps,Register Count,24", "ps_flat,ps,stage,99"]

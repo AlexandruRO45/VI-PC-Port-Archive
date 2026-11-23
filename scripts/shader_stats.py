@@ -58,7 +58,7 @@ REQUIRED = ("name", "stage", "statistic", "value")
 def load_stats(path):
     """Read counters keyed by (shader, stage) from vk_pipeline_check --stats."""
     out = defaultdict(dict)
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         header = reader.fieldnames or []
         missing = [c for c in REQUIRED if c not in header]
