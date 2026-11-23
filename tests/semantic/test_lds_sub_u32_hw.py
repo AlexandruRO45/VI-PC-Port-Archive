@@ -565,5 +565,48 @@ class TestLdsSubU32SIMD(unittest.TestCase):
             self.assertEqual(mem.get(lane * 4), 100 - lane)
 
 
+
+class TestLdsSubU32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register preservation and non-returning contract."""
+
+    def test_unrelated_vgprs_preserved(self) -> None:
+        interp = ScalarLDSInterpreter(capacity_dwords=1024)
+        for r in range(256):
+            interp.write_reg_u32(RegKind.VGPR, r, 0xBEEF0000 | r)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        interp.write_reg_u32(RegKind.VGPR, 2, 5)
+        interp.lds.write_dword(0x10, 40)
+
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 35)
+        for r in range(256):
+            if r == 1:
+                self.assertEqual(interp.read_reg_u32(RegKind.VGPR, r), 0x10)
+            elif r == 2:
+                self.assertEqual(interp.read_reg_u32(RegKind.VGPR, r), 5)
+            else:
+                self.assertEqual(interp.read_reg_u32(RegKind.VGPR, r), 0xBEEF0000 | r)
+
+    def test_vaddr_vdata_aliased(self) -> None:
+        # ds_sub_u32 v1, v1 -> address is v1, subtract value is v1
+        interp = ScalarLDSInterpreter(capacity_dwords=1024)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        interp.lds.write_dword(0x10, 100)
+
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 100 - 0x10)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0x10)
+
+
 if __name__ == "__main__":
     unittest.main()
