@@ -119,6 +119,9 @@ struct VulkanDeviceInfo {
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
     // device leaves this false until the Xbox PS input mapping is confirmed (synthetic GLSL is not that ABI).
     bool inner_coverage_abi = false;
+    // Logical device enabled multiview if the view count is nonzero.
+    std::uint32_t max_multiview_view_count = 0;
+    std::uint32_t max_multiview_instance_index = 0;
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
     bool host_image_copy = false;

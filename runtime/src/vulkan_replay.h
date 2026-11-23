@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -771,6 +772,8 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    std::uint32_t view_mask = 0;
+    std::uint32_t max_multiview_instance_index = 0;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
 };
 
@@ -2138,6 +2141,11 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
                   std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
     }
+    if (pipeline->view_mask) {
+        if (std::uint32_t(std::bit_width(pipeline->view_mask)) > layers) return ReplayResult::invalid_subresource;
+        if (draw.instances && std::uint64_t(draw.first_instance) + draw.instances - 1 >
+                                  pipeline->max_multiview_instance_index) return ReplayResult::invalid_draw;
+    }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
@@ -3087,6 +3095,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.draw = std::uint32_t(out.draw_count++);
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
                 return r;
+            // The query planners allocate one Vulkan slot at a time. Keep multiview draws out of those scopes.
+            if (prepared_draw.graphics->view_mask && (ordinary_active || binary_active || statistics_active_count))
+                return ReplayResult::unsupported;
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
@@ -4060,7 +4071,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
             rendering.renderArea = {{0, 0}, d.area};
-            rendering.layerCount = d.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
+            rendering.viewMask = d.graphics->view_mask;
+            rendering.layerCount = rendering.viewMask ? 1 : d.layers;
             rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
             rendering.pColorAttachments = colors.data();
             const GraphicsPipeline& graphics = *d.graphics;

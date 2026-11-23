@@ -2889,6 +2889,7 @@ struct PipelineStream {
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
+    D3D12_VIEW_INSTANCING_DESC views{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
@@ -3053,21 +3054,16 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             if (ok && FLOAT(r.DepthBias) != bias) log_once("a fractional depth bias is truncated; bias x1000", int(bias * 1000));
             break;
         }
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
-            D3D12_VIEW_INSTANCING_DESC d{};
-            take(d);
-            if (ok && d.ViewInstanceCount) {
-                log_once("view instancing is not supported yet; views", int(d.ViewInstanceCount));
-                return E_NOTIMPL;
-            }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+            take(out.views);
             break;
-        }
         default:
             log_once("unknown pipeline state stream subobject type:", int(type));
             return E_INVALIDARG;
         }
         if (!ok) return E_INVALIDARG;
     }
+    if (out.has_cs && out.views.ViewInstanceCount) return E_NOTIMPL;
     if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
     if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
     return S_OK;
@@ -3169,10 +3165,30 @@ public:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr,
+                            const D3D12_VIEW_INSTANCING_DESC& views = {}) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
+        if (const UINT count = views.ViewInstanceCount) {
+            if (count > D3D12_MAX_VIEW_INSTANCE_COUNT || !views.pViewInstanceLocations) return E_INVALIDARG;
+            if (views.Flags != D3D12_VIEW_INSTANCING_FLAG_NONE || count > device_.info.max_multiview_view_count ||
+                mesh || desc.GS.BytecodeLength || desc.HS.BytecodeLength || desc.DS.BytecodeLength) {
+                log_once("view instancing needs enabled Vulkan multiview and an unmasked vertex PSO; views", int(count));
+                return E_NOTIMPL;
+            }
+            // Vulkan uses the same bit index for the attachment layer and ViewIndex. Keep it equal to the
+            // D3D12 view ID, and use viewport zero (the only viewport modelled by replay).
+            for (UINT i = 0; i < count; ++i) {
+                const auto& location = views.pViewInstanceLocations[i];
+                if (location.ViewportArrayIndex || location.RenderTargetArrayIndex != i) {
+                    log_once("view instancing needs viewport zero and a layer matching each view ID; view", int(i));
+                    return E_NOTIMPL;
+                }
+                graphics_.view_mask |= 1u << i;
+            }
+            graphics_.max_multiview_instance_index = device_.info.max_multiview_instance_index;
+        }
         if (as && as->pShaderBytecode && as->BytecodeLength) {
             log_once("amplification shaders are not supported (the game has none); bytes", int(as->BytecodeLength));
             return E_NOTIMPL;
@@ -3360,6 +3376,25 @@ public:
             if (stage.words.empty()) return E_FAIL;
             const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
             if (!inner.valid) return E_INVALIDARG;
+            if (graphics_.view_mask) {
+                // Vulkan multiview owns attachment-layer selection. D3D12 can add shader-provided indices to
+                // the PSO locations, which this path cannot represent. Check direct and member decorations.
+                constexpr unsigned op_decorate = 71, op_member_decorate = 72, builtin = 11;
+                constexpr unsigned layer = 9, viewport_index = 10;
+                for (std::size_t i = 5; i < stage.words.size();) {
+                    const auto op = stage.words[i] & 0xffff;
+                    const auto count = stage.words[i] >> 16;
+                    const auto operand = op == op_member_decorate ? 3u : 2u;
+                    if ((op == op_decorate || op == op_member_decorate) && count > operand + 1 &&
+                        stage.words[i + operand] == builtin &&
+                        (stage.words[i + operand + 1] == layer || stage.words[i + operand + 1] == viewport_index)) {
+                        log_once("view instancing with shader layer or viewport builtins is unsupported; stage",
+                                 int(stage.bit));
+                        return E_NOTIMPL;
+                    }
+                    i += count;
+                }
+            }
             if (inner.fully_covered &&
                 (stage.bit != VK_SHADER_STAGE_FRAGMENT_BIT ||
                  device_.conservative_raster_tier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 ||
@@ -3906,6 +3941,7 @@ private:
             if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
         const bool depth_bound = !(unbound & leonida::GraphicsPipeline::unbound_depth);
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.viewMask = graphics_.view_mask;
         rendering.colorAttachmentCount = std::uint32_t(colors.size());
         rendering.pColorAttachmentFormats = colors.data();
         if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -5944,7 +5980,8 @@ public:
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
+                                                                     stream.views);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);
@@ -8924,6 +8961,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
     bool chosen_draw_params = false;
+    bool chosen_multiview = false;
     leonida::Vulkan13Features v13, candidate13;
     // The first usable device of the highest vulkan_device_rank: a native driver over Microsoft's Dozen (which says
     // it is a discrete GPU, #915), then discrete over integrated; the test harnesses (vk_device_pick.h) pick the same.
@@ -8957,6 +8995,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 chosen_features = features.features;
                 chosen12 = f12;
                 chosen_draw_params = draw_params;
+                chosen_multiview = f11.multiview == VK_TRUE;
                 v13.choose(candidate13);
             }
             break;
@@ -9067,6 +9106,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                               v13.enable(ext_chain)};
     enable11.shaderDrawParameters = chosen_draw_params ? VK_TRUE : VK_FALSE;
+    if (chosen_multiview) {
+        VkPhysicalDeviceMultiviewProperties multiview{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &multiview};
+        vkGetPhysicalDeviceProperties2(info.physical, &properties);
+        enable11.multiview = VK_TRUE;
+        info.max_multiview_view_count = multiview.maxMultiviewViewCount;
+        info.max_multiview_instance_index = multiview.maxMultiviewInstanceIndex;
+    }
     if (!chosen_draw_params) std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderDrawParameters\n");
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.timelineSemaphore = VK_TRUE;

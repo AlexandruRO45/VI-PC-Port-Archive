@@ -116,6 +116,8 @@ public:
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
+    bool request_multiview = false;
+    VkPhysicalDeviceMultiviewProperties multiview{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES};
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
@@ -373,6 +375,11 @@ public:
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                   v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
         enable11.shaderDrawParameters = features11.shaderDrawParameters;
+        if (request_multiview && features11.multiview) {
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &multiview};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            enable11.multiview = VK_TRUE;
+        }
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;

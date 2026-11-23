@@ -42,6 +42,13 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: ha
 
 namespace {
 
+// The SDK stream subobjects are individually aligned to a pointer.
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Payload>
+struct alignas(void*) Subobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    Payload payload;
+};
+
 struct Vertex {
     float x, y;
     std::uint8_t r, g, b, a;
@@ -57,6 +64,7 @@ static_assert(offsetof(Vertex, wrong_color) == 16);
 
 int main() {
     vktest::Device d;
+    d.request_multiview = true;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
@@ -121,6 +129,8 @@ int main() {
         info.queue_family = d.family;
         info.buffer_device_address = true;
         info.subgroup = d.subgroup;
+        info.max_multiview_view_count = d.multiview.maxMultiviewViewCount;
+        info.max_multiview_instance_index = d.multiview.maxMultiviewInstanceIndex;
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
         info.features.logicOp = d.enabled.logicOp;
@@ -1007,6 +1017,91 @@ int main() {
             }
             std::printf("castable RTVs: %u draws stored in the view's channel order and encoding\n",
                         unsigned(std::size(casts)));
+        }
+
+        D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3)) == S_OK);
+        EXPECT(options3.ViewInstancingTier == D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED);
+        if (info.max_multiview_view_count >= 2) {
+            struct {
+                Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+                Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+                Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+                Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC> input;
+                Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+                Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+                Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC> views;
+            } stream{{.payload = root.p}, {.payload = pso_desc.VS}, {.payload = pso_desc.PS},
+                     {.payload = pso_desc.InputLayout}, {.payload = pso_desc.PrimitiveTopologyType},
+                     {.payload = {{rt_desc.Format}, 1}}, {.payload = {}}};
+            Ref<ID3D12Device2> device2;
+            EXPECT(device->QueryInterface(IID_PPV_ARGS(&device2.p)) == S_OK);
+            const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+            Ref<ID3D12PipelineState> ordinary, multiview, rejected;
+            EXPECT(device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&ordinary.p)) == S_OK);
+            D3D12_VIEW_INSTANCE_LOCATION locations[] = {{0, 0}, {1, 1}};
+            stream.views.payload = {2, locations, D3D12_VIEW_INSTANCING_FLAG_NONE};
+            EXPECT(device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&rejected.p)) == E_NOTIMPL && !rejected.p);
+            locations[1].ViewportArrayIndex = 0;
+            EXPECT(device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&multiview.p)) == S_OK);
+
+            auto array_desc = rt_desc;
+            array_desc.DepthOrArraySize = 2;
+            Ref<ID3D12Resource> array_target;
+            EXPECT(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &array_desc,
+                                                   D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                                                   IID_PPV_ARGS(&array_target.p)) == S_OK);
+            Ref<ID3D12DescriptorHeap> array_heap;
+            EXPECT(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&array_heap.p)) == S_OK);
+            const D3D12_CPU_DESCRIPTOR_HANDLE array_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(array_heap.p, 9))(array_heap.p))};
+            D3D12_RENDER_TARGET_VIEW_DESC view{};
+            view.Format = array_desc.Format;
+            view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray.ArraySize = 2;
+            device->CreateRenderTargetView(array_target.p, &view, array_rtv);
+
+            const auto begin_array_draw = transition(array_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const auto end_array_draw = transition(array_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+            auto array_src = src;
+            array_src.pResource = array_target.p;
+            UINT64 value = 100;
+            // The zero-view stream is the negative control: its draw leaves the second slice blue.
+            for (auto* pipeline : {ordinary.p, multiview.p}) {
+                for (UINT layer = 0; layer < 2; ++layer) {
+                    EXPECT(allocator->Reset() == S_OK && list->Reset(allocator.p, pipeline) == S_OK);
+                    list->ResourceBarrier(1, &begin_array_draw);
+                    list->ClearRenderTargetView(array_rtv, blue, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->IASetVertexBuffers(0, 1, &vbv);
+                    list->IASetIndexBuffer(&ibv);
+                    list->RSSetViewports(1, &viewport);
+                    list->RSSetScissorRects(1, &scissor);
+                    list->OMSetRenderTargets(1, &array_rtv, FALSE, nullptr);
+                    list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                    list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                    list->ResourceBarrier(1, &end_array_draw);
+                    array_src.SubresourceIndex = layer;
+                    list->CopyTextureRegion(&dst, 0, 0, 0, &array_src, nullptr);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++value;
+                    EXPECT(queue->Signal(fence.p, value) == S_OK && fence->SetEventOnCompletion(value, nullptr) == S_OK);
+                    const auto* pixel = static_cast<const std::uint8_t*>(mapped) + 8 * 256 + 8 * 4;
+                    const std::array<std::uint8_t, 4> red{255, 0, 0, 255}, clear{0, 0, 255, 255};
+                    const auto& expected = layer == 0 || pipeline == multiview.p ? red : clear;
+                    EXPECT(std::equal(expected.begin(), expected.end(), pixel));
+                }
+            }
+            // Reset releases the last multiview PSO and its recorded references before the existing lifetime checks.
+            EXPECT(allocator->Reset() == S_OK && list->Reset(allocator.p, pso.p) == S_OK && list->Close() == S_OK);
+        } else {
+            std::printf("SKIP: view instancing checks need Vulkan multiview with two views\n");
         }
 
         // A draw without a topology is invalid; Close reports it.

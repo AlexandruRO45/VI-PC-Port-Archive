@@ -2069,8 +2069,14 @@ The trace will enumerate them.
   - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
     tessellation or GS, CS with a graphics stage, or no stage at all.
   - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
-    masks, view instancing.
+    masks, and unsupported view instancing modes.
   - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
+- **View instancing:** unmasked vertex PSOs can use Vulkan multiview with viewport zero and render-target array
+  indices 0 through view count minus one. These indices are relative to the bound RTV or DSV. Pipeline creation
+  and draw replay use the same mask, including pipelines made for unbound attachment slots. Each bound attachment
+  must cover the full mask. OPTIONS3 still reports `D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED`: shader translation
+  does not lower `SV_ViewID` to `ViewIndex`, and dynamic masking, other location mappings, additive shader indices,
+  active graphics queries, and multiview for mesh or geometry pipelines are outside this path.
 - **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
   assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
   and strides are not dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065/07066). Creation
