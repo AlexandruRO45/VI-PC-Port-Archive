@@ -389,5 +389,19 @@ class VCvtPknormU16F16ScalarInterpreterTests(unittest.TestCase):
         res_sel = interpret_cvt_pknorm_u16_f16(s0, s1, sel=(1, 0))
         self.assertEqual(res_sel, (0xFFFF << 16) | 0x8000)
 
+class VCvtPknormU16F16SimdDivergenceTests(unittest.TestCase):
+    def test_exec_masking(self):
+        wave = WavefrontSimdState(32)
+        wave.exec_mask = 0xF0F0F0F0
+        for lane in range(32):
+            wave.set_vgpr(lane, 0, 0xCAFEBABE)
+            if (wave.exec_mask >> lane) & 1:
+                wave.set_vgpr(lane, 0, interpret_cvt_pknorm_u16_f16(0x3C00, 0x3800))
+        for lane in range(32):
+            if (wave.exec_mask >> lane) & 1:
+                self.assertEqual(wave.get_vgpr(lane, 0), (0x8000 << 16) | 0xFFFF)
+            else:
+                self.assertEqual(wave.get_vgpr(lane, 0), 0xCAFEBABE)
+
 if __name__ == '__main__':
     unittest.main()
