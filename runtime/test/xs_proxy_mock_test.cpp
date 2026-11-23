@@ -246,6 +246,14 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     return mock_query(child, riid, out);
 }
 
+HRESULT WINAPI mock_create_resource(Mock* self, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                    const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                                    const D3D12_CLEAR_VALUE*, REFIID, void** out) {
+    ++self->calls[27];
+    self->args[27][0] = reinterpret_cast<std::uint64_t>(out);
+    return out ? E_FAIL : S_FALSE;
+}
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -256,6 +264,7 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[27] = reinterpret_cast<void*>(&mock_create_resource);
         return true;
     }();
     (void)filled;
@@ -692,6 +701,32 @@ int check_allocators() {
 // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
 // (CreateReservedResource2/CreateSampler2 there) and 80 is just past it. None of the five may reach the mock's own
 // slot: the mock's call counter proves the route, and the returned token/queue/list proves the handler ran.
+int check_resource_capability() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* const* table = *reinterpret_cast<void* const* const*>(device);
+    const auto slot = reinterpret_cast<SlotFn>(table[76]);
+    EXPECT(hr_of(slot(device, word(&heap), D3D12_HEAP_FLAG_NONE, word(&desc), D3D12_RESOURCE_STATE_COMMON,
+                      0, word(&kResourceIid), 0, 0, 0, 0, 0, 0, 0, 0)) == S_FALSE);
+    EXPECT(mock->calls[27] == 1 && mock->args[27][0] == 0);
+    EXPECT(hr_of(slot(device, word(&heap), D3D12_HEAP_FLAG_NONE, 0, D3D12_RESOURCE_STATE_COMMON,
+                      0, word(&kResourceIid), 0, 0, 0, 0, 0, 0, 0, 0)) == E_POINTER);
+    EXPECT(mock->calls[27] == 1);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    return 0;
+}
+
 int check_xbox_slots() {
 #ifdef __ID3D12Device11_INTERFACE_DEFINED__
     Mock* mock = nullptr;
@@ -948,7 +983,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
+        check_alloc_failures() || check_allocators() || check_resource_capability() || check_xbox_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

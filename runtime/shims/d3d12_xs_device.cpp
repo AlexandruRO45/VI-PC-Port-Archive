@@ -1457,8 +1457,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
                               const IID* riid, void** out) {
     note_slot(76);
-    if (!out) return E_POINTER;
-    *out = nullptr;
+    if (out) *out = nullptr;
     if (!xbox_desc) return E_POINTER;
     if (!riid) return E_POINTER;
 
