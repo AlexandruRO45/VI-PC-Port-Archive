@@ -376,6 +376,53 @@ VOLUME_ROOTS = ("/mnt", "/media", "/run/media", "/Volumes")   # POSIX: where dri
 # level more than a drive letter, so these roots are also searched from the user's own folder.
 USER_MOUNT_ROOTS = ("/media", "/run/media")
 
+# A dead network mount blocks os.scandir()/stat() in D-state and even SIGTERM cannot stop it, so --find must not
+# enter one. Parsed from /proc/self/mounts on Linux; elsewhere the table is empty and the usual roots are used.
+NETWORK_FSTYPES = frozenset({
+    "nfs", "nfs4", "cifs", "smbfs", "smb3", "fuse.sshfs", "fuse.rclone", "fuse.smbnetfs", "davfs", "davfs2",
+    "9p", "ceph", "glusterfs", "afs", "ncpfs", "fuse.davfs2",
+})
+
+
+def _unescape_mount_point(text: str) -> str:
+    """Undo the octal escapes /proc/self/mounts uses for space, tab, newline and backslash."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
+
+
+def network_mounts_from_mounts_text(text: str) -> tuple:
+    """Normalized mount points of network file systems in /proc/self/mounts text (one path per line, fields 2 and 3)."""
+    found = set()
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mount, fstype = _unescape_mount_point(fields[1]), fields[2]
+        if fstype in NETWORK_FSTYPES:
+            found.add(os.path.normcase(os.path.normpath(mount)))
+    return tuple(sorted(found))
+
+
+def network_mounts() -> tuple:
+    """Linux: the mount points of network file systems from /proc/self/mounts. Empty on other systems."""
+    if not sys.platform.startswith("linux"):
+        return ()
+    try:
+        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as f:
+            return network_mounts_from_mounts_text(f.read())
+    except OSError:
+        return ()
+
+
+def under_network_mount(path: str, mounts: tuple) -> bool:
+    """Lexical only: realpath()/isdir()/stat() on a dead mount point would block in D-state."""
+    if not mounts:
+        return False
+    candidate = os.path.normcase(os.path.normpath(path))
+    for mount in mounts:
+        if candidate == mount or candidate.startswith(mount.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
 
 def volume_roots() -> list:
     """POSIX mount points find_dumps() starts from: VOLUME_ROOTS, then /media/<user> and /run/media/<user>, so a copy
@@ -491,11 +538,14 @@ def find_dumps(containers: list | None = None) -> list:
     of a file with that suffix is read."""
     home = os.path.expanduser("~")
     roots = discovery_roots(home)
+    mounts = network_mounts()
     skip = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
             "system volume information", "node_modules", ".git"}
     visited_depths, found, seen_containers = {}, {}, set()
 
     def visit(d: str, depth: int) -> None:
+        if under_network_mount(d, mounts):
+            return
         try:
             real = os.path.normcase(os.path.realpath(d))
         except OSError:
@@ -519,6 +569,8 @@ def find_dumps(containers: list | None = None) -> list:
             return
         subs = []
         for e in entries:
+            if under_network_mount(e.path, mounts):
+                continue  # stat() on a dead mount point is what blocks
             try:
                 if e.is_dir(follow_symlinks=False):
                     if e.name.lower() not in skip and not e.name.startswith((".", "$")):
@@ -535,6 +587,8 @@ def find_dumps(containers: list | None = None) -> list:
             visit(s, depth - 1)
 
     for r in roots:
+        if under_network_mount(r, mounts):
+            continue  # before isdir(): a dead mount point blocks even that
         if os.path.isdir(r):
             visit(r, 2)
     return list(found.values())
