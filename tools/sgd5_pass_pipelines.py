@@ -69,13 +69,19 @@ def decode_blend(row):
 DECODERS = (decode_raster, decode_depth, decode_blend)
 
 
-def pass_states(data, effect, raw):
-    """Decode the rows bytes 6, 7, 8 of a pass select; None for an empty table, ValueError out of range."""
+def pass_states(data, effect, raw, cache=None):
+    """Decode the rows bytes 6, 7, 8 of a pass select; None for an empty table, ValueError out of range.
+
+    ``cache``, a dict kept for one effect, makes passes that select the same row share one decoded object."""
+    cache = {} if cache is None else cache
     out = []
     for kind, decode, selector, (count, first, width) in zip(KINDS, DECODERS, raw[6:9], effect.tables):
         if selector >= max(count, 1):
             raise ValueError(f"{kind} selector {selector} is outside the effect's {count} rows")
-        out.append(decode(data[first + selector * width:first + (selector + 1) * width]) if count else None)
+        if (kind, selector) not in cache:
+            row = data[first + selector * width:first + (selector + 1) * width]
+            cache[(kind, selector)] = decode(row) if count else None
+        out.append(cache[(kind, selector)])
     return out
 
 
@@ -105,17 +111,21 @@ def census(archive, index, databases=None, states=None):
             carve = {}
             for effect in S.effect_records(data, groups, count):
                 cursor = effect.first_pass
+                decoded_rows = {}  # (kind, selector) -> decoded row, shared by the effect's passes
+                as_json = {}
                 for tindex, (tname, passes) in enumerate(S.techniques(data, effect)):
                     for programs in passes:
                         raw = data[cursor:cursor + PASS_SIZE]
                         cursor += PASS_SIZE
                         counts["passes"] += 1
-                        decoded = pass_states(data, effect, raw)
-                        for kind, state in zip(KINDS, decoded):
+                        decoded = pass_states(data, effect, raw, decoded_rows)
+                        for kind, selector, state in zip(KINDS, raw[6:9], decoded):
                             if state is None:
                                 counts[f"passes with an empty {kind} table"] += 1
                             if states is not None:
-                                states[(kind, json.dumps(state, sort_keys=True))] += 1
+                                if (kind, selector) not in as_json:
+                                    as_json[(kind, selector)] = json.dumps(state, sort_keys=True)
+                                states[(kind, as_json[(kind, selector)])] += 1
                         if not programs:
                             counts["skipped: no program"] += 1
                             continue

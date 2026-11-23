@@ -143,6 +143,14 @@ class PassPipelinesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the effect's 0 rows"):
             self.census(data, layout, index)
 
+    def test_passes_selecting_one_row_share_its_decoded_object(self):
+        # One decoded object per selected row and effect, not one copy per pass (memory on large effects).
+        data, layout, index = build([(1, 1, 0, 0, 0, 0)] * 3, {16: [bytes([3, 1]).ljust(16, b"\0")]})
+        rows, _ = self.census(data, layout, index)
+        self.assertEqual(len(rows), 3)
+        self.assertIsNotNone(rows[0]["raster_state"])
+        self.assertIs(rows[0]["raster_state"], rows[2]["raster_state"])
+
     def test_row_outside_the_measured_ranges_is_an_error(self):
         good_depth = bytes([1, 1, 7, 1]).ljust(24, b"\0")
         cases = (
