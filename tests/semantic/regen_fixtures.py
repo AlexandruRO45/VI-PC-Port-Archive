@@ -16,8 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 ASM_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
-SHADERS = ("ps_exp_color_mask",   # PS color-export mask (test_export_valid_mask.py)
-           "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail",  # SMEM / raw MUBUF bounds measured on RDNA2
+SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail",  # SMEM / raw MUBUF bounds measured on RDNA2
            "ps_fnan_med3", "ps_fnan_fract",    # float NaN / fract rows measured on RDNA2 hardware
            "ps_sdwa_dword_hi",   # 16-bit SDWA results with dst_sel:DWORD zero the high half
            "ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_ops7", "ps_ops8",
@@ -38,6 +37,7 @@ SHADERS = ("ps_exp_color_mask",   # PS color-export mask (test_export_valid_mask
            "cs_w64x_saveexec_b64",   # s_and/s_or/s_andn2_saveexec_b64, s_andn2_wrexec_b64 (test_saveexec_b64.py)
            "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
            "cs_cvt_pk_u8",   # v_cvt_pk_u8_f32 rounding and NaN (test_cvt_pk_u8.py)
+           "ps_exp_color_mask",   # PS color-export mask (test_export_valid_mask.py)
            "ps_vcmp_f32_nan", "ps_vcmp_64", "cs_w32_andn2_exec")   # VOPC f32 NaN / 64-bit int compares; s_andn2_saveexec/wrexec_b32
 
 
