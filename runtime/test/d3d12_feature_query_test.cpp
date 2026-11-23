@@ -50,7 +50,9 @@ Answer measure(ID3D12Device* d, int feature) {
             a.size = size;
             // The payload is read from a buffer poisoned with a nonzero byte, so a query that stops writing its output
             // (whose expected value is zero) shows as 0xA5 instead of matching the zero-filled buffer.
-            buffer.assign(kMaxSize * 4, 0xA5);
+            // Features 17 and 55 have input fields the host reads (it refuses 17 and leaves the input parts of 55
+            // alone when they are 0xA5), so they are read from the zero-filled buffer.
+            buffer.assign(kMaxSize * 4, feature == 17 || feature == 55 ? 0 : 0xA5);
             if (SUCCEEDED(d->CheckFeatureSupport(static_cast<D3D12_FEATURE>(feature), buffer.data(), size)))
                 a.bytes.assign(buffer.begin(), buffer.begin() + size);
             break;
