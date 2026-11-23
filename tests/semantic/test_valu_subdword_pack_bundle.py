@@ -232,6 +232,21 @@ class TestPermLane16Selectors(unittest.TestCase):
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
         self.assertIn("OpGroupNonUniformShuffle", spv)
 
+class TestPermLane16Divergence(unittest.TestCase):
+    def test_wave64_multi_lane(self):
+        code = [
+            "s_mov_b32 exec_lo, 0xFFFFFFFF",
+            "s_mov_b32 exec_hi, 0x00000000",
+            "v_mov_b32_e32 v1, 300",
+            "s_mov_b32 s1, 0x76543210",
+            "s_mov_b32 s2, 0xFEDCBA98",
+            "v_permlane16_b32 v0, v1, s1, s2",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_p16_div", code, fssm=saveexec_run.fssm())
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
