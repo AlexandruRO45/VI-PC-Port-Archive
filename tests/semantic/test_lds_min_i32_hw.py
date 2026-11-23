@@ -655,3 +655,69 @@ class TestLdsMinI32SIMD(unittest.TestCase):
         mem = run_compute_kernel(lines, lanes=16)
         for lane in range(16):
             self.assertEqual(mem.get(lane * 4), lane)
+
+
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestLdsMinI32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and operand preservation contracts."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(capacity_dwords=1024)
+
+    def test_vaddr_equals_vdata_aliasing(self) -> None:
+        # Address 0x10 (16) stores value 50. Instruction ds_min_i32 v1, v1 where v1=0x10 (16).
+        # LDS[16] = min(50, 16) = 16.
+        self.interp.lds.write_dword(0x10, 50)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+
+        inst = Instruction(
+            opcode=Opcode.DS_MIN_I32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 1),
+        )
+        old_val, new_val = self.interp.step(inst)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_val, 0x10)
+        self.assertEqual(self.interp.lds.read_dword(0x10), 0x10)
+        # v1 remains preserved as 0x10
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 0x10)
+
+    def test_vdst_equals_vaddr_aliasing(self) -> None:
+        # In ds_min_rtn_i32 v1, v1, v2: v1 is both address and return destination.
+        # Address is 0x20, LDS has 100, v2 is 25.
+        # Address must be evaluated before vdst overwrite: old_val (100) written into v1.
+        self.interp.lds.write_dword(0x20, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x20)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 25)
+
+        inst = Instruction(
+            opcode=Opcode.DS_MIN_RTN_I32,
+            vdst=Register(RegKind.VGPR, 1),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        old_val, new_val = self.interp.step(inst)
+        self.assertEqual(old_val, 100)
+        self.assertEqual(new_val, 25)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 100)
+        self.assertEqual(self.interp.lds.read_dword(0x20), 25)
+
+    def test_translator_aliased_kernel(self) -> None:
+        # Translates kernel with vaddr == vdata
+        lines = [
+            "v_mov_b32_e32 v1, 0x10",  # v1 = 16
+            "v_mov_b32_e32 v2, 40",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_min_i32 v1, v1",  # min(40, 16) = 16
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v3, v31, s[0:3], 0 offen",
+        ]
+        mem = run_compute_kernel(lines, lanes=1)
+        self.assertEqual(mem.get(0), 16)
