@@ -517,5 +517,109 @@ class SaluAndB64Ieee754Tests(unittest.TestCase):
         self.assertEqual(hi_only, f_hi << 32)
         self.assertEqual(ref_scc(hi_only), 1)
 
+class SaluAndB64TranslatorTests(unittest.TestCase):
+    """Translator-backed execution tests using support.translate_lines and mrt0_words."""
+
+    def test_translator_basic_and(self) -> None:
+        v0 = 0x01234567_89ABCDEF
+        v1 = 0x00FF00FF_F0F0F0F0
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_and_b64 s[4:5], s[0:1], s[2:3]",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_and_basic", lines)
+        out = mrt0_words(spv)
+        res64 = (out[1] << 32) | out[0]
+        expected = v0 & v1
+        self.assertEqual(res64, expected)
+        self.assertEqual(out[2], 1 if expected != 0 else 0)
+
+    def test_translator_zero_result_clears_scc(self) -> None:
+        v0 = 0x55555555_55555555
+        v1 = 0xAAAAAAAA_AAAAAAAA
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_and_b64 s[4:5], s[0:1], s[2:3]",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_and_zero", lines)
+        out = mrt0_words(spv)
+        res64 = (out[1] << 32) | out[0]
+        self.assertEqual(res64, 0)
+        self.assertEqual(out[2], 0)
+
+    def test_translator_dst_aliasing_src0(self) -> None:
+        v0 = 0x12345678_9ABCDEF0
+        v1 = 0x0F0F0F0F_F0F0F0F0
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_and_b64 s[0:1], s[0:1], s[2:3]",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_and_alias", lines)
+        out = mrt0_words(spv)
+        res64 = (out[1] << 32) | out[0]
+        expected = v0 & v1
+        self.assertEqual(res64, expected)
+        self.assertEqual(out[2], 1)
+
+    def test_translator_null_dst_updates_scc(self) -> None:
+        v0 = 0x12345678_9ABCDEF0
+        v1 = 0x12345678_9ABCDEF0
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_and_b64 null, s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_and_null_dst", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 1)
+
+    def test_translator_emits_bitwise_and(self) -> None:
+        lines = [
+            "s_and_b64 s[4:5], s[0:1], s[2:3]",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_and_emit", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+
 if __name__ == "__main__":
     unittest.main()
