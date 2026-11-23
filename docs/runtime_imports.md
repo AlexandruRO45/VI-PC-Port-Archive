@@ -40,22 +40,22 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 
 | Image | Size of image | Entry RVA | Shim | Host | Module | Unimplemented | `--init` |
 |---|---:|---:|---:|---:|---:|---:|---|
-| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 4 | 56 | 0 | 0 | exit 0 |
-| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 4 | 53 | 0 | 0 | exit 0 |
-| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 6 | 80 | 0 | 0 | exit 0 |
-| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 5 | 17 | 0 | 0 | exit 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 26 | 172 | 0 | 0 | exit 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 24 | 116 | 0 | 0 | exit 0 |
-| `concrt140.dll` | 303,104 | `0x29160` | 2 | 101 | 0 | 0 | exit 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 13 | 174 | 0 | 0 | exit 0 |
-| `msvcp140_1.dll` | 36,864 | `0x15c0` | 2 | 31 | 0 | 0 | exit 0 |
-| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 2 | 94 | 0 | 0 | exit 0 |
-| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 4 | 60 | 0 | 0 | exit 0 |
-| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 2 | 22 | 0 | 0 | exit 0 |
-| `vccorlib140.dll` | 344,064 | `0x27e50` | 7 | 107 | 0 | 0 | exit 0 |
+| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 5 | 55 | 0 | 0 | exit 0 |
+| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 5 | 52 | 0 | 0 | exit 0 |
+| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 8 | 78 | 0 | 0 | exit 0 |
+| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 6 | 16 | 0 | 0 | exit 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 28 | 170 | 0 | 0 | exit 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 27 | 113 | 0 | 0 | exit 0 |
+| `concrt140.dll` | 303,104 | `0x29160` | 4 | 99 | 0 | 0 | exit 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 16 | 171 | 0 | 0 | exit 0 |
+| `msvcp140_1.dll` | 36,864 | `0x15c0` | 3 | 30 | 0 | 0 | exit 0 |
+| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 4 | 92 | 0 | 0 | exit 0 |
+| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 6 | 58 | 0 | 0 | exit 0 |
+| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 3 | 21 | 0 | 0 | exit 0 |
+| `vccorlib140.dll` | 344,064 | `0x27e50` | 9 | 105 | 0 | 0 | exit 0 |
 | `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 | exit 0 |
-| `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 | exit 0 |
-| `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 | exit 0 |
+| `vcruntime140.dll` | 110,592 | `0xf890` | 4 | 37 | 0 | 0 | exit 0 |
+| `vcruntime140_1.dll` | 49,152 | `0x3e90` | 2 | 32 | 0 | 0 | exit 0 |
 
 Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged. `DisableThreadLibraryCalls` is served the same way: a mapped module gets `TRUE` (the real function refuses a module the Windows loader did not map, which failed the `DllMain` of the four `msvcp140_*` satellite DLLs), and any other handle goes to the real function.
 
