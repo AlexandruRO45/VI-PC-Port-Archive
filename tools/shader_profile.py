@@ -7,7 +7,7 @@ Counts each mnemonic (number of shaders using it and total occurrences), groups 
 classifies instructions (ALU vs memory vs branch), computes operation ratios, and summarises register pressure
 per stage (VGPR/SGPR counts from `profile_shader`; `--per-shader` also lists every shader).
 In the JSON report, ratios.alu_to_memory is null when the corpus has ALU instructions and no memory instructions.
-`categories_by_stage` breaks those instruction counts down by stage, using `?` when the stage is unknown.
+`categories_by_stage` uses the carve index first, then a recognized stage prefix in the filename, otherwise `?`.
 
 `undecoded` counts the llvm-mc 'invalid instruction encoding' warnings shader_disasm.py copies into each .s file.
 by_word lists the four bytes at each warning position, their total occurrences and how many shaders contain them.
@@ -28,6 +28,7 @@ FAMILIES = [("s_buffer_", "smem"), ("s_load", "smem"), ("s_", "scalar"), ("v_", 
             ("buffer_", "buffer"), ("tbuffer_", "buffer"), ("image_", "image"), ("global_", "global"),
             ("flat_", "flat"), ("scratch_", "scratch"), ("exp", "export")]
 
+STAGE_PREFIX = re.compile(r"(ps|vs|gs|hs|ds|cs|ms|as|lib)_", re.IGNORECASE | re.ASCII)
 VGPR_RANGE = re.compile(r"\bv\[(\d+):(\d+)\]")
 VGPR_SINGLE = re.compile(r"\bv(\d+)\b")
 SGPR_RANGE = re.compile(r"\bs\[(\d+):(\d+)\]")
@@ -336,7 +337,10 @@ def main():
     for entry in shader_files:
         name = entry.name
         n += 1
-        stage = stages.get(name[:-2]) or (name[:2].lower() if name[2:3] == "_" else "?")
+        stage = stages.get(name[:-2])
+        if not stage:
+            prefix = STAGE_PREFIX.match(name)
+            stage = prefix[1].lower() if prefix else "?"
         try:
             with open(entry.path, encoding="utf-8", errors="replace") as f:
                 text = f.read()

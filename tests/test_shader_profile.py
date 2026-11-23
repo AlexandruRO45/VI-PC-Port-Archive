@@ -393,13 +393,16 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.write("ps_second", "\tv_mov_b32 v1, 2\n\ts_endpgm\n")
         self.write("vs_first", "\ts_load_dword s0, s[2:3], 0\n")
         self.write("unclassified", "")
+        self.write("zz_foo", "\tv_mov_b32 v2, 1\n")
+        self.write("LIB_helper", "\ts_endpgm\n")
         _, data = self.run_profile()
         stages = data["categories_by_stage"]
-        self.assertEqual(list(stages), ["?", "ps", "vs"])
+        self.assertEqual(list(stages), ["?", "lib", "ps", "vs"])
         self.assertEqual(stages["ps"], {"alu": 3, "memory": 0, "branch": 0,
                                         "export": 0, "other": 1, "total": 4})
         self.assertEqual(stages["vs"]["memory"], 1)
-        self.assertEqual(stages["?"]["total"], 0)
+        self.assertEqual(stages["?"]["alu"], 1)
+        self.assertEqual(stages["lib"]["total"], 1)
         for key, count in data["categories"].items():
             self.assertEqual(sum(stage[key] for stage in stages.values()), count)
 
