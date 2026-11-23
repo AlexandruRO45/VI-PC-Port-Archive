@@ -12990,8 +12990,14 @@ class Gen:
         return half
 
     def image_msaa_load(self, op, a, mods):
-        """image_msaa_load (and image_load on 2D_MSAA / 2D_MSAA_ARRAY): OpImageFetch with Sample operand from the
-        MSAA sampled image bindings 20..25 (float/uint/sint selected from T# FORMAT, matching image_load_typed)."""
+        """Lower image_msaa_load (MIMG 0x80) and ordinary image_load on 2D_MSAA / 2D_MSAA_ARRAY.
+
+        Both read from the MSAA sampled image bindings 20..25 (float/uint/sint selected from T# FORMAT,
+        matching image_load_typed), but their result semantics differ:
+        - image_msaa_load (RDNA2 ISA §12.16 opcode 128): returns up to 4 consecutive samples
+          (sample_idx + 0..3) of the single component (channel 0 / red), selected by bits 0..3 of dmask.
+        - image_load on 2D_MSAA / 2D_MSAA_ARRAY: fetches 1 sample at sample_idx and returns its RGBA
+          components selected by dmask."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D_MSAA")
         if dim not in self.MSAA_DIMS:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
@@ -13015,7 +13021,7 @@ class Gen:
         if len(coords) < ncoord + 1:
             raise Unsupported(op + " coords")
         ints = [self.as_int(c) for c in coords[:ncoord]]
-        sample_idx = self.as_int(coords[ncoord])
+        sample_u = coords[ncoord]
         iv = self.tmp()
         self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
         idx = self.desc_lookup_sgpr(a[2], 8)
@@ -13027,10 +13033,43 @@ class Gen:
             self.emit(f"{im} = OpLoad %msimg{cls}_{di} {ip}")
             return im
 
-        def fetch(image, _cls, ty):
-            res = self.tmp()
-            self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Sample {sample_idx}")
-            return res
+        if op == "image_msaa_load":
+            sample_ids = {}
+            for k in range(4):
+                if (dmask >> k) & 1:
+                    if k == 0:
+                        sample_ids[k] = sample_u
+                    else:
+                        sk = self.tmp()
+                        self.emit(f"{sk} = OpIAdd %uint {sample_u} {self.cu(k)}")
+                        sample_ids[k] = sk
+
+            scalar_types = ("%float", "%uint", "%int")
+
+            def fetch(image, cls, ty):
+                st = scalar_types[cls]
+                zero = None
+                lanes = []
+                for k in range(4):
+                    if k in sample_ids:
+                        fetched = self.tmp()
+                        self.emit(f"{fetched} = OpImageFetch {ty} {image} {iv} Sample {sample_ids[k]}")
+                        ch0 = self.tmp()
+                        self.emit(f"{ch0} = OpCompositeExtract {st} {fetched} 0")
+                        lanes.append(ch0)
+                    else:
+                        if zero is None:
+                            zero = (self.tof(self.cu(0)) if cls == 0 else
+                                    (self.cu(0) if cls == 1 else self.as_int(self.cu(0))))
+                        lanes.append(zero)
+                res = self.tmp()
+                self.emit(f"{res} = OpCompositeConstruct {ty} {' '.join(lanes)}")
+                return res
+        else:
+            def fetch(image, _cls, ty):
+                res = self.tmp()
+                self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Sample {sample_u}")
+                return res
 
         self.image_read_typed(dim, self.sgpr_word(a[2], 1), None, idx, dmask, vdata, d16, fetch, view)
 
