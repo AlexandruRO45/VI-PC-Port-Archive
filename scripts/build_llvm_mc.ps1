@@ -146,9 +146,22 @@ New-Item -ItemType Directory -Force $Dest | Out-Null
 $final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
 Copy-Item -Force $exe $final
 if (-not $Keep) {
-    Remove-DirectoryRobust $Temp
-    if (Test-Path -LiteralPath $Temp) {
+    # A caller-supplied -Temp may also contain files unrelated to this build.
+    Remove-DirectoryRobust $src
+    Remove-DirectoryRobust $out
+    Remove-Item -LiteralPath $bat, $probeFile -Force -ErrorAction SilentlyContinue
+    $remaining = $src, $out, $bat, $probeFile | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if ($remaining) {
         Write-Warning "Installed $final, but cleanup of '$Temp' failed."
+    } else {
+        try {
+            if (-not (Get-ChildItem -LiteralPath $Temp -Force | Select-Object -First 1)) {
+                # Non-recursive: a file added since the check also survives.
+                [IO.Directory]::Delete($paths.GetUnresolvedProviderPathFromPSPath($Temp))
+            }
+        } catch {
+            Write-Warning "Installed $final, but cleanup of '$Temp' failed."
+        }
     }
 }
 if (-not $NoEnv) {
