@@ -710,5 +710,41 @@ class TestVPkMadI16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x00070003)
 
+def ref_v_pk_mad_u16(s0: int, s1: int, s2: int) -> int:
+    """Unsigned 16-bit integer multiply-add on packed values.
+    Each half: (src0 * src1 + src2) wrapping to 16 bits.
+    """
+    a_lo, a_hi = s0 & MASK16, (s0 >> 16) & MASK16
+    b_lo, b_hi = s1 & MASK16, (s1 >> 16) & MASK16
+    c_lo, c_hi = s2 & MASK16, (s2 >> 16) & MASK16
+    res_lo = (a_lo * b_lo + c_lo) & MASK16
+    res_hi = (a_hi * b_hi + c_hi) & MASK16
+    return pack16(res_lo, res_hi)
+
+
+class TestVPkMadU16Oracle(unittest.TestCase):
+    def test_oracle_basic_mad(self) -> None:
+        s0 = pack16(10, 20)
+        s1 = pack16(30, 40)
+        s2 = pack16(5, 15)
+        # 10*30 + 5 = 305; 20*40 + 15 = 815
+        self.assertEqual(ref_v_pk_mad_u16(s0, s1, s2), pack16(305, 815))
+
+    def test_oracle_unsigned_overflow_wrap(self) -> None:
+        s0 = pack16(0x0100, 0x0200)
+        s1 = pack16(0x0100, 0x0200)
+        s2 = pack16(2, 3)
+        # 256*256 + 2 = 65538 & 0xFFFF = 2
+        # 512*512 + 3 = 262147 & 0xFFFF = 3
+        self.assertEqual(ref_v_pk_mad_u16(s0, s1, s2), pack16(2, 3))
+
+    def test_oracle_full_range_operands(self) -> None:
+        s0 = pack16(0xFFFF, 0xFFFF)
+        s1 = pack16(2, 3)
+        s2 = pack16(5, 10)
+        # 65535*2 + 5 = 131075 & 0xFFFF = 3
+        # 65535*3 + 10 = 196615 & 0xFFFF = 7
+        self.assertEqual(ref_v_pk_mad_u16(s0, s1, s2), pack16(3, 7))
+
 if __name__ == "__main__":
     unittest.main()
