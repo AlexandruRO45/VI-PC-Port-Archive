@@ -64,6 +64,25 @@ $log = Join-Path $env:TEMP d3d12.log
 python -I tools\boot_trace.py $trace --d3d12 $log
 ```
 
+For a bounded native Windows pass, use the same image, package and runtime settings with a fresh local output
+directory outside the package and repository. Choose the deadline (seconds) for the workload:
+
+```powershell
+python -I scripts/run_boot.py run --runtime .\runtime\build\gta6rt.exe --image $exe --game-dir $pkg --out "$env:TEMP\boot-001" --deadline 300
+```
+
+Use `dry-run` or `init` in place of `run` for the earlier passes. Each invocation needs its own directory.
+The runner redirects guest writes and saves there, defaults to the Vulkan backend, and writes separate stdout,
+stderr, startup trace, parser output and `result.json`. That result records the loader's unsigned Windows exit
+code, launch or timeout outcome, parser status, runtime SHA-256, checkout revisions when available, and installed
+display adapters. A checkout revision identifies the local tree and does not establish the binary's build origin.
+The wrapper returns 0 for a successful loader, parser and requested captures, or 1 for an incomplete or failed run.
+
+At the deadline an external writer attempts a thread minidump before the runner terminates its job. Set
+`--capture-timeout` to change the writer's 10-second budget. For an earlier snapshot during execution, supply
+`--diagnose-after SECONDS`. A timeout records elapsed time only; pipeline compilation may still be progressing.
+Keep the entire output directory local, including dumps and parser diagnostics. Share only counts and error classes.
+
 The capture pipeline writes each message as text to avoid PowerShell 5.1 wrapping the first stderr record at a
 narrow output width. The tool also reads existing UTF-16LE logs saved with `2>` in PowerShell 5.1 and recognizes
 the `program.exe : ` prefix on the first stderr line.
