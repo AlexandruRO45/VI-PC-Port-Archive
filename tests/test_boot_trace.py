@@ -404,6 +404,23 @@ class BootTraceTests(unittest.TestCase):
         ):
             self.assertIn(needle, text)
 
+    def test_xmem_attribute_sample_preserves_order_and_optional_size(self):
+        free = {"api": "XMemFree", "attributes": "0x10", "caller": "fixture.dll+0x20"}
+        alloc = {"api": "XMemAlloc", "attributes": "0x10", "size": 0, "caller": "fixture.dll+0x30"}
+        later = {**alloc, "attributes": "0x20", "size": 4096}
+        self.write(self.startup, [{"kind": "xmem_attributes", **record} for record in (free, alloc, later)])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(bt.main([self.startup, "--limit", "2", "--json"]), 0)
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["startup"]["xmem_attributes"], [free, alloc])
+        self.assertEqual(summary["startup"]["kinds"]["xmem_attributes"], 3)
+        text = bt.format_text(summary, 2)
+        self.assertIn("XMemFree 0x10 from fixture.dll+0x20\n", text)
+        self.assertIn("XMemAlloc 0x10 size 0 from fixture.dll+0x30", text)
+        self.assertIn("... 1 more", text)
+        self.assertNotIn("4096", text)
+
     def test_failed_file_opens_and_skipped_int3_are_listed(self):
         self.write(
             self.startup,

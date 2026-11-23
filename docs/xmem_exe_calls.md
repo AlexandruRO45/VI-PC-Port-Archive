@@ -108,4 +108,6 @@ whose attribute is a constant pass `0xf0814000`, not that value, so it comes fro
 
 Which of these calls the boot reaches, and in what order, is not measured: nothing ran. A call site is code that can
 call, and the boot may reach only some of them. The first run's trace (`--trace`, `xmem_attributes` events) is the
-signal for the order.
+signal for the order. Run `python -I tools/boot_trace.py startup.jsonl` on the local trace to see the first
+`--limit` records in trace order, with each API, attribute word, caller and allocation size when present. The
+shim records each API/attribute pair once, so the count measures observed pairs.

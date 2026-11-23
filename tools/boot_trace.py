@@ -63,6 +63,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "unimplemented": [],
         "unimplemented_by_dll": {},
         "debug_strings": 0,
+        "xmem_attributes": [],
         "file_open_failed": [],
         "file_open_failed_count": 0,
         "int3_skipped": [],
@@ -132,6 +133,12 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     )
             elif kind == "debug_string":
                 trace["debug_strings"] += 1
+            elif kind == "xmem_attributes":
+                if len(trace["xmem_attributes"]) < limit:
+                    record = {key: event.get(key) for key in ("api", "attributes", "caller")}
+                    if "size" in event:
+                        record["size"] = event["size"]
+                    trace["xmem_attributes"].append(record)
             elif kind == "file_open_failed":
                 trace["file_open_failed_count"] += 1
                 if len(trace["file_open_failed"]) < limit:
@@ -262,6 +269,15 @@ def format_text(summary: dict, limit: int) -> str:
             out.append("  unimplemented: none")
         if startup["debug_strings"]:
             out.append(f"  debug strings: {startup['debug_strings']} (text not shown)")
+        if samples := startup.get("xmem_attributes"):
+            count = startup["kinds"]["xmem_attributes"]
+            out.append(f"  XMem attribute records: {count}")
+            shown = samples[:limit]
+            for item in shown:
+                size = f" size {item['size']}" if "size" in item else ""
+                out.append(f"    {item['api']} {item['attributes']}{size} from {item['caller']}")
+            if len(shown) < count:
+                out.append(f"    ... {count - len(shown)} more")
         if startup["file_open_failed_count"]:
             out.append(f"  failed file opens: {startup['file_open_failed_count']}")
             for item in startup["file_open_failed"][:limit]:
