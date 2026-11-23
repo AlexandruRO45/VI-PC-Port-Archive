@@ -433,6 +433,77 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
 
+    def test_invalid_binary_floats_preserve_previous_outputs(self):
+        self.export()
+        with open(os.path.join(self.tmp.name, "out.glb"), "rb") as f:
+            previous_glb = f.read()
+        with open(os.path.join(self.tmp.name, "report.json"), "rb") as f:
+            previous_report = f.read()
+        cases = [(label, [(0, 0, 0, (value, 0.0, 0.0))])
+                 for label, value in (("nan", math.nan), ("inf", math.inf), ("-inf", -math.inf))]
+        # Every stored source float is finite; decoding multiplies 3e38 by 2.
+        cases.append(("overflow", [(4, 0, 0, (2, 3e38, 0.0, [0, 2])),
+                                   (2, 0, 1, 0.0), (2, 0, 2, 0.0)]))
+        for label, channels in cases:
+            sequence = clips_fixture.encode_sequence(2, channels)
+            dictionary = clips_fixture.dictionary(sequences=[sequence], frames=2,
+                tracks=[(joaat32("skel_a"), joaat32("bonetranslation"), 2)])
+            offset = clips_fixture.write_rpf(self.anim, [dictionary])[0]
+            for existing in (True, False):
+                with self.subTest(value=label, existing=existing), tempfile.TemporaryDirectory() as tmp:
+                    out, report = os.path.join(tmp, "out.glb"), os.path.join(tmp, "report.json")
+                    if existing:
+                        for path, data in ((out, previous_glb), (report, previous_report)):
+                            with open(path, "wb") as f:
+                                f.write(data)
+                    r = self.run_tool(self.packs, out, "--skeleton", hex(self.offsets[0]),
+                                      "--part", hex(self.offsets[1]), "--anim", self.anim,
+                                      "--dictionary", hex(offset), "--report", report)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("float32", r.stderr)
+                    self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+                    self.assertEqual(r.stdout, "")
+                    if existing:
+                        for path, data in ((out, previous_glb), (report, previous_report)):
+                            with open(path, "rb") as f:
+                                self.assertEqual(f.read(), data)
+                    else:
+                        self.assertEqual(os.listdir(tmp), [])
+
+
+class FloatBufferTest(unittest.TestCase):
+    def joints(self):
+        skeleton = skeleton_resource()
+        return anim_glb.read_skeleton(skeleton, anim_glb.drawable_at(skeleton, None))[0]
+
+    def test_animation_values_must_be_finite(self):
+        for path, width in (("translation", 3), ("scale", 3), ("rotation", 4)):
+            for value in (math.nan, math.inf, -math.inf):
+                with self.subTest(path=path, value=value):
+                    keys = [(0.0, (value,) + (0.0,) * (width - 1))]
+                    with self.assertRaisesRegex(anim_glb.ExportError, "finite.*float32"):
+                        anim_glb.build(self.joints(), [], [("sample", {(0, path): keys})])
+
+    def test_single_key_time_must_be_finite(self):
+        for time in (math.nan, math.inf, -math.inf):
+            with self.subTest(time=time):
+                keys = [(time, (0.0, 0.0, 0.0))]
+                with self.assertRaisesRegex(anim_glb.ExportError, "finite.*float32"):
+                    anim_glb.build(self.joints(), [], [("sample", {(0, "translation"): keys})])
+
+    def test_finite_float32_overflow_is_an_export_error(self):
+        for value in (1e39, -1e39, 10 ** 400):
+            with self.subTest(value=value):
+                keys = [(0.0, (value, 0.0, 0.0))]
+                with self.assertRaisesRegex(anim_glb.ExportError, "float32.*range"):
+                    anim_glb.build(self.joints(), [], [("sample", {(0, "translation"): keys})])
+
+    def test_valid_float32_bits_are_preserved(self):
+        values = [0.0, -0.0, 1.0, -2.0, 2 ** -149, -(2 ** -149), 2 ** -126,
+                  float.fromhex("0x1.fffffep+127")]
+        bits = [0, 0x80000000, 0x3F800000, 0xC0000000, 1, 0x80000001, 0x00800000, 0x7F7FFFFF]
+        self.assertEqual(anim_glb._floats(values), struct.pack("<8I", *bits))
+
 
 if __name__ == "__main__":
     unittest.main()

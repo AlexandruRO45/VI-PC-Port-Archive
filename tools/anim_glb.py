@@ -477,7 +477,11 @@ def _accessor(accessors, view, component, count, kind, **extra):
 
 
 def _floats(values):
-    return struct.pack(f"<{len(values)}f", *values)
+    try:
+        require(all(math.isfinite(v) for v in values), "non-finite float32 data")
+        return struct.pack(f"<{len(values)}f", *values)
+    except OverflowError:
+        raise ExportError("float32 value out of range") from None
 
 
 def build(joints, meshes, clips, *, root_motion=True, generator="Leonida anim_glb"):
