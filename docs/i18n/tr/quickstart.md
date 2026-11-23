@@ -91,7 +91,21 @@ python -I make_game.py --game "D:\paket\yolu" --wav    # Opus akışlarını ayr
 python -I make_game.py --wave64-emulate off            # auto (varsayılan), on veya off
 ```
 
-Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
+Aşamalar: `check` her zaman ilk olarak çalışır; ardından seçilmişlerse `shaders`, `assets` ve `runtime` birlikte
+(paralel olarak) yürütülür (birbirlerine bağımlı değillerdir). `pipelines`, çevrilmiş shader'lar hazır olduğunda
+ve bu derleme `runtime` aşamasını da içeriyorsa o aşama `vk_pipeline_check` aracını yeniden derlemeyi bitirdiğinde
+başlar; böylece `assets` aşamasının geri kalanıyla örtüşebilir. Bu aşama, GPU sürücünüzde çevrilen her bir shader'ı
+oluşturur, atlamak zorunda kaldıklarını bildirir ve `--out` içindeki `pipeline_cache.bin` dosyasına bir pipeline
+önbelleği kaydeder (runtime henüz bu önbelleği yüklemediğinden ilk açılışı hızlandırmaz). Shader çevirisi en uzun
+CPU adımıdır: varsayılan olarak CPU iş parçacıklarının yarısı olan `--jobs` işlemde çalışır. Shaders ve assets aşamaları
+aynı anda çalıştığında bu bütçe aralarında paylaştırılır ve `rpf9dump` aracına `--jobs` olarak iletilir; tek başına bir
+assets çalıştırması ise `rpf9dump`'ın tüm çekirdekleri kullanmasına izin verir. İlerleme satırları; çeviri parçaları,
+varlık adımları ve genel aşama tamamlanması için yüzde ve yaklaşık kalan süre (ETA) bilgisi içerir.
+
+Etkileşimli bir terminalde LEONIDA kurulum ekranı, iş parçacığı sayısını ve aşamaların örtüşüp örtüşmeyeceğini
+ayarlamanıza imkân tanır; ardından tuşlarla geçiş yapılabilen aşama bazlı günlük görünümü (`1`–`4` / `Tab`), paralel
+çıktıları ayrıştırılmış halde tutar; tüm aşama günlükleri `work/logs/` altına kaydedilir. Düz konsol görünümü için
+`--no-tui` parametresini kullanın (veya stdout çıktısını yeniden yönlendirin).
 
 - **`--wave64-emulate`**: Wave64 compute ve mesh shader'larını her subgroup genişliğinde birebir çalışacak şekilde
   çevirir. NVIDIA ve Intel GPU'lar 32 şeritli subgroup kullandığı için buna ihtiyaç duyar. Varsayılan `auto` modu
@@ -110,6 +124,10 @@ Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runt
   içine çapraz derleme yapabilir ya da `--runtime-build <klasör>` ile önceden derlenmiş bir Windows runtime'ını
   (`gta6rt.exe` ve `gta6rt_tls_host.dll`, örn. CI'daki `runtime-windows` paketi) doğrudan kopyalayabilir. Her iki durumda
   da çıkış klasörüne `gta6rt.sh` başlatıcısını yazar (`wine` veya `WINE` ortam değişkeni ile çalıştırılır).
+  Linux'ta paketlenmiş oyunun içe aktarmalarını incelemek için `<out>/gta6rt.sh --dry-run`, ardından TLS geri çağırmalarını
+  ve DLL başlatmasını denetlemek için `<out>/gta6rt.sh --init` çalıştırın. Başlatmak için `<out>/gta6rt.sh --run` kullanın.
+  Bu komutlar varsayılan olarak `game_path.txt` içindeki paketi, yazma işlemleri için portun `overlay` klasörünü ve
+  Vulkan'ı kullanır.
 
 ## Sık Karşılaşılan Sorunlar
 
@@ -130,7 +148,7 @@ Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runt
 
 1. Aynı işi iki kez yapmamak için açık PR'lara ve [koordinasyon issue'suna][coord] göz atın. Başlamadan önce
    `claiming: <ID>` yazarak (veya henüz ID yoksa tek satırlık açıklamayla) görevi sahiplenin.
-2. Sentetik girdilerle ilgili testleri çalıştırın (örneğin depo kökünde `python -I tests/test_manifest.py`).
+2. Sentetik girdilerle ilgili testleri çalıştırın (örneğin depo kökünde `python -I tests/test_manifest_verifier.py`).
 3. PR açıklamasında görev ID'sini, neleri test ettiğinizi ve GPU testi çalıştırdıysanız ekran kartı ile sürücü
    sürümünü belirtin; yapay zekâ desteği kullandıysanız not düşün. Tüm kurallar için
    [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) dosyasına bakın.
