@@ -478,44 +478,34 @@ without it they're skipped, which is expected, not a failure. To test the fallba
 **for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
 (`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
 
-## Fused multiply-add: GLSL Fma or OpFmaKHR
+## Fused multiply-add: GLSL Fma, OpFmaKHR or exact
 
 `cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on
-operands taken from user SGPRs so the driver cannot fold them. Run it with default `--fma glsl` (GLSL.std.450 `Fma`) or
-with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
-That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit
-77 (a SKIP) for a module that needs it on a device without it. The Vulkan specification allows a driver to split GLSL
-`Fma` into two roundings, which is why `khr` exists: on AMD Windows (26.11.2) and NVIDIA (617.42) GLSL `Fma` stayed
-fused, whereas **Mesa RADV (26.2.6-arch3.1, AMD Radeon RX 6800, Linux)** splits 5 of the 7 f32 ops under `--fma glsl`
-(reusing the live `a * a` product in `v3`) and returns 8/8 fused exact under `LEONIDA_FMA=khr`. Under default
-`--fma glsl`, `check.py` and `run_gpu_tests.py` therefore accept either the fused or the exact split word for each of
-fused, whereas **Mesa RADV (Linux)** splits several of the 7 f32 ops under `--fma glsl` — the exact split count varies
-by GPU, Mesa/ACO version, and execution modes (4 of 7 on RX 6800 / Mesa 26.2.6-arch3.1 and RX 7600 / Mesa 27.0.0-devel
-with `SignedZeroInfNanPreserve 32`, 5 of 7 on RX 6800 before float controls, 7 of 7 on Radeon Pro V540 RDNA1 / Mesa
-25.2.8) — while returning 8/8 fused exact under `LEONIDA_FMA=khr` where supported. Under default `--fma glsl`,
-`check.py` and `run_gpu_tests.py` therefore accept either the fused or the exact split word independently for each of
-the 7 f32 outputs while still requiring exact f16 round-to-odd (`0x00007351`); under `LEONIDA_FMA=khr`, all 8 words
-must be strictly fused.
-operands taken from user SGPRs so the driver cannot fold them. It passes with the default translation (`--fma glsl`,
-GLSL.std.450 `Fma`) on a driver that keeps `Fma` fused, and with `LEONIDA_FMA=khr` **for `build.py`** (or for
-`run_gpu_tests.py`), which emits `OpFmaKHR`. That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs
-enable it when the device has it and exit 77 (a SKIP) for a module that needs it on a device without it. The Vulkan
-specification allows a driver to split GLSL `Fma` into two roundings, which is why `khr` exists. The AMD Windows
-(26.11.2) and NVIDIA (617.42) drivers we tried don't. Two do, failing `cs_fma_fused` with `glsl` in words 0, 2, 3 and 5
-(`v_fma_f32`, `v_fmaak_f32`, `v_fmac_f32`), which get the split value:
+operands taken from user SGPRs so the driver cannot fold them. Translate it with the default `--fma glsl`
+(GLSL.std.450 `Fma`), with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`,
+or with `LEONIDA_FMA=exact`, which builds the single rounding from plain f32 operations (`Gen.fma_exact`, SHADER-497).
+`khr` needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit 77
+(a SKIP) for a module that needs it on a device without it. `exact` needs no extension.
 
-- RADV (Mesa 26.3.1, RX 6700 XT, measured in #3004's review). It has `VK_KHR_shader_fma` since Mesa 26.2 (#1364), so
-  `khr` fixes it, and so does `exact`.
-- The Intel UHD Graphics driver (Xe-LP, Windows 101.7088). It has no `VK_KHR_shader_fma`, so only `exact` fixes it.
+The Vulkan specification allows a driver to split GLSL `Fma` into two roundings, which is why `khr` and `exact` exist.
+The AMD Windows (26.11.2) and NVIDIA (617.42) drivers we tried keep it fused. Two drivers split it under `--fma glsl`:
 
-`LEONIDA_FMA=exact` (`--fma exact`) builds the single rounding from plain f32 operations and needs no extension; with
-it `cs_fma_fused` passes on both of those, on an RTX 3050 Laptop (617.42), an RTX 5060 Laptop (621.01), an RTX 5070 Ti
-(621.24) and a Radeon 780M (26.11.2).
-Intel UHD Graphics (Xe-LP, Windows 101.7088) splits it too, words 0, 2, 3 and 5 (`v_fma_f32`, `v_fmaak_f32`,
-`v_fmac_f32`), and has no `VK_KHR_shader_fma`, so `khr` can't be used there. For such a device,
-`LEONIDA_FMA=exact` (`--fma exact`) builds the single rounding from plain f32 operations and needs no extension;
-under it, as under `khr`, all 8 words must be strictly fused, and they are on that Intel UHD and on an RTX 3050
-Laptop (617.42).
+- Mesa RADV (Linux). The number of split f32 words varies by GPU, Mesa/ACO version and execution modes: 4 of 7 on an
+  RX 6800 (Mesa 26.2.6-arch3.1), an RX 7600 (Mesa 27.0.0-devel) with `SignedZeroInfNanPreserve 32` and an RX 6700 XT
+  (Mesa 26.3.1, words 0, 2, 3 and 5, measured in #3004's review); 5 of 7 on the RX 6800 before float controls; 7 of 7
+  on a Radeon Pro V540 (RDNA1, Mesa 25.2.8). RADV has `VK_KHR_shader_fma` since Mesa 26.2 (#1364), so `khr` gives
+  8/8 fused there, and so does `exact`.
+- The Intel UHD Graphics driver (Xe-LP, Windows 101.7088): words 0, 2, 3 and 5 (`v_fma_f32`, `v_fmaak_f32`,
+  `v_fmac_f32`). It has no `VK_KHR_shader_fma`, so only `exact` gives 8/8 fused there.
+
+So under `--fma glsl`, `check.py` and `run_gpu_tests.py` accept either the fused or the exact split word independently
+for each of the 7 f32 outputs, while still requiring the exact f16 round-to-odd word (`0x00007351`). Under `khr` and
+`exact`, all 8 words must be strictly fused: a split word there means the correctly rounded path is broken. Both read
+the mode from the `fma` field the translator records for the shader in `index.json` (TEST-1147), so a `check.py` run
+in a fresh shell judges an `exact` build strictly; `LEONIDA_FMA` and the `shaderFmaFloat32` feature are only the
+fallback for an older index without the field. With `exact`, `cs_fma_fused` gives 8/8 fused on the Intel UHD, the
+RX 6700 XT and a Radeon 610M on RADV, an RTX 3050 Laptop (617.42), an RTX 5060 Laptop (621.01), an RTX 5070 (616.56),
+an RTX 5070 Ti (621.24) and a Radeon 780M (26.11.2).
 
 ## Hardware oracle (optional, AMD)
 
