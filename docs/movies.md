@@ -317,6 +317,21 @@ arguments (the flags word and the options pointer) were not told apart; both are
 `BinkSetMemory`, `BinkSetOSFileCallbacks`, `BinkStartAsyncThread`, `BinkDoFrameAsyncMulti`/`Wait`, the stop calls,
 `BinkGetPlatformInfo`, `BinkGetKeyFrame`, `BinkShouldSkip` and `BinkSetSoundSystem`.
 
+### The exe's path: async decode (RT-BINK-ASYNC)
+
+The exe decodes with `BinkNextFrame(bink)`, `BinkDoFrameAsyncMulti(bink, thread_ids, count)` and
+`BinkDoFrameAsyncWait(bink, 0xffffffff)` on decode threads it starts with `BinkStartAsyncThread`, and stops with
+`BinkRequestStopAsyncThreadsMulti(thread_ids, count)` and `BinkWaitStopAsyncThreadsMulti(thread_ids, count)`
+(argument shapes read from the exe's call sites on 1.0.2.1; `thread_ids` is a `u32` array).
+[`runtime/test/bink_async_test.cpp`](../runtime/test/bink_async_test.cpp) runs that sequence through `rt::Loader`
+with one thread, id 0: `BinkStartAsyncThread(0, 0)` returns 1; frames 1 and 2 of each stream decoded that way equal
+`BinkDoFrame`'s, plane for plane over the picture area, on **515 of 515** streams (`LEONIDA_BINK_LIMIT=515`, two
+runs, about 2 minutes each; the default is 8 streams); `BinkDoFrameAsyncWait` returned non-zero in all 1,030 calls and
+both stop calls returned. `BinkDoFrameAsyncMulti` with a thread count of 1 also needs `BinkNextFrame` first, or
+nothing is decoded. Frame 0 writes one of the two frame sets only, so the other holds uninitialised memory and the
+comparison starts at frame 1. A finite wait of 10,000 returned before the decode finished on 10 to 45 of 515 streams
+per run (output differing run to run); the unit of that argument is not established, so use `0xffffffff` as the exe does.
+
 ### Audio track decoding (`BinkOpenTrack` / `BinkGetTrackData`, ASSET-323)
 
 Using the same temporary `xmem.dll` → `msvcrt.dll` (`malloc`/`free`) copy of `Bink2Scarlett.dll` on Windows 11,

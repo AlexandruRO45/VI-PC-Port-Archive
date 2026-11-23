@@ -918,6 +918,23 @@ if(BUILD_TESTING)
     add_test(NAME bink_framebuffers COMMAND bink_framebuffers_test)
     set_tests_properties(bink_framebuffers PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
+    # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_BINK_INDEX are set. Runs the call sequence the retail
+    # exe imports (frame buffers, async decode threads) over movies.rpf (docs/movies.md section 4).
+    add_executable(bink_async_test
+      test/bink_async_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+    )
+    target_compile_definitions(bink_async_test PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(bink_async_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_link_options(bink_async_test PRIVATE /OPT:NOREF)
+    target_link_libraries(bink_async_test PRIVATE psapi)
+    add_dependencies(bink_async_test gta6rt_tls_host)
+    add_test(NAME bink_async COMMAND bink_async_test)
+    set_tests_properties(bink_async PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
     # Optional local viewer: plays a .bk2 in a window through the package's Bink2Scarlett.dll (test/bink_play.cpp).
     # The CTest entry is the headless smoke run; it skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_play
