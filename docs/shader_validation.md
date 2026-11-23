@@ -1752,6 +1752,18 @@ RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixe
   seeded heap was tried and abandoned, because a pointer read from float data is a wild address and takes NVIDIA's
   device down.
 
+**With the fallbacks (`--bary-fallback --min-lod-fallback`, same 480 shaders, variant z).** The same sample was
+retranslated with both flags and drawn through `<name>.bary_gs.spv` where a shader reads raw barycentrics (`VKS_GS`,
+`tools/bary_fallback_gs.py`). The Intel UHD 770 creates 440 of the 480 (265 before; the 207 that needed
+`fragmentShaderBarycentric` or `shaderResourceMinLod` are gone), 32 time out (zeroed-heap loops, which the same
+translation also hits on the RTX 4080 SUPER), and 8 are not translated (`computed I/J pair under --bary-fallback`,
+#3898). Intel against NVIDIA on the same fallback translation: 434 OK on both, 0 differ, 4 NVIDIA device losses
+(the unterminated loop above), 8 not translated, 34 timeouts on both. Intel with the fallbacks against NVIDIA with
+the default translation: 373 OK, 53 differ by more than 0.1 and 8 are NaN on one side. The same 61 differ between the
+two translations on NVIDIA alone (all in the barycentric stratum, none of them one of the 9 that read raw
+barycentrics), so it is the fallback translation, not the GPU: not root-caused. Only 9 of the 480 read raw
+barycentrics and need the geometry shader; all 9 agree on both GPUs.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
