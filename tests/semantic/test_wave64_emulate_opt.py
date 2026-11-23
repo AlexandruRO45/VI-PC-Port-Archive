@@ -441,6 +441,13 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 vals[res] = v
             elif op == "OpCompositeConstruct":
                 vals[res] = tuple(vals[x] for x in a[1:])
+            elif op == "OpBitcast" and ptr_types.get(a[0], (None,))[0] == "PhysicalStorageBuffer":
+                src = types[id_t[a[1]]]
+                if src[0] != "vec" or src[2] != 2 or types[src[1]][:2] != ("int", 32):
+                    raise NotImplementedError(f"OpBitcast {line}")
+                lo, hi = vals[a[1]]
+                ptrs[res] = ("psb", (lo & MASK32) | ((hi & MASK32) << 32))
+                vals[res] = ptrs[res]
             elif op == "OpConvertUToPtr":
                 ptrs[res] = ("psb", vals[a[1]])
                 vals[res] = ptrs[res]
@@ -1324,11 +1331,12 @@ class StructuredEmulationTests(unittest.TestCase):
             i2 = next(i for i, l in enumerate(lines) if l.strip().startswith("%blk2 = OpLabel"))
             i3 = next(i for i, l in enumerate(lines) if l.strip().startswith("%blk3 = OpLabel"))
             blk2_to_end = lines[i2:]
-            store_idx = next(i for i, l in enumerate(blk2_to_end)
-                             if "OpStore" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
-            i3_rel = i3 - i2
-            load_idx = next(i for i, l in enumerate(blk2_to_end[i3_rel:], i3_rel)
-                            if "OpLoad %uint" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
+            # Follow the access-chain result to the actual physical memory operation.
+            pointers = {line.split()[0] for line in blk2_to_end if " = OpAccessChain %_ptr_PSB_uint " in line}
+            store_idx = next(i for i, line in enumerate(blk2_to_end[:i3 - i2])
+                             if line.strip().startswith("OpStore ") and line.split()[1] in pointers)
+            load_idx = next(i for i, line in enumerate(blk2_to_end[i3 - i2:], i3 - i2)
+                            if " = OpLoad %uint " in line and line.split()[4] in pointers)
             self.assertTrue(any("OpControlBarrier" in l for l in blk2_to_end[store_idx:load_idx]),
                             f"missing OpControlBarrier between blk2 buffer_store and blk3 buffer_load ({expected_mode})")
             for rev in (False, True):
@@ -1394,6 +1402,38 @@ class StructuredEmulationTests(unittest.TestCase):
                 v4 += 31
             v4 += 31
             self.assertEqual(mem[l * 4], v4, f"lane {l}")
+
+        # 2) Guard-spine coalescing after an early-exit branch (0 -> [1 (end), 2]) and inside a header-exit loop:
+        #    cfg_structure.structure hoists spine guards into the enclosing list where skip_pc holds the early-exit
+        #    target. _unwrap_known_pc_guards must coalesce and unwrap all hoisted post-dominating spine guards.
+        import cfg_structure
+        succ_early = [[1, 2], []]  # block 0 -> early exit 1 or main body 2
+        cur = 2
+        for _ in range(10):
+            succ_early.append([cur + 1, cur + 2])
+            succ_early.append([cur + 2])
+            cur += 2
+        succ_early.append([])
+        raw_tree = cfg_structure.structure(succ_early)
+        out_pcs = {b: (frozenset(s) if s else frozenset({-1})) for b, s in enumerate(succ_early)}
+        unwrapped_tree = wave64_emulate_opt._unwrap_known_pc_guards(raw_tree, out_pcs, 0)
+
+        def count_guards(t):
+            c = 0
+            st = [t]
+            while st:
+                for item in st.pop():
+                    if item[0] == "guard":
+                        c += 1
+                        st.append(item[2])
+                    elif item[0] == "loop":
+                        st.append(item[2])
+            return c
+
+        # Raw tree has 22 guards (guard 1, guard 2, plus 10 arm guards and 10 hoisted spine guards);
+        # coalesced unwrap removes all 10 hoisted spine guards -> 12 guards.
+        self.assertEqual(count_guards(raw_tree), 22)
+        self.assertEqual(count_guards(unwrapped_tree), 12)
 
 
 if __name__ == "__main__":
