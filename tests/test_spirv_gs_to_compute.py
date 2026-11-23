@@ -274,6 +274,29 @@ def test_help_is_a_clean_exit_zero(capsys):
         assert "SPIRV-Tools" in out
 
 
+def test_missing_spirv_dis_is_one_error_line(capsys, monkeypatch, tmp_path):
+    """A SPIRV-Tools binary that is not installed is one ERROR line naming SPIRV_DIS, not a traceback."""
+    monkeypatch.setenv("SPIRV_DIS", "no-such-spirv-dis-binary")
+    source = tmp_path / "in.spv"
+    source.write_bytes(b"")
+    assert gsc.main(["spirv_gs_to_compute.py", str(source), str(tmp_path / "out.spv")]) == 2
+    assert capsys.readouterr().err.splitlines() == [
+        "ERROR: no-such-spirv-dis-binary not found: install SPIRV-Tools, put it on PATH, or set SPIRV_DIS to it"]
+
+
+def test_spirv_dis_that_refuses_the_input_is_one_error_line(capsys, monkeypatch, tmp_path):
+    """SPIRV_DIS pointing at a program that exits nonzero is one ERROR line, not a CalledProcessError traceback."""
+    monkeypatch.setenv("SPIRV_DIS", sys.executable)  # `python --raw-id in.spv` exits 2 with its usage on stderr
+    source = tmp_path / "in.spv"
+    source.write_bytes(b"")
+    assert gsc.main(["spirv_gs_to_compute.py", str(source), str(tmp_path / "out.spv")]) == 2
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1, err
+    assert err[0].startswith(f"ERROR: {source} is not a SPIR-V module ")
+    assert err[0].count(":") >= 2  # the disassembler's own last line follows
+    assert not (tmp_path / "out.spv").exists()
+
+
 @pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
 @pytest.mark.parametrize("targets,expected_targets", [
     ("%in_pos", ""),
