@@ -404,5 +404,39 @@ class TestVDivFixupF32ASTInterpreter(unittest.TestCase):
         self.assertEqual(bits_to_f32(state.vgprs[0]), 2.5)
 
 
+def step_simd_div_fixup_f32(wave: WaveDivState, instr: Instruction) -> None:
+    if instr.opcode != "v_div_fixup_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.read_lane_f32(lane, instr.src0)
+            s1 = wave.read_lane_f32(lane, instr.src1)
+            s2 = wave.read_lane_f32(lane, instr.src2)
+            res = ref_div_fixup_f32(s0, s1, s2)
+            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+
+
+class TestVDivFixupF32SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence and IEEE 754 priority rules for v_div_fixup_f32."""
+
+    def test_simd_divergence(self):
+        wave = WaveDivState(wave_size=32)
+        wave.exec_mask = 0x00FF00FF
+        for lane in range(32):
+            wave.vgprs[lane][1] = f32_to_bits(2.5)
+            wave.vgprs[lane][2] = f32_to_bits(2.0)
+            wave.vgprs[lane][3] = f32_to_bits(5.0)
+            wave.vgprs[lane][0] = f32_to_bits(0.0)
+
+        instr = Instruction("v_div_fixup_f32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_simd_div_fixup_f32(wave, instr)
+
+        for lane in range(32):
+            if (0x00FF00FF >> lane) & 1:
+                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 2.5)
+            else:
+                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
