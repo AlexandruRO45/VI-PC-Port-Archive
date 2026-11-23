@@ -99,9 +99,22 @@ def pc_tail_env() -> bool:
     return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def clear_case_output(path: str) -> None:
+    """A later case can reuse the directory; its producer must write a new file."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise SystemExit(f"cannot remove the previous case output {path}: {e}") from e
+
+
 def translate(work: str, pc_tail: bool = False) -> str:
     """Translate work/disasm into work/spirv and return that directory."""
     spirv = os.path.join(work, "spirv")
+    modules = ("vs_ids.spv", "ps_image_load.spv")
+    for name in modules:
+        clear_case_output(os.path.join(spirv, name))
     cmd = [sys.executable, "-I", TRANSLATOR, os.path.join(work, "disasm"), "--out", spirv]
     if pc_tail:
         cmd.append("--pc-tail-ubo")
@@ -109,7 +122,7 @@ def translate(work: str, pc_tail: bool = False) -> str:
     if r.returncode:
         raise SystemExit(f"translator failed:\n{r.stdout}\n{r.stderr}")
     # The batch translator can exit successfully even when an individual shader is rejected.
-    missing = [name for name in ("vs_ids.spv", "ps_image_load.spv") if not os.path.isfile(os.path.join(spirv, name))]
+    missing = [name for name in modules if not os.path.isfile(os.path.join(spirv, name))]
     if missing:
         raise SystemExit(f"translator did not emit {', '.join(missing)}:\n{r.stdout}\n{r.stderr}")
     return spirv
@@ -213,7 +226,7 @@ def read_rgba(path: str) -> list:
         data = f.read()
     want = DRAW * DRAW * 16
     if len(data) != want:
-        raise SystemExit(f"{path}: {len(data)} bytes, expected {want}")
+        raise ValueError(f"{path}: {len(data)} bytes, expected {want}")
     return list(struct.unpack(f"<{DRAW * DRAW * 4}f", data))
 
 
@@ -290,7 +303,7 @@ def exit_status(returncode: int) -> str:
     return f"exit {returncode}"
 
 
-def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, data=None, pc_tail=False) -> bool:
+def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, data=None, pc_tail=False) -> bool | None:
     """data: the (texel bytes, T# words) to use instead of drawing them from rng (main draws all cases up front, so
     the translator and the hardware oracle see the same textures)."""
     vk_format, _, _, model = FORMATS[fmt_name]
@@ -316,6 +329,7 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, d
     run_kw = {"capture_output": True, "text": True}
     if pc_tail:
         run_kw["env"] = dict(os.environ, LEONIDA_PC_TAIL_UBO="1")
+    clear_case_output(out_path)
     r = subprocess.run([harness, os.path.join(spirv, "vs_ids.spv"), os.path.join(spirv, "ps_image_load.spv"),
                         out_path, spec_path], **run_kw)
     if r.returncode == 77:   # a device limit or missing feature, named on the harness's "unsupported:" line
@@ -337,7 +351,11 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, d
             for line in shown:
                 print(f"    {line}")
         return False
-    got = read_rgba(out_path)
+    try:
+        got = read_rgba(out_path)
+    except (OSError, ValueError) as e:
+        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL (could not read fresh pixels: {e})")
+        return False
     problems = compare(fmt_name, texels, width, height, got, dmask)
     if not problems:
         if show:

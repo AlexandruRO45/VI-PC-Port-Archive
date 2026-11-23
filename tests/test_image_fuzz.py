@@ -276,15 +276,19 @@ def test_compare_treats_any_nan_as_equal():
     assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got) == []
 
 
-def run_case_with_harness_result(monkeypatch, tmp_path, returncode, stdout, stderr=""):
+def run_case_with_harness_result(monkeypatch, tmp_path, returncode, stdout, stderr="", *, frame=None):
     """run_case with the translator stubbed out and vk_image_fuzz answering `returncode`/`stdout`/`stderr`."""
     build = tmp_path / "build"
     build.mkdir()
     (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
     monkeypatch.setattr(imf, "assemble", lambda *_args: None)
     monkeypatch.setattr(imf, "translate", lambda work: str(tmp_path / "spirv"))
-    monkeypatch.setattr(imf.subprocess, "run",
-                        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode, stdout, stderr))
+    def run(cmd, **_kw):
+        if frame is not None:
+            Path(cmd[3]).write_bytes(frame)
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+    monkeypatch.setattr(imf.subprocess, "run", run)
     return imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False)
 
 
@@ -318,6 +322,42 @@ def test_rejected_fragment_translation_is_reported_before_the_harness(
     monkeypatch.setattr(imf.subprocess, "run", run)
     with pytest.raises(SystemExit, match=r"(?s)ps_image_load\.spv.*s_trap"):
         imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(work), str(build), False, False)
+
+
+def test_translation_does_not_accept_an_old_fragment_module(monkeypatch, tmp_path):
+    spirv = tmp_path / "spirv"
+    spirv.mkdir()
+    fragment = spirv / "ps_image_load.spv"
+    fragment.write_bytes(b"old case's module")
+
+    def run(cmd, **_kw):
+        (spirv / "vs_ids.spv").touch()
+        return subprocess.CompletedProcess(cmd, 0, "fragment was rejected", "")
+
+    monkeypatch.setattr(imf.subprocess, "run", run)
+    with pytest.raises(SystemExit, match=r"(?s)ps_image_load\.spv.*fragment was rejected"):
+        imf.translate(str(tmp_path))
+    assert not fragment.exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "stale", "truncated", "fresh"])
+def test_case_checks_only_pixels_written_by_this_harness(monkeypatch, tmp_path, capsys, kind):
+    fmt = "R8G8B8A8_UNORM"
+    texels, _ = imf.make_texels(fmt, 4, 4, random.Random(1))
+    pixels = drawn(imf.oracle(fmt, texels, 4, 4), 4, 4)
+    correct_frame = struct.pack(f"<{len(pixels)}f", *pixels)
+    readback = tmp_path / "out.raw"
+    if kind == "stale":
+        readback.write_bytes(correct_frame)
+    new_frame = {"fresh": correct_frame, "truncated": b"short"}.get(kind)
+
+    passed = run_case_with_harness_result(monkeypatch, tmp_path, 0, "", frame=new_frame)
+    assert passed is (kind == "fresh")
+    if kind in ("missing", "stale"):
+        assert not readback.exists()
+        assert "could not read fresh pixels" in capsys.readouterr().out
+    elif kind == "truncated":
+        assert "expected 65536" in capsys.readouterr().out
 
 
 def test_unsupported_without_a_reason_line_still_skips(monkeypatch, tmp_path, capsys):
