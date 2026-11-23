@@ -475,16 +475,19 @@ STORE64_FILL = STORE_FILL + (lambda i: (i + 1) << 32 | (0xFFFFFFF0 + i) & 0xFFFF
                              lambda i: (0x100 + i) << 32 | (0xFFFFFF00 + i))
 STORE64_WORDS = {
     # 64-bit image atomics: the data pair afterwards (low dword in the uint image, high in the sint image) of 2D cases
-    # 0..15 and of 3D cases 0..5 at 16..21; the 2D texels 0..16 and the six 3D texels afterwards
+    # 0..15, of 3D cases 0..5 at 16..21 and of 2D cases 17..19 (umax, no glc) at 22..24; the 2D texels 0..19 and the
+    # six 3D texels afterwards
     "cs_imgatomic64": (
         {**{c: 0xFFFFFFF0 + c for c in range(15)}, 15: 7,
-         16: 0xFFFFFF39, 17: 0xFFFFFF13, 18: 0xFFFFFF2C, 19: 0xFFFFFF06, 20: 0xFFFFFF1E, 21: 0xFFFF},
+         16: 0xFFFFFF39, 17: 0xFFFFFF13, 18: 0xFFFFFF2C, 19: 0xFFFFFF06, 20: 0xFFFFFF1E, 21: 0xFFFF,
+         22: 0, 23: 5, 24: 0xFFFFFFFF},
         {**{c: c + 1 for c in range(15)}, 15: 0,
-         16: 0x139, 17: 0x113, 18: 0x12C, 19: 0x106, 20: 0x11E, 21: 0xFFFF0000},
+         16: 0x139, 17: 0x113, 18: 0x12C, 19: 0x106, 20: 0x11E, 21: 0xFFFF0000, 22: 0x13, 23: 0x13, 24: 0x13},
         {},
         {0: 0x2_00000010, 1: 0xFFFFFFFF, 2: 0xFFFFFFFF_FFFFFFF0, 5: 0x7FFFFFFF_00000000, 7: 0x7_FFFFFFFF,
          8: 0xA_00000000, 9: 0xA_0000FFF9, 10: 0xF000000B_FFFFFFFF, 11: 0xFFFFFFF3_00000004,
-         12: 0x12345678_9ABCDEF0, 13: 0xDEADBEEF_CAFEF00D, 15: 0x11_00000006, 16: 0x11_00000040},
+         12: 0x12345678_9ABCDEF0, 13: 0xDEADBEEF_CAFEF00D, 15: 0x11_00000006, 16: 0x11_00000040,
+         17: 0x13_00000000, 18: 0x13_00000005},
         {57: 0x13B_00000039, 19: 0x112_FFFFFFFF, 6: 0xFEEDFACE_DEADBEEF, 30: 0x01234567_89ABCDEF,
          39: 0xFFFF0127_FFFF00D8}),
 }

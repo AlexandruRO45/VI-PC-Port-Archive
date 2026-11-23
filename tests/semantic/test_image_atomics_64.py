@@ -181,6 +181,20 @@ class ImageAtomics64(unittest.TestCase):
                 self.assertEqual(case(kind, m, d, glc=False)[:2], (fn(m, d), [*split(d), 0xDEAD, 0xBEEF]))
         self.assertEqual(case("cmpswap", m, d, m, glc=False)[:2], (d, [*split(d), *split(m)]))
 
+    def test_game_form_umax_2d_without_glc(self):
+        """The game's only 64-bit MIMG atomic (D3D-251 census: 2D umax, 953 of 954 sites without glc): a 64-bit
+        unsigned max, decided by the high dword where they differ, by the low one where the high dwords match."""
+        for m, d, want in ((0x00000012_00000001, 0x00000013_00000000, 0x00000013_00000000),    # high decides
+                           (0x00000013_00000002, 0x00000013_00000005, 0x00000013_00000005),    # low decides
+                           (0x00000014_00000003, 0x00000013_FFFFFFFF, 0x00000014_00000003),    # kept
+                           (0xFFFFFFFF_00000000, 0x7FFFFFFF_FFFFFFFF, 0xFFFFFFFF_00000000)):   # unsigned
+            for active in (True, False):
+                with self.subTest(m=hex(m), d=hex(d), active=active):
+                    texel, regs, ran = case("umax", m, d, glc=False, active=active)
+                    self.assertEqual(texel, want if active else m)
+                    self.assertEqual(regs[:2], list(split(d)))
+                    self.assertEqual(ran, ["OpAtomicUMax"])
+
     def test_inactive_lane_changes_nothing(self):
         m, d = 0x00000003_FFFFFFF2, 0xFFFFFFFF_FFFFFFF0
         for kind in [*MODEL, "cmpswap"]:

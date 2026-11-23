@@ -30,8 +30,13 @@
 ;   14  cmpswap  1, 0x00000000fffffffe               0x0000000ffffffffe   high dword differs: kept    W(14)
 ;   15  add      7, no glc                           0x00000010ffffffff   carry: 0x0000001100000006   7 (the data)
 ;   16  add      1, 64 threads                       0x0000001100000000   0x0000001100000040          (not stored)
+;   17  umax     0x0000001300000000, no glc          0x0000001200000001   0x0000001300000000          the data, at 22
+;   18  umax     0x0000001300000005, no glc          0x0000001300000002   0x0000001300000005          the data, at 23
+;   19  umax     0x00000013ffffffff, no glc          0x0000001400000003   kept                        the data, at 24
 ; Cases 7 and 8 differ from a per-dword min / max (0x00000007fffffff7, 0x0000000afffffff8), and 14 from a compare of
-; the low dword alone.
+; the low dword alone. Cases 17 to 19 are the game's form (D3D-251 census: its only 64-bit MIMG atomic is 2D umax,
+; 953 of 954 sites without glc): the high dword decides 17 (a per-dword max gives 0x0000001300000001) and 19
+; (0x00000014ffffffff), the low dword 18. Their data pairs go to uint/sint texels 22..24 (16..21 hold the 3D pairs).
 ;    k  op       data (64-bit)          (x, y, z)  i    V(i)                 volume word i afterwards     pair afterwards
 ;    0  add      0x0000000100000100     (1, 2, 3)  57   0x00000139ffffff39   0x0000013b00000039           V(57)
 ;    1  umin     0x00000112ffffffff     (3, 0, 1)  19   0x00000113ffffff13   0x00000112ffffffff           V(19)
@@ -39,8 +44,8 @@
 ;    3  cmpswap  0xfeedfacedeadbeef, V(6) (2, 1, 0)  6  0x00000106ffffff06   equal: 0xfeedfacedeadbeef    V(6)
 ;    4  swap     0x0123456789abcdef     (2, 3, 1)  30   0x0000011effffff1e   0x0123456789abcdef           V(30)
 ;    5  xor      0xffff00000000ffff, no glc (3, 1, 2) 39 0x00000127ffffff27   0xffff0127ffff00d8           the data
-; Every other word keeps its fill: uint word i = 100 + i for i = 22..63, sint word i = -2i for i = 22..63, the r32
-; volume 200 + i, 2D r64 word i = W(i) for i = 17..63 and r64 volume word i = V(i) elsewhere.
+; Every other word keeps its fill: uint word i = 100 + i for i = 25..63, sint word i = -2i for i = 25..63, the r32
+; volume 200 + i, 2D r64 word i = W(i) for i = 20..63 and r64 volume word i = V(i) elsewhere.
 s_mov_b32 s16, 0x6000
 s_mov_b32 s17, 0x3e00000
 s_mov_b32 s18, 0x66
@@ -196,6 +201,30 @@ v_mov_b32_e32 v5, 0
 image_atomic_add v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
 image_store v4, v[1:2], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
 image_store v5, v[1:2], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+v_mov_b32_e32 v1, 1
+v_mov_b32_e32 v2, 2
+v_mov_b32_e32 v4, 0
+v_mov_b32_e32 v5, 0x13
+image_atomic_umax v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+v_mov_b32_e32 v8, 6
+v_mov_b32_e32 v9, 2
+image_store v4, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+image_store v5, v[8:9], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+v_mov_b32_e32 v1, 2
+v_mov_b32_e32 v4, 5
+v_mov_b32_e32 v5, 0x13
+image_atomic_umax v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+v_mov_b32_e32 v8, 7
+image_store v4, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+image_store v5, v[8:9], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+v_mov_b32_e32 v1, 3
+v_mov_b32_e32 v4, -1
+v_mov_b32_e32 v5, 0x13
+image_atomic_umax v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+v_mov_b32_e32 v8, 0
+v_mov_b32_e32 v9, 3
+image_store v4, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+image_store v5, v[8:9], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
 v_mov_b32_e32 v9, 2
 v_mov_b32_e32 v1, 1
 v_mov_b32_e32 v2, 2

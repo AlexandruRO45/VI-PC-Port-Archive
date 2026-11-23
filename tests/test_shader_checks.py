@@ -699,7 +699,10 @@ class StoreWordsChecks(unittest.TestCase):
         self.assertEqual(volume, [200 + i for i in range(64)])
         self.assertEqual(wide[16], 0x11_00000000 + 64)              # 64 threads each added 1
         self.assertEqual((wide[3], wide[4], wide[6], wide[14]), (0x4_FFFFFFF3, 0x5_FFFFFFF4, 0x7_FFFFFFF6, 0xF_FFFFFFFE))
-        self.assertEqual(wide[17:], [(i + 1) << 32 | (0xFFFFFFF0 + i) & 0xFFFFFFFF for i in range(17, 64)])
+        # 2D umax without glc (the game's form): the high dword decides 17 and 19 (kept), the low dword 18
+        self.assertEqual(wide[17:20], [0x13_00000000, 0x13_00000005, 0x14_00000003])
+        self.assertEqual((uint[22:25], sint[22:25]), ([0, 5, 0xFFFFFFFF], [0x13, 0x13, 0x13]))   # the data, kept
+        self.assertEqual(wide[20:], [(i + 1) << 32 | (0xFFFFFFF0 + i) & 0xFFFFFFFF for i in range(20, 64)])
         self.assertEqual({i for i, w in enumerate(wide3d) if w != (0x100 + i) << 32 | (0xFFFFFF00 + i)},
                          {57, 19, 6, 30, 39})
         name = "cs_imgatomic64"

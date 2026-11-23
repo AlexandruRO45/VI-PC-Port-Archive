@@ -154,6 +154,30 @@
 	image_atomic_add v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
 	image_store v4, v[1:2], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
 	image_store v5, v[1:2], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+	v_mov_b32_e32 v1, 1
+	v_mov_b32_e32 v2, 2
+	v_mov_b32_e32 v4, 0
+	v_mov_b32_e32 v5, 0x13
+	image_atomic_umax v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+	v_mov_b32_e32 v8, 6
+	v_mov_b32_e32 v9, 2
+	image_store v4, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+	image_store v5, v[8:9], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+	v_mov_b32_e32 v1, 2
+	v_mov_b32_e32 v4, 5
+	v_mov_b32_e32 v5, 0x13
+	image_atomic_umax v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+	v_mov_b32_e32 v8, 7
+	image_store v4, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+	image_store v5, v[8:9], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+	v_mov_b32_e32 v1, 3
+	v_mov_b32_e32 v4, -1
+	v_mov_b32_e32 v5, 0x13
+	image_atomic_umax v[4:5], v[1:2], s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+	v_mov_b32_e32 v8, 0
+	v_mov_b32_e32 v9, 3
+	image_store v4, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+	image_store v5, v[8:9], s[32:39] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
 	v_mov_b32_e32 v9, 2
 	v_mov_b32_e32 v1, 1
 	v_mov_b32_e32 v2, 2
