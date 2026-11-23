@@ -578,3 +578,64 @@ class TestSIMDDivergence(unittest.TestCase):
             else:
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src2_in_place_accumulation(self) -> None:
+        """Verify v0 = v1 * v2 + v0 reads initial v0 before writeback."""
+        state = ScalarMachineState()
+        init_v0 = pack_f16x2(F16_HALF, F16_HALF)    # 0.5, 0.5
+        v1_val = pack_f16x2(F16_ONE, F16_ONE)      # 1.0, 1.0
+        v2_val = pack_f16x2(F16_TWO, F16_TWO)      # 2.0, 2.0
+
+        state.set_vgpr(0, init_v0)
+        state.set_vgpr(1, v1_val)
+        state.set_vgpr(2, v2_val)
+
+        interp = ScalarInterpreter()
+        instr = VPKFMA16Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(0))
+        res = interp.step(instr, state)
+
+        # 1.0 * 2.0 + 0.5 = 2.5 (0x4100)
+        self.assertEqual(res, 0x41004100)
+        self.assertEqual(state.get_vgpr(0), 0x41004100)
+
+        # Cross check with translated SPIR-V
+        spv_res = run_translator_pk_fma(v1_val, v2_val, init_v0, name="ps_alias_dst_src2")
+        self.assertEqual(res, spv_res)
+
+    def test_alias_all_operands_same_register(self) -> None:
+        """Verify v0 = v0 * v0 + v0 evaluated with identical operand."""
+        state = ScalarMachineState()
+        init_v0 = pack_f16x2(F16_TWO, F16_TWO)     # 2.0, 2.0
+        state.set_vgpr(0, init_v0)
+
+        interp = ScalarInterpreter()
+        instr = VPKFMA16Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(0), src2=VGPR(0))
+        res = interp.step(instr, state)
+
+        # 2.0 * 2.0 + 2.0 = 6.0 (0x4600)
+        self.assertEqual(res, 0x46004600)
+        self.assertEqual(state.get_vgpr(0), 0x46004600)
+
+    def test_alias_src0_equals_src1(self) -> None:
+        """Verify v0 = v1 * v1 + v2."""
+        state = ScalarMachineState()
+        v1_val = pack_f16x2(F16_TWO, F16_TWO)      # 2.0, 2.0
+        v2_val = pack_f16x2(F16_ONE, F16_ONE)      # 1.0, 1.0
+        state.set_vgpr(1, v1_val)
+        state.set_vgpr(2, v2_val)
+
+        interp = ScalarInterpreter()
+        instr = VPKFMA16Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(1), src2=VGPR(2))
+        res = interp.step(instr, state)
+
+        # 2.0 * 2.0 + 1.0 = 5.0 (0x4500)
+        self.assertEqual(res, 0x45004500)
+        self.assertEqual(state.get_vgpr(0), 0x45004500)
