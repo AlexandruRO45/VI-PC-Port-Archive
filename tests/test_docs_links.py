@@ -17,7 +17,8 @@ from urllib.parse import unquote
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-FENCE = re.compile(r"```.*?```", re.S)
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+\"[^\"]*\")?\)")
 HTML = re.compile(r'(?:href|src)\s*=\s*"([^"]+)"')
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$", re.M)
@@ -25,8 +26,26 @@ EXTERNAL = ("http://", "https://", "mailto:", "tel:", "data:")
 
 
 def strip_fences(text):
-    """Drop fenced code blocks: headings and links inside them are not rendered."""
-    return FENCE.sub("", text)
+    """Drop fenced code blocks: headings and links inside them are not rendered.
+
+    Fences pair line by line, as CommonMark does: a run of three or more backticks or tildes (indented at most three
+    spaces) opens a block that only a run of the same character, at least as long and alone on its line, closes. A
+    fence that is never closed runs to the end of the page, and backticks inside a line are inline code, not a fence.
+    """
+    kept = []
+    fence = None
+    for line in text.splitlines(keepends=True):
+        if fence is None:
+            match = FENCE_OPEN.match(line)
+            if match:
+                fence = match.group(1)
+            else:
+                kept.append(line)
+            continue
+        match = FENCE_CLOSE.match(line)
+        if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+            fence = None
+    return "".join(kept)
 
 
 def slug(heading):
@@ -121,6 +140,26 @@ class SlugTest(unittest.TestCase):
     def test_punctuation_is_dropped(self):
         self.assertEqual(slug("The Windows runtime on Linux, under Wine or Proton"),
                          "the-windows-runtime-on-linux-under-wine-or-proton")
+
+    def test_fences_pair_line_by_line(self):
+        text = ("# Before\n"
+                "````md\n```\n# Inside four\n```\n````\n"
+                "Inline ```code``` is not a fence.\n"
+                "## Between\n"
+                "~~~\n# Inside tilde\n```\n~~~\n"
+                "```python\n# Inside a comment\n```\n"
+                "### After\n"
+                "```\n# Never closed\n")
+        stripped = strip_fences(text)
+        self.assertEqual(HEADING.findall(stripped), [("#", "Before"), ("##", "Between"), ("###", "After")])
+        self.assertIn("Inline ```code``` is not a fence.", stripped)
+
+    def test_heading_after_inline_triple_backticks_keeps_its_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("Run ```make``` first.\n\n```sh\nmake\n```\n\n## Real heading\n")
+            self.assertEqual(anchors(page), {"real-heading"})
 
     def test_duplicate_headings_get_a_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
