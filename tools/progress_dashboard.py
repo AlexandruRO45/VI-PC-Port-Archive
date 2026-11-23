@@ -29,6 +29,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -376,7 +377,13 @@ def parse_lasttest(text):
             continue
         m = re.match(r"^Test time =\s*([\d.]+) sec", line)
         if m:
-            secs = float(m.group(1))
+            try:
+                secs = float(m.group(1))
+            except ValueError:
+                secs = None
+            else:
+                if not math.isfinite(secs):
+                    secs = None
             continue
         if name and line.startswith(("Test Passed", "Test Failed", "Test Not Run")):
             res = "pass" if "Passed" in line else ("fail" if "Failed" in line else "skip")
