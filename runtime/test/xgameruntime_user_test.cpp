@@ -153,6 +153,8 @@ int main(int argc, char** argv) {
     check(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &issue_queue) == S_OK,
           "issue queue created");
     for (int slot_index : {29, 31}) {
+        check(at<ResolveResult>(user, slot_index + 1)(user, nullptr) == E_INVALIDARG,
+              "issue result rejects a null async block");
         bool called = false;
         XAsyncBlock issue{};
         issue.queue = issue_queue;

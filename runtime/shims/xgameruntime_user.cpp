@@ -331,6 +331,7 @@ HRESULT STDMETHODCALLTYPE user_resolve_issue_async(void*, XUserHandle user, cons
     return XAsyncBegin(async, nullptr, &kIssueIdentity, "XUserResolveIssueWithUiAsync", issue_provider);
 }
 HRESULT STDMETHODCALLTYPE user_resolve_issue_result(void*, XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
     return XAsyncGetResult(async, &kIssueIdentity, 0, nullptr, nullptr);
 }
 
