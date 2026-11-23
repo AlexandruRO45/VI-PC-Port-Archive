@@ -484,6 +484,23 @@ class TestValuFmaF32ClampOracle(unittest.TestCase):
         hw = run_ternary_f32("v_fma_f32", 0.3, 0.4, 0.2, omod="mul:2", clamp=True)
         self.assertAlmostEqual(hw, 0.64, places=6)
 
+class TestValuFmaF32AST(unittest.TestCase):
+    """Stage 20: Symbolic AST and typed modifier definitions for v_fma_f32."""
+
+    def test_ast_fma_compilation(self):
+        lines = [
+            "v_mov_b32 v0, 0x3f000000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_mov_b32 v2, 0x3f000000",
+            "v_fma_f32 v3, v0, v1, v2 clamp",
+            "exp mrt0, v3, v3, v3, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(next_test_id("ps_ast_fma"), lines)
+        self.assertIn("FClamp", spv)
+        words = support.mrt0_words(spv)
+        self.assertAlmostEqual(bits_to_f32(words[0]), 0.75, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
