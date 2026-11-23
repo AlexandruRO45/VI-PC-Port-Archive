@@ -19,8 +19,17 @@ TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR", os.path.join(ROOT, "tools"))
 SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
-def make_bink():
-    return SENTINEL
+def make_bink(frames=1):
+    """A minimal Bink 2 stream (as in tests/test_bink_index.py) whose payload is the sentinel.
+
+    bink_index refuses a named file that does not start with a `KB2` header, so the bare sentinel no longer passes
+    for a stream.
+    """
+    total = 0x2C + 4 + 4 * frames + len(SENTINEL)
+    header = bytearray(0x2C)
+    header[0:4] = b"KB2n"
+    struct.pack_into("<10I", header, 4, total - 8, frames, len(SENTINEL), frames, 320, 240, 30, 1, 0x40013, 0)
+    return bytes(header) + b"\x00\x05\xe9\x87" + bytes(4 * frames) + SENTINEL
 
 
 def make_rpf(payload, head_size=0x40):

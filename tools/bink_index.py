@@ -333,6 +333,9 @@ def same_output_path(first, second):
         return False
 
 
+NOT_A_TARGET = "not a Bink 2 stream (KB2) or an RPF archive"
+
+
 def target_problem(path):
     """None when a single named file is something this tool indexes, else a one-line reason.
 
@@ -344,7 +347,7 @@ def target_problem(path):
     if not head:
         return "empty file"
     if head[1:4] != b"FPR" and not SIG.match(head):
-        return "not a Bink 2 stream (KB2) or an RPF archive"
+        return NOT_A_TARGET
     return None
 
 
@@ -396,7 +399,7 @@ def main(argv=None):
     if not rows and not os.path.isdir(a.target) and not is_rpf_archive(a.target):
         # A named file with no Bink 2 stream and no RPF header is a wrong path or
         # format, not an empty index; a directory scan still reports 0 streams.
-        print(f"bink_index: error: {a.target}: not a Bink 2 stream or an RPF archive", file=sys.stderr)
+        print(f"bink_index: error: {a.target}: {NOT_A_TARGET}", file=sys.stderr)
         return 2
     probe = False
     if a.probe:
