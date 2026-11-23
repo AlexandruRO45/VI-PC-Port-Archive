@@ -566,5 +566,67 @@ class TestSNorSaveExecIEEE754Bitwise(unittest.TestCase):
         self.assertEqual(new_exec, 0x7FFF_FFFF)
         self.assertEqual(scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestSNorSaveExecNegativeAndMutation(unittest.TestCase):
+    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+
+    def test_reject_64bit_destination_size(self):
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=0, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=32)
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_reject_out_of_bounds_sgpr_destination(self):
+        for oob_idx in (106, 120, 256):
+            with self.subTest(oob_idx=oob_idx):
+                instr = SNorSaveExecB32Instruction(
+                    dst=RegOperand(RegisterKind.SGPR, index=oob_idx, size_bits=32),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=32)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_invalid_destination_register_kind(self):
+        for bad_kind in (RegisterKind.VGPR, RegisterKind.EXEC_LO, RegisterKind.VCC_LO, RegisterKind.SCC):
+            with self.subTest(bad_kind=bad_kind):
+                instr = SNorSaveExecB32Instruction(
+                    dst=RegOperand(bad_kind, index=0, size_bits=32),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=32)
+                )
+                with self.assertRaises(TypeError):
+                    instr.validate()
+
+    def test_mutation_detector_logic(self):
+        """Verify detection of mutant logic implementations (OR vs NOR vs NAND)."""
+        def mutant_or(s0: int, e: int):
+            new_e = (s0 | e) & MASK32
+            return new_e, e, int(new_e != 0)
+
+        def mutant_nand(s0: int, e: int):
+            new_e = (~(s0 & e)) & MASK32
+            return new_e, e, int(new_e != 0)
+
+        s0 = 0x0000_FFFF
+        e = 0x00FF_0000
+        # Correct NOR: ~(0x00FF_FFFF) = 0xFF00_0000
+        correct_new, correct_d, correct_scc = s_nor_saveexec_b32_oracle(s0, e)
+        self.assertEqual(correct_new, 0xFF00_0000)
+        self.assertEqual(correct_d, e)
+        self.assertEqual(correct_scc, 1)
+
+        # Mutant OR produces 0x00FF_FFFF
+        m_new, m_d, m_scc = mutant_or(s0, e)
+        self.assertNotEqual(m_new, correct_new)
+
+        # Mutant NAND produces ~(0) = 0xFFFFFFFF
+        m_new2, _, _ = mutant_nand(s0, e)
+        self.assertNotEqual(m_new2, correct_new)
+
+
 if __name__ == "__main__":
     unittest.main()
