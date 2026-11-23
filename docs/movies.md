@@ -7,7 +7,7 @@ of contents is encrypted, but the streams can be named from the game's mount lis
 **Status: indexed and decode-checked. All 515 Bink 2 streams have been enumerated, their fixed headers read, and
 frame 0 of every stream decoded with the package's own Bink 2 library (515/515). The RPF9 table of contents is
 encrypted, but the streams can be named from the game's mount lists ([section 8](#8-names-from-the-mount-lists)).
-Nothing here is a playback path yet.**
+Nothing here is the game's playback path yet; section 9 plays a movie locally.**
 
 Every number below was measured on the Xbox Series 1.0.2.1 package on 2026-11-21. The archive is read-only. No
 game video, audio, frames, carved streams or reports that quote them are in this repository; the tools write only
@@ -473,3 +473,25 @@ python -I tools/bink_names.py <package>/movies.rpf --mount <package>/common.rpf 
 python -I tools/bink_names.py <temp>/movies.csv --mount <temp>/common --pins <temp>/pins.csv --out <temp>/names.json
 python -I tools/bink_names.py <package>/pack/story000/story000.rpf --mount <package>/pack/story000/story000.rpf --out <temp>/story000-names.csv
 ```
+
+## 9. Watching a movie, locally
+
+`bink_play` (`runtime/test/bink_play.cpp`) plays a stream in a window at its frame rate: Space pauses, Left/Right
+seek by a second, `Esc` quits ([bink_play.md](../runtime/test/bink_play.md) has the full key list and the measured
+frame rates). It maps the package's `Bink2Scarlett.dll` with `rt::Loader`, and for `archive@OFFSET` it calls
+`BinkSetFileOffset` and opens the archive with `BINKFILEOFFSET`. The movie is never extracted and no decoded frame
+is written to disk.
+
+`tools/bink_play.py` finds a movie by name in `movies.rpf` through `bink_names.py` ([section 8](#8-names-from-the-mount-lists))
+and starts the player. The name table it keeps in `%LOCALAPPDATA%\Leonida\bink_names.csv` holds names, offsets and
+frame sizes only, and is rebuilt when the archive changes:
+
+```sh
+python -I tools/bink_play.py --list                  # the names it knows, optionally filtered by NAME
+python -I tools/bink_play.py stinger                 # any unique part of a path, case-insensitive
+python -I tools/bink_play.py Stinger/RSG_STINGER.bk2 --game-dir <package>
+```
+
+It needs `bink_play.exe` from a runtime build (or `--exe`), and `--game-dir` or `LEONIDA_GAME_DIR`. This is a way to
+watch a movie; what the game's own playback calls do is still unknown ([section 5](#5-what-is-still-unknown)).
+
