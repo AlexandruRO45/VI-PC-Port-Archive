@@ -233,7 +233,7 @@ def _analyze_from_source(source) -> list[dict]:
             "archive_type": row["type"],
         }
         if row["type"] == "text":
-            text = blob.decode("utf-8", "replace")
+            text = blob.decode("utf-8-sig", "replace")
             if _is_fx_preload_lines(text.splitlines()):
                 item.update(parse_fx_preload_list(text))
             else:

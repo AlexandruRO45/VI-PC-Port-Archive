@@ -186,6 +186,25 @@ class GamedataBlobsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Region 2 bounds"):
             gamedata_blobs.parse_spatial_grid_blob(bytes(bad_r3))
 
+    def test_short_preload_with_a_utf8_bom_is_text(self):
+        self.add(b"\xef\xbb\xbffx_a.fx\n")
+        self.finish()
+
+        payload, = gamedata_blobs.read_payloads(self.carve)
+        self.assertEqual((payload["archive_type"], payload["kind"], payload["_stems"]),
+                         ("text", "fx_preload_list", ["fx_a"]))
+
+    def test_text_payload_bom_is_not_part_of_the_first_line(self):
+        bom = b"\xef\xbb\xbf"
+        self.add(bom + b"fx_first.fx\nfx_second.fx\n" + b"\n" * 64)
+        self.add(bom + b"# settings\nmotion.speed 2\n" + b"\n" * 64)
+        self.finish()
+
+        preload, vfx = gamedata_blobs.read_payloads(self.carve)
+        self.assertEqual(preload["_stems"], ["fx_first", "fx_second"])
+        self.assertEqual((vfx["comment_lines"], vfx["data_lines"], vfx["_prefixes"]),
+                         (1, 1, ["motion"]))
+
     def test_reads_carve_cross_references_sgd5_and_protects_paths(self):
         # Pad text/XML cleanly so printable() > 0.95 distinguishes text from binary in small fixtures
         preload0 = ("fx_one.fx\nfx_unused.fx\nfx_two.fx\n" + "\n" * 10).encode("ascii")

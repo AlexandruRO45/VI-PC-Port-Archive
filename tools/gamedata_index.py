@@ -53,7 +53,8 @@ PAGE_MARKER, PAGE_MARKER_AT = b"0DRP", 16
 
 
 def printable(data: bytes) -> float:
-    sample = data[:4096]
+    start = len(BOM) if data.startswith(BOM) else 0
+    sample = data[start:start + 4096]
     if not sample:
         return 0.0
     good = sum(1 for c in sample if c in (9, 10, 13) or 32 <= c < 127)
