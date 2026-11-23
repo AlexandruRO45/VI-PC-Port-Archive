@@ -70,6 +70,11 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertIn("chcp 65001 >nul", text)
         self.assertLess(text.index("chcp 65001 >nul"), text.index('call `"$vcvars`"'))
 
+    def test_script_has_single_utf8_bom(self):
+        raw = SCRIPT.read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf#"))
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf\xef\xbb\xbf"))
+
     @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell")
     def test_path_fallback_prefers_vs_and_skips_msys_cmake(self):
         text = SCRIPT.read_text(encoding="utf-8")
