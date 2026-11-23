@@ -130,6 +130,14 @@ class TestSwapDivergence(unittest.TestCase):
         self.assertIn("OpCopyObject", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSwapTranslator(unittest.TestCase):
+    def test_translator_mutation_guard(self):
+        prog = ["v_mov_b32_e32 v6, 1234", "v_mov_b32_e32 v7, 5678", "v_swap_b32 v6, v7", "s_endpgm"]
+        spv = support.translate_lines("cs_swap_trans", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCopyObject", spv)
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
