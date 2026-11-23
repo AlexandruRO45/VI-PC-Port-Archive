@@ -2369,13 +2369,23 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     skip = os.path.join(out, "pipeline_crashes.txt")
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
-    base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    jobs_args = ["--jobs", str(jobs)] if jobs else []
+    base = [exe, spirv, cache, *jobs_args]
+
+    def seed_bvh() -> None:
+        bvh = os.path.join(spirv, "bvh")
+        if not os.path.isfile(os.path.join(bvh, "index.json")):
+            return
+        log("pipelines: creating XboxBvhBuilder compute pipelines")
+        run([exe, bvh, cache, *jobs_args])
+
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
         # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
         # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
         run(base)
+        seed_bvh()
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
@@ -2443,6 +2453,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
+    seed_bvh()
     log("pipelines: done")
 
 
