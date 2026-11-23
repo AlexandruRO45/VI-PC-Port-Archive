@@ -695,5 +695,51 @@ class TestVSadI16ConditionCodesAndFlags(unittest.TestCase):
         flags = compute_flags(s0, s1, 0xFFFF_0001)
         self.assertTrue(flags.carry)
 
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestVSadI16IEEE754BitPatterns(unittest.TestCase):
+    """Test suite verifying bit-exact integer handling of IEEE 754 float patterns.
+
+    v_sad_i16 operates strictly on signed 16-bit integers. Halfword patterns corresponding
+    to IEEE 754 half-precision (f16) or single-precision (f32) specials (+0.0, -0.0,
+    subnormals, infinities, NaNs) must be evaluated as binary signed integers without
+    floating-point normalization or subnormal flush-to-zero (FTZ).
+    """
+
+    @staticmethod
+    def float_to_u32(val: float) -> int:
+        """Convert Python float to 32-bit unsigned integer bitcast."""
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    def test_ieee754_zero_and_negative_zero(self) -> None:
+        """+0.0 (0x00000000) vs -0.0 (0x80000000) in single precision."""
+        pos_zero = self.float_to_u32(+0.0)  # 0x00000000
+        neg_zero = self.float_to_u32(-0.0)  # 0x80000000
+
+        # In signed 16-bit:
+        # pos_zero has h0=0, h1=0
+        # neg_zero has h0=0, h1=-32768 (0x8000)
+        # diff = |0 - 0| + |-32768 - 0| = 32768
+        self.assertEqual(ref_sad_i16(pos_zero, neg_zero, 0), 32768)
+
+    def test_ieee754_f16_half_precision_specials(self) -> None:
+        """Verify packed IEEE 754 half-precision (f16) values."""
+        f16_pos_inf = 0x7C00  # signed: 31744
+        f16_neg_inf = 0xFC00  # signed: -1024
+
+        # diff = |31744 - (-1024)| = 32768 per lane -> total = 65536 = 0x10000
+        s0 = pack_halfwords(f16_pos_inf, f16_pos_inf)
+        s1 = pack_halfwords(f16_neg_inf, f16_neg_inf)
+        self.assertEqual(ref_sad_i16_sum(s0, s1), 0x10000)
+        self.assertEqual(ref_sad_i16(s0, s1, 0), 0x10000)
+
+    def test_ieee754_subnormals_no_denorm_flushing(self) -> None:
+        """16-bit subnormal bit patterns are never flushed to zero."""
+        f16_subnorm_min = 0x0001
+        s0 = pack_halfwords(f16_subnorm_min, 0)
+        self.assertEqual(ref_sad_i16(s0, 0, 0), 1)
+
 if __name__ == "__main__":
     unittest.main()
