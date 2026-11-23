@@ -301,6 +301,25 @@ class TestLdsIncU32Offset(unittest.TestCase):
         self.assertEqual(fin[0x44], 0)
         self.assertEqual(fin[0x48], 0)
 
+class TestLdsIncU32Chaining(unittest.TestCase):
+    def test_chained_increments_through_wrap(self):
+        init = {0x40: 0}
+        ops = [("ds_inc_u32", 0x40, 0, (3,))] * 5
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x40], 1)
+
+    def test_multi_location_independent_increments(self):
+        init = {0x10: 2, 0x20: 4}
+        ops = [
+            ("ds_inc_u32", 0x10, 0, (3,)),
+            ("ds_inc_u32", 0x20, 0, (4,)),
+            ("ds_inc_u32", 0x10, 0, (3,)),
+            ("ds_inc_u32", 0x20, 0, (4,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x10], 0)
+        self.assertEqual(fin[0x20], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
