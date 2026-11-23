@@ -193,5 +193,50 @@ class SXorB32ScalarInterpreterTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr(0), 0x12345678)
         self.assertEqual(state.scc, 1)
 
+class WavefrontState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.scalar_state = ScalarRegisterState()
+        self.vgprs = [[0] * 64 for _ in range(lane_count)]
+
+    def execute_scalar_instruction(self, ast: InstructionAST) -> None:
+        # SALU instructions execute uniformly on the scalar processor once per wavefront
+        execute_scalar_xor_b32(self.scalar_state, ast)
+
+
+class SXorB32SimdDivergenceTests(unittest.TestCase):
+    def test_salu_uniform_execution_wave32(self):
+        wave = WavefrontState(lane_count=32)
+        wave.scalar_state.set_sgpr(0, 0xFF00FF00)
+        wave.scalar_state.set_sgpr(1, 0x00FF00FF)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 2),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        wave.execute_scalar_instruction(ast)
+        self.assertEqual(wave.scalar_state.get_sgpr(2), MASK32)
+        self.assertEqual(wave.scalar_state.scc, 1)
+        # Vector registers are unaffected by scalar operations
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 0)
+
+    def test_salu_uniform_execution_wave64(self):
+        wave = WavefrontState(lane_count=64)
+        wave.scalar_state.set_sgpr(0, 0xAAAAAAAA)
+        wave.scalar_state.set_sgpr(1, 0x55555555)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        wave.execute_scalar_instruction(ast)
+        self.assertEqual(wave.scalar_state.get_sgpr(0), MASK32)
+        self.assertEqual(wave.scalar_state.scc, 1)
+        for lane in range(64):
+            self.assertEqual(wave.vgprs[lane][0], 0)
+
 if __name__ == "__main__":
     unittest.main()
