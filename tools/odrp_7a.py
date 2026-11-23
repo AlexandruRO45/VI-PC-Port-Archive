@@ -91,20 +91,40 @@ COLUMNS = [
 ]
 
 
+_U16_AT = struct.Struct("<H").unpack_from
+_U32_AT = struct.Struct("<I").unpack_from
+_U64_AT = struct.Struct("<Q").unpack_from
+_BE32_AT = struct.Struct(">I").unpack_from
+_STANDALONE_HEADER = struct.Struct("<QQ4sIQIIQQQQ4HQQ")  # the 0x60-byte standalone header, field by field
+_STRUCT_ROWS = struct.Struct("<IIIIQIHH")
+_MEMBER_ROWS = struct.Struct("<IIBBHI")
+_BLOCK_ROWS = struct.Struct("<IIQ")
+_PSIN_BLOCK_ROWS = struct.Struct("<II8s")
+_VIRTUAL_END = VIRTUAL_BASE + SEGMENT_SPAN
+_PHYSICAL_END = PHYSICAL_BASE + SEGMENT_SPAN
+_COPY_TABLE_BYTES = 256  # a table this small is cheaper to copy than to wrap in a memoryview
+
+
+def _rows(layout, data, start, stop):
+    """Iterate `layout` rows over `data[start:stop]` without copying a large table."""
+    part = data[start:stop] if stop - start <= _COPY_TABLE_BYTES else memoryview(data)[start:stop]
+    return layout.iter_unpack(part)
+
+
 def _u16(data, at):
-    return struct.unpack_from("<H", data, at)[0] if 0 <= at and at + 2 <= len(data) else None
+    return _U16_AT(data, at)[0] if 0 <= at and at + 2 <= len(data) else None
 
 
 def _u32(data, at):
-    return struct.unpack_from("<I", data, at)[0] if 0 <= at and at + 4 <= len(data) else None
+    return _U32_AT(data, at)[0] if 0 <= at and at + 4 <= len(data) else None
 
 
 def _u64(data, at):
-    return struct.unpack_from("<Q", data, at)[0] if 0 <= at and at + 8 <= len(data) else None
+    return _U64_AT(data, at)[0] if 0 <= at and at + 8 <= len(data) else None
 
 
 def _be32(data, at):
-    return struct.unpack_from(">I", data, at)[0] if 0 <= at and at + 4 <= len(data) else None
+    return _BE32_AT(data, at)[0] if 0 <= at and at + 4 <= len(data) else None
 
 
 def virtual_offset(pointer):
@@ -139,36 +159,46 @@ def parse_standalone_header(data):
     (`8` zero bytes + `0x50000000` pointer) followed by `"0DRP"`, version `122`, and valid
     `0x50000000` table pointers; otherwise returns `None`.
     """
-    if len(data) < STANDALONE_HEADER_SIZE:
+    if data[0x10:0x14] != b"0DRP" or len(data) < 0x60:  # `SIGNATURE`, `STANDALONE_HEADER_SIZE`; most buffers fail the first test
         return None
-    if data[0x00:0x08] != b"\x00" * 8:
+    (
+        zero0,
+        raw_page_map,
+        signature,
+        version,
+        zero18,
+        root_objects,
+        zero24,
+        raw28,
+        raw30,
+        raw38,
+        raw40,
+        structs,
+        enums,
+        blocks,
+        unknown_4e,
+        raw50,
+        zero58,
+    ) = _STANDALONE_HEADER.unpack_from(data, 0)
+    if zero0 or zero18 or zero24 or zero58 or signature != SIGNATURE or version != VERSION:
         return None
-    page_map = virtual_offset(_u64(data, 0x08))
-    if page_map is None:
-        return None
-    if data[0x10:0x14] != SIGNATURE or _u32(data, 0x14) != VERSION:
-        return None
-    if data[0x18:0x20] != b"\x00" * 8:
-        return None
-    root_objects = _u32(data, 0x20)
-    if _u32(data, 0x24) != 0:
-        return None
-    q28 = virtual_offset(_u64(data, 0x28))
-    q30 = _optional_virtual_offset(_u64(data, 0x30))
-    q38 = virtual_offset(_u64(data, 0x38))
-    q40 = _optional_virtual_offset(_u64(data, 0x40))
-    q50 = _optional_virtual_offset(_u64(data, 0x50))
-    if None in (q28, q30, q38, q40, q50):
-        return None
-    if data[0x58:0x60] != b"\x00" * 8:
-        return None
-    structs, enums, blocks, unknown_4e = struct.unpack_from("<4H", data, 0x48)
     if not (1 <= structs <= 4096 and enums <= 4096 and 1 <= blocks <= 4096):
         return None
-    if enums > 0 and _u64(data, 0x30) == 0:
+    if not (VIRTUAL_BASE <= raw_page_map < _VIRTUAL_END and VIRTUAL_BASE <= raw28 < _VIRTUAL_END):
+        return None
+    if not (VIRTUAL_BASE <= raw38 < _VIRTUAL_END):
+        return None
+    # `+0x30`, `+0x40` and `+0x50` hold `0` (absent) or a virtual pointer.
+    if raw30 and not VIRTUAL_BASE <= raw30 < _VIRTUAL_END:
+        return None
+    if raw40 and not VIRTUAL_BASE <= raw40 < _VIRTUAL_END:
+        return None
+    if raw50 and not VIRTUAL_BASE <= raw50 < _VIRTUAL_END:
+        return None
+    if enums > 0 and raw30 == 0:
         return None
     return {
-        "page_map": page_map,
+        "page_map": raw_page_map - VIRTUAL_BASE,
         "version": VERSION,
         "root_objects": root_objects,
         "structs": structs,
@@ -176,11 +206,11 @@ def parse_standalone_header(data):
         "blocks": blocks,
         "unknown_4e": unknown_4e,
         "tables": {
-            "q28": q28,
-            "q30": None if _u64(data, 0x30) == 0 else q30,
-            "q38": q38,
-            "q40": None if _u64(data, 0x40) == 0 else q40,
-            "q50": None if _u64(data, 0x50) == 0 else q50,
+            "q28": raw28 - VIRTUAL_BASE,
+            "q30": raw30 - VIRTUAL_BASE if raw30 else None,
+            "q38": raw38 - VIRTUAL_BASE,
+            "q40": raw40 - VIRTUAL_BASE if raw40 else None,
+            "q50": raw50 - VIRTUAL_BASE if raw50 else None,
         },
     }
 
@@ -226,6 +256,7 @@ def parse_standalone(data):
         "schema_checked": False,
         "error": "",
     }
+    del hdr  # the tables below are what is left to walk; keep the header dict out of the peak
 
     if q28 + 32 * nst > size:
         base_row["needs_continuation"] = True
@@ -241,27 +272,24 @@ def parse_standalone(data):
         return base_row
 
     struct_sizes = {}
-    for i in range(nst):
-        off = q28 + 32 * i
-        shash, _sig, _flags, _zero0c, mptr_raw, ssize, _zero1c, mcount = struct.unpack_from(
-            "<IIIIQIHH", data, off
-        )
+    for i, (shash, _sig, _flags, _zero0c, mptr_raw, ssize, _zero1c, mcount) in enumerate(
+        _rows(_STRUCT_ROWS, data, q28, q28 + 32 * nst)
+    ):
         if ssize > (1 << 20) or mcount > 256:
             base_row["error"] = f"struct {i} exceeds size or member cap"
             return base_row
         if mcount > 0:
-            moff = virtual_offset(mptr_raw)
-            if moff is None:
+            if not (VIRTUAL_BASE <= mptr_raw < _VIRTUAL_END):
                 base_row["error"] = f"struct {i} has non-virtual member pointer"
                 return base_row
+            moff = mptr_raw - VIRTUAL_BASE
             if moff + 16 * mcount > size:
                 base_row["needs_continuation"] = True
                 base_row["error"] = f"struct {i} member table extends past stream end"
                 return base_row
-            for j in range(mcount):
-                mhash, field_off, mtype, _sub, elem_idx, _ref = struct.unpack_from(
-                    "<IIBBHI", data, moff + 16 * j
-                )
+            for j, (mhash, field_off, mtype, _sub, elem_idx, _ref) in enumerate(
+                _rows(_MEMBER_ROWS, data, moff, moff + 16 * mcount)
+            ):
                 if mhash != ARRAY_ELEMENT_HASH and field_off >= ssize:
                     base_row["error"] = f"struct {i} member {j} offset {field_off} >= size {ssize}"
                     return base_row
@@ -269,7 +297,7 @@ def parse_standalone(data):
                     if elem_idx >= mcount:
                         base_row["error"] = f"struct {i} array member {j} index {elem_idx} out of range"
                         return base_row
-                    desc_hash = _u32(data, moff + 16 * elem_idx)
+                    desc_hash = _U32_AT(data, moff + 16 * elem_idx)[0]
                     if desc_hash != ARRAY_ELEMENT_HASH:
                         base_row["error"] = f"struct {i} array member {j} target is not 0x100"
                         return base_row
@@ -279,28 +307,26 @@ def parse_standalone(data):
     physical_blocks = 0
     resolved_struct_block = False
     needs_more_blocks = False
-    block_list = []
+    entity_size = struct_sizes.get(ENTITY_STRUCT, 0)
+    entities = 0  # whole entity rows in the in-bounds virtual `ENTITY_STRUCT` blocks (used for map resources)
 
-    for i in range(nbl):
-        off = q38 + 16 * i
-        bhash, bsize, bptr = struct.unpack_from("<IIQ", data, off)
+    for i, (bhash, bsize, bptr) in enumerate(_rows(_BLOCK_ROWS, data, q38, q38 + 16 * nbl)):
         if bsize > (1 << 24):
             base_row["error"] = f"block {i} exceeds 16 MiB cap"
             return base_row
-        voff = virtual_offset(bptr)
-        if voff is not None:
+        if VIRTUAL_BASE <= bptr < _VIRTUAL_END:
+            voff = bptr - VIRTUAL_BASE
             virtual_blocks += 1
             if voff + bsize > size:
                 needs_more_blocks = True
             else:
                 if bhash in struct_sizes:
                     resolved_struct_block = True
-            block_list.append((bhash, bsize, voff))
+                if bhash == ENTITY_STRUCT and entity_size > 0 and bsize % entity_size == 0:
+                    entities += bsize // entity_size
             continue
-        poff = physical_offset(bptr)
-        if poff is not None:
+        if PHYSICAL_BASE <= bptr < _PHYSICAL_END:
             physical_blocks += 1
-            block_list.append((bhash, bsize, None))
             continue
         base_row["error"] = f"block {i} has invalid segment pointer"
         return base_row
@@ -317,15 +343,9 @@ def parse_standalone(data):
         base_row["error"] = "no virtual block matches a declared struct"
         return base_row
 
-    entity_size = struct_sizes.get(ENTITY_STRUCT, 0)
-    map_size = struct_sizes.get(MAPDATA_STRUCT, 0)
-    if entity_size > 0 and map_size > 0:
+    if entity_size > 0 and struct_sizes.get(MAPDATA_STRUCT, 0) > 0:
         base_row["resource_kind"] = "map"
-        base_row["entities"] = sum(
-            bsize // entity_size
-            for bhash, bsize, voff in block_list
-            if bhash == ENTITY_STRUCT and voff is not None and voff + bsize <= size and bsize % entity_size == 0
-        )
+        base_row["entities"] = entities
 
     base_row["complete"] = True
     base_row["schema_checked"] = True
@@ -366,14 +386,37 @@ def parse_lrsc_payload(payload):
     }
 
 
+_COUNT_ROWS = {  # the two layouts `_parse_psin_container` reads: `LSCH` u16@+30 of 32, `LENM` u32@+16 of 24
+    (32, 30, "<H"): struct.Struct("<30xH0x"),
+    (24, 16, "<I"): struct.Struct("<16xI4x"),
+}
+
+
+def _count_rows(header_size, count_at, count_fmt):
+    """One struct that reads just the count field of each `header_size`-byte header."""
+    rows = _COUNT_ROWS.get((header_size, count_at, count_fmt))
+    if rows is None:  # not stored: the table above never grows
+        tail = header_size - count_at - struct.calcsize(count_fmt)
+        rows = struct.Struct(f"{count_fmt[:1]}{count_at}x{count_fmt[1:]}{tail}x")
+    return rows
+
+
 def _header_count(payload, header_size, elem_size, count_at, count_fmt):
     if not payload:
         return 0
+    total = len(payload)
+    rows = _count_rows(header_size, count_at, count_fmt)
+    fits = total // header_size
     elements = 0
-    for k in range(1, len(payload) // header_size + 1):
-        elements += struct.unpack_from(count_fmt, payload, header_size * (k - 1) + count_at)[0]
-        if header_size * k + elem_size * elements == len(payload):
+    k = 0
+    for (count,) in _rows(rows, payload, 0, fits * header_size):
+        k += 1
+        elements += count
+        used = header_size * k + elem_size * elements
+        if used == total:
             return k
+        if used > total:  # counts are unsigned, so `used` only grows from here
+            return None
     return None
 
 
@@ -381,20 +424,21 @@ def _psin_block_count(blob, first_section):
     """Count rows in a `PSIN` `+0x08` instance block table, or return `None` if malformed."""
     if first_section < 16 or first_section > len(blob):
         return None
-    at = 8
-    count = 0
+    rows = (first_section - 8) // 16
     sizes = []
-    while at + 8 <= first_section:
-        kind = _u32(blob, at)
+    at = 8
+    for kind, bsize, fill in _rows(_PSIN_BLOCK_ROWS, blob, 8, 8 + 16 * rows):
         if kind == BLOCK_TABLE_END:
             break
-        if at + 16 > first_section or blob[at + 8:at + 16] != BLOCK_ROW_FILL_8:
+        if fill != BLOCK_ROW_FILL_8:
             return None
-        sizes.append(_u32(blob, at + 4))
-        count += 1
+        sizes.append(bsize)
         at += 16
     else:
-        return None
+        # Every whole row was a block; the terminator may still sit in a trailing half row.
+        if first_section - at < 8 or _u32(blob, at) != BLOCK_TABLE_END:
+            return None
+    count = len(sizes)
     end = (at + 15) & ~15
     if end > first_section or blob[at:end] != b"\x70" * (end - at):
         return None
@@ -775,8 +819,8 @@ class _StreamConsumer:
                 return
             self._flush_pending()
 
-        if parse_standalone_header(data) is not None:
-            rec = parse_standalone(data)
+        rec = parse_standalone(data)  # `None` unless the header validates
+        if rec is not None:
             if rec["needs_continuation"] and next_off is not None:
                 self.pending = {
                     "kind": "standalone",
