@@ -77,5 +77,9 @@ class CliHelpTests(unittest.TestCase):
 
 
 
+    def test_short_help_works_from_an_unrelated_cwd(self):
+        self.loop_from_tempdir("-h")
+
+
 if __name__ == "__main__":
     unittest.main()
