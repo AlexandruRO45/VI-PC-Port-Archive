@@ -12647,7 +12647,8 @@ class Gen:
         if "glc" in mods:
             # A coherent read of one mip: image_load_coherent reads a storage view, which has one level.
             raise Unsupported("image_load_mip glc")
-        if "tfe" in mods or "lwe" in mods:
+        packed = "a16" in mods
+        if ("tfe" in mods or "lwe" in mods) and (packed or (dim == "dim:SQ_RSRC_IMG_3D" and "d16" in mods)):
             raise Unsupported("image_load_mip status")
         mip_dims = {
             "dim:SQ_RSRC_IMG_1D": ("img1d", "%images_1d", "_ptr_UC_img1", 1, "dim:SQ_RSRC_IMG_1D"),
@@ -12666,14 +12667,13 @@ class Gen:
         elif dim in ("dim:SQ_RSRC_IMG_2D_ARRAY", "dim:SQ_RSRC_IMG_CUBE"):
             self.uses_tex_array = True
         vdata, addr = a[0], self.addr_regs(a[1])
-        packed = "a16" in mods
         total = ncoord + 1  # integer coordinates + explicit mip level
         need_regs = (total + 1) // 2 if packed else total
         if len(addr) < need_regs:
             raise Unsupported("image_load_mip coords")
         idx = self.desc_lookup_sgpr(a[2], 8)
         ip, img = self.tmp(), self.tmp()
-        self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {idx}")
+        self.dynamic_sampled_access(ip, f"%{iptr}", iarr, idx)
         self.emit(f"{img} = OpLoad %{itype} {ip}")
         if packed:
             words = [self.load_reg("vgpr", r) for r in addr[:need_regs]]
@@ -12700,9 +12700,6 @@ class Gen:
         if op == "image_store":
             self.image_store(a, mods, dim)
             return
-        if op == "image_load_mip" and "glc" in mods:
-            # A coherent read of one mip: image_load_coherent reads a storage view, which has one level.
-            raise Unsupported("image_load_mip glc")
         if op == "image_load_mip":
             self.image_load_mip(a, mods, dim)
             return

@@ -112,11 +112,25 @@ class ImageLoadMipDimsTests(unittest.TestCase):
                             got = tuple(m.value(v, 0, 0) for v in (*args[1:], lod))
                         self.assertEqual(got, expected)
 
+    def test_status_modifier_compatibility_matches_main(self):
+        # Preserve main's corpus compatibility for non-a16 status forms (except 3D d16 status).
+        compat_cases = [
+            "image_load_mip v[0:4], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D tfe",
+            "image_load_mip v[0:4], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D lwe",
+            "image_load_mip v[0:2], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D d16 tfe",
+            "image_load_mip v[0:4], v[4:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_3D tfe",
+        ]
+        for line in compat_cases:
+            with self.subTest(line=line):
+                _translate_ps("ps_mip_status_compat", [line])
+
     def test_refused_forms_stay_unsupported(self):
         bad_cases = [
             "image_load_mip v[0:3], v[4:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY glc",
             "image_load_mip v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_3D a16 tfe",
-            "image_load_mip v[0:3], v[4:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY lwe",
+            "image_load_mip v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D a16 lwe",
+            "image_load_mip v[0:2], v[4:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_3D d16 tfe",
+            "image_load_mip v[0:2], v[4:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_3D d16 lwe",
             "image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY",   # needs 4 coords
             "image_load_mip v[0:3], v4, s[0:7] dmask:0xf dim:SQ_RSRC_IMG_3D a16",          # needs 2 regs
             "image_load_mip v[0:3], v4, s[0:7] dmask:0xf dim:SQ_RSRC_IMG_1D",              # needs 2 regs
