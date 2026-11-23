@@ -4,9 +4,11 @@ param([Parameter(Mandatory)][string]$Game, [Parameter(Mandatory)][string]$Out)
 $root = Split-Path $PSScriptRoot -Parent
 $tool = Join-Path $root "tools\rpf9_carve.py"
 
-# The carver needs Python 3.12+, but `python` can be an older install first on PATH (Python 2.7 puts C:\Python27
-# there), which stops at `-I` with "Unknown option". Keep `python` unless it reports an older version; then take the
-# py launcher's newest Python 3, as Build.bat does.
+# The carver needs Python 3.12+. `python` can be missing, the App Installer stub, or an older install first on PATH
+# (Python 2.7 puts C:\Python27 there and stops at -I with "Unknown option"). Resolved once, at the first archive that
+# needs carving, so an empty or fully cached -Game needs no Python at all: a `python` that reports 3.12+, else the py
+# launcher's versions in Build.bat's order. `py -3` alone is only the last try: it follows PY_PYTHON3, which can name
+# an older Python than one the launcher also has.
 function Get-PythonVersion([string]$Exe, [string[]]$Prefix) {
     # No spaces in the probe, so it reaches a .cmd wrapper (pyenv-win, a venv shim) without cmd.exe re-quoting it;
     # and the answer is the last all-digit line, so text a wrapper or cmd's AutoRun prints first doesn't hide it.
@@ -19,17 +21,21 @@ function Get-PythonVersion([string]$Exe, [string[]]$Prefix) {
     if ($LASTEXITCODE -eq 0 -and $v) { return [int]$v }
     return $null
 }
-$pythonExe, $pythonPrefix = "python", @()
-$found = Get-PythonVersion $pythonExe $pythonPrefix
-if ($null -ne $found -and $found -lt 312) {
-    $launcher = $null
-    if (Get-Command py -CommandType Application -ErrorAction SilentlyContinue) { $launcher = Get-PythonVersion "py" @("-3") }
-    if ($null -eq $launcher -or $launcher -lt 312) {
-        throw ("Python 3.12 or newer is needed, but python on PATH is {0}.{1} and the py launcher has no Python 3.12+. " +
-               "Install it from https://www.python.org/downloads/ and run this again.") -f [math]::Floor($found / 100), ($found % 100)
+function Resolve-Python {
+    $found = Get-PythonVersion "python" @()
+    if ($null -ne $found -and $found -ge 312) { return [pscustomobject]@{ exe = "python"; prefix = @() } }
+    if (Get-Command py -CommandType Application -ErrorAction SilentlyContinue) {
+        foreach ($version in "-3.14", "-3.13", "-3.12", "-3") {
+            $got = Get-PythonVersion "py" @($version)
+            if ($null -ne $got -and $got -ge 312) { return [pscustomobject]@{ exe = "py"; prefix = @($version) } }
+        }
     }
-    $pythonExe, $pythonPrefix = "py", @("-3")
+    $seen = if ($null -ne $found) { "python on PATH is {0}.{1}" -f [math]::Floor($found / 100), ($found % 100) }
+            else { "python on PATH is missing or did not answer" }
+    throw ("Python 3.12 or newer is needed, but $seen and the py launcher has no Python 3.12+. " +
+           "Install it from https://www.python.org/downloads/ and run this again.")
 }
+$python = $null
 # -Game may be relative or end in a separator; archive names are cut from a separator-ended prefix.
 $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 # Resolve-Path preserves 8.3 short components (e.g. RUNNER~1), while Get-ChildItem emits canonical
@@ -55,8 +61,10 @@ foreach ($archive in $archives) {
     $dest = $archive.destination
     $index = Join-Path $dest "index.json"
     if (-not (Test-Path -LiteralPath $index)) {
+        if ($null -eq $python) { $python = Resolve-Python }
         Write-Host ("{0:HH:mm:ss} carving {1} ({2:N1} GiB)" -f (Get-Date), $rel, ($f.Length / 1GB))
-        & $pythonExe @pythonPrefix -I $tool $f.FullName $dest | Select-Object -Last 1
+        $pythonPrefix = $python.prefix
+        & $python.exe @pythonPrefix -I $tool $f.FullName $dest | Select-Object -Last 1
         if ($LASTEXITCODE -ne 0) { throw "Carving $rel failed (exit $LASTEXITCODE)" }
     }
     try {
