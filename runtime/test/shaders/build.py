@@ -101,7 +101,10 @@ def asm_fssm_fields(path):
             at = int(m.group(1), 0)
         m = re.match(r";\s*fssm-data:\s*(.*)", s)
         if m:
-            words += [int(w, 0) for w in m.group(1).split()]
+            try:
+                words += [int(w, 0) for w in m.group(1).split()]
+            except ValueError as e:
+                sys.exit(f"{os.path.basename(path)}: bad fssm-data word: {e}")
     return at, words
 
 
@@ -151,12 +154,18 @@ def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
     fssm.mkdir()
-    shift = user_data_shift()   # LEONIDA_USER_DATA_SHIFT: compute fixtures for a D3D12 PSO (compute_fixture.py)
+    try:
+        shift = user_data_shift()   # LEONIDA_USER_DATA_SHIFT: compute fixtures for a D3D12 PSO (compute_fixture.py)
+    except ValueError as e:
+        sys.exit(str(e))
     for n in names:
         asm_path = os.path.join(HERE, shader_source(n) + ".asm")
         raw = Path(asm_path).read_text(encoding="utf-8")
         if shift and n.startswith("cs_"):
-            raw = shift_user_data(raw, shift)
+            try:
+                raw = shift_user_data(raw, shift)
+            except ValueError as e:
+                sys.exit(f"{n}.asm: {e}")
         mattr = asm_mattr(asm_path)
         cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         if n in CLIP_CASES:
@@ -175,7 +184,10 @@ def translate_tests(work, names):
         if program:   # where the translator looks for a program to hash, as in the game's work folder
             (fssm / (n + ".fssm")).write_bytes(program)
         if n.startswith("cs_"):
-            program = bytes(compute_header(asm_path, shift))
+            try:
+                program = bytes(compute_header(asm_path, shift))
+            except ValueError as e:
+                sys.exit(f"{n}.asm: {e}")
             extra = cs_fssm_extra(asm_path)
             if extra:
                 program += bytes(extra[0] - len(program)) + extra[1]
