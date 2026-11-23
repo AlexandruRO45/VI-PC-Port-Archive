@@ -143,11 +143,28 @@ bool is_top_window_at(HWND window, POINT screen_point) {
     return hit && GetAncestor(hit, GA_ROOT) == window;
 }
 
-void set_client_size(HWND window, int width, int height) {
-    RECT rect{0, 0, width, height};
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-    SetWindowPos(window, HWND_TOP, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
+// On a display scaled above 100%, a DPI-unaware process gets logical coordinates from ClientToScreen while GetPixel on
+// the screen DC reads physical pixels, so the on-screen check would read another spot (the title bar at 225%).
+// Per-monitor awareness makes both physical. Looked up at run time, as older Windows and Wine may lack it; if neither
+// call works, the test runs as before.
+void make_dpi_aware() {
+    using SetDpiAwarenessContextFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    const auto set_context = reinterpret_cast<SetDpiAwarenessContextFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+    if (set_context && set_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) return;
+    SetProcessDPIAware();
+}
+
+// Sizes the client area from the frame the window has. AdjustWindowRect uses the system DPI, which under per-monitor
+// awareness need not be the DPI of the window's monitor, and the extent checks need the exact client size. On a shown
+// window this also activates it, which the on-screen check needs (the window is shown without activation).
+bool set_client_size(HWND window, int width, int height) {
+    RECT outer{}, client{};
+    if (!GetWindowRect(window, &outer) || !GetClientRect(window, &client)) return false;
+    const int frame_width = (outer.right - outer.left) - (client.right - client.left);
+    const int frame_height = (outer.bottom - outer.top) - (client.bottom - client.top);
+    return SetWindowPos(window, nullptr, 0, 0, width + frame_width, height + frame_height,
+                        SWP_NOMOVE | SWP_NOZORDER) != FALSE;
 }
 
 // A driver double around the real driver: the device and the presenter get their functions through it
@@ -303,6 +320,7 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 }  // namespace
 
 int main() {
+    make_dpi_aware();  // before any window exists
     vktest::Device d;
     const auto device_status = d.initialize(true);
     if (device_status == vktest::DeviceStatus::unavailable) {
@@ -335,6 +353,7 @@ int main() {
         std::fprintf(stderr, "FAIL: cannot create the presentation window (Win32 error %lu)\n", GetLastError());
         return 1;
     }
+    EXPECT(set_client_size(window, width, height));
     ShowWindow(window, SW_SHOWNOACTIVATE);
     UpdateWindow(window);
     pump();
@@ -457,7 +476,7 @@ int main() {
 
         // A resize recreates the swapchain; the 320x240 back buffer is scaled to the new size. Unsynchronised
         // presents (sync interval 0) switch the present mode on the way.
-        set_client_size(window, 400, 300);
+        EXPECT(set_client_size(window, 400, 300));
         for (int i = 0; i < 10; ++i) EXPECT(frame(i < 5 ? 1 : 0));
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
         EXPECT(presenter->presented() == 70 - driver::out_of_date);
