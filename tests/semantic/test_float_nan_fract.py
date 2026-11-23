@@ -470,6 +470,33 @@ class AllNaNSrc0PayloadTests(unittest.TestCase):
                 self.assertEqual(run_op(f"{op} v0, -v1, v2", (snan, NAN_A)), snan ^ SIGN_BIT32)
                 self.assertEqual(run_op(f"{op} v0, |v1|, v2", (snan, NAN_A)), snan)
 
+    def test_f32_src0_sign_mods_keep_signalling_nan(self):
+        # VOP3 abs/neg are sign-bit moves (#6685), so an all-NaN result keeps src0's signalling bit through |v| and
+        # -|v| too, for the three-input ops as well (OpFNegate and FAbs on a float may quiet it).
+        snan_a, snan_b = 0x7F800001, 0xFF800005
+        for op in ("v_min_f32_e64", "v_max_f32_e64"):
+            with self.subTest(op=op):
+                self.assertEqual(run_op(f"{op} v0, |v1|, v2", (snan_b, NAN_A)), snan_b & ~SIGN_BIT32 & MASK32)
+                self.assertEqual(run_op(f"{op} v0, -|v1|, v2", (snan_a, NAN_A)), snan_a | SIGN_BIT32)
+        for op in ("v_min3_f32", "v_max3_f32", "v_med3_f32"):
+            with self.subTest(op=op):
+                self.assertEqual(run_op(f"{op} v0, |v1|, v2, v3", (snan_b, NAN_A, NAN_B)), snan_b & ~SIGN_BIT32 & MASK32)
+                self.assertEqual(run_op(f"{op} v0, -|v1|, v2, v3", (snan_a, NAN_A, NAN_B)), snan_a | SIGN_BIT32)
+
+    def test_f32_minmax_sign_mods_are_bit_moves_in_the_spirv(self):
+        # The rule is in the emitted SPIR-V, not only in the interpreter's words: abs/neg are integer sign-bit moves
+        # (OpBitwiseAnd 0x7FFFFFFF, OpBitwiseXor 0x80000000), never FAbs/OpFNegate, whose NaN bits SPIR-V leaves to
+        # the driver. The DPP form applies src0's modifiers before the lane shuffle, outside the VOP2 path.
+        for line in ("v_min_f32_e64 v0, -|v1|, v2", "v_max_f32_e64 v0, -|v1|, v2", "v_min3_f32 v0, -|v1|, v2, v3",
+                     "v_max3_f32 v0, -|v1|, v2, v3", "v_med3_f32 v0, -|v1|, v2, v3", "v_min3_f32 v0, v1, -v2, |v3|",
+                     "v_min_f32_dpp v0, -|v1|, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                     "v_max_f32_dpp v0, -v1, |v2| row_shr:1 row_mask:0xf bank_mask:0xf"):
+            with self.subTest(line=line):
+                spv = translate_text(LOAD + line + "\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+                self.assertNotIn(" FAbs ", spv)
+                self.assertNotIn("OpFNegate", spv)
+                self.assertIn("OpBitwiseXor %uint", spv)
+
     def test_non_nan_constant_fast_path(self):
         # f16_bits emits 1 OpUGreaterThan (%float |x| > inf); all-NaN tracking adds 0 when a constant is non-NaN.
         for line, reg_line, extra_gt in (

@@ -6507,7 +6507,11 @@ class Gen:
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
         src = args[1]
-        src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
+        if ins["op"].split("_dpp")[0] in ("v_min_f32", "v_max_f32"):
+            # Both-NaN result is src0's bits: abs/neg as sign-bit moves, as in the non-DPP form (src_u_sign_mods).
+            src_val = self.src_u_sign_mods(src)
+        else:
+            src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
 
         lane = self.wave_lane()
         group_bits = 7 if dpp8 is not None else 15
