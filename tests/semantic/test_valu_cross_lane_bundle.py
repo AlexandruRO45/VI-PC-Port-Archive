@@ -270,6 +270,21 @@ class TestWriteLaneTranslator(unittest.TestCase):
         self.assertIn("OpBitwiseAnd", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestPermLane16Oracle(unittest.TestCase):
+    def test_oracle_identity(self):
+        lanes = [i for i in range(64)]
+        s1 = 0x76543210
+        s2 = 0xFEDCBA98
+        out = model_permlane16(lanes, s1, s2, xor16=False)
+        self.assertEqual(out, lanes)
+
+    def test_translator_permlane16_oracle(self):
+        prog = ["s_mov_b32 s1, 0x76543210", "s_mov_b32 s2, 0xFEDCBA98", "v_permlane16_b32 v0, v1, s1, s2", "s_endpgm"]
+        spv = support.translate_lines("cs_p16_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
