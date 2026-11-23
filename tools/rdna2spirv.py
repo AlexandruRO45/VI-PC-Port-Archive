@@ -2190,8 +2190,8 @@ class Gen:
         addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0), byte exact.
         Each dword is loaded only when it is in range per the V#'s OOB_SELECT (buffer_address; docs/design.md, Buffer
         bounds checking): for modes 0 and 3 dword i ends inside the stride / num_records, else it is 0 and memory is
-        not read; modes 1 and 2 check the index / num_records once. An INVALID V# format zeroes all active results
-        without reading memory. Inactive lanes don't load."""
+        not read; modes 1 and 2 check the index / num_records once. A V# format outside 1..77 (INVALID 0 or a
+        reserved 78..127) zeroes all active results without reading memory. Inactive lanes don't load."""
         if any(m in mods for m in ("lds", "tfe")) or "format" in op:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -3602,10 +3602,11 @@ class Gen:
             - Indexed swizzle (`SWIZZLE_ENABLE=1, idxen=1`): multi-dword raw, typed, and `_x2` atomic accesses step
               linearly by `+4` bytes (`step = None`), and typed formats > 4 bytes execute normally.
         A literal V# word1/word3 (`sgpr_imm`) folds each bit; a run-time one selects dynamically. elem="fmt" checks the
-        whole element's format size. parts=True is for raw MUBUF loads and stores: FORMAT=0 (INVALID, word3 bits
-        [18:12]) suppresses every dword before any memory access, and the 4th element is a function k -> in-range
-        bool id for dword k (modes 0 and 3, and a run-time V#), or None when every dword shares in_bounds (literal
-        mode 1/2, or literal FORMAT=0, whose whole access is out of range)."""
+        whole element's format size. parts=True is for raw MUBUF loads and stores: a FORMAT outside 1..77 (word3
+        bits [18:12], INVALID 0 or reserved 78..127) suppresses every dword before any memory access, and the 4th
+        element is a function k -> in-range bool id for dword k (modes 0 and 3, and a run-time V#), or None when
+        every dword shares in_bounds (literal mode 1/2, or a literal out-of-range FORMAT, whose whole access is out
+        of range)."""
         vaddr, rsrc = a[1], a[2]
         soff = a[3] if len(a) > 3 else {"k": "imm", "v": 0}
         if (rsrc["k"] == "sgpr" and rsrc.get("n") == 4):
@@ -3765,11 +3766,14 @@ class Gen:
         format_ok = None
         if parts:
             # Raw opcodes supply the data layout and use identity selectors. The descriptor still gates access.
+            # Measured on RDNA2 (all 128 codes, gfx1036): FORMAT is usable iff 1 <= FORMAT <= 77; INVALID (0)
+            # and the reserved codes 78..127 suppress the access just like 0. Unsigned FORMAT - 1 < 77 covers it.
             if lit3 is None:
-                fmt, format_ok = self.tmp(), self.tmp()
+                fmt, fmt_m1, format_ok = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
-                self.emit(f"{format_ok} = OpINotEqual %bool {fmt} {self.cu(0)}")
-            elif (lit3 >> 12 & 0x7F) == 0:
+                self.emit(f"{fmt_m1} = OpISub %uint {fmt} {self.cu(1)}")
+                self.emit(f"{format_ok} = OpULessThan %bool {fmt_m1} {self.cu(77)}")
+            elif not 1 <= (lit3 >> 12 & 0x7F) <= 77:
                 return addr, d3, "%false", None, step
         mode = None if lit3 is None else lit3 >> 28 & 3
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)

@@ -1133,5 +1133,56 @@ class TestNegativeControlsAndMutations(unittest.TestCase):
                     harness.translate_and_run(asm)
 
 
+class TestRawFormatGateRange(unittest.TestCase):
+    """Raw MUBUF access is live only for FORMAT 1..77; 0 and 78..127 suppress it.
+
+    Measured on RDNA2 (gfx1036, all 128 codes, PR #1435 comment 7097323541).
+    The run-time form builds word3 with s_or_b32, which keeps it out of sgpr_imm
+    so the translator emits the run-time gate instead of folding a literal one.
+    """
+
+    CODES = (0, 1, 22, 77, 78, 100, 127)
+
+    def setUp(self):
+        self.harness = MubufSpirvHarness()
+        self.addCleanup(self.harness.cleanup)
+
+    def _asm(self, fmt, runtime, store):
+        if runtime:
+            desc = (f"\ts_mov_b32 s3, 0x31000000\n"
+                    f"\ts_mov_b32 s4, {fmt << 12:#x}\n"
+                    "\ts_or_b32 s3, s3, s4\n")
+        else:
+            desc = f"\ts_mov_b32 s3, {0x31000000 | (fmt << 12):#x}\n"
+        op = ("\tbuffer_store_dword v2, off, s[0:3], 0 offset:0\n" if store else
+              "\tbuffer_load_dword v2, off, s[0:3], 0 offset:0\n")
+        return ("; fmt gate range\n"
+                "\ts_mov_b32 s0, 0x1000\n"
+                "\ts_mov_b32 s1, 0\n"
+                "\ts_mov_b32 s2, 0x100\n"
+                + desc +
+                ("\tv_mov_b32 v2, 0x12345678\n" if store else "") +
+                op +
+                "\ts_waitcnt vmcnt(0)\n"
+                "\texp mrt0 v2, v2, v2, v2 done vm\n"
+                "\ts_endpgm\n")
+
+    def test_load_gate_range(self):
+        for runtime in (False, True):
+            for fmt in self.CODES:
+                with self.subTest(runtime=runtime, fmt=fmt):
+                    mrt, _ = self.harness.translate_and_run(
+                        self._asm(fmt, runtime, False), memory={0x1000: 0xCAFEBABE})
+                    self.assertEqual(mrt[0], 0xCAFEBABE if 1 <= fmt <= 77 else 0)
+
+    def test_store_gate_range(self):
+        for runtime in (False, True):
+            for fmt in self.CODES:
+                with self.subTest(runtime=runtime, fmt=fmt):
+                    _, mem = self.harness.translate_and_run(
+                        self._asm(fmt, runtime, True), memory={0x1000: 0xEEEEEEEE})
+                    self.assertEqual(mem[0x1000], 0x12345678 if 1 <= fmt <= 77 else 0xEEEEEEEE)
+
+
 if __name__ == "__main__":
     unittest.main()
