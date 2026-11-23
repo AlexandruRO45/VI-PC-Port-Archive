@@ -76,8 +76,8 @@ def _hash_file(path: str, *, expected_size: int | None = None) -> tuple[int, str
     return size, h.hexdigest()
 
 
-def sha256(path: str) -> str:
-    return _hash_file(path)[1]
+def sha256(path: str, *, expected_size: int | None = None) -> str:
+    return _hash_file(path, expected_size=expected_size)[1]
 
 
 def same_output_path(first: str, second: str) -> bool:
@@ -107,7 +107,12 @@ def walk(game_dir: str, *, exclude=None):
             if contains_manifest and os.path.normcase(name) == excluded_name:
                 continue
             p = os.path.join(root, name)
-            yield os.path.relpath(p, game_dir).replace("\\", "/"), p
+            rel = os.path.relpath(p, game_dir)
+            if os.sep != "/":
+                rel = rel.replace(os.sep, "/")
+            if os.altsep and os.altsep != "/":
+                rel = rel.replace(os.altsep, "/")
+            yield rel, p
 
 
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
@@ -170,11 +175,20 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
     os.makedirs(out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out_dir) as staging:
         staged = os.path.join(staging, "manifest.json")
-        with open(staged, "w", encoding="utf-8") as f:
+        with open(staged, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "files": entries}, f, indent=1)
         os.replace(staged, out)
     print(f"{len(entries)} files, {total / 2**30:.1f} GiB -> {out}")
     return 0
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
 
 
 def load_manifest(manifest: str) -> dict:
@@ -182,8 +196,8 @@ def load_manifest(manifest: str) -> dict:
     as a JSONDecodeError, KeyError or TypeError traceback halfway through verify."""
     with open(manifest, encoding="utf-8") as f:
         try:
-            doc = json.load(f)
-        except ValueError as error:  # JSONDecodeError, or UnicodeDecodeError for a file that isn't UTF-8
+            doc = json.load(f, object_pairs_hook=_reject_duplicate_keys)
+        except ValueError as error:  # JSONDecodeError, duplicate keys, or UnicodeDecodeError for non-UTF-8
             raise ManifestError(f"{manifest} is not valid JSON ({error}); create it again") from None
     files = doc.get("files") if isinstance(doc, dict) else None
     if not isinstance(files, dict):
@@ -197,6 +211,9 @@ def load_manifest(manifest: str) -> dict:
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
     have = dict(walk(game_dir, exclude=manifest))
+    if not want and have:
+        # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
+        raise ManifestError(f"{manifest} lists no files, but {game_dir} holds {len(have)}; create it again")
     problems = {}
     pending = []
     for rel, info in want.items():
@@ -206,15 +223,18 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
         elif os.path.getsize(p) != info["size"]:
             problems[rel] = "SIZE"
         else:
-            pending.append((rel, p, info["sha256"]))
+            pending.append((rel, p, info["sha256"].lower()))
+
+    def hash_pending(rel: str, path: str) -> str:
+        return sha256(path, expected_size=want[rel]["size"])
 
     if jobs == 1:
         for rel, p, digest in pending:
-            if sha256(p) != digest:
+            if hash_pending(rel, p) != digest:
                 problems[rel] = "CHANGED"
     else:
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = {pool.submit(sha256, p): (rel, digest) for rel, p, digest in pending}
+            futures = {pool.submit(hash_pending, rel, p): (rel, digest) for rel, p, digest in pending}
             for future in as_completed(futures):
                 rel, digest = futures[future]
                 if future.result() != digest:
