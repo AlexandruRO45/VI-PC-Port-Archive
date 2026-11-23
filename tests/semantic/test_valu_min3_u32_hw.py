@@ -480,5 +480,77 @@ class TestValuMin3U32RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.state.vgprs[2], 10)
         self.assertEqual(self.state.vgprs[4], 0xBBBB_BBBB)
 
+@dataclasses.dataclass(frozen=True)
+class Min3StatusFlags:
+    """Status flags and operand analysis for 3-operand minimum."""
+    zero: bool
+    negative: bool
+    is_min_src0: bool
+    is_min_src1: bool
+    is_min_src2: bool
+    tie_count: int
+    parity: bool
+
+
+def compute_min3_status_flags(a: int, b: int, c: int) -> Min3StatusFlags:
+    res = oracle_min3_u32(a, b, c)
+    ua, ub, uc = u32(a), u32(b), u32(c)
+    is0 = (res == ua)
+    is1 = (res == ub)
+    is2 = (res == uc)
+    tie_count = int(is0) + int(is1) + int(is2)
+    zero = (res == 0)
+    negative = bool(res & SIGN_BIT32)
+    parity = (bin(res).count("1") % 2 == 0)
+    return Min3StatusFlags(
+        zero=zero,
+        negative=negative,
+        is_min_src0=is0,
+        is_min_src1=is1,
+        is_min_src2=is2,
+        tie_count=tie_count,
+        parity=parity,
+    )
+
+
+class TestValuMin3U32ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and extrema boundary tests for v_min3_u32."""
+
+    def test_status_flags_zero(self) -> None:
+        flags = compute_min3_status_flags(0, 10, 20)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertTrue(flags.is_min_src0)
+        self.assertFalse(flags.is_min_src1)
+        self.assertEqual(flags.tie_count, 1)
+        self.assertTrue(flags.parity)
+
+    def test_status_flags_negative_msb(self) -> None:
+        flags = compute_min3_status_flags(0x8000_0000, 0x9000_0000, 0xA000_0000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.is_min_src0)
+        self.assertEqual(flags.tie_count, 1)
+
+    def test_status_flags_two_way_tie(self) -> None:
+        flags = compute_min3_status_flags(15, 15, 30)
+        self.assertTrue(flags.is_min_src0)
+        self.assertTrue(flags.is_min_src1)
+        self.assertFalse(flags.is_min_src2)
+        self.assertEqual(flags.tie_count, 2)
+
+    def test_status_flags_three_way_tie(self) -> None:
+        flags = compute_min3_status_flags(42, 42, 42)
+        self.assertTrue(flags.is_min_src0)
+        self.assertTrue(flags.is_min_src1)
+        self.assertTrue(flags.is_min_src2)
+        self.assertEqual(flags.tie_count, 3)
+
+    def test_extrema_boundary_status(self) -> None:
+        flags = compute_min3_status_flags(MASK32, 0, MASK32)
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.is_min_src1)
+        self.assertEqual(flags.tie_count, 1)
+
 if __name__ == "__main__":
     unittest.main()
