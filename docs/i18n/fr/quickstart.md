@@ -100,8 +100,10 @@ L'espace indiqué plus haut correspond à la compilation complète. Pour *lancer
 `--stages check,shaders,runtime` a besoin d'environ 30 Go ; l'étape `assets` (~370 Go) ne sert qu'aux outils de
 ressources, et `--wav` ajoute plusieurs fois la taille de l'Ogg Opus. `--work` et `--out` peuvent être sur un autre disque. Le runtime lit le paquet sur
 place : si son disque est en lecture seule, passez `gta6rt --overlay <dossier accessible en écriture>` (c'est une
-option de `gta6rt`, pas de `make_game.py`). Ne supprimez pas les fichiers `.s` de `work/shaders/dxbc/disasm` : sans
-eux et sans `work/shaders/spirv/index.json`, l'étape `shaders` peut sembler terminée avec zéro shader.
+option de `gta6rt`, pas de `make_game.py`). Laissez les fichiers `.s` de `work/shaders/dxbc/disasm` en place : la
+prochaine exécution les compare à la liste de `disasm.done` et désassemble à nouveau ceux qui manquent (tous si le
+fichier `disasm.done` est antérieur à cette liste), puis retraduit tous les shaders. Un dossier `disasm` qui est un
+lien symbolique est refusé quand l'étape doit le vider.
 
 ### Depuis un terminal (`make_game.py`)
 
