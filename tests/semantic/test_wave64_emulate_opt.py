@@ -563,6 +563,11 @@ def _translate_encoded(name, insns, local_size=(64, 1, 1), emulate=True, rsrc2=0
     for txt, nb in insns:
         enc = ",".join(["0x00"] * nb)
         lines.append(f"\t{txt:52s} ; encoding: [{enc}]")
+    return _translate_text(name, "\n".join(lines) + "\n", local_size, emulate, rsrc2)
+
+
+def _translate_text(name, text, local_size=(64, 1, 1), emulate=True, rsrc2=0x8088):
+    """Translate a listing in the translator's .s format as compute with the given local size."""
     prev_emu = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
@@ -572,7 +577,7 @@ def _translate_encoded(name, insns, local_size=(64, 1, 1), emulate=True, rsrc2=0
             s_path = os.path.join(td, "disasm", name + ".s")
             f_path = os.path.join(td, "fssm", name + ".fssm")
             with open(s_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
+                f.write(text)
             lx, ly, lz = local_size
             with open(f_path, "wb") as f:
                 f.write(bytes(0x138) + struct.pack("<4I", rsrc2, lx, ly, lz))
@@ -967,6 +972,17 @@ class LocalExecFoldTests(unittest.TestCase):
                         inside = ((lane % 64) * 5) & 15 > 12
                         want = 1 + (121 if inside and not taken else 0)
                         self.assertEqual(mem[lane * 4], want, f"lane {lane}")
+
+    def test_folded_region_scalar_exit_fixture(self):
+        # The taken scc0 case above as a real llvm-mc listing (fixtures/wave64_fold_scc_exit.asm).
+        with open(os.path.join(HERE, "fixtures", "wave64_fold_scc_exit.asm"), encoding="utf-8") as f:
+            text = f.read()
+        for threads in (64, 128):
+            with self.subTest(threads=threads):
+                spv, gen = _translate_text("cs_fold_scc_exit", text, (threads, 1, 1))
+                self.assertEqual(_switch_case_count(gen), 1)
+                mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28)
+                self.assertEqual([mem[lane * 4] for lane in range(threads)], [1] * threads)
 
     def test_cs_w64x_saveexec_b64_fixture_emulated_exact(self):
         # Run the repo's real cs_w64x_saveexec_b64.s fixture under --wave64-emulate on the 64-lane barrier interpreter.
