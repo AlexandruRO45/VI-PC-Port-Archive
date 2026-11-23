@@ -14,9 +14,9 @@ repository's own tools/ is never modified) and the test file is run against it t
 tests/semantic/test_mutations.py does. A mutant the test file still passes is reported as SURVIVED.
 
 A surviving mutant is a lead, not a verdict: some mutants are equivalent (they can't change any result, e.g. a
-constant that only feeds a branch the op never takes), so read each one before asking for a new case. Exit status:
-0 when every mutant is caught, 1 when any survives, 2 on a usage or baseline error (the unmutated copy must pass
-first). Synthetic: no game files, no GPU.
+constant that only feeds a branch the op never takes), so read each one before asking for a new case.
+Exit 0 when every mutant is caught and 1 when any survives. A usage error, baseline error or timeout takes
+precedence and exits 2. The unmutated copy must pass first. Synthetic inputs need only the CPU.
 """
 from __future__ import annotations
 
@@ -181,8 +181,8 @@ def mutants_for(lines: list[str], first: int, last: int) -> list[Mutant]:
     return out
 
 
-def run_test(test_file: str, tools_dir: str, timeout: int) -> tuple[bool, str]:
-    """True when the test file passes against tools_dir."""
+def run_test(test_file: str, tools_dir: str, timeout: int) -> tuple[bool | None, str]:
+    """The test's pass/fail result against tools_dir, or None if it times out."""
     here = os.path.dirname(os.path.abspath(test_file))
     path = os.pathsep.join(filter(None, [here, os.path.join(ROOT, "tests", "semantic"), os.environ.get("PYTHONPATH")]))
     env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path)
@@ -190,7 +190,7 @@ def run_test(test_file: str, tools_dir: str, timeout: int) -> tuple[bool, str]:
         p = subprocess.run([sys.executable, os.path.abspath(test_file)], env=env, capture_output=True, text=True,
                            timeout=timeout)
     except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout} s"
+        return None, f"timed out after {timeout} s"
     tail = (p.stdout + p.stderr).strip().splitlines()
     return p.returncode == 0, tail[-1] if tail else ""
 
@@ -255,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         if not ok:
             print(f"error: the test file fails on the unmutated translator ({last_line})", file=sys.stderr)
             return 2
-        survived = 0
+        survived = timed_out = 0
         t0 = time.time()
         for m in mutants:
             mutated = list(lines)
@@ -263,12 +263,21 @@ def main(argv: list[str] | None = None) -> int:
             with open(target, "w", encoding="utf-8", newline="") as f:
                 f.write(sep.join(mutated))
             ok, last_line = run_test(args.test_file, tools, args.timeout)
-            if ok:
+            if ok is None:
+                timed_out += 1
+                verdict = "TIMEOUT"
+            elif ok:
                 survived += 1
-            print(f"  {'SURVIVED' if ok else 'caught  '}  line {m.line}: {m.label}"
+                verdict = "SURVIVED"
+            else:
+                verdict = "caught"
+            print(f"  {verdict:8}  line {m.line}: {m.label}"
                   + ("" if ok else f"  ({last_line})"))
-        print(f"{len(mutants) - survived} of {len(mutants)} mutants caught, {survived} survived "
+        caught = len(mutants) - survived - timed_out
+        print(f"{caught} of {len(mutants)} mutants caught, {survived} survived, {timed_out} timed out "
               f"({time.time() - t0:.0f} s)")
+        if timed_out:
+            return 2
         return 1 if survived else 0
 
 

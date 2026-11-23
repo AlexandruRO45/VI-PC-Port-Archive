@@ -1,10 +1,13 @@
 """tools/semantic_mutants.py: branch lookup, mutant generation, and one end-to-end run on a weak and a strong test."""
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -151,6 +154,34 @@ class EndToEnd(unittest.TestCase):
     def test_strong_test_catches_it(self):
         code, out = self.run_tool(STRONG_EXTRA)
         self.assertRegex(out, r"caught\s+line \d+: last operand \{ya\} -> \{xa\}")
+
+    def test_timed_out_mutant_is_reported_separately_and_run_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = os.path.join(tmp, "tools")
+            os.mkdir(tools)
+            with open(os.path.join(tools, sm.TRANSLATOR), "w", encoding="utf-8", newline="\n") as f:
+                f.write('opcode = "OpBitwiseOr"\n')
+            test = os.path.join(tmp, "test_timeout.py")
+            with open(test, "w", encoding="utf-8", newline="\n") as f:
+                f.write(textwrap.dedent('''\
+                    import os
+                    from pathlib import Path
+                    import time
+
+                    source = Path(os.environ["LEONIDA_TOOLS_DIR"], "rdna2spirv.py").read_text(encoding="utf-8")
+                    if "OpBitwiseAnd" in source:
+                        time.sleep(10)
+                    elif "OpBitwiseXor" in source:
+                        raise AssertionError("caught the second mutant")
+                    '''))
+            out = io.StringIO()
+            with mock.patch.object(sm, "ROOT", tmp), contextlib.redirect_stdout(out):
+                code = sm.main([test, "--lines", "1-1", "--timeout", "2"])
+            report = out.getvalue()
+            self.assertEqual(code, 2, report)
+            self.assertIn("1 of 2 mutants caught, 0 survived, 1 timed out", report)
+            self.assertRegex(report, r"TIMEOUT\s+line 1: OpBitwiseOr -> OpBitwiseAnd")
+            self.assertRegex(report, r"caught\s+line 1: OpBitwiseOr -> OpBitwiseXor")
 
 
 if __name__ == "__main__":
