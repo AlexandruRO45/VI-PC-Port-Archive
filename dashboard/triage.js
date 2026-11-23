@@ -22,6 +22,7 @@ const GRAPH_RETRY_MS = 5 * 60 * 1000;     // after a failed sweep the search pat
 const GRAPH_PAGE_SIZES = [100, 50, 25];
 const GRAPH_MAX_PRS = 8000;               // past this the sweep reports itself incomplete instead of done
 const GRAPH_TIMEOUT_STATUS = [502, 503, 504];
+const GRAPH_FETCH_MS = 60 * 1000;         // one GraphQL call; past this it counts as unanswered (smaller page, or sweep failed)
 const GRAPH_FILES = 100;                  // files per PR; a PR with more can't be placed in a round
 const BODY_BATCH = 50;                    // bodies per GraphQL call
 const BODY_MAX_BATCHES = 25;              // per sweep: the first one fetches every body (about 21 calls)
@@ -37,7 +38,7 @@ const ITEM_RE = /\b([A-Z][A-Z0-9]{1,7})-(\d{1,5})\b/g;
 const DEPENDS_RE = /depends on:?([^\n]*)/gi;
 const STAGE_RANK = { ready: 0, green: 1, running: 2, waiting: 3, failing: 4, rebase: 5, draft: 6 };
 
-const graph = { at: 0, failAt: 0, ok: false, pages: 0, bodyCalls: 0, busy: null };   // busy: { what, done, total } while sweeping
+const graph = { at: 0, failAt: 0, ok: false, pages: 0, bodyCalls: 0, busy: null, bodiesRun: null };   // bodiesRun: the description load in the background   // busy: { what, done, total } while sweeping
 let bodies = {};                          // n → { u: updatedAt, lids, deps }
 let triageHtml = '';
 
@@ -157,11 +158,11 @@ async function graphql(query, variables = {}) {
   if (!token) throw new Error('GraphQL needs a token');
   if (Date.now() < (blockedUntil.graphql || 0)) throw new RateLimitError('graphql', blockedUntil.graphql);
   apiCalls++;
-  const res = await fetch('https://api.github.com/graphql', {
+  const { res, json } = await fetchTimed('https://api.github.com/graphql', {
     method: 'POST',
     headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables }),
-  });
+  }, GRAPH_FETCH_MS);
   if (res.headers.get('x-ratelimit-resource')) {
     rate.graphql = {
       remaining: Number(res.headers.get('x-ratelimit-remaining')),
@@ -176,7 +177,7 @@ async function graphql(query, variables = {}) {
     err.status = res.status;
     throw err;
   }
-  const body = await res.json();
+  const body = json();
   if (!body.data) throw new Error((body.errors && body.errors[0] && body.errors[0].message) || 'GraphQL answered without data');
   if (body.errors) console.warn('[dashboard] GraphQL answered in part', body.errors.slice(0, 3));
   return scrubDeep(body.data);
@@ -251,8 +252,8 @@ const graphDue = now => !!activeToken() && now - graph.at >= GRAPH_MS && now - g
 /** The search path runs only when there is no token or the sweep has not worked lately. */
 const graphCovers = () => !!activeToken() && graph.ok && Date.now() - graph.failAt >= GRAPH_RETRY_MS;
 
-/** A failure that a smaller page may get past: no response at all, or a gateway timeout. */
-const timedOut = e => !!e && (e.name === 'TypeError' || GRAPH_TIMEOUT_STATUS.includes(e.status));
+/** A failure that a smaller page may get past: no response at all, no response in time, or a gateway timeout. */
+const timedOut = e => !!e && (e.name === 'TypeError' || e.name === 'TimeoutError' || GRAPH_TIMEOUT_STATUS.includes(e.status));
 
 /** One page of open PRs after `cursor`, asked again with fewer PRs when GitHub doesn't answer in time. */
 async function prPage(cursor) {
@@ -298,12 +299,13 @@ async function loadGraph(now) {
   graph.ok = true;
   store.set(GRAPH_KEY, { at: graph.at });
   applyGraph(nodes.map(pickGraphPr));
-  try {
-    if (await loadBodies(nodes)) applyGraph(nodes.map(pickGraphPr));
-  } catch (e) {
-    console.error('[dashboard] GraphQL descriptions failed; item IDs from titles only until the next sweep', e);
-  } finally {
-    graphProgress(null);
+  graphProgress(null);
+  // Descriptions refine the list in the background, so the sync (and the status bar) does not wait for them.
+  if (!graph.bodiesRun) {
+    graph.bodiesRun = loadBodies(nodes)
+      .then(read => { if (read) applyGraph(nodes.map(pickGraphPr)); })
+      .catch(e => console.error('[dashboard] GraphQL descriptions failed; item IDs from titles only until the next sweep', e))
+      .finally(() => { graph.bodiesRun = null; graphProgress(null); });
   }
   return 'done';
 }

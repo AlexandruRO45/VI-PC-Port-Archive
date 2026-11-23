@@ -1,7 +1,7 @@
 # Dashboard
 
 A live overview of the GitHub side of the project in one static page: `index.html` plus `live.js`, `pipeline.js`,
-`activity.js` and `triage.js`. No build step, no dependencies, no server code: it reads public GitHub data in the visitor's
+`activity.js`, `triage.js`, `security.js` and `proof.js`. No build step, no dependencies, no server code: it reads public GitHub data in the visitor's
 browser. An example running from a fork's GitHub Pages: https://clhelper.github.io/Leonida/
 
 ## What it shows
@@ -16,6 +16,11 @@ browser. An example running from a fork's GitHub Pages: https://clhelper.github.
 - **Triage**: items that open PRs from more than one author work on (possible duplicates), and with a token the next
   merge round (green, mergeable PRs that share no file, so merging them all makes none of them conflict) and the files
   the most open PRs change. `tests/test_dashboard_triage.cjs` covers it (`node --test`).
+- **Security reviews**: the shared table of PRs that volunteers have read for malicious code
+  ([Etoile-Bleu/leonida-reviews](https://github.com/Etoile-Bleu/leonida-reviews)): one box per verdict (do not merge,
+  needs a second look, quick scan only, could not be reviewed, being reviewed, clean) that filters the list, search,
+  reviewer and order filters, and an Open / Closed tag per PR once the pipeline has the open PRs. The list starts with
+  5 reviews and shows 20 more per click (`security.js`; `tests/test_dashboard_security.cjs` covers its checks).
 - **Live feed**: PRs opened, merged and closed, claims and other commands on the coordination issue, merge rounds and
   reverts on `main`.
 - **Activity**: merged and opened PRs per hour over the last 24 hours, and who merged most.
@@ -41,13 +46,17 @@ browser. An example running from a fork's GitHub Pages: https://clhelper.github.
 
 From the browser, GET requests only, except the GraphQL sweep with a token:
 
-- `raw.githubusercontent.com`: the README, and every 30 minutes `docs/design.md` and `docs/runtime_imports.md`
-  (no rate limit).
+- `raw.githubusercontent.com`: the README, every 30 minutes `docs/design.md` and `docs/runtime_imports.md`, and every
+  15 minutes the review table's `docs/reviews.json` from `Etoile-Bleu/leonida-reviews` (no rate limit). Every field
+  of the review table is type-checked and escaped before it is shown.
 - `api.github.com`: the coordination issue and its comments, the D3D12 tracker, GitHub search (open and merged PRs,
   CI results), the latest commits on `main` and the repository's star and contributor counts.
 - `api.github.com/graphql`, only with a token: every open PR with its changed files, CI result and merge state, about
   a dozen read-only queries every 2 minutes while the tab is in use. It replaces the PR searches, so the pipeline
   has no 1,000-result cap and conflicts are read live. A PR's description is fetched only when the PR changed.
+
+Every request gives up after 30 seconds (a GraphQL call after 60), so a call GitHub never answers cannot keep the
+page updating forever; a sweep page that times out is asked again with fewer PRs.
 
 It parses the coordination issue and the tracker as they are written today. When their format changes, a section
 shows less until the parser follows. Text from GitHub is shown with the game's title masked.
@@ -65,7 +74,8 @@ and sent only to `api.github.com`.
 ## What it keeps in the browser
 
 Local storage under `ldash:v2:<repo>:`: the last GitHub answers, the last pipeline load, the merged PRs of the last
-24 hours, the feed and the counts of the two documents (not the documents), so a reload shows them at once. Clearing the site's data resets it.
+24 hours, the feed, the counts of the two documents (not the documents) and the review table packed (each scope text
+once, about 0.3 MB), so a reload shows them at once. Clearing the site's data resets it.
 
 ## No game data
 

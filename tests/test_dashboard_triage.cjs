@@ -27,6 +27,12 @@ function load({ token = 'ghp_test', fetch = async () => { throw new Error('no ne
     applied: [],
     fetch,
   };
+  // index.html's fetchTimed, without the timer: the fake fetch answers or throws (a timeout as name 'TimeoutError').
+  ctx.fetchTimed = async (url, init) => {
+    const res = await fetch(url, init);
+    const body = await res.json();
+    return { res, json: () => body };
+  };
   ctx.applyGraph = items => ctx.applied.push(items);
   vm.runInNewContext(source + EXPORTS, ctx);
   return ctx;
@@ -146,6 +152,8 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
   const ctx = load({ fetch: fakeGraphql(nodes, calls) });
   const { t } = ctx;
   assert.equal(await t.loadGraph(Date.now()), 'done');
+  assert.equal(ctx.applied.length, 1, 'the sweep is done before the descriptions: they load in the background');
+  await t.graph.bodiesRun;
   assert.equal(calls.pages, 3);
   assert.equal(calls.bodies, 5, '230 bodies in batches of 50');
   assert.equal(ctx.applied.length, 2, 'the PR list is shown before the descriptions, then again with them');
@@ -178,6 +186,7 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
   t.graph.at = 0;
   calls.bodyPrs.length = 0;
   assert.equal(await t.loadGraph(Date.now()), 'done');
+  await t.graph.bodiesRun;
   assert.deepEqual(calls.bodyPrs, [10]);
   assert.deepEqual([...ctx.applied[ctx.applied.length - 1][9].lids], ['BUILD-1']);
   assert.equal(t.bodies[230], undefined);
@@ -189,6 +198,7 @@ test('the PR list is shown even when its descriptions fail to load', async () =>
   const ctx = load({ fetch: async (url, init) => (JSON.parse(init.body).query.includes('pullRequests(')
     ? working(url, init) : { ok: false, status: 502, headers: { get: () => null }, json: async () => ({}) }) });
   assert.equal(await ctx.t.loadGraph(Date.now()), 'done');
+  await ctx.t.graph.bodiesRun;
   assert.equal(ctx.applied.length, 1);
   assert.equal(ctx.applied[0].length, 2);
   assert.ok(ctx.t.graphCovers());
@@ -223,6 +233,14 @@ test('a page GitHub does not answer in time is asked again smaller, from the sam
   assert.deepEqual(JSON.parse(JSON.stringify(calls.sizes)), [100, 25, 100], 'the next page goes back to the full size');
   assert.equal(ctx.applied[0].length, 160, 'every PR, none twice');
   assert.equal(new Set(ctx.applied[0].map(p => p.n)).size, 160);
+});
+
+test('a call with no answer in time counts as unanswered: asked again smaller, then the sweep gives up', async () => {
+  let asked = 0;
+  const ctx = load({ fetch: async () => { asked++; const e = new Error('no answer within 60 s'); e.name = 'TimeoutError'; throw e; } });
+  assert.equal(await ctx.t.loadGraph(Date.now()), 'error', 'the sync goes on instead of waiting');
+  assert.equal(asked, 3, 'asked at 100, 50 and 25 PRs');
+  assert.equal(ctx.t.graph.busy, null);
 });
 
 test('an error that a smaller page cannot fix is not retried', async () => {

@@ -284,6 +284,55 @@ details.more div { font-size: 12.5px; color: var(--muted); margin-top: 6px; over
 .done-strip { display: flex; flex-wrap: wrap; gap: 6px; }
 .done-strip a { font: 500 12px var(--mono); padding: 4px 9px; border-radius: 99px; background: rgba(46,230,200,.1); color: var(--done); }
 
+/* security reviews */
+.sec-say { font-size: 15px; color: var(--muted); margin: 0 0 14px; }
+.sec-say b { color: var(--text); }
+.sec-boxes { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 1000px) { .sec-boxes { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .sec-boxes { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.sec-box { text-align: left; font: inherit; color: var(--text); cursor: pointer; padding: 14px 16px; border-radius: 14px; background: var(--card);
+  border: 1px solid var(--line); border-top: 3px solid var(--v); transition: background .15s, border-color .15s; }
+.sec-box:hover { background: var(--card-hi); }
+.sec-box.on { background: var(--card-hi); border-color: var(--v); box-shadow: 0 0 0 1px var(--v) inset; }
+.sec-box.zero { opacity: .55; }
+.sec-box b { display: block; font: 700 30px var(--display); letter-spacing: -.02em; color: var(--v); }
+.sec-box span { font-size: 13px; color: var(--muted); }
+.sec-box:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+.sec-note { margin-top: 10px; }
+.sec-tools { margin: 16px 0 12px; padding: 14px; display: grid; gap: 12px; }
+.sec-tools input[type="search"] { width: 100%; min-width: 0; font: 15px var(--body); color: var(--text); background: rgba(255,255,255,.06); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; outline: none; }
+.sec-tools input[type="search"]:focus { border-color: var(--pink); }
+.sec-row { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+.sec-field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); min-width: 0; }
+.sec-field select { font: 500 13.5px var(--body); color: var(--text); background: rgba(255,255,255,.06); border: 1px solid var(--line); border-radius: 10px; padding: 7px 10px; max-width: 220px; min-width: 0; color-scheme: dark; }
+.sec-field select option { background: #17122b; color: var(--text); }
+.sec-check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
+.sec-check input { accent-color: var(--orange); margin: 0; }
+.sec-field select:focus-visible, .sec-check:focus-within { outline: 2px solid var(--teal); outline-offset: 1px; }
+.sec-count { text-align: right; font: 500 12px var(--mono); color: var(--dim); margin: 0 0 8px; }
+.sec-cards { display: flex; flex-direction: column; gap: 8px; }
+.sec-group { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: 16px 0 4px; }
+.sec-group b { font: 700 16px var(--display); }
+.sec-group .sec-mark { width: 20px; height: 20px; display: inline-grid; place-items: center; border-radius: 50%; font-size: 11px; font-weight: 700; color: var(--v); border: 1px solid var(--v); align-self: center; }
+.sec-group .sec-n { font: 700 12px var(--mono); color: var(--muted); }
+.sec-group .sec-help { font-size: 13px; color: var(--muted); }
+.sec-card { padding: 12px 16px; border-radius: 14px; background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--v); font-size: 14px; }
+.sec-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+.sec-pr { font: 700 13.5px var(--mono); color: var(--v); }
+.sec-title { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.sec-pills { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; }
+.sec-pill { font: 700 11px var(--mono); padding: 3px 9px; border-radius: 99px; color: var(--v); background: color-mix(in srgb, var(--v) 14%, transparent); border: 1px solid color-mix(in srgb, var(--v) 40%, transparent); white-space: nowrap; }
+.sec-tag { font: 500 11px var(--mono); padding: 3px 9px; border-radius: 99px; color: var(--muted); border: 1px solid var(--line); white-space: nowrap; }
+.sec-tag.open { color: var(--done); border-color: rgba(46,230,200,.4); }
+.sec-findings { margin: 8px 0 0; padding-left: 20px; color: #e2d9f7; overflow-wrap: anywhere; }
+.sec-findings li { margin: 3px 0; }
+.sec-none { margin: 6px 0 0; color: var(--dim); font-size: 13px; }
+.sec-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+.sec-meta code { font: 600 12px var(--mono); }
+.sec-how { margin-top: 6px; font-size: 12.5px; color: var(--muted); }
+.sec-how summary { cursor: pointer; text-decoration: underline dotted; width: fit-content; }
+.sec-how p { margin: 6px 0 0; overflow-wrap: anywhere; }
+
 /* q&a */
 .safety { border-radius: var(--radius); padding: 20px 22px; margin-bottom: 18px; border: 1px solid rgba(255,77,109,.45);
   background: radial-gradient(500px 220px at 0% 0%, rgba(255,77,109,.18), transparent 60%), var(--card); }
@@ -529,6 +578,7 @@ body.card-mode .card-url { display: block; }
       <a href="#pulse">Activity</a>
       <a href="#queue">Merge queue</a>
       <a href="#triage">Triage</a>
+      <a href="#security">Security</a>
       <a href="#work">Work board</a>
       <a href="#faq">Q&amp;A</a>
     </nav>
@@ -696,6 +746,20 @@ body.card-mode .card-url { display: block; }
         </div>
       </div>
       <div id="triageBody"><div class="pending" data-part="pipeline"><div class="skeleton"></div><div class="pending-box"><b class="pending-title">Loading from GitHub…</b><p class="pending-msg"></p><button class="linkbtn pb-token" type="button" hidden>Load faster with a free token</button></div></div></div>
+    </div>
+  </section>
+
+  <section id="security">
+    <div class="wrap">
+      <div class="sec-head">
+        <div>
+          <div class="eyebrow">Before merging</div>
+          <h2>Security reviews</h2>
+          <p class="lede">Volunteers read the open pull requests for malicious code, so the maintainers can merge with less risk. Every verdict, live from the table they share.</p>
+        </div>
+        <a class="btn" href="https://github.com/Etoile-Bleu/leonida-reviews" target="_blank" rel="noopener">Review table ↗</a>
+      </div>
+      <div id="securityBody"><div class="pending"><div class="skeleton"></div><div class="pending-box"><b class="pending-title">Loading the review table…</b><p class="pending-msg"></p></div></div></div>
     </div>
   </section>
 
@@ -877,6 +941,28 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const fmt = n => (n == null || Number.isNaN(n)) ? '–' : Number(n).toLocaleString('en-US');
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const FETCH_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * fetch() that gives up after `ms`, reading the body included: a request GitHub never answers would otherwise keep the
+ * sync waiting (and the status bar on "Updating…") until the tab is closed. A timeout rejects with name 'TimeoutError'.
+ */
+async function fetchTimed(url, opts = {}, ms = FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    const body = await res.arrayBuffer();
+    return { res, text: () => new TextDecoder().decode(body), json: () => JSON.parse(new TextDecoder().decode(body)) };
+  } catch (e) {
+    if (e.name !== 'AbortError') throw e;
+    const err = new Error(`no answer within ${Math.round(ms / 1000)} s`);
+    err.name = 'TimeoutError';
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const store = {
   get(key) {
@@ -1058,9 +1144,11 @@ async function api(path, pick = d => d, cacheKey = path, { maxAge = 0 } = {}) {
   if (token) headers.Authorization = 'Bearer ' + token;
   if (sameUrl && cached.etag) headers['If-None-Match'] = cached.etag;
   let res;
+  let got;
   apiCalls++;
   try {
-    res = await fetch(url, { headers });
+    got = await fetchTimed(url, { headers });
+    res = got.res;
   } catch (e) {
     if (cached) return fromCache(cached);
     throw new Error('Could not reach GitHub (' + e.message + ')');
@@ -1088,7 +1176,7 @@ async function api(path, pick = d => d, cacheKey = path, { maxAge = 0 } = {}) {
     if ((blockedUntil[resource] || 0) > Date.now()) throw new RateLimitError(resource, blockedUntil[resource]);
     throw new Error('GitHub answered ' + res.status + ' for ' + path);
   }
-  const entry = { url, data: scrubDeep(pick(await res.json())), etag: res.headers.get('etag'), link: res.headers.get('link'), at: Date.now() };
+  const entry = { url, data: scrubDeep(pick(got.json())), etag: res.headers.get('etag'), link: res.headers.get('link'), at: Date.now() };
   store.set('api:' + cacheKey, entry);
   return entry;
 }
@@ -1102,9 +1190,9 @@ async function rawFile(path) {
     throw new Error('not saved from an earlier visit');
   }
   try {
-    const res = await fetch(url, { cache: 'no-cache' });
+    const { res, text } = await fetchTimed(url, { cache: 'no-cache' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    const entry = { data: scrub(await res.text()), at: Date.now() };
+    const entry = { data: scrub(text()), at: Date.now() };
     store.set('raw:' + path, entry);
     return entry;
   } catch (e) {
@@ -1826,6 +1914,7 @@ document.addEventListener('DOMContentLoaded', init);
 <script src="activity.js"></script>
 <script src="pipeline.js"></script>
 <script src="triage.js"></script>
+<script src="security.js"></script>
 <script src="proof.js"></script>
 </body>
 </html>

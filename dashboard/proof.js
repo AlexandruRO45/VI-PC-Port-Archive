@@ -138,9 +138,9 @@ function parseImports(text) {
 }
 
 async function proofText(path) {
-  const res = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${path}`, { cache: 'no-cache' });
+  const { res, text } = await fetchTimed(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${path}`, { cache: 'no-cache' });
   if (!res.ok) throw new Error(`Could not load ${path} (HTTP ${res.status})`);
-  return res.text();
+  return text();
 }
 
 const proofState = { at: 0, busy: false };
