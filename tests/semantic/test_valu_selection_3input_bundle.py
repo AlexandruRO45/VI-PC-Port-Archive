@@ -385,5 +385,31 @@ class VMin3I32SimdBoundaryTests(unittest.TestCase):
         int_min = 0x80000000
         self.assertEqual(ref_min3_i32(int_min, int_min, int_min), int_min)
 
+class VMin3I32TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution and negative mutation controls for v_min3_i32."""
+
+    def test_spirv_translation_execution(self):
+        lines = [
+            "v_mov_b32 v0, 50",
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 90",
+            "v_min3_i32 v3, v0, v1, v2",
+            "v_mov_b32 v0, v3",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_min3_i32_int", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 10)
+
+    def test_negative_mutation_signed_vs_unsigned(self):
+        # -1 (0xFFFFFFFF) as signed is < 10, but as unsigned is > 10
+        a, b, c = u32(-1), 10, 20
+        signed_min = ref_min3_i32(a, b, c)
+        unsigned_min = min(a, b, c)
+        self.assertEqual(i32(signed_min), -1)
+        self.assertEqual(unsigned_min, 10)
+        self.assertNotEqual(signed_min, unsigned_min)
+
 if __name__ == "__main__":
     unittest.main()
