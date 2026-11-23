@@ -2,7 +2,8 @@
 
     python -I tests/test_psin_psch_rejects.py
 
-Every case changes one thing in a synthetic input that the same test class shows to be accepted.
+The inputs are synthetic. Most cases damage an input the same test class shows to be accepted; the rest are the
+smallest section that reaches the check. The container cases use the builder in tests/test_psin_psch.py.
 """
 import os
 import struct
@@ -19,10 +20,11 @@ from test_psin_psch import build_synthetic_psch_psin  # noqa: E402
 FIRST = 64                                  # the data area is 0x10..0x40
 ROWS = ((0x11, 16, 0, 32), (0x22, 48, 0, 16))
 BLOB = b"PSIN" + struct.pack(">I", FIRST) + b"pppppppp"
+ELEMENT_HASH, ARRAY, ENUM, MAP = 0x100, 0x0D, 0x0E, 0x10    # as docs/psin.md gives them, not read from the tool
 
 
-def pmap(rows=ROWS, root=1, z0=0, count=None, fill=b"pppppp"):
-    head = struct.pack(">IHHH6s", root, 0, z0, len(rows) if count is None else count, fill)
+def pmap(rows=ROWS, root=1, z0=0, count=None, fill=b"pppppp", flags=0):
+    head = struct.pack(">IHHH6s", root, flags, z0, len(rows) if count is None else count, fill)
     return head + b"".join(struct.pack(">4I", *row) for row in rows)
 
 
@@ -48,6 +50,13 @@ def psch(entries, offsets=None, count=None):
     return b"PSCH" + struct.pack(">I", 8 + len(body)) + body
 
 
+def without(blob, tag):
+    """`blob` with the one section called `tag` renamed, so the container lacks it."""
+    if blob.count(tag) != 1:
+        raise AssertionError(f"{tag!r} occurs {blob.count(tag)} times in the fixture")
+    return blob.replace(tag, b"XXXX")
+
+
 class RejectCase(unittest.TestCase):
     def rejects(self, cases, call):
         for label, (reason, *args) in cases.items():
@@ -62,11 +71,14 @@ class PmapTests(RejectCase):
         self.assertTrue(exact["reserved_zero"])
         self.assertEqual([(b["id"], b["hash"], b["offset"], b["length"]) for b in exact["blocks"]],
                          [(1, 0x11, 16, 32), (2, 0x22, 48, 16)])
-        padded = psin_psch.decode_pmap(pmap((ROWS[0], (0x22, 48, 0, 1))), BLOB, FIRST)
-        self.assertFalse(padded["exact_end"])
+        for length in (1, 2, 15):
+            with self.subTest(length=length):
+                padded = psin_psch.decode_pmap(pmap((ROWS[0], (0x22, 48, 0, length))), BLOB, FIRST)
+                self.assertFalse(padded["exact_end"])
         self.assertEqual(psin_psch.decode_pmap(pmap(root=2), BLOB, FIRST)["root_block_id"], 2)
 
-    def test_nonzero_reserved_fields_are_reported_not_refused(self):
+    def test_flags_and_reserved_fields_are_reported_not_refused(self):
+        self.assertEqual(psin_psch.decode_pmap(pmap(flags=0xFFFE), BLOB, FIRST)["flags"], 0xFFFE)
         for payload in (pmap(z0=1), pmap(((0x11, 16, 1, 32), ROWS[1]))):
             self.assertFalse(psin_psch.decode_pmap(payload, BLOB, FIRST)["reserved_zero"])
 
@@ -92,12 +104,13 @@ class PmapTests(RejectCase):
 
 
 class PschTests(RejectCase):
-    GOOD = ((0x11, struct_entry([(0xA1, 7, 0, 0, 0)])), (0x22, enum_entry([(0xB1, 0, -1)])))
+    GOOD = ((0x11, struct_entry([(0xA1, 7, 0, 0, 0)])), (0x22, enum_entry([(0xB1, 0, -2), (0xB2, 0, 3)])))
 
     def test_accepts_structs_enums_and_an_empty_table(self):
         out = psin_psch.decode_psch(psch(self.GOOD))
         self.assertEqual([(s["hash"], s["size"], len(s["members"])) for s in out["structs"]], [(0x11, 16, 1)])
-        self.assertEqual([(e["hash"], e["values"][0]["value"]) for e in out["enums"]], [(0x22, -1)])
+        self.assertEqual([(e["hash"], [(v["hash"], v["value"]) for v in e["values"]]) for e in out["enums"]],
+                         [(0x22, [(0xB1, -2), (0xB2, 3)])])
         self.assertEqual(psin_psch.decode_psch(psch(()))["entry_count"], 0)
 
     def test_rejects(self):
@@ -137,6 +150,9 @@ class PsigStnsTests(RejectCase):
         out = psin_psch.decode_stns(good)
         self.assertEqual(out["blocks"], [{"kind": 0x101, "bytes": 16, "records": 1}])
         self.assertEqual((out["raw_blocks"], out["tail_pad"]), (record, 4))
+        two = psin_psch.decode_stns(struct.pack("<5I", 2, 0x101, 16, 0x102, 240) + record * 16 + bytes(12))
+        self.assertEqual([(b["kind"], b["records"]) for b in two["blocks"]], [(0x101, 1), (0x102, 15)])
+        self.assertEqual((two["records"], two["raw_blocks"], two["tail_pad"]), (16, record * 16, 12))
         self.rejects({
             "short count": ("shorter than 4-byte", b"\0\0\0"),
             "table past the end": ("runs past section end", struct.pack("<3I", 2, 0x101, 16)),
@@ -151,7 +167,7 @@ class PsigStnsTests(RejectCase):
 
 
 class SchemaTests(unittest.TestCase):
-    ELEMENT = (psin_psch.ARRAY_ELEMENT, 7, 0, 0, 0)
+    ELEMENT = (ELEMENT_HASH, 7, 0, 0, 0)
 
     def errors(self, members, size=16, rows=((0x11, 16, 0, 48),)):
         blocks = psin_psch.decode_pmap(pmap(rows), BLOB, FIRST)
@@ -161,13 +177,13 @@ class SchemaTests(unittest.TestCase):
     def test_accepts_resolved_descriptors(self):
         self.assertEqual(self.errors([
             self.ELEMENT,
-            (0xA1, psin_psch.PSCH_TYPE_ARRAY, 0, 0, 0),
-            (0xA2, psin_psch.PSCH_TYPE_ENUM, 0, 8, 0x22),
-            (0xA3, psin_psch.PSCH_TYPE_MAP, 0, 15, 0),
+            (0xA1, ARRAY, 0, 0, 0),
+            (0xA2, ENUM, 0, 8, 0x22),
+            (0xA3, MAP, 0, 15, 0),
         ]), [])
 
     def test_an_element_descriptor_needs_no_offset_inside_the_struct(self):
-        self.assertEqual(self.errors([(psin_psch.ARRAY_ELEMENT, 7, 0, 99, 0)]), [])
+        self.assertEqual(self.errors([(ELEMENT_HASH, 7, 0, 99, 0)]), [])
 
     def test_root_block_without_a_struct(self):
         self.assertEqual(self.errors([], rows=((0x99, 16, 0, 48),)),
@@ -180,15 +196,14 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(self.errors([], size=0), [])
 
     def test_each_bad_member_is_named(self):
-        array, enum, map_ = psin_psch.PSCH_TYPE_ARRAY, psin_psch.PSCH_TYPE_ENUM, psin_psch.PSCH_TYPE_MAP
         for member, want in (
             ((0xA1, 7, 0, 16, 0), ["member 1 offset 16 >= size 16"]),
-            ((0xA1, array, 0, 0, 2), ["array member 1 bad descriptor 2"]),
-            ((0xA1, array, 0, 0, 1), ["array member 1 bad descriptor 1"]),      # itself: not an element
-            ((0xA1, enum, 0, 0, 0x11), ["enum member 1 missing enum 00000011"]),  # a struct's hash
-            ((0xA1, map_, 0, 0, 2), ["map member 1 bad key descriptor 2"]),
-            ((0xA1, map_, 0, 0, 2 << 16), ["map member 1 bad value descriptor 2"]),
-            ((0xA1, map_, 0, 0, 1 << 16 | 1),
+            ((0xA1, ARRAY, 0, 0, 2), ["array member 1 bad descriptor 2"]),
+            ((0xA1, ARRAY, 0, 0, 1), ["array member 1 bad descriptor 1"]),      # itself: not an element
+            ((0xA1, ENUM, 0, 0, 0x11), ["enum member 1 missing enum 00000011"]),  # a struct's hash
+            ((0xA1, MAP, 0, 0, 2), ["map member 1 bad key descriptor 2"]),
+            ((0xA1, MAP, 0, 0, 2 << 16), ["map member 1 bad value descriptor 2"]),
+            ((0xA1, MAP, 0, 0, 1 << 16 | 1),
              ["map member 1 bad key descriptor 1", "map member 1 bad value descriptor 1"]),
         ):
             with self.subTest(member=member):
@@ -198,20 +213,24 @@ class SchemaTests(unittest.TestCase):
 class ContainerTests(RejectCase):
     def test_rejects(self):
         blob = build_synthetic_psch_psin()
-        self.assertTrue(psin_psch.parse_psch_container(blob)["valid"])
+        report = psin_psch.parse_psch_container(blob)
+        self.assertTrue(report["valid"])
+        self.assertEqual(report["member_type_counts"],
+                         {"0x07": 2, "0x0b": 1, "0x0c": 1, "0x0d": 1, "0x0e": 1, "0x10": 1})
         cases = {
             "not PSIN": ("not a PSIN container", b"XXXX" + blob[4:]),
             "truncated": ("incomplete PSIN container", blob[:-1]),
         }
         for tag in ("PMAP", "PSCH", "PSIG", "STNS"):
-            cases[f"no {tag}"] = (f"missing {tag} section", blob.replace(tag.encode("ascii"), b"XXXX"))
+            cases[f"no {tag}"] = (f"missing {tag} section", without(blob, tag.encode("ascii")))
         self.rejects(cases, psin_psch.parse_psch_container)
 
-    def test_only_a_complete_container_with_the_sections_is_recognised(self):
+    def test_a_complete_container_with_pmap_or_psch_is_recognised(self):
         blob = build_synthetic_psch_psin()
         self.assertTrue(psin_psch.is_psch_container(blob))
-        self.assertTrue(psin_psch.is_psch_container(blob.replace(b"PSCH", b"XXXX")))
-        self.assertFalse(psin_psch.is_psch_container(blob.replace(b"PSCH", b"XXXX").replace(b"PMAP", b"XXXX")))
+        self.assertTrue(psin_psch.is_psch_container(without(blob, b"PSCH")))     # either tag is enough
+        self.assertTrue(psin_psch.is_psch_container(without(blob, b"PMAP")))
+        self.assertFalse(psin_psch.is_psch_container(without(without(blob, b"PSCH"), b"PMAP")))
         self.assertFalse(psin_psch.is_psch_container(blob[:-1]))
         self.assertFalse(psin_psch.is_psch_container(b""))
 
@@ -221,9 +240,9 @@ class ContainerTests(RejectCase):
         report = psin_psch.parse_psch_container(bytes(blob))
         self.assertFalse(report["stdn_match"])
         self.assertEqual(report["errors"], ["STDN payload does not match STNS block data prefix"])
-        without = psin_psch.parse_psch_container(build_synthetic_psch_psin(with_stdn=False))
-        self.assertTrue(without["valid"])
-        self.assertIsNone(without["stdn_match"])
+        absent = psin_psch.parse_psch_container(build_synthetic_psch_psin(with_stdn=False))
+        self.assertTrue(absent["valid"])
+        self.assertIsNone(absent["stdn_match"])
 
 
 if __name__ == "__main__":
