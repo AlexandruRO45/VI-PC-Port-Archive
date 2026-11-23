@@ -66,5 +66,53 @@ class RowsTest(unittest.TestCase):
         self.assertEqual("\n".join(lines).count("global_store_b32"), len(rows) + len(p.control_rows()))
 
 
+class _FakeOracle:
+    """A gfx1030 oracle that answers every kernel with `words` (the measured rule: compares ignore OPSEL)."""
+    arch, device = "gfx1030", "fake gfx1030"
+
+    def __init__(self, words):
+        self.words = words
+
+    def run(self, kernels, words=4):
+        return [list(self.words) for _ in kernels]
+
+    def close(self):
+        pass
+
+
+class HardwareResultTest(unittest.TestCase):
+    @staticmethod
+    def clean_words():
+        return ([p.answer(r, False) for r in p.rows()] +
+                [p.control_answer(opsel, True) for _n, opsel in p.control_rows()])
+
+    def run_main(self, words):
+        import contextlib
+        import io
+        from unittest import mock
+        import runner
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["vcmp16_opsel_probe.py", "--oracle", "hw"]), \
+                mock.patch.object(runner, "open_oracle", lambda **kw: _FakeOracle(words)), \
+                contextlib.redirect_stdout(out):
+            rc = p.main()
+        return rc, out.getvalue()
+
+    def test_a_clean_result_passes(self):
+        # Control for the next test: the same words with nothing left unwritten are a pass.
+        rc, out = self.run_main(self.clean_words())
+        self.assertEqual(rc, 0, out[-600:])
+
+    def test_a_word_the_kernel_never_stored_is_a_harness_error_not_a_pass(self):
+        import runner
+        for index in (0, len(p.rows())):            # a compare row, and the first control word
+            with self.subTest(word=index):
+                words = self.clean_words()
+                words[index] = runner.SENTINEL
+                rc, out = self.run_main(words)
+                self.assertEqual(rc, 2, out[-600:])
+                self.assertIn(f"left word {index} unwritten", out)
+
+
 if __name__ == "__main__":
     unittest.main()
