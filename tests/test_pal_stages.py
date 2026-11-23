@@ -191,5 +191,27 @@ class TestCli(unittest.TestCase):
         self.assertEqual(document["blobs"][0]["hardware_stage"], "ngg")
 
 
+    def test_nothing_readable_is_one_error_line_and_exit_2(self):
+        # `0 blobs, errors 1` on its own reads like a successful run, so nothing decoded is a failure.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "not-a-shader.fssm")
+            with open(path, "wb") as f:
+                f.write(b"not a container\n")
+            result = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("ERROR: not-a-shader.fssm:", result.stderr)
+        self.assertIn("0 blobs, errors 1", result.stdout)
+
+    def test_json_with_nothing_readable_also_exits_2(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "not-a-shader.fssm")
+            with open(path, "wb") as f:
+                f.write(b"not a container\n")
+            result = subprocess.run([sys.executable, "-I", TOOL, path, "--json"],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["tally"]["errors"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
