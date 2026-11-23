@@ -1532,9 +1532,98 @@ inline bool copy_subresource(const ResourceBinding& resource, std::uint32_t subr
     return resource.image && subresource != all_subresources && image_range(resource, subresource, out);
 }
 
-// CopyTextureRegion: texture to texture, footprint to texture (upload) or texture to footprint (readback).
+// CopyTextureRegion: texture to texture, footprint to/from texture, or two buffer footprints.
 // Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
 inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
+    if (copy.dst.footprint && copy.src.footprint) {
+        // D3D12 also permits the texture data on BOTH sides to be stored in buffers. Neither
+        // ResourceBinding then has an image format, so the COM boundary retains its footprint
+        // byte/block layout. Each active row becomes a VkBufferCopy; padding between rows/slices
+        // must not be overwritten, even when the two footprints have different row pitches.
+        if (!p.source.buffer || !p.binding.buffer || !copy.src.block_bytes ||
+            copy.src.block_bytes != copy.dst.block_bytes ||
+            copy.src.block_extent != copy.dst.block_extent) return ReplayResult::invalid_copy;
+        const std::uint32_t block = copy.src.block_extent, bytes = copy.src.block_bytes;
+        if (block != 1 && block != 4) return ReplayResult::unsupported;
+        const CopyLocation &src = copy.src, &dst = copy.dst;
+        const CopyBox box = copy.has_box ? copy.box
+            : CopyBox{0, 0, 0, src.width, src.height, src.depth};
+        if (box.right <= box.left || box.bottom <= box.top || box.back <= box.front ||
+            box.right > src.width || box.bottom > src.height || box.back > src.depth)
+            return ReplayResult::invalid_copy;
+        const std::uint32_t width = box.right - box.left, height = box.bottom - box.top;
+        const std::uint32_t depth = box.back - box.front;
+        if (!within(copy.x, width, dst.width) || !within(copy.y, height, dst.height) ||
+            !within(copy.z, depth, dst.depth) ||
+            (box.left | box.top | copy.x | copy.y) % block ||
+            (block > 1 && ((width % block && box.right != src.width && copy.x + width != dst.width) ||
+                           (height % block && box.bottom != src.height && copy.y + height != dst.height))))
+            return ReplayResult::invalid_copy;
+        const std::uint64_t src_rows = (std::uint64_t(src.height) + block - 1) / block;
+        const std::uint64_t dst_rows = (std::uint64_t(dst.height) + block - 1) / block;
+        const std::uint64_t copied_rows = (std::uint64_t(height) + block - 1) / block;
+        const std::uint64_t copied_bytes = (std::uint64_t(width) + block - 1) / block * bytes;
+        if (!src_rows || !dst_rows || !copied_bytes ||
+            std::uint64_t(src.row_pitch) < ((std::uint64_t(src.width) + block - 1) / block) * bytes ||
+            std::uint64_t(dst.row_pitch) < ((std::uint64_t(dst.width) + block - 1) / block) * bytes ||
+            copied_rows > (1u << 20) || depth > (1u << 20) / copied_rows)
+            return ReplayResult::invalid_copy;
+        const std::uint64_t src_slice = src_rows * src.row_pitch, dst_slice = dst_rows * dst.row_pitch;
+        // The final copied row is the greatest accessed address. Check every multiplication
+        // by division before computing offsets so a guest's UINT32 dimensions cannot wrap u64.
+        const auto region = [&](const CopyLocation& loc, const ResourceBinding& binding,
+                                std::uint32_t z, std::uint64_t first_row, std::uint32_t x,
+                                std::uint64_t slice_pitch, std::uint64_t& first,
+                                std::uint64_t& end) {
+            if (binding.buffer_offset > UINT64_MAX - binding.size || loc.offset > binding.size ||
+                z > (binding.size - loc.offset) / slice_pitch) return false;
+            const std::uint64_t slice_start = loc.offset + std::uint64_t(z) * slice_pitch;
+            const std::uint64_t last_row = first_row + copied_rows - 1;
+            const std::uint64_t last_column = std::uint64_t(x / block) * bytes;
+            const std::uint64_t remaining = binding.size - slice_start;
+            if (last_row > remaining / loc.row_pitch ||
+                last_column > remaining - last_row * loc.row_pitch ||
+                copied_bytes > remaining - last_row * loc.row_pitch - last_column)
+                return false;
+            const std::uint64_t offset = slice_start + first_row * loc.row_pitch + last_column;
+            const std::uint64_t last = slice_start + last_row * loc.row_pitch + last_column + copied_bytes;
+            first = binding.buffer_offset + offset;
+            end = binding.buffer_offset + last;
+            return true;
+        };
+        std::uint64_t source_begin = 0, source_end_first = 0, dest_begin = 0, dest_end_first = 0;
+        if (!region(src, p.source, box.front, box.top / block, box.left, src_slice,
+                    source_begin, source_end_first) ||
+            !region(dst, p.binding, copy.z, copy.y / block, copy.x, dst_slice,
+                    dest_begin, dest_end_first))
+            return ReplayResult::invalid_copy;
+        // Reserve the exact number of disjoint copies and ensure all later slices fit before
+        // generating any commands (prepare is transactional; emit never sees a partial list).
+        std::uint64_t ignored_first = 0, final_source = 0, final_destination = 0;
+        if (!region(src, p.source, box.front + depth - 1, box.top / block, box.left,
+                    src_slice, ignored_first, final_source) ||
+            !region(dst, p.binding, copy.z + depth - 1, copy.y / block, copy.x,
+                    dst_slice, ignored_first, final_destination)) return ReplayResult::invalid_copy;
+        // A single vkCmdCopyBuffer cannot read and write overlapping bytes of the same VkBuffer,
+        // including two distinct D3D12 resources backed by overlapping arena allocations.
+        if (p.source.buffer == p.binding.buffer && source_begin < final_destination &&
+            dest_begin < final_source) return ReplayResult::invalid_copy;
+        p.buffer_copies.reserve(std::size_t(copied_rows) * depth);
+        for (std::uint32_t z = 0; z < depth; ++z) {
+            const VkDeviceSize source_slice = p.source.buffer_offset + src.offset +
+                std::uint64_t(box.front + z) * src_slice +
+                std::uint64_t(box.top / block) * src.row_pitch +
+                std::uint64_t(box.left / block) * bytes;
+            const VkDeviceSize dest_slice = p.binding.buffer_offset + dst.offset +
+                std::uint64_t(copy.z + z) * dst_slice +
+                std::uint64_t(copy.y / block) * dst.row_pitch +
+                std::uint64_t(copy.x / block) * bytes;
+            for (std::uint64_t row = 0; row < copied_rows; ++row)
+                p.buffer_copies.push_back({source_slice + row * src.row_pitch,
+                                           dest_slice + row * dst.row_pitch, copied_bytes});
+        }
+        return ReplayResult::success;
+    }
     if (!copy.dst.footprint && !copy.src.footprint) {
         VkImageSubresourceRange dst{}, src{};
         if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||

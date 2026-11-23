@@ -499,6 +499,33 @@ public:
         if (!dst || !src) return check(false);
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
+        if (copy.src.footprint && copy.dst.footprint) {
+            // For two buffer resources there is no image format in the replay resolver. Obtain
+            // the byte/block layout from the same D3D12 device that validates texture footprints.
+            // A synthetic 8x8 probe distinguishes ordinary texels (8 rows) from BC 4x4 blocks
+            // (2 rows), and covers 96-bit RGB and uncommon packed formats without a second map.
+            if (footprint_family(src->PlacedFootprint.Footprint.Format) !=
+                footprint_family(dst->PlacedFootprint.Footprint.Format))
+                return check(false);
+            D3D12_RESOURCE_DESC texture{};
+            texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            texture.Width = 8;
+            texture.Height = 8;
+            texture.DepthOrArraySize = texture.MipLevels = 1;
+            texture.Format = src->PlacedFootprint.Footprint.Format;
+            texture.SampleDesc.Count = 1;
+            ID3D12Device* device = nullptr;
+            if (FAILED(GetDevice(IID_PPV_ARGS(&device)))) return check(false);
+            UINT rows = 0;
+            UINT64 row_bytes = 0;
+            device->GetCopyableFootprints(&texture, 0, 1, 0, nullptr, &rows, &row_bytes, nullptr);
+            device->Release();
+            const UINT block = rows == 2 ? 4 : rows == 8 ? 1 : 0;
+            if (!block || !row_bytes || row_bytes == UINT64_MAX || row_bytes % (8 / block) ||
+                row_bytes / (8 / block) > UINT32_MAX) return check(false);
+            copy.src.block_bytes = copy.dst.block_bytes = UINT(row_bytes / (8 / block));
+            copy.src.block_extent = copy.dst.block_extent = block;
+        }
         check(list_.copy_texture(copy));
     }
 
@@ -793,6 +820,54 @@ public:
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
+    // Compatible DXGI formats share the same typeless family, even when one copy footprint is
+    // named with the typeless member and the other with a typed member. Refusing those copies
+    // breaks valid D3D12 buffer-to-buffer paths (measured on WARP with RGBA8 TYPELESS->UNORM).
+    static DXGI_FORMAT footprint_family(DXGI_FORMAT format) {
+        const UINT f = static_cast<UINT>(format);
+        const auto member = [&](DXGI_FORMAT first, DXGI_FORMAT last) {
+            return f >= static_cast<UINT>(first) && f <= static_cast<UINT>(last);
+        };
+        if (member(DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32A32_SINT))
+            return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+        if (member(DXGI_FORMAT_R32G32B32_TYPELESS, DXGI_FORMAT_R32G32B32_SINT))
+            return DXGI_FORMAT_R32G32B32_TYPELESS;
+        if (member(DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_SINT))
+            return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+        if (member(DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G32_SINT))
+            return DXGI_FORMAT_R32G32_TYPELESS;
+        if (member(DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT))
+            return DXGI_FORMAT_R32G8X24_TYPELESS;
+        if (member(DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UINT))
+            return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+        if (member(DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_SINT))
+            return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        if (member(DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_SINT))
+            return DXGI_FORMAT_R16G16_TYPELESS;
+        if (member(DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_SINT))
+            return DXGI_FORMAT_R32_TYPELESS;
+        if (member(DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT))
+            return DXGI_FORMAT_R24G8_TYPELESS;
+        if (member(DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_SINT))
+            return DXGI_FORMAT_R8G8_TYPELESS;
+        if (member(DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_SINT))
+            return DXGI_FORMAT_R16_TYPELESS;
+        if (member(DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_SINT))
+            return DXGI_FORMAT_R8_TYPELESS;
+        if (member(DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM_SRGB)) return DXGI_FORMAT_BC1_TYPELESS;
+        if (member(DXGI_FORMAT_BC2_TYPELESS, DXGI_FORMAT_BC2_UNORM_SRGB)) return DXGI_FORMAT_BC2_TYPELESS;
+        if (member(DXGI_FORMAT_BC3_TYPELESS, DXGI_FORMAT_BC3_UNORM_SRGB)) return DXGI_FORMAT_BC3_TYPELESS;
+        if (member(DXGI_FORMAT_BC4_TYPELESS, DXGI_FORMAT_BC4_SNORM)) return DXGI_FORMAT_BC4_TYPELESS;
+        if (member(DXGI_FORMAT_BC5_TYPELESS, DXGI_FORMAT_BC5_SNORM)) return DXGI_FORMAT_BC5_TYPELESS;
+        if (member(DXGI_FORMAT_BC6H_TYPELESS, DXGI_FORMAT_BC6H_SF16)) return DXGI_FORMAT_BC6H_TYPELESS;
+        if (member(DXGI_FORMAT_BC7_TYPELESS, DXGI_FORMAT_BC7_UNORM_SRGB)) return DXGI_FORMAT_BC7_TYPELESS;
+        if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+            format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        if (format == DXGI_FORMAT_B8G8R8X8_UNORM || format == DXGI_FORMAT_B8G8R8X8_TYPELESS ||
+            format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB) return DXGI_FORMAT_B8G8R8X8_TYPELESS;
+        return format;
+    }
+
     template<class E>
     static std::uint32_t u(E value) {
         return static_cast<std::uint32_t>(value);

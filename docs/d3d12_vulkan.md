@@ -185,6 +185,14 @@ What is implemented (all of it testable without the game):
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
+  `CopyTextureRegion` may also name **two buffer-backed placed footprints** (no image on either side).
+  The COM layer determines the format's block size from its D3D12 device; replay checks row and
+  slice bounds and maps each active row to `VkBufferCopy` between the two buffers, leaving each
+  footprint's padding untouched. Matching members of a DXGI typeless family have the same block
+  layout. Source/destination overlaps in one Vulkan buffer remain invalid rather than issuing
+  an overlapping `vkCmdCopyBuffer`. The synthetic `d3d12_footprint_buffer_copy_test` compares
+  seven native WARP and Vulkan readbacks, including BC1, RGB96 and 3D boxed slices, with every
+  byte of the destination footprint and its padding checked.
   Whole-resource depth/stencil copies issue one `vkCmdCopyImage` per aspect, with a transfer write-to-read/write
   dependency between them; all mips and layers stay batched within each aspect. This avoids stencil corruption
   observed on RX 5700 XT, Windows driver 32.0.21045.5002, when both aspects share one multi-region copy command.

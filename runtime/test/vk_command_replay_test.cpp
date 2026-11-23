@@ -389,6 +389,34 @@ int part_c(vktest::Device& d) {
     const auto slices = [&](ResourceId id, VkDeviceSize offset, std::uint32_t depth) {
         return CopyLocation{id, true, 0, offset, size, size, depth, pitch};
     };
+    // Buffer-backed footprints have no VkImage format. The COM boundary records their byte/block
+    // sizes, and replay must form exact active-row VkBufferCopy regions without copying padding.
+    {
+        detail::Prepared prepared{};
+        prepared.source = bindings.at(up_id);
+        prepared.binding = bindings.at(down_id);
+        const CopyLocation from{up_id, true, 0, 0, 4, 4, 1, 256, 4, 1};
+        const CopyLocation to{down_id, true, 0, 512, 4, 4, 1, 512, 4, 1};
+        EXPECT(detail::prepare_texture_copy({to, 1, 1, 0, from, true, {1, 1, 0, 3, 3, 1}}, prepared) ==
+               ReplayResult::success);
+        EXPECT(prepared.buffer_copies.size() == 2);
+        EXPECT(prepared.buffer_copies[0].srcOffset == 260 && prepared.buffer_copies[0].dstOffset == 1028 &&
+               prepared.buffer_copies[0].size == 8);
+        EXPECT(prepared.buffer_copies[1].srcOffset == 516 && prepared.buffer_copies[1].dstOffset == 1540 &&
+               prepared.buffer_copies[1].size == 8);
+        prepared = {};
+        prepared.source = bindings.at(up_id);
+        prepared.binding = bindings.at(down_id);
+        CopyLocation outside = to;
+        outside.offset = prepared.binding.size - 512;
+        EXPECT(detail::prepare_texture_copy({outside, 0, 0, 0, from, false, {}}, prepared) ==
+               ReplayResult::invalid_copy);
+        prepared = {};
+        prepared.source = bindings.at(up_id);
+        prepared.binding = bindings.at(up_id);
+        EXPECT(detail::prepare_texture_copy({from, 0, 0, 0, from, false, {}}, prepared) ==
+               ReplayResult::invalid_copy);  // VkBufferCopy cannot overlap itself
+    }
     CommandList list;
     EXPECT(list.copy_texture({sub(volume_id), 0, 0, 0, slices(up_id, up_at, size), false, {}}));  // four slices up
     EXPECT(list.transition({volume_id, 0, s::copy_dest, s::copy_source}));

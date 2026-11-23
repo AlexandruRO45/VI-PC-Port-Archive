@@ -113,7 +113,7 @@ int main() {
     const CopyLocation placed{4, true, 0, 512, 8, 8, 1, 256};
     CHECK(list.copy_texture({texture, 0, 0, 0, placed, false, {}}));
     CHECK(list.copy_texture({placed, 0, 0, 0, texture, true, {2, 2, 0, 6, 6, 1}}));
-    CHECK(!list.copy_texture({placed, 0, 0, 0, placed, false, {}}));                 // footprint to footprint
+    CHECK(!list.copy_texture({placed, 0, 0, 0, placed, false, {}}));                 // missing footprint format metadata
     CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 100, 8, 8, 1, 256}, false, {}}));  // offset not 512
     CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 512, 8, 8, 1, 100}, false, {}}));  // pitch not 256
     CHECK(!list.copy_texture({texture, 0, 0, 0, texture, true, {2, 2, 0, 2, 6, 1}}));          // empty box
@@ -138,6 +138,17 @@ int main() {
     CHECK(slices.z == 2 && slices.src.depth == 4 && slices.box.front == 1 && slices.box.back == 3);
     const auto& resolved = std::get<ResolveSubresource>(list.commands()[5]);
     CHECK(resolved.dst == 7 && resolved.dst_subresource == 1 && resolved.src == 8 && resolved.src_subresource == 0);
+
+    // Two placed footprints are a valid D3D12 buffer-to-buffer texture-region copy. The COM
+    // boundary supplies their block layout; reject incomplete metadata, but record valid input.
+    CHECK(list.reset());
+    const CopyLocation buffer_source{4, true, 0, 0, 8, 8, 1, 256, 4, 1};
+    const CopyLocation buffer_dest{5, true, 0, 512, 8, 8, 1, 512, 4, 1};
+    CHECK(list.copy_texture({buffer_dest, 1, 2, 0, buffer_source, true, {2, 3, 0, 6, 7, 1}}));
+    CHECK(list.close() && list.commands().size() == 1);
+    const auto& footprint_copy = std::get<CopyTexture>(list.commands()[0]);
+    CHECK(footprint_copy.src.block_bytes == 4 && footprint_copy.dst.block_bytes == 4 &&
+          footprint_copy.dst.row_pitch == 512 && footprint_copy.box.left == 2 && footprint_copy.y == 2);
 
     // Dispatches keep the user data they were recorded with; no pipeline is refused, no groups records nothing.
     CHECK(list.reset());

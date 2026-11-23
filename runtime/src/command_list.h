@@ -296,7 +296,8 @@ struct CopyBuffer {
 };
 
 // D3D12_TEXTURE_COPY_LOCATION: a texture subresource, or a placed footprint in a buffer. The footprint's format is
-// not kept: the copy uses the texture's own format for the plane, which D3D12 requires to be compatible.
+// not kept for image copies: the copy uses the texture's own format for the plane. Buffer-to-buffer
+// copies need the placed footprint's own byte/block layout because neither side has an image format.
 struct CopyLocation {
     ResourceId resource;
     bool footprint;
@@ -306,6 +307,8 @@ struct CopyLocation {
     std::uint32_t height;
     std::uint32_t depth;
     std::uint32_t row_pitch;
+    std::uint32_t block_bytes = 0; // two buffer footprints only; bytes per texel or BC block
+    std::uint32_t block_extent = 1;
 };
 
 // D3D12_BOX: right, bottom and back are exclusive.
@@ -680,7 +683,10 @@ public:
     }
 
     bool copy_texture(const CopyTexture& copy) {
-        if (!valid(copy.dst) || !valid(copy.src) || (copy.dst.footprint && copy.src.footprint)) return false;
+        if (!valid(copy.dst) || !valid(copy.src)) return false;
+        if (copy.dst.footprint && copy.src.footprint &&
+            (!copy.dst.block_bytes || copy.dst.block_bytes != copy.src.block_bytes ||
+             copy.dst.block_extent != copy.src.block_extent)) return false;
         if (copy.has_box && (copy.box.right <= copy.box.left || copy.box.bottom <= copy.box.top ||
                              copy.box.back <= copy.box.front))
             return false;
