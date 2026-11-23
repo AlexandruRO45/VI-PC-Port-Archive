@@ -11,6 +11,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -214,6 +215,25 @@ def payload(structure):
     return bytes(prefix) + structure
 
 
+class RecordingPool:
+    """Stands in for multiprocessing.Pool: records its size, runs the work in this process."""
+    sizes = []
+
+    def __init__(self, workers, initializer=None):
+        RecordingPool.sizes.append(workers)
+        if initializer is not None:
+            initializer()
+
+    def imap_unordered(self, func, jobs):
+        return map(func, jobs)
+
+    def close(self):
+        pass
+
+    def join(self):
+        pass
+
+
 class TestArchive(unittest.TestCase):
     def write_rpf(self, streams):
         body = b"".join(zlib.compress(s) + bytes(16) for s in streams)
@@ -269,6 +289,16 @@ class TestArchive(unittest.TestCase):
         self.assertEqual(w_before_bad.checked, 0)
         w_bad = C.scan_window((path, next_boundary, next_boundary + window))
         self.assertEqual((w_bad.checked, w_bad.passed), (1, 0))
+    def test_workers_above_the_pool_limit_are_capped(self):
+        # 62 workers never return from multiprocessing.Pool on Windows (tools/pool_workers.py:4-7).
+        path = self.write_rpf([payload(build())])
+        RecordingPool.sizes = []
+        self.addCleanup(setattr, RecordingPool, "sizes", [])
+        with unittest.mock.patch.object(C.pool_workers, "MAX_PROCESS_WORKERS", 61), \
+                unittest.mock.patch.object(C.multiprocessing, "Pool", RecordingPool):
+            tally, _ = C.scan_archive(path, 62, 64, progress=False)
+        self.assertEqual(RecordingPool.sizes, [61])
+        self.assertEqual(tally.checked, 1)
 
     def test_cli_json_and_exit_status(self):
         with tempfile.TemporaryDirectory() as d:
