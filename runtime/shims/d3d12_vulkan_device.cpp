@@ -1164,7 +1164,7 @@ struct DeviceState {
         const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
                                         image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
                                         image.type == g::ImageType::image_3d;
-        if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        if (!storage && supports_lod_clamp) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
             clamp.minLod = g::image_min_lod(words);
             if (clamp.minLod > float(image.first_mip + image.mip_count - 1)) {
