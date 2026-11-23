@@ -505,6 +505,30 @@ int main() {
         return fail("queue/alloc/cl/fence");
     cl->Close();
 
+    // Exercise resize flags before the host comparison, which may stop early under Wine.
+    {
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        desc.Width = 128;
+        desc.Height = 128;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+        IDXGISwapChain1* chain = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &desc, nullptr, nullptr, &chain)))
+            return fail("CreateSwapChainForHwnd for resize flags");
+        for (const UINT flags : {static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH), 0u}) {
+            if (FAILED(chain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, flags)))
+                return fail("ResizeBuffers flags");
+            DXGI_SWAP_CHAIN_DESC1 actual{};
+            if (FAILED(chain->GetDesc1(&actual)) || actual.Flags != flags)
+                return fail("ResizeBuffers should replace swap chain flags");
+        }
+        chain->Release();
+    }
+
     // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.
     const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
     if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");

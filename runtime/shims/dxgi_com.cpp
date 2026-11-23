@@ -372,15 +372,15 @@ public:
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
-        const UINT next_flags = flags ? flags : flags_;
-        const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+        const bool allow_tearing = (flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
         source_size_ = {w, h};  // host-measured: ResizeBuffers resets the source region to the new back buffers
         statistics_disjoint_.store(true, std::memory_order_relaxed);
-        flags_ = next_flags;
         register_buffers();
         std::uint32_t next = 0;
-        return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
+        if (!swapchain_.acquire_next_image(next)) return E_FAIL;
+        flags_ = flags;
+        return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* mode) override {
