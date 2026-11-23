@@ -93,6 +93,7 @@ class ShaderStageResumeTest(unittest.TestCase):
                 json.dump([{"file": "s0.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "s0"}], f)
+                self.touch(self.dxbc, "fssm", "s0.fssm")
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 
@@ -220,6 +221,8 @@ class ShaderStageResumeTest(unittest.TestCase):
             json.dump([{"file": name + ".dxbc"} for name in ("s0", "s1", "unsupported")], f)
         with open(os.path.join(self.dxbc, "fssm_index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump([{"name": name} for name in ("s0", "s1", "unsupported")], f)
+        for name in ("s1", "unsupported"):
+            self.touch(self.dxbc, "fssm", name + ".fssm")
 
         original = self.fake_py
 
@@ -284,6 +287,16 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.run_stage()
         os.remove(os.path.join(self.dxbc, "fssm_index.json"))
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
+
+    def test_missing_native_shader_invalidates_a_finished_unpack(self):
+        self.run_stage()
+        native = os.path.join(self.dxbc, "fssm", "s0.fssm")
+        os.remove(native)
+
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
+        self.assertTrue(os.path.isfile(native))
+        self.assertEqual(self.run_stage(), [])
 
     def test_old_unpack_index_with_a_noncurrent_shader_is_refreshed(self):
         self.run_stage()

@@ -135,6 +135,8 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
                                   ("fssm_index.json", [{"name": "shader"}])):
                 with open(os.path.join(dxbc, name), "w", encoding="utf-8") as f:
                     json.dump(entries, f)
+            os.makedirs(os.path.join(dxbc, "fssm"))
+            open(os.path.join(dxbc, "fssm", "shader.fssm"), "wb").close()
             plan = os.path.join(spirv, make_game.SHARD_PLAN)
             with open(plan, "w", encoding="utf-8") as f:
                 json.dump({"jobs": 2, "wave64_emulate": False, "translator": "d1"}, f)

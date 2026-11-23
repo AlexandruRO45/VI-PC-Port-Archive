@@ -126,6 +126,7 @@ class RecordedFlagsTest(unittest.TestCase):
                 json.dump([{"file": "shader.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "shader"}], f)
+                self.touch(self.dxbc, "fssm", "shader.fssm")
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 

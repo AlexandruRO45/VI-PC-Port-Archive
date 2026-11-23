@@ -502,6 +502,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 files = {
                     "dxbc/index.json": '[{"file": "shader.dxbc"}]',
                     "dxbc/fssm_index.json": '[{"name": "shader"}]',
+                    "dxbc/fssm/shader.fssm": "",
                     "dxbc/disasm.done": "test llvm-mc 21",
                     "spirv/index.json": "{}",
                     "spirv/translation_sources.sha256": fingerprint,

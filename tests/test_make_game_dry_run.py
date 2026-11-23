@@ -396,6 +396,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             f.write('[{"file": "shader.dxbc"}]')
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
             f.write('[{"name": "shader"}]')
+        Path(dxbc_dir, "fssm").mkdir()
+        Path(dxbc_dir, "fssm", "shader.fssm").touch()
         with open(os.path.join(dxbc_dir, "disasm", "shader.s"), "w", encoding="utf-8", newline="\n") as f:
             f.write("synthetic listing\n")
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
@@ -438,6 +440,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             elif tool == "fssm_unpack.py":
                 with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
                     f.write('[{"name": "shader"}]')
+                Path(dxbc_dir, "fssm").mkdir(exist_ok=True)
+                Path(dxbc_dir, "fssm", "shader.fssm").touch()
             elif tool == "shader_disasm.py":
                 disasm = os.path.join(dxbc_dir, "disasm")
                 os.makedirs(disasm, exist_ok=True)

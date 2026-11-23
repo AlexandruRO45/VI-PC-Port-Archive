@@ -862,13 +862,16 @@ def llvm_mc_signature() -> str:
 
 
 def unpacked_shader_stems(dxbc: str) -> set[str] | None:
-    """Return current unpacked names, allowing the unpacker to skip non-FSSM containers."""
+    """Return current unpacked names when every indexed native shader still exists."""
     try:
         carved = shader_stems(os.path.join(dxbc, "index.json"), "file", ".dxbc")
         unpacked = shader_stems(os.path.join(dxbc, "fssm_index.json"), "name")
     except (OSError, ValueError):
         return None
-    return unpacked if unpacked and unpacked <= carved else None
+    if not unpacked or not unpacked <= carved:
+        return None
+    native = os.path.join(dxbc, "fssm")
+    return unpacked if all(os.path.isfile(os.path.join(native, name + ".fssm")) for name in unpacked) else None
 
 
 def disassembly_listings(dxbc: str) -> set[str] | None:
