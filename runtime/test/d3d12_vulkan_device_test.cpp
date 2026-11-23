@@ -3916,6 +3916,19 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
          }},
+        // 0xFFFFFFFF descriptors in a CPU-only heap: far past what the process can allocate, E_OUTOFMEMORY on the host
+        // runtime. The layer keeps these heaps in host memory, so the allocation must fail with that HRESULT, not
+        // throw std::bad_alloc out of CreateDescriptorHeap. (A CPU-only sampler heap of that size is left out: the
+        // host answered E_OUTOFMEMORY in one run and S_OK in the next on an RX 9060 XT.)
+        {"descriptor heap: 0xFFFFFFFF RTV", [](ID3D12Device* d) {
+             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 0xFFFFFFFFu});
+         }},
+        {"descriptor heap: 0xFFFFFFFF DSV", [](ID3D12Device* d) {
+             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 0xFFFFFFFFu});
+         }},
+        {"descriptor heap: 0xFFFFFFFF CBV/SRV/UAV", [](ID3D12Device* d) {
+             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0xFFFFFFFFu});
+         }},
         // CreateCommandQueue.
         {"command queue: null description", [](ID3D12Device* d) {
              void* out = nullptr;

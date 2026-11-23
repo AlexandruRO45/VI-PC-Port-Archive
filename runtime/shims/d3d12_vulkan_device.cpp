@@ -49,6 +49,7 @@
 #include <map>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <set>
 #include <string>
@@ -1661,7 +1662,13 @@ public:
             cpu_ = device.arena.mapped + arena_offset_;
             std::memset(cpu_, 0, std::size_t(bytes));
         } else {
-            storage_.reset(new std::byte[std::size_t(bytes)]());
+            // A heap the process cannot allocate is E_OUTOFMEMORY, as on the host runtime, not a std::bad_alloc.
+            storage_.reset(new (std::nothrow) std::byte[std::size_t(bytes)]());
+            if (!storage_) {
+                log_once("descriptor heap too large for host memory; descriptors:", int(std::min<UINT>(
+                                                                                        desc.NumDescriptors, INT_MAX)));
+                return;
+            }
             cpu_ = reinterpret_cast<std::uint8_t*>(storage_.get());
         }
     }
