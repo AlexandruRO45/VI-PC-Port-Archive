@@ -336,3 +336,104 @@ class TestDsMinU32ScalarInterpreter(unittest.TestCase):
         rtns, fin = L.run_chain(ops, {0x40: 100})
         self.assertEqual(rtns, [100, 0xDEAD, 20])
         self.assertEqual(fin, {0x40: 20})
+
+
+# -----------------------------------------------------------------------------
+# Part 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# -----------------------------------------------------------------------------
+
+class SIMDLDSWavefrontInterpreter:
+    """Wavefront interpreter modeling multi-lane divergence and lane masking."""
+
+    def __init__(self, wave_size: int = 32, lds: LDSModel32 | None = None):
+        assert wave_size in (32, 64)
+        self.wave_size = wave_size
+        self.lds = lds or LDSModel32()
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.lane_vgprs: list[dict[int, int]] = [{} for _ in range(wave_size)]
+
+    def set_lane_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.lane_vgprs[lane][reg] = val & MASK32
+
+    def get_lane_vgpr(self, lane: int, reg: int) -> int:
+        return self.lane_vgprs[lane].get(reg, 0)
+
+    def execute(self, inst: DsInstruction, arbitration_order: list[int] | None = None) -> None:
+        order = arbitration_order or list(range(self.wave_size))
+        for lane in order:
+            if not ((self.exec_mask >> lane) & 1):
+                continue
+            vaddr = self.get_lane_vgpr(lane, inst.vaddr.index)
+            vdata0 = self.get_lane_vgpr(lane, inst.vdata0.index)
+            old_val = self.lds.ds_min_u32(vaddr, vdata0, inst.offset)
+            if inst.opcode == DsOpcode.DS_MIN_RTN_U32:
+                assert inst.vdst is not None
+                self.set_lane_vgpr(lane, inst.vdst.index, old_val)
+
+
+class TestDsMinU32SIMDMultiLane(unittest.TestCase):
+    """Test suite verifying SIMD divergence, Wave32/Wave64 EXEC masking, and lane contention."""
+
+    def test_wave32_divergence_even_lanes(self):
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32)
+        simd.exec_mask = 0x55555555  # Even lanes active (0, 2, 4...)
+        simd.lds.write_dword(0x10, 1000)
+
+        for lane in range(32):
+            simd.set_lane_vgpr(lane, 0, 0x10)
+            simd.set_lane_vgpr(lane, 1, 100 + lane)
+
+        inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.execute(inst)
+
+        # Min among even lanes: lane 0 provided 100, which is min
+        self.assertEqual(simd.lds.read_dword(0x10), 100)
+
+    def test_wave64_exec_masking(self):
+        simd = SIMDLDSWavefrontInterpreter(wave_size=64)
+        simd.exec_mask = 0x00000000FFFFFFFF  # Low 32 lanes active, high 32 masked off
+        simd.lds.write_dword(0x20, 1000)
+
+        for lane in range(64):
+            simd.set_lane_vgpr(lane, 0, 0x20)
+            # High lanes have smaller values, but are masked off!
+            simd.set_lane_vgpr(lane, 1, 500 if lane < 32 else 5)
+
+        inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.execute(inst)
+
+        self.assertEqual(simd.lds.read_dword(0x20), 500)
+
+    def test_lane_contention_commutativity_and_associativity(self):
+        """Atomic unsigned minimum is commutative: any arbitration order converges to the same result."""
+        values = [random.randint(10, 5000) for _ in range(32)]
+        expected_min = min(values)
+
+        for trial in range(5):
+            order = list(range(32))
+            random.shuffle(order)
+
+            simd = SIMDLDSWavefrontInterpreter(wave_size=32)
+            simd.lds.write_dword(0x30, 0xFFFFFFFF)
+            for lane in range(32):
+                simd.set_lane_vgpr(lane, 0, 0x30)
+                simd.set_lane_vgpr(lane, 1, values[lane])
+
+            inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+            simd.execute(inst, arbitration_order=order)
+            self.assertEqual(simd.lds.read_dword(0x30), expected_min)
+
+    def test_multi_bank_parallel_updates(self):
+        """Lanes write to 32 distinct LDS banks simultaneously."""
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32)
+        for lane in range(32):
+            addr = lane * 4
+            simd.lds.write_dword(addr, 200 + lane)
+            simd.set_lane_vgpr(lane, 0, addr)
+            simd.set_lane_vgpr(lane, 1, 50 + lane)
+
+        inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.execute(inst)
+
+        for lane in range(32):
+            self.assertEqual(simd.lds.read_dword(lane * 4), 50 + lane)
