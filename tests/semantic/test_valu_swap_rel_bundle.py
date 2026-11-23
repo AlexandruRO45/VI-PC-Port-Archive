@@ -152,6 +152,20 @@ class TestSwapRelOracle(unittest.TestCase):
         self.assertIn("OpSelect", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSwapRelAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        vgprs = {4: 100, 8: 200}
+        m0 = (4 << 16) | 4
+        out = model_swaprel(0, 4, m0, vgprs)
+        self.assertEqual(out[4], 200)
+        self.assertEqual(out[8], 100)
+
+    def test_translator_swaprel_ast(self):
+        prog = ["s_mov_b32 m0, 0x00040004", "v_mov_b32_e32 v4, 100", "v_mov_b32_e32 v8, 200", "v_swaprel_b32 v0, v4", "s_endpgm"]
+        spv = support.translate_lines("cs_swaprel_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpShiftRightLogical", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
