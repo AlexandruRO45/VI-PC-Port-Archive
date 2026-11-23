@@ -361,5 +361,29 @@ int main() {
     CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0x1080}}));
     CHECK(list.close());
     CHECK(list.commands().size() == 7);
+
+    // BUILD-1403: mesh draws with zero Z (first == 0) must not be recorded through either Draw overload.
+    CHECK(list.reset());
+    Draw mesh_draw{};
+    mesh_draw.pipeline = 1;
+    mesh_draw.mesh = true;
+    mesh_draw.count = 4;      // X
+    mesh_draw.instances = 4;  // Y
+    mesh_draw.first = 0;      // Z = 0 (empty grid)
+    CHECK(list.draw(mesh_draw));             // const Draw& overload: returns !closed_, does not record
+    CHECK(list.commands().empty());
+    CHECK(list.draw(std::move(mesh_draw)));  // Draw&& rvalue overload: must also drop zero-Z mesh draw
+    CHECK(list.commands().empty());
+
+    // Valid mesh draw (non-zero X, Y, Z) is recorded
+    Draw valid_mesh{};
+    valid_mesh.pipeline = 1;
+    valid_mesh.mesh = true;
+    valid_mesh.count = 4;
+    valid_mesh.instances = 4;
+    valid_mesh.first = 1;     // Z = 1
+    CHECK(list.draw(std::move(valid_mesh)));
+    CHECK(list.commands().size() == 1);
+
     return 0;
 }
