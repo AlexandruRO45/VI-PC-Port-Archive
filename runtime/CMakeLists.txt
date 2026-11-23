@@ -1015,7 +1015,27 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # vk_pipeline_check creates pipelines on the main thread and on std::thread workers. A big translated mesh or
+  # structured compute shader makes the AMD Windows driver's shader compiler recurse deeply on the calling
+  # thread (#4816: 26 mesh modules overflow 1 MB, 0xC00000FD). Windows gives every thread the PE
+  # SizeOfStackReserve (1 MB by default), so one linker setting covers main and all workers. 8 MB leaves margin
+  # over the 2 MB that fixes the mesh case and the 4 MB the deeper structured-control-flow trees need; a
+  # reserve only takes address space, committed memory grows on use. Other platforms size thread stacks
+  # themselves.
+  set(LEONIDA_VK_PIPELINE_CHECK_STACK 8388608)
+  if(MSVC)
+    target_link_options(vk_pipeline_check PRIVATE "/STACK:${LEONIDA_VK_PIPELINE_CHECK_STACK}")
+  elseif(MINGW)
+    target_link_options(vk_pipeline_check PRIVATE "-Wl,--stack,${LEONIDA_VK_PIPELINE_CHECK_STACK}")
+  endif()
   if(BUILD_TESTING)
+    if(WIN32)
+      # Reads SizeOfStackReserve from the built .exe; no GPU needed.
+      add_test(NAME vk_pipeline_check_stack COMMAND "${CMAKE_COMMAND}"
+               "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
+               "-DMIN_STACK=${LEONIDA_VK_PIPELINE_CHECK_STACK}"
+               -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pe_stack_reserve.cmake")
+    endif()
     add_test(NAME vk_pipeline_check_cli COMMAND "${CMAKE_COMMAND}"
              "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
