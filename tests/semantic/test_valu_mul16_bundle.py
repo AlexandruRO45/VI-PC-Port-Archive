@@ -157,5 +157,18 @@ class VMulLoU16TranslatorIntegrationTests(unittest.TestCase):
         res_add = u16(a + b)
         self.assertNotEqual(res_mul, res_add)
 
+class VMadI16OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_mad_i16."""
+
+    def test_basic_signed_mad(self):
+        # 10 * 20 + 5 = 205
+        self.assertEqual(ref_mad_i16(10, 20, 5), 205)
+
+    def test_negative_operands(self):
+        # -2 * 10 + 5 = -15 = 0xFFF1
+        self.assertEqual(ref_mad_i16(u16(-2), 10, 5), 0xFFF1)
+        # -5 * -4 + (-10) = 20 - 10 = 10
+        self.assertEqual(ref_mad_i16(u16(-5), u16(-4), u16(-10)), 10)
+
 if __name__ == "__main__":
     unittest.main()
