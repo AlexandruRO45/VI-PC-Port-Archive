@@ -25,8 +25,8 @@
 // On 1.0.2.1 steps 1-5 work. In step 6 the measured Xbox backend descriptor (type 0x01000002, device at +0x10, see
 // docs/d3d12_vulkan.md Appendix A.3) gets the DLL into its D3D12 backend: it creates descriptor heaps, views and
 // resources through the proxy. On an RTX 2000 Ada (driver 597.06) it then stops at its HRESULT check, because the
-// driver refuses one of its textures (DXGI_FORMAT_R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS); on WARP the
-// context is created as is. The other backend ids are controls: they end in FFX_API_RETURN_ERROR before the device
+// driver refuses one of its textures (DXGI_FORMAT_R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS); Windows 11's WARP
+// creates the context as is. The other backend ids are controls: they end in FFX_API_RETURN_ERROR before the device
 // is touched. In step 7 the dispatch is recorded up to the DLL's compute pipeline, which a PC device cannot create
 // (slot 67 and 62 codes are not PC shaders). The INFO lines are the measurement; the
 // PASS/FAIL checks only cover what is known to work.
@@ -215,8 +215,8 @@ Call guarded_dispatch(ffx::PfnDispatch fn, ffx::Context* ctx, const ffx::Header*
 }
 
 // PC stand-in for one console capability. The console build creates a DXGI_FORMAT_R9G9B9E5_SHAREDEXP texture with
-// ALLOW_UNORDERED_ACCESS; some PC drivers refuse it (E_INVALIDARG on an RTX 2000 Ada; WARP takes it), which stops
-// the DLL's context creation. While
+// ALLOW_UNORDERED_ACCESS; some PC drivers refuse it (E_INVALIDARG on an RTX 2000 Ada; Windows 11's WARP takes it),
+// which stops the DLL's context creation. While
 // installed, device slot 76 creates such a texture as R32_UINT (the same 32 bits per texel), so the test can measure
 // what the DLL does after it. Installed by swapping the proxy's vtable pointer, and removed again before the proxy's
 // own helpers run, because they recognise the proxy by that pointer.
@@ -240,6 +240,30 @@ HRESULT WINAPI standin_slot76(void* self, const D3D12_HEAP_PROPERTIES* heap, D3D
     return g_slot76(self, heap, heap_flags, desc, state, clear, riid, out);
 }
 
+Slot76Fn g_slot27 = nullptr;
+ID3D12Device* g_host = nullptr;
+HRESULT g_host_refusal = S_OK;
+std::string g_host_refused;
+
+// Windows 10's runtime, hardware and WARP, refuses the DLL's upload buffer in state 0x8c3 (GENERIC_READ passes).
+HRESULT WINAPI standin_slot27(void* self, const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                              const D3D12_CLEAR_VALUE* clear, const IID* riid, void** out) {
+    const HRESULT hr = g_slot27(self, heap, heap_flags, desc, state, clear, riid, out);
+    if (SUCCEEDED(hr) || !g_host || !heap || !desc) return hr;
+    ID3D12Resource* direct = nullptr;
+    const HRESULT host_hr =
+        g_host->CreateCommittedResource(heap, heap_flags, desc, state, clear, IID_PPV_ARGS(&direct));
+    if (direct) direct->Release();
+    if (SUCCEEDED(host_hr)) return hr;
+    g_host_refusal = host_hr;
+    char line[160];
+    std::snprintf(line, sizeof(line), "heap type %d, heap flags %#x, dimension %d, format %d, flags %#x, state %#x",
+                  heap->Type, heap_flags, desc->Dimension, desc->Format, desc->Flags, state);
+    g_host_refused = line;
+    return hr;
+}
+
 // Device slots 67 and 62 are the DLL's two compute-pipeline paths (calls at RVAs 0x56d9 and 0x5825): slot 67 from
 // native code, which the proxy refuses, then slot 62 with a D3D12_COMPUTE_PIPELINE_STATE_DESC. This wrapper records
 // slot 62's HRESULT: on failure the DLL's pipeline function returns 0x8000000d (RVA 0x4b85), but the dispatch goes
@@ -261,6 +285,8 @@ void install_standins(void* proxy, unsigned slots, bool substitute_texture) {
     for (unsigned i = 0; i < slots && i < std::size(g_standin_vtable); ++i) g_standin_vtable[i] = g_proxy_vtable[i];
     g_slot76 = reinterpret_cast<Slot76Fn>(g_proxy_vtable[76]);
     if (substitute_texture) g_standin_vtable[76] = reinterpret_cast<void*>(&standin_slot76);
+    g_slot27 = reinterpret_cast<Slot76Fn>(g_proxy_vtable[27]);
+    g_standin_vtable[27] = reinterpret_cast<void*>(&standin_slot27);
     g_slot62 = reinterpret_cast<Slot62Fn>(g_proxy_vtable[62]);
     g_standin_vtable[62] = reinterpret_cast<void*>(&standin_slot62);
     *static_cast<void***>(proxy) = g_standin_vtable;
@@ -637,6 +663,7 @@ int main() {
         return 1;
     }
 
+    bool host_not_comparable = false;
     try {
         // 1. Map.
         rt::Loader loader(game_dir);
@@ -744,6 +771,7 @@ int main() {
         }
         check(pc != nullptr, on_vulkan ? "Vulkan-backed D3D12 device created" : "PC D3D12 device created");
         if (!pc) return 1;
+        if (!on_vulkan) g_host = pc;
         void* proxy = nullptr;
         const HRESULT hr = rt::d3d12_xs::create_device_proxy(pc, __uuidof(ID3D12Device), &proxy);
         check(SUCCEEDED(hr) && proxy, "Xbox-ABI device proxy created");
@@ -864,9 +892,9 @@ int main() {
         check(!c.faulted || hresult_stop, "ffxCreateContext returns, or stops at the DLL's HRESULT check");
 
         // 7. If the driver refused the texture, the same create with the PC stand-in (standin_slot76;
-        //    LEONIDA_FSR_NO_STANDIN=1 skips it). Some drivers take that texture (WARP does), so the context may exist
-        //    already. Either way, one ffxDispatch on the context, recorded into the logging command list (not
-        //    executed).
+        //    LEONIDA_FSR_NO_STANDIN=1 skips it). Some drivers take that texture (Windows 11's WARP does), so the
+        //    context may exist already. Either way, one ffxDispatch on the context, recorded into the logging command
+        //    list (not executed).
         bool pipeline_stop = false;
         const bool want_standin = hresult_stop && env("LEONIDA_FSR_NO_STANDIN") != "1";
         if (want_standin || ctx) {
@@ -884,7 +912,15 @@ int main() {
                 note("with the PC stand-in: ffxCreateContext(backend 0x1000002, 4.1.1) -> " + describe(c) + "; " +
                      std::to_string(g_standins) + " R9G9B9E5_SHAREDEXP UAV texture(s) created as R32_UINT");
                 if (g_formatted) note("  the DLL formatted HRESULT " + hex(g_first_formatted));
-                check(!c.faulted && c.rc == ffx::RETURN_OK && ctx, "ffxCreateContext succeeds with the PC stand-in");
+                host_not_comparable = c.faulted && c.code == kMsvcCppException && g_formatted > 0 &&
+                                      FAILED(g_host_refusal) &&
+                                      g_first_formatted == static_cast<DWORD>(g_host_refusal);
+                if (host_not_comparable)
+                    note("the host device itself refuses a committed resource the DLL creates (" + g_host_refused +
+                         ") -> " + hex(static_cast<uint32_t>(g_host_refusal)));
+                else
+                    check(!c.faulted && c.rc == ffx::RETURN_OK && ctx,
+                          "ffxCreateContext succeeds with the PC stand-in");
             }
 
             if (ctx) {
@@ -1001,6 +1037,11 @@ int main() {
         return 1;
     }
 
+    if (host_not_comparable && !g_failures) {
+        std::printf("SKIP (the host D3D12 device refuses a resource the DLL creates, e.g. Windows 10: not comparable; "
+                    "LEONIDA_FSR_DEVICE=vulkan runs on the Vulkan-backed device)\n");
+        return 77;
+    }
     std::printf("fsr_dispatch_test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
