@@ -19,12 +19,17 @@ MISSING_INPUT_TOOLS = (
     "bary_fallback_gs",
     "content_definitions",
     "cpu_ref",
+    "gamedata_blobs",
     "gamedata_maps",
     "gamedata_sps1",
+    "glb_skinning",
+    "mesh_compute_vs",
     "navmesh_index",
     "pe_inspect",
+    "psin_psch",
     "rtti_scan",
     "shader_disasm",
+    "spirv_stubs",
     "tile_probe",
 )
 
