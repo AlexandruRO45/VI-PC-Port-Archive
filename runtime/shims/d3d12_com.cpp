@@ -559,7 +559,7 @@ public:
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        if (!view.ptr || !color) return check(false);
+        if (!view.ptr || !color || (count && !rects)) return check(false);
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
     }
@@ -569,7 +569,7 @@ public:
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearDepthStencilView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        if (!view.ptr) return check(false);
+        if (!view.ptr || (count && !rects)) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
     }

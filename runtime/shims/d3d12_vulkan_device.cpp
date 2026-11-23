@@ -5419,13 +5419,19 @@ public:
     }
 
     // A constant-buffer view is a 16-byte GFX10 raw buffer V# in the first half of the slot (zeros in the rest).
-    // A null description, zero address, or zero size leaves the whole slot zeroed (null V#: reads return 0).
+    // A null description, zero or unaligned (< 256 B) address, or zero, unaligned, or > 64 KiB size leaves the whole
+    // slot zeroed (null V#: reads return 0), matching D3D12's CBV placement and size rules.
     void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
-        if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
+        constexpr UINT kAlign = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+        constexpr UINT kMaxSize = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16u;
+        if (!desc || !desc->BufferLocation || (desc->BufferLocation & (kAlign - 1u)) != 0 ||
+            !desc->SizeInBytes || (desc->SizeInBytes & (kAlign - 1u)) != 0 || desc->SizeInBytes > kMaxSize) {
+            return;
+        }
         leonida::gfx10::Buffer buffer{};
         buffer.address = desc->BufferLocation;
         buffer.stride = 0;
