@@ -816,6 +816,7 @@ class QueryTest(unittest.TestCase):
                     "driver_id": 1,
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
+                    "kosmickrisp": False,
                     "sampler_lod_bias": True,
                 })
 
@@ -942,6 +943,23 @@ class QueryTest(unittest.TestCase):
                 res, vk = self._run_query(FakeDevice(extension_names=extensions, sampler_mip_lod_bias=feature))
                 self.assertIs(res["sampler_lod_bias"], want)
                 self.assertEqual(bool(vk.portability_chained), b"VK_KHR_portability_subset" in extensions)
+
+    def test_kosmickrisp_samplers_take_no_lod_bias(self):
+        """TEST-918 (#3124): KosmicKrisp reports samplerMipLodBias true, but its OpImageQueryLod leaves the sampler's
+        bias out of the calculated LOD, so its samplers are treated as taking none, with or without the subset."""
+        subset = (b"VK_KHR_swapchain", b"VK_KHR_portability_subset")
+        kk = vk_info.VK_DRIVER_ID_MESA_KOSMICKRISP
+        for label, driver, extensions, feature, want in (
+            ("amd", vk_info.VK_DRIVER_ID_AMD_PROPRIETARY, (b"VK_KHR_swapchain",), False, True),
+            ("kosmickrisp_reports_bias", kk, subset, True, False),
+            ("kosmickrisp_no_subset", kk, (b"VK_KHR_swapchain",), False, False),
+            ("moltenvk", vk_info.VK_DRIVER_ID_MOLTENVK, subset, False, False),
+        ):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(driver_id=driver, extension_names=extensions,
+                                                      sampler_mip_lod_bias=feature))
+                self.assertIs(res["sampler_lod_bias"], want)
+                self.assertIs(res["kosmickrisp"], driver == kk)
 
     def test_native64_uses_default_size_without_required_mesh_stage(self):
         dev = FakeDevice(

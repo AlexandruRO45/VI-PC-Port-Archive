@@ -13,6 +13,11 @@ namespace leonida {
 
 inline constexpr const char* kPortabilitySubsetExtension = "VK_KHR_portability_subset";
 inline constexpr auto kPortabilitySubsetFeaturesType = VkStructureType(1000163000);
+#ifndef VK_DRIVER_ID_MESA_KOSMICKRISP
+// Older Vulkan headers stop before Mesa's Metal driver: 28 is what Mesa 26.3.1 reports, and the number
+// the Khronos registry assigns it.
+inline constexpr VkDriverId VK_DRIVER_ID_MESA_KOSMICKRISP = static_cast<VkDriverId>(28);
+#endif
 
 // VkPhysicalDevicePortabilitySubsetFeaturesKHR, member for member.
 struct PortabilitySubsetFeatures {
@@ -59,14 +64,28 @@ inline bool is_moltenvk(PFN_vkGetPhysicalDeviceProperties2 properties2, VkPhysic
     return driver.driverID == VK_DRIVER_ID_MOLTENVK;
 }
 
+// Whether `physical` is KosmicKrisp, Mesa's Metal driver, by its driver ID. It reports samplerMipLodBias as true and
+// ignores mipLodBias in OpImageQueryLod's calculated LOD (#3124, measured on Mesa 26.3.1, a driver bug): shaders that
+// ask for a LOD with a biased S# read the wrong one, so its samplers are treated as taking no bias and the shaders
+// apply the S#'s bias themselves, as on MoltenVK. TEST-918.
+inline bool is_kosmickrisp(PFN_vkGetPhysicalDeviceProperties2 properties2, VkPhysicalDevice physical) {
+    if (!properties2) return false;
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    properties2(physical, &properties);
+    return driver.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP;
+}
+
 // Whether `physical`'s samplers take a LOD bias (VkSamplerCreateInfo::mipLodBias). Every conformant device's do. A
 // portability-subset device's do when it reports samplerMipLodBias; MoltenVK does not (Metal samplers have no bias),
 // and there a non-zero mipLodBias is invalid (VUID-VkSamplerCreateInfo-samplerMipLodBias-04467) and ignored. The
 // translated shaders then apply the S#'s bias themselves (tools/rdna2spirv.py --lod-bias-fallback).
-// With `properties2`, MoltenVK without the extension in sight (under Wine, is_moltenvk) counts as one without the bias.
+// With `properties2`, MoltenVK without the extension in sight (under Wine, is_moltenvk) counts as one without the bias,
+// and KosmicKrisp counts as one even though it reports the feature (is_kosmickrisp).
 inline bool sampler_mip_lod_bias(PFN_vkEnumerateDeviceExtensionProperties enumerate,
                                  PFN_vkGetPhysicalDeviceFeatures2 features2, VkPhysicalDevice physical,
                                  PFN_vkGetPhysicalDeviceProperties2 properties2 = nullptr) {
+    if (is_kosmickrisp(properties2, physical)) return false;
     if (!has_portability_subset(enumerate, physical)) return !is_moltenvk(properties2, physical);
     if (!features2) return false;
     PortabilitySubsetFeatures subset{};

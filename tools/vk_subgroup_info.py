@@ -73,6 +73,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 100
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR = 1000163000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6
+VK_DRIVER_ID_MESA_KOSMICKRISP = 28      # Mesa's Metal driver: samplerMipLodBias true, but OpImageQueryLod drops the bias
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
 # Navi 10, Navi 14, and Navi 12 PCI IDs from Linux amdgpu's chipset table.
@@ -339,7 +340,8 @@ def query(*, stage_caps=False) -> dict:
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
-                          not portability or bool(u32(subset, PORTABILITY_SAMPLER_MIP_LOD_BIAS)))
+                          (not portability or bool(u32(subset, PORTABILITY_SAMPLER_MIP_LOD_BIAS)))
+                          and u32(drv, 16) != VK_DRIVER_ID_MESA_KOSMICKRISP)
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -378,6 +380,7 @@ def query(*, stage_caps=False) -> dict:
             "rdna1_amd_windows": (vendor == AMD_VENDOR_ID and driver == VK_DRIVER_ID_AMD_PROPRIETARY
                                   and device in RDNA1_DEVICE_IDS),
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),
+            "kosmickrisp": driver == VK_DRIVER_ID_MESA_KOSMICKRISP,
             "sampler_lod_bias": lod_bias,
         }
         if stage_caps:
