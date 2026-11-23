@@ -1,11 +1,12 @@
-"""Every LEONIDA_* / GTA6RT_* environment variable the runtime and make_game.py read is named in a document.
+"""Every LEONIDA_* / GTA6RT_* / VKH_* environment variable the runtime, make_game.py and vk_harness read is documented.
 
     python -I tests/test_docs_env_vars.py
 
 `runtime/README.md` documents the runtime's variables one by one, but five that the `xgameruntime` shim reads
-(`LEONIDA_DEVICE_TYPE` and four more) were in no document at all. This collects the variable names that appear as
-string literals in `runtime/src`, `runtime/shims` and `make_game.py` and checks that each is written in some
-tracked Markdown file. Sources and Markdown only: no build, no GPU, no game files.
+(`LEONIDA_DEVICE_TYPE` and four more) were in no document at all, and six `VKH_*` options of `vk_harness` were only
+in source comments. This collects the variable names that appear as string literals in `runtime/src`, `runtime/shims`,
+`make_game.py` and `runtime/test/vk_harness.cpp` and checks that each is written in some tracked Markdown file.
+Sources and Markdown only: no build, no GPU, no game files.
 """
 import os
 import re
@@ -13,9 +14,9 @@ import subprocess
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# A variable name as a string literal: "LEONIDA_X", L"LEONIDA_X" or 'LEONIDA_X'.
-LITERAL = re.compile(r"""["']((?:LEONIDA|GTA6RT)_[A-Z0-9_]+)["']""")
-CODE = ("runtime/src/", "runtime/shims/", "make_game.py")
+# A variable name as a string literal: "LEONIDA_X", L"LEONIDA_X", 'LEONIDA_X' or "VKH_X".
+LITERAL = re.compile(r"""["']((?:LEONIDA|GTA6RT|VKH)_[A-Z0-9_]+)["']""")
+CODE = ("runtime/src/", "runtime/shims/", "make_game.py", "runtime/test/vk_harness.cpp")
 # Set by the runtime for itself, not by a person: gta6rt passes the first to the copy of itself it starts with the
 # image base reserved (runtime/src/base_reservation.h), and the second is a name that is only looked up to make
 # the CRT build its environment table (runtime/shims/process.cpp).
@@ -68,7 +69,9 @@ class EnvironmentVariablesTest(unittest.TestCase):
         # A moved folder or a changed spelling must not turn the check below into a no-op.
         found = variables_read(self.sources)
         self.assertGreaterEqual(len(found), 20, sorted(found))
-        for known in ("LEONIDA_UNIMPLEMENTED", "LEONIDA_D3D12", "LEONIDA_DEVICE_TYPE"):
+        for known in ("LEONIDA_UNIMPLEMENTED", "LEONIDA_D3D12", "LEONIDA_DEVICE_TYPE",
+                      "VKH_HEAP", "VKH_HEAP_DUMP", "VKH_GS_HELPER",
+                      "VKH_MESH_COMPUTE", "VKH_MESH_PRIMS", "VKH_MESH_SLOT"):
             self.assertIn(known, found)
         self.assertGreater(len(self.pages), 20)
 
@@ -83,14 +86,17 @@ class EnvironmentVariablesTest(unittest.TestCase):
     def test_an_undocumented_variable_is_reported(self):
         sources = {"runtime/shims/x.cpp": 'GetEnvironmentVariableA("LEONIDA_ONE", s, n);\n'
                                           'kName[] = L"LEONIDA_TWO";\n// LEONIDA_COMMENT is not a literal\n',
-                   "make_game.py": "os.environ.get('GTA6RT_THREE')\nos.environ.get(\"LEONIDA_BASE_RESERVED\")\n"}
+                   "make_game.py": "os.environ.get('GTA6RT_THREE')\nos.environ.get(\"LEONIDA_BASE_RESERVED\")\n",
+                   "runtime/test/vk_harness.cpp": 'std::getenv("VKH_FOUR");\n'}
         self.assertEqual(variables_read(sources),
                          {"GTA6RT_THREE": "make_game.py:1", "LEONIDA_BASE_RESERVED": "make_game.py:2",
-                          "LEONIDA_ONE": "runtime/shims/x.cpp:1", "LEONIDA_TWO": "runtime/shims/x.cpp:2"})
+                          "LEONIDA_ONE": "runtime/shims/x.cpp:1", "LEONIDA_TWO": "runtime/shims/x.cpp:2",
+                          "VKH_FOUR": "runtime/test/vk_harness.cpp:1"})
         # A longer name that contains the variable does not document it.
-        pages = {"a.md": "Set `LEONIDA_ONE=1`.", "b.md": "LEONIDA_TWO_MORE and XGTA6RT_THREE"}
+        pages = {"a.md": "Set `LEONIDA_ONE=1`.", "b.md": "LEONIDA_TWO_MORE and XGTA6RT_THREE and VKH_FOUR_MORE"}
         self.assertEqual(undocumented(sources, pages),
-                         [("GTA6RT_THREE", "make_game.py:1"), ("LEONIDA_TWO", "runtime/shims/x.cpp:2")])
+                         [("GTA6RT_THREE", "make_game.py:1"), ("LEONIDA_TWO", "runtime/shims/x.cpp:2"),
+                          ("VKH_FOUR", "runtime/test/vk_harness.cpp:1")])
 
 
 if __name__ == "__main__":

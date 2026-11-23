@@ -534,6 +534,36 @@ applied; a queue count outside 1 to 16 is ignored, with a message. Only tests ap
 `gta6rt --run` creates for a game (`LEONIDA_D3D12=vulkan`) ignores both and prints `... is a test setting; the
 game's device ignores it`, so leaving them set cannot slow a game down (`run_tiny_frame_queue_test_settings`).
 
+## `vk_harness` environment options
+
+`vk_harness` (`runtime/test/vk_harness.cpp`) runs a translated graphics or mesh shader pair and writes the RGBA32F
+output image to a raw file. Besides the shared flags above (`LEONIDA_VK_DEVICE`, `LEONIDA_PC_TAIL_UBO`), it reads
+these `VKH_*` options:
+
+| Variable | Effect |
+|---|---|
+| `VKH_SGPRS=w0,w1,...` | Sets push-constant user SGPRs `s0`, `s1`, ... (up to 32 comma-separated words, decimal or `0x` hex; unset words are 0). |
+| `VKH_HEAP=addr=word,...` | Allocates a zeroed 64 KiB device-addressable heap (Xbox VA 0 = heap base, passed in push-constant dwords 32..33, or set 1 with `LEONIDA_PC_TAIL_UBO=1`), writes each 32-bit `word` at 4-byte-aligned `addr` (< `0x10000`), and requires `bufferDeviceAddress`. Use `0=0` for an empty zeroed heap. |
+| `VKH_HEAP_DUMP=<file>` | After the draw, writes the 64 KiB heap to `<file>` (requires `VKH_HEAP` or `VKH_TEX_RGBA` to allocate the heap) so tests can inspect shader stores or atomics. |
+| `VKH_DRAW_MESH=<file>` | Draws an indexed mesh (`u32 vertex_count`, `u32 index_count`, vertex bytes, `u32` indices) instead of the default 3-vertex triangle. Requires `VKH_VERTEX_LAYOUT`. |
+| `VKH_VERTEX_LAYOUT=loc:Nf,...` | Float vertex attribute layout for `VKH_DRAW_MESH` (e.g. `0:3f,1:2f`; up to 8 attributes). |
+| `VKH_VERTICES=<n>` | Draws `n` vertices (`vkCmdDraw(n, 1, 0, 0)`) instead of 3 when neither `VKH_DRAW_MESH` nor `VKH_MESH` is active (used by `w64_graphics.py` to fill whole vertex/geometry waves). |
+| `VKH_DRAW=<firstVertex>,<firstInstance>` | Passes non-zero `firstVertex` and `firstInstance` to the default 3-vertex `vkCmdDraw` (used by `vs_base_ids`). |
+| `VKH_MESH=1` | Treats the first shader as a `VK_EXT_mesh_shader` mesh shader and draws with `vkCmdDrawMeshTasksEXT(1, 1, 1)` (or the `--mesh-group-readback` grid). Ignored when `VKH_MESH_COMPUTE` is set; exits 77 without `VK_EXT_mesh_shader`. |
+| `VKH_MESH_COMPUTE=<vs.spv>` | Dispatches a `--mesh-compute` mesh shader (first argument) as compute over the mesh grid (`1x1x1` or `--mesh-group-readback`), writing slots to an output buffer (address in push-constant dwords 36..37), then draws `groups * VKH_MESH_PRIMS * 3` vertices with `<vs.spv>` (`tools/mesh_compute_vs.py`) and the fragment shader. Needs `VKH_MESH_SLOT`, `VKH_MESH_PRIMS`, and `bufferDeviceAddress` (not `VK_EXT_mesh_shader`); incompatible with `LEONIDA_PC_TAIL_UBO=1` (exits 77). |
+| `VKH_MESH_SLOT=<bytes>` | Output buffer stride in bytes per workgroup for `VKH_MESH_COMPUTE` (`index.json` `mesh_compute.slot_bytes`). |
+| `VKH_MESH_PRIMS=<n>` | Maximum primitives per workgroup for `VKH_MESH_COMPUTE` (`index.json` `mesh_compute.max_primitives`); sets the draw vertex count for `<vs.spv>`. |
+| `VKH_GS=<geometry.spv>` | Inserts a geometry stage between the vertex and fragment shaders (exits 77 without `geometryShader`). |
+| `VKH_GS_HELPER=1` | Marks the `VKH_GS` stage as a pass-through helper feeding the pixel shader under test (e.g. `--bary-fallback`), so `VKH_SUBGROUP_SIZE` still applies to the fragment stage instead of the geometry stage. |
+| `VKH_GS_PRIMITIVES=1` | Queries geometry-shader output primitives around a VS/GS/FS draw with `VKH_GS` and prints `gs_primitives=<n>` to stderr (exits 77 without `pipelineStatisticsQuery`). |
+| `VKH_SUBGROUP_SIZE=32\|64` | Requests a required subgroup size for the stage under test: mesh (`VKH_MESH`), compute (`VKH_MESH_COMPUTE`), geometry (`VKH_GS` without `VKH_GS_HELPER`), or fragment otherwise. Prints `fragment subgroup size: N` or `... not available` to stderr (exit code stays 0). |
+| `VKH_COLOR_FORMAT=<VkFormat>:<bytes>` | Overrides the color target's `VkFormat` number and bytes per texel (`1..16`, default RGBA32F / `16`), writing raw target texels to the output file (`tools/ps_oracle.py --format`; exits 77 if the format is not a color attachment). |
+| `VKH_BINARY_OUT=<file>` | Writes the pipeline's `VK_KHR_pipeline_binary` data to `<file>` after building it (exits 77 without `VK_KHR_pipeline_binary` and `VK_KHR_maintenance5`). |
+| `VKH_BINARY_IN=<file>` | Builds the pipeline from a saved `VK_KHR_pipeline_binary` file instead of compiling SPIR-V (`tools/ps_oracle.py`; exits 77 without `VK_KHR_pipeline_binary` and `VK_KHR_maintenance5`). |
+| `VKH_TEX_RGBA=<file>` | Binds a 2D RGBA8 texture (`u32 width`, `u32 height`, `width*height*4` bytes) at bindless set 0 image index 1 (1×1 magenta at index 0), allocates the 64 KiB heap, writes a `T#` at `VKH_TSHARP_VA`, and registers `VKH_SSHARP` at sampler index 1. |
+| `VKH_TSHARP_VA=<offset>` | 4-byte-aligned offset (at most `0xFFE0`, default `0x100`) in the 64 KiB heap where `VKH_TEX_RGBA` writes the 8-dword `T#`. |
+| `VKH_SSHARP=w0,w1,w2,w3` | Four comma-separated sampler descriptor dwords registered at sampler index 1 when `VKH_TEX_RGBA` is set (default `0x92,0xc00000,0x14500000,0`). |
+
 ## Known problems
 
 | What you see | Cause | What to do |
