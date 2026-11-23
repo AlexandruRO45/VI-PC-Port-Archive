@@ -6,9 +6,9 @@
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
 files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/DXBC shader
-containers, SPIR-V, DDS, AWC audio, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, YSC/SCRP compiled scripts, the
-animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE executables and XVD
-images. The magics are
+containers, SPIR-V, DDS, AWC audio, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, the PSO/shader cache, YSC/SCRP
+compiled scripts, the animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE
+executables and XVD images. The magics are
 the ones docs/ measures (docs/gamedata.md and the shader and audio notes). Text formats (disassembly, .obj, .spvasm)
 have no magic and stay with the extension check.
 
@@ -60,6 +60,7 @@ MAGICS = (
     ("SPS1 shader-preset table", 0, b"SPS1"),
     ("SGD5 effects database", 0, b"SGD5"),
     ("RDS5 texture container", 0, b"RDS5"),
+    ("PSO cache", 0, b"PS\x00\x09"),  # docs/pso_cache.md: magic PS\0\x09 at 0x00, measured
     ("YSC compiled script", 0, b"YSC\x00"),
     ("MoVE animation container", 0, b"MoVE"),
     ("SKEL_ bone table", 0, b"SKEL_"),
