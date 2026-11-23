@@ -286,8 +286,12 @@ class TestHistoryHelpers(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             bptc._flatten_bc7_entry(["bad"] + [0] * 23, 24)
-        with self.assertRaises(TypeError):
+        # A JSON null or object in an entry is malformed history input: ValueError, which the
+        # CLI reports as one line (bcpack_tool), not a TypeError traceback.
+        with self.assertRaises(ValueError):
             bptc._flatten_bc7_entry([None] + [0] * 23, 24)
+        with self.assertRaises(ValueError):
+            bptc._flatten_bc7_entry([{}] + [0] * 23, 24)
 
     def test_read_history_section_sources_errors_and_mtime_cache(self) -> None:
         self.assertIsNone(bptc._read_history_section(None, "bc6h", "endpointHistory"))
@@ -481,11 +485,29 @@ class TestLoadBc6h(unittest.TestCase):
             {"indexHistory": {"0": ["bad"] + [0] * 15}},
             {"endpointClass": {"0": "bad"}},
             {"indexClass": {"0": "bad"}},
+            # Wrong JSON types: a number or null where a row or integer belongs.
+            {"endpointHistory": {"0": 5}},
+            {"endpointHistory": [0] * 256},
+            {"endpointHistory": {"0": [5, 5, 5]}},
+            {"endpointHistory": {"0": [[None, 0, 0, 0], [0] * 4, [0] * 4]}},
+            {"indexHistory": {"0": 7}},
+            {"indexHistory": {"0": [[0]] + [0] * 15}},
+            {"endpointClass": {"0": None}},
+            {"indexClass": {"0": [3]}},
+            {"endpointConfirmedBits": {"0": 16}},
+            {"endpointConfirmedBits": {"0": [[None, 0, 0, 0], [0] * 4, [0] * 4]}},
+            {"indexConfirmedBits": {"0": 4}},
+            {"indexConfirmedBits": {"0": [None] * 16}},
         ]
         for bad_sec in bad_sections:
             with self.subTest(bad_sec=bad_sec):
-                with self.assertRaises((ValueError, TypeError)):
+                with self.assertRaises(ValueError):
                     bptc.load_bc6h({"bc6h": bad_sec})
+        # A codec section that is not a JSON object.
+        for bad in ([], [1, 2], 5, "x", True):
+            with self.subTest(section=bad):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc6h({"bc6h": bad})
 
 
 class TestLoadBc7(unittest.TestCase):
@@ -631,11 +653,52 @@ class TestLoadBc7(unittest.TestCase):
             {"historyEndpointLastResort": [[1, 2, 3]]},
             {"historyEndpointLastResort": [[1, 2, 3, 4, 5]]},
             {"historyEndpointLastResort": [["bad", 0]]},
+            # Wrong JSON types: a number or null where a list or integer belongs.
+            {"historyEndpoints": {"0": [None] * 24}},
+            {"historyIndexBits": {"0": [{}] + [0] * 31}},
+            {"historyEndpointLastResort": [5]},
+            {"historyEndpointLastResort": 5},
+            {"historyEndpointLastResort": [[None, 0]]},
+            {"historyEndpointLastResort": [[1, 2, [3], 4]]},
         ]
         for bad_sec in bad_sections:
             with self.subTest(bad_sec=bad_sec):
-                with self.assertRaises((ValueError, TypeError)):
+                with self.assertRaises(ValueError):
                     bptc.load_bc7({"bc7": bad_sec})
+        # A codec section that is not a JSON object, given as a dict or read from a file.
+        for bad in ([], [1, 2], 5, "x"):
+            with self.subTest(section=bad):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc7({"bc7": bad})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bc7.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"bc7": []}, fh)
+            with self.assertRaises(ValueError):
+                bptc.load_bc7(path)
+            with self.assertRaises(ValueError):
+                bptc.load_bc7(tmp)  # directory holding bc7.json
+
+
+class TestLoadBcHistory(unittest.TestCase):
+    """load_bc_history() rejects wrong-typed BC1/BC3/BC4/BC5 values with ValueError."""
+
+    def test_wrong_typed_values(self) -> None:
+        self.assertEqual(
+            bptc.load_bc_history(1, {"bc1": {"confirmed": {"1": [1, 2, 3, 4, 5, 6]}}}),
+            ({1: (1, 2, 3, 4, 5, 6)}, {}, False),
+        )
+        for codec, sec in (
+            (1, {"confirmed": {"1": [None, 0, 0, 0, 0, 0]}}),
+            (1, {"provisional": {"1": [[1], 0, 0, 0, 0, 0]}}),
+            (3, {"confirmed": {"2": [0, 0, 0, 0, 0, 0, 0, {}]}}),
+            (4, {"provisional": {"3": [None, None]}}),
+            (5, {"confirmed": {"4": [0, 0, [0], 0]}}),
+        ):
+            key = f"bc{codec}"
+            with self.subTest(codec=codec, sec=sec):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc_history(codec, {key: sec})
 
 
 if __name__ == "__main__":

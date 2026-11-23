@@ -6,6 +6,7 @@ Usage:
 from __future__ import annotations
 
 import io
+import json
 import os
 import struct
 import sys
@@ -238,6 +239,42 @@ class TestCliErrorPaths(unittest.TestCase):
             )
             self._assert_one_error_line(rc, err, "hist.json")
             self.assertFalse(os.path.exists(out_file))
+
+    def test_wrong_typed_history_json(self) -> None:
+        # Valid JSON whose values have the wrong JSON type (null, list or number where the
+        # loader wants an object, array or integer) is a malformed --history file too: one
+        # ERROR line naming it, exit 2, no output, never a TypeError/AttributeError traceback.
+        bc7_stream = test_bcpack.encode_bc7_mode6_blocks(
+            test_bcpack.DocumentedExampleTest.BC7_BLOCK
+        )
+        cases = [
+            ("bc1_null", 1, self.compressed_stream, 32,
+             {"bc1": {"confirmed": {"1": [None, 0, 0, 0, 0, 0]}}}),
+            ("bc1_list", 1, self.compressed_stream, 32,
+             {"bc1": {"provisional": {"7": [[1], 0, 0, 0, 0, 0]}}}),
+            ("bc7_list_section", 7, bc7_stream, 16, {"bc7": []}),
+            ("bc7_null_value", 7, bc7_stream, 16,
+             {"bc7": {"historyEndpoints": {"0": [None] * 24}}}),
+            ("bc7_last_resort", 7, bc7_stream, 16,
+             {"bc7": {"historyEndpointLastResort": [5]}}),
+        ]
+        for name, codec, stream, size, doc in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp_dir:
+                in_file = os.path.join(tmp_dir, "sample.bcpack")
+                with open(in_file, "wb") as f:
+                    f.write(stream)
+                history = os.path.join(tmp_dir, f"hist_{name}.json")
+                with open(history, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(doc, f)
+                out_file = os.path.join(tmp_dir, "out.raw")
+                rc, err, _ = self._cli(
+                    ["decode", in_file, out_file, "--codec", str(codec), "--size", str(size),
+                     "--history", history],
+                    tmp_dir, f"decode_{name}",
+                )
+                self._assert_one_error_line(rc, err, "sample.bcpack")
+                self.assertIn(f"hist_{name}.json", err)
+                self.assertFalse(os.path.exists(out_file))
 
     def test_success_path_still_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
