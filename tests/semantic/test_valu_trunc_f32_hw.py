@@ -255,5 +255,17 @@ class TestValuTruncF32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(state.lanes_vgpr[lane][0], 0xDEADBEEF)
 
 
+class TestValuTruncF32Aliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation."""
+
+    def test_in_place_truncation(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, f32_to_u32(99.99))
+        instr = ASTInstruction(Opcode.V_TRUNC_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
+        res = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, f32_to_u32(99.0))
+        self.assertEqual(state.vgprs[0], f32_to_u32(99.0))
+
+
 if __name__ == "__main__":
     unittest.main()
