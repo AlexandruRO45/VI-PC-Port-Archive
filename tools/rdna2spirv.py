@@ -8751,9 +8751,15 @@ class Gen:
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
             # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
             # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1) & 0xFFFF. The m form is masked: a byte where
-            # S1's byte is 0 is skipped (as v_msad_u8). clamp is not modelled: rejected rather than guessed.
-            if a[0].get("n") != 2 or "clamp" in mods:
+            # S1's byte is 0 is skipped (as v_msad_u8). clamp and other modifiers are not modelled: rejected rather
+            # than guessed.
+            if len(a) != 4:
                 raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n") != 2:
+                raise Unsupported(op + " destination")
+            if (mods or ins["op"].endswith(("_dpp", "_sdwa")) or
+                    any(s.get("neg") or s.get("abs") or s.get("sext") for s in a)):
+                raise Unsupported(op + " modifiers")
 
             x_lo, x_hi = self.src64_data(a[1], op, allow_vgpr=True)
             y = self.src_u(a[2])
@@ -8801,9 +8807,16 @@ class Gen:
             #   v_sad_u16:   S2 + sum over the 2 halves of |S0.h - S1.h|
             #   v_sad_u32:   S2 + |S0 - S1|
             #   v_msad_u8:   v_sad_u8, skipping each byte where S1's byte is 0 (masked SAD)
-            # clamp is not modelled: rejected rather than guessed.
+            # clamp and other modifiers are not modelled: rejected rather than guessed.
+            if len(a) != 4:
+                raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " destination")
             if "clamp" in mods:
                 raise Unsupported(op + " clamp")
+            if (mods or ins["op"].endswith(("_dpp", "_sdwa")) or
+                    any(s.get("neg") or s.get("abs") or s.get("sext") for s in a)):
+                raise Unsupported(op + " modifiers")
             x, y, acc = (self.src_u(t) for t in a[1:4])
             width = {"v_sad_u16": 16, "v_sad_u32": 32}.get(op, 8)
             total = None
@@ -8839,9 +8852,14 @@ class Gen:
             # Four masked byte-SADs with full 32-bit accumulators (RDNA ISA pseudocode): for k = 0..3,
             # D[k] = S2[k] + v_msad_u8 of the 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1, wrapping at
             # 32 bits; a byte where S1's byte is 0 adds nothing. S2 and D are 128-bit (four VGPRs).
-            # clamp is not modelled: rejected rather than guessed.
-            if a[0].get("n") != 4 or "clamp" in mods:
+            # clamp and other modifiers are not modelled: rejected rather than guessed.
+            if len(a) != 4:
                 raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n") != 4:
+                raise Unsupported(op + " destination")
+            if (mods or ins["op"].endswith(("_dpp", "_sdwa")) or
+                    any(s.get("neg") or s.get("abs") or s.get("sext") for s in a)):
+                raise Unsupported(op + " modifiers")
             s0, s2 = a[1], a[3]
             x_lo, x_hi = self.src64_data(s0, op, allow_vgpr=True)
             if s2["k"] == "vgpr" and s2.get("n") == 4:
