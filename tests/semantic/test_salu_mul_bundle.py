@@ -553,5 +553,23 @@ class TestSMulHiU32SIMDAndWaveDivergence(unittest.TestCase):
         lanes = wave.broadcast_result(val)
         self.assertTrue(all(l == 2 for l in lanes))
 
+class TestSMulHiU32IntegerOverflowExtremes(unittest.TestCase):
+    def test_full_range_upper_bound(self) -> None:
+        # Max 64-bit value product
+        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFE)
+
+    def test_power_of_two_shifts(self) -> None:
+        # Multiplying by 2^k gives exact high bits
+        for k in range(32):
+            val = 1 << k
+            # (2^k) * (2^(32-k)) = 2^32 -> high 32 bits is 1
+            other = 1 << (32 - k) if k > 0 else 0
+            if other > 0 and other <= MASK32:
+                self.assertEqual(ref_s_mul_hi_u32(val, other), 1)
+
+    def test_asymmetric_high_product(self) -> None:
+        # 0xFFFFFFFF * 0x80000000 = 0x7FFFFFFF_80000000 -> high 32 bits is 0x7FFFFFFF
+        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0x80000000), 0x7FFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
