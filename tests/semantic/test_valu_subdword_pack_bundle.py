@@ -247,6 +247,12 @@ class TestPermLane16Divergence(unittest.TestCase):
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
         self.assertIn("OpGroupNonUniformShuffle", spv)
 
+class TestPermLane16Mutation(unittest.TestCase):
+    def test_nibble_mask_boundaries(self):
+        # All 15s (0xFFFFFFFF)
+        spv = run_cs_permlane("v_permlane16_b32", 0xFFFFFFFF, 0xFFFFFFFF, name="cs_p16_all15")
+        self.assertIn("OpBitFieldUExtract", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
