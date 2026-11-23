@@ -5,6 +5,7 @@ no game file or asset is used. `image_query_probe.py --help` is bounded so its a
 hardware-oracle startup cost back in.
 """
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,20 @@ class NotAnArchiveExitCodeTests(unittest.TestCase):
             path = os.path.join(tmp, "not-an-archive.rpf")
             with open(path, "wb") as f:
                 f.write(b"this file exists but is not an RPF7/8/9 archive")
+            p = run_tool("navmesh_index", path, "--out", os.path.join(tmp, "out.json"))
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            lines = p.stderr.strip().splitlines()
+            self.assertEqual(len(lines), 1, p.stderr)
+            self.assertTrue(lines[0].startswith("ERROR:"), p.stderr)
+            self.assertIn(path, p.stderr)
+
+    def test_data_start_past_the_end_is_exit_2_with_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "data-start-past-eof.rpf")
+            # "9FPR" is the archive magic and the u32 at offset 4 the data-area start; 4096 is past the 64 bytes.
+            with open(path, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<I", 4096) + bytes(56))
             p = run_tool("navmesh_index", path, "--out", os.path.join(tmp, "out.json"))
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
