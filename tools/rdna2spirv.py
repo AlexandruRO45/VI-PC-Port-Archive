@@ -744,13 +744,45 @@ class Gen:
                 h_mod = hn
         return self.modify_f(out, s), h_mod, self._f16_const_nan(s, hi)
 
-    def fma_mix_srcs(self, a, mods):
-        """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
-        sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
-        selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
-        # A hand-written list shorter than the three operands (op_sel_hi:[0,0]) is padded with 0, as llvm-mc prints it.
-        sb = ([int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0, 0, 0])[:3]
-        hb = ([int(x) for x in selhi.split("[")[1].rstrip("]").split(",")] + [0, 0, 0])[:3]
+    def fma_mix_srcs(self, op, raw_op, a, mods):
+        """Validate operands/modifiers and read the 3 sources of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
+        if raw_op.endswith(("_e32", "_dpp", "_sdwa")):
+            raise Unsupported(op + " modifiers")
+        if len(a) != 4:
+            raise Unsupported(op + " operands")
+        if a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1 or a[0].get("neg") or a[0].get("abs"):
+            raise Unsupported(op + " destination")
+        sel_mod = selhi_mod = None
+        clamp_seen = False
+        for m in mods:
+            if m == "clamp":
+                if clamp_seen:
+                    raise Unsupported(op + " modifiers")
+                clamp_seen = True
+            elif m.startswith("op_sel:"):
+                if sel_mod is not None:
+                    raise Unsupported(op + " modifiers")
+                sel_mod = m
+            elif m.startswith("op_sel_hi:"):
+                if selhi_mod is not None:
+                    raise Unsupported(op + " modifiers")
+                selhi_mod = m
+            else:
+                raise Unsupported(op + " modifiers")
+
+        def parse_bits(m, prefix):
+            if m is None:
+                return [0, 0, 0]
+            if not (m.startswith(prefix + "[") and m.endswith("]")):
+                raise Unsupported(op + " modifiers")
+            parts = m[len(prefix) + 1:-1].split(",")
+            # A hand-written list shorter than the three operands (op_sel_hi:[0,0]) is padded with 0, as llvm-mc prints it.
+            if not parts or len(parts) > 3 or any(p not in ("0", "1") for p in parts):
+                raise Unsupported(op + " modifiers")
+            return ([int(p) for p in parts] + [0, 0, 0])[:3]
+
+        sb = parse_bits(sel_mod, "op_sel:")
+        hb = parse_bits(selhi_mod, "op_sel_hi:")
         # An f32 operand reads as a zero of its sign when it is denormal: the game's MODE flushes f32 denormals
         # (denorm_mode_32 = 0), measured on gfx1036 for 0x00000001, 0x807fffff and the integer inline constants 1 and
         # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
@@ -9615,10 +9647,11 @@ class Gen:
             self.wqm(op, a)
         elif op == "v_fma_mix_f32":
             # Each source is f32, or (op_sel_hi bit set) an f16 from the low/high half chosen by op_sel.
-            vals = self.fma_mix_srcs(a, mods)
+            # VOP3P has no omod (mul:*/div:*), so only clamp applies.
+            vals = self.fma_mix_srcs(op, ins["op"], a, mods)
             r = self.tmp()
             self.emit_fma(r, vals[0], vals[1], vals[2])
-            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods, allow_omod=False)))
         elif op in ("v_div_fmas_f32", "v_div_fmas_f64"):
             # Scaled FMA for IEEE-754 division (RDNA2 ISA VOP3, measured natively on gfx1036 wave32/wave64):
             #   VCC == 0: fma(S0, S1, S2)
@@ -10562,7 +10595,7 @@ class Gen:
             self.dst(a[0], r)
             self.scc_nonzero(r)
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
-            vals = self.fma_mix_srcs(a, mods)
+            vals = self.fma_mix_srcs(op, ins["op"], a, mods)
             r = self.fma_mix_odd(*vals)
             r = self.clamp_f16(r, mods)
             self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
