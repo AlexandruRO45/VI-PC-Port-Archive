@@ -104,6 +104,21 @@ class AmdSwizzleCliGuardTests(unittest.TestCase):
             self.assertIn("ERROR:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_a_negative_offset_is_refused_instead_of_slicing_the_tail(self):
+        # tile_probe.py fixed this same shape: data[a.offset:] with a negative offset reads the file's tail.
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "blob.bin")
+            with open(blob, "wb") as f:
+                f.write(bytes(64))
+            for offset, why in (("-16", "negative"), ("64", "past the end")):
+                with self.subTest(offset=offset, why=why), mock.patch.object(sys, "stderr", io.StringIO()) as err, \
+                        mock.patch.object(sys, "stdout", io.StringIO()) as out:
+                    with self.assertRaises(SystemExit) as cm:
+                        self.mod.main([blob, "--width", "8", "--height", "8", "--offset", offset])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("--offset must be inside the blob", err.getvalue())
+                    self.assertEqual(out.getvalue(), "")   # nothing ran before the refusal
+
     def test_bad_out_paths_rejected_before_reading_or_searching(self):
         with tempfile.TemporaryDirectory() as tmp:
             blob = os.path.join(tmp, "blob.bin")
