@@ -372,5 +372,27 @@ class TestSaluXnorSaveexecB32RegisterAliasing(unittest.TestCase):
         self.assertEqual(mem.get(0), 1)  # SCC
         self.assertEqual(mem.get(4), 4)  # popcount of saved_d (0xF has 4 bits)
 
+# --- Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation ---
+
+class TestSaluXnorSaveexecB32ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation tests."""
+
+    def test_scc_is_zero_when_exec_lo_is_zero(self) -> None:
+        hw_lo, _, hw_scc, _ = run_salu_xnor_saveexec_b32(0x55555555, 0xAAAAAAAA, 0x000000FF)
+        self.assertEqual(hw_lo, 0)
+        self.assertEqual(hw_scc, 0)
+
+    def test_scc_is_one_when_exec_lo_is_nonzero(self) -> None:
+        hw_lo, _, hw_scc, _ = run_salu_xnor_saveexec_b32(0x55555555, 0x0000000F, 0x000000FF)
+        self.assertNotEqual(hw_lo, 0)
+        self.assertEqual(hw_scc, 1)
+
+    def test_scc_ignores_exec_hi(self) -> None:
+        """SCC reflects EXEC_LO only; non-zero EXEC_HI must not force SCC = 1 when EXEC_LO == 0."""
+        hw_lo, hw_hi, hw_scc, _ = run_salu_xnor_saveexec_b32(0x55555555, 0xAAAAAAAA, 0xFFFFFFFF)
+        self.assertEqual(hw_lo, 0)
+        self.assertEqual(hw_hi, 0xFFFFFFFF)
+        self.assertEqual(hw_scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
