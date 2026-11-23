@@ -252,6 +252,40 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(len(r["merges"]), 1)
         self.assertEqual(r["commits"], {"total": 1, "on_main": 1})
 
+    def test_cli_reports_the_replay_tree_after_a_squash_and_revert(self):
+        base = self.git("rev-parse", "main")
+        self.pr_branch("original", base, "A new line from the PR.\n")
+        self.squash_merge(42, "original")
+        self.pr_branch("replay", base, "A new line from the PR.\n")
+        self.git("branch", "squashed")
+        self.git("revert", "--no-edit", "HEAD")
+        self.git("branch", "reverted")
+        self.append("docs/notes.md", "A different line on main.\n")
+        self.commit("Edit the same line independently")
+
+        for main, matches, conflict in (("squashed", True, False), ("reverted", False, False),
+                                        ("main", False, True)):
+            with self.subTest(main=main):
+                merge = subprocess.run(["git", "-C", self.repo, "merge-tree", "--write-tree", main, "replay"],
+                                       capture_output=True, encoding="utf-8", check=False)
+                self.assertEqual(merge.returncode, int(conflict), merge.stderr)
+                self.assertEqual(merge.stdout.splitlines()[0] == self.git("rev-parse", main + "^{tree}"), matches)
+
+                cmd = [sys.executable, "-I", "-B", mc.__file__, "--repo", self.repo, "--main", main, "42=replay"]
+                report = subprocess.run([*cmd, "--json"], capture_output=True, encoding="utf-8")
+                text = subprocess.run(cmd, capture_output=True, encoding="utf-8")
+                self.assertEqual(report.returncode, 1, report.stderr)
+                self.assertEqual(text.returncode, 1, text.stderr)
+                row, = json.loads(report.stdout)
+                self.assertEqual(row["verdict"], "already-merged")
+                self.assertEqual(row["commits"], {"total": 1, "on_main": 1})
+                self.assertIs(row["conflict"], conflict)
+                self.assertIs(row.get("tree_matches_main"), matches)
+                self.assertIn("#42 already-merged", text.stdout)
+                change_warning = "merge would change the current main tree"
+                self.assertEqual(change_warning in text.stdout, not matches and not conflict)
+                self.assertEqual("conflicts" in text.stdout, conflict)
+
     def test_a_multi_commit_squash_merged_pr_is_already_merged_despite_cherry_miss(self):
         base = self.git("rev-parse", "main")
         self.git("checkout", "-q", "-b", "sq2", base)
