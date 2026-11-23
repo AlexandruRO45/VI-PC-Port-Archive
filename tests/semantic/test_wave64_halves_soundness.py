@@ -383,6 +383,106 @@ class SoundnessRegressions(unittest.TestCase):
             "v_mov_b32_e32 v6, s5",
         ], "B", reasons=[], idioms=["readfirstlane-uniform"])
 
+    # -- the run side of an accepted vote must stay inside the voted mask (unconfined-vote-side)
+    # v0 is the global lane: only lane 2 votes yes below, so in two 32-lane waves the second one skips the run side
+    # that the 64-lane wave runs for it.
+    CODE = "unconfined-vote-side"
+
+    def test_vccz_run_side_widens_exec_before_the_join(self):
+        # s_or_b64 restores EXEC inside the run side, then v7 is written in every lane: 5 in the wave, 0 in lanes
+        # 32..63 of the halves
+        self.assert_tier_c_and_diverges("vs_vccz_widened", [
+            "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 4", "s_and_saveexec_b64 s[16:17], vcc",
+            "v_add_nc_u32_e32 v6, 9, v6", "s_or_b64 exec, exec, s[16:17]", "v_add_nc_u32_e32 v7, 5, v7",
+        ], contains=[self.CODE])
+
+    def test_execz_run_side_widens_exec_before_the_join(self):
+        self.assert_tier_c_and_diverges("vs_execz_widened", [
+            "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 3",
+            "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[12:13]", "v_add_nc_u32_e32 v7, 5, v7",
+            "s_or_b64 exec, exec, s[12:13]",
+        ], contains=[self.CODE])
+
+    def test_run_side_narrows_to_another_mask_after_the_restore(self):
+        # after the restore the second narrowing is to lanes 41..63, none of which voted
+        self.assert_tier_c_and_diverges("vs_vccz_renarrowed", [
+            "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 7", "s_and_saveexec_b64 s[16:17], vcc",
+            "v_add_nc_u32_e32 v6, 9, v6", "s_or_b64 exec, exec, s[16:17]", "v_cmp_lt_u32_e32 vcc, 40, v0",
+            "s_and_saveexec_b64 s[18:19], vcc", "v_add_nc_u32_e32 v7, 5, v7", "s_or_b64 exec, exec, s[18:19]",
+        ], contains=[self.CODE])
+
+    def test_execz_run_side_restores_exec_but_the_skipped_path_does_not(self):
+        # the restore is the last instruction of the run side and the join comes after it: a half with no lane on
+        # reaches the join with EXEC still empty, the wave with every lane on
+        self.assert_tier_c_and_diverges("vs_execz_restore_inside", [
+            "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 2",
+            "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[12:13]", "v_add_nc_u32_e32 v7, 5, v7",
+        ], contains=[self.CODE])
+
+    def test_execnz_loop_widens_exec_in_its_body(self):
+        # lanes 0..31 leave the loop after one pass, lanes 32..63 after two. The body switches every lane back on
+        # for v7 += 1: twice in the wave, once in the first half
+        self.assert_tier_c_and_diverges("vs_execnz_loop_widened", [
+            "v_mov_b32_e32 v9, 0", "v_lshrrev_b32_e32 v10, 5, v0", "v_add_nc_u32_e32 v10, 1, v10",
+            "v_add_nc_u32_e32 v9, 1, v9", "s_mov_b64 s[18:19], exec", "s_mov_b64 exec, s[10:11]",
+            "v_add_nc_u32_e32 v7, 1, v7", "s_mov_b64 exec, s[18:19]", "v_cmp_lt_u32_e32 vcc, v9, v10",
+            "s_and_b64 exec, exec, vcc", "s_cbranch_execnz -8", "s_mov_b64 exec, s[10:11]",
+        ], contains=[self.CODE])
+
+    def test_run_side_leaves_past_the_join(self):
+        # one path of the run side jumps over the join's v7 += 5 to the end; the half that skipped the side runs it
+        self.assert_tier_c_and_diverges("vs_vccz_past_join", [
+            "v_cmp_eq_u32_e32 vcc, 2, v0", "s_mov_b32 s20, 1", "s_cbranch_vccz 5",
+            "s_and_saveexec_b64 s[16:17], vcc", "v_add_nc_u32_e32 v6, 9, v6", "s_or_b64 exec, exec, s[16:17]",
+            "s_cmp_eq_u32 s20, 1", "s_cbranch_scc1 1", "v_add_nc_u32_e32 v7, 5, v7",
+        ], contains=[self.CODE])
+
+    def test_confined_run_sides_stay_tier_a(self):
+        for name, body in (
+                # the restore is the last instruction of the run side
+                ("vs_vccz_restore_last", [
+                    "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 3", "s_and_saveexec_b64 s[16:17], vcc",
+                    "v_add_nc_u32_e32 v6, 9, v6", "s_or_b64 exec, exec, s[16:17]"]),
+                # the same with the EXEC saved before the vote (s[10:11], the prologue's copy)
+                ("vs_vccz_restore_from_saved", [
+                    "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 3", "s_and_b64 exec, exec, vcc",
+                    "v_add_nc_u32_e32 v6, 9, v6", "s_mov_b64 exec, s[10:11]"]),
+                # the run side leaves EXEC narrowed and the join overwrites it for both paths
+                ("vs_vccz_join_sets_exec", [
+                    "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 2", "s_and_b64 exec, exec, vcc",
+                    "v_add_nc_u32_e32 v6, 9, v6", "s_mov_b64 exec, s[10:11]"]),
+                # a skip region inside the run side: its restore is to a mask saved inside the vote
+                ("vs_vccz_nested_skip", [
+                    "v_and_b32_e32 v4, 7, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_cbranch_vccz 8",
+                    "s_and_saveexec_b64 s[16:17], vcc", "v_add_nc_u32_e32 v6, 9, v6", "v_cmp_lt_u32_e32 vcc, 32, v0",
+                    "s_and_saveexec_b64 s[18:19], vcc", "s_cbranch_execz 1", "v_add_nc_u32_e32 v7, 5, v7",
+                    "s_or_b64 exec, exec, s[18:19]", "s_or_b64 exec, exec, s[16:17]"]),
+                # whole-quad mode inside a skip region: the quads of the lanes that are on stay inside their half
+                ("vs_execz_wqm_inside", [
+                    "v_and_b32_e32 v4, 7, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+                    "s_cbranch_execz 2", "s_wqm_b64 exec, exec", "v_mov_b32_e32 v6, 7",
+                    "s_or_b64 exec, exec, s[12:13]"]),
+                # an EXEC skip region, and a loop closed by execnz that only narrows
+                ("vs_execz_join_restores", [
+                    "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 1",
+                    "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[12:13]"]),
+                ("vs_execnz_loop", [
+                    "v_mov_b32_e32 v9, 0", "v_lshrrev_b32_e32 v10, 5, v0", "v_add_nc_u32_e32 v10, 1, v10",
+                    "v_add_nc_u32_e32 v9, 1, v9", "v_add_nc_u32_e32 v7, 1, v7", "v_cmp_lt_u32_e32 vcc, v9, v10",
+                    "s_and_b64 exec, exec, vcc", "s_cbranch_execnz -5", "s_mov_b64 exec, s[10:11]"]),
+        ):
+            (tier, reasons, _), asm = meta_of(name, vs(body))
+            self.assertEqual(tier, "A", f"{name}: got {tier}, reasons={reasons}")
+            self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), name)
+
+    def test_store_after_the_restore_is_refused_in_a_pixel_shader(self):
+        # the effect need not be a VGPR write
+        self.assert_ps_tier("ps_vccz_store_after_restore", [
+            "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 5", "s_and_saveexec_b64 s[16:17], vcc",
+            "v_add_nc_u32_e32 v6, 9, v6", "s_or_b64 exec, exec, s[16:17]",
+            "buffer_store_dword v6, v0, s[0:3], 0 offen",      # two words: the vote skips five
+        ], "C", contains=[self.CODE])
+
 
 if __name__ == "__main__":
     unittest.main()

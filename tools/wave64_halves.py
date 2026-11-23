@@ -59,7 +59,7 @@ NAMES = {CNT: "lane-count", RNK: "lane-rank", FF1: "first-lane", BASE: "allocati
          LANE: "lane-id", X: "cross-lane", CTRL: "stale-scalar", MASKD: "mask-as-data", WFS: "waterfall-scalar"}
 REASONS = sorted(set(NAMES.values()) | {"tainted-branch", "unsafe-vote-branch", "mask-half", "elected-side-effect",
                                         "tainted-exec", "mask-compare", "unmodelled-op", "unsafe-execz-branch",
-                                        "analysis-error"})
+                                        "unconfined-vote-side", "analysis-error"})
 
 BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz",
             "s_cbranch_execz", "s_cbranch_execnz"}
@@ -202,6 +202,8 @@ class Analysis:
         self.tok = {("e",): (None, None, True)}      # exec token -> (parent token, exec tag after, exec is the entry exec)
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
+        self.accepted = {}                           # vote block -> (mask register key, run side, skipped side,
+        #                                              registers holding the EXEC of the vote), of the accepted votes
         self.branch_class = {}
 
     # ---- helpers ----
@@ -915,14 +917,14 @@ class Analysis:
                 return
             if g and g[0] == "vote":
                 # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
-                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev)
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, st)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
         if t & ~ELECT:
             self.bad_branch(ev, ins, op, t)
             return
-        self.vote(n, ins, op, reg, op.endswith("nz"), ev)
+        self.vote(n, ins, op, reg, op.endswith("nz"), ev, st)
 
     def bad_branch(self, ev, ins, op, t):
         if ev is not None:
@@ -932,7 +934,7 @@ class Analysis:
                     return
             ev["viol"].append(("tainted-branch", ins.get("pc"), op))
 
-    def vote(self, n, ins, op, reg, on_taken, ev):
+    def vote(self, n, ins, op, reg, on_taken, ev, st=None):
         """A wave-wide vote on mask register `reg` decides the branch. EXEC's own vote is always a skip of
         lane-masked work; for any other mask the side that runs when the vote is yes must start by narrowing EXEC
         to that mask, so lanes that voted no are inert there."""
@@ -944,12 +946,17 @@ class Analysis:
             return
         run = targets[0] if on_taken else (targets[1] if len(targets) > 1 else None)
         skip = targets[1] if on_taken and len(targets) > 1 else (targets[0] if not on_taken else None)
+        # for confine_votes(): the registers that hold a copy of the EXEC of the vote
+        held = frozenset(r for r, g in st["g"].items() if g and g[0] == "mask" and g[1] == st["x"]) if st else \
+            frozenset()
         if reg == "exec":
             # The side that runs when EXEC is zero is taken by a half with no active lane, not only by a wave with
             # none, and then runs its scalar work and effects while the other half does not. So it must be the join
             # (or only jumps to it). The exit of a loop closed by the vote is the join of every lane: allowed.
             if run is None or skip is None or (self.reaches(run, n, -1) and not self.reaches(skip, n, -1)) \
                     or self.reaches(run, self.past_jumps(skip), n):
+                if run is not None and skip is not None:
+                    self.accepted[n] = (reg, run, skip, held)
                 return
             if ev is not None:
                 ev["viol"].append(("unsafe-execz-branch", ins.get("pc"), op))
@@ -958,6 +965,8 @@ class Analysis:
         # that side must be no code of its own: the join, which the run side reaches again.
         ok = run is not None and self.narrows(run, reg) and skip is not None \
             and self.reaches(run, self.past_jumps(skip), n)
+        if ok:
+            self.accepted[n] = (reg, run, skip, held)
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
 
@@ -998,6 +1007,186 @@ class Analysis:
             return False
         return False
 
+    # ---- the run side of an accepted vote stays inside the voted mask ----
+    LANE_EFFECTS = SINKS + ("buffer_atomic", "global_atomic", "flat_atomic", "ds_add", "ds_sub", "ds_inc", "ds_dec",
+                            "ds_min", "ds_max", "ds_and", "ds_or", "ds_xor", "ds_cmpst", "ds_wrxchg", "ds_mskor")
+
+    def confine_votes(self, ev):
+        """An accepted vote lets a half whose lanes all voted no skip the side the wave runs. That is exact only
+        while the lanes outside the voted mask M are inert on that side, which vote() does not see: it checks that
+        the side starts by narrowing EXEC to M, not that EXEC stays there. So, per accepted vote, a forward pass over
+        the run side (its blocks up to the join, or back to the vote for a loop) follows EXEC as one of
+            "in"     inside M, or inside M's whole quads (`s_wqm_b64`: a quad is four consecutive lanes and never
+                     crosses lane 32): no lane of a half that voted no is on;
+            "pre"    the EXEC of the vote outside M (that EXEC itself, or it with lanes of M switched): the state
+                     the skipped path has;
+            "other"  anything else,
+        and the same two facts for the mask registers it can tell: the voted mask, a saved EXEC, a compare made
+        under an "in" EXEC, and the 64-bit mov/and/or/andn2/xor of those. The vote of EXEC itself has M = EXEC, so
+        it starts "in". Tier C `unconfined-vote-side` when
+          * a lane effect (a VGPR write, a store or export, an atomic) runs while EXEC is not "in": the wave runs
+            it in the lanes of the half that skipped the side;
+          * the side reaches the join with EXEC in another state than the skipped path has ("pre" after a mask
+            vote, "in" after an EXEC vote), unless the join first overwrites EXEC (`s_mov_b64 exec, <register>`);
+          * the side reaches the vote again in another state than the first time, or ends the program."""
+        for n in sorted(self.accepted):
+            reg, run, skip, held = self.accepted[n]
+            self.confine_vote(n, reg, run, skip, held, ev)
+
+    def confine_vote(self, n, reg, run, skip, held, ev):
+        mask_vote = reg != "exec"
+        want = "pre" if mask_vote else "in"
+        facts = {r: want for r in held}
+        if mask_vote:
+            for r in ((reg, ("s", reg[1] + 1)) if isinstance(reg, tuple) else (reg,)):
+                facts[r] = "in"
+        # the skipped path: its blocks that only jump, up to the join. Reaching one of them ends the run side.
+        chain, b = set(), skip
+        while b not in chain:
+            chain.add(b)
+            if len(self.succ[b]) != 1 or not all(
+                    base_op(i["op"]) in ("s_branch", "s_nop", "s_waitcnt") for i in self.blocks[b]):
+                break
+            b = self.succ[b][0]
+        join_sets_exec = self.overwrites_exec(b)
+        entry = {run: (want, facts)}
+        work = [run]
+        while work:
+            b = work.pop()
+            ex, fc = entry[b]
+            for ins in self.blocks[b]:
+                ex, fc, _ = self.confine_step(ins, ex, fc)
+            if b == n:
+                continue                                  # the vote again: checked below; its run side is seeded
+            for s in self.succ[b]:
+                if s in chain:
+                    continue
+                new = (ex, fc) if s not in entry else (
+                    ex if ex == entry[s][0] else "other", {k: v for k, v in fc.items() if entry[s][1].get(k) == v})
+                if s not in entry or new != entry[s]:
+                    entry[s] = new
+                    work.append(s)
+        seen = set()
+
+        def bad(ins):
+            if ev is not None and id(ins) not in seen:
+                seen.add(id(ins))
+                ev["viol"].append(("unconfined-vote-side", ins.get("pc"), base_op(ins["op"])))
+        for b in sorted(entry):
+            ex, fc = entry[b]
+            for ins in self.blocks[b]:
+                was = ex
+                ex, fc, effect = self.confine_step(ins, ex, fc)
+                if effect and was != "in":
+                    bad(ins)
+            if not self.blocks[b]:
+                continue
+            last = self.blocks[b][-1]
+            if b == n:
+                if ex != want:
+                    bad(last)
+            elif not self.succ[b]:
+                bad(last)
+            elif any(s in chain for s in self.succ[b]) and ex != want and not join_sets_exec:
+                bad(last)
+
+    def overwrites_exec(self, blk):
+        """Whether block `blk` starts by setting EXEC from a register, whatever EXEC was."""
+        for ins in self.blocks[blk]:
+            op, a = base_op(ins["op"]), ins["args"]
+            if op in ("s_waitcnt", "s_nop"):
+                continue
+            return op == "s_mov_b64" and len(a) == 2 and a[0].get("k") == "special" and a[0].get("t") == "exec" \
+                and _regs(a[1]) not in ([], ["exec"]) and not _half(a[1])
+        return False
+
+    @staticmethod
+    def confine_fact(a, ex, facts):
+        """"in" / "pre" / None of a 64-bit mask operand: EXEC, an SGPR pair, VCC, the constant 0."""
+        if a.get("k") == "imm":
+            return "in" if a.get("v") == 0 else None
+        if _half(a) or (a.get("k") == "sgpr" and a.get("n", 1) != 2):
+            return None
+        regs = _regs(a)
+        if regs == ["exec"]:
+            return ex if ex != "other" else None
+        vals = {facts.get(r) for r in regs}
+        return vals.pop() if regs and len(vals) == 1 else None
+
+    CONFINE_MIX = {
+        "and": lambda x, y: "in" if "in" in (x, y) else ("pre" if x == y == "pre" else None),
+        "or": lambda x, y: "in" if x == y == "in" else ("pre" if "pre" in (x, y) and None not in (x, y) else None),
+        "andn2": lambda x, y: "in" if x == "in" else None,          # x & ~y
+        "andn1": lambda x, y: "in" if y == "in" else None,          # ~x & y
+        "xor": lambda x, y: "in" if x == y == "in" else None,
+    }
+
+    def confine_step(self, ins, ex, facts):
+        """(EXEC state, mask facts, whether the instruction is a lane effect) after one instruction."""
+        op, a = base_op(ins["op"]), ins["args"]
+        dests, _, defs, _ = operands(ins)
+        effect = op.startswith(self.LANE_EFFECTS) or any(
+            isinstance(r, tuple) and r[0] == "v" for d in dests for r in _regs(d))
+        facts = dict(facts)
+
+        def fact(x):
+            return self.confine_fact(x, ex, facts)
+
+        def put(x, f):
+            whole = not _half(x) and (x.get("k") != "sgpr" or x.get("n", 1) == 2)
+            for r in _regs(x):
+                if r == "exec":
+                    continue
+                facts.pop(r, None)
+                if f is not None and whole:
+                    facts[r] = f
+
+        kind = op.split("_")[1] if op.count("_") >= 2 else ""
+        mix = self.CONFINE_MIX.get(kind)
+        if op.startswith(SAVEEXEC):
+            # D = EXEC (saveexec) or the new EXEC (wrexec); EXEC = S <kind> EXEC
+            old = ex if ex != "other" else None
+            new = mix(fact(a[1]), old) if mix and op.endswith("_b64") and len(a) == 2 else None
+            if a:
+                put(a[0], new if "_wrexec_" in op else old)
+            return new or "other", facts, effect
+        if op.startswith("v_cmpx"):
+            return ("in" if ex == "in" else "other"), facts, effect
+        if a and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec"):
+            if op == "s_mov_b64" and len(a) == 2 and not _half(a[0]):
+                new = fact(a[1])
+            elif op == "s_wqm_b64" and len(a) == 2 and not _half(a[0]):
+                new = "in" if fact(a[1]) == "in" else None
+            elif mix and op.endswith("_b64") and len(a) == 3 and not _half(a[0]):
+                new = mix(fact(a[1]), fact(a[2]))
+            else:
+                new = None
+            return new or "other", facts, effect
+        if "exec" in defs:
+            return "other", facts, effect
+        # no EXEC write: the mask registers this instruction defines
+        if op == "s_mov_b64" and len(a) == 2:
+            put(a[0], fact(a[1]))
+        elif op == "s_wqm_b64" and len(a) == 2:
+            put(a[0], "in" if fact(a[1]) == "in" else None)
+        elif mix and op.startswith("s_") and op.endswith("_b64") and len(a) == 3:
+            put(a[0], mix(fact(a[1]), fact(a[2])))
+        elif op.startswith("v_cmp"):
+            # a compare is masked by EXEC: its mask is inside M when EXEC is
+            f = "in" if ex == "in" else None
+            for d in dests:
+                put(d, f)
+            if "vcc" in defs:
+                facts.pop("vcc", None)
+                if f:
+                    facts["vcc"] = f
+        else:
+            for d in dests:
+                put(d, None)
+            for r in defs:
+                facts.pop(r, None)
+        return ex, facts, effect
+
     # ---- fixpoint ----
     def run(self, stale):
         self.stale = stale
@@ -1016,9 +1205,11 @@ class Analysis:
                     work.append(s)
         ev = {"viol": [], "idioms": set(), "uniform_readlane": set()}
         self.voted = {}
+        self.accepted = {}
         for n in range(self.n):
             if entry[n] is not None:
                 self.block(n, entry[n], ev)
+        self.confine_votes(ev)
         return ev
 
     # ---- control dependence on wave-wide votes ----
