@@ -39,7 +39,15 @@ As a CLI:
 Usage: `python -I tools/spirv_opt.py --help` lists the options.
 """
 import argparse
+import os
 import sys
+import tempfile
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 _PURE_OPS = frozenset((
     "OpAccessChain",
@@ -1181,17 +1189,63 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
     return "\n".join(out) + ("\n" if spvasm.endswith("\n") else "")
 
 
+def _write_staged(path: str, text: str) -> None:
+    dest = os.path.realpath(path)
+    dest_dir = os.path.dirname(dest) or "."
+    tmp_path = None
+    try:
+        mode = published_mode(dest)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=dest_dir,
+            prefix=".spirv_opt-",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(text)
+        try:
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, dest)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Sound dominator-tree SPIR-V optimizer.")
     ap.add_argument("src", help="input .spvasm file")
     ap.add_argument("-o", "--out", required=True, help="output .spvasm file")
     ap.add_argument("--passes", type=int, default=4, help="max optimization passes (default: 4)")
     args = ap.parse_args(argv)
-    with open(args.src, encoding="utf-8") as f:
-        text = f.read()
+    if args.passes < 1:
+        ap.error("--passes must be at least 1")
+    if os.path.isdir(args.out):
+        print(f"ERROR: cannot write {args.out}: destination is a directory", file=sys.stderr)
+        return 2
+    if same_report_path(args.out, args.src):
+        print(f"ERROR: -o {args.out} would overwrite input {args.src}", file=sys.stderr)
+        return 2
+    try:
+        with open(args.src, encoding="utf-8-sig") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"ERROR: cannot read {args.src}: {e}", file=sys.stderr)
+        return 2
     opt = optimize(text, max_passes=args.passes)
-    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-        f.write(opt)
+    try:
+        _write_staged(args.out, opt)
+    except OSError as e:
+        print(f"ERROR: cannot write {args.out}: {e}", file=sys.stderr)
+        return 2
     return 0
 
 

@@ -543,5 +543,126 @@ class SpirvOptTests(unittest.TestCase):
             self.assertNotIn(dead, opt)
 
 
+class SpirvOptCliTests(unittest.TestCase):
+    SCRIPT = os.path.join(TOOLS, "spirv_opt.py")
+    MINIMAL_SPV = "\n".join([
+        "               OpCapability Shader",
+        "               OpMemoryModel Logical GLSL450",
+        "               OpEntryPoint Fragment %main \"main\"",
+        "               OpExecutionMode %main OriginUpperLeft",
+        "       %void = OpTypeVoid",
+        "       %fn_t = OpTypeFunction %void",
+        "       %main = OpFunction %void None %fn_t",
+        "      %entry = OpLabel",
+        "               OpReturn",
+        "               OpFunctionEnd",
+        "",
+    ])
+
+    def _run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, "-I", self.SCRIPT, *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_cli_rejects_nonpositive_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "in.spvasm")
+            out = os.path.join(d, "out.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.MINIMAL_SPV)
+            for bad in ("0", "-2"):
+                r = self._run_cli(src, "-o", out, "--passes", bad)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("--passes", r.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_cli_missing_and_invalid_utf8_input_are_one_line_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out.spvasm")
+            r = self._run_cli(os.path.join(d, "missing.spvasm"), "-o", out)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("ERROR: cannot read", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+            bad = os.path.join(d, "bad.spvasm")
+            with open(bad, "wb") as f:
+                f.write(b"\xff\xfe\x80\x81")
+            r2 = self._run_cli(bad, "-o", out)
+            self.assertEqual(r2.returncode, 2)
+            self.assertIn("ERROR: cannot read", r2.stderr)
+            self.assertNotIn("Traceback", r2.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_cli_refuses_output_aliasing_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "same.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.MINIMAL_SPV)
+            r = self._run_cli(src, "-o", src)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("overwrite", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(src, encoding="utf-8") as f:
+                self.assertEqual(f.read(), self.MINIMAL_SPV)
+
+    def test_cli_directory_and_unwritable_output_are_one_line_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "in.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.MINIMAL_SPV)
+            r = self._run_cli(src, "-o", d)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("ERROR:", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+            blocker = os.path.join(d, "not_a_dir")
+            with open(blocker, "wb") as f:
+                f.write(b"keep")
+            r2 = self._run_cli(src, "-o", os.path.join(blocker, "out.spvasm"))
+            self.assertEqual(r2.returncode, 2)
+            self.assertIn("ERROR: cannot write", r2.stderr)
+            self.assertNotIn("Traceback", r2.stderr)
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep")
+
+    def test_cli_reads_utf8_bom_and_stages_clean_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "bom.spvasm")
+            out = os.path.join(d, "out.spvasm")
+            with open(src, "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write(self.MINIMAL_SPV)
+            r = self._run_cli(src, "-o", out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, "rb") as f:
+                raw = f.read()
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(raw.decode("utf-8"), spirv_opt.optimize(self.MINIMAL_SPV))
+
+    def test_cli_write_failure_preserves_previous_output(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "in.spvasm")
+            out = os.path.join(d, "out.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.MINIMAL_SPV)
+            with open(out, "wb") as f:
+                f.write(b"; previous output\n")
+            err = io.StringIO()
+            with mock.patch.object(os, "replace", side_effect=PermissionError("denied")):
+                with contextlib.redirect_stderr(err):
+                    rc = spirv_opt.main([src, "-o", out])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"; previous output\n")
+            self.assertEqual(sorted(os.listdir(d)), ["in.spvasm", "out.spvasm"])
+
+
 if __name__ == "__main__":
     unittest.main()
