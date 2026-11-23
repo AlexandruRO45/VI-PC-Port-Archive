@@ -22,8 +22,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import warnings
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -321,6 +323,48 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[0]["args"][1]["v"], 1.0)
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
+
+    def test_disasm_bytes_matches_decoded_instruction_formatting(self):
+        # Two valid instructions and one trailing invalid byte.
+        code = words(0xBF810000, 0xBF8C0070) + b"\xff"
+        info = rdna2_decode.decode_bytes(code)
+        self.assertEqual(info["invalid"], 1)
+        expected = "".join(rdna2_decode.format_insn(ins) + "\n" for ins in info["insns"])
+        text, invalid = rdna2_decode.disasm_bytes(code)
+        self.assertEqual(text, expected)
+        self.assertEqual(invalid, info["invalid"])
+
+    def test_disasm_bytes_streams_without_building_decode_bytes(self):
+        code = words(0xBF810000)
+        with mock.patch.object(rdna2_decode, "decode_bytes",
+                               side_effect=AssertionError("disasm_bytes used decode_bytes")):
+            text, invalid = rdna2_decode.disasm_bytes(code)
+        self.assertEqual(invalid, 0)
+        self.assertIn("s_endpgm", text)
+
+    def test_disasm_bytes_skips_invalid_word_without_dropping_the_next(self):
+        code = words(0xBF810000, 0xFFFFFFFF, 0xBF8C0070)
+        text, invalid = rdna2_decode.disasm_bytes(code)
+        self.assertEqual(invalid, 1)
+        lines = text.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("s_endpgm", lines[0])
+        self.assertIn("s_waitcnt", lines[1])
+
+    def test_disasm_bytes_peak_is_bounded_by_the_listing(self):
+        code = bytes.fromhex("000040d501050e04") * 8192 + b"\xff"
+        tracemalloc.start()
+        try:
+            text, invalid = rdna2_decode.disasm_bytes(code)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(text), 778_240)
+        self.assertEqual(invalid, 1)
+        self.assertLess(peak, 6 << 20)
+
+    def test_disasm_bytes_empty_input(self):
+        self.assertEqual(rdna2_decode.disasm_bytes(b""), ("", 0))
 
 
 if __name__ == "__main__":
