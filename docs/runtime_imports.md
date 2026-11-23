@@ -330,7 +330,18 @@ python -I tools/gdk_runtime_calls.py "$game\XCurl.dll" "$game\libHttpClient.GDK.
 python -I tools/gdk_runtime_calls.py <exe> --out <dir>    # writes <exe>.gdk_calls.txt and .json, prints a summary
 ```
 
-It finds the helper the thunks share (the call a known id's `lea` feeds, after which a vtable slot past IUnknown is
+For a checklist covering several images, save the aggregate JSON and pass it to the checklist tool.
+
+```powershell
+python -I tools/gdk_runtime_calls.py "$game\XCurl.dll" "$game\libHttpClient.GDK.dll" --json > calls.json
+python -I tools/exe_checklist.py --gdk-calls calls.json --out checklist.md
+```
+
+If one image is unreadable, the scanner exits with an error and records the missing input in the aggregate JSON.
+The checklist keeps observed calls and marks other class-linked notes as unknown. If every image is unreadable,
+the checklist rejects the empty report. The individual files from `--out` describe only the images that produced them.
+
+The scanner finds the helper the thunks share (the call a known id's `lea` feeds, after which a vtable slot past IUnknown is
 called), takes every call to it as a thunk, reads the class and interface ids loaded into `rcx` and `rdx` (an id the
 table doesn't know is listed as unknown) and records each slot called up to `Release`, within the thunk's
 `.pdata` function or a byte window without one. The slots are named from `tools/gdk_runtime_classes.json`: the ids,

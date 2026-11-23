@@ -125,6 +125,19 @@ class ExeChecklist(unittest.TestCase):
                     self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report, "--gdk-calls", known]), 0)
                 self.assertIn("demo.cpp:3` ASSUMPTION **called**", stdout.getvalue())
 
+    def test_redirected_aggregate_report_preserves_unknown_classes(self):
+        report = os.path.join(self.root, "calls.json")
+        content = json.dumps({"images": [{"classes": []}], "unreadable_images": 1})
+        for encoding in ("utf-8-sig", "utf-16"):
+            with self.subTest(encoding=encoding):
+                with open(report, "wb") as f:
+                    f.write(content.encode(encoding))
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report]), 0)
+                self.assertIn("demo.cpp:3` ASSUMPTION (unknown)", stdout.getvalue())
+                self.assertNotIn("(not called)", stdout.getvalue())
+
     def test_malformed_reports_fail_without_publishing_a_checklist(self):
         report = os.path.join(self.root, "malformed.json")
         for case, (payload, reason) in enumerate((

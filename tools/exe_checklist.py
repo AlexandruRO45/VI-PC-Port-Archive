@@ -11,7 +11,9 @@ first look at the executable (scripts/first_look.ps1) has one list to work throu
 several). A shim note then says whether the executable calls a runtime class that file serves: "called" items are
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
 `constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
-If any input was skipped, unreadable or cut off, an unobserved class is marked "unknown".
+For a multi-image checklist, use the aggregate --json report. It counts unreadable inputs; --out writes a report
+only for each readable image. If the report records a skipped, unreadable or cut-off input, unobserved classes
+are marked "unknown".
 
 Output: Markdown, to stdout or --out (LF). Exit status 0; 1 when a --gdk-calls file can't be read. Reads files only.
 Standard library only.
@@ -120,7 +122,7 @@ def read_calls(paths: list[str]) -> tuple[set[str], bool]:
     ids = set()
     complete = True
     for p in paths:
-        with open(p, encoding="utf-8") as f:
+        with open(p, "rb") as f:
             doc = json.load(f)
         if not isinstance(doc, dict):
             raise ValueError(f"{p}: expected a report object")
@@ -185,7 +187,7 @@ def render(notes: list[dict], called: set[str] | None, *, complete: bool = True)
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    ap.add_argument("--gdk-calls", action="append", default=[], help="gdk_runtime_calls.py JSON for the executable")
+    ap.add_argument("--gdk-calls", action="append", default=[], help="gdk_runtime_calls.py JSON (use its --json output for a multi-image scan)")
     ap.add_argument("--out", help="write the checklist here instead of stdout")
     ap.add_argument("--root", default=DEFAULT_ROOT, help="the repository (default: %(default)s)")
     a = ap.parse_args(argv)
