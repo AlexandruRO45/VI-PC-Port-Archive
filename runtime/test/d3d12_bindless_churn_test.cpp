@@ -20,6 +20,7 @@
 // required).
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -32,7 +33,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <string>
 #include <vector>
 
 #ifndef LEONIDA_TEST_CS_SET0_SAMPLE_SPV
@@ -404,8 +404,7 @@ int main(int argc, char** argv) {
     const auto program = fssm_program({0x43530003, 0xbf810000});
     // One folder per process: ctest runs this program twice (d3d12_bindless_churn and _validated), and with -j the
     // first to finish would remove the other's index while it still creates its pipeline.
-    const auto library = std::filesystem::temp_directory_path() /
-                         ("leonida_bindless_churn_test_" + std::to_string(GetCurrentProcessId()));
+    const auto library = testfiles::process_temp_dir("leonida_bindless_churn_test");
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_SPV, library / "cs_set0_sample.spv",
                                std::filesystem::copy_options::overwrite_existing);
