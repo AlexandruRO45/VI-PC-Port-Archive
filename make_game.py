@@ -1586,6 +1586,22 @@ def drop(*paths: str) -> None:
 SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
 
 
+def drop_index(index: str) -> str:
+    """Remove a translated index the next run must not take as finished; "" once it is gone.
+
+    A remove that fails returns a sentence for the stage's failure message instead of raising: on Windows the
+    lock that stopped the index being read or merged (an antivirus scan, the search indexer) usually stops this
+    too, and the PermissionError traceback would hide why the stage failed. The reason is the strerror, not
+    str(error), which quotes the path a second time through repr() (every Windows backslash doubled)."""
+    try:
+        os.remove(index)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f" {index} could not be removed ({error.strerror or error}): delete it before running the shaders stage again."
+    return ""
+
+
 def translator_digest() -> str:
     """SHA-256 over every file directly in tools/: rdna2spirv.py, the modules it imports and the data it reads
     (gfx10_formats.json). Any change there counts, so parts made by other code are never merged with new ones."""
@@ -1700,14 +1716,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     if bad:
         # An older index describes the corpus from the run before: keeping it would make the next run take the
         # failed translation as finished. The next successful --merge writes it again.
-        index = os.path.join(spirv, "index.json")
-        try:
-            os.remove(index)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log(f"  cannot remove the stale {index}: {e}")
-        fail("rdna2spirv.py: " + ", ".join(bad))
+        fail("rdna2spirv.py: " + ", ".join(bad) + "." + drop_index(os.path.join(spirv, "index.json")))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
     index = os.path.join(spirv, "index.json")
     if os.path.isfile(index):
@@ -1716,18 +1725,18 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
             with open(index, encoding="utf-8") as f:
                 merged = json.load(f)
         except (OSError, ValueError) as e:
-            os.remove(index)
-            fail(f"rdna2spirv.py --merge wrote an unreadable {index}: {e}")
+            fail(f"rdna2spirv.py --merge wrote an unreadable {index}: {getattr(e, 'strerror', None) or e}."
+                 + drop_index(index))
         if not merged:
             # A marker left behind would look like a finished translation to the next run; drop it with the failure.
-            os.remove(index)
+            left = drop_index(index)
             # The plan would make the retry reuse the same empty parts even after the disassembly was repaired.
             try:
                 os.remove(plan_path)
             except OSError:
                 pass
             fail("rdna2spirv.py translated 0 shaders, so the empty index is not kept. Run the shaders stage again; "
-                 "if it happens again, the disassembly logged above is why.")
+                 "if it happens again, the disassembly logged above is why." + left)
 
 
 def verify_translation_completeness(dxbc: str, spirv: str) -> None:
@@ -2223,7 +2232,8 @@ def require_translated_shaders(work: str) -> str:
         with open(index, encoding="utf-8") as f:
             translated = json.load(f)
     except (OSError, ValueError) as e:
-        fail(f"The translated shader index {index} is unreadable ({e}): run the shaders stage again.")
+        fail(f"The translated shader index {index} is unreadable ({getattr(e, 'strerror', None) or e}): "
+             "run the shaders stage again.")
     if not translated:
         # A build from before the shaders stage refused an empty merge can carry this marker.
         fail(f"The translated shader index {index} is empty, so there is nothing to check. Run the shaders stage again.")
@@ -2369,7 +2379,7 @@ def pipeline_names(spirv: str) -> "list[str]":
         with open(path, encoding="utf-8") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
-        fail(f"pipelines: cannot read {path}: {e}")
+        fail(f"pipelines: cannot read {path}: {getattr(e, 'strerror', None) or e}")
     if not isinstance(index, dict):
         fail(f"pipelines: {path} must contain a JSON object")
     return sorted(index, key=lambda n: n.encode("utf-8"))
@@ -2607,19 +2617,17 @@ def main() -> int:
     is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")
     game_entries = []
     if is_game_drive_root:
-        try:
-            game_entries = [
-                os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
-                for e in os.listdir(real_game)
-            ]
-        except OSError:
-            game_entries = []
+        # The dump's own top-level names, from the version manifest: os.listdir(real_game) would also count an
+        # unrelated --out or --work folder on the drive, so the rerun that resumes the build was rejected.
+        top_level = {rel.replace("\\", "/").split("/", 1)[0] for rel in [v["expected_exe"], *v["files"]]}
+        game_entries = [os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
+                        for e in sorted(top_level) if e]
     for p in (out, work):
         # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
         real_destination = os.path.normcase(os.path.realpath(p))
         if is_game_drive_root:
             # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
-            # inside the dump's existing top-level entries, but allow separate top-level folders.
+            # inside the dump's own top-level entries, but allow separate top-level folders.
             inside = (real_destination == real_game) or any(
                 path_is_within(real_destination, entry) for entry in game_entries
             )
