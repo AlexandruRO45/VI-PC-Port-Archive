@@ -8,6 +8,18 @@ statistics over the user's own copy — no payload is stored here.
 
 Subject: `story000_script.rpf`, region `0x2000..0x3127000` (51,531,776 bytes), 905 page-blocks.
 
+## Archive coverage
+
+How much of the whole archive that mass is, measured with `tools/rpf9_carve.py` on 1.0.2.1: the archive is
+78,023,040 bytes in the data span. The carver reads 2,632 zlib streams from it — 20,408,094 B stored,
+74,729,504 B inflated, 26.2% of the span — and 5.9% is zero padding. The other **68.0% (53,028,987 B in 41 unread
+ranges)** is what this page is about. One range dominates: 51,707,216 B at offset 688, 7.85 bits per byte over a
+1 MiB sample. The next two are 65,545 B (7.998 bits per byte) and 8,596 B (6.146). So the unidentified encoder
+is not a scattering of small holes; it is one contiguous block that starts a few hundred bytes into the archive.
+
+On the PSIN side of the same archive (`tools/psin_index.py`): 2,309 streams start with `PSIN`, 2,118 complete,
+191 the first 64 KiB of a larger record.
+
 ## Two populations
 
 | population | blocks | bytes | share | decoder |
