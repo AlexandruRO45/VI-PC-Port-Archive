@@ -224,7 +224,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         mocks["pipelines"].assert_not_called()
 
     def test_independent_stages_all_run_when_listed_out_of_order(self):
-        """shaders/assets/runtime overlap; pipelines still runs once shaders (and the checker) are ready.
+        """shaders/assets/runtime overlap; pipelines starts after shaders and a selected runtime finish.
         wave64_settings is patched: left to probe the installed GPU it returns keep_emulated=False on native-wave64
         RDNA2 under the AMD Windows driver, and the test then failed there (TEST-461)."""
         manager = MagicMock()

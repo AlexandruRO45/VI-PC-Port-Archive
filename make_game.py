@@ -27,7 +27,8 @@ Stages (each skips work that is already done, so a stopped build continues where
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 
 shaders, assets and runtime do not depend on each other and run together after check. pipelines starts once the
-translated shaders are ready and vk_pipeline_check exists (from runtime, or already on disk), so it can overlap
+translated shaders are ready and, when this run includes runtime, that stage has finished rebuilding
+vk_pipeline_check (a checker already on disk is enough only when runtime is not selected), so it can overlap
 the rest of assets. When shaders and assets share the machine, --jobs is split between them and passed to
 rpf9dump; a solo assets run still lets rpf9dump use every core.
 
@@ -1788,7 +1789,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
                      fallbacks: tuple[str, ...], overlap: bool = True) -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
-    pipelines starts once shaders and vk_pipeline_check are ready. With overlap=False, stages run in order."""
+    pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
     split = max(1, jobs // len(cpu_heavy)) if (overlap and len(cpu_heavy) > 1) else jobs
     dump_jobs = split if (overlap and len(cpu_heavy) > 1 and "assets" in stages) else None
@@ -1859,10 +1860,12 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         if "pipelines" in stages:
             shaders_ok = wait("shaders") if "shaders" in futures else True
             if shaders_ok:
-                # Checker may already be on disk from an earlier run; only wait on runtime when it is missing.
-                if not pipeline_check_exe() and "runtime" in futures:
-                    wait("runtime")
-                futures["pipelines"] = ex.submit(_invoke_stage, "pipelines", fn_pipelines)
+                # When runtime is in this run it rebuilds vk_pipeline_check at the same path: wait for it so
+                # pipelines does not validate with a stale binary or race the Windows linker. A checker already
+                # on disk is enough only when this run is not rebuilding it.
+                runtime_ok = wait("runtime") if "runtime" in futures else True
+                if runtime_ok:
+                    futures["pipelines"] = ex.submit(_invoke_stage, "pipelines", fn_pipelines)
 
         for name, fut in list(futures.items()):
             try:

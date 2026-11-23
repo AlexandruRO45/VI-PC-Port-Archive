@@ -311,6 +311,44 @@ class SerialOverlapTest(unittest.TestCase):
                     overlap=False)
         self.assertEqual(order, ["shaders", "assets", "runtime", "pipelines"])
 
+    def test_overlap_waits_for_runtime_before_pipelines_even_if_checker_exists(self):
+        """Flyander/#1797: a stale vk_pipeline_check on disk must not start pipelines mid-rebuild."""
+        import threading
+        import time
+
+        order = []
+        lock = threading.Lock()
+
+        def record(name, hold=0.0):
+            def fn(*a, **k):
+                with lock:
+                    order.append(f"start-{name}")
+                if hold:
+                    time.sleep(hold)
+                with lock:
+                    order.append(f"end-{name}")
+            return fn
+
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "g")
+            out = os.path.join(tmp, "o")
+            work = os.path.join(tmp, "w")
+            os.makedirs(game)
+            with mock.patch.object(make_game, "shaders", side_effect=record("shaders")), \
+                    mock.patch.object(make_game, "assets", side_effect=record("assets")), \
+                    mock.patch.object(make_game, "runtime", side_effect=record("runtime", hold=0.15)), \
+                    mock.patch.object(make_game, "pipelines", side_effect=record("pipelines")), \
+                    mock.patch.object(make_game, "log"), \
+                    mock.patch.object(make_game, "pipeline_check_exe", return_value="stale_checker"):
+                make_game.run_build_stages(
+                    ["shaders", "assets", "runtime", "pipelines"],
+                    game=game, work=work, out=out, v={}, wav=False, jobs=2,
+                    runtime_build=None, emulate=False, keep_emulated=True, fallbacks=(),
+                    overlap=True)
+        self.assertIn("end-runtime", order)
+        self.assertIn("start-pipelines", order)
+        self.assertLess(order.index("end-runtime"), order.index("start-pipelines"))
+
 
 class SetupDefaultsTest(unittest.TestCase):
     def test_esc_keeps_clamped_defaults(self):
