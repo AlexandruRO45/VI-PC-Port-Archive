@@ -224,5 +224,19 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(hw["load_d16"][255] & 0xFFFF, 0x3C00)
 
 
+class WriteJsonReportPreserveTest(unittest.TestCase):
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(ip, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    ip.write_json_report(path, {"new": True})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
+
 if __name__ == "__main__":
     unittest.main()
