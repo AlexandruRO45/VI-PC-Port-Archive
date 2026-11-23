@@ -279,3 +279,39 @@ class TestSMovrelsB64Oracle(unittest.TestCase):
         expected = oracle_s_movrels_b64(12, 30, 0, sgprs)
         self.assertEqual(expected[12], 0xDEADBEEF)
         self.assertEqual(expected[13], 0xFEEDFACE)
+
+
+class TestSMovrelsB64AST(unittest.TestCase):
+    def test_ast_structure_and_emission(self):
+        lines = [
+            "s_mov_b32 s20, 0x01020304",
+            "s_mov_b32 s21, 0x05060708",
+            "s_mov_b32 m0, 0",
+            "s_movrels_b64 s[10:11], s[20:21]",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, s11",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b64_ast", lines)
+        self.assertIn("OpAccessChain %_ptr_Function_uint %sgpr", spv)
+
+    def test_ast_execution_semantics(self):
+        lines = [
+            "s_mov_b32 s22, 0x77889900",
+            "s_mov_b32 s23, 0xAABBCCDD",
+            "s_mov_b32 m0, 2",
+            "s_movrels_b64 s[14:15], s[20:21]",
+            "v_mov_b32 v0, s14",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b64_exec", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x77889900)
+        self.assertEqual(out[1], 0xAABBCCDD)
