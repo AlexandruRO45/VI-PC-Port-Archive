@@ -903,5 +903,31 @@ class PackIndexValidationTest(unittest.TestCase):
         self.assertEqual(saves.pack_from_dir(self.extracted), saves.build_jsav(3, 0, [], [], []))
 
 
+class InfoChivesTest(unittest.TestCase):
+    """info() reads a save folder's chives.json. A well-formed JSON that is not an object must be one
+    ERROR line exit 2 (the same convention pack_from_dir uses), not an AttributeError traceback."""
+
+    def run_info(self, folder):
+        return subprocess.run([sys.executable, "-I", TOOL, "info", folder], capture_output=True, text=True)
+
+    def test_a_non_object_chives_is_one_error_line(self):
+        for doc in ([], None, 5, "x", [1, 2]):
+            with self.subTest(doc=doc):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write(os.path.join(tmp, "chives.json"), json.dumps(doc).encode())
+                    r = self.run_info(tmp)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertIn("ERROR:", r.stderr)
+                    self.assertIn("chives.json must be an object", r.stderr)
+
+    def test_an_object_chives_still_reports_the_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(os.path.join(tmp, "chives.json"), json.dumps({"save_directory": "SLOT0"}).encode())
+            r = self.run_info(tmp)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("save folder, dir SLOT0", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -244,6 +244,8 @@ def info(paths):
             cj = os.path.join(p, 'chives.json')
             if os.path.exists(cj):
                 meta = json.loads(read(cj))
+                if not isinstance(meta, dict):
+                    raise ValueError(f'{cj}: chives.json must be an object')
                 print(f'{p}: save folder, dir {meta.get("save_directory")}')
             for name in sorted(os.listdir(p)):
                 fp = os.path.join(p, name)
