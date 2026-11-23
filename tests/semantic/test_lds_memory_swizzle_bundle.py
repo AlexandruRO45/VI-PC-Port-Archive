@@ -373,6 +373,29 @@ class TestDsBPermuteB32Oracle(unittest.TestCase):
         for d in range(32):
             self.assertEqual(out[d], datas[7])
 
+class BPermuteExpr(ASTNode):
+    def __init__(self, offset: int = 0) -> None:
+        self.offset = offset
+
+    def eval(
+        self,
+        addrs: list[int],
+        datas: list[int],
+        exec_mask: int = MASK32,
+        old_dst: list[int] | None = None,
+    ) -> list[int]:
+        return ref_ds_bpermute_b32(addrs, datas, self.offset, exec_mask, old_dst)
+
+
+class TestDsBPermuteB32AST(unittest.TestCase):
+    def test_bpermute_ast_eval(self) -> None:
+        expr = BPermuteExpr(offset=12)  # d reads from (d + 3) % 32
+        addrs = [l * 4 for l in range(32)]
+        datas = [200 + l for l in range(32)]
+        out = expr.eval(addrs, datas)
+        for d in range(32):
+            self.assertEqual(out[d], datas[(d + 3) % 32])
+
 
 if __name__ == "__main__":
     unittest.main()
