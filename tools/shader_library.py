@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fspx_unpack  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 MAGIC = b"PS\x00\x09"
 HEADER = 0x80
@@ -261,6 +262,8 @@ def main(argv=None) -> int:
         ap.error("--jobs must be at least 1")
     if not a.out and not a.save:
         ap.error("give --out, --save or both")
+    if a.save and same_report_path(a.save, a.src):
+        ap.error("--save must not overwrite the input")
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
