@@ -38,6 +38,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -174,11 +175,12 @@ class Collector:
     def panel(self, pid, title, unit, weighted=False):
         self.panels[pid] = {"id": pid, "title": title, "unit": unit, "weighted": weighted}
 
-    def source(self, sid, path, status, records=None, note=None):
+    def source(self, sid, path, status, records=None, note=None, *, label=None):
         rel = None
         if path:
             rel = os.path.relpath(path, ROOT).replace("\\", "/") if inside(path, ROOT) else "<outside>/" + os.path.basename(path)
-        self.sources.append({k: v for k, v in {"id": sid, "path": rel, "status": status, "records": records, "note": note}.items()
+        self.sources.append({k: v for k, v in {"id": sid, "path": rel, "status": status, "records": records,
+                                                "note": note, "label": label}.items()
                              if v is not None})
 
     def add(self, cid, panel, group, name, status, detail=None, weight=None, **attrs):
@@ -454,20 +456,24 @@ def collect_ctest(col, args):
         col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
-    for path in args.junit or []:
+    junit_paths = args.junit or []
+    basename_counts = Counter(os.path.basename(path) for path in junit_paths)
+    for report_number, path in enumerate(junit_paths, 1):
+        basename = os.path.basename(path)
+        source_label = f"junit #{report_number}:{basename}" if basename_counts[basename] > 1 else None
         if not os.path.isfile(path):
-            col.source("junit", path, "missing")
+            col.source("junit", path, "missing", label=source_label)
             continue
         try:
             root = ET.parse(path).getroot()
         except (ET.ParseError, LookupError, ValueError) as e:
-            col.source("junit", path, "invalid", note=str(e))
+            col.source("junit", path, "invalid", note=str(e), label=source_label)
             continue
         # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.
         is_ctest = root.tag == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
         rows = parse_junit(root)
-        sets.append(("junit:" + os.path.basename(path), path, rows, is_ctest))
-        col.source("junit", path, "ok", len(rows))
+        sets.append((source_label or f"junit:{basename}", path, rows, is_ctest))
+        col.source("junit", path, "ok", len(rows), label=source_label)
     for label, path, rows, is_ctest in sets:
         ran = os.path.getmtime(path)
         for name, res, secs, detail in rows:

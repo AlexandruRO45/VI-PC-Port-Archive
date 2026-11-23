@@ -385,7 +385,7 @@ function tables() {
   for (const m of SNAP.metrics) mb.append(el("tr", {}, el("td", {}, m.title), el("td", { class: "mono" }, m.value === null ? "n/a" : el("span", {}, el("span", { class: "minibar" }, el("i", { style: `width:${m.value * 100}%` })), pct(m.value))),
     el("td", { class: "mono" }, `${fmt(m.numerator)} / ${fmt(m.denominator)}`), el("td", {}, m.formula + (m.note ? "; " + m.note : ""))));
   const sb = document.querySelector("#sources tbody");
-  for (const s of SNAP.sources) sb.append(el("tr", {}, el("td", { class: "mono" }, s.id), el("td", {}, el("span", { class: "sw", style: `background:var(--${s.status === "ok" ? "verified" : s.status === "skipped" ? "unknown" : "partial"})` }), " " + s.status),
+  for (const s of SNAP.sources) sb.append(el("tr", {}, el("td", { class: "mono" }, s.label || s.id), el("td", {}, el("span", { class: "sw", style: `background:var(--${s.status === "ok" ? "verified" : s.status === "skipped" ? "unknown" : "partial"})` }), " " + s.status),
     el("td", { class: "mono" }, s.records ?? ""), el("td", { class: "mono" }, s.path || ""), el("td", {}, s.note || "")));
   document.getElementById("notes").textContent = (SNAP.notes || []).join(" · ");
   const latest = (SNAP.github || {}).merged_latest;

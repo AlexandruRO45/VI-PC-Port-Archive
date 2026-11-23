@@ -104,6 +104,28 @@ class Tests(unittest.TestCase):
                  '<testcase classname="tests.a" name="t[1_2]"><skipped/></testcase></testsuite></testsuites>'
         self.assertEqual([(n, r) for n, r, _, _ in pd.parse_junit(pytest)], [("tests.a::t[1-2]", "pass"), ("tests.a::t[1_2]", "skip")])
 
+    def test_same_named_junit_reports_have_distinct_source_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory, "repo")
+            root.mkdir()
+            paths = []
+            for folder, verdict in (("windows", ""), ("wine", "<failure/>")):
+                path = Path(directory, folder, "results.xml")
+                path.parent.mkdir()
+                path.write_text(f'<testsuite><testcase name="loader">{verdict}</testcase></testsuite>',
+                                encoding="utf-8", newline="\n")
+                paths.append(path)
+            col = pd.Collector()
+            with mock.patch.object(pd, "ROOT", root), mock.patch.object(pd, "last_commit_time", return_value=None):
+                pd.collect_ctest(col, SimpleNamespace(junit=paths))
+
+        labels = ["junit #1:results.xml", "junit #2:results.xml"]
+        self.assertEqual([(c["group"], c["status"]) for c in col.components],
+                         [(labels[0], "verified"), (labels[1], "failed")])
+        sources = [s for s in col.sources if s["id"] == "junit"]
+        self.assertEqual([s["label"] for s in sources], labels)
+        self.assertEqual([s["path"] for s in sources], ["<outside>/results.xml"] * 2)
+
     def test_lasttest_log(self):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
