@@ -7,11 +7,14 @@
     and runs the Leonida runtime without triggering the title's 30-second initialization watchdog.
 
 .EXAMPLE
-    .\scripts\run_optimized_rtx5060.ps1 -LeonidaDir "Documents\Leonida" -Mode Run
+    .\scripts\run_optimized_rtx5060.ps1 -Image "game.exe" -Mode Run
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
+    [string]$Image = "",
+
+    [Parameter(Position = 1)]
     [string]$LeonidaDir = "Documents\Leonida",
 
     [ValidateSet("Init", "Run", "DryRun")]
@@ -22,7 +25,10 @@ param(
 
     [int]$ArenaMb = 256,
 
-    [switch]$SkipBarCheck
+    [switch]$SkipBarCheck,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ExtraArgs
 )
 
 $ErrorActionPreference = "Stop"
@@ -98,9 +104,20 @@ $argFlag = switch ($Mode) {
 }
 
 Write-Host "[EXEC] Launching with mode: $argFlag" -ForegroundColor Cyan
+if ($Image) {
+    Write-Host "[EXEC] Image target: $Image" -ForegroundColor Cyan
+}
 Write-Host ""
 
-& $rtExe $argFlag
+$callArgs = @($argFlag)
+if ($Image) {
+    $callArgs += $Image
+}
+if ($ExtraArgs) {
+    $callArgs += $ExtraArgs
+}
+
+& $rtExe @callArgs
 $exitCode = $LASTEXITCODE
 
 Write-Host ""
