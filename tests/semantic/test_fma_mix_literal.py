@@ -134,6 +134,12 @@ class FmaMixLiteralTest(unittest.TestCase):
         stored = program(0x3C000001, words=words, text=text)
         self.assertEqual(self.run_ps(listing(printed), blob(stored)), [f2u(1.0)] * 4)
 
+    def test_lit_around_a_register_is_refused(self):
+        # A register inside lit() is no literal: refused, as before lit() was read (review on #6808).
+        program_ = program(0, words="01 00 20 cc ff 04 02 02", text="v_fma_mix_f32 v1, lit(v2), v2, 0")
+        with self.assertRaises(rdna2spirv.Unsupported):
+            self.run_ps(listing(program_), None)
+
     def test_llvm23_lit_form_with_another_literal_is_refused(self):
         # The text names 3.0, the blob holds a literal whose low half differs: refused, as for the cut form.
         text = "v_fma_mix_f32 v1, lit(0x40400000), v2, 0"

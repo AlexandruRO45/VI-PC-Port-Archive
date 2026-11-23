@@ -164,6 +164,15 @@ class OperandTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(shader_ir.operand(text), shader_ir.operand(plain))
 
+    def test_llvm23_lit_of_a_register_is_not_unwrapped(self):
+        # lit() wraps a constant; a register inside it is not a literal and must not parse as the register (or as a
+        # constant): it keeps the lit(...) text, which the translator refuses as before lit() was read.
+        for text in ("lit(v2)", "lit(s4)", "-lit(v2)", "lit(vcc_lo)"):
+            with self.subTest(text=text):
+                op = shader_ir.operand(text)
+                self.assertNotIn(op["k"], ("vgpr", "sgpr", "imm", "fimm"))
+                self.assertIn("lit(", op.get("t", ""))
+
 
 class SplitArgsTests(unittest.TestCase):
     def test_commas_inside_parentheses_stay_together(self):

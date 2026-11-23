@@ -36,7 +36,8 @@ _INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
 _FLOAT = re.compile(r"-?\d+\.\d+(e[+-]?\d+)?")
 # LLVM 23 prints a literal it could also show as an inline constant as lit(V), e.g. a v_fma_mix* f32 source
 # `lit(0x42200000)`, where LLVM 21 printed the inline constant of the low half (0) and dropped the literal.
-_LIT = re.compile(r"lit\(([^()]+)\)")
+# Only a numeric constant is unwrapped: lit(v2) is no literal and stays raw (Unsupported), as before.
+_LIT = re.compile(r"lit\((-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+(?:e[+-]?\d+)?)?))\)")
 
 
 def operand(tok):
