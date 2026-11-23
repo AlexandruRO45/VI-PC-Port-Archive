@@ -541,6 +541,12 @@ def main(argv=None) -> int:
         print(f"ERROR: {len(failed)} bank(s) could not be read or written, first {os.path.basename(b)}: {e}",
               file=sys.stderr)
         return 1
+    if not os.path.isdir(a.src) and sum(tot.values()) == 0:
+        # A named file that is not a bank (or exports nothing) is a wrong path or format, not an empty success
+        # (awc_manifest / awc_shorts / awc_markers refuse the same input). A directory scan still skips bad banks
+        # among good ones and keeps reporting 0 banks for an empty folder.
+        print(f"awc_opus: error: {a.src}: holds no AWC bank", file=sys.stderr)
+        return 2
     return 0
 
 

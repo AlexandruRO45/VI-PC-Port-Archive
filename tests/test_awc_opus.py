@@ -1144,17 +1144,40 @@ class MalformedBankTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 awc.export_bank(path, os.path.join(tmp, "out"))
 
-    def test_main_skips_bad_bank(self):
+    def test_main_refuses_a_named_file_that_is_not_a_bank(self):
+        # awc_manifest / awc_shorts / awc_markers refuse the same input: a wrong path must not exit 0.
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "bad.awc")
             with open(path, "wb") as f:
                 f.write(b"XATD" + b"\x00" * 60)
-            out = io.StringIO()
+            out_dir = os.path.join(tmp, "out")
+            out, err = io.StringIO(), io.StringIO()
             # --jobs 1: the module is loaded under a private name, which worker processes cannot import
-            argv = ["awc_opus.py", path, os.path.join(tmp, "out"), "--jobs", "1"]
+            argv = ["awc_opus.py", path, out_dir, "--jobs", "1"]
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(awc.main(), 2)
+            self.assertIn("skip bad.awc", out.getvalue())
+            self.assertIn("holds no AWC bank", err.getvalue())
+            self.assertFalse(os.path.isdir(out_dir), "a refused named file must not create <out>")
+
+    def test_main_skips_bad_bank_in_a_directory_scan(self):
+        # Directory scans still skip a bad bank among good ones (and empty folders stay exit 0).
+        with tempfile.TemporaryDirectory() as tmp:
+            banks = os.path.join(tmp, "banks")
+            os.makedirs(banks)
+            with open(os.path.join(banks, "bad.awc"), "wb") as f:
+                f.write(b"XATD" + b"\x00" * 60)
+            good = os.path.join(banks, "good.awc")
+            with open(good, "wb") as f:
+                f.write(build_bank([(1, format_block(1, 48000, 0, 1), struct.pack("<h", 1))]))
+            out_dir = os.path.join(tmp, "out")
+            out = io.StringIO()
+            argv = ["awc_opus.py", banks, out_dir, "--jobs", "1"]
             with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
                 self.assertEqual(awc.main(), 0)
             self.assertIn("skip bad.awc", out.getvalue())
+            self.assertIn("1 WAV", out.getvalue())
 
 
 class WriteFileReadOnlyTest(unittest.TestCase):
