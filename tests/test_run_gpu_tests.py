@@ -107,6 +107,94 @@ class PackedFormatFixture(unittest.TestCase):
             self.assertIn("0/1 passed", output.getvalue())
 
 
+class Minmax16Fixture(unittest.TestCase):
+    """cs_minmax16's row goes through check.minmax16_test, which asks for 32 lanes: where vk_compute_test says it
+    can't pin them, the dump is whatever width the driver picked, and the row is a SKIP (#6903 review)."""
+
+    UNAVAILABLE = "SKIP (the device can't run this shader at 32 lanes on request)"
+    MINMAX16 = list(check.MINMAX16_WORDS) + [0xEEEEEEEE] * 32
+    FILTER = "cs_minmax16"
+
+    def run_suite(self, said, dumps, flip=None):
+        """The fixtures in `dumps` (name -> the words a correct device dumps) over a fake vk_compute_test that answers
+        `said` about the requested subgroup size: the exit status, the output and, per shader, the size the suite
+        asked for (index.json records 32 for each, as the translator does)."""
+        asked = {}
+
+        def translate(_cmd, env=None, gpu=True):
+            for f in os.listdir(rgt.SHADER_DIR):
+                if self.FILTER in f and f.endswith(".asm"):
+                    (Path(work) / "spirv" / (f[:-4] + ".spv")).touch()
+            (Path(work) / "spirv" / "index.json").write_text(json.dumps({n: {"subgroup_size": 32} for n in dumps}))
+            return 0, ""
+
+        def harness(_tool, shader, *args, env=None, cwd=None):
+            name = Path(shader).stem
+            words = list(dumps[name])
+            if flip is not None:
+                words[flip] ^= 1
+            asked[name] = env.get("VKC_SUBGROUP_SIZE")
+            Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(words)}I", *words))
+            return 0, said + "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
+
+        with tempfile.TemporaryDirectory() as work:
+            args = SimpleNamespace(filter=self.FILTER, build=work, llvm_mc="unused")
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(check, "run", side_effect=harness),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, work)
+        return rc, output.getvalue(), asked
+
+    def test_passes_at_the_requested_32_lanes(self):
+        rc, out, asked = self.run_suite("compute subgroup size: 32\n", {"cs_minmax16": self.MINMAX16})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_minmax16", out)
+        self.assertIn("32/32 dumped words exact", out)
+        self.assertIn("1/1 passed", out)
+        self.assertEqual(asked, {"cs_minmax16": "32"})
+
+    def test_a_size_the_device_cannot_pin_is_a_skip_not_a_pass(self):
+        rc, out, asked = self.run_suite("compute subgroup size: 32 not available\n", {"cs_minmax16": self.MINMAX16})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP  cs_minmax16", out)
+        self.assertIn(self.UNAVAILABLE, out)
+        self.assertIn("0/1 passed, 1 skipped", out)
+        self.assertNotIn("PASS  cs_minmax16", out)
+        self.assertEqual(asked, {"cs_minmax16": "32"})
+
+    def test_a_wrong_word_still_fails(self):
+        for word in (0, 31, 32, 63):
+            with self.subTest(word=word):
+                rc, out, _ = self.run_suite("compute subgroup size: 32\n", {"cs_minmax16": self.MINMAX16}, flip=word)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("FAIL  cs_minmax16", out)
+                self.assertIn(f"word {word}: expected", out)
+                self.assertNotIn("skipped", out)
+
+    def test_the_width_independent_fmt_rows_ask_for_no_subgroup_size(self):
+        # dump_test skips a requested size the device can't pin. The cs_fmt_* dumps are the same words at every wave
+        # width, so the suite asks for none there (as check.py's main doesn't): a 64-only GPU or llvmpipe, where the
+        # recorded 32 lanes can't be pinned, keeps judging them instead of losing the rows.
+        dumps = {name: list(words) + [0xEEEEEEEE] * (total - len(words)) for name, words, total in (
+            ("cs_fmt_1010102", check.FMT_1010102_WORDS, 64),
+            ("cs_fmt_sint32", check.FMT_SINT32_WORDS, len(check.FMT_SINT32_WORDS)),
+            ("cs_fmt_int_narrow", check.FMT_INT_NARROW_WORDS, len(check.FMT_INT_NARROW_WORDS)),
+            ("cs_fmt_xy_xyz", check.FMT_XY_XYZ_WORDS, 192),
+            ("cs_fmt_d16_xyz", check.FMT_D16_XYZ_WORDS, len(check.FMT_D16_XYZ_WORDS)))}
+        self.FILTER = "cs_fmt"
+        try:
+            rc, out, asked = self.run_suite("device: fake (subgroup 64..64)\n", dumps)
+        finally:
+            self.FILTER = "cs_minmax16"
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(asked, {name: None for name in dumps})
+        self.assertNotIn("SKIP", out)
+        self.assertNotIn("FAIL", out)
+
+
 class FrameReadbackTest(unittest.TestCase):
     def test_only_a_frame_written_by_this_run_can_pass(self):
         name = "ps_ops"

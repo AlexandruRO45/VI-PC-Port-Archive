@@ -368,7 +368,7 @@ CVT_F32_SAT_CASES = (
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # v_min3/v_max3/v_med3 on f16/i16/u16 (cs_minmax16.asm): two operand triples per op taken from the RDNA2-measured
 # words in tests/semantic/test_alu_min3_max3_med3_16_hw.py, each with op_sel reading the low or the high half of every
-# source and writing the low or the high half of the destination (the other half of v4 is kept). 32 words.
+# source and writing the low or the high half of the destination (the other half of v13 is kept). 32 words.
 MINMAX16_WORDS = [
     0xdeadbc00, 0xdeadbc00, 0x8000beef, 0x8000beef,
     0xdead7c00, 0xdead7c00, 0x7c00beef, 0x7c00beef,
@@ -702,7 +702,8 @@ def failure(code, output, lines):
 
 def dump_test(tools, spirv, name, want, words, env=None):
     """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
-    console dump stops at word 7."""
+    console dump stops at word 7. A subgroup size the run asked for (VKC_SUBGROUP_SIZE) that the device can't pin
+    is a Skip, as in compute_test: the dump would be whatever width the driver picked, not the requested one's."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
         # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
@@ -710,6 +711,8 @@ def dump_test(tools, spirv, name, want, words, env=None):
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
                         "1", "dump", env=child)
         if skip := compute_unsupported(code, out):
+            return skip
+        if skip := unpinned_subgroup_skip(out):
             return skip
         if code:
             return failure(code, out, 3)
@@ -765,7 +768,7 @@ def minmax16_test(tools, spirv, env=None):
     """cs_minmax16.asm: the 32 result words of the eight 16-bit three-operand min/max/median ops over two operand
     triples each, with op_sel on every source and the destination (MINMAX16_WORDS), plus the untouched words after
     them up to the 64-word heap. Wave32, one group: the run is pinned to a 32-wide subgroup like compute_test does,
-    since AMD's default is 64."""
+    since AMD's default is 64, and a device that can't pin 32 is a Skip."""
     env = dict(os.environ if env is None else env)
     env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_minmax16") or 32))
     return dump_test(tools, spirv, "cs_minmax16", MINMAX16_WORDS + [0xEEEEEEEE] * 32, 64, env)

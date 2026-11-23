@@ -18,6 +18,7 @@ import check
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
 GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
 GOOD_TBUFFER_STORE = struct.pack("<192I", *check.TBUFFER_STORE_WORDS, *[0xEEEEEEEE] * 140)
+GOOD_MINMAX16 = struct.pack("<64I", *check.MINMAX16_WORDS, *[0xEEEEEEEE] * 32)
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -35,8 +36,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 17)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all
+         # and cs_minmax16
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -58,7 +60,8 @@ def cvt_answer(env, wrong_for=None):
 
 
 class Wave64Checks(unittest.TestCase):
-    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT)):
+    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT), minmax=""):
+        """minmax: what vk_compute_test said about cs_minmax16's requested subgroup size before the dump (nothing: judged)."""
         def harness(_tool, shader, *args, env=None):
             name = Path(shader).stem
             if name == "cs_fmt_1010102":
@@ -88,6 +91,10 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(check.FMT_ALL_WORDS))))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(check.FMT_ALL_WORDS)}I", *check.FMT_ALL_WORDS))
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
+            if name == "cs_minmax16":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
+                Path(env["VKC_DUMP"]).write_bytes(GOOD_MINMAX16)
+                return 0, minmax + "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
             if name == "cs_heap_init":
                 # The seeded words come back only if check.py wrote the init file and sized the buffer for it.
                 path = (env or {}).get("VKC_HEAP_INIT")
@@ -183,6 +190,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "table_fetch_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -259,6 +267,14 @@ class Wave64Checks(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
 
+    def test_minmax16_skips_where_32_lanes_cannot_be_pinned(self):
+        # #6903 review: dump_test used to drop vk_compute_test's "N not available" line, so an otherwise correct dump
+        # from whatever width the driver picked passed as the 32-lane one.
+        status, out = self.run_checks(*FULL_WAVE, minmax="compute subgroup size: 32 not available\n")
+        self.assertEqual(status, 0, out)
+        self.assertRegex(out, r"cs_minmax16 +SKIP \(the device can't run this shader at 32 lanes on request\)")
+        self.assertIn(f"{TOTAL - 4} of {TOTAL} pass, 4 skipped", out)
+
 
 class FloatToIntSweep(unittest.TestCase):
     """check.cvt_f32_sat_test sends each input in VKC_SGPRS and judges both words of every dispatch."""
@@ -307,6 +323,61 @@ class FloatToIntSweep(unittest.TestCase):
         cases = next(ast.literal_eval(n.value) for n in ast.walk(ast.parse(src))
                      if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "CASES")
         self.assertEqual(tuple(cases), check.CVT_F32_SAT_CASES)
+
+
+class Minmax16Dump(unittest.TestCase):
+    """cs_minmax16 through dump_test with a fake vk_compute_test: judged only at the 32 lanes the helper asks for."""
+
+    def run_dump(self, out, flip=None, env=None):
+        words = list(check.MINMAX16_WORDS) + [0xEEEEEEEE] * 32
+        if flip is not None:
+            words[flip] ^= 1
+        sizes = []
+
+        def harness(_tool, shader, *args, env=None):
+            self.assertEqual((Path(shader).name, args), ("cs_minmax16.spv", ("1", "dump")))
+            self.assertEqual(env["VKC_OUT_WORDS"], "64")
+            sizes.append(env.get("VKC_SUBGROUP_SIZE"))
+            Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *words))
+            return 0, out + "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
+
+        with patch.object(check, "run", side_effect=harness), patch.object(check, "subgroup_size", return_value=32):
+            return check.minmax16_test("tools", "spirv", env), sizes
+
+    def test_judged_at_the_requested_32_lanes(self):
+        # No size line (an older vk_compute_test), the pinned line and MoltenVK's observed one are all judged.
+        for line in ("", "compute subgroup size: 32\n",
+                     "compute subgroup size: 32 (observed: all 32 invocations of a 32x1x1 group)\n"):
+            with self.subTest(line=line):
+                problem, sizes = self.run_dump(line)
+                self.assertEqual(problem, "")
+                self.assertEqual(sizes, ["32"])
+        for word in (0, 31, 32, 63):
+            with self.subTest(word=word):
+                problem, _ = self.run_dump("compute subgroup size: 32\n", flip=word)
+                self.assertNotIsInstance(problem, check.Skip)
+                self.assertTrue(problem.startswith(f"word {word}: expected"), problem)
+
+    def test_a_size_the_device_cannot_pin_is_a_skip_not_a_pass(self):
+        # #6903 review: dump_test dropped the "not available" line, so an otherwise correct dump passed. The 64 is
+        # VKC_SUBGROUP_SIZE forced on a 32-only GPU (the helper's setdefault keeps the caller's size).
+        for size, env in ((32, None), (64, {"VKC_SUBGROUP_SIZE": "64"})):
+            with self.subTest(size=size):
+                problem, sizes = self.run_dump(f"compute subgroup size: {size} not available\n", env=env)
+                self.assertIsInstance(problem, check.Skip)
+                self.assertEqual(problem, f"SKIP (the device can't run this shader at {size} lanes on request)")
+                self.assertEqual(sizes, [str(size)])
+
+    def test_every_dump_that_asks_for_a_size_skips_when_it_cannot_be_pinned(self):
+        # fmt_all_test asks for 32 lanes like minmax16_test, and dump_test itself for whatever its caller passed.
+        unpinned = patch.object(check, "run", return_value=(0, "compute subgroup size: 32 not available\n"))
+        with tempfile.TemporaryDirectory() as tmp, unpinned, patch.object(check, "subgroup_size", return_value=32):
+            self.assertIsInstance(check.fmt_all_test(tmp, tmp), check.Skip)
+            self.assertIsInstance(check.dump_test(tmp, tmp, "cs_fmt_sint32", check.FMT_SINT32_WORDS, 64,
+                                                 {"VKC_SUBGROUP_SIZE": "32"}), check.Skip)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(check, "run", return_value=(0, "exit-free run\n")):
+            self.assertEqual(check.dump_test(tmp, tmp, "cs_fmt_sint32", check.FMT_SINT32_WORDS, 64),
+                             "no VKC_DUMP file written")
 
 
 class MeshWorkgroupChecks(unittest.TestCase):

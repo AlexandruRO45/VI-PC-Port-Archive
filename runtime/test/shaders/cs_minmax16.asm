@@ -1,11 +1,15 @@
 ; v_min3/v_max3/v_med3 on f16, i16 and u16 (docs/design.md row: three-operand 16-bit min/max/median),
 ; run once on a GPU. Each of the eight ops gets two operand triples taken from the RDNA2-measured words in
 ; tests/semantic/test_alu_min3_max3_med3_16_hw.py, each tried with op_sel reading the low or the high half of
-; every source and writing the low or the high half of the destination (the other half of v4 is kept).
-;   out[k] = v4 after the op for case k; operands' unused half is 0xabcd (low read) or 0x1234 (high read).
+; every source and writing the low or the high half of the destination (the other half of v13 is kept).
+;   out[k] = v13 after the op for case k; operands' unused half is 0xabcd (low read) or 0x1234 (high read).
+; One invocation stores: v_cmpx leaves invocation 0 alone for the whole program (as cs_fmt_all.asm does), so no
+; two invocations of the 32-thread group write the same word, which would be a data race under the Vulkan memory
+; model even with equal values.
 ; group: 32,1,1
 ; mattr: +wavefrontsize32,-wavefrontsize64
 ; Run: vk_compute_test cs_minmax16.spv 1 dump -> out[0..31] = <see check.py MINMAX16_WORDS>
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32 v10, 0xabcdbc00
 v_mov_b32 v11, 0xabcd4000
 v_mov_b32 v12, 0xabcd0001

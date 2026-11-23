@@ -1038,31 +1038,36 @@ def run_suite(a, work: str) -> int:
             results.append((name,) + compute_result(rc, msg, rc == 0 and vals == want,
                                                     " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_fmt_1010102":
-            problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
+            # The cs_fmt_* rows ask for no subgroup size: their words don't depend on the wave width, so they are
+            # judged at the device's own width. (check.py's dump_test skips a requested size the device can't pin,
+            # and the 32 lanes index.json records for them can't be pinned on llvmpipe or a 64-only GPU.)
+            problem = fmt_1010102_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
         elif name == "cs_fmt_sint32":
-            problem = fmt_sint32_test(a.build, spirv_dir, cs_env)
+            problem = fmt_sint32_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
         elif name == "cs_fmt_int_narrow":
-            problem = fmt_int_narrow_test(a.build, spirv_dir, cs_env)
+            problem = fmt_int_narrow_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "136/136 dumped words exact"))
         elif name == "cs_fmt_xy_xyz":
             # TEST-185: xy/xyz format loads and stores, words measured natively on a Radeon 680M (the .asm header)
-            problem = fmt_xy_xyz_test(a.build, spirv_dir, cs_env)
+            problem = fmt_xy_xyz_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name == "cs_tbuffer_store":
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
-            problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
+            problem = tbuffer_store_test(a.build, spirv_dir)
         elif name == "cs_fmt_d16_xyz":
             # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
-            problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
+            problem = fmt_d16_xyz_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "80/80 dumped words exact"))
             results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name == "cs_minmax16":
             # docs/design.md row: 16-bit three-operand min/max/median (cs_minmax16.asm header); op_sel on every
-            # source and the destination, two operand triples per op from the RDNA2-measured words.
+            # source and the destination, two operand triples per op from the RDNA2-measured words. The helper asks
+            # for 32 lanes, so its Skip on a device that can't pin them is kept.
             problem = minmax16_test(a.build, spirv_dir, cs_env)
-            results.append((name, not problem, problem or "32/32 dumped words exact"))
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "32/32 dumped words exact"))
         elif name in ("cs_global_neg_offset", "cs_global_mem_ext"):
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
