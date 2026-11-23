@@ -364,6 +364,104 @@ const Kind kinds[] = {
 // Draws per pass; a frame's draws outnumber its other commands.
 constexpr std::uint32_t draws_per_pass = 16;
 
+bool check_draw_attachment_reuse() {
+    Scene scene;
+    scene.resources.at(Scene::color).array_layers = 2;
+    scene.resources.at(Scene::color).mip_levels = 2;
+    scene.resources.at(Scene::depth).array_layers = 2;
+    scene.bare = scene.pipeline;
+    scene.bare.pipeline = fake_handle<VkPipeline>(0x6010);
+    GraphicsPipeline cast = scene.bare;
+    cast.pipeline = fake_handle<VkPipeline>(0x6020);
+    cast.color_formats = {VK_FORMAT_B8G8R8A8_UNORM};
+    constexpr std::uintptr_t cast_id = 0x7002;
+    const auto get_pipeline = scene.vk.graphics_pipeline;
+    scene.vk.graphics_pipeline = [&](std::uintptr_t id) { return id == cast_id ? &cast : get_pipeline(id); };
+    const auto get_view = scene.vk.image_view;
+    std::size_t view_calls = 0;
+    bool fail_mip_view = false;
+    scene.vk.image_view = [&](const ResourceBinding& resource, const VkImageSubresourceRange& range) {
+        ++view_calls;
+        return fail_mip_view && range.baseMipLevel == 1 ? VK_NULL_HANDLE : get_view(resource, range);
+    };
+
+    Draw first{};
+    first.pipeline = Scene::pipeline_id;
+    first.count = 3;
+    first.instances = 1;
+    first.depth = depth_view;
+    first.depth.layer_count = 2;
+    auto views = std::make_shared<DrawViews>();
+    views->render_targets[0] = color_view;
+    views->render_targets[0].layer_count = 2;
+    first.views = views;
+    Draw compatible = first;
+    auto geometry = std::make_shared<DrawViews>(*views);
+    geometry->vertex_buffers[0] = {Scene::geometry_va + 32, 256, 16};
+    compatible.views = geometry;
+    compatible.pipeline = Scene::bare_id;
+    compatible.indexed = true;
+    compatible.index = {Scene::geometry_va + 512, 32, 57};
+    Draw reformat = compatible;
+    reformat.pipeline = cast_id;
+    Draw mip = reformat;
+    auto slice = std::make_shared<DrawViews>(*geometry);
+    slice->render_targets[0] = {Scene::color, 1, 1, 1};
+    mip.views = slice;
+    Draw depth_slice = mip;
+    depth_slice.depth = {Scene::depth, 0, 1, 1};
+    Draw depth_only = depth_slice;
+    auto no_colors = std::make_shared<DrawViews>(*slice);
+    no_colors->render_target_count = 0;
+    depth_only.views = no_colors;
+    Draw no_targets = depth_only;
+    no_targets.depth = {};
+    no_targets.viewport = {0, 0, 32, 16, 0, 1};
+    Draw resized = no_targets;
+    resized.viewport = {0, 0, 48, 24, 0, 1};
+
+    CommandList list;
+    if (!list.draw(first) || !list.draw(first) || !list.draw(compatible) || !list.draw(reformat) || !list.draw(mip) ||
+        !list.draw(depth_slice) || !list.transition({Scene::texture, 0, s::common, s::pixel_shader_resource}) ||
+        !list.draw(depth_slice) || !list.draw(depth_only) || !list.draw(no_targets) || !list.draw(resized) ||
+        !list.close())
+        return false;
+    PreparedList prepared;
+    const auto resolve = [&scene](ResourceId id) { return scene.resolve(id); };
+    if (prepare(list, resolve, scene.vk, prepared) != ReplayResult::success || prepared.draw_count != 10)
+        return false;
+    const auto& d = prepared.draws;
+    const VkImageView first_view = d[0].colors[0].view;
+    if (view_calls != 11) {
+        std::fprintf(stderr, "FAIL draw attachments: expected 11 view lookups, got %zu\n", view_calls);
+        return false;
+    }
+    if (!first_view || d[0].layers != 2 || d[1].colors[0].view != first_view || d[2].colors[0].view != first_view ||
+        d[2].pipeline != scene.bare.pipeline || d[2].vertex_offsets[0] != 32 || d[2].vertex_strides[0] != 16 ||
+        !d[2].index_buffer || d[2].index_offset != 512 || d[3].colors[0].view == first_view ||
+        d[4].colors[0].range.baseMipLevel != 1 || d[4].colors[0].range.baseArrayLayer != 1 ||
+        d[4].layers != 1 || d[4].area.width != 960 || d[4].area.height != 540 ||
+        d[5].depth.range.baseArrayLayer != 1 || d[5].depth.view == d[4].depth.view ||
+        d[7].colors[0].id || !d[7].depth.id || d[8].area.width != 32 || d[8].area.height != 16 ||
+        d[9].area.width != 48 || d[9].area.height != 24)
+        return false;
+
+    // Refill the same PreparedList on further executions, including missing and replaced bindings.
+    auto retired = scene.resources.extract(Scene::color);
+    if (prepare(list, resolve, scene.vk, prepared) != ReplayResult::unresolved_resource) return false;
+    retired.mapped().image = fake_handle<VkImage>(0x5000);
+    scene.resources.insert(std::move(retired));
+    fail_mip_view = true;
+    if (prepare(list, resolve, scene.vk, prepared) != ReplayResult::unsupported) return false;
+    fail_mip_view = false;
+    view_calls = 0;
+    if (prepare(list, resolve, scene.vk, prepared) != ReplayResult::success || view_calls != 11 ||
+        d[0].colors[0].view == first_view)
+        return false;
+    scene.bare.samples = 2;
+    return prepare(list, resolve, scene.vk, prepared) == ReplayResult::invalid_subresource;
+}
+
 // One pass of the frame.
 bool frame_pass(CommandList& l, std::uint32_t pass) {
     const std::uint32_t query = (pass * 2) % Scene::queries;
@@ -595,6 +693,10 @@ int main(int argc, char** argv) {
     const Result f = run(scene, lists, frame, reps, warmup);
     check("frame", f);
     if (self_test) {
+        if (!check_draw_attachment_reuse()) {
+            std::fprintf(stderr, "FAIL draw attachments: reuse changed a prepared draw or its validation\n");
+            ++failures;
+        }
         // A PreparedList keeps its draws' storage from one execution to the next. A draw prepared in an entry an
         // indexed draw with depth used before must not keep that draw's depth attachment or index buffer.
         CommandList earlier, later;

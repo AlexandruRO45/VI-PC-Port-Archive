@@ -2072,10 +2072,79 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
 
 namespace detail {
 
-// Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
-// typeless texture is viewed as the format the pipeline renders.
+inline std::size_t bound_color_slots(const Draw& draw, std::size_t pipeline_slots) {
+    return draw.views ? std::min<std::size_t>(draw.views->render_target_count, pipeline_slots) : 0;
+}
+
+inline bool same_draw_targets(const Draw& a, const Draw& b, std::size_t pipeline_slots) {
+    const auto same_view = [](const TargetView& x, const TargetView& y) {
+        return x.resource == y.resource && x.mip == y.mip && x.first_layer == y.first_layer &&
+               x.layer_count == y.layer_count && x.format == y.format;
+    };
+    if (!same_view(a.depth, b.depth)) return false;
+    if (a.views == b.views) return true;
+    // Geometry can change the DrawViews snapshot without changing any of the output descriptors.
+    const std::size_t count = bound_color_slots(a, pipeline_slots);
+    if (count != bound_color_slots(b, pipeline_slots)) return false;
+    return !count || std::equal(a.views->render_targets.begin(), a.views->render_targets.begin() + count,
+                                b.views->render_targets.begin(), same_view);
+}
+
+// Attachment views take the pipeline's formats, so a typeless texture is viewed as the format it renders.
 template<typename Resolve>
-ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
+ReplayResult prepare_draw_attachments(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk,
+                                     const GraphicsPipeline& pipeline, PreparedDraw& p) {
+    p.area = {UINT32_MAX, UINT32_MAX};
+    std::uint32_t layers = UINT32_MAX;
+    const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {
+        const VkExtent2D e = mip_extent(b, view.mip);
+        p.area = {std::min(p.area.width, e.width), std::min(p.area.height, e.height)};
+        layers = std::min(layers, range.layerCount);
+    };
+
+    p.colors.assign(pipeline.color_formats.size(), {});
+    const std::size_t render_target_count = bound_color_slots(draw, p.colors.size());
+    for (std::size_t slot = 0; slot < render_target_count; ++slot) {
+        const TargetView& target = draw.views->render_targets[slot];
+        if (!target.resource) continue;
+        const ResourceBinding* binding = resolve(target.resource);
+        if (!binding) return ReplayResult::unresolved_resource;
+        auto& a = p.colors[slot];
+        a.binding = *binding;
+        a.id = target.resource;
+        if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+        // D3D12 requires the PSO's SampleDesc on every bound target (a mismatch is undefined); Vulkan's dynamic
+        // rendering requires the counts to agree, so the list fails here instead of in the driver.
+        if (a.binding.samples != pipeline.samples) return ReplayResult::invalid_subresource;
+        if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
+        ResourceBinding viewed = a.binding;
+        if (pipeline.color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline.color_formats[slot];
+        a.view = vk.image_view(viewed, a.range);
+        if (!a.view) return ReplayResult::unsupported;
+        shrink(a.binding, target, a.range);
+    }
+    if (draw.depth.resource && pipeline.depth_format != VK_FORMAT_UNDEFINED) {
+        const ResourceBinding* binding = resolve(draw.depth.resource);
+        if (!binding) return ReplayResult::unresolved_resource;
+        auto& a = p.depth;
+        a.binding = *binding;
+        a.id = draw.depth.resource;
+        if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
+        if (a.binding.samples != pipeline.samples) return ReplayResult::invalid_subresource;
+        if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
+        ResourceBinding viewed = a.binding;
+        viewed.format = pipeline.depth_format;
+        a.view = vk.image_view(viewed, a.range);
+        if (!a.view) return ReplayResult::unsupported;
+        shrink(a.binding, draw.depth, a.range);
+    }
+    p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
+    return ReplayResult::success;
+}
+
+template<typename Resolve>
+ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p,
+                          const Draw* previous_draw, const PreparedDraw* previous) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
         !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
@@ -2090,61 +2159,33 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
-    p.area = {UINT32_MAX, UINT32_MAX};
-    std::uint32_t layers = UINT32_MAX;
-    const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {
-        const VkExtent2D e = mip_extent(b, view.mip);
-        p.area = {std::min(p.area.width, e.width), std::min(p.area.height, e.height)};
-        layers = std::min(layers, range.layerCount);
-    };
-
-    p.colors.assign(pipeline->color_formats.size(), {});
-    const std::uint32_t render_target_count = draw.views ? draw.views->render_target_count : 0;
-    for (std::size_t slot = 0; slot < render_target_count && slot < p.colors.size(); ++slot) {
-        const TargetView& target = draw.views->render_targets[slot];
-        if (!target.resource) continue;
-        const ResourceBinding* binding = resolve(target.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
-        auto& a = p.colors[slot];
-        a.binding = *binding;
-        a.id = target.resource;
-        if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
-        // D3D12 requires the PSO's SampleDesc on every bound target (a mismatch is undefined); Vulkan's dynamic
-        // rendering requires the counts to agree, so the list fails here instead of in the driver.
-        if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
-        if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
-        ResourceBinding viewed = a.binding;
-        if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
-        a.view = vk.image_view(viewed, a.range);
-        if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, target, a.range);
+    const auto* previous_pipeline = previous ? previous->graphics : nullptr;
+    if (previous_pipeline &&
+        (pipeline == previous_pipeline ||
+         (pipeline->samples == previous_pipeline->samples && pipeline->depth_format == previous_pipeline->depth_format &&
+          pipeline->color_formats == previous_pipeline->color_formats)) &&
+        same_draw_targets(draw, *previous_draw, pipeline->color_formats.size())) {
+        p.colors = previous->colors;
+        p.depth = previous->depth;
+        p.area = previous->area;
+        p.layers = previous->layers;
+    } else if (const auto result = prepare_draw_attachments(draw, resolve, vk, *pipeline, p);
+               result != ReplayResult::success) {
+        return result;
     }
-    if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
-        const ResourceBinding* binding = resolve(draw.depth.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
-        auto& a = p.depth;
-        a.binding = *binding;
-        a.id = draw.depth.resource;
-        if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
-        if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
-        if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
-        ResourceBinding viewed = a.binding;
-        viewed.format = pipeline->depth_format;
-        a.view = vk.image_view(viewed, a.range);
-        if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, draw.depth, a.range);
-    }
-    if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
-        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
-                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
-    }
-    p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
+    bool has_attachments = p.depth.id != 0;
     std::uint32_t unbound = 0;
-    for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
+    for (std::size_t slot = 0; slot < p.colors.size(); ++slot) {
+        has_attachments |= p.colors[slot].id != 0;
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
+    }
+    if (!has_attachments) {  // the viewport can change even while all attachments stay unbound
+        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
+                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+    }
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
     if (unbound) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
@@ -2531,7 +2572,7 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
 }
 
 // Resolves and checks every command. Nothing is written to a command buffer.
-// Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown).
+// Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown) stable for this preparation.
 // statistics_helpers promises a statistics segment pool at QueryReplay::plan(). Keep the default for replay()
 // and callers without a summation helper: reject before allocating any helper scratch.
 template<typename Resolve>
@@ -3081,8 +3122,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
+            // Reuse only from an adjacent draw prepared in this invocation. Bindings stay stable until emit.
+            const Draw* previous_draw = i ? std::get_if<Draw>(&commands[i - 1]) : nullptr;
+            const auto* previous = previous_draw ? &out.draws[out.draw_count - 1] : nullptr;
             p.draw = std::uint32_t(out.draw_count++);
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
+            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw, previous_draw, previous);
+                r != ReplayResult::success)
                 return r;
         }
     }
