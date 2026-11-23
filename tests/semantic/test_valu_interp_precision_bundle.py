@@ -191,6 +191,18 @@ class TestInterpMovF32Flat(unittest.TestCase):
             words = support.mrt0_words(spv)
             self.assertEqual(len(words), 4)
 
+class TestInterpMovF32Translator(unittest.TestCase):
+    def test_mov_f32_translator_pipeline(self):
+        code = [
+            "v_interp_mov_f32 v8, p0, attr6.y",
+            "exp mrt0, v8, v8, v8, v8 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mov_f32_trans", code)
+        self.assertIn("OpEntryPoint Fragment", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
