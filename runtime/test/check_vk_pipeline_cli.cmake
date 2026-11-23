@@ -87,3 +87,35 @@ foreach(bytes -1 1.5 4294967296)
     message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
   endif()
 endforeach()
+
+# --memory-cap-mb (process_memory_cap.h). VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE makes setting up the cap fail on
+# every platform. The malformed index tells how far a run got: its error means the check went on past the cap.
+file(WRITE "${TEST_DIR}/index.json" "not JSON\n")
+function(run_with_cap_failure)
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E env VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE=1
+                          ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  set(code "${code}" PARENT_SCOPE)
+  set(log "${log}" PARENT_SCOPE)
+endfunction()
+
+# A cap the caller asked for and can't get is an error, before the index and before any Vulkan call.
+run_with_cap_failure(--memory-cap-mb 1024)
+if(NOT code STREQUAL "2" OR NOT log MATCHES "cannot set the memory cap of --memory-cap-mb 1024"
+   OR log MATCHES "index.json: ")
+  message(FATAL_ERROR "--memory-cap-mb 1024 with a failing cap: expected an error before the index, got ${code}\n${log}")
+endif()
+
+# The default cap failing is a warning (Windows; elsewhere there is no default cap), and the check goes on.
+run_with_cap_failure()
+if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: " OR log MATCHES "cannot set the memory cap")
+  message(FATAL_ERROR "default cap failing: expected a warning and the malformed index, got ${code}\n${log}")
+endif()
+
+# 0 is no cap: nothing is set up, so nothing can fail.
+run_with_cap_failure(--memory-cap-mb 0)
+if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: " OR log MATCHES "memory cap")
+  message(FATAL_ERROR "--memory-cap-mb 0: expected no cap and the malformed index, got ${code}\n${log}")
+endif()
+check_invalid(--memory-cap-mb -1)
+check_invalid(--memory-cap-mb 16GiB)

@@ -45,7 +45,11 @@
 //   --memory-cap-mb N  Windows: cap each checker process at N MiB of committed memory with a job object
 //                 (process_memory_cap.h), so a runaway driver compile fails the checker instead of exhausting the
 //                 system's commit limit (0xC000012D in other programs). Default: the physical memory size; 0 = no
-//                 cap. --isolate children are in the same job. No effect off Windows.
+//                 cap. --isolate children are in the same job. No effect off Windows. When the job can't be set
+//                 up, the default cap is a warning and the check goes on; a cap given with --memory-cap-mb N (N > 0)
+//                 is an error (exit 2) before any Vulkan call, since the caller asked for the containment.
+//   test hook     VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE=1 makes setting up the memory cap fail (on every platform),
+//                 for testing the warning and the error above.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] simulates a process crash
 //                 just before the pipeline of a matching module is created. For testing --isolate and the
 //                 pipelines stage's retry.
@@ -806,6 +810,7 @@ int main(int argc, char** argv) {
     size_t large_module_bytes = 4 * 1024 * 1024;
     unsigned large_parallel = 0;   // 0 = by the memory budget
     uint64_t memory_cap_mb = leonida::default_process_memory_cap() / (1024 * 1024);   // 0 off Windows: no cap
+    bool memory_cap_given = false;   // --memory-cap-mb on the command line: a failure to set it up is an error
     double slow = 30.0;
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
@@ -848,7 +853,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-bytes") valid = number(max_bytes);
         else if (a == "--large-module-bytes") valid = number(large_module_bytes);
         else if (a == "--large-parallel") valid = number(large_parallel);
-        else if (a == "--memory-cap-mb") valid = number(memory_cap_mb);
+        else if (a == "--memory-cap-mb") valid = memory_cap_given = number(memory_cap_mb);
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
@@ -890,7 +895,16 @@ int main(int argc, char** argv) {
     // Before any Vulkan call: the driver's allocations are what the cap is for. A child of --isolate inherits the
     // parent's job and sets its own, nested, with the same value.
     if (memory_cap_mb > UINT64_MAX / (1024 * 1024)) memory_cap_mb = UINT64_MAX / (1024 * 1024);
-    if (std::string cap_error; !leonida::apply_process_memory_cap(memory_cap_mb * 1024 * 1024, cap_error)) {
+    std::string cap_error;
+    const char* simulate_cap_failure = std::getenv("VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE");
+    const bool cap_ok = simulate_cap_failure && *simulate_cap_failure && memory_cap_mb
+                            ? (cap_error = "simulated by VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE", false)
+                            : leonida::apply_process_memory_cap(memory_cap_mb * 1024 * 1024, cap_error);
+    if (!cap_ok && memory_cap_given) {
+        std::fprintf(stderr, "error: cannot set the memory cap of --memory-cap-mb %llu (%s)\n",
+                     static_cast<unsigned long long>(memory_cap_mb), cap_error.c_str());
+        return 2;
+    } else if (!cap_ok) {
         std::fprintf(stderr, "warning: no memory cap (%s); a runaway compile can exhaust the system's memory\n",
                      cap_error.c_str());
     } else if (memory_cap_mb && !iso_child) {
@@ -963,8 +977,10 @@ int main(int argc, char** argv) {
         std::vector<std::string> pass = {"--jobs", std::to_string(jobs), "--slow", std::to_string(slow), "--stage", stage_filter,
                                          "--max-bytes", std::to_string(max_bytes),
                                          "--large-module-bytes", std::to_string(large_module_bytes),
-                                         "--large-parallel", std::to_string(large_parallel),
-                                         "--memory-cap-mb", std::to_string(memory_cap_mb)};
+                                         "--large-parallel", std::to_string(large_parallel)};
+        // Only an explicit cap goes to the children, so it stays an error there too; without one they take the same
+        // default, and a failure to set it stays a warning.
+        if (memory_cap_given) pass.insert(pass.end(), {"--memory-cap-mb", std::to_string(memory_cap_mb)});
         if (cache_feedback) pass.push_back("--cache-feedback");
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
