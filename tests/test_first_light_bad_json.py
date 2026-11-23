@@ -10,6 +10,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -99,6 +104,21 @@ class CliBadJsonTests(unittest.TestCase):
         proc = self.list_cli()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.splitlines(), ["vs a", "ps b"])
+
+    @staticmethod
+    def _deep_json(depth: int) -> str:
+        """A JSON array nested `depth` levels deep."""
+        return "[" * depth + "]" * depth
+
+    def test_check_reports_a_deeply_nested_manifest(self):
+        path = self.bad_manifest(self._deep_json(100000))
+        self.assert_one_clean_line(self.check_cli(), path)
+        self.assertIn("nesting is too deep", self.check_cli().stderr)
+
+    def test_list_reports_a_deeply_nested_index(self):
+        path = self.bad_index(self._deep_json(100000))
+        self.assert_one_clean_line(self.list_cli(), path)
+        self.assertIn("nesting is too deep", self.list_cli().stderr)
 
 
 if __name__ == "__main__":

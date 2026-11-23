@@ -874,6 +874,8 @@ def load_json(
         raise SystemExit(
             f"the {kind} {path} is not valid JSON ({e.msg} at line {e.lineno} column {e.colno})"
         ) from e
+    except RecursionError as e:
+        raise SystemExit(f"the {kind} {path} is not valid JSON: nesting is too deep") from e
     if not isinstance(data, expect):
         raise SystemExit(f"the {kind} {path} is a {type(data).__name__}, expected {wanted}")
     if expect is dict:
