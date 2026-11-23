@@ -1,4 +1,4 @@
-"""Reject repeated literal opcode cases in Gen._insn's if/elif chains.
+"""Reject repeated literal opcode cases in the translator's if/elif dispatchers.
 
     python -I tests/test_opcode_dispatch.py
 
@@ -6,6 +6,8 @@ A repeated opcode makes its later branch unreachable, as happened when two class
 handled v_cmp_class_f64 / v_cmpx_class_f64. Read the AST without importing the translator or requiring game files,
 LLVM, SPIRV-Tools or a GPU. Only bare ``op == '...'`` and ``op in (...)`` conditions with literal strings count:
 operand/stage guards can intentionally handle the same opcode, and separate chains are independent.
+Check Gen._insn, lds_op, x_memory_order, image_op, image_misc and gs_ds, including a negative control that injects
+a duplicate into each method's real AST in memory.
 """
 import ast
 import os
@@ -13,6 +15,7 @@ import textwrap
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DISPATCHERS = ("_insn", "lds_op", "x_memory_order", "image_op", "image_misc", "gs_ds")
 
 
 def literal_opcodes(test):
@@ -54,6 +57,27 @@ def repeated_opcodes(function):
     return repeated
 
 
+def dispatcher_issues(tree):
+    """Method name -> integrity problem, including missing or no-longer-checkable dispatchers."""
+    gen = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Gen"), None)
+    if gen is None:
+        return {"Gen": "Missing translator class Gen; update the dispatcher check"}
+    methods = {node.name: node for node in gen.body if isinstance(node, ast.FunctionDef)}
+    issues = {}
+    for name in DISPATCHERS:
+        function = methods.get(name)
+        if function is None:
+            issues[name] = f"Missing Gen.{name}; update the dispatcher check"
+        elif not any(literal_opcodes(node.test) for node in ast.walk(function) if isinstance(node, ast.If)):
+            issues[name] = f"Gen.{name} has no bare literal opcode cases; update the dispatcher check"
+        else:
+            repeated = repeated_opcodes(function)
+            if repeated:
+                issues[name] = f"Repeated opcode cases in Gen.{name}: " + "; ".join(
+                    f"{op} at lines {first} and {again}" for op, first, again in repeated)
+    return issues
+
+
 def sample(body):
     """A hand-written dispatcher for the checker's positive and negative controls."""
     source = "def dispatch(op, stage=None):\n" + textwrap.indent(textwrap.dedent(body), "    ")
@@ -61,6 +85,17 @@ def sample(body):
 
 
 class OpcodeDispatchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(ROOT, "tools", "rdna2spirv.py")
+        with open(path, encoding="utf-8") as f:
+            cls.translator = ast.parse(f.read(), filename=path)
+
+    @staticmethod
+    def sample_dispatchers():
+        return ast.parse("class Gen:\n" + "".join(
+            f"    def {name}(self, op):\n        if op == 'v_alpha_b32': pass\n" for name in DISPATCHERS))
+
     def test_repeated_equality_reports_both_lines(self):
         function = sample("""\
             if op == 'v_alpha_b32': pass
@@ -142,16 +177,49 @@ class OpcodeDispatchTests(unittest.TestCase):
         self.assertEqual(repeated_opcodes(sample("if op in ('v_alpha_b32', 'v_alpha_b32'): pass\n")), [])
 
     def test_translator_has_no_repeated_literal_dispatch_cases(self):
-        path = os.path.join(ROOT, "tools", "rdna2spirv.py")
-        with open(path, encoding="utf-8") as f:
-            tree = ast.parse(f.read(), filename=path)
-        gen = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Gen")
-        function = next(node for node in gen.body if isinstance(node, ast.FunctionDef) and node.name == "_insn")
-        self.assertTrue(any(literal_opcodes(node.test) for node in ast.walk(function) if isinstance(node, ast.If)),
-                        "Gen._insn has no bare literal opcode cases; update the dispatcher check")
-        repeated = repeated_opcodes(function)
-        self.assertEqual(repeated, [], "Repeated opcode cases in tools/rdna2spirv.py Gen._insn: " +
-                         "; ".join(f"{op} at lines {first} and {again}" for op, first, again in repeated))
+        issues = dispatcher_issues(self.translator)
+        self.assertEqual(issues, {}, "Literal opcode dispatch issues in tools/rdna2spirv.py: " +
+                         "; ".join(issues.values()))
+
+    def test_each_dispatcher_rejects_an_injected_duplicate(self):
+        gen = next(node for node in self.translator.body if isinstance(node, ast.ClassDef) and node.name == "Gen")
+        methods = {node.name: node for node in gen.body if isinstance(node, ast.FunctionDef)}
+        for name in DISPATCHERS:
+            with self.subTest(method=name):
+                branch = next(node for node in ast.walk(methods[name])
+                              if isinstance(node, ast.If) and literal_opcodes(node.test))
+                opcode = sorted(literal_opcodes(branch.test))[0]
+                tail = branch.orelse
+                duplicate = ast.If(test=ast.parse(f"op == {opcode!r}", mode="eval").body,
+                                   body=[ast.Pass()], orelse=tail, lineno=branch.lineno + 1)
+                branch.orelse = [duplicate]
+                try:
+                    issues = dispatcher_issues(self.translator)
+                    expected = f"Repeated opcode cases in Gen.{name}: {opcode} at lines "
+                    self.assertIn(expected + f"{branch.lineno} and {duplicate.lineno}", issues.get(name, ""))
+                finally:
+                    branch.orelse = tail
+        self.assertEqual(dispatcher_issues(self.translator), {})
+
+    def test_missing_dispatcher_is_reported(self):
+        for name in DISPATCHERS:
+            with self.subTest(method=name):
+                tree = self.sample_dispatchers()
+                tree.body[0].body = [node for node in tree.body[0].body if node.name != name]
+                self.assertEqual(dispatcher_issues(tree), {name: f"Missing Gen.{name}; update the dispatcher check"})
+
+    def test_dispatcher_without_literal_cases_is_reported(self):
+        for name in DISPATCHERS:
+            with self.subTest(method=name):
+                tree = self.sample_dispatchers()
+                function = next(node for node in tree.body[0].body if node.name == name)
+                function.body = [ast.Pass()]
+                self.assertEqual(dispatcher_issues(tree), {
+                    name: f"Gen.{name} has no bare literal opcode cases; update the dispatcher check"})
+
+    def test_missing_gen_is_reported(self):
+        self.assertEqual(dispatcher_issues(ast.parse("")), {
+            "Gen": "Missing translator class Gen; update the dispatcher check"})
 
 
 if __name__ == "__main__":
