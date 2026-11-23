@@ -251,6 +251,16 @@ def load_names(path):
     return out, duplicates, malformed
 
 
+def _measurable(p):
+    """True when placement ``p`` has a three-number position and its rotation and scales, when present, are finite.
+    A NaN would make every distance from it NaN, and min() over the placements would then depend on their order."""
+    pos = p["position"]
+    if pos is None or len(pos) != 3:
+        return False
+    values = list(pos) + list(p.get("rotation") or ()) + [p.get(k) for k in ("scale_xy", "scale_z")]
+    return all(v is None or math.isfinite(v) for v in values)
+
+
 def _local(q, p, r):
     d = [q[i] - p[i] for i in range(3)]
     return [sum(r[j][i] * d[j] for j in range(3)) for i in range(3)]  # R^T (q - p)
@@ -337,7 +347,7 @@ def resolve(names, found, duplicate_keys=0, malformed_positions=0):
         pv = summary["positions_vs_placements"]
         pv["equal" if len(positions) == len(pl) else "more_positions" if len(positions) > len(pl)
            else "fewer_positions"] += 1
-        positioned = [p for p in pl if p["position"] is not None and len(p["position"]) == 3]
+        positioned = [p for p in pl if _measurable(p)]
         if not positioned:  # no placement to measure from; counted instead of failing the whole run
             summary["keys_without_a_placement_position"] += 1
             continue

@@ -247,6 +247,27 @@ class ResolveTest(unittest.TestCase):
         s, _ = T.resolve({KEY_A: [[0.0, 0.0, 0.0]]}, {0: ([d2], [p])})
         self.assertEqual(s["keys_without_a_placement_position"], 1)
 
+    def test_non_finite_placement_is_not_measured_from(self):
+        # A NaN made every distance NaN, and min() over the placements then depended on their order: with the bad
+        # placement first the key came out as 0 m (inside its box), with it last as 9 m from the good copy.
+        nan, inf = float("nan"), float("inf")
+        unit = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])
+        d = {"name": HA, "keys": {}, "bb_min": unit[0], "bb_max": unit[1], "rooms": []}
+        good = {"archetype": HA, "position": [10.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale_xy": 1.0, "scale_z": 1.0}
+        for bad in (dict(good, position=[nan, 0.0, 0.0]), dict(good, rotation=[nan, 0.0, 0.0, 1.0]),
+                    dict(good, rotation=[inf, 0.0, 0.0, 1.0]), dict(good, scale_xy=nan), dict(good, scale_z=inf)):
+            for order in ([bad, good], [good, bad]):
+                s, rows = T.resolve({KEY_A: [[0.0, 0.0, 0.0]]}, {0: ([d], order)})
+                self.assertEqual(rows[KEY_A]["outside_box_m_stored"], [9.0], order)
+                self.assertEqual(rows[KEY_A]["outside_box_m_conjugate"], [9.0], order)
+                self.assertEqual(s["distance_outside_own_interior_box"]["stored"]["within_m"]["0"], 0, order)
+            # With no finite placement left the key is counted like one whose placements have no position.
+            s, rows = T.resolve({KEY_A: [[0.0, 0.0, 0.0]]}, {0: ([d], [bad])})
+            self.assertEqual(s["keys_without_a_placement_position"], 1, bad)
+            self.assertNotIn("outside_box_m_stored", rows[KEY_A])
+            self.assertEqual(s["distance_outside_own_interior_box"]["stored"]["n"], 0)
+
     def test_scaled_box_negative_and_missing_scale(self):
         lo, hi = [-1.0, -2.0, 0.0], [3.0, 2.0, 4.0]
         self.assertEqual(T._scaled(lo, hi, {"scale_xy": -2.0, "scale_z": 0.5}), ([-6.0, -4.0, 0.0], [2.0, 4.0, 2.0]))
