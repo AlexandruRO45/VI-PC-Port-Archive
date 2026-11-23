@@ -438,5 +438,97 @@ class TestSIMDDivergence(unittest.TestCase):
         self.assertEqual(res, expected_agreement)
         self.assertEqual(wave.get_sgpr(6), expected_agreement)
 
+
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0_in_place(self) -> None:
+        """Verify s0 = s_xnor_b32(s0, s1) correctly reads prior s0 before overwriting."""
+        state = ScalarMachineState()
+        init_s0 = 0x12345678
+        init_s1 = 0x87654321
+        state.set_sgpr(0, init_s0)
+        state.set_sgpr(1, init_s1)
+
+        interp = ScalarInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(0), src0=SGPR(0), src1=SGPR(1))
+        res = interp.step(instr, state)
+
+        expected = ~(init_s0 ^ init_s1) & MASK32
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_sgpr(0), expected)
+
+        lines = [
+            f"s_mov_b32 s0, {init_s0:#x}",
+            f"s_mov_b32 s1, {init_s1:#x}",
+            "s_xnor_b32 s0, s0, s1",
+            "v_mov_b32 v0, s0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_dst_src0", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], expected)
+
+    def test_alias_dst_equals_src1_in_place(self) -> None:
+        """Verify s1 = s_xnor_b32(s0, s1) correctly reads prior s1 before overwriting."""
+        state = ScalarMachineState()
+        init_s0 = 0xA5A5A5A5
+        init_s1 = 0x5A5A5A5A
+        state.set_sgpr(0, init_s0)
+        state.set_sgpr(1, init_s1)
+
+        interp = ScalarInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(1), src0=SGPR(0), src1=SGPR(1))
+        res = interp.step(instr, state)
+
+        expected = ~(init_s0 ^ init_s1) & MASK32
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_sgpr(1), expected)
+
+        lines = [
+            f"s_mov_b32 s0, {init_s0:#x}",
+            f"s_mov_b32 s1, {init_s1:#x}",
+            "s_xnor_b32 s1, s0, s1",
+            "v_mov_b32 v0, s1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_dst_src1", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], expected)
+
+    def test_alias_all_operands_identical(self) -> None:
+        """Verify s0 = s_xnor_b32(s0, s0) results in 0xFFFFFFFF and SCC = 1 for any s0."""
+        for val in [0x00000000, 0x12345678, 0xFFFFFFFF, 0xDEADBEEF]:
+            state = ScalarMachineState()
+            state.set_sgpr(0, val)
+
+            interp = ScalarInterpreter()
+            instr = SXnorB32Instruction(dst=SGPR(0), src0=SGPR(0), src1=SGPR(0))
+            res = interp.step(instr, state)
+
+            self.assertEqual(res, 0xFFFFFFFF)
+            self.assertEqual(state.get_sgpr(0), 0xFFFFFFFF)
+            self.assertEqual(state.scc, 1)
+
+            lines = [
+                f"s_mov_b32 s0, {val:#x}",
+                "s_xnor_b32 s0, s0, s0",
+                "s_cselect_b32 s1, 1, 0",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, s1",
+                "v_mov_b32 v2, 0",
+                "v_mov_b32 v3, 0",
+                "exp mrt0 v0, v1, v2, v3 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_alias_all_{val:x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], 0xFFFFFFFF)
+            self.assertEqual(words[1], 1)
+
 if __name__ == "__main__":
     unittest.main()
