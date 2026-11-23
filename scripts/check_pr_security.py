@@ -434,7 +434,53 @@ def check_pins(pins, remote=ACTION_REMOTE):
 
 # A maintainer who has read a change marks that exact commit as reviewed with a label named for it. The label names
 # the commit, so a push after the review is not covered by it, and a fork can't add labels to its own pull request.
-OVERRIDE_LABEL = re.compile(r"^security-reviewed:([0-9a-f]{7,40})$")
+# At least 16 hex digits: a commit whose SHA starts with the same 7 can be ground out in minutes, 16 can't. (GitHub
+# caps a label at 50 characters, so the full 40 don't fit after the prefix.) Who added the label is checked too: see
+# override_authorized().
+OVERRIDE_LABEL = re.compile(r"^security-reviewed:([0-9a-f]{16,40})$")
+
+
+def codeowners(path):
+    """The user logins in a CODEOWNERS file (teams, `@org/team`, can't be checked without more access, so they don't
+    count). The file is read from the base branch's checkout, which a pull request can't change."""
+    owners = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                for word in line.split("#", 1)[0].split()[1:]:
+                    if re.match(r"^@[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$", word):
+                        owners.add(word[1:].lower())
+    except OSError:
+        pass
+    return owners
+
+
+def read_label_events(path):
+    """[(login, label, time)] of the `labeled` events in a file of `gh api --paginate` issue-event pages."""
+    import json
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    decoder, index, events = json.JSONDecoder(), 0, []
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        page, index = decoder.raw_decode(text, index)
+        for event in page if isinstance(page, list) else [page]:
+            if isinstance(event, dict) and event.get("event") == "labeled":
+                events.append((str((event.get("actor") or {}).get("login") or ""),
+                               str((event.get("label") or {}).get("name") or ""), str(event.get("created_at") or "")))
+    return events
+
+
+def override_authorized(label, events, owners):
+    """(ok, who): whether the latest time `label` was added, a code owner added it."""
+    added = sorted((when, who) for who, name, when in events if name == label)
+    if not added:
+        return False, ""
+    who = added[-1][1]
+    return who.lower() in owners, who
 
 
 def override_label(event):
@@ -761,6 +807,13 @@ def scan(repo, base, head, check_tags=False, action_remote=ACTION_REMOTE, messag
         findings += check_path(status, old_mode, new_mode, path, head_bytes)
         if old_mode in ("100644", "100755"):
             findings += doc_wipe(repo, old, new, status, path, old_sha)
+        # A file no scanner here can read is listed, so a person looks at it (the xz backdoor hid in binary test
+        # files). An executable is already blocked above.
+        if is_blob and new_mode in ("100644", "100755") and b"\0" in head_bytes and \
+                not any(f.path == path and f.rule == "executable" for f in findings):
+            findings.append(Finding(path, None, REVIEW, "not-inspected",
+                                    "a binary file (%d bytes) that none of the scanners read; check what it is and "
+                                    "why it is needed" % size))
         if gone or not is_blob or new_mode == "120000" or b"\0" in head_bytes:
             continue
         if size > MAX_SCAN_BYTES:
@@ -952,10 +1005,16 @@ def read_semgrep(path, root=""):
             report = json.load(f)
         results = report["results"]
     except (OSError, ValueError, KeyError, TypeError) as error:
-        return [Finding("<semgrep>", None, REVIEW, "scanner-did-not-run",
-                        "Semgrep's results could not be read (%s); its rules did not check this change" %
-                        type(error).__name__)]
+        # Fail closed: a scan that didn't happen is not a pass. Rerun the job, or a maintainer overrides it.
+        return [Finding("<semgrep>", None, BLOCK, "scanner-did-not-run",
+                        "Semgrep's results could not be read (%s), so its rules did not check this change; rerun "
+                        "the job" % type(error).__name__)]
     found = []
+    errors = report.get("errors") if isinstance(report, dict) else None
+    if isinstance(errors, list) and errors:
+        found.append(Finding("<semgrep>", None, REVIEW, "scanner-incomplete",
+                             "Semgrep could not analyse everything (%d error%s, e.g. a file it couldn't parse or a "
+                             "timeout); read those files by hand" % (len(errors), "" if len(errors) == 1 else "s")))
     for result in results if isinstance(results, list) else ():
         try:
             rel = tool_path(result["path"], root)
@@ -980,9 +1039,9 @@ def read_gitleaks(path, root=""):
         if not isinstance(report, list):
             raise TypeError("not a list")
     except (OSError, ValueError, TypeError) as error:
-        return [Finding("<gitleaks>", None, REVIEW, "scanner-did-not-run",
-                        "Gitleaks's results could not be read (%s); it did not check this change" %
-                        type(error).__name__)]
+        return [Finding("<gitleaks>", None, BLOCK, "scanner-did-not-run",
+                        "Gitleaks's results could not be read (%s), so it did not check this change; rerun the job"
+                        % type(error).__name__)]
     found = []
     for leak in report:
         try:
@@ -1091,7 +1150,12 @@ def main(argv=None):
                         help="also print GitHub Actions annotations and write $GITHUB_STEP_SUMMARY")
     parser.add_argument("--github-event", metavar="PATH",
                         help="a pull_request event file ($GITHUB_EVENT_PATH): scan its title and description, and "
-                             "honour a security-reviewed:<head sha> label")
+                             "honour a security-reviewed:<head sha> label added by a code owner (needs --label-events)")
+    parser.add_argument("--label-events", metavar="FILE",
+                        help="the pull request's issue events (gh api --paginate .../issues/N/events), to check who "
+                             "added the override label")
+    parser.add_argument("--codeowners", default=os.path.join(".github", "CODEOWNERS"), metavar="FILE",
+                        help="who may add the override label (default: %(default)s, from the base branch)")
     parser.add_argument("--check-action-tags", action="store_true",
                         help="check that each pinned action the change adds is the commit its # vX.Y.Z comment names "
                              "(reads the action repository's tags with git ls-remote)")
@@ -1142,6 +1206,21 @@ def main(argv=None):
     except (OSError, ValueError) as error:
         print("check_pr_security: %s" % visible(str(error), 2000), file=sys.stderr)
         return 2
+    if override:
+        # Only a code owner's label waives anything; without the events to check that, nothing is waived.
+        try:
+            ok, who = override_authorized(override, read_label_events(args.label_events), codeowners(args.codeowners)) \
+                if args.label_events else (False, "")
+        except (OSError, ValueError) as error:
+            ok, who = False, ""
+            print("check_pr_security: label events: %s" % visible(str(error), 300), file=sys.stderr)
+        if not ok:
+            findings.append(Finding("<pull request labels>", None, REVIEW, "override-not-authorized",
+                                    "the label %s was not added by someone in .github/CODEOWNERS (%s), so it waives "
+                                    "nothing" % (override, ("added by " + who) if who else "who added it is unknown")))
+            override = None
+        else:
+            override = "%s (added by %s)" % (override, who)
     if override:
         for finding in findings:
             if finding.level == BLOCK:

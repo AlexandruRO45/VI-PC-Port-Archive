@@ -20,8 +20,9 @@ Thanks for helping. A few rules keep the project safe to host:
   for the reviewer. CI also runs Semgrep (the rules are in the script, `SEMGREP_RULES`) and Gitleaks on the changed
   files, offline in pinned containers, and reports what they find on added lines the same way. Run the line checks
   before you push: `python -I scripts/check_pr_security.py origin/main HEAD`. A maintainer
-  who has read a `block` finding and accepts it adds the label `security-reviewed:<head sha>`; it covers that commit
-  only.
+  who has read a `block` finding and accepts it adds the label `security-reviewed:<head sha>` (16 or more hex digits);
+  it covers that commit only, and only counts when someone listed in `.github/CODEOWNERS` added it. A scanner that
+  fails blocks the pull request until the job is rerun.
 
 ## Before you start
 

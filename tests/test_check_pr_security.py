@@ -424,46 +424,91 @@ def event(head, labels=(), title="t", body=""):
 
 class Override(ScanTest):
     HEAD = "0123456789abcdef0123456789abcdef01234567"
+    PREFIX16 = "security-reviewed:0123456789abcdef"
 
-    def test_the_label_must_name_the_head(self):
-        self.assertEqual(cps.override_label(event(self.HEAD, ["bug", "security-reviewed:0123456"])),
-                         "security-reviewed:0123456")
+    def test_the_label_must_name_the_head_with_16_or_more_digits(self):
+        self.assertEqual(cps.override_label(event(self.HEAD, ["bug", self.PREFIX16])), self.PREFIX16)
         self.assertEqual(cps.override_label(event(self.HEAD, ["security-reviewed:" + self.HEAD])),
                          "security-reviewed:" + self.HEAD)
-        for label in ("security-reviewed", "security-reviewed:012345", "security-reviewed:fedcba9",
-                      "security-reviewed:0123456 ", "Security-Reviewed:0123456"):
+        # 7 digits can be matched by a commit ground out for it, so they no longer count.
+        for label in ("security-reviewed", "security-reviewed:0123456", "security-reviewed:0123456789abcde",
+                      "security-reviewed:fedcba9876543210", self.PREFIX16 + " ", "Security-Reviewed:0123456789abcdef"):
             self.assertIsNone(cps.override_label(event(self.HEAD, [label])), label)
         self.assertIsNone(cps.override_label({"pull_request": {"head": {"sha": "nope"}, "labels": []}}))
         self.assertIsNone(cps.override_label([]))
 
-    def run_with_event(self, changes, labels, **kw):
+    def test_only_a_code_owners_latest_label_counts(self):
+        owners = {"maintainer"}
+        events = [("intruder", "security-reviewed:abc", "2026-01-01T00:00:00Z"),
+                  ("maintainer", "security-reviewed:abc", "2026-01-02T00:00:00Z")]
+        self.assertEqual(cps.override_authorized("security-reviewed:abc", events, owners), (True, "maintainer"))
+        later = events + [("intruder", "security-reviewed:abc", "2026-01-03T00:00:00Z")]
+        self.assertEqual(cps.override_authorized("security-reviewed:abc", later, owners), (False, "intruder"))
+        self.assertEqual(cps.override_authorized("security-reviewed:abc", [], owners), (False, ""))
+
+    def test_codeowners_logins(self):
+        path = os.path.join(self.repo.dir, "CODEOWNERS")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# @commented-out\n/.github/   @Maintainer  @org/team\n*.ps1 @other # @not-this\n")
+        self.assertEqual(cps.codeowners(path), {"maintainer", "other"})
+        self.assertEqual(cps.codeowners(os.path.join(self.repo.dir, "missing")), set())
+
+    def test_label_events_from_paginated_pages(self):
+        path = os.path.join(self.repo.dir, "events.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write('[{"event": "labeled", "actor": {"login": "a"}, "label": {"name": "x"}, "created_at": "1"}]\n'
+                    '[{"event": "unlabeled", "actor": {"login": "b"}, "label": {"name": "x"}, "created_at": "2"},'
+                    ' {"event": "labeled", "actor": {"login": "c"}, "label": {"name": "y"}, "created_at": "3"}]')
+        self.assertEqual(cps.read_label_events(path), [("a", "x", "1"), ("c", "y", "3")])
+
+    def run_with_event(self, changes, labels, labeler="maintainer", events=True, **kw):
+        import json
         self.repo.files = dict(self.base_files)
         head = self.repo.commit(changes, parents=[self.base])
+        names = [l.replace("HEAD", head[:16]) for l in labels]
         path = os.path.join(self.repo.dir, "event.json")
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            import json
-            json.dump(event(head, [l.replace("HEAD", head[:9]) for l in labels], **kw), f)
+            json.dump(event(head, names, **kw), f)
+        owners = os.path.join(self.repo.dir, "CODEOWNERS")
+        with open(owners, "w", encoding="utf-8", newline="\n") as f:
+            f.write("/.github/ @Maintainer\n")
+        args = ["--codeowners", owners]
+        if events:
+            events_path = os.path.join(self.repo.dir, "events.json")
+            with open(events_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"event": "labeled", "actor": {"login": labeler}, "label": {"name": n},
+                            "created_at": "2026-01-01T00:00:00Z"} for n in names], f)
+            args += ["--label-events", events_path]
         summary = os.path.join(self.repo.dir, "summary.md")
         env = dict(git_env(), GITHUB_STEP_SUMMARY=summary)
         result = subprocess.run([sys.executable, "-I", SCRIPT, "--repo", self.repo.dir, "--github", "--github-event",
-                                 path, self.base, head], capture_output=True, text=True, encoding="utf-8",
+                                 path] + args + [self.base, head], capture_output=True, text=True, encoding="utf-8",
                                 errors="replace", env=env)
         with open(summary, encoding="utf-8") as f:
             return result, f.read()
 
-    def test_a_label_for_the_head_turns_blocks_into_a_pass(self):
+    def test_a_code_owners_label_for_the_head_turns_blocks_into_a_pass(self):
         bad = {"tools/x.py": "x = '" + RLO + "'\n"}
         result, _ = self.run_with_event(bad, [])
         self.assertEqual(result.returncode, 1, result.stdout)
         result, text = self.run_with_event(bad, ["security-reviewed:HEAD"])
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("block (overridden) hidden-unicode", result.stdout)
+        self.assertIn("added by maintainer", result.stdout)
         self.assertIn("::warning ", result.stdout)
         self.assertNotIn("::error ", result.stdout)
         self.assertIn("marked this head commit as reviewed", text)
 
+    def test_a_label_from_anyone_else_or_unchecked_waives_nothing(self):
+        bad = {"tools/x.py": "x = '" + RLO + "'\n"}
+        for kw in ({"labeler": "someone-with-triage"}, {"events": False}):
+            result, _ = self.run_with_event(bad, ["security-reviewed:HEAD"], **kw)
+            self.assertEqual(result.returncode, 1, (kw, result.stdout))
+            self.assertIn("override-not-authorized", result.stdout)
+            self.assertNotIn("(overridden)", result.stdout)
+
     def test_a_label_for_an_older_commit_does_not(self):
-        result, _ = self.run_with_event({"tools/x.py": "x = '" + RLO + "'\n"}, ["security-reviewed:fedcba9"])
+        result, _ = self.run_with_event({"tools/x.py": "x = '" + RLO + "'\n"}, ["security-reviewed:fedcba9876543210"])
         self.assertEqual(result.returncode, 1, result.stdout)
 
     def test_the_event_text_is_scanned_and_annotated_without_a_file(self):
@@ -569,6 +614,12 @@ class AfterTheFullRun(ScanTest):
         self.assertEqual(self.scan({"README.md": same}, base_changes=base), [])
         self.assertEqual(self.scan({"docs/x.md": "See https://new-home.example.invalid/.\n"}), [])
 
+    def test_a_binary_file_no_scanner_reads_is_listed(self):
+        found = self.scan({"docs/images/shot.png": b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + b"\0" * 32})
+        self.assertEqual([(f.level, f.rule) for f in found], [(cps.REVIEW, "not-inspected")])
+        # An executable is blocked as one, not listed twice.
+        self.assertEqual(self.rules({"tools/helper.bin": b"MZ\x90\x00" + b"\0" * 64}), {(cps.BLOCK, "executable")})
+
     def test_this_repositorys_own_raw_files_are_known(self):
         base = {"README.md": "See https://github.com/ItsNotRexed/Leonida.\n"}
         own = "Run https://raw.githubusercontent.com/ItsNotRexed/Leonida/main/install.ps1 to set up.\n"
@@ -625,15 +676,25 @@ class OtherScanners(ScanTest):
         findings = self.scan({"tools/x.py": "a = 1\n"}, external=cps.read_semgrep(self.write("s.json", report)))
         self.assertEqual([(f.level, f.rule) for f in findings], [(cps.REVIEW, "semgrep:run-built-code")])
 
-    def test_a_missing_or_broken_report_is_listed(self):
-        self.assertEqual([f.rule for f in cps.read_semgrep(self.write("s.json", "[]"))], ["scanner-did-not-run"])
+    def test_a_missing_or_broken_report_blocks(self):
+        # Fail closed: a scanner that crashed, or a pull request that made it crash, is not a pass.
+        semgrep = cps.read_semgrep(self.write("s.json", "[]"))
         missing = cps.read_gitleaks(os.path.join(self.repo.dir, "nope.json"))
         broken = cps.read_gitleaks(self.write("g.json", "{not json"))
-        for (finding,) in (missing, broken):
-            self.assertEqual((finding.level, finding.rule), (cps.REVIEW, "scanner-did-not-run"))
+        for (finding,) in (semgrep, missing, broken):
+            self.assertEqual((finding.level, finding.rule), (cps.BLOCK, "scanner-did-not-run"))
             self.assertFalse(finding.in_file())
         findings = self.scan({"tools/x.py": "a = 1\n"}, external=missing)
-        self.assertEqual([f.rule for f in findings], ["scanner-did-not-run"])
+        self.assertEqual([(f.level, f.rule) for f in findings], [(cps.BLOCK, "scanner-did-not-run")])
+        result = subprocess.run([sys.executable, "-I", SCRIPT, "--repo", self.repo.dir, "--gitleaks-json",
+                                 os.path.join(self.repo.dir, "nope.json"), self.base, self.base],
+                                capture_output=True, text=True, env=git_env())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_semgrep_errors_are_listed(self):
+        report = {"results": [], "errors": [{"level": "warn", "type": "Timeout", "path": "tools/x.py"}]}
+        found = cps.read_semgrep(self.write("s.json", report))
+        self.assertEqual([(f.level, f.rule) for f in found], [(cps.REVIEW, "scanner-incomplete")])
 
     def test_gitleaks_results_block_and_never_quote_the_secret(self):
         report = [{"File": "/src/tools/x.py", "StartLine": 1, "RuleID": "generic-api-key",
@@ -756,10 +817,15 @@ class TheWorkflow(unittest.TestCase):
 
     def test_it_reads_only(self):
         self.assertRegex(self.code, r"(?m)^permissions:\s*\{\}\s*$")
-        grants = re.findall(r"(?m)^\s+([\w-]+):\s*(read|write)\s*$", self.code)
-        self.assertEqual(grants, [("contents", "read")])
+        grants = re.findall(r"(?m)^\s+([\w-]+):\s*(read|write)\s*(?:#.*)?$", self.code)
+        self.assertEqual(grants, [("contents", "read"), ("issues", "read"), ("pull-requests", "read")])
         self.assertNotIn("secrets.", self.code)
-        self.assertNotIn("github.token", self.code)
+        # The read-only token goes to one step only: the one that reads who added the labels, and runs nothing else.
+        self.assertEqual(self.code.count("github.token"), 1)
+        step = self.code[self.code.index("- name: Who added the labels"):]
+        step = step[:step.index("- name:", 2)]
+        self.assertIn("GH_TOKEN: ${{ github.token }}", step)
+        self.assertRegex(step, r"run: >-\s+gh api --paginate \"repos/\$GITHUB_REPOSITORY/issues/\$PR_NUMBER/events")
 
     def test_the_checkout_is_the_base_branch_without_credentials(self):
         self.assertNotRegex(self.code, r"(?m)^\s+ref:")
@@ -772,7 +838,8 @@ class TheWorkflow(unittest.TestCase):
         flat = " ".join(self.code.split())
         self.assertIn("python3 -I scripts/check_pr_security.py --github --github-event \"$GITHUB_EVENT_PATH\" "
                       "--check-action-tags --semgrep-json \"$RUNNER_TEMP/tool-out/semgrep.json\" --gitleaks-json "
-                      "\"$RUNNER_TEMP/tool-out/gitleaks.json\" --tool-root /src \"$SCAN_BASE\" \"$SCAN_HEAD\"", flat)
+                      "\"$RUNNER_TEMP/tool-out/gitleaks.json\" --label-events \"$RUNNER_TEMP/label-events.json\" "
+                      "--codeowners .github/CODEOWNERS --tool-root /src \"$SCAN_BASE\" \"$SCAN_HEAD\"", flat)
         self.assertIn("python3 -I scripts/check_pr_security.py --write-semgrep-rules", flat)
         self.assertIn("python3 -I scripts/check_pr_security.py --export \"$RUNNER_TEMP/pr-files\"", flat)
         # The pull request's tree is never put on disk: no checkout, switch, worktree, reset or archive of it.
@@ -783,7 +850,8 @@ class TheWorkflow(unittest.TestCase):
         self.assertIsNone(cps.UNTRUSTED_EXPRESSION.search(self.text))
         for expression in re.findall(r"\$\{\{\s*([^}]*?)\s*\}\}", self.code):  # a YAML comment is never evaluated
             self.assertIn(expression, ("github.event.pull_request.number", "github.event.pull_request.head.sha",
-                                       "github.event.pull_request.base.sha", "github.event.pull_request.commits"),
+                                       "github.event.pull_request.base.sha", "github.event.pull_request.commits",
+                                       "github.token"),
                           expression)
 
     def test_semgrep_and_gitleaks_run_pinned_offline_and_read_only(self):
@@ -806,7 +874,9 @@ class TheWorkflow(unittest.TestCase):
     def test_the_scan_of_the_workflow_only_flags_its_trigger(self):
         found = {(f.level, f.rule) for n, line in enumerate(self.text.splitlines(), 1)
                  for f in cps.check_line(".github/workflows/pr-security.yml", n, line)}
-        self.assertEqual(found, {(cps.BLOCK, "dangerous-trigger")})
+        self.assertEqual({rule for level, rule in found if level == cps.BLOCK}, {"dangerous-trigger"})
+        # Its one token (read-only, for the label events) is listed, as it should be for any workflow.
+        self.assertEqual({rule for level, rule in found if level == cps.REVIEW}, {"workflow-token", "credential-read"})
 
 
 class OwnFiles(unittest.TestCase):

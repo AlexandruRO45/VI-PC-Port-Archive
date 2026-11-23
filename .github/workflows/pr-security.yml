@@ -7,8 +7,10 @@ name: PR security
 # request's title, description and commit messages are scanned too, read from the event file, never from `${{ }}`.
 #
 # A maintainer who has read a `block` finding and accepts it adds the label `security-reviewed:<head sha>` (7 or more
-# hex digits of the head commit). The label names that commit, so a push after the review fails again until a new
-# label names the new head; adding or removing a label runs the scan again.
+# hex digits of the head commit, at least 16 so a colliding commit can't be made to fit it). The label names that
+# commit, so a push after the review fails again until a new label names the new head; adding or removing a label runs
+# the scan again. It only counts when the person who added it (read from the pull request's issue events) is listed
+# in .github/CODEOWNERS on main. A scanner that fails leaves no report, and that blocks.
 #
 # This is the one workflow here on pull_request_target, and it is safe only as long as it never runs the pull
 # request: pull_request_target checks out the base branch, so the workflow and the scanner are the reviewed copies on
@@ -32,6 +34,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      issues: read          # who added the override label, from the pull request's issue events
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,8 +96,19 @@ jobs:
           zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
           dir /src --redact --no-banner --exit-code 0 --report-format json --report-path /out/gitleaks.json
           || echo "::warning::Gitleaks did not finish"
+      # The read-only token reads who added which label; nothing from the pull request runs here, and the scanner
+      # only reads the file. CODEOWNERS comes from this checkout of main, which a pull request can't change.
+      - name: Who added the labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: >-
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/events?per_page=100"
+          > "$RUNNER_TEMP/label-events.json"
+          || echo "::warning::could not read the label events; an override label will not count"
       - name: Scan what the pull request adds
         run: >-
           python3 -I scripts/check_pr_security.py --github --github-event "$GITHUB_EVENT_PATH" --check-action-tags
           --semgrep-json "$RUNNER_TEMP/tool-out/semgrep.json" --gitleaks-json "$RUNNER_TEMP/tool-out/gitleaks.json"
+          --label-events "$RUNNER_TEMP/label-events.json" --codeowners .github/CODEOWNERS
           --tool-root /src "$SCAN_BASE" "$SCAN_HEAD"
