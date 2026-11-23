@@ -665,7 +665,7 @@ int main() {
                 std::printf("SKIP (the host D3D12 runtime has no ID3D12Device11, e.g. Windows 10 without the Agility "
                             "SDK; LEONIDA_BVH_DEVICE=vulkan runs on the Vulkan-backed device)\n");
                 pc->Release();
-                return g_failures ? 1 : 0;
+                return g_failures ? 1 : 77;
             }
             host11->Release();
         }
