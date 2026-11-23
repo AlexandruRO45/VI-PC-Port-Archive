@@ -34,8 +34,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr UINT64 bytes = 1024;
-constexpr UINT words = UINT(bytes / 4);
+constexpr UINT64 kBufferBytes = 1024;
+constexpr UINT kBufferWords = UINT(kBufferBytes / 4);
 constexpr D3D12_COMMAND_LIST_TYPE types[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE,
                                              D3D12_COMMAND_LIST_TYPE_COPY};
 
@@ -73,7 +73,7 @@ ComPtr<ID3D12Resource> buffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, D3D12_
     properties.Type = heap;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = bytes;
+    desc.Width = kBufferBytes;
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -88,7 +88,7 @@ bool fill(ID3D12Resource* upload, std::uint32_t seed) {
     std::uint32_t* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
     CHECK(SUCCEEDED(upload->Map(0, &none, reinterpret_cast<void**>(&mapped))));
-    for (UINT i = 0; i < words; ++i) mapped[i] = pattern(seed, i);
+    for (UINT i = 0; i < kBufferWords; ++i) mapped[i] = pattern(seed, i);
     upload->Unmap(0, nullptr);
     return true;
 }
@@ -97,12 +97,12 @@ bool exact(ID3D12Resource* readback, std::uint32_t seed) {
     std::uint32_t* mapped = nullptr;
     CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
     unsigned bad = 0;
-    for (UINT i = 0; i < words; ++i)
+    for (UINT i = 0; i < kBufferWords; ++i)
         if (mapped[i] != pattern(seed, i) && bad++ < 3)
             std::fprintf(stderr, "word %u: got %08x want %08x\n", i, mapped[i], pattern(seed, i));
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
-    if (bad) std::fprintf(stderr, "%u of %u words differ\n", bad, words);
+    if (bad) std::fprintf(stderr, "%u of %u words differ\n", bad, kBufferWords);
     return bad == 0 ? true : fail("the readback differs from the data the CPU wrote", __LINE__);
 }
 
@@ -129,7 +129,7 @@ bool record_copy(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, bool dst_
         after[count++] = transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     }
     if (count) list->ResourceBarrier(count, before);
-    list->CopyBufferRegion(dst, 0, src, 0, bytes);
+    list->CopyBufferRegion(dst, 0, src, 0, kBufferBytes);
     if (count) list->ResourceBarrier(count, after);
     return SUCCEEDED(list->Close());
 }
@@ -277,7 +277,7 @@ bool release_while_held(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, int 
     for (int i = 0; i < iterations; ++i) {
         std::uint32_t* mapped = nullptr;
         CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
-        for (UINT w = 0; w < words; ++w) mapped[w] = sentinel;
+        for (UINT w = 0; w < kBufferWords; ++w) mapped[w] = sentinel;
         readback->Unmap(0, nullptr);
         auto gate = make_fence(device), f = make_fence(device), done = make_fence(device);
         CopyList copy;
@@ -296,7 +296,7 @@ bool release_while_held(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, int 
         wait_for(done.Get(), 1);  // b's Signal comes after its batch
         CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
         bool copied = true;
-        for (UINT w = 0; w < words; ++w) copied &= mapped[w] == pattern(7, w);
+        for (UINT w = 0; w < kBufferWords; ++w) copied &= mapped[w] == pattern(7, w);
         const D3D12_RANGE none{0, 0};
         readback->Unmap(0, &none);
         dropped += !copied;
