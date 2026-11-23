@@ -2999,6 +2999,10 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
+            if (stage.entry->writes_stencil && !device_.info.shader_stencil_export) {
+                std::fprintf(stderr, "[rt] d3d12: %s requires VK_EXT_shader_stencil_export\n", stage.entry->name.c_str());
+                return E_NOTIMPL;
+            }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
@@ -8772,6 +8776,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return std::any_of(extensions.begin(), extensions.end(),
                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
     };
+    // Unlike barycentric/interlock, VK_EXT_shader_stencil_export has no feature structure: advertising the device
+    // extension is the support check, and enabling its name makes SPV_EXT_shader_stencil_export valid for modules.
+    info.shader_stencil_export = has_device_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     if (has_device_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
@@ -8944,6 +8951,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.fragment_shader_barycentric)
         device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+    if (info.shader_stencil_export) device_extensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 #endif

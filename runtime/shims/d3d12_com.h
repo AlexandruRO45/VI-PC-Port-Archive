@@ -153,6 +153,8 @@ struct VulkanDeviceInfo {
     // offsets outside gathers: the index's needs_maintenance8).
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
+    // VK_EXT_shader_stencil_export is enabled on the logical device: translated StencilExportEXT modules can be used.
+    bool shader_stencil_export = false;
     bool maintenance8 = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
