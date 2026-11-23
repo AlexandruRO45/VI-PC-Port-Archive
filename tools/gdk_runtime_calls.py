@@ -986,6 +986,16 @@ def main(argv: list[str] | None = None) -> int:
                          "as served (default: %(default)s)")
     a = ap.parse_args(argv)
 
+    # A path that names nothing, or a folder, is a wrong argument, not an unreadable image: say so and write
+    # nothing (a readable image later on the command line waits for the whole list, as any usage error does).
+    for path in a.image:
+        if os.path.isdir(path):
+            print(f"{path}: is a directory", file=sys.stderr)
+            return 2
+        if not os.path.exists(path):
+            print(f"{path}: does not exist", file=sys.stderr)
+            return 2
+
     try:
         table = RuntimeTable.load(a.table)
     except (OSError, ValueError, KeyError, TypeError) as e:
@@ -1012,7 +1022,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             r = report(path, table, served)
         except (PeFormatError, OSError) as e:
-            print(f"{path}: not a readable PE image ({e})", file=sys.stderr)
+            reason = getattr(e, "strerror", None) or str(e)
+            print(f"{path}: not a readable PE image ({reason})", file=sys.stderr)
             rc = 1
             continue
         if r["cut_off_sections"]:
