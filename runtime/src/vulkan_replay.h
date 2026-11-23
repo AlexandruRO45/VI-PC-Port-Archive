@@ -2115,9 +2115,16 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
-        a.view = vk.image_view(viewed, a.range);
+        VkImageSubresourceRange view_subrange = a.range;
+        if (a.binding.volume) {
+            // A 2D-array attachment view of a 3D image selects W slices here (as rect_view does for clears);
+            // a.range stays layer 0..1 for layout tracking and barriers.
+            view_subrange.baseArrayLayer = target.first_layer;
+            view_subrange.layerCount = target.layer_count;
+        }
+        a.view = vk.image_view(viewed, view_subrange);
         if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, target, a.range);
+        shrink(a.binding, target, view_subrange);
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
