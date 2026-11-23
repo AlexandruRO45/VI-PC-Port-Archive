@@ -377,6 +377,16 @@ class TestValuSubF32BoundaryExtremes(unittest.TestCase):
         hw = run_binary_f32("v_sub_f32", 1.0, float("-inf"), clamp=True)
         self.assertEqual(hw, 1.0)
 
+class TestValuSubF32NegativeControls(unittest.TestCase):
+    """Stage 12: Negative controls and mutation detection for v_sub_f32."""
+
+    def test_sub_mutation_omitted_clamp(self):
+        clamped = run_binary_f32("v_sub_f32", 0.2, 0.8, clamp=True)
+        raw = run_binary_f32("v_sub_f32", 0.2, 0.8, clamp=False)
+        self.assertAlmostEqual(clamped, 0.0, places=6)
+        self.assertAlmostEqual(raw, -0.6, places=6)
+        self.assertNotEqual(clamped, raw)
+
 
 if __name__ == "__main__":
     unittest.main()
