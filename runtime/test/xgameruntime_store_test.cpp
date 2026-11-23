@@ -221,6 +221,12 @@ int main() {
         std::snprintf(label, sizeof(label), "slot %d callback and offline result", index);
         check(callbacks == 1 && XAsyncGetStatus(&request, false) == E_FAIL &&
                   at<AsyncResult>(store, result_slot)(store, &request) == E_FAIL, label);
+        if (index == 71) {
+            uint32_t wrong_count = 99;
+            check(at<AsyncResult>(store, 74)(store, &request) == E_INVALIDARG &&
+                      at<Count>(store, 63)(store, &request, &wrong_count) == E_INVALIDARG && wrong_count == 99,
+                  "other offline operations reject a failed durables block without changing count");
+        }
         if (index == 62) {
             uint32_t result_count = 99;
             check(at<Count>(store, 63)(store, &request, &result_count) == E_FAIL && result_count == 0,
@@ -238,6 +244,10 @@ int main() {
     XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
     check(canceled_callbacks == 1 && XAsyncGetStatus(&canceled, false) == E_ABORT &&
               at<AsyncResult>(store, 72)(store, &canceled) == E_ABORT, "canceled request reports E_ABORT");
+    uint32_t canceled_wrong_count = 99;
+    check(at<AsyncResult>(store, 74)(store, &canceled) == E_INVALIDARG &&
+              at<Count>(store, 63)(store, &canceled, &canceled_wrong_count) == E_INVALIDARG && canceled_wrong_count == 99,
+          "other offline operations reject a canceled durables block without changing count");
     XTaskQueueCloseHandle(queue);
     check(at<NoArgs>(store, 46)(store) == E_NOTIMPL, "an undocumented slot answers E_NOTIMPL");
 
