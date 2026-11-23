@@ -657,10 +657,11 @@ class PropRuleTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "café.obj").write_text("vt 0 0\n", encoding="utf-8", newline="\n")
-            manifest = '{\n  "Items": [\n' + self.item(r"café.obj") + "\n  ]\n}\n"
+            (root / "caf\u00e9.obj").write_text("vt 0 0\n", encoding="utf-8", newline="\n")
+            # Utf8JsonWriter escapes non-ASCII, so the manifest holds the six characters \u00E9, not the letter
+            manifest = '{\n  "Items": [\n' + self.item(r"caf\u00E9.obj") + "\n  ]\n}\n"
             (root / "manifest.json").write_text(manifest, encoding="utf-8", newline="\n")
-            self.assertEqual([row["File"] for row in prop.pick(tmp)], ["café.obj"])
+            self.assertEqual([row["File"] for row in prop.pick(tmp)], ["caf\u00e9.obj"])
 
     def test_the_stream_decodes_escaped_backslash_and_quote_in_a_filename(self):
         import first_light_prop as prop
