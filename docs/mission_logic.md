@@ -116,13 +116,13 @@ a person, a name dictionary turns that name into a 32-bit hash, and the same has
 
 1. **Start from a name the mission text uses.** `COM_KBOS_NEIGHB` is the replay-table id for the mission
    publicly catalogued as **Pipework** (Mandy's rent). The text table at `data.rpf` stream
-   `0x19957A0` contains the line "You brought the cops to Mandy's house" and the line "Bert died".
+   `0x19957A0` contains two of the mission's subtitle lines, one naming Mandy and one naming Bert.
    The stream carries no mission id; the id-to-text step rests on the public name and the cast, not an
    archive key.
 2. **Resolve the character and its schedule.** `common.rpf` stream `0x4C270` lists
    `KeyLento/Perschars/Peds/Unique/Mandy` and `.../Bert` under the pack `PSP_KeyLento_perschars_peds`.
-   SixNG's name dictionary, which is lower-case joaat, resolves the pack to `0x865F0DA9`, Mandy to
-   `0x03A885E6` and Bert to `0xE34ACBC8`.
+   SixNG's name dictionary, which is lower-case joaat, resolves the pack and both names to their 32-bit
+   hashes.
 3. **Scan the PSINs for the link hash.** In the 64-byte element above, `linkHash` is the dword at byte
    `+0x34`, not the archetype dword. Inflating the five `story000_script.rpf` streams at `0x3FE4000`,
    `0x3FE8000`, `0x3FEB000`, `0x3FEE000` and `0x3FF0000` and searching for those two hashes finds 28

@@ -457,15 +457,14 @@ Bink/opaque regions were not decoded, and the encrypted RPF9 table of contents p
 path enumeration (27 top-level entries remain). The evidence supports a shared ped-appearance
 actor assembled from existing components, not a unique `mandy` resource.
 The mission binding is now measured. `COM_KBOS_NEIGHB` is the internal id of the "Pipework"
-mission: the replay table carries that `<MissionId>`, and the mission text names "Mandy's
-house", "Follow Mandy" and "Bert died". Five PSIN state tables in
+mission: the replay table carries that `<MissionId>`, and three lines of the mission text name
+Mandy or Bert. Five PSIN state tables in
 `pack/story000/story000_script.rpf` (`03fe4000`, `03fe8000`, `03feb000`, `03fee000`,
-`03ff0000`) contain both characters as entity link hashes: `0x03A885E6` (`Mandy`) and
-`0xE34ACBC8` (`Bert`); the schedule pack hash is `0x865F0DA9`
-(`PSP_KeyLento_perschars_peds`).
+`03ff0000`) contain both characters as entity link hashes, the joaat of their names; the
+schedule pack (`PSP_KeyLento_perschars_peds`) is found the same way.
 
 The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, record 3499) maps
-`Name = 0x03A885E6` (`mandy`) to `ModelSetName = 0x03A885E6`; `CPedModelInfo__InitData`
+`Name` (the joaat of `mandy`) to the same `ModelSetName`; `CPedModelInfo__InitData`
 (`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
 is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
 named `cs_mandy` drawable**. The `cs_mandy` ID above is the 32-bit `ModelName` at row offset
