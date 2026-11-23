@@ -47,8 +47,11 @@ import os
 import re
 import struct
 import sys
+from array import array
 from collections import defaultdict
 from dataclasses import dataclass, field
+from itertools import chain
+from operator import itemgetter
 from typing import Iterable
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -379,14 +382,26 @@ def align_part_to_standing_space(
         raise PedAssembleError(f"Unsupported target_space {target_space!r}")
     tx, ty, tz = part.translation
     ox, oy, oz = standing_offset_vector(standing_offset, part.coord_space) if apply_offset else (0.0, 0.0, 0.0)
-    shifted = [(p[0] + tx + ox, p[1] + ty + oy, p[2] + tz + oz) for p in part.positions]
     normals = list(part.normals) if part.normals is not None else None
 
-    if part.coord_space != target_space:
-        convert = rage_to_yup_vec3 if target_space == "y-up" else yup_to_rage_vec3
-        shifted = [convert(p) for p in shifted]
+    if part.coord_space == target_space:
+        shifted = [(p[0] + tx + ox, p[1] + ty + oy, p[2] + tz + oz) for p in part.positions]
+    elif target_space == "y-up":
+        # Shift and rage_to_yup_vec3 in one pass: (x, y, z) -> (x, z, -y).
+        shifted = [
+            (float(p[0] + tx + ox), float(p[2] + tz + oz), float(-(p[1] + ty + oy)))
+            for p in part.positions
+        ]
         if normals is not None:
-            normals = [convert(n) for n in normals]
+            normals = [(float(n[0]), float(n[2]), float(-n[1])) for n in normals]
+    else:
+        # Shift and yup_to_rage_vec3 in one pass: (x, y, z) -> (x, -z, y).
+        shifted = [
+            (float(p[0] + tx + ox), float(-(p[2] + tz + oz)), float(p[1] + ty + oy))
+            for p in part.positions
+        ]
+        if normals is not None:
+            normals = [(float(n[0]), float(-n[2]), float(n[1])) for n in normals]
 
     return MeshPart(
         name=part.name,
@@ -412,7 +427,7 @@ def align_part_to_standing_space(
 
 def _quantize_point(p: tuple[float, float, float], tol: float) -> tuple[int, int, int]:
     inv = 1.0 / max(tol, 1e-12)
-    return (int(round(p[0] * inv)), int(round(p[1] * inv)), int(round(p[2] * inv)))
+    return (round(p[0] * inv), round(p[1] * inv), round(p[2] * inv))
 
 
 def _canonical_tri_key(
@@ -421,10 +436,12 @@ def _canonical_tri_key(
     p2: tuple[float, float, float],
     tol: float,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
-    q0 = _quantize_point(p0, tol)
-    q1 = _quantize_point(p1, tol)
-    q2 = _quantize_point(p2, tol)
-    a, b, c = sorted((q0, q1, q2))
+    inv = 1.0 / max(tol, 1e-12)
+    a, b, c = sorted((
+        (round(p0[0] * inv), round(p0[1] * inv), round(p0[2] * inv)),
+        (round(p1[0] * inv), round(p1[1] * inv), round(p1[2] * inv)),
+        (round(p2[0] * inv), round(p2[1] * inv), round(p2[2] * inv)),
+    ))
     return (a, b, c)
 
 
@@ -443,11 +460,14 @@ def _triangle_geometry(
     a = positions[tri[0]]
     b = positions[tri[1]]
     c = positions[tri[2]]
-    p0 = (a[0] + ox, a[1] + oy, a[2] + oz)
-    p1 = (b[0] + ox, b[1] + oy, b[2] + oz)
-    p2 = (c[0] + ox, c[1] + oy, c[2] + oz)
-    centroid = ((p0[0] + p1[0] + p2[0]) / 3.0, (p0[1] + p1[1] + p2[1]) / 3.0, (p0[2] + p1[2] + p2[2]) / 3.0)
-    normal = _vec_norm(_vec_cross(_vec_sub(p1, p0), _vec_sub(p2, p0)))
+    x0, y0, z0 = p0 = (a[0] + ox, a[1] + oy, a[2] + oz)
+    x1, y1, z1 = p1 = (b[0] + ox, b[1] + oy, b[2] + oz)
+    x2, y2, z2 = p2 = (c[0] + ox, c[1] + oy, c[2] + oz)
+    centroid = ((x0 + x1 + x2) / 3.0, (y0 + y1 + y2) / 3.0, (z0 + z1 + z2) / 3.0)
+    # Same operations, in the same order, as _vec_cross(_vec_sub(p1, p0), _vec_sub(p2, p0)).
+    e1x, e1y, e1z = x1 - x0, y1 - y0, z1 - z0
+    e2x, e2y, e2z = x2 - x0, y2 - y0, z2 - z0
+    normal = _vec_norm((e1y * e2z - e1z * e2y, e1z * e2x - e1x * e2z, e1x * e2y - e1y * e2x))
     return p0, p1, p2, centroid, normal
 
 
@@ -582,6 +602,165 @@ def find_coplanar_overlap_indices(
     return culled, stats
 
 
+_CENTROID_CHUNK = 2048
+
+
+def _triangle_centroid_columns(part: MeshPart) -> tuple[array, array, array]:
+    """Return per-axis ``array('d')`` columns of ``part``'s triangle centroids, translation included.
+
+    Built in bounded chunks so the temporary float objects stay small next to the mesh itself.
+    """
+    tris = part.triangles
+    columns = []
+    for axis, shift in enumerate(part.translation):
+        coords = [p[axis] for p in part.positions]
+        column = array("d")
+        for start in range(0, len(tris), _CENTROID_CHUNK):
+            column.extend([
+                (coords[a] + coords[b] + coords[c]) / 3.0 + shift
+                for a, b, c in tris[start:start + _CENTROID_CHUNK]
+            ])
+        columns.append(column)
+    cx, cy, cz = columns
+    return cx, cy, cz
+
+
+def _centroids_in_box(columns: tuple[array, array, array], lo: list[float], hi: list[float]) -> list[int]:
+    """Indices of the centroids lying inside the closed box ``lo``..``hi``."""
+    cx, cy, cz = columns
+    lox, loy, loz = lo
+    hix, hiy, hiz = hi
+    return [
+        k for k, (x, y, z) in enumerate(zip(cx, cy, cz))
+        if lox <= x <= hix and loy <= y <= hiy and loz <= z <= hiz
+    ]
+
+
+def _near_triangle_subsets(
+    target: MeshPart,
+    ref_parts: list[MeshPart],
+    *,
+    centroid_tol: float,
+    vertex_tol: float,
+    target_columns: tuple[array, array, array] | None = None,
+    ref_columns: list[tuple[array, array, array]] | None = None,
+) -> tuple[list[int], list[MeshPart]] | None:
+    """Narrow a ``find_coplanar_overlap_indices`` query to the triangles that can possibly match.
+
+    A target triangle is only removed by a reference triangle whose centroid lies within
+    ``max(|centroid_tol|, vertex_tol)`` of its own: the proximity tier requires a centroid distance
+    of at most ``centroid_tol``, and a shared quantized vertex key puts every corner, so the
+    centroid, within one quantization step. Triangles whose centroid is farther than that from the
+    other side's centroid box cannot change any index or count, so leaving them out of the query
+    changes no result (matching is any-hit and independent per target triangle).
+
+    Returns ``(target_indices, narrowed_refs)``, or ``None`` when the narrowing is not provably
+    safe (mismatched coordinate spaces, which the full query reports as an error; non-finite
+    tolerances or coordinates; malformed triangles). The caller then runs the full query unchanged.
+    """
+    try:
+        if not target.triangles or not ref_parts:
+            return None
+        if any(ref.coord_space != target.coord_space for ref in ref_parts):
+            return None
+        tol = max(abs(float(centroid_tol)), abs(float(vertex_tol)), 1e-12)
+        if not math.isfinite(tol):
+            return None
+        t_cols = target_columns if target_columns is not None else _triangle_centroid_columns(target)
+        r_cols = ref_columns if ref_columns is not None else [_triangle_centroid_columns(r) for r in ref_parts]
+        if len(r_cols) != len(ref_parts):
+            return None
+        scale = 0.0
+        for cols in (t_cols, *r_cols):
+            for col in cols:
+                if not len(col):
+                    continue
+                if not math.isfinite(sum(col)):
+                    return None
+                scale = max(scale, abs(min(col)), abs(max(col)))
+        margin = tol * 1.01 + 1e-6 + 1e-9 * scale
+        t_lo = [min(c) - margin for c in t_cols]
+        t_hi = [max(c) + margin for c in t_cols]
+        ref_cols_nonempty = [c for c in r_cols if len(c[0])]
+        if not ref_cols_nonempty:
+            return [], []
+        r_lo = [min(min(c[a]) for c in ref_cols_nonempty) - margin for a in range(3)]
+        r_hi = [max(max(c[a]) for c in ref_cols_nonempty) + margin for a in range(3)]
+        target_sel = _centroids_in_box(t_cols, r_lo, r_hi)
+        if not target_sel:
+            return [], []
+        narrowed: list[MeshPart] = []
+        for ref, cols in zip(ref_parts, r_cols):
+            tris = ref.triangles
+            narrowed.append(MeshPart(
+                name=ref.name,
+                positions=ref.positions,
+                triangles=[tris[k] for k in _centroids_in_box(cols, t_lo, t_hi)],
+                role=ref.role,
+                coord_space=ref.coord_space,
+                translation=ref.translation,
+            ))
+        return target_sel, narrowed
+    except (ValueError, TypeError, IndexError, OverflowError):
+        return None
+
+
+def _overlap_query(
+    target: MeshPart,
+    ref_parts: list[MeshPart],
+    *,
+    centroid_tol: float,
+    plane_tol: float | None,
+    normal_cos_min: float,
+    vertex_tol: float,
+    target_columns: tuple[array, array, array] | None = None,
+    ref_columns: list[tuple[array, array, array]] | None = None,
+) -> tuple[set[int], dict]:
+    """``find_coplanar_overlap_indices`` with the work limited to triangles near the other side.
+
+    Returns exactly what the full query returns: the same culled indices (in ``target``'s own
+    numbering) and the same stats.
+    """
+    narrowed = _near_triangle_subsets(
+        target, ref_parts, centroid_tol=centroid_tol, vertex_tol=vertex_tol,
+        target_columns=target_columns, ref_columns=ref_columns,
+    )
+    if narrowed is None:
+        return find_coplanar_overlap_indices(
+            target, ref_parts,
+            centroid_tol=centroid_tol, plane_tol=plane_tol,
+            normal_cos_min=normal_cos_min, vertex_tol=vertex_tol,
+        )
+    target_sel, narrowed_refs = narrowed
+    n_tris = len(target.triangles)
+    if not target_sel or not any(r.triangles for r in narrowed_refs):
+        return set(), {
+            "target": target.name,
+            "target_triangles_before": n_tris,
+            "culled_exact_key": 0,
+            "culled_coplanar_proximity": 0,
+            "culled_total": 0,
+            "target_triangles_after": n_tris,
+        }
+    sub_target = MeshPart(
+        name=target.name,
+        positions=target.positions,
+        triangles=[target.triangles[k] for k in target_sel],
+        role=target.role,
+        coord_space=target.coord_space,
+        translation=target.translation,
+    )
+    sub_culled, stats = find_coplanar_overlap_indices(
+        sub_target, narrowed_refs,
+        centroid_tol=centroid_tol, plane_tol=plane_tol,
+        normal_cos_min=normal_cos_min, vertex_tol=vertex_tol,
+    )
+    culled = {target_sel[k] for k in sub_culled}
+    stats["target_triangles_before"] = n_tris
+    stats["target_triangles_after"] = n_tris - len(culled)
+    return culled, stats
+
+
 def cull_part_overlap(
     target: MeshPart,
     ref_parts: list[MeshPart],
@@ -593,7 +772,7 @@ def cull_part_overlap(
     compact_vertices: bool = False,
 ) -> tuple[MeshPart, dict]:
     """Return a copy of ``target`` with coplanar triangles overlapping ``ref_parts`` removed."""
-    culled_idx, stats = find_coplanar_overlap_indices(
+    culled_idx, stats = _overlap_query(
         target,
         ref_parts,
         centroid_tol=centroid_tol,
@@ -873,14 +1052,27 @@ def inspect_seams(
         })
 
     pairwise_overlaps = []
+    def _columns(part: MeshPart) -> tuple[array, array, array] | None:
+        try:
+            return _triangle_centroid_columns(part)
+        except (ValueError, TypeError, IndexError):
+            return None
+
+    target_cols = ref_cols = None
     for i in range(len(parts)):
+        # One target at a time keeps only a pair of centroid tables alive, never one per part.
+        target_cols = _columns(parts[i]) if i + 1 < len(parts) else None
         for j in range(i + 1, len(parts)):
-            culled_ij, st = find_coplanar_overlap_indices(
+            ref_cols = _columns(parts[j])
+            culled_ij, st = _overlap_query(
                 parts[i],
                 [parts[j]],
                 centroid_tol=overlap_tol,
                 plane_tol=plane_tol,
                 normal_cos_min=normal_cos_min,
+                vertex_tol=DEFAULT_VERTEX_QUANT_TOL,
+                target_columns=target_cols,
+                ref_columns=[ref_cols] if ref_cols is not None else None,
             )
             if culled_ij:
                 pairwise_overlaps.append({
@@ -890,6 +1082,7 @@ def inspect_seams(
                     "exact_key_hits": st["culled_exact_key"],
                     "proximity_hits": st["culled_coplanar_proximity"],
                 })
+    target_cols = ref_cols = None  # release the last centroid tables before the topology pass
 
     topology = analyze_edge_topology(parts, weld_tol=weld_tol)
     return {
@@ -1668,7 +1861,35 @@ def _append_accessor(
     return len(accessors) - 1
 
 
+_PACK_CHUNK_ROWS = 4096
+_GET_X, _GET_Y, _GET_Z = itemgetter(0), itemgetter(1), itemgetter(2)
+
+
+def _pack_rows_fast(rows: list, comps: int, code: str) -> bytes | None:
+    """Pack ``rows`` of exactly ``comps`` values each as little-endian ``code`` values.
+
+    Returns ``None`` when a row is not exactly ``comps`` long or ``struct`` rejects a value, so the
+    caller's row-by-row path reports the failure exactly as before. Rows are packed in bounded
+    chunks, which keeps the temporary flattened list small.
+    """
+    out = bytearray()
+    step = _PACK_CHUNK_ROWS
+    try:
+        for start in range(0, len(rows), step):
+            chunk = rows[start:start + step]
+            if any(len(r) != comps for r in chunk):
+                return None
+            flat = list(chain.from_iterable(chunk))
+            out += struct.pack(f"<{len(flat)}{code}", *flat)
+    except (struct.error, TypeError, OverflowError):
+        return None
+    return bytes(out)
+
+
 def _pack_u16_vec4(rows: list[tuple[int, int, int, int]]) -> bytes:
+    fast = _pack_rows_fast(rows, 4, "H")
+    if fast is not None:
+        return fast
     buf = bytearray(len(rows) * 8)
     for i, (a, b, c, d) in enumerate(rows):
         struct.pack_into("<4H", buf, i * 8, a, b, c, d)
@@ -1676,12 +1897,52 @@ def _pack_u16_vec4(rows: list[tuple[int, int, int, int]]) -> bytes:
 
 
 def _pack_f32_vec(rows: list[tuple[float, ...]], comps: int) -> bytes:
+    fast = _pack_rows_fast(rows, comps, "f")
+    if fast is not None:
+        return fast
     fmt = f"<{comps}f"
     stride = comps * 4
     buf = bytearray(len(rows) * stride)
     for i, row in enumerate(rows):
         struct.pack_into(fmt, buf, i * stride, *row[:comps])
     return bytes(buf)
+
+
+def _remap_joint_rows_fast(
+    joints: list,
+    weights: list,
+    slot_map: list[tuple[bool, int | str]] | None,
+    n_dst: int,
+) -> list[tuple[int, int, int, int]] | None:
+    """Remap every joint row through one lookup table, or return ``None`` for the general path.
+
+    Only handles the case where each distinct source joint value is an ``int`` that maps cleanly
+    (a resolved ``slot_map`` entry, or an in-range index when ``slot_map`` is ``None``). Then the
+    weight of a slot cannot change its result, so no per-slot weight test is needed. Anything else
+    (an error to report, an unmapped zero-weight padding slot, ragged rows) returns ``None`` and
+    the caller's slot-by-slot loop produces the original result or error message.
+    """
+    if len(joints) != len(weights):
+        return None
+    try:
+        if set(map(len, weights)) - {4}:
+            return None
+        values = set(chain.from_iterable(joints))
+        table: dict[int, int] = {}
+        for v in values:
+            if type(v) is not int:
+                return None
+            if slot_map is None:
+                if not 0 <= v < n_dst:
+                    return None
+                table[v] = v
+            else:
+                if not 0 <= v < len(slot_map) or not slot_map[v][0]:
+                    return None
+                table[v] = int(slot_map[v][1])
+        return [(table[a], table[b], table[c], table[d]) for a, b, c, d in joints]
+    except (TypeError, ValueError, KeyError):
+        return None
 
 
 def remap_part_joints(
@@ -1782,6 +2043,9 @@ def remap_part_joints(
     ) -> list[tuple[int, int, int, int]] | None:
         if joints is None or weights is None:
             return None
+        fast = _remap_joint_rows_fast(joints, weights, slot_map, n_dst)
+        if fast is not None:
+            return fast
         remapped: list[tuple[int, int, int, int]] = []
         for vi, (j_row, w_row) in enumerate(zip(joints, weights)):
             if len(j_row) != 4 or len(w_row) != 4:
@@ -1917,7 +2181,7 @@ def build_assembled_glb(
             apply_offset=(apply_standing and not is_skinned_part),
         )
         n_verts = len(aligned.positions)
-        flat_indices = [idx for tri in aligned.triangles for idx in tri]
+        flat_indices = list(chain.from_iterable(aligned.triangles))
         if aligned.normals is not None and len(aligned.normals) == n_verts:
             normals = aligned.normals
         else:
@@ -1925,13 +2189,12 @@ def build_assembled_glb(
 
         pos_bytes = _pack_f32_vec(aligned.positions, 3)
         pos_bv = _append_bv(bin_buf, buffer_views, pos_bytes, target=TARGET_ARRAY_BUFFER)
-        xs = [p[0] for p in aligned.positions]
-        ys = [p[1] for p in aligned.positions]
-        zs = [p[2] for p in aligned.positions]
         pos_acc = _append_accessor(
             accessors, pos_bv, COMPONENT_FLOAT, n_verts, "VEC3",
-            min_vals=[min(xs), min(ys), min(zs)],
-            max_vals=[max(xs), max(ys), max(zs)],
+            min_vals=[min(map(_GET_X, aligned.positions)), min(map(_GET_Y, aligned.positions)),
+                      min(map(_GET_Z, aligned.positions))],
+            max_vals=[max(map(_GET_X, aligned.positions)), max(map(_GET_Y, aligned.positions)),
+                      max(map(_GET_Z, aligned.positions))],
         )
 
         nrm_bytes = _pack_f32_vec(normals, 3)
