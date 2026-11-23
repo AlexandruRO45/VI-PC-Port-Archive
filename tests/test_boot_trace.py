@@ -137,6 +137,20 @@ class BootTraceTests(unittest.TestCase):
         self.assertIs(trace["exceptions"][1]["cpp"], True)
         self.assertEqual(trace["exit"], 0)
 
+    def test_exception_stack_keeps_the_runtime_frame_depth(self):
+        frames = [f"fixture.dll+0x{offset:x}" for offset in range(17)]
+        for stack in (frames[:16], frames):
+            with self.subTest(frame_count=len(stack)):
+                self.write(self.startup, [{"kind": "exception", "stack": stack}])
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(bt.main([self.startup, "--json"]), 0)
+                summary = json.loads(output.getvalue())
+                self.assertEqual(summary["startup"]["exceptions"][0]["stack"], frames[:16])
+                full = bt.format_text(summary, 16)
+                self.assertIn("stack: " + ", ".join(frames[:16]), full)
+                self.assertIn("stack: " + frames[0] + ", ... 15 more", bt.format_text(summary, 1))
+
     def test_exception_limit_keeps_final_observation(self):
         early = [
             {"kind": "exception", "code": "0xe06d7363", "at": f"synthetic.exe+0x{0x1100 + i:x}", "cpp": True}

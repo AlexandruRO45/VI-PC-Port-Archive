@@ -31,6 +31,7 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+MAX_STACK_FRAMES = 16  # kMaxFrames in runtime/shims/startup_trace.h
 
 
 class TraceError(ValueError):
@@ -155,7 +156,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     "cpp": event.get("cpp"),
                     "access": event.get("access"),
                     "address": event.get("address"),
-                    "stack": stack[:8] if isinstance(stack, list) else [],
+                    "stack": stack[:MAX_STACK_FRAMES] if isinstance(stack, list) else [],
                 }
                 if len(trace["exceptions"]) < limit:
                     trace["exceptions"].append(detail)
