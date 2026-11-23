@@ -15,6 +15,7 @@ Usage:
                                   [--out FILE] [--check-extents]
 
 Only hashes, bounds and scalar fields are written; no model, texture or payload.
+`--out` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 from __future__ import annotations
 
@@ -23,15 +24,19 @@ import json
 import math
 import mmap
 import os
+import stat
 import statistics
 import struct
 import sys
+import tempfile
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 import world_census as WC  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -303,12 +308,44 @@ def main(argv=None):
     doc = run(a.path, a.start, a.limit, a.check_extents)
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     try:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1, sort_keys=True)
+        write_json_report(a.out, doc)
     except OSError as e:
         ap.error("--out %s: %s" % (a.out, e.strerror or e))
     print(json.dumps({k: doc[k] for k in ("summary", "extents") if k in doc}, indent=1, sort_keys=True))
     return 0
+
+
+def write_json_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1, sort_keys=True)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".world_archetypes-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, sort_keys=True)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

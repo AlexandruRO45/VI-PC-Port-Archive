@@ -14,6 +14,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -347,6 +348,17 @@ class CliTest(unittest.TestCase):
                 WA.main([os.path.join(self.tmp.name, "nope")])
             finally:
                 sys.stderr = saved
+
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}'
+        path = os.path.join(self.tmp.name, "out.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(WA, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                WA.write_json_report(path, {"summary": {}})
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":
