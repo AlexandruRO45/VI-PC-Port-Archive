@@ -138,7 +138,7 @@ def main(argv=None):
         ap.error(f"{a.index} is not a translator index (expected a JSON object)")
     carve = None
     if a.carve:
-        with open(a.carve, encoding="utf-8") as f:
+        with open(a.carve, encoding="utf-8-sig") as f:  # same for the carve index
             carve = json.load(f)
     # --base overrides the stages it names and keeps the defaults for the rest, so a partial override never drops
     # a stage from the check.
