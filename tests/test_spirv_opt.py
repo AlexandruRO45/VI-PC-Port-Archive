@@ -542,6 +542,43 @@ class SpirvOptTests(unittest.TestCase):
         for dead in ("%dead_grp", "%dead_only", "%dead_str", "%dead_g", "%dead_id"):
             self.assertNotIn(dead, opt)
 
+    def test_cli_out_must_not_name_the_input(self):
+        # An -o naming the input must be refused: without the guard the CLI exited 0 and rewrote the
+        # source file with the optimized output, so the dead %dead = OpIAdd vanished from the input.
+        spvasm = """               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out0 Location 0
+        %void = OpTypeVoid
+          %fn = OpTypeFunction %void
+        %uint = OpTypeInt 32 0
+      %v4uint = OpTypeVector %uint 4
+    %_ptr_Out = OpTypePointer Output %v4uint
+         %c1  = OpConstant %uint 1
+        %out0 = OpVariable %_ptr_Out Output
+        %main = OpFunction %void None %fn
+       %entry = OpLabel
+        %dead = OpIAdd %uint %c1 %c1
+         %vec = OpCompositeConstruct %v4uint %c1 %c1 %c1 %c1
+                OpStore %out0 %vec
+                OpReturn
+                OpFunctionEnd
+"""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "in.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(spvasm)
+            with open(src, "rb") as f:
+                before = f.read()
+            r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_opt.py"), src, "-o", src],
+                              capture_output=True, text=True, errors="replace")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertEqual(r.stderr.count("would overwrite the input"), 1)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(src, "rb") as f:
+                self.assertEqual(f.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

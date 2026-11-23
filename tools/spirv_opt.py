@@ -39,7 +39,12 @@ As a CLI:
 Usage: `python -I tools/spirv_opt.py --help` lists the options.
 """
 import argparse
+import os
 import sys
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 _PURE_OPS = frozenset((
     "OpAccessChain",
@@ -1187,6 +1192,8 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--out", required=True, help="output .spvasm file")
     ap.add_argument("--passes", type=int, default=4, help="max optimization passes (default: 4)")
     args = ap.parse_args(argv)
+    if same_report_path(args.out, args.src):
+        ap.error(f"{args.out} would overwrite the input {args.src}")
     with open(args.src, encoding="utf-8") as f:
         text = f.read()
     opt = optimize(text, max_passes=args.passes)
