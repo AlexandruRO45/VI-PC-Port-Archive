@@ -215,6 +215,57 @@ class ShaderSidecarIOTest(unittest.TestCase):
             meta = shader_meta.collect(src_path, "cs_direct", [info["insns"]], [[]])
             self.assertIn("fssm_sha256", meta)
 
+    def test_unreadable_sidecar_propagates_permission_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            disasm_dir = os.path.join(td, "disasm")
+            fssm_dir = os.path.join(td, "fssm")
+            fspx_dir = os.path.join(td, "fspx")
+            os.makedirs(disasm_dir)
+            os.makedirs(fssm_dir)
+            os.makedirs(fspx_dir)
+
+            src_path = os.path.join(disasm_dir, "vs_perm.s")
+            fssm_path = os.path.join(fssm_dir, "vs_perm.fssm")
+            code_path = os.path.join(fspx_dir, "vs_perm.code")
+            dxbc_path = os.path.join(td, "vs_perm.dxbc")
+            with open(src_path, "wb") as f:
+                f.write(b"; vs_perm synthetic\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+            with open(fssm_path, "wb") as f:
+                f.write(_make_fssm_ps())
+            with open(code_path, "wb") as f:
+                f.write(b"\x00\x00\x81\xbf")
+            with open(dxbc_path, "wb") as f:
+                f.write(_make_dxbc([(b"ISG1", _make_isg1([]))]))
+
+            orig_open = builtins.open
+
+            def deny(target):
+                target_key = os.path.normcase(os.path.abspath(target))
+
+                def wrapped(file, *args, **kwargs):
+                    if os.path.normcase(os.path.abspath(os.fspath(file))) == target_key:
+                        raise PermissionError(13, "Permission denied", os.fspath(file))
+                    return orig_open(file, *args, **kwargs)
+
+                return wrapped
+
+            # Unreadable FSSM must raise rather than falling back to fspx/.code or omitting fssm_sha256.
+            builtins.open = deny(fssm_path)
+            try:
+                with self.assertRaises(PermissionError):
+                    rdna2spirv.translate(src_path)
+            finally:
+                builtins.open = orig_open
+
+            # Unreadable DXBC must raise in shader_meta.collect as well.
+            info = shader_ir.parse_file(src_path)
+            builtins.open = deny(dxbc_path)
+            try:
+                with self.assertRaises(PermissionError):
+                    shader_meta.collect(src_path, "vs_perm", [info["insns"]], [[]])
+            finally:
+                builtins.open = orig_open
+
 
 if __name__ == "__main__":
     unittest.main()

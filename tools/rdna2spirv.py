@@ -15779,8 +15779,12 @@ def _read_optional_bytes(path):
     try:
         with open(path, "rb") as f:
             return f.read()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
         return None
+    except PermissionError:
+        if os.path.isdir(path):
+            return None
+        raise
 
 
 class _ShaderSidecars:

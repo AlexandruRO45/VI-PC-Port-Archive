@@ -716,12 +716,21 @@ def fspx_state_sha256_file(disasm_path, name):
 _UNSET = object()
 
 
-def _sha256_optional_file(path):
+def _read_optional_bytes(path):
     try:
         with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
+            return f.read()
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
         return None
+    except PermissionError:
+        if os.path.isdir(path):
+            return None
+        raise
+
+
+def _sha256_optional_file(path):
+    data = _read_optional_bytes(path)
+    return hashlib.sha256(data).hexdigest() if data is not None else None
 
 
 def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=(),
@@ -752,12 +761,9 @@ def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()
 
     dxbc_info = {}
     if dxbc_bytes is _UNSET:
-        dxbc_path = os.path.join(parent, name + ".dxbc")
-        try:
-            with open(dxbc_path, "rb") as f:
-                dxbc_info = read_dxbc_meta(f.read())
-        except OSError:
-            pass
+        dxbc_data = _read_optional_bytes(os.path.join(parent, name + ".dxbc"))
+        if dxbc_data is not None:
+            dxbc_info = read_dxbc_meta(dxbc_data)
     elif dxbc_bytes is not None:
         dxbc_info = read_dxbc_meta(dxbc_bytes)
     if "input_signature" in dxbc_info:
