@@ -2,6 +2,7 @@
 // Huffman blocks, compressed from synthetic data with Python's zlib), the JSON reader, FSSM extraction from a
 // synthetic DXBC container, and index lookup by content hash. No game data.
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -343,7 +344,8 @@ int main() {
     CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
 
     // An index with one findable shader, one without a hash, and the module next to it.
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
+    const testfiles::ScratchDir scratch("leonida_shader_library_test");
+    const auto& dir = scratch.path();
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
     const std::string hash2 = sha256_hex(bytes("another program"));
@@ -432,7 +434,7 @@ int main() {
             spv.write(reinterpret_cast<const char*>(words), sizeof(words));
         }
         ShaderLibrary fspx;
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3);
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3 && fspx.fspx_size() == 1);
         const auto found = fspx.fspx_candidates("cs", code_hash);
         CHECK(found.size() == 1 && found[0]->name == "fspx/upscaler_00" && found[0]->local_size[0] == 8 &&
               found[0]->wave64 && found[0]->fssm_sha256.empty());
@@ -452,9 +454,10 @@ int main() {
             std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
             sub << "{broken";
         }
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_candidates("cs", code_hash).empty());
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 &&
+              fspx.fspx_candidates("cs", code_hash).empty());
         std::filesystem::remove(dir / "fspx" / "index.json");
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.find("cs", hash));
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 && fspx.find("cs", hash));
         std::filesystem::remove_all(dir);
     }
 
