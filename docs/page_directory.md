@@ -386,6 +386,12 @@ outside it), to another page, or to a named RBF0/PSIN/model/texture resource:
   resource therefore extends forward by payload, not by nesting another directory.
 - `PSIN` (2,281) and `RBF0` (1,263) are separate top-level stream classes in `data.rpf`, not `q38` payloads.
 
+Run `python -I tools/q38_window_census.py <archive.rpf>` to count each prefix and offset probe independently.
+The JSON on stdout gives matches and eligible targets per probe. A `joined` window fits in the directory stream
+and continuations read for q38. A `record` window also fits inside the target's declared size. For example,
+the four-byte word at +0x14 needs 24 available bytes, while a four-byte prefix needs only four. Pages with
+unreadable q38 records are counted separately and contribute no targets.
+
 ### Cross-check: `0x00010015` data pages
 
 A typed data page has a different prefix: eight zero bytes, a `0x5000xxxx` pointer at +0x08, a small `u32` at

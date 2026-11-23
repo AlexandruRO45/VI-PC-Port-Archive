@@ -280,29 +280,31 @@ def resource_of(page):
     }
 
 
-def index_streams(streams, progress=None):
-    """Consume a stream sequence and return page records. At most one page waits for a continuation."""
-    pages = []
+def visit_pages(streams, visit, progress=None):
+    """Visit each indexed page with its base bytes and continuation streams."""
+    pages_seen = 0
     waiting = None
     streams_seen = 0
 
-    def add(page):
+    def add(page, base, cont):
+        nonlocal pages_seen
         page["resource"] = resource_of(page)
-        pages.append(page)
+        visit(page, base, cont)
+        pages_seen += 1
 
     def start(offset, stored, data):
         page, complete = parse_page(data, [])
         page["offset"] = offset
         page["stored"] = stored
         if complete:
-            add(page)
+            add(page, data, [])
             return None
         return (page, data, [])
 
     for offset, stored, data in streams:
         streams_seen += 1
         if progress and streams_seen % 2000 == 0:
-            progress(streams_seen, len(pages))
+            progress(streams_seen, pages_seen)
         if waiting is not None:
             page, base, cont = waiting
             cont.append((offset, stored, data))
@@ -310,7 +312,7 @@ def index_streams(streams, progress=None):
             page["offset"] = waiting[0]["offset"]
             page["stored"] = waiting[0]["stored"]
             if complete:
-                add(page)
+                add(page, base, cont)
                 waiting = None
                 continue
             if is_page(data):
@@ -320,13 +322,13 @@ def index_streams(streams, progress=None):
                 # continuation was appended and would lose it from the reported continuations/records.
                 page["complete"] = False
                 page["error"] = page["error"] or "resource ended before q38 was complete"
-                add(page)
+                add(page, base, cont)
                 waiting = start(offset, stored, data)
                 continue
             if len(cont) >= MAX_CONTINUATIONS:
                 page["complete"] = False
                 page["error"] = page["error"] or "too many continuation streams"
-                add(page)
+                add(page, base, cont)
                 waiting = None
             else:
                 waiting = (page, base, cont)
@@ -334,10 +336,17 @@ def index_streams(streams, progress=None):
         if is_page(data):
             waiting = start(offset, stored, data)
     if waiting is not None:
-        page = waiting[0]
+        page, base, cont = waiting
         page["complete"] = False
         page["error"] = page["error"] or "archive ended before q38 was complete"
-        add(page)
+        add(page, base, cont)
+    return streams_seen
+
+
+def index_streams(streams, progress=None):
+    """Consume a stream sequence and return page records."""
+    pages = []
+    streams_seen = visit_pages(streams, lambda page, base, cont: pages.append(page), progress)
     return pages, streams_seen
 
 
