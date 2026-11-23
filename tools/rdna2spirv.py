@@ -5090,11 +5090,18 @@ class Gen:
     def vop3_mask_operand(self, m):
         """The carry-in / select mask operand of a VOP3 v_cndmask_b32 or v_add/sub/subrev_co_ci_u32. The corpus listing
         prints it in wave32 syntax in wave64 (`s4`, like `vcc_lo`), but the hardware reads the 64-bit pair s[4:5]
-        (llvm-mc gfx1030 encodes both spellings the same): a single SGPR always becomes the pair, certified mask or
-        not (a mask half such as `s_mov_b32 s4, exec_lo` leaves s5 free to hold another mask or data), so lanes 32-63
-        take their bit from r+1. mask_src then selects lo/hi when both words are masks, else takes bit L of the
-        64-bit value, which is exact for a mask word too (it holds 0 / ~0 per invocation)."""
-        if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1:
+        (llvm-mc gfx1030 encodes both spellings the same): a single SGPR becomes the pair (a mask half such as
+        `s_mov_b32 s4, exec_lo` leaves s5 free to hold another mask or data), so lanes 32-63 take their bit from r+1.
+        mask_src then selects lo/hi when both words are masks, else takes bit L of the 64-bit value, which is exact
+        for a mask word too (it holds 0 / ~0 per invocation).
+
+        Exception: a register kept as lane_masks.MASK on its own (the narrow-printed destination of a VOP3 v_cmp_e64,
+        `v_cmp_eq_u32_e64 s4, ...`) holds the WHOLE per-lane mask in that one register and s5 is never written, so
+        it stays single. Limit: a later write of s5 changes lanes 32-63 on hardware, and lane_masks cannot tell;
+        that case and a MASK merged from half-masks resolve when #2231 records those destinations as
+        MASK_LO / MASK_HI pairs, which then widen here."""
+        if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1 \
+                and self.cur_masks.get(m["r"]) != lane_masks.MASK:
             return dict(m, n=2)
         return m
 

@@ -193,6 +193,17 @@ class HandWrittenCases(unittest.TestCase):
         mem = run(translate("cs_ms_cnd64c", 64, lines=body), 64, 64)
         self.assertEqual([mem.get(4 * i, 0) for i in range(64)], [1 if i == 40 else 0 for i in range(64)])
 
+    def test_wave64_narrow_vcmp_dest_stays_single(self):
+        # `v_cmp_*_e64 s4` printed with one SGPR keeps the whole per-lane mask in s4 and never writes s5; the stale
+        # s5 (0 or -1) must not reach lanes 32-63 (hardware: only lane 40). Regression of c5597061.
+        want = [1 if i == 40 else 0 for i in range(64)]
+        for s5 in ("0", "-1"):
+            setup = ["s_mov_b32 s5, " + s5, "v_cmp_eq_u32_e64 s4, v0, 40"]
+            for tag, op in (("cnd", "v_cndmask_b32_e64 v8, 0, 1, s4"),
+                            ("ci", "v_add_co_ci_u32_e64 v8, s6, 0, 0, s4")):
+                self.assertEqual(self.lanes64(f"cs_ms_narrow_{tag}{s5}".replace("-", "m"), setup, op), want,
+                                 f"{tag} s5={s5}")
+
 
 if __name__ == "__main__":
     unittest.main()
