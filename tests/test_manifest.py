@@ -41,6 +41,29 @@ class ManifestSha256Test(unittest.TestCase):
         expected = hashlib.sha256(b"").hexdigest()
         self.assertEqual(manifest.sha256(path), expected)
 
+    def test_sha256_reuses_buffer_across_short_reads(self):
+        payload = bytes(range(25))
+        path = os.path.join(self.tmp.name, "short-reads.bin")
+        with open(path, "wb") as f:
+            f.write(payload)
+
+        buffers = []
+        with open(path, "rb", buffering=0) as f:
+            readinto = f.readinto
+
+            def read_some(buffer):
+                view = memoryview(buffer)
+                buffers.append(view.obj)
+                return readinto(view[:3])
+
+            with patch.object(manifest, "CHUNK", 8), patch.object(f, "readinto", read_some), \
+                    patch.object(manifest, "open", return_value=f, create=True):
+                self.assertEqual(manifest.sha256(path), hashlib.sha256(payload).hexdigest())
+
+        self.assertGreater(len(buffers), 1)
+        self.assertEqual(len(buffers[0]), 8)
+        self.assertTrue(all(buf is buffers[0] for buf in buffers))
+
 
 class ManifestWalkTest(unittest.TestCase):
     def setUp(self):
@@ -530,18 +553,18 @@ class ManifestAtomicCreateTest(unittest.TestCase):
         def open_with_edit(path, mode, **kwargs):
             stream = open(path, mode, **kwargs)
             if path == source and mode == "rb":
-                original_read = stream.read
+                original_readinto = stream.readinto
 
-                def read_then_edit(size):
-                    chunk = original_read(size)
-                    stream.read = original_read
+                def read_then_edit(buffer):
+                    count = original_readinto(buffer)
+                    stream.readinto = original_readinto
                     stamp = os.stat(source)
                     with open(source, "r+b") as f:
                         f.write(b"X")
                     os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
-                    return chunk
+                    return count
 
-                stream.read = read_then_edit
+                stream.readinto = read_then_edit
             return stream
 
         with patch.object(manifest, "open", side_effect=open_with_edit, create=True):
