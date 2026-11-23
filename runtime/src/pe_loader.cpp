@@ -440,11 +440,13 @@ void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
         if (!fn) break;
         auto callback =
             reinterpret_cast<PIMAGE_TLS_CALLBACK>(m.base + rva_in(m, fn, "a TLS callback"));
+        uint64_t phase = 0;
         if (trace && startup_trace::enabled())
-            startup_trace::event("tls_callback", "\"module\":" + startup_trace::quote(m.name) + ",\"at\":" +
+            phase = startup_trace::enter("tls_callback", "\"module\":" + startup_trace::quote(m.name) + ",\"at\":" +
                                                      startup_trace::quote(startup_trace::where(reinterpret_cast<uint64_t>(callback))) +
                                                      ",\"reason\":" + std::to_string(reason));
         callback(m.base, static_cast<DWORD>(reason), nullptr);
+        if (phase) startup_trace::returned("tls_callback_return", phase);
     }
 }
 
@@ -1110,9 +1112,13 @@ void Loader::initialise(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
+        uint64_t phase = 0;
         if (startup_trace::enabled())
-            startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
+            phase = startup_trace::enter("dllmain_enter", "\"module\":" + startup_trace::quote(m.name) +
+                                                          ",\"reason\":" + std::to_string(DLL_PROCESS_ATTACH));
+        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
+        if (phase)
+            startup_trace::returned("dllmain", phase, "\"module\":" + startup_trace::quote(m.name) +
                                                 ",\"result\":" + std::to_string(ok));
         if (!ok) {
             set_initialised(m, true);  // it ran: a second DLL_PROCESS_ATTACH would be wrong

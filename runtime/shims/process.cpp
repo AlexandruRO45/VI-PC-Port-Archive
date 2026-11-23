@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "process_shim.h"
+#include "startup_trace.h"
 #include "shims.h"
 
 namespace rt::process {
@@ -263,7 +264,12 @@ DWORD WINAPI game_thread(void* p) {
     auto* call = static_cast<EntryCall*>(p);
     // An EXE entry point (mainCRTStartup and friends) takes the PEB pointer and returns the process exit code.
     auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(call->entry);
+    uint64_t phase = 0;
+    if (startup_trace::enabled())
+        phase = startup_trace::enter("game_entry", "\"at\":" + startup_trace::quote(
+            startup_trace::where(reinterpret_cast<uint64_t>(entry))));
     const DWORD code = entry(nullptr);
+    if (phase) startup_trace::returned("game_entry_return", phase, "\"result\":" + std::to_string(code));
     end_run(static_cast<int>(code));  // returning from the entry point is an exit too
 }
 

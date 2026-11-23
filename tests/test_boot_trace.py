@@ -111,6 +111,19 @@ class BootTraceTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
+    def test_nested_and_concurrent_phases(self):
+        entries = [
+            {"kind": "dllmain_enter", "tid": 7, "phase_id": 1, "module": "outer.dll", "reason": 1},
+            {"kind": "dllmain_enter", "tid": 7, "phase_id": 2, "module": "inner.dll", "reason": 1},
+            {"kind": "game_entry", "tid": 8, "phase_id": 3, "at": "game.exe+0x20"},
+            {"kind": "dllmain", "tid": 7, "phase_id": 2, "result": 0},
+            {"kind": "game_entry_return", "tid": 8, "phase_id": 3, "result": 42},
+        ]
+        self.write(self.startup, STARTUP + entries)
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual([p["phase_id"] for p in trace["outstanding_phases"]], [1])
+        self.assertIn("outer.dll (thread 7, id 1, reason 1)", bt.format_text({"startup": trace}, 10))
+
     def test_startup_summary(self):
         self.write(self.startup, STARTUP)
         trace = bt.parse_startup(self.startup)

@@ -578,6 +578,12 @@ if(BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       )
     endforeach()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME startup_trace_phases COMMAND "${Python3_EXECUTABLE}" -I
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/startup_trace_phases.py"
+        "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_startup_cmdline>")
+    endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8)

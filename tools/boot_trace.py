@@ -68,6 +68,9 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "exit": None,
         "error": None,
     }
+    outstanding = {}
+    entries = {"dllmain_enter": "dllmain", "tls_callback": "tls_callback", "game_entry": "game_entry"}
+    returns = {"dllmain": "dllmain", "tls_callback_return": "tls_callback", "game_entry_return": "game_entry"}
     seen_imports = set()
     with _open_text(path) as fh:
         for number, line in enumerate(fh, 1):
@@ -91,6 +94,16 @@ def parse_startup(path: str, limit: int = 10) -> dict:
             trace["events"] += 1
             kind = str(event.get("kind"))
             trace["kinds"][kind] = trace["kinds"].get(kind, 0) + 1
+            tid, phase_id = event.get("tid"), event.get("phase_id")
+            if type(tid) is int and type(phase_id) is int:
+                if kind in entries:
+                    phase = entries[kind]
+                    outstanding[tid, phase_id, phase] = {
+                        "phase": phase, "tid": tid, "phase_id": phase_id,
+                        "module": event.get("module"), "at": event.get("at"), "reason": event.get("reason"),
+                    }
+                elif kind in returns:
+                    outstanding.pop((tid, phase_id, returns[kind]), None)
             if kind == "trace_open":
                 trace["pid"] = event.get("pid")
             elif kind == "map":
@@ -152,6 +165,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["error"] = event.get("what")
     if trace["events"] == 0:
         raise TraceError(f"{path} has no valid startup event")
+    trace["outstanding_phases"] = list(outstanding.values())
     return trace
 
 
@@ -227,6 +241,13 @@ def format_text(summary: dict, limit: int) -> str:
                 phase = {0: "process detach", 1: "process attach"}.get(reason, phase)
             at = callback["at"] or "address unknown"
             out.append(f"    last observed TLS callback: {at} ({phase})")
+        phases = startup.get("outstanding_phases", [])
+        if phases:
+            out.append(f"  outstanding phases (no return observed): {len(phases)}")
+            for item in reversed(phases[-limit:] if limit else []):
+                location = item["at"] or item["module"] or "unknown"
+                reason = "" if item["reason"] is None else f", reason {item['reason']}"
+                out.append(f"    {item['phase']} at {location} (thread {item['tid']}, id {item['phase_id']}{reason})")
         dm = startup["dllmain"]
         line = f"  dllmain: {dm['ok']} ok, {dm['failed']} failed"
         if dm["failed_modules"]:
