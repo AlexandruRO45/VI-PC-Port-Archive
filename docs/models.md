@@ -815,6 +815,21 @@ POSITION bounding box (marked `partial` when a POSITION accessor has no `min`/`m
 what the JSON chunk says — a field the exporter dropped reads `(missing)` — and never infers
 geometry from the BIN chunk. Standard library only; no game files.
 
+## Preview the exports
+
+`tools/gallery.py` is a local browser page for what an export wrote: `--models-dir` is walked for
+`.glb`/`.gltf` files and `--textures-dir` for `.png`, `.jpg`, `.webp` and `.dds` (a `.dds` is decoded to a PNG
+preview on request through `tools/dds_png.py`). The page is served at `http://localhost:8080`, on the next port
+when that one is taken:
+
+```
+python -I tools/gallery.py --models-dir <work>\models --textures-dir <work>\textures [--port 8080] [--no-browser]
+```
+
+It binds `127.0.0.1` only and answers only requests whose `Host` header names the loopback address, so nothing of
+the export is reachable from another machine or from a web page. `python -I tests/test_gallery.py` covers both
+listing endpoints, the DDS preview and the path guards with synthetic files and needs no game files.
+
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
