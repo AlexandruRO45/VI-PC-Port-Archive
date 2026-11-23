@@ -694,20 +694,102 @@ function resetCamera() {
   if (controls) controls.reset();
 }
 
+// glTF skins may carry a second JOINTS_1/WEIGHTS_1 set (eight influences). three r128 only skins with the
+// first (skinIndex/skinWeight); GLTFLoader keeps the second as the attributes joints_1/weights_1.
+function hasSecondSkinSet(mesh) {
+  const a = mesh.isSkinnedMesh && mesh.geometry && mesh.geometry.attributes;
+  const ok = at => at && at.itemSize === 4;
+  return !!a && ok(a.joints_1) && ok(a.weights_1) && ok(a.skinIndex) && ok(a.skinWeight);
+}
+
+// GLTFLoader rescales the first weight set to sum 1 in place, which erases how much weight the second set
+// carries. Skip that for eight-influence meshes; the shader divides by the total of both sets instead.
+if (THREE.SkinnedMesh) {
+  const normalizeSkinWeights = THREE.SkinnedMesh.prototype.normalizeSkinWeights;
+  THREE.SkinnedMesh.prototype.normalizeSkinWeights = function () {
+    if (hasSecondSkinSet(this)) return;
+    return normalizeSkinWeights.call(this);
+  };
+}
+
+function patchSecondSkinSet(shader) {
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <skinning_pars_vertex>', `#include <skinning_pars_vertex>
+#ifdef USE_SKINNING
+attribute vec4 joints_1;
+attribute vec4 weights_1;
+#endif`)
+    .replace('#include <skinbase_vertex>', `#include <skinbase_vertex>
+#ifdef USE_SKINNING
+mat4 boneMatX1 = getBoneMatrix( joints_1.x );
+mat4 boneMatY1 = getBoneMatrix( joints_1.y );
+mat4 boneMatZ1 = getBoneMatrix( joints_1.z );
+mat4 boneMatW1 = getBoneMatrix( joints_1.w );
+float skinTotal = dot( skinWeight, vec4( 1.0 ) ) + dot( weights_1, vec4( 1.0 ) );
+float skinScale = skinTotal > 0.0 ? 1.0 / skinTotal : 1.0;
+vec4 skinW0 = skinWeight * skinScale;
+vec4 skinW1 = weights_1 * skinScale;
+#endif`)
+    .replace('#include <skinnormal_vertex>', `#ifdef USE_SKINNING
+mat4 skinMatrix = skinW0.x * boneMatX + skinW0.y * boneMatY + skinW0.z * boneMatZ + skinW0.w * boneMatW
+  + skinW1.x * boneMatX1 + skinW1.y * boneMatY1 + skinW1.z * boneMatZ1 + skinW1.w * boneMatW1;
+skinMatrix = bindMatrixInverse * skinMatrix * bindMatrix;
+objectNormal = vec4( skinMatrix * vec4( objectNormal, 0.0 ) ).xyz;
+#ifdef USE_TANGENT
+objectTangent = vec4( skinMatrix * vec4( objectTangent, 0.0 ) ).xyz;
+#endif
+#endif`)
+    .replace('#include <skinning_vertex>', `#ifdef USE_SKINNING
+vec4 skinVertex = bindMatrix * vec4( transformed, 1.0 );
+vec4 skinned = boneMatX * skinVertex * skinW0.x + boneMatY * skinVertex * skinW0.y
+  + boneMatZ * skinVertex * skinW0.z + boneMatW * skinVertex * skinW0.w
+  + boneMatX1 * skinVertex * skinW1.x + boneMatY1 * skinVertex * skinW1.y
+  + boneMatZ1 * skinVertex * skinW1.z + boneMatW1 * skinVertex * skinW1.w;
+transformed = ( bindMatrixInverse * skinned ).xyz;
+#endif`);
+}
+
+// A clone of `source` (or of each entry of a material array) that skins with both influence sets. The clone
+// keeps the source's own onBeforeCompile hook and program-cache key, and is cached per mesh and source.
+function skinVariant(mesh, source) {
+  const variants = mesh.userData.skinVariants || (mesh.userData.skinVariants = new Map());
+  if (!variants.has(source)) {
+    const make = m => {
+      const clone = m.clone();
+      const before = m.onBeforeCompile;
+      const key = m.customProgramCacheKey();
+      clone.skinning = true;
+      clone.onBeforeCompile = function (shader, renderer) {
+        before.call(this, shader, renderer);
+        patchSecondSkinSet(shader);
+      };
+      clone.customProgramCacheKey = () => key + '|skin-influences-8';
+      return clone;
+    };
+    variants.set(source, Array.isArray(source) ? source.map(make) : make(source));
+  }
+  return variants.get(source);
+}
+
 function applyMeshShading() {
   if (!currentMesh) return;
   currentMesh.traverse(child => {
     if (child.isMesh) {
+      let material;
       if (shadingMode === 'clay') {
-        child.material = clayMaterial;
+        material = clayMaterial;
       } else if (shadingMode === 'normals') {
-        child.material = normalMaterial;
+        material = normalMaterial;
       } else {
-        child.material = child.userData.origMaterial || child.material;
+        material = child.userData.origMaterial || child.material;
       }
-      if (child.material) {
-        child.material.wireframe = wireframeActive;
-        child.material.needsUpdate = true;
+      if (material && hasSecondSkinSet(child)) material = skinVariant(child, material);
+      child.material = material;
+      if (material) {
+        [].concat(material).forEach(m => {
+          m.wireframe = wireframeActive;
+          m.needsUpdate = true;
+        });
       }
     }
   });
@@ -716,13 +798,20 @@ function applyMeshShading() {
 function disposeModel(root) {
   root.traverse(child => {
     if (child.geometry) child.geometry.dispose();
+    // Per-mesh skin variants share textures with their source; release only the variants.
+    if (child.userData.skinVariants) {
+      child.userData.skinVariants.forEach(variant => [].concat(variant).forEach(m => m.dispose()));
+      child.userData.skinVariants.clear();
+    }
     // In clay/normals mode child.material is a shared material; the model's own is origMaterial.
     const material = child.userData.origMaterial || child.material;
     if (!material) return;
-    Object.values(material).forEach(value => {
-      if (value && value.isTexture) value.dispose();
+    [].concat(material).forEach(m => {
+      Object.values(m).forEach(value => {
+        if (value && value.isTexture) value.dispose();
+      });
+      m.dispose();
     });
-    material.dispose();
   });
 }
 

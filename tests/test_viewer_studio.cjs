@@ -30,6 +30,11 @@ function fakeElement() {
 
 class Vector3 { set() { return this; } sub() { return this; } }
 class Disposable { disposed = false; dispose() { this.disposed = true; } }
+class Material extends Disposable {
+    onBeforeCompile() {}
+    customProgramCacheKey() { return 'stock'; }
+    clone() { return new Material(); }
+}
 
 function loadStudio() {
     const elements = new Map(), loads = [], alerts = [];
@@ -42,8 +47,9 @@ function loadStudio() {
         document, URLSearchParams, localStorage: { getItem: () => null, setItem() {} }, window: {}, setTimeout() {},
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
-            MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
+            MeshStandardMaterial: Material, MeshNormalMaterial: Material, Vector3,
             Box3: class { setFromObject() { return this; } getCenter(v) { return v; } getSize(v) { return v; } },
+            SkinnedMesh: class { normalizeSkinWeights() { this.normalized = true; } },
             GLTFLoader: class { load(url, onLoad, onProgress, onError) { loads.push({ url, onLoad, onError }); } },
         },
     });
@@ -275,4 +281,75 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
     pending[1].resolve({ok: false});
     await older;
     assert.equal(output.textContent, 'R = -2.5');
+});
+
+function skinnedMesh(studio, extra = true, material = fakeMaterial()) {
+    const attr = { itemSize: 4 };
+    const attributes = { skinIndex: attr, skinWeight: attr, ...(extra ? { joints_1: attr, weights_1: attr } : {}) };
+    const mesh = Object.assign(new (studio.run('THREE.SkinnedMesh'))(), {
+        isMesh: true, isSkinnedMesh: true, geometry: { attributes, dispose() {} }, material, userData: {} });
+    return mesh;
+}
+
+function fakeMaterial(hook = () => {}) {
+    const material = Object.assign(new Disposable(), { onBeforeCompile: hook,
+        customProgramCacheKey: () => 'stock' });
+    material.clone = () => Object.assign(fakeMaterial(hook), { clone: material.clone });
+    return material;
+}
+
+const STOCK_SHADER = ['skinning_pars_vertex', 'skinbase_vertex', 'skinnormal_vertex', 'skinning_vertex']
+    .map(name => `#include <${name}>`).join('\n');
+
+test('a second JOINTS_1/WEIGHTS_1 set skins positions and normals, and keeps the first weights raw', () => {
+    const studio = loadStudio();
+    const full = skinnedMesh(studio), first = skinnedMesh(studio, false);
+    full.normalizeSkinWeights();
+    first.normalizeSkinWeights();
+    assert.equal(full.normalized, undefined);
+    assert.equal(first.normalized, true);
+
+    const calls = [];
+    const stock = fakeMaterial(() => calls.push('stock'));
+    const variant = studio.run('skinVariant', full)(full, stock);
+    assert.notEqual(variant, stock);
+    assert.equal(variant.skinning, true);
+    assert.equal(variant.customProgramCacheKey(), 'stock|skin-influences-8');
+    const shader = { vertexShader: STOCK_SHADER };
+    variant.onBeforeCompile(shader, {});
+    assert.deepEqual(calls, ['stock']);
+    assert.match(shader.vertexShader, /attribute vec4 joints_1;[\s\S]*attribute vec4 weights_1;/);
+    const skinNormal = shader.vertexShader.split('boneMatX1 * skinVertex')[0];
+    assert.match(skinNormal, /skinW1\.w \* boneMatW1;\s*skinMatrix = bindMatrixInverse \* skinMatrix \* bindMatrix;\s*objectNormal/);
+    assert.match(shader.vertexShader, /boneMatW1 \* skinVertex \* skinW1\.w/);
+    assert.match(shader.vertexShader, /1\.0 \/ skinTotal/);
+    assert.equal(stock.onBeforeCompile.length, 0);
+    assert.equal(studio.run('skinVariant', full)(full, stock), variant);
+});
+
+test('shading modes keep eight-influence variants per mesh, handle material arrays and dispose only variants', () => {
+    const studio = loadStudio();
+    const stock = [fakeMaterial(), fakeMaterial()];
+    const mesh = skinnedMesh(studio, true, stock);
+    const plain = skinnedMesh(studio, false);
+    const root = { position: new Vector3(), userData: {}, traverse(visit) { visit(this); visit(mesh); visit(plain); } };
+    studio.run(`setShadingMode('original'); loadModel('/models/a.glb', 'a.glb', '', 1);`);
+    studio.loads[0].onLoad({ scene: root });
+    assert.ok(Array.isArray(mesh.material) && mesh.material.every(m => !stock.includes(m)));
+    assert.equal(plain.material, plain.userData.origMaterial);
+    const originalVariants = mesh.material;
+    studio.run(`setShadingMode('clay')`);
+    const clay = mesh.material;
+    assert.notEqual(clay, studio.run('clayMaterial'));
+    assert.equal(studio.run('clayMaterial.skinning'), undefined);
+    assert.equal(plain.material, studio.run('clayMaterial'));
+    studio.run(`setShadingMode('normals')`);
+    assert.notEqual(mesh.material, studio.run('normalMaterial'));
+    studio.run(`setShadingMode('original')`);
+    assert.equal(mesh.material, originalVariants);
+    studio.run(`loadModel('/models/b.glb', 'b.glb', '', 1)`);
+    studio.loads[1].onLoad({ scene: fakeModel() });
+    assert.ok(originalVariants.every(m => m.disposed) && clay.disposed);
+    assert.equal(studio.run('clayMaterial.disposed'), false);
+    assert.equal(studio.run('normalMaterial.disposed'), false);
 });
