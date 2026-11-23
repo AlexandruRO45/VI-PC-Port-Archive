@@ -33,6 +33,10 @@ native_entry PROC FRAME
     test eax, eax
     jz fail_release
 
+    mov rax, 1111111111111111h
+    mov qword ptr [pages], rax
+    mov rax, 2222222222222222h
+    mov qword ptr [pages+8], rax
     mov qword ptr [page_count], 3
     mov ecx, 20000000h
     lea rdx, page_count
@@ -42,6 +46,12 @@ native_entry PROC FRAME
     jnz fail_large
     cmp qword ptr [page_count], 0
     jne fail_large
+    mov rax, 1111111111111111h
+    cmp qword ptr [pages], rax
+    jne fail_canary
+    mov rax, 2222222222222222h
+    cmp qword ptr [pages+8], rax
+    jne fail_canary
 
     mov ecx, 1
     xor edx, edx
@@ -69,6 +79,9 @@ fail_large:
     jmp done
 fail_null:
     mov eax, 6
+    jmp done
+fail_canary:
+    mov eax, 7
 done:
     add rsp, 38h
     ret

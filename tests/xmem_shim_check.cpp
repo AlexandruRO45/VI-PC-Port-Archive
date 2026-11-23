@@ -138,18 +138,22 @@ bool physical_pages_checks()
     // Zero pages are accepted with a null array; a missing count or array is rejected.
     count = 0;
     if (!XMemAllocatePhysicalPages(pages_64k, &count, nullptr) || !XMemFreePhysicalPages(0, nullptr)) return false;
+    pages[0] = 0x1111111111111111;
+    pages[1] = 0x2222222222222222;
     SetLastError(0);
-    if (XMemAllocatePhysicalPages(pages_64k, nullptr, pages) || GetLastError() != ERROR_INVALID_PARAMETER) return false;
+    if (XMemAllocatePhysicalPages(pages_64k, nullptr, pages) || GetLastError() != ERROR_INVALID_PARAMETER ||
+        pages[0] != 0x1111111111111111 || pages[1] != 0x2222222222222222) return false;
     count = 1;
     SetLastError(0);
     if (XMemAllocatePhysicalPages(pages_64k, &count, nullptr) || count != 0 ||
         GetLastError() != ERROR_INVALID_PARAMETER) return false;
 
-    // The large-page flag requires a 32-page multiple.
+    // The large-page flag requires a 32-page multiple, and a refusal preserves the array.
     count = 3;
     SetLastError(0);
     if (XMemAllocatePhysicalPages(pages_large, &count, pages) || count != 0 ||
-        GetLastError() != ERROR_INVALID_PARAMETER) return false;
+        GetLastError() != ERROR_INVALID_PARAMETER ||
+        pages[0] != 0x1111111111111111 || pages[1] != 0x2222222222222222) return false;
     std::vector<ULONGLONG> large_pages(32);
     count = large_pages.size();
     if (!XMemAllocatePhysicalPages(pages_large, &count, large_pages.data()) || count != large_pages.size() ||
@@ -169,10 +173,13 @@ bool physical_pages_checks()
     if (!XMemFreePhysicalPages(count, pages)) return false;
 
     // An impossible request fails without changing the array or keeping the count.
+    pages[0] = 0x3333333333333333;
+    pages[1] = 0x4444444444444444;
     count = SIZE_MAX;
     SetLastError(0);
     if (XMemAllocatePhysicalPages(pages_64k, &count, pages) || count != 0 ||
-        GetLastError() != ERROR_NOT_ENOUGH_MEMORY) return false;
+        GetLastError() != ERROR_NOT_ENOUGH_MEMORY ||
+        pages[0] != 0x3333333333333333 || pages[1] != 0x4444444444444444) return false;
 
     std::printf("physical pages: allocation, failure and chunked release checks\n");
     return true;
