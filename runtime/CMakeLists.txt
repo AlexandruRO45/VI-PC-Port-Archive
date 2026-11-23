@@ -776,6 +776,34 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
+    foreach(target dll_attach_a dll_attach_b)
+      add_library(${target} SHARED test/fixtures/dll_reentrant_attach.cpp)
+      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /GS-)
+      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_link_options(${target} PRIVATE /NODEFAULTLIB /ENTRY:dll_attach_main)
+      target_link_libraries(${target} PRIVATE kernel32)
+      set_target_properties(${target} PROPERTIES PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+        ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
+    endforeach()
+    target_compile_definitions(dll_attach_a PRIVATE ATTACH_DLL_A)
+    # The import-only fixtures have no relocations, so give them distinct preferred bases.
+    target_link_options(dll_attach_b PRIVATE /BASE:0x181000000)
+    add_executable(dll_reentrant_attach_test
+      test/dll_reentrant_attach_test.cpp
+      src/pe_loader.cpp
+      shims/library_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(dll_reentrant_attach_test PRIVATE src shims)
+    target_compile_definitions(dll_reentrant_attach_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dll_reentrant_attach_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_libraries(dll_reentrant_attach_test PRIVATE psapi)
+    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b)
+    set_target_properties(dll_reentrant_attach_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
+    add_test(NAME dll_reentrant_attach COMMAND dll_reentrant_attach_test
+      WORKING_DIRECTORY "$<TARGET_FILE_DIR:dll_reentrant_attach_test>")
+
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
     # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll). No game files.

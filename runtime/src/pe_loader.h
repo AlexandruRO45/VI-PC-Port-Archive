@@ -35,6 +35,7 @@ struct Module {
     uint32_t size = 0;
     uint32_t entry_rva = 0;
     bool relocated = false;
+    bool attaching = false;  // process attach is on the stack under the loader mutex
     bool initialised = false;
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception

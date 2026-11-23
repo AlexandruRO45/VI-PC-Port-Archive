@@ -1033,6 +1033,7 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     }
 
     if (existing) {
+        if (existing->attaching) return static_cast<void*>(existing->base);
         try {
             initialise();
             return static_cast<void*>(existing->base);
@@ -1148,13 +1149,22 @@ void Loader::register_unwind(Module& m) {
 }
 
 void Loader::initialise() {
+    std::lock_guard lock(mutex_);
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
-    for (auto* m : init_order_) initialise(*m);
+    // A nested LoadLibrary can append to init_order_ and invalidate its iterators.
+    for (size_t i = 0; i < init_order_.size(); ++i) initialise(*init_order_[i]);
 }
 
 void Loader::initialise(Module& m) {
-    if (m.initialised) return;
+    if (m.attaching || m.initialised) return;
+
+    // TLS callbacks and DllMain can both re-enter initialise() through LoadLibrary.
+    m.attaching = true;
+    const struct ResetAttaching {
+        bool& attaching;
+        ~ResetAttaching() { attaching = false; }
+    } reset_attaching{m.attaching};
 
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
