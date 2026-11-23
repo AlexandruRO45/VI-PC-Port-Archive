@@ -339,6 +339,19 @@ CVT_F32_SAT_CASES = (
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
+# v_min3/v_max3/v_med3 on f16/i16/u16 (cs_minmax16.asm): two operand triples per op taken from the RDNA2-measured
+# words in tests/semantic/test_alu_min3_max3_med3_16_hw.py, each with op_sel reading the low or the high half of every
+# source and writing the low or the high half of the destination (the other half of v4 is kept). 32 words.
+MINMAX16_WORDS = [
+    0xdeadbc00, 0xdeadbc00, 0x8000beef, 0x8000beef,
+    0xdead7c00, 0xdead7c00, 0x7c00beef, 0x7c00beef,
+    0xdead8001, 0xdead8001, 0x8000beef, 0x8000beef,
+    0xdead0001, 0xdead0001, 0x1234beef, 0x1234beef,
+    0xdead0000, 0xdead0000, 0xbeef, 0xbeef,
+    0xdead8000, 0xdead8000, 0xfffebeef, 0xfffebeef,
+    0xdead0000, 0xdead0000, 0x8001beef, 0x8001beef,
+    0xdeadfffe, 0xdeadfffe, 0x1234beef, 0x1234beef,
+]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -708,6 +721,15 @@ def tbuffer_store_test(tools, spirv, env=None):
 def fmt_d16_xyz_test(tools, spirv, env=None):
     """The d16_xyz/d16_xy loads and d16_xyz stores of cs_fmt_d16_xyz.asm: the whole 80-word heap."""
     return dump_test(tools, spirv, "cs_fmt_d16_xyz", FMT_D16_XYZ_WORDS, len(FMT_D16_XYZ_WORDS), env)
+
+def minmax16_test(tools, spirv, env=None):
+    """cs_minmax16.asm: the 32 result words of the eight 16-bit three-operand min/max/median ops over two operand
+    triples each, with op_sel on every source and the destination (MINMAX16_WORDS), plus the untouched words after
+    them up to the 64-word heap. Wave32, one group: the run is pinned to a 32-wide subgroup like compute_test does,
+    since AMD's default is 64."""
+    env = dict(os.environ if env is None else env)
+    env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_minmax16") or 32))
+    return dump_test(tools, spirv, "cs_minmax16", MINMAX16_WORDS + [0xEEEEEEEE] * 32, 64, env)
 
 
 class Skip(str):
@@ -1736,6 +1758,7 @@ def main():
     results.append(("cs_fmt_all", fmt_all_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     results.append(("cs_fmt_d16_xyz", fmt_d16_xyz_test(tools, spirv)))
+    results.append(("cs_minmax16", minmax16_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",

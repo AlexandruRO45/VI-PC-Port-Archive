@@ -26,7 +26,7 @@ import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
-                   fmt_xy_xyz_test, tbuffer_store_test)
+                   fmt_xy_xyz_test, minmax16_test, tbuffer_store_test)
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
@@ -958,6 +958,11 @@ def run_suite(a, work: str) -> int:
             problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "80/80 dumped words exact"))
             results.append((name, not problem, problem or "128/128 dumped words exact"))
+        elif name == "cs_minmax16":
+            # docs/design.md row: 16-bit three-operand min/max/median (cs_minmax16.asm header); op_sel on every
+            # source and the destination, two operand triples per op from the RDNA2-measured words.
+            problem = minmax16_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "32/32 dumped words exact"))
         elif name in ("cs_global_neg_offset", "cs_global_mem_ext"):
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
