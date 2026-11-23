@@ -446,7 +446,7 @@ def run_case(name, body, wave, structured=True):
             f.write(STUB_DXBC)
         try:
             ref = cf_ref.run(path, wave=wave)
-        except cpu_ref.CpuRefError as e:
+        except cpu_ref.Unsupported as e:
             return ("skip", f"cf_ref: {e}")
         old = rdna2spirv.STRUCTURED
         rdna2spirv.STRUCTURED = structured
@@ -639,7 +639,11 @@ def main(argv=None):
         matched = 0
         for wave in waves:
             body = program_for(a.seed, a.program, wave, a.depth)
-            status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
+            try:
+                status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
+            except Exception as e:  # noqa: BLE001 - same harness-error handling as the suite
+                print(f"program {a.program} wave{wave}: harness error {type(e).__name__}: {e}")
+                return 2
             print(f"program {a.program} wave{wave}: {status} {detail}")
             matched += status == "match"
             if status == "mismatch":
