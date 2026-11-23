@@ -116,6 +116,16 @@ class FirstLookExitTest(unittest.TestCase):
                     self.assertIn("synthetic dry run from " + expected_dir,
                                   (report / "dryrun.txt").read_text(encoding="utf-16"))
                     self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    if layout == "Release":
+                        # An interrupted rebuild may leave the loader path and TLS DLL in place.
+                        (build / "Release/gta6rt.exe").write_bytes(b"")
+                        retry = subprocess.run(
+                            [*POWERSHELL, "-File", str(wrapper), "-Exe", str(image)],
+                            env=env, capture_output=True, text=True, timeout=30,
+                        )
+                        log = (report / "dryrun.txt").read_text(encoding="utf-16")
+                        self.assertNotIn("synthetic dry run from Release", log, retry.stdout + retry.stderr)
+                        self.assertIn("No loader output was captured for this dry run.", log)
 
 
 if __name__ == "__main__":

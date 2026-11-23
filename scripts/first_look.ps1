@@ -92,6 +92,8 @@ if (-not $hasTls -or $stale) {
     $tlsHost = Join-Path (Split-Path -LiteralPath $rt) $tlsName
     if (-not (Test-Path -LiteralPath $tlsHost -PathType Leaf)) { throw "runtime build did not produce $tlsHost" }
 }
+# Tee-Object leaves the destination untouched when the launch produces no pipeline output.
+Set-Content -LiteralPath (Join-Path $out "dryrun.txt") -Value "No loader output was captured for this dry run." -Encoding Unicode
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & {
     # Keep native stderr in the report without letting Windows PowerShell stop the dry run on it.
