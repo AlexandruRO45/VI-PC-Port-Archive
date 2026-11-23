@@ -124,8 +124,11 @@ class Gen:
 
     def compound(self, depth):
         r = self.r
-        kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "vloop", "irr",
-                         "sccmask", "csel"))
+        kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
+                         "vloop", "irr", "sccmask", "csel"))
+        if kind == "saveexec":
+            return ("saveexec", self.cmp(), r.choice(("andn2", "orn2", "xor", "nand", "nor", "xnor")),
+                    r.choice((None, "s_cbranch_execz", "s_cbranch_scc0")), [self.probe()] + self.block(depth))
         if kind == "sccmask":
             return ("sccmask", self.cmp(), r.choice(("and", "andn2", "or", "xor")),
                     r.choice(("s_cbranch_scc0", "s_cbranch_scc1")), [self.probe()] + self.block(depth))
@@ -282,6 +285,18 @@ class Emitter:
             self.ins(f"v_cmpx_{cc}_{ty}_e32 {k}, v{v}")
             if skip:
                 self.br("s_cbranch_execz", end)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.place(end)
+            self.ins(f"s_mov_{w} {ex}, {save}")
+        elif kind == "saveexec":
+            _, c, op_name, skip_br, body = n
+            save, end = self.sreg(20), self.label()
+            self.vcmp(c)
+            self.ins(f"s_{op_name}_saveexec_{w} {save}, {self.vcc()}")
+            if skip_br is not None:
+                self.br(skip_br, end)
             self.depth += 1
             self.nodes(body)
             self.depth -= 1
@@ -598,7 +613,13 @@ def main(argv=None):
     ap.add_argument("--spirv-val", action="store_true",
                     help="also run spirv-as and spirv-val on every translation (a failure counts as a mismatch)")
     ap.add_argument("--self-test", action="store_true")
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
+    if a.programs < 1:
+        ap.error("--programs must be at least 1")
     if a.spirv_val:
         missing = [t for t in ("spirv-as", "spirv-val") if not shutil.which(t)]
         if missing:
