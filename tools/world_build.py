@@ -1030,15 +1030,15 @@ def resolve_model_textures(
     return result
 
 
-_BUCKET_ALPHA = {1: "BLEND", 3: "MASK"}
+_BUCKET_ALPHA = {1: "BLEND", 2: "BLEND", 3: "MASK"}
 
 
 def shader_alpha_modes(item: dict) -> dict[int, str]:
     """shader_index -> glTF alphaMode for a model manifest item, from ``Materials[].RenderBucket``.
 
-    Bit 7 is a separate flag (docs/models.md, Shader render buckets) and is masked off; only bucket 1 (alpha)
-    gives BLEND and 3 (cutout) gives MASK, at the glTF default cutoff. Other, missing, non-integer or
-    conflicting values (one slot listed twice with different buckets) leave the slot out, i.e. opaque."""
+    Mask off the separate bit 7 flag (docs/models.md, Shader render buckets). Buckets 1 (alpha) and 2
+    (decal) give BLEND, and 3 (cutout) gives MASK at the glTF default cutoff. Other, missing, non-integer
+    or conflicting values (one slot listed twice with different buckets) leave the slot out, i.e. opaque."""
     seen: dict[int, set] = {}
     for mat in _list_field(item, "Materials"):
         if not isinstance(mat, dict):

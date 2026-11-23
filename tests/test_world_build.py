@@ -1335,14 +1335,15 @@ def _write_bucket_fixture(assets_dir, buckets):
     return models_dir, item
 
 
-BUCKET_MODES = ["BLEND", "MASK", "OPAQUE", "OPAQUE"]  # per cube group of _write_bucket_fixture [1, 0x83, 0, 2]
+BUCKET_FIXTURE = [1, 0x83, 0, 0x82]
+BUCKET_MODES = ["BLEND", "MASK", "OPAQUE", "BLEND"]
 
 
 def assert_bucket_materials(test, gltf):
     """Per-primitive alpha mode, one shared image for the three materials, and the glTF default cutoff."""
     prims = [p for m in gltf["meshes"] for p in m["primitives"]]
     modes = [gltf["materials"][p["material"]].get("alphaMode", "OPAQUE") for p in prims]
-    test.assertEqual(modes[:4], BUCKET_MODES)
+    test.assertEqual(modes, BUCKET_MODES)
     test.assertEqual(len(gltf["materials"]), 3)
     test.assertEqual(len({gltf["materials"][p["material"]]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
                           for p in prims}), 1)
@@ -1351,8 +1352,6 @@ def assert_bucket_materials(test, gltf):
 
 
 class RenderBucketAlphaTest(unittest.TestCase):
-    # bucket 1 -> BLEND, 0x83 (bit 7 flag + bucket 3) -> MASK, the rest stay opaque
-
     def test_shader_alpha_modes(self):
         item = {"Materials": [
             {"ShaderIndex": 0, "RenderBucket": 1}, {"ShaderIndex": 1, "RenderBucket": 0x83},
@@ -1363,7 +1362,7 @@ class RenderBucketAlphaTest(unittest.TestCase):
             {"ShaderIndex": 8, "RenderBucket": 1}, {"ShaderIndex": "8", "RenderBucket": 3},   # same slot
             {"ShaderIndex": "9", "RenderBucket": 3}, {"ShaderIndex": True, "RenderBucket": 1},
         ]}
-        self.assertEqual(world_build.shader_alpha_modes(item), {0: "BLEND", 1: "MASK", 5: "BLEND", 9: "MASK"})
+        self.assertEqual(world_build.shader_alpha_modes(item), {0: "BLEND", 1: "MASK", 2: "BLEND", 5: "BLEND", 9: "MASK"})
         self.assertEqual(world_build.shader_alpha_modes({}), {})
 
     def test_file_name_never_decides_the_mode(self):
@@ -1394,7 +1393,7 @@ class RenderBucketAlphaTest(unittest.TestCase):
     def test_baked_world_keeps_modes_separate_for_one_dds(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets, out = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
-            _write_bucket_fixture(assets, [1, 0x83, 0, 2])
+            _write_bucket_fixture(assets, BUCKET_FIXTURE)
             world_build.build_world(assets, out)
             with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
                 world = json.load(f)
@@ -1407,7 +1406,7 @@ class RenderBucketAlphaTest(unittest.TestCase):
     def test_no_textures_means_no_alpha_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets, out = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
-            _write_bucket_fixture(assets, [1, 3])
+            _write_bucket_fixture(assets, [1, 2, 3])
             world_build.build_world(assets, out, textures=False)
             with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
                 world = json.load(f)

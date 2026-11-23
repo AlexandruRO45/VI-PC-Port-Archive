@@ -338,7 +338,7 @@ class InstancedBuildTest(unittest.TestCase):
         for mode in ("gpu", "nodes"):
             with self.subTest(mode=mode):
                 assets = os.path.join(self.tmp, f"bucket_assets_{mode}")
-                twb._write_bucket_fixture(assets, [1, 0x83, 0, 2])
+                twb._write_bucket_fixture(assets, twb.BUCKET_FIXTURE)
                 ents = os.path.join(self.tmp, f"bucket_{mode}.jsonl")
                 twp.write_entities(ents, [twp.entity("cubes", (10 + 10 * i, 10, 0)) for i in range(3)])
                 out = os.path.join(self.tmp, f"bucket_world_{mode}")
