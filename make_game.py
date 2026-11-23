@@ -11,7 +11,8 @@ r"""Build the PC port from your own copy of the game.
 The game folder is your own Xbox Series package, version 1.0.2.1, with its files already readable on disk
 (see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents
 (also where Windows keeps them, such as in OneDrive), Games, your home folder, the top of each drive on Windows
-and the usual mount points elsewhere (/mnt, /media, /run/media, /Volumes), two folder levels down. A share path
+and the usual mount points elsewhere (/mnt, /media, /run/media, /Volumes, and the per-user /media/<user> and
+/run/media/<user> where Linux desktops mount drives), two folder levels down. A share path
 (\\server\share\...) can't be listed, so give it to --game. This script never decrypts or works around anything:
 it reads plain files and writes
 everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
@@ -224,6 +225,24 @@ XVD_HEADER_SIZE = 0x1000
 XVD_ENCRYPTION_DISABLED = 0x2          # VolumeFlags bit
 CONTAINER_SUFFIXES = (".xvc", ".msixvc", ".xvd")
 VOLUME_ROOTS = ("/mnt", "/media", "/run/media", "/Volumes")   # POSIX: where drives and shares are mounted
+# udisks2, which mounts removable and internal drives on Linux desktops, puts a drive at <root>/<user>/<label>: one
+# level more than a drive letter, so these roots are also searched from the user's own folder.
+USER_MOUNT_ROOTS = ("/media", "/run/media")
+
+
+def volume_roots() -> list:
+    """POSIX mount points find_dumps() starts from: VOLUME_ROOTS, then /media/<user> and /run/media/<user>, so a copy
+    in a folder on a udisks2-mounted drive (/media/<user>/<label>/GTA VI) is two levels down, as D:\\Games\\GTA VI
+    is on Windows."""
+    roots = list(VOLUME_ROOTS)
+    try:
+        import getpass
+        user = getpass.getuser()
+    except Exception:   # no USER/LOGNAME and no passwd entry (a bare container): the shared roots still work
+        user = ""
+    if user and os.sep not in user and user not in (".", ".."):
+        roots += [os.path.join(root, user) for root in USER_MOUNT_ROOTS]
+    return roots
 
 
 def xvd_header(path: str):
@@ -304,14 +323,15 @@ def known_folders() -> list:
 def discovery_roots(home: str) -> list:
     r"""Where find_dumps() starts looking. Windows: the known folders, the home folder and every drive letter. Else:
     the same folders plus the usual mount points, because that is where a copy on another disk or on a network share
-    shows up (/Volumes is where macOS mounts both, /run/media is where Fedora and openSUSE mount removable media).
+    shows up (/Volumes is where macOS mounts both; Linux desktops mount a drive at /media/<user>/<label> or, on Fedora
+    and openSUSE, /run/media/<user>/<label>, so the per-user folders are roots too).
     A Windows share path (\\server\share\...) can't be listed at all; --game takes it directly."""
     roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + known_folders() + [home]
     if os.name == "nt":
         import string
         roots += [f"{d}:\\" for d in string.ascii_uppercase if os.path.isdir(f"{d}:\\")]
     else:
-        roots += list(VOLUME_ROOTS)
+        roots += volume_roots()
     return roots
 
 
@@ -1741,10 +1761,33 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
 
 
 # ---------------------------------------------------------------- runtime
-WINE_LAUNCHER = """#!/bin/sh
+def wine_launcher(out: str, work: str, image: str) -> str:
+    shaders = os.path.abspath(os.path.join(work, "shaders", "spirv"))
+    # The runtime reads shader_path.txt. Its absolute path needs updating only if the whole port moved.
+    moved_catalog = ""
+    if os.path.commonpath([os.path.abspath(out), shaders]) == os.path.abspath(out):
+        relative = shlex.quote(os.path.relpath(shaders, out))
+        moved_catalog = f"""    if [ "$here" != {shlex.quote(os.path.realpath(out))} ]; then
+        shaders="$here"/{relative}
+        export LEONIDA_SHADERS="${{LEONIDA_SHADERS:-Z:$shaders}}"
+    fi
+"""
+    return f"""#!/bin/sh
 # Starts the Windows build of the loader with Wine. WINE picks another one, e.g. a Proton build's bin/wine.
 here=$(dirname "$(readlink -f "$0")")
-exec "${WINE:-wine}" "$here/gta6rt.exe" "$@"
+if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
+    game=$(cat "$here/game_path.txt" && printf .) || exit 1
+    cd "${{game%.}}" || exit 1
+    image={shlex.quote(image)}
+    if [ ! -f "./$image" ]; then
+        printf 'Missing game executable: %s/%s\\n' "$PWD" "$image" >&2
+        exit 1
+    fi
+    # Wine maps the Unix filesystem root to Z:. The game reads from its package and writes to the port's overlay.
+{moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
+    set -- "$1" "./$image" --overlay "Z:$here/overlay"
+fi
+exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
 """
 
 
@@ -1833,7 +1876,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     if os.name != "nt":
         start = os.path.join(out, "gta6rt.sh")
         with open(start, "w", encoding="utf-8", newline="\n") as f:
-            f.write(WINE_LAUNCHER)
+            f.write(wine_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]))
         os.chmod(start, os.stat(start).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     image = os.path.join(game, v["expected_exe"])
     if not os.path.isfile(image):
@@ -1846,9 +1889,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         log("runtime: built. Inspect the game's imports in PowerShell:\n"
             f"  & {ps_literal(start)} --dry-run {ps_literal(image)}")
     else:
-        # Wine inherits the package directory; the image argument needs no host-to-Windows path conversion.
-        command = shlex.join([start, "--dry-run", "./" + v["expected_exe"]])
-        log(f"runtime: built. Inspect the game's imports with Wine:\n  (cd {shlex.quote(game)} && {command})")
+        log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 
 
 def positive_int(text: str) -> int:
