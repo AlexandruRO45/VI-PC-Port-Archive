@@ -18,6 +18,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from make_game import windows_powershell  # noqa: E402
 SCRIPTS = ("build_runtime.ps1", "build_llvm_mc.ps1")
 LAUNCH = re.compile(r"^\$p = Start-Process cmd\.exe -ArgumentList (.+?) -NoNewWindow -PassThru\s*$", re.M)
 FOLDERS = ("plain", "a & b", "a&b", "x^y", "sp (x)", "東京 & co")
@@ -41,7 +43,7 @@ def start(arguments, bat):
                "$p.WaitForExit()\n"
                "exit $p.ExitCode\n")
     encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
-    return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    return subprocess.run([windows_powershell(), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
                           env=dict(os.environ, LEONIDA_LAUNCH_BAT=str(bat)), capture_output=True, timeout=60)
 
 

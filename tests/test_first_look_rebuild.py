@@ -15,6 +15,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from make_game import windows_powershell  # noqa: E402
 SCRIPT = ROOT / "scripts" / "first_look.ps1"
 PE_INSPECT_STUB = (
     "from pathlib import Path\n"
@@ -52,7 +54,7 @@ class FirstLookRebuildTest(unittest.TestCase):
             os.utime(source, (newer, newer) if source_newer else (older, older))
             env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
             env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
-            run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            run = subprocess.run([windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                   "-Command", RUN], cwd=root, env=env, capture_output=True, text=True, timeout=60)
             return (root / "scripts" / "built.txt").is_file(), run.stdout + run.stderr
 

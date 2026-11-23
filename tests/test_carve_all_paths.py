@@ -41,7 +41,7 @@ class CarveAllGamePathTest(unittest.TestCase):
                     index.write_text(contents, encoding="utf-8")
                     coverage.write_bytes(b"[]\n")
                     result = subprocess.run(
-                        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                        [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                          "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
                     )
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -59,7 +59,7 @@ class CarveAllGamePathTest(unittest.TestCase):
             summary = {key: 0 for key in INDEX["summary"]}
             (cached / "index.json").write_text(json.dumps({"summary": summary, "files": []}), encoding="utf-8")
             result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                  "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
