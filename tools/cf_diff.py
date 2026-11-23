@@ -641,16 +641,16 @@ def main(argv=None):
             body = program_for(a.seed, a.program, wave, a.depth)
             try:
                 status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
+                print(f"program {a.program} wave{wave}: {status} {detail}")
+                matched += status == "match"
+                if status == "mismatch":
+                    rc = 1
+                    if a.minimize:
+                        body = minimize(body, wave, structured)
+                        print("reduced:", run_case("ps_cf_min", body, wave, structured)[1])
             except Exception as e:  # noqa: BLE001 - same harness-error handling as the suite
                 print(f"program {a.program} wave{wave}: harness error {type(e).__name__}: {e}")
                 return 2
-            print(f"program {a.program} wave{wave}: {status} {detail}")
-            matched += status == "match"
-            if status == "mismatch":
-                rc = 1
-                if a.minimize:
-                    body = minimize(body, wave, structured)
-                    print("reduced:", run_case("ps_cf_min", body, wave, structured)[1])
             if a.show or a.minimize:
                 print(listing_text(build(body, wave), f"ps_cf_{a.program:04d}_w{wave}"))
         if not rc and not matched:   # same order as the suite: a mismatch (1) outranks "nothing was compared" (2)

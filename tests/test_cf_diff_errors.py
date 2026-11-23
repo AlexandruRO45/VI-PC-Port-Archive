@@ -17,7 +17,7 @@ ERRORS = (
 )
 
 
-def fail_second_reference(monkeypatch, case):
+def fail_second_reference(monkeypatch, case, mismatch=False):
     run = cf_diff.cf_ref.run
     calls = []
 
@@ -34,7 +34,13 @@ def fail_second_reference(monkeypatch, case):
                 if case == "bad_branch":
                     lines = [("s_branch 100", 4), ("s_endpgm", 4)]
                 listing.write_text(cf_diff.listing_text(lines, "ps_bad"), encoding="utf-8", newline="\n")
-        return run(path, **kwargs)
+        result = run(path, **kwargs)
+        if mismatch:
+            lane = next(iter(result["exports"]))
+            words = list(result["exports"][lane])
+            words[0] ^= 1
+            result["exports"][lane] = tuple(words)
+        return result
 
     monkeypatch.setattr(cf_diff.cf_ref, "run", run_reference)
     return calls
@@ -63,6 +69,33 @@ def test_replay_reference_error_after_passing_wave_exits_2(case, diagnostic, mon
     assert "program 1 wave32: match" in out
     assert "program 1 wave64: harness error ProgramError:" in out
     assert diagnostic in out
+
+
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("phase", ("candidate", "recheck"))
+def test_replay_minimization_reference_error_exits_2(wave, phase, monkeypatch, capsys):
+    # One node gives minimize() a candidate to run; no nodes reaches the final recheck directly.
+    body = [("probe", 1)] if phase == "candidate" else []
+    monkeypatch.setattr(cf_diff, "program_for", lambda *args: body)
+    calls = fail_second_reference(monkeypatch, "bad_branch", mismatch=True)
+    code = cf_diff.main(["--program", "1", "--wave", str(wave), "--minimize"])
+    out = capsys.readouterr().out
+    assert code == 2, out
+    assert calls == [wave, wave]
+    assert f"program 1 wave{wave}: mismatch" in out
+    assert f"program 1 wave{wave}: harness error ProgramError:" in out
+    assert "which is not an instruction" in out
+
+
+def test_minimization_unsupported_candidate_preserves_mismatch(monkeypatch, capsys):
+    monkeypatch.setattr(cf_diff, "program_for", lambda *args: [("probe", 1)])
+    calls = fail_second_reference(monkeypatch, "unsupported", mismatch=True)
+    code = cf_diff.main(["--program", "1", "--wave", "32", "--minimize"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert calls == [32, 32, 32]   # original mismatch, skipped candidate, final mismatch recheck
+    assert "reduced: lane" in out
+    assert "harness error" not in out
 
 
 @pytest.mark.parametrize("args", (
