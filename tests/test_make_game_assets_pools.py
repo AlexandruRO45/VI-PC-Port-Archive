@@ -1,4 +1,5 @@
-"""Texture pools in make_game.assets() must not collide on their basename (no game files).
+"""Texture pools in make_game.assets() must not collide on their basename, and a pool folder that is a symlink or
+junction is unlinked rather than walked (no game files).
 
     python -I tests/test_make_game_assets_pools.py
 """
@@ -133,6 +134,30 @@ class AssetsPoolsTest(unittest.TestCase):
         self.run_assets("d1")
         os.remove(os.path.join(pool_dir, make_game.DECODER_RECORD))
         self.assertEqual(self.run_assets("d1"), [(p, pool_dir)])
+
+    def test_a_stale_export_under_a_linked_pool_folder_is_unlinked_not_refused(self):
+        # A work folder may keep its assets on another drive through a symlink or junction; rmtree refuses a link
+        # ("Cannot call rmtree on a symbolic link"), so the old export is unlinked and its target keeps its files.
+        p = self.pool("data/ttdb/pool.ttpf")
+        pool_dir = os.path.join(self.out, "ttpf", "pool")
+        target = os.path.join(self.tmp.name, "linked", "pool")
+        os.makedirs(target)
+        kept = os.path.join(target, "000000_old.dds")
+        with open(kept, "wb"):
+            pass
+        with open(os.path.join(target, make_game.DECODER_RECORD), "w") as f:
+            f.write("d1\n")
+        os.makedirs(os.path.dirname(pool_dir), exist_ok=True)
+        try:
+            os.symlink(target, pool_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("this host cannot create a directory symlink here")
+        self.assertEqual(self.run_assets("d2"), [(p, pool_dir)])
+        self.assertFalse(os.path.islink(pool_dir))    # the link is gone, not walked
+        self.assertTrue(os.path.isfile(kept))         # what it pointed at is left alone
+        with open(os.path.join(pool_dir, make_game.DECODER_RECORD), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "d2\n")
+
 
     def test_a_colliding_pool_keeps_its_own_record(self):
         a = self.pool("data/ttdb/A/pool.ttpf")
