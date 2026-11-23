@@ -124,6 +124,23 @@ class Psv0InputsTest(unittest.TestCase):
     def test_missing_chunk_is_refused(self):
         self.assertRaises(ValueError, ps_interp_modes.psv0_inputs, dxbc_container({b"ISG1": b"\0" * 8}))
 
+    def test_chunk_offset_inside_header_is_ignored(self):
+        in_hdr = b"DXBC" + b"PSV0" + b"\0" * 12 + struct.pack("<IIII", 1, 36, 1, 4)
+        self.assertEqual(ps_interp_modes.chunk_table(in_hdr), {})
+        self.assertRaises(ValueError, ps_interp_modes.psv0_inputs, in_hdr)
+
+        in_table = b"DXBC" + b"\0" * 16 + struct.pack("<III", 1, 40, 2) + struct.pack("<II", 32, 0)
+        self.assertEqual(ps_interp_modes.chunk_table(in_table), {})
+
+    def test_zero_bind_size_with_nonzero_resources_is_refused(self):
+        runtime = b"\0" * 24 + bytes([0, 0, 0, 0, 0, 0, 0, 0]) + b"\0" * 12
+        payload = (struct.pack("<I", len(runtime)) + runtime
+                   + struct.pack("<I", 1) + struct.pack("<I", 0)
+                   + struct.pack("<I", 4) + b"\0\0\0\0"
+                   + struct.pack("<I", 0)
+                   + struct.pack("<I", 16))
+        self.assertRaises(ValueError, ps_interp_modes.psv0_inputs, dxbc_container({b"PSV0": payload}))
+
 
 def psv0_inputs_name(container):
     return ps_interp_modes.psv0_inputs(container)[0]["name"]
@@ -182,6 +199,14 @@ class DisasmFactsTest(unittest.TestCase):
         self.assertEqual(per, {0: {"mov"}})
         self.assertEqual(ij, set())
 
+    def test_slash_comments_are_ignored(self):
+        per, ij = ps_interp_modes.disasm_facts(
+            "\t// v_interp_p1_f32 v2, v0, attr0.x\n"
+            "\tv_interp_mov_f32 v5, p0, attr1.y // v_interp_p1_f32 v2, v1, attr2.x\n"
+        )
+        self.assertEqual(per, {1: {"mov"}})
+        self.assertEqual(ij, set())
+
 
 class PairClassTest(unittest.TestCase):
     def rows(self, *specs):
@@ -214,6 +239,30 @@ class PairClassTest(unittest.TestCase):
 
     def test_raw_barycentric_read_without_v_interp(self):
         self.assertEqual(ps_interp_modes.pair_class(self.rows(), [], {}, {"v0"}), "raw_bary")
+
+    def test_noperspective_generic_and_clip_inputs_classify_linear(self):
+        self.assertEqual(
+            ps_interp_modes.pair_class(self.rows((0, 4, 0xF)), [], {0: {"p1p2"}}, {"v0"}),
+            "linear_center",
+        )
+        self.assertEqual(
+            ps_interp_modes.pair_class(self.rows((6, 5, 0xF)), [], {0: {"p1p2"}}, {"v0"}),
+            "linear_centroid",
+        )
+        self.assertEqual(
+            ps_interp_modes.pair_class(self.rows((7, 7, 0xF)), [], {0: {"p1p2"}}, {"v0"}),
+            "linear_sample",
+        )
+
+    def test_mode7_position_is_linear_sample(self):
+        self.assertEqual(
+            ps_interp_modes.pair_class(self.rows((3, 7, 0xF), (3, 5, 0xF)), [], {0: {"p1p2"}}, {"v0"}),
+            "linear_sample",
+        )
+
+    def test_position_plus_system_value_stays_linear(self):
+        rows = self.rows((3, 5, 0xF), (13, 1, 0xF))
+        self.assertEqual(ps_interp_modes.pair_class(rows, [], {0: {"p1p2"}}, {"v0"}), "linear_centroid")
 
 
 class ShaderRowTest(unittest.TestCase):
@@ -292,6 +341,29 @@ class ShaderRowTest(unittest.TestCase):
             with open(dx, "wb") as f: f.write(c)
             row = ps_interp_modes.shader_row(dx, None, None)
         self.assertEqual(row["inputs"][0]["rw"], 3)
+
+    def test_disjoint_component_packed_row_does_not_steal_sibling_name(self):
+        elems = [
+            struct.pack("<II6B2B", 0, 0, 1, 1, 0x40 | (0 << 4) | 2, 0, 3, 2, 0, 0),
+            struct.pack("<II6B2B", 0, 0, 1, 1, 0x40 | (2 << 4) | 2, 0, 3, 2, 0, 0),
+        ]
+        runtime = b"\0" * 24 + bytes([0, 0, 0, 0, 2, 0, 0, 0]) + b"\0" * 12
+        psv_payload = (struct.pack("<I", len(runtime)) + runtime
+                       + struct.pack("<I", 0) + struct.pack("<I", 4) + b"\0\0\0\0"
+                       + struct.pack("<I", 1) + struct.pack("<I", 0)
+                       + struct.pack("<I", 16) + b"".join(elems))
+        names = [b"TEXCOORD0\0"]
+        isg_payload = (struct.pack("<II", 1, 8)
+                       + struct.pack("<6I", 0, 8 + 32, 0, 0, 3, 1)
+                       + bytes([0x3, 0x3, 0, 0, 0, 0, 0, 0])
+                       + b"".join(names))
+        c = dxbc_container({b"PSV0": psv_payload, b"ISG1": isg_payload})
+        with tempfile.TemporaryDirectory() as tmp:
+            dx = os.path.join(tmp, "disjoint.dxbc")
+            with open(dx, "wb") as f:
+                f.write(c)
+            row = ps_interp_modes.shader_row(dx, None, None)
+        self.assertEqual([(i["rw"], i["name"]) for i in row["inputs"]], [(3, "TEXCOORD0"), (0, "")])
 
 
 class TallyTest(unittest.TestCase):

@@ -102,12 +102,13 @@ def chunk_table(data):
     if len(data) < 32 or data[:4] != b"DXBC":
         return {}
     count = struct.unpack_from("<I", data, 28)[0]
-    if 32 + 4 * count > len(data):
+    header_end = 32 + 4 * count
+    if header_end > len(data):
         return {}
     out = {}
     for i in range(count):
         off = struct.unpack_from("<I", data, 32 + 4 * i)[0]
-        if off + 8 > len(data):
+        if off < header_end or off + 8 > len(data):
             continue
         out[data[off:off + 4]] = (off, struct.unpack_from("<I", data, off + 4)[0])
     return out
@@ -138,6 +139,8 @@ def psv0_inputs(data):
         if pos + 4 > len(p):
             raise ValueError("truncated before bind-info size")
         bind = struct.unpack_from("<I", p, pos)[0]
+        if bind == 0:
+            raise ValueError("zero bind-info size with nonzero resources")
         pos += 4 + bind * resources
     if pos + 4 > len(p):
         raise ValueError("truncated before string table")
@@ -237,7 +240,7 @@ def disasm_facts(text):
     per = {}
     ij = set()
     for line in text.splitlines():
-        m = VINTERP.search(line.split(";")[0])
+        m = VINTERP.search(line.split(";")[0].split("//")[0])
         if not m:
             continue
         op, src, attr = m.group(1), m.group(2), int(m.group(3))
@@ -246,6 +249,16 @@ def disasm_facts(text):
         if kind != "mov":
             ij.add(src)
     return per, ij
+
+
+def _linear_pair(rows):
+    """Linear barycentric pair variant needed by a linear row set (sample > centroid > center)."""
+    modes = {r["mode"] for r in rows}
+    if 7 in modes:
+        return "linear_sample"
+    if 5 in modes:
+        return "linear_centroid"
+    return "linear_center"
 
 
 def pair_class(rows, table, usage, ij):
@@ -258,31 +271,37 @@ def pair_class(rows, table, usage, ij):
     persp_center  - a read arbitrary/clip/cull row with a perspective mode: the pair is
                     PERSP_CENTER (centroid/sample would need their own pair, and no shader
                     reads a second pair)
-    linear_*      - SV_Position rows are the only read inputs: the position is interpolated
-                    through the parameter cache with the linear pair (D3D forces
-                    noperspective on SV_Position; mode 5 asks for the centroid variant).
-                    A shader that reads any other row interpolates that row instead and
-                    takes SV_Position from the system VGPRs after the pair.
+    linear_*      - a read noperspective arbitrary/clip/cull row, or SV_Position when no
+                    other non-system inputs are read: interpolated through the parameter cache
+                    with the linear pair (D3D forces noperspective on SV_Position; sample (7) >
+                    centroid (5) > center (4)). A shader that also reads another non-system
+                    row interpolates that row instead and takes SV_Position (and any
+                    SYSTEM_KINDS inputs) from the system VGPRs after the pair.
     flat_only     - interpolation reads only Constant rows (P0 semantics): any enabled pair
                     gives the same value
-    none          - no v_interp at all (system inputs only)
+    raw_bary      - reads barycentric I/J registers directly without v_interp
+    none          - no v_interp and no barycentric read (system inputs only)
     """
     read = [r for r in rows if r["rw"]]
     persp = [r for r in read if r["kind"] in (0, 6, 7)
              and interp_class(r["kind"], r["mode"])[0] in ("persp_center", "persp_centroid",
                                                            "persp_sample")]
+    linear = [r for r in read if r["kind"] in (0, 6, 7)
+              and interp_class(r["kind"], r["mode"])[0] in ("linear_center", "linear_centroid",
+                                                            "linear_sample")]
     positions = [r for r in read if r["kind"] == 3]
-    others = [r for r in read if r["kind"] != 3]
+    others = [r for r in read if r["kind"] != 3 and r["kind"] not in SYSTEM_KINDS]
     interpolates = any(k - {"mov"} for k in usage.values())
     if interpolates and persp:
         return "persp_center"
+    if interpolates and linear:
+        return _linear_pair(linear)
     if interpolates and positions and not others:
-        # the position rows are the only read inputs, so the interpolation reads them
-        # through the parameter cache with the linear pair (D3D forces noperspective on
-        # SV_Position; mode 5 asks for the centroid variant).  A shader that also reads
-        # other rows interpolates those and takes SV_Position from the system VGPRs.
-        mode = max(r["mode"] for r in positions)
-        return "linear_centroid" if mode == 5 else "linear_center"
+        # the position rows are the only non-system read inputs, so the interpolation reads
+        # them through the parameter cache with the linear pair (D3D forces noperspective on
+        # SV_Position; mode 7 asks for sample, mode 5 asks for centroid).  A shader that also
+        # reads other non-system rows interpolates those and takes SV_Position from system VGPRs.
+        return _linear_pair(positions)
     if interpolates:
         return "flat_only"
     if ij:
@@ -304,7 +323,7 @@ def shader_row(dxbc_path, fssm_path, disasm_path):
         span = range(r["row"], r["row"] + max(r.get("rows", 1), 1))
         reg_matches = [e for e in isg if e["register"] in span]
         col_matches = [e for e in reg_matches if not rmask or not e["mask"] or (e["mask"] & rmask)]
-        matches = col_matches or reg_matches
+        matches = col_matches
         rw_val = 0
         for e in matches:
             rw_val |= (e["rw"] & rmask) if (rmask and e["mask"]) else e["rw"]
