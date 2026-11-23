@@ -90,6 +90,44 @@ class ReportPathTest(unittest.TestCase):
             result = self.run_tool(carve, "--json", str(out), "--csv", str(out))
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("must use different paths", result.stderr)
+            self.assertFalse(out.exists())
+
+    def test_one_report_cannot_be_a_parent_of_the_other(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve = self.make_carve(td)
+            spellings = ["Report"]
+            if (carve / "INDEX.JSON").exists():
+                spellings.append("report")
+            for parent_flag, child_flag in (("--csv", "--json"), ("--json", "--csv")):
+                for spelling in spellings:
+                    for existing in (False, True):
+                        with self.subTest(parent=parent_flag, spelling=spelling, existing=existing):
+                            with tempfile.TemporaryDirectory(dir=td) as outdir:
+                                root = pathlib.Path(outdir)
+                                parent = root / "Report"
+                                child = root / spelling / "child"
+                                sentinel = b"previous report\r\n"
+                                if existing:
+                                    parent.write_bytes(sentinel)
+                                result = self.run_tool(carve, parent_flag, str(parent),
+                                                       child_flag, str(child))
+                                self.assertEqual(result.returncode, 2, result.stderr)
+                                if existing:
+                                    self.assertEqual(parent.read_bytes(), sentinel)
+                                self.assertEqual(list(root.iterdir()), [parent] if existing else [])
+                                self.assertIn("--csv", result.stderr)
+                                self.assertIn("--json", result.stderr)
+
+    def test_common_text_prefix_allows_both_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve = self.make_carve(td)
+            root = pathlib.Path(td)
+            csv_path = root / "Report"
+            js = root / "Reporter" / "child.json"
+            result = self.run_tool(carve, "--csv", str(csv_path), "--json", str(js))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("offset", csv_path.read_text(encoding="utf-8").splitlines()[0].split(","))
+            self.assertEqual(json.loads(js.read_text(encoding="utf-8"))["rows"], [])
 
     def test_reports_in_a_writable_folder_still_work(self):
         with tempfile.TemporaryDirectory() as td:
