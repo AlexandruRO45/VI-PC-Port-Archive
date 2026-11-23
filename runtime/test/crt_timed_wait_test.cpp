@@ -77,14 +77,21 @@ int main() {
     }
 
     {
-        // Nobody notifies: the wait times out after about its timeout, with the mutex held again.
-        const auto start = Clock::now();
         std::unique_lock<std::mutex> lock(mutex);
-        const std::cv_status status = cv.wait_for(lock, std::chrono::milliseconds(200));
+        const auto start = Clock::now();
+        const auto deadline = start + std::chrono::milliseconds(200);
+        // A wait can wake spuriously. Retry against the original deadline and limit the attempts
+        // so repeated immediate returns still fail the test.
+        std::cv_status status;
+        int attempts = 0;
+        do {
+            status = cv.wait_until(lock, deadline);
+            ++attempts;
+        } while (status == std::cv_status::no_timeout && attempts < 1000);
         const long long waited = ms_since(start);
-        std::printf("  an unnotified wait_for(200 ms) returned after %lld ms\n", waited);
-        check(status == std::cv_status::timeout, "an unnotified wait_for times out");
-        check(waited >= 150 && waited < 2000, "an unnotified wait_for lasts about its timeout");
+        std::printf("  unnotified 200 ms wait took %lld ms (wait_until calls = %d)\n", waited, attempts);
+        check(status == std::cv_status::timeout, "an unnotified wait reports a timeout");
+        check(waited >= 150 && waited < 2000, "an unnotified wait lasts about its timeout");
         check(lock.owns_lock(), "the mutex is held again after the timeout");
         bool other_got_it = true;
         std::thread probe([&] { other_got_it = mutex.try_lock(); if (other_got_it) mutex.unlock(); });
