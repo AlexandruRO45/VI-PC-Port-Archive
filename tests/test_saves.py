@@ -557,6 +557,58 @@ class ImportTest(unittest.TestCase):
             self.assertEqual(sorted(e["container"] for e in m["entries"]), ["Player", "SLOT3"])
             self.assertFalse(any(n.startswith("~") for _, _, fs in os.walk(out) for n in fs))
 
+    def test_dry_run_reads_only_headers_and_reports_full_sizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder, out = os.path.join(tmp, "source"), os.path.join(tmp, "output")
+            plain = bytearray(make_asav(slot="Plain", payload=bytes(65536)))
+            inner = bytearray(make_asav(slot="Packed", title="Packed title", payload=bytes(32768)))
+            # Both offsets are beyond the fixed header, but still within the payload's physical file extent.
+            for blob in (plain, inner):
+                struct.pack_into("<I", blob, 0x14, saves.ASAV_HDR + 16)
+            packed = make_slayer("n" * 8192, inner)
+            sources = {os.path.join(folder, "Save"): plain, os.path.join(folder, "chives.dat"): packed}
+            for path, data in sources.items():
+                write(path, data)
+
+            opened = {path: [] for path in sources}
+
+            def track_open(path, *args, **kwargs):
+                stream = open(path, *args, **kwargs)
+                if path not in opened:
+                    return stream
+                tracked = mock.MagicMock(wraps=stream)
+                tracked.__enter__.return_value = tracked
+                tracked.__exit__.side_effect = stream.__exit__
+                opened[path].append(tracked)
+                return tracked
+
+            with mock.patch.object(saves, "open", side_effect=track_open, create=True):
+                report = quiet(saves.import_saves, [folder, "--out", out, "--with-packed", "--dry-run"])
+            self.assertFalse(os.path.exists(out))
+            self.assertEqual(report.count("container 'Packed'"), 2)
+            self.assertIn(f"{len(plain)} bytes  (Packed title)", report)
+            self.assertIn(f"{len(packed)} bytes  (Packed title)", report)
+            reads = {os.path.basename(path): [call for stream in streams for call in stream.read.call_args_list]
+                     for path, streams in opened.items()}
+            self.assertEqual(reads, {"Save": [mock.call(8), mock.call(saves.ASAV_HDR)],
+                                     "chives.dat": [mock.call(saves.SLAYER1_HDR), mock.call(saves.ASAV_HDR)]})
+
+    def test_import_rejects_truncated_save_headers(self):
+        plain = make_asav()
+        inner = bytearray(make_asav())
+        struct.pack_into("<I", inner, 0x14, len(inner) + 1)
+        cases = ((plain[:8], b"", "header is only 8 bytes"),
+                 (plain, b"SLAYER1\0" + struct.pack("<II", 1, 0xffffffff), "declares a 4294967295-byte name"),
+                 (plain, make_slayer("packed", inner), f"past the end of a {len(inner)}-byte file"))
+        for payload, companion, expected in cases:
+            with self.subTest(error=expected), tempfile.TemporaryDirectory() as tmp:
+                folder, out = os.path.join(tmp, "source"), os.path.join(tmp, "output")
+                write(os.path.join(folder, "Save"), payload)
+                write(os.path.join(folder, "chives.dat"), companion)
+                with self.assertRaisesRegex(ValueError, expected):
+                    quiet(saves.import_saves, [folder, "--out", out, "--dry-run"])
+                self.assertFalse(os.path.exists(out))
+
     def _existing_import(self, out):
         story = os.path.join(out, "local-user", "SLOT3", "SLOT0")
         profile = os.path.join(out, "local-user", "Player", "Player")
@@ -705,12 +757,14 @@ class ImportTest(unittest.TestCase):
             def changing_source(path, mode, *args, **kwargs):
                 if path == source and mode == "rb":
                     opens.append(path)
-                    if len(opens) == 4:
+                    # Change the source after probing its type and reading its header.
+                    if len(opens) == 3:
                         write(source, new_bytes)
                 return open(path, mode, *args, **kwargs)
 
             with mock.patch.object(saves, "open", side_effect=changing_source, create=True):
                 quiet(saves.import_saves, [story, profile, "--out", out, "--force"])
+            self.assertEqual(rd(first), new_bytes)
             files = [first, second]
             for entry, path in zip(rd_json(manifest)["entries"], files, strict=True):
                 data = rd(path)
@@ -774,7 +828,7 @@ class ImportTest(unittest.TestCase):
                 quiet(saves.import_saves, [empty, "--out", os.path.join(tmp, "o")])
 
     def test_discovery_reads_at_most_eight_bytes_per_candidate(self):
-        # save_slot probes each candidate with eight bytes, then reads only the chosen payload in full.
+        # save_slot probes each candidate with eight bytes before opening the chosen header.
         with tempfile.TemporaryDirectory() as tmp:
             folder = os.path.join(tmp, "story")
             jsav, _, _ = make_jsav()
@@ -785,7 +839,7 @@ class ImportTest(unittest.TestCase):
         payload = os.path.join(folder, "SLOT0")
         other = os.path.join(folder, "notes.txt")
         self.assertEqual(reader.call_args_list,
-                         [mock.call(payload, 8), mock.call(other, 8), mock.call(payload)])
+                         [mock.call(payload, 8), mock.call(other, 8)])
 
     def test_info_directory_reads_only_eight_bytes_per_candidate(self):
         # The info directory loop probes each candidate with eight bytes and only reads the chosen save in full,

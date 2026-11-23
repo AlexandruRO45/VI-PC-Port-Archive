@@ -47,7 +47,8 @@ def ts(v):
         return None
 
 
-def parse_asav(d):
+def parse_asav(d, *, file_size=None):
+    """Read ASAV fields, using the supplied file size when d contains only the header."""
     if d[:4] != b'ASAV':
         raise ValueError('not ASAV')
     # The fixed fields below are read at absolute offsets, so a short file must be rejected here instead of
@@ -70,11 +71,11 @@ def parse_asav(d):
         'checksum_160': '%08x' % struct.unpack_from('<I', d, 0x160)[0],   # algorithm unknown
         'field_164': struct.unpack_from('<I', d, 0x164)[0],
         'size_168': struct.unpack_from('<Q', d, 0x168)[0],
-        'file_size': len(d),
+        'file_size': len(d) if file_size is None else file_size,
     }
     h['timestamp_utc'] = ts(h['timestamp'])
-    if h['payload_offset'] > len(d):
-        raise ValueError(f"payload offset {h['payload_offset']:#x} is past the end of a {len(d)}-byte file")
+    if h['payload_offset'] > h['file_size']:
+        raise ValueError(f"payload offset {h['payload_offset']:#x} is past the end of a {h['file_size']}-byte file")
     return h
 
 
@@ -170,7 +171,7 @@ def build_jsav(version, n_code, hashes, flags, blocks):
 SLAYER1_HDR = 16           # "SLAYER1\0" + u32 version + u32 name length
 
 
-def parse_slayer(d, path=None):
+def _slayer_header(d, file_size, path):
     if d[:8] != b'SLAYER1\0':
         raise ValueError('not SLAYER1')
     where = f' in {path}' if path else ''
@@ -181,13 +182,17 @@ def parse_slayer(d, path=None):
                          f'{SLAYER1_HDR}')
     ver, nlen = struct.unpack_from('<II', d, 8)
     # The name and the 8-byte payload-size field that follows it must fit before either is read.
-    size_off = SLAYER1_HDR + nlen
-    if size_off + 8 > len(d):
+    inner = SLAYER1_HDR + nlen + 8
+    if inner > file_size:
         raise ValueError(f'SLAYER1{where} declares a {nlen}-byte name; with the 8-byte payload size the header '
-                         f'needs {SLAYER1_HDR + nlen + 8} bytes, but the file has only {len(d)}')
-    name = d[SLAYER1_HDR:SLAYER1_HDR + nlen].decode('ascii', 'replace')
-    size = struct.unpack_from('<Q', d, size_off)[0]
-    inner = size_off + 8
+                         f'needs {inner} bytes, but the file has only {file_size}')
+    return ver, inner
+
+
+def parse_slayer(d, path=None):
+    ver, inner = _slayer_header(d, len(d), path)
+    name = d[SLAYER1_HDR:inner - 8].decode('ascii', 'replace')
+    size = struct.unpack_from('<Q', d, inner - 8)[0]
     return {'magic': 'SLAYER1', 'version': ver, 'name': name, 'payload_size': size,
             'payload_offset': inner, 'file_size': len(d)}
 
@@ -464,18 +469,24 @@ def save_slot(folder):
                          'move the extra files out or import a folder per save')
     payload = found[0]
     slot, title = payload, None
-    d = read(os.path.join(folder, payload))
-    if kind_of(d) == 'ASAV':
-        h = parse_asav(d)
-        slot, title = h['slot_name'] or payload, h['title']
+    with open(os.path.join(folder, payload), 'rb') as f:
+        d = f.read(ASAV_HDR)
+        if kind_of(d) == 'ASAV':
+            h = parse_asav(d, file_size=os.fstat(f.fileno()).st_size)
+            slot, title = h['slot_name'] or payload, h['title']
     packed = os.path.join(folder, 'chives.dat')
     if os.path.isfile(packed):
-        p = read(packed)
-        if kind_of(p) == 'SLAYER1':
-            inner = p[parse_slayer(p, packed)['payload_offset']:]
-            if inner[:4] == b'ASAV':
-                ih = parse_asav(inner)
-                slot, title = ih['slot_name'] or slot, ih['title']
+        with open(packed, 'rb') as f:
+            preamble = f.read(SLAYER1_HDR)
+            if kind_of(preamble) == 'SLAYER1':
+                size = os.fstat(f.fileno()).st_size
+                _, offset = _slayer_header(preamble, size, packed)
+                f.seek(offset)
+                inner = f.read(ASAV_HDR)
+                if inner[:4] == b'ASAV':
+                    # The inner ASAV spans the bytes after the wrapper, as in the full parser.
+                    ih = parse_asav(inner, file_size=size - offset)
+                    slot, title = ih['slot_name'] or slot, ih['title']
     return meta.get('save_directory') or os.path.basename(os.path.normpath(folder)), payload, slot, title
 
 
@@ -694,7 +705,8 @@ def import_saves(args):
         raise ValueError('import: the manifest and a payload must have different destinations')
     if dry:
         for src, _, entry in plan:
-            _print_import_entry(entry, len(read(src)))
+            with open(src, 'rb') as f:
+                _print_import_entry(entry, os.fstat(f.fileno()).st_size)
         print('dry run: nothing written')
         return
     for _, dst, _ in plan:
