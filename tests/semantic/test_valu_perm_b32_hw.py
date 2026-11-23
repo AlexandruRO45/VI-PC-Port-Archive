@@ -364,5 +364,78 @@ class TestVPermB32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(res[i], 0xCAFEBABE)
 
 
+class TestVPermB32RegisterAliasing(unittest.TestCase):
+    """Register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_dst_aliases_src0(self):
+        self.rf.write_vgpr(1, 0x07060504)
+        self.rf.write_vgpr(2, 0x03020100)
+        self.rf.write_vgpr(3, 0x00010203)
+        inst = VPermB32Instruction(
+            dst=Operand(RegType.VGPR, 1),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0x00010203)
+        self.assertEqual(self.rf.vgprs[1], 0x00010203)
+
+    def test_dst_aliases_src1(self):
+        self.rf.write_vgpr(1, 0x07060504)
+        self.rf.write_vgpr(2, 0x03020100)
+        self.rf.write_vgpr(3, 0x07060504)
+        inst = VPermB32Instruction(
+            dst=Operand(RegType.VGPR, 2),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0x07060504)
+        self.assertEqual(self.rf.vgprs[2], 0x07060504)
+
+    def test_dst_aliases_src2(self):
+        self.rf.write_vgpr(1, 0x07060504)
+        self.rf.write_vgpr(2, 0x03020100)
+        self.rf.write_vgpr(3, 0x0C0C0C0C)
+        inst = VPermB32Instruction(
+            dst=Operand(RegType.VGPR, 3),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0x00000000)
+        self.assertEqual(self.rf.vgprs[3], 0x00000000)
+
+    def test_dst_aliases_all_operands(self):
+        self.rf.write_vgpr(1, 0x03020100)
+        inst = VPermB32Instruction(
+            dst=Operand(RegType.VGPR, 1),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 1),
+            src2=Operand(RegType.VGPR, 1),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0x03020100)
+        self.assertEqual(self.rf.vgprs[1], 0x03020100)
+
+    def test_hw_translator_aliasing(self):
+        lines = [
+            "v_mov_b32 v1, 0x07060504",
+            "v_mov_b32 v2, 0x03020100",
+            "v_mov_b32 v3, 0x00010203",
+            "v_perm_b32 v1, v1, v2, v3",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_perm_alias", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], 0x00010203)
+
+
 if __name__ == "__main__":
     unittest.main()
