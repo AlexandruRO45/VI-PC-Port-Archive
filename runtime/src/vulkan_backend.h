@@ -24,6 +24,7 @@
 #include "xdxr_build.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -927,16 +928,18 @@ public:
             return it == query_pools_.end() ? nullptr : &it->second;
         };
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
-        if (loaded_) {
+        if (vk.vkCreateSemaphore && vk.vkDestroySemaphore) {
             VkSemaphoreTypeCreateInfo bindless_type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
             bindless_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
             VkSemaphoreCreateInfo bindless_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &bindless_type};
             if (vk.vkCreateSemaphore(device_, &bindless_info, nullptr, &bindless_timeline_) != VK_SUCCESS) {
                 bindless_timeline_ = VK_NULL_HANDLE;
+                bindless_sync_failed_ = true;
                 loaded_ = false;
-            } else {
-                fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
             }
+        }
+        if (loaded_) {
+            fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
         }
     }
 
@@ -944,13 +947,14 @@ public:
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
-        if (bindless_timeline_) vk.vkDestroySemaphore(device_, bindless_timeline_, nullptr);
+        if (bindless_timeline_ && vk.vkDestroySemaphore) vk.vkDestroySemaphore(device_, bindless_timeline_, nullptr);
     }
 
     VulkanContext(const VulkanContext&) = delete;
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     bool loaded() const { return loaded_; }
+    bool bindless_sync_failed() const { return bindless_sync_failed_; }
     void configure_predication(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
                                VkDeviceSize max_range, std::uint32_t family) {
         std::unique_lock lock(resource_mutex_);
@@ -1348,6 +1352,7 @@ private:
 
     VkDevice device_;
     bool loaded_ = false;
+    bool bindless_sync_failed_ = false;
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
@@ -1482,7 +1487,7 @@ public:
 
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
         : context_(context), queue_(queue), kind_(kind), family_(family) {
-        if (!context.loaded()) return;
+        if (context.bindless_sync_failed()) return;
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1660,13 +1665,19 @@ public:
     }
 
     bool idle() {
+        if (!queue_ || !context_.vk.vkQueueWaitIdle) return false;
         std::lock_guard lock(context_.submit_mutex());
         return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
     }
 
 private:
+    struct TimelineOp {
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        std::uint64_t value = 0;
+    };
+
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
-        if (!ok_ || !context_.loaded() || context_.is_device_lost()) return ReplayResult::unsupported;
+        if (!ok_ || context_.bindless_sync_failed() || context_.is_device_lost()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
@@ -1885,8 +1896,16 @@ private:
             if (!transfer_only)
                 prepare_bindless_sync(bindless_recorded, false, bindless_wait, bindless_wait_val, bindless_signal,
                                       bindless_signal_val);
-            const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, bindless_wait, bindless_wait_val,
-                                                   bindless_signal, bindless_signal_val);
+            std::array<TimelineOp, 1> extra_waits{};
+            std::size_t extra_wait_count = 0;
+            std::array<TimelineOp, 1> extra_signals{};
+            std::size_t extra_signal_count = 0;
+            if (bindless_wait) extra_waits[extra_wait_count++] = {bindless_wait, bindless_wait_val};
+            if (bindless_signal) extra_signals[extra_signal_count++] = {bindless_signal, bindless_signal_val};
+            const bool submitted =
+                ended && submit(command_buffer, VK_NULL_HANDLE, 0,
+                                std::span<const TimelineOp>(extra_waits.data(), extra_wait_count),
+                                std::span<const TimelineOp>(extra_signals.data(), extra_signal_count));
             if (submitted) {
                 if (bindless_signal) {
                     context_.bindless_upload_value_ = bindless_signal_val;
@@ -1982,8 +2001,16 @@ private:
         if (!transfer_only)
             prepare_bindless_sync(bindless_recorded, runs_shaders, bindless_wait, bindless_wait_val, bindless_signal,
                                   bindless_signal_val);
-        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, bindless_wait, bindless_wait_val,
-                                               bindless_signal, bindless_signal_val);
+        std::array<TimelineOp, 1> extra_waits{};
+        std::size_t extra_wait_count = 0;
+        std::array<TimelineOp, 1> extra_signals{};
+        std::size_t extra_signal_count = 0;
+        if (bindless_wait) extra_waits[extra_wait_count++] = {bindless_wait, bindless_wait_val};
+        if (bindless_signal) extra_signals[extra_signal_count++] = {bindless_signal, bindless_signal_val};
+        const bool submitted =
+            ended && submit(command_buffer, VK_NULL_HANDLE, 0,
+                            std::span<const TimelineOp>(extra_waits.data(), extra_wait_count),
+                            std::span<const TimelineOp>(extra_signals.data(), extra_signal_count));
         if (submitted) {
             if (bindless_signal) {
                 context_.bindless_upload_value_ = bindless_signal_val;
@@ -2333,51 +2360,77 @@ private:
     }
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
-                VkSemaphore extra_wait = VK_NULL_HANDLE, std::uint64_t extra_wait_value = 0,
-                VkSemaphore extra_signal = VK_NULL_HANDLE, std::uint64_t extra_signal_value = 0) {
-        if (!ok_ || context_.is_device_lost()) return false;
+                std::span<const TimelineOp> extra_waits = {}, std::span<const TimelineOp> extra_signals = {}) {
+        if (!ok_ || context_.bindless_sync_failed() || context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) collect_bindings(completed());
         std::span<const VkSemaphore> semaphores = waits_;
         std::span<const std::uint64_t> values = wait_values_;
-        std::vector<VkSemaphore> extra_waits;
-        std::vector<std::uint64_t> extra_values;
-        if (last_sparse_ || extra_wait) {
-            extra_waits = waits_;
-            extra_values = wait_values_;
+        std::vector<VkSemaphore> combined_waits;
+        std::vector<std::uint64_t> combined_values;
+        bool has_extra_waits = false;
+        for (const TimelineOp& op : extra_waits) {
+            if (op.semaphore) {
+                has_extra_waits = true;
+                break;
+            }
+        }
+        if (last_sparse_ || has_extra_waits) {
+            combined_waits = waits_;
+            combined_values = wait_values_;
             if (last_sparse_) {
-                extra_waits.push_back(progress_);
-                extra_values.push_back(last_sparse_);
+                combined_waits.push_back(progress_);
+                combined_values.push_back(last_sparse_);
             }
-            if (extra_wait) {
-                extra_waits.push_back(extra_wait);
-                extra_values.push_back(extra_wait_value);
+            for (const TimelineOp& op : extra_waits) {
+                if (op.semaphore) {
+                    combined_waits.push_back(op.semaphore);
+                    combined_values.push_back(op.value);
+                }
             }
-            semaphores = extra_waits;
-            values = extra_values;
+            semaphores = combined_waits;
+            values = combined_values;
         }
         const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
-            VkSemaphore signals[3]{progress_, VK_NULL_HANDLE, VK_NULL_HANDLE};
-            std::uint64_t signal_values[3]{ticket, 0, 0};
-            std::uint32_t signal_count = 1;
-            if (fence) {
-                signals[signal_count] = fence;
-                signal_values[signal_count] = value;
-                ++signal_count;
-            }
-            if (extra_signal) {
-                signals[signal_count] = extra_signal;
-                signal_values[signal_count] = extra_signal_value;
-                ++signal_count;
-            }
+            std::array<VkSemaphore, 4> stack_signals{progress_, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+            std::array<std::uint64_t, 4> stack_signal_values{ticket, 0, 0, 0};
+            std::uint32_t stack_count = 1;
+            std::vector<VkSemaphore> overflow_signals;
+            std::vector<std::uint64_t> overflow_signal_values;
+            const auto push_signal = [&](VkSemaphore sem, std::uint64_t val) {
+                if (!sem) return;
+                if (!overflow_signals.empty()) {
+                    overflow_signals.push_back(sem);
+                    overflow_signal_values.push_back(val);
+                    return;
+                }
+                if (stack_count < stack_signals.size()) {
+                    stack_signals[stack_count] = sem;
+                    stack_signal_values[stack_count] = val;
+                    ++stack_count;
+                    return;
+                }
+                overflow_signals.assign(stack_signals.begin(), stack_signals.begin() + stack_count);
+                overflow_signal_values.assign(stack_signal_values.begin(), stack_signal_values.begin() + stack_count);
+                overflow_signals.push_back(sem);
+                overflow_signal_values.push_back(val);
+            };
+            if (fence) push_signal(fence, value);
+            for (const TimelineOp& op : extra_signals) push_signal(op.semaphore, op.value);
+            const VkSemaphore* signal_ptr =
+                overflow_signals.empty() ? stack_signals.data() : overflow_signals.data();
+            const std::uint64_t* signal_val_ptr =
+                overflow_signals.empty() ? stack_signal_values.data() : overflow_signal_values.data();
+            const std::uint32_t signal_count =
+                overflow_signals.empty() ? stack_count : std::uint32_t(overflow_signals.size());
             VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
             timeline.waitSemaphoreValueCount = std::uint32_t(values.size());
             timeline.pWaitSemaphoreValues = values.data();
             timeline.signalSemaphoreValueCount = signal_count;
-            timeline.pSignalSemaphoreValues = signal_values;
+            timeline.pSignalSemaphoreValues = signal_val_ptr;
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
             submit.waitSemaphoreCount = std::uint32_t(semaphores.size());
             submit.pWaitSemaphores = semaphores.data();
@@ -2385,7 +2438,7 @@ private:
             submit.commandBufferCount = command_buffer ? 1 : 0;
             submit.pCommandBuffers = &command_buffer;
             submit.signalSemaphoreCount = signal_count;
-            submit.pSignalSemaphores = signals;
+            submit.pSignalSemaphores = signal_ptr;
             res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
             if (res == VK_SUCCESS) context_.record_submit_locked(progress_, ticket);
         }
