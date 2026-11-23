@@ -600,3 +600,49 @@ class TestPermB32NegativeAndTranslator(unittest.TestCase):
             "v_perm_b32 v0, v1, v2, v3",
         ])
         self.assertIn("OpBitFieldUExtract", spv)
+
+
+# ------------------------------------------------------------------------------
+# ds_swizzle_b32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_ds_swizzle_quad(quad: List[int], p0: int, p1: int, p2: int, p3: int) -> List[int]:
+    return [quad[p0], quad[p1], quad[p2], quad[p3]]
+
+
+def ref_ds_swizzle_swap(quad: List[int]) -> List[int]:
+    return [quad[1], quad[0], quad[3], quad[2]]
+
+
+def ref_ds_swizzle_reverse(quad: List[int]) -> List[int]:
+    return [quad[3], quad[2], quad[1], quad[0]]
+
+
+def ref_ds_swizzle_broadcast(quad: List[int], lane_idx: int) -> List[int]:
+    return [quad[lane_idx]] * 4
+
+
+class TestDsSwizzleB32Oracle(unittest.TestCase):
+    def test_oracle_quad_perm_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v2, v0",
+            "ds_swizzle_b32 v4, v2 offset:swizzle(QUAD_PERM,3,2,1,0)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_swiz_quad_perm", lines, lanes=4)
+        expected = ref_ds_swizzle_quad([0, 1, 2, 3], 3, 2, 1, 0)
+        self.assertEqual(res, expected)
+
+    def test_oracle_swap_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v2, v0",
+            "ds_swizzle_b32 v4, v2 offset:swizzle(SWAP,1)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_swiz_swap", lines, lanes=4)
+        expected = ref_ds_swizzle_swap([0, 1, 2, 3])
+        self.assertEqual(res, expected)
