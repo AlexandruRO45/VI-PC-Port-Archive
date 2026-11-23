@@ -24,6 +24,7 @@ Exit codes:
     1   at least one case disagrees (or a wave32/wave64 result differs)
     2   bad arguments or harness error
     77  hardware oracle unavailable or not a GFX10 device
+Usage: `python -I tools/buffer_bounds_probe.py --help` lists the options.
 """
 import argparse
 import json
