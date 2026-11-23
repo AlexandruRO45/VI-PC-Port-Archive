@@ -463,6 +463,9 @@ def main(argv=None) -> int:
     ap.add_argument("--carve-dir", help="existing rpf9_carve.py index.json folder for an .rpf archive")
     ap.add_argument("--json", help="write aggregate decoded counts to this JSON file")
     a = ap.parse_args(argv)
+    if not os.path.exists(a.target):
+        print(f"ERROR: {a.target}: does not exist", file=sys.stderr)
+        return 2
 
     try:
         if a.json:

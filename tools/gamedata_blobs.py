@@ -360,6 +360,9 @@ def main(argv=None) -> int:
     ap.add_argument("--shaders", help="shaders.rpf archive to verify preload lists against SGD5 DB0/DB1")
     ap.add_argument("--json", help="write aggregate decoded counts to this JSON")
     a = ap.parse_args(argv)
+    if not os.path.exists(a.target):
+        print(f"ERROR: {a.target}: no such file or folder", file=sys.stderr)
+        return 2
 
     try:
         if a.json:
@@ -372,7 +375,7 @@ def main(argv=None) -> int:
         payloads = read_payloads(a.target)
         xref = cross_reference_sgd5(payloads, a.shaders) if a.shaders else None
     except (OSError, ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
-        print("error:", e, file=sys.stderr)
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
     for p in payloads:

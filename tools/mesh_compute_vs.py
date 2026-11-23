@@ -289,7 +289,7 @@ def main(argv):
         return 2
     if not os.path.isdir(argv[1]):
         print(f"ERROR: {argv[1]}: not a directory", file=sys.stderr)
-        return 1
+        return 2
     try:
         built = build_for_index(argv[1])
     except RuntimeError as e:

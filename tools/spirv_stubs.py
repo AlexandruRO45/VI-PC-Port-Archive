@@ -292,7 +292,8 @@ def main(argv=None):
     spirv_dir = argv[0]
     idx_path = os.path.join(spirv_dir, "index.json")
     if not os.path.isfile(idx_path):
-        sys.exit(f"missing {idx_path}")
+        print(f"ERROR: {idx_path}: does not exist", file=sys.stderr)
+        return 2
     try:
         with open(idx_path, encoding="utf-8-sig") as f:
             index = json.load(f)
