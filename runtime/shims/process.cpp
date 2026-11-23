@@ -13,6 +13,7 @@
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
 //     CRT's exit lock. Not covered yet: at_quick_exit() handlers (quick_exit() runs none) and the thread-local
 //     destructor callback (_register_thread_local_exe_atexit_callback); both still reach the host CRT.
+// vccorlib's GetCmdArguments, how a C++/CX program gets its arguments, answers with the game's argv too.
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
@@ -218,6 +219,19 @@ C* after_program_name(C* p) {
 char* __cdecl game_get_narrow_winmain_command_line() { return after_program_name(g_cmdline.data()); }
 wchar_t* __cdecl game_get_wide_winmain_command_line() { return after_program_name(g_wcmdline.data()); }
 
+// vccorlib140.dll: wchar_t** Platform::Details::GetCmdArguments(int* argc), what the main() wrapper of a C++/CX
+// program calls for its Platform::Array<String^>^ argument. vccorlib reads its argv from the CRT it imports, so the
+// host copy the loader prefers (prefer_host_copy) answers with gta6rt's arguments, and Wine has no vccorlib140.dll at
+// all. The game's argument table is returned instead: the wide one, whichever main the CRT startup chose, since that
+// is the type the function returns.
+// The fact (title arguments through this export) is from sammwyy/xvalkyrie, src/runtime/common/execute.cpp:206-211
+// at 53af7df77c10 (GPL-3.0); reimplemented here, no code taken. The name is checked against vccorlib.lib of MSVC
+// 14.44.
+wchar_t** __cdecl game_cx_cmd_arguments(int* argc) {
+    if (argc) *argc = g_argc;
+    return g_wargv_ptr;
+}
+
 // The host CRT's environment tables, read when the game asks (RT-136). _environ and _wenviron are not stable: the host
 // CRT builds the wide table only when a wide environment function first runs (a host started through main() has
 // none until then), and _putenv/_wputenv reallocate both, so a pointer taken in set_command_line would be null or
@@ -376,4 +390,8 @@ SHIM_TABLE(process,
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
+    {"vccorlib140.dll", "?GetCmdArguments@Details@Platform@@YAPEAPEA_WPEAH@Z",
+     reinterpret_cast<void*>(&game_cx_cmd_arguments)},
+    {"vccorlib140d.dll", "?GetCmdArguments@Details@Platform@@YAPEAPEA_WPEAH@Z",
+     reinterpret_cast<void*>(&game_cx_cmd_arguments)},
 );
