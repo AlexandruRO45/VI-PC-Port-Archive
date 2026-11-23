@@ -350,3 +350,153 @@ class TestValuPkMaxI16BitwiseEdgeCases(unittest.TestCase):
             for cb1 in checkerboards:
                 res = ref_pk_max_i16(cb0, cb1)
                 self.assertEqual(res, ref_pk_max_i16(cb1, cb0))
+
+
+def parse_v_pk_max_i16_asm(asm_line: str) -> ASTInstruction:
+    """Parse a single assembly instruction line for v_pk_max_i16."""
+    clean = asm_line.strip()
+    if not clean:
+        raise ValueError("Empty assembly line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0].lower()
+    if mnemonic != "v_pk_max_i16":
+        raise ValueError(f"Expected mnemonic v_pk_max_i16, got {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError("Missing operands")
+    operands_str = [op.strip() for op in parts[1].split(",")]
+    if len(operands_str) != 3:
+        raise ValueError(f"Expected 3 operands (dst, src0, src1), got {len(operands_str)}")
+
+    def parse_op(op_str: str) -> ASTOperand:
+        op_lower = op_str.lower()
+        if op_lower.startswith("v") and op_lower[1:].isdigit():
+            return ASTOperand.vgpr(int(op_lower[1:]))
+        elif op_lower.startswith("s") and op_lower[1:].isdigit():
+            return ASTOperand.sgpr(int(op_lower[1:]))
+        elif op_str.startswith("0x") or op_str.startswith("-") or op_str.isdigit():
+            val = int(op_str, 0)
+            return ASTOperand.literal32(val)
+        else:
+            raise ValueError(f"Invalid operand: {op_str}")
+
+    dst = parse_op(operands_str[0])
+    src0 = parse_op(operands_str[1])
+    src1 = parse_op(operands_str[2])
+
+    inst = ASTInstruction(Opcode.V_PK_MAX_I16, dst, src0, src1)
+    inst.validate()
+    return inst
+
+
+# Mutant functions for mutation testing
+def mutant_min(src0: int, src1: int) -> int:
+    """Mutant 1: uses min instead of max."""
+    lo0 = s16(src0 & MASK16)
+    hi0 = s16((src0 >> 16) & MASK16)
+    lo1 = s16(src1 & MASK16)
+    hi1 = s16((src1 >> 16) & MASK16)
+    return ((min(hi0, hi1) & MASK16) << 16) | (min(lo0, lo1) & MASK16)
+
+
+def mutant_unsigned_max(src0: int, src1: int) -> int:
+    """Mutant 2: uses unsigned max (fails on negative numbers)."""
+    lo0 = src0 & MASK16
+    hi0 = (src0 >> 16) & MASK16
+    lo1 = src1 & MASK16
+    hi1 = (src1 >> 16) & MASK16
+    return ((max(hi0, hi1) & MASK16) << 16) | (max(lo0, lo1) & MASK16)
+
+
+def mutant_lo_only(src0: int, src1: int) -> int:
+    """Mutant 3: writes lo result to both halves."""
+    lo0 = s16(src0 & MASK16)
+    lo1 = s16(src1 & MASK16)
+    m = max(lo0, lo1) & MASK16
+    return (m << 16) | m
+
+
+def mutant_hi_only(src0: int, src1: int) -> int:
+    """Mutant 4: writes hi result to both halves."""
+    hi0 = s16((src0 >> 16) & MASK16)
+    hi1 = s16((src1 >> 16) & MASK16)
+    m = max(hi0, hi1) & MASK16
+    return (m << 16) | m
+
+
+class TestValuPkMaxI16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, mutation detection, and translator execution."""
+
+    def test_syntax_rejection_malformed_syntax(self):
+        with self.assertRaises(ValueError):
+            parse_v_pk_max_i16_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_v_pk_max_i16_asm("v_pk_min_i16 v0, v1, v2")
+
+        with self.assertRaises(ValueError):
+            parse_v_pk_max_i16_asm("v_pk_max_i16 v0, v1")
+
+        with self.assertRaises(TypeError):
+            parse_v_pk_max_i16_asm("v_pk_max_i16 s0, v1, v2")
+
+    def test_mutation_detection_min(self):
+        s0 = 0x0005FFFB
+        s1 = 0xFFFB0005
+        correct = ref_pk_max_i16(s0, s1)
+        mutated = mutant_min(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_unsigned_max(self):
+        # -5 (0xFFFB) vs +5 (0x0005): in signed max, result is +5 (0x0005).
+        # In unsigned max, 0xFFFB (65531) > 0x0005 (5), so result is 0xFFFB.
+        s0 = 0x0005FFFB
+        s1 = 0xFFFB0005
+        correct = ref_pk_max_i16(s0, s1)
+        mutated = mutant_unsigned_max(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_lo_only(self):
+        s0 = (10 << 16) | 1
+        s1 = (20 << 16) | 2
+        correct = ref_pk_max_i16(s0, s1)
+        mutated = mutant_lo_only(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_hi_only(self):
+        s0 = (10 << 16) | 1
+        s1 = (20 << 16) | 2
+        correct = ref_pk_max_i16(s0, s1)
+        mutated = mutant_hi_only(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_pk_max_spirv_emission(self):
+        """Verify that support.translate_lines emits SMax in SPIR-V disassembly."""
+        lines = [
+            "v_mov_b32_e32 v1, 0x0005fffb",
+            "v_mov_b32_e32 v2, 0xfffb0005",
+            "v_pk_max_i16 v0, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pk_max_i16_emit", lines)
+        self.assertIn("SMax", spv)
+
+    def test_pk_max_hardware_execution(self):
+        """Verify hardware-accurate execution of v_pk_max_i16 through support.mrt0_words."""
+        lines = [
+            "v_mov_b32_e32 v1, 0x0005fffb",
+            "v_mov_b32_e32 v2, 0xfffb0005",
+            "v_pk_max_i16 v0, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pk_max_i16_hw", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x00050005)
+        self.assertEqual(words[1], 0x00050005)
+        self.assertEqual(words[2], 0x00050005)
+        self.assertEqual(words[3], 0x00050005)
+
+
+if __name__ == "__main__":
+    unittest.main()
