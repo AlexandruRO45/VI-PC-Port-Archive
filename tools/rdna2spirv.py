@@ -11245,7 +11245,7 @@ class Gen:
             self.emit(f"{r} = {'OpConvertUToF' if op.endswith('u32') else 'OpConvertSToF'} %float "
                       f"{x if op.endswith('u32') else self.as_int(x)}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))   # VOP3: clamp, omod
-        elif op.startswith("v_cvt_f32_ubyte"):
+        elif op in ("v_cvt_f32_ubyte0", "v_cvt_f32_ubyte1", "v_cvt_f32_ubyte2", "v_cvt_f32_ubyte3"):
             n = int(op[-1])
             x = self.src_u(a[1])
             s, m, r = self.tmp(), self.tmp(), self.tmp()

@@ -21,6 +21,7 @@ sys.path.insert(0, HERE)
 
 import spirv_mini_interp as si  # noqa: E402
 import support  # noqa: E402
+from rdna2spirv import Unsupported  # noqa: E402
 
 M32 = 0xFFFFFFFF
 M64 = (1 << 64) - 1
@@ -82,6 +83,11 @@ class Misc(unittest.TestCase):
                 e = struct.unpack("<I", struct.pack("<f", float((x >> (8 * k)) & 0xFF)))[0]
                 with self.subTest(k=k, x=hex(x)):
                     self.assertEqual(self.one(f"v_cvt_f32_ubyte{k}", [x]), e)
+
+    def test_cvt_f32_ubyte_rejects_unknown_mnemonics(self):
+        for op in ("v_cvt_f32_ubyte", "v_cvt_f32_ubyte4", "v_cvt_f32_ubyte10"):
+            with self.subTest(op=op), self.assertRaisesRegex(Unsupported, op):
+                self.one(op, [0x12345678])
 
     def test_shifts_b16(self):
         for x in (0, 1, 0x8000, 0xFFFF, 0x7FFF, 0xA5C3):
