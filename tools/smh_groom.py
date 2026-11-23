@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glb_writer  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 SYS_BASE = 0x50000000
 GPU_BASE = 0x60000000
@@ -1902,7 +1903,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "export-glb":
-            if os.path.exists(args.output) and os.path.exists(args.path) and os.path.samefile(args.path, args.output):
+            if os.path.isdir(args.output):
+                raise GroomError(f"output path is a directory: {args.output}")
+            if same_report_path(args.output, args.path):
                 raise GroomError(f"output must not overwrite the input file: {args.path}")
             groom = load_groom(args.path, offset=args.offset)
             meta = write_glb(

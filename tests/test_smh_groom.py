@@ -952,14 +952,25 @@ class CliTests(unittest.TestCase):
                 summary = glb_writer.read_glb_summary(f.read())
             self.assertEqual(summary["version"], 2)
 
-            # Refusing to overwrite input
+            # Refusing to overwrite input or write to a directory
             import contextlib
             import io
-            err_buf = io.StringIO()
-            with contextlib.redirect_stderr(err_buf):
-                bad_rc = smh_groom.main(["export-glb", smh_path, smh_path])
-            self.assertEqual(bad_rc, 1)
-            self.assertIn("must not overwrite", err_buf.getvalue())
+            for bad_out, expected_msg in (
+                (smh_path, "must not overwrite"),
+                (os.path.join(tmp, ".", os.path.basename(smh_path)), "must not overwrite"),
+                (tmp, "directory"),
+            ):
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf):
+                    bad_rc = smh_groom.main(["export-glb", smh_path, bad_out])
+                self.assertEqual(bad_rc, 1)
+                self.assertIn(expected_msg, err_buf.getvalue())
+            if sys.platform == "win32":
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf):
+                    bad_rc = smh_groom.main(["export-glb", smh_path, smh_path.upper()])
+                self.assertEqual(bad_rc, 1)
+                self.assertIn("must not overwrite", err_buf.getvalue())
 
 
 if __name__ == "__main__":
