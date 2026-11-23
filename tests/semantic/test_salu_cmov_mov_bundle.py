@@ -114,6 +114,25 @@ class TestSCmovB32AST(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 50)
 
+class TestSCmovB32SCCGating(unittest.TestCase):
+    def test_scc_alternating_conditions(self) -> None:
+        for scc in (0, 1):
+            self.assertEqual(ref_s_cmov_b32(scc, 0xBEEF, 0xCAFE), 0xBEEF if scc else 0xCAFE)
+
+    def test_translator_scc_gating(self) -> None:
+        body = [
+            "s_cmp_eq_u32 10, 10",        # SCC = 1
+            "s_mov_b32 s4, 77",
+            "s_cmov_b32 s4, 88",          # becomes 88
+            "s_cmp_eq_u32 10, 20",        # SCC = 0
+            "s_cmov_b32 s4, 99",          # stays 88
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_cmov_b32_gating")
+        for l in range(32):
+            self.assertEqual(results[l], 88)
+
 
 if __name__ == "__main__":
     unittest.main()
