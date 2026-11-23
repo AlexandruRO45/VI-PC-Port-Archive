@@ -934,3 +934,45 @@ class TestCmpxClassF64ASTAndScalar(unittest.TestCase):
     def test_scalar_predicated_execution_hardware(self):
         val_hw, _ = run_cmp_shader("f64", 0x0000000000000000, CLASS_NEG_NORMAL, is_cmpx=True, test_id="ast_scalar_pred")
         self.assertEqual(val_hw, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f64 SIMD Divergence & Active Mask Narrowing
+# ------------------------------------------------------------------------------
+
+def step_cmpx_class_f64_simd(wave: SIMDWaveClassLogic, insn: VCmpxClassF64Instruction):
+    mask = insn.mask.value if isinstance(insn.mask, LiteralOperand) else wave.vgprs[insn.mask.index][0]
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            lo = wave.vgprs[insn.src0_lo.index][lane] & MASK32
+            hi = wave.vgprs[insn.src0_hi.index][lane] & MASK32
+            val64 = (hi << 32) | lo
+            if not ref_cmp_class_f64(val64, mask):
+                wave.exec_mask &= ~(1 << lane)
+
+
+class TestCmpxClassF64SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_and_exec_narrowing_hardware(self):
+        wave = SIMDWaveClassLogic(wave_size=32)
+        wave.vgprs[2][0] = 0
+        wave.vgprs[3][0] = 0x3FF00000
+        wave.vgprs[2][1] = 0
+        wave.vgprs[3][1] = 0x80000000
+
+        insn = VCmpxClassF64Instruction(
+            src0_lo=RegisterOperand(OperandType.VGPR, 2),
+            src0_hi=RegisterOperand(OperandType.VGPR, 3),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        step_cmpx_class_f64_simd(wave, insn)
+
+        val_lane0, _ = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_POS_NORMAL, is_cmpx=True, test_id="simd_l0")
+        val_lane1, _ = run_cmp_shader("f64", 0x8000000000000000, CLASS_POS_NORMAL, is_cmpx=True, test_id="simd_l1")
+        self.assertEqual(val_lane0, 1)
+        self.assertEqual(val_lane1, 0)
+        self.assertEqual(wave.exec_mask & 1, 1)
+        self.assertEqual((wave.exec_mask >> 1) & 1, 0)
+
+    def test_cascaded_cmpx_narrowing_hardware(self):
+        val_cascade, _ = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_POS_NORMAL, is_cmpx=True, test_id="cascade")
+        self.assertEqual(val_cascade, 1)
