@@ -21,11 +21,8 @@
 extern char** environ;
 
 namespace host {
-namespace {
 
-using HANDLE = void*;
-
-std::string narrow(const char16_t* s, int64_t n = -1) {  // UTF-16 -> UTF-8
+std::string narrow(const char16_t* s, int64_t n) {  // UTF-16 -> UTF-8
     std::string out;
     for (int64_t i = 0; n < 0 ? s[i] != 0 : i < n; ++i) {
         uint32_t c = s[i];
@@ -42,7 +39,7 @@ std::string narrow(const char16_t* s, int64_t n = -1) {  // UTF-16 -> UTF-8
     }
     return out;
 }
-std::u16string widen(const char* s, int64_t n = -1) {  // UTF-8 -> UTF-16; a bad byte passes through as Latin-1
+std::u16string widen(const char* s, int64_t n) {  // UTF-8 -> UTF-16; a bad byte passes through as Latin-1
     std::u16string out;
     auto* u = reinterpret_cast<const uint8_t*>(s);
     int64_t len = n < 0 ? static_cast<int64_t>(std::strlen(s)) : n;
@@ -66,6 +63,11 @@ std::u16string widen(const char* s, int64_t n = -1) {  // UTF-8 -> UTF-16; a bad
     }
     return out;
 }
+
+namespace {
+
+using HANDLE = void*;
+
 int64_t wlen(const char16_t* s) {
     int64_t n = 0;
     while (s[n]) ++n;
@@ -355,6 +357,12 @@ int ReleaseSemaphore(HANDLE h, int32_t n, int32_t* previous) {
     s->c.notify_all();
     return 1;
 }
+int ResetEvent(HANDLE h) {
+    Signal* s = static_cast<Object*>(h)->signal;
+    std::lock_guard<std::mutex> g(s->m);
+    s->count = 0;
+    return 1;
+}
 uint32_t WaitForSingleObjectEx(HANDLE h, uint32_t ms, int32_t) {
     auto* o = static_cast<Object*>(h);
     if (o->kind == Object::Thread) {  // ponytail: a thread is waited for without a timeout
@@ -576,10 +584,46 @@ void GetNativeSystemInfo(uint8_t* si) { system_info(si); }
 uint32_t GetCurrentProcessorNumber() { return 0; }
 void FlushProcessWriteBuffers() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 HANDLE GetCurrentThread() { return reinterpret_cast<HANDLE>(-2); }
+int DuplicateHandle(HANDLE, HANDLE source, HANDLE, HANDLE* out, uint32_t, int32_t, uint32_t options) {
+    if (!out || !source || source == reinterpret_cast<HANDLE>(-1)) return set_last_error(6 /* INVALID_HANDLE */), 0;
+    *out = duplicate_object(source);
+    if ((options & 1) && source != reinterpret_cast<HANDLE>(-2)) close_object(static_cast<Object*>(source));  // CLOSE_SOURCE
+    return 1;
+}
 int SwitchToThread() { return sched_yield() == 0; }
 // ponytail: the handler is recorded nowhere; a fault reaches the host's signal handler and ends the run.
 void* AddVectoredExceptionHandler(uint32_t, void* handler) { return handler; }
 void* EncodePointer(void* p) { return p; }
+int AreFileApisANSI() { return 1; }
+// ponytail: system messages are "Windows error N"; the CRT and std::system_error only need some text.
+uint32_t FormatMessageA(uint32_t flags, const void*, uint32_t id, uint32_t, char* buf, uint32_t size, void*) {
+    std::string text = "Windows error " + std::to_string(id);
+    if (flags & 0x100) {  // FORMAT_MESSAGE_ALLOCATE_BUFFER: buf is a char** for LocalFree
+        *reinterpret_cast<char**>(buf) = strdup(text.c_str());
+        return static_cast<uint32_t>(text.size());
+    }
+    if (size <= text.size()) return set_last_error(122), 0;
+    std::memcpy(buf, text.c_str(), text.size() + 1);
+    return static_cast<uint32_t>(text.size());
+}
+void* LocalFree(void* p) {
+    free(p);
+    return nullptr;
+}
+uint32_t GetTempPathW(uint32_t n, char16_t* buf) {
+    const char16_t tmp[] = u"/tmp/";
+    if (n < 6) return 6;
+    std::memcpy(buf, tmp, sizeof tmp);
+    return 5;
+}
+
+// Leonida's tests compare against Microsoft's D3D12 when one is present and look for Wine's marker to know it is
+// not (test/d3d12_copy_compare.h). There is no Microsoft D3D12 here either, so the host answers like Wine.
+const char* wine_get_version() { return "macos_host"; }
+int32_t CreateDXGIFactory1(const void*, void** out) {
+    *out = nullptr;
+    return static_cast<int32_t>(0x887A0004);  // DXGI_ERROR_UNSUPPORTED
+}
 
 // advapi32: there are no Windows security tokens here, so no privilege is ever held.
 int OpenProcessToken(HANDLE, uint32_t, HANDLE*) { return set_last_error(5 /* ERROR_ACCESS_DENIED */), 0; }
@@ -607,8 +651,9 @@ Exports kernel32_crt_exports() {
         K(GetConsoleMode), K(WriteConsoleW), K(OutputDebugStringA), K(OutputDebugStringW), K(HeapReAlloc),
         K(HeapSize), K(HeapQueryInformation), K(VirtualProtect), K(QueryPerformanceFrequency), K(GetTickCount64),
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
-        K(GetCurrentThread), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
-        K(SetEvent), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(ExitThread), K(FreeLibraryAndExitThread),
+        K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
+        K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
+        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }

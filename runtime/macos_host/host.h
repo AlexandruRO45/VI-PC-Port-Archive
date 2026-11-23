@@ -38,6 +38,8 @@ void set_last_error(uint32_t e);
 std::string to_host_path(const char* windows_path);
 [[noreturn]] void fail(const std::string& why);
 extern std::string g_exe_path;              // host path of the game image
+std::string narrow(const char16_t* s, int64_t n = -1);  // UTF-16 -> UTF-8
+std::u16string widen(const char* s, int64_t n = -1);    // UTF-8 -> UTF-16
 void* find_export(const std::string& key);  // "dll!name" (dll lowercase) -> entry, or nullptr
 bool has_dll(const std::string& dll);       // the host exports something from this (lowercase) DLL
 
@@ -83,13 +85,27 @@ struct Object {
     uint32_t exit_code = 0;
     bool joined = false;
     Signal* signal = nullptr;
+    int refs = 1;  // DuplicateHandle hands out the same object; the last CloseHandle frees it
 };
 void free_signal(Signal* s);
+Object* duplicate_object(void* h);  // a real handle to h, or to the calling thread for GetCurrentThread's -2
 using ThreadProc = uint32_t(MSABI*)(void*);
 Object* spawn_thread(ThreadProc proc, void* arg);  // nullptr on failure
 uint32_t wait_thread(Object* o);                   // joins; returns the exit code
 void close_object(Object* o);
 [[noreturn]] void exit_thread(uint32_t code);  // from inside a guest thread
+
+// The game image's .pdata unwinder (eh.cpp). Registers are Windows-numbered, gpr[0..15] then rip as gpr[16],
+// which is both the host's Ctx and the Windows CONTEXT from Rax on; xmm[16][16] holds xmm0..15.
+struct RuntimeFunction { uint32_t begin, end, unwind; };
+struct Unwound {
+    uint64_t establisher = 0;
+    uint64_t handler = 0;       // language handler address, 0 if none
+    uint64_t handler_data = 0;  // what follows the handler RVA in UNWIND_INFO
+    uint8_t flags = 0;          // UNW_FLAG_EHANDLER 1, UNW_FLAG_UHANDLER 2
+};
+const RuntimeFunction* lookup_function(uint64_t rip);  // nullptr outside the image or in a leaf
+Unwound unwind_frame(uint64_t* gpr, uint8_t* xmm);    // the registers become the caller's
 
 using Exports = std::vector<std::pair<std::string, void*>>;  // "dll!name" -> ms_abi entry
 Exports kernel32_exports();
@@ -98,6 +114,9 @@ Exports eh_exports();
 Exports vulkan_exports();
 Exports user32_exports();
 Exports kernel32_crt_exports();
+Exports kernel32_file_exports();
+Exports d3d12_serialize_exports();
+Exports seh_exports();
 
 }  // namespace host
 

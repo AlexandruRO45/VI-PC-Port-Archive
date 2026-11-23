@@ -243,7 +243,18 @@ uint32_t wait_thread(Object* o) {
     return o->exit_code;
 }
 
+Object* duplicate_object(void* h) {
+    if (h == reinterpret_cast<void*>(-2)) {
+        if (!t_self) return new Object{Object::Thread, -1, pthread_self(), thread_id(), 0, true};  // ponytail: the main
+        h = t_self;  // thread's duplicate is never joined, so waiting on it returns at once
+    }
+    auto* o = static_cast<Object*>(h);
+    __atomic_add_fetch(&o->refs, 1, __ATOMIC_RELAXED);
+    return o;
+}
+
 void close_object(Object* o) {
+    if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (o->kind == Object::File && o->fd > 2) close(o->fd);
     if (o->kind == Object::Thread && !o->joined) pthread_detach(o->thread);
     if (o->signal) free_signal(o->signal);
@@ -356,7 +367,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: macos_host <image.exe> [guest arguments...]\n");
         return 64;
     }
-    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports})
+    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
 
     char real[PATH_MAX];

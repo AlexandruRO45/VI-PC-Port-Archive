@@ -51,7 +51,7 @@ template <typename T> T rd(uint64_t addr) {
     return v;
 }
 
-struct RuntimeFunction { uint32_t begin, end, unwind; };
+}  // namespace
 
 const RuntimeFunction* lookup_function(uint64_t rip) {
     const uint8_t* nt = g_image + rd<uint32_t>(reinterpret_cast<uint64_t>(g_image) + 0x3C);
@@ -69,20 +69,17 @@ const RuntimeFunction* lookup_function(uint64_t rip) {
     return nullptr;
 }
 
-struct Unwound {
-    uint64_t establisher = 0;
-    uint64_t handler = 0;       // language handler address, 0 if none
-    uint64_t handler_data = 0;  // what follows the handler RVA in UNWIND_INFO
-};
 
-// RtlVirtualUnwind for a frame stopped at a call site: ctx becomes the caller's state.
-void apply_codes(Ctx& ctx, const RuntimeFunction* rf, uint64_t rip_offset, uint64_t& frame, Unwound* out) {
+namespace {
+// RtlVirtualUnwind for a frame stopped at a call site: the registers become the caller's state.
+void apply_codes(uint64_t* gpr, uint8_t* xmm, const RuntimeFunction* rf, uint64_t rip_offset, uint64_t& frame,
+                 Unwound* out) {
     uint64_t base = reinterpret_cast<uint64_t>(g_image);
     uint64_t ui = base + rf->unwind;
     uint8_t flags = rd<uint8_t>(ui) >> 3, count = rd<uint8_t>(ui + 2), fr = rd<uint8_t>(ui + 3);
     uint8_t frame_reg = fr & 0xF, frame_off = fr >> 4;
     if (out) {
-        frame = frame_reg ? ctx.gpr[frame_reg] - 16ull * frame_off : ctx.gpr[4];
+        frame = frame_reg ? gpr[frame_reg] - 16ull * frame_off : gpr[4];
         out->establisher = frame;
     }
     auto code = [&](int i) { return rd<uint16_t>(ui + 4 + 2 * i); };
@@ -91,42 +88,49 @@ void apply_codes(Ctx& ctx, const RuntimeFunction* rf, uint64_t rip_offset, uint6
         uint8_t at = c & 0xFF, op = (c >> 8) & 0xF, info = c >> 12;
         int slots = op == 1 ? (info ? 3 : 2) : op == 4 || op == 8 ? 2 : op == 5 || op == 9 ? 3 : 1;
         if (at > rip_offset) { i += slots; continue; }  // in the prolog, not executed yet
-        uint64_t& rsp = ctx.gpr[4];
+        uint64_t& rsp = gpr[4];
         switch (op) {
-            case 0: ctx.gpr[info] = rd<uint64_t>(rsp); rsp += 8; break;                      // PUSH_NONVOL
+            case 0: gpr[info] = rd<uint64_t>(rsp); rsp += 8; break;                      // PUSH_NONVOL
             case 1: rsp += info ? (code(i + 1) | uint32_t(code(i + 2)) << 16) : code(i + 1) * 8u; break;
             case 2: rsp += info * 8u + 8; break;                                             // ALLOC_SMALL
-            case 3: rsp = ctx.gpr[frame_reg] - 16ull * frame_off; break;                     // SET_FPREG
-            case 4: ctx.gpr[info] = rd<uint64_t>(frame + code(i + 1) * 8u); break;           // SAVE_NONVOL
-            case 5: ctx.gpr[info] = rd<uint64_t>(frame + (code(i + 1) | uint32_t(code(i + 2)) << 16)); break;
-            case 8: std::memcpy(ctx.xmm[info], reinterpret_cast<void*>(frame + code(i + 1) * 16u), 16); break;
-            case 9: std::memcpy(ctx.xmm[info], reinterpret_cast<void*>(frame + (code(i + 1) | uint32_t(code(i + 2)) << 16)), 16); break;
+            case 3: rsp = gpr[frame_reg] - 16ull * frame_off; break;                     // SET_FPREG
+            case 4: gpr[info] = rd<uint64_t>(frame + code(i + 1) * 8u); break;           // SAVE_NONVOL
+            case 5: gpr[info] = rd<uint64_t>(frame + (code(i + 1) | uint32_t(code(i + 2)) << 16)); break;
+            case 8: std::memcpy(xmm + 16 * info, reinterpret_cast<void*>(frame + code(i + 1) * 16u), 16); break;
+            case 9: std::memcpy(xmm + 16 * info, reinterpret_cast<void*>(frame + (code(i + 1) | uint32_t(code(i + 2)) << 16)), 16); break;
             default: fail("unwind: unsupported opcode " + std::to_string(op));
         }
         i += slots;
     }
     uint64_t tail = ui + 4 + 2 * ((count + 1) & ~1);
     if (flags & 4) {  // CHAININFO: the parent's codes, all executed
-        apply_codes(ctx, reinterpret_cast<const RuntimeFunction*>(tail), ~0ull, frame, nullptr);
+        apply_codes(gpr, xmm, reinterpret_cast<const RuntimeFunction*>(tail), ~0ull, frame, nullptr);
     } else if (out && (flags & 3)) {
+        out->flags = flags & 3;
         out->handler = base + rd<uint32_t>(tail);
         out->handler_data = tail + 4;
     }
 }
 
-Unwound virtual_unwind(Ctx& ctx) {
+}  // namespace
+
+Unwound unwind_frame(uint64_t* gpr, uint8_t* xmm) {
     Unwound u;
-    const RuntimeFunction* rf = lookup_function(ctx.rip);
+    uint64_t& rip = gpr[16];
+    const RuntimeFunction* rf = lookup_function(rip);
     if (rf) {
         uint64_t frame = 0;
-        apply_codes(ctx, rf, ctx.rip - reinterpret_cast<uint64_t>(g_image) - rf->begin, frame, &u);
+        apply_codes(gpr, xmm, rf, rip - reinterpret_cast<uint64_t>(g_image) - rf->begin, frame, &u);
     } else {
-        u.establisher = ctx.gpr[4];  // leaf function
+        u.establisher = gpr[4];  // leaf function
     }
-    ctx.rip = rd<uint64_t>(ctx.gpr[4]);
-    ctx.gpr[4] += 8;
+    rip = rd<uint64_t>(gpr[4]);
+    gpr[4] += 8;
     return u;
 }
+
+namespace {
+Unwound virtual_unwind(Ctx& ctx) { return unwind_frame(ctx.gpr, ctx.xmm[0]); }  // ctx.rip follows gpr[15]
 
 // __CxxFrameHandler3 and the MSVC throw metadata; every pointer is an RVA from the image base.
 struct FuncInfo { uint32_t magic; int32_t max_state; uint32_t unwind_map, n_try, try_map, n_ip, ip_map; int32_t unwind_help; uint32_t es, flags; };

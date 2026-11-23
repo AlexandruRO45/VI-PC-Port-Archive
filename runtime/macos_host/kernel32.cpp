@@ -150,11 +150,6 @@ void* SetUnhandledExceptionFilter(void*) { return nullptr; }
 
 // The CRT reaches these only on a failure path (__report_gsfailure, unhandled exceptions).
 int32_t UnhandledExceptionFilter(void*) { unsupported("UnhandledExceptionFilter (the guest crashed)"); }
-void RtlCaptureContext(void*) { unsupported("RtlCaptureContext (the guest reported a failure)"); }
-void* RtlLookupFunctionEntry(uint64_t, uint64_t*, void*) { unsupported("RtlLookupFunctionEntry"); }
-void* RtlVirtualUnwind(uint32_t, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*) {
-    unsupported("RtlVirtualUnwind");
-}
 
 }  // namespace
 
@@ -168,7 +163,6 @@ Exports kernel32_exports() {
         K(GetCurrentProcess), K(GetCurrentProcessId), K(GetCurrentThreadId),
         K(GetTempPathA), K(SetCurrentDirectoryA), K(InitializeSListHead), K(IsDebuggerPresent),
         K(IsProcessorFeaturePresent), K(SetUnhandledExceptionFilter), K(UnhandledExceptionFilter),
-        K(RtlCaptureContext), K(RtlLookupFunctionEntry), K(RtlVirtualUnwind),
     };
 }
 

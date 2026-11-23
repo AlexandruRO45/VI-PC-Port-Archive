@@ -91,6 +91,7 @@ int PeekMessageW(Msg* msg, void*, uint32_t, uint32_t, uint32_t) {
     msg->message = 0x0012;  // WM_QUIT
     return 1;
 }
+void* LoadCursorW(void*, const char16_t*) { return reinterpret_cast<void*>(1); }  // the cursor is AppKit's
 int TranslateMessage(const Msg*) { return 0; }
 int64_t DispatchMessageW(const Msg*) { return 0; }
 int64_t DefWindowProcW(void*, uint32_t, uint64_t, int64_t) { return 0; }
@@ -109,7 +110,7 @@ void* metal_layer_for_window(void* hwnd) { return hwnd ? (__bridge void*)static_
 #define U(name) EXPORT("user32.dll", name)
 Exports user32_exports() {
     return {U(RegisterClassExW), U(CreateWindowExW), U(ShowWindow), U(DestroyWindow), U(PeekMessageW),
-            U(TranslateMessage), U(DispatchMessageW), U(DefWindowProcW), U(GetClientRect)};
+            U(TranslateMessage), U(DispatchMessageW), U(DefWindowProcW), U(GetClientRect), U(LoadCursorW)};
 }
 
 }  // namespace host

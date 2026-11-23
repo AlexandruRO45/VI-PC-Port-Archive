@@ -15,7 +15,7 @@ mkdir -p "$OUT"
   "$OUT/guest.obj" "$OUT/kernel32.lib" /out:"$OUT/guest_fixed.exe"
 VKH=${VKH:-/opt/homebrew/opt/vulkan-headers/include}
 MVK=${MVK:-$HOME/.local/share/moltenvk/MoltenVK/MoltenVK/dynamic/dylib/macOS}  # universal MoltenVK release
-/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra -I"$VKH" host.cpp kernel32.cpp kernel32_crt.cpp crt.cpp eh.cpp vulkan.cpp \
+/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra -I"$VKH" host.cpp kernel32.cpp kernel32_crt.cpp kernel32_file.cpp d3d12_serialize.cpp seh.cpp crt.cpp eh.cpp vulkan.cpp \
   window.mm -framework Cocoa -framework QuartzCore -Wl,-rpath,"$MVK" -o "$OUT/macos_host"
 
 # Leonida's own stand-in game (runtime/test/fixtures/tiny_game.cpp), built as runtime/CMakeLists.txt builds it,
@@ -32,6 +32,8 @@ $CL /c $FIX/tiny_game.cpp /Fo"$OUT/tiny_game.obj"
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/tiny_game.obj" "$OUT/xgameruntime.lib" /out:"$OUT/tiny_game.exe"
 $CL /c guest/eh_probe.cpp /Fo"$OUT/eh_probe.obj"
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/eh_probe.obj" /out:"$OUT/eh_probe.exe"
+${CL/\/MD/\/MT} /c guest/eh_probe.cpp /Fo"$OUT/eh_probe_mt.obj"  # static CRT: throws go through RaiseException
+"$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/eh_probe_mt.obj" /out:"$OUT/eh_probe_mt.exe"
 printf 'LIBRARY vulkan-1.dll\nEXPORTS\n  vkGetInstanceProcAddr\n' > "$OUT/vulkan-1.def"
 "$LLVM/llvm-dlltool" -m i386:x86-64 -d "$OUT/vulkan-1.def" -l "$OUT/vulkan-1.lib"
 $CL -I"$VKH" /c guest/vk_clear.c /Fo"$OUT/vk_clear.obj"
