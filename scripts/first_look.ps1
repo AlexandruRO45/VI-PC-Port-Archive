@@ -66,7 +66,9 @@ if (-not $rt -or $stale) {
     if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
         (Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=Visual Studio ' -Quiet)) {
         # The wrapper configures Ninja and cannot reuse a Visual Studio build tree.
-        $cmake = (Select-String -LiteralPath $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.+)$').Matches.Groups[1].Value
+        $commandEntry = Select-String -LiteralPath $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.+)$'
+        if (-not $commandEntry) { throw "Missing CMAKE_COMMAND in $cache. Reconfigure the Visual Studio build and retry." }
+        $cmake = $commandEntry.Matches.Groups[1].Value
         $folders = $configs
         $existing = Find-RuntimeLoader $build $configs
         $configArgs = @()
