@@ -379,6 +379,8 @@ def _bone_name_map(skeleton) -> tuple[dict[str, dict], dict[int, dict]]:
         raise SkinError("skeleton has no bones")
     by_name, by_hash = {}, {}
     for bone in skeleton:
+        if not isinstance(bone, dict):
+            raise SkinError(f"skeleton bone has no fields: {type(bone).__name__}")
         name = bone.get("name")
         if not isinstance(name, str) or not name:
             raise SkinError("skeleton bone has no name")

@@ -240,6 +240,10 @@ class SkinnedGlbTest(unittest.TestCase):
             handle.write(payload)
         return path
 
+    def test_bone_name_map_rejects_a_non_object_entry(self):
+        with self.assertRaisesRegex(skinned_glb.SkinError, "bone has no fields"):
+            skinned_glb._bone_name_map([{"name": "root", "bind_matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}, [1, 2]])
+
     def test_joint_count_and_palette_resolution(self):
         _gltf, _binary, stats = self._build()
         self.assertEqual(stats["ped_joints"], 3)
