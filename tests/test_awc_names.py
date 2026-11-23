@@ -15,6 +15,8 @@ import unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import report_paths  # noqa: E402
 
 
 def load_module():
@@ -479,6 +481,196 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))
             self.assertEqual(A.read_words(path), ["a_word", "2"])
+
+
+class TestReportPaths(unittest.TestCase):
+    def test_uses_shared_same_report_path(self):
+        self.assertIs(A.same_report_path, report_paths.same_report_path)
+
+    def test_refuses_out_overwriting_input_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "bank.awc"), make_bank(["a_01"]))
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            with open(bank, "rb") as fh:
+                original_bytes = fh.read()
+            # Direct same path
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", bank])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(bank, "rb") as fh:
+                self.assertEqual(fh.read(), original_bytes)
+
+            # Different spelling with dot-segments
+            alt = os.path.join(tmp, ".", "bank.awc")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", alt])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(bank, "rb") as fh:
+                self.assertEqual(fh.read(), original_bytes)
+
+            # Case-folding alias on case-insensitive volume
+            case_alt = os.path.join(tmp, "BANK.AWC")
+            if report_paths.case_insensitive_volume(tmp) or os.path.normcase("A") == os.path.normcase("a"):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        A.main([bank, "--words", words, "--out", case_alt])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("must not overwrite an input", err.getvalue())
+                with open(bank, "rb") as fh:
+                    self.assertEqual(fh.read(), original_bytes)
+
+    def test_refuses_out_case_alias_on_folding_volume_mocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "bank.awc"), make_bank(["a_01"]))
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            with open(bank, "rb") as fh:
+                original_bytes = fh.read()
+            case_alt = os.path.join(tmp, "BANK.AWC")
+            with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+                  mock.patch.object(report_paths, "_resolved_key", side_effect=str),
+                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe,
+                  contextlib.redirect_stderr(io.StringIO()) as err,
+                  contextlib.redirect_stdout(io.StringIO())):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", case_alt])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("must not overwrite an input", err.getvalue())
+            self.assertGreaterEqual(probe.call_count, 1)
+            with open(bank, "rb") as fh:
+                self.assertEqual(fh.read(), original_bytes)
+
+    def test_refuses_out_overwriting_words_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "bank.awc"), make_bank(["a_01"]))
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            with open(words, "rb") as fh:
+                original_words = fh.read()
+            # Direct words collision
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", words])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(words, "rb") as fh:
+                self.assertEqual(fh.read(), original_words)
+
+            # Dot-segment spelling of words
+            alt_words = os.path.join(tmp, ".", "words.txt")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", alt_words])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(words, "rb") as fh:
+                self.assertEqual(fh.read(), original_words)
+
+    def test_refuses_out_overwriting_conversations_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "bank.awc"), make_bank(["a_01"]))
+            conv_file = write(os.path.join(tmp, "conv.bin"), b"TESTAU_ABCD\x00LABEL_01\x00")
+            with open(conv_file, "rb") as fh:
+                original_conv = fh.read()
+            # Direct collision on conversation file
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--conversations", conv_file, "--out", conv_file])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(conv_file, "rb") as fh:
+                self.assertEqual(fh.read(), original_conv)
+
+            # Collision inside conversation folder
+            conv_dir = os.path.join(tmp, "conv_folder")
+            os.mkdir(conv_dir)
+            nested_conv = write(os.path.join(conv_dir, "dialogue.bin"), b"TESTAU_WXYZ\x00LABEL_02\x00")
+            with open(nested_conv, "rb") as fh:
+                original_nested = fh.read()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--conversations", conv_dir, "--out", nested_conv])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(nested_conv, "rb") as fh:
+                self.assertEqual(fh.read(), original_nested)
+
+    def test_refuses_out_overwriting_manifest_json_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_file = os.path.join(tmp, "audio_manifest.json")
+            with open(manifest_file, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"bank_count": 1, "streams": [{"bank": "one", "stream": "00000001"}]}, fh)
+            with open(manifest_file, "rb") as fh:
+                original_manifest = fh.read()
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([manifest_file, "--words", words, "--out", manifest_file])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(manifest_file, "rb") as fh:
+                self.assertEqual(fh.read(), original_manifest)
+
+    def test_refuses_out_overwriting_scanned_folder_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank_dir = os.path.join(tmp, "banks")
+            os.mkdir(bank_dir)
+            bank = write(os.path.join(bank_dir, "test.awc"), make_bank(["a_01"]))
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            with open(bank, "rb") as fh:
+                original_bytes = fh.read()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank_dir, "--words", words, "--out", bank])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(bank, "rb") as fh:
+                self.assertEqual(fh.read(), original_bytes)
+
+    def test_refuses_out_as_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "bank.awc"), make_bank(["a_01"]))
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", tmp])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("is a folder, not a file", err.getvalue())
+
+    def test_refuses_out_missing_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "bank.awc"), make_bank(["a_01"]))
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            nonexistent = os.path.join(tmp, "no_such_folder", "out.csv")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", nonexistent])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("folder does not exist", err.getvalue())
+
+    def test_distinct_out_writes_successfully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "bank.awc"), make_bank(["a_01"]))
+            words = write(os.path.join(tmp, "words.txt"), "a_01\n")
+            out = os.path.join(tmp, "names.csv")
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = A.main([bank, "--words", words, "--out", out])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(out))
 
 
 if __name__ == "__main__":
