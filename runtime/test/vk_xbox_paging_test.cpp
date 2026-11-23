@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <numeric>
+#include <optional>
 #include <vector>
 
 using namespace leonida;
@@ -199,7 +200,8 @@ int main() {
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok());
 
-    // The arena.
+    // The arena. The pool is made after it (it needs the arena's memory types) but must outlive it.
+    std::optional<PagePool> pool_storage;
     PagedRegion region;
     if (!region.create(d.device, d.device_proc, kArena)) {
         std::printf("FAIL the 64 GiB sparse arena could not be created\n");
@@ -210,7 +212,7 @@ int main() {
                 (unsigned long long)(region.size() >> 30), (unsigned long long)region.address(),
                 region.memory_type_bits(), page_type);
     EXPECT(page_type != UINT32_MAX);
-    PagePool pool(d.device, d.device_proc, page_type);
+    PagePool& pool = pool_storage.emplace(d.device, d.device_proc, page_type);
     EXPECT(pool.ok());
     PageMapper mapper(region, pool);
     const SubmitBinds submit = [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds) {
@@ -429,6 +431,30 @@ int main() {
     const VkDeviceSize freed = pool.trim(queue.completed_ticket());
     std::printf("INFO trim freed %.0f MiB; %u chunk(s) left\n", double(freed) / (1 << 20), pool.chunk_count());
     EXPECT(pool.chunk_count() == 0);
+
+    // A region destroyed with a page still mapped gives its chunk back to trim(), as one cleared first does.
+    for (bool clear : {true, false}) {
+        std::vector<PageId> one;
+        EXPECT(pool.allocate(1, one));
+        {
+            PagedRegion temporary;
+            EXPECT(temporary.create(d.device, d.device_proc, kPageSize));
+            PageMapper m(temporary, pool);
+            const auto one_pool = m.register_page_pool(one);
+            const PageMappingRange range{PageRangeType::incrementing, 1, 0};
+            const PageMappingBatch batch{0, &range, 1};
+            EXPECT(m.copy_page_mappings_batch(one_pool, {&batch, 1}, submit));
+            if (clear) EXPECT(m.clear_page_mappings(0, 1, submit));
+            gpu.wait_queue(queue.submitted_ticket());
+            EXPECT(m.unregister_page_pool(one_pool));
+        }
+        pool.release(one);
+        const VkDeviceSize freed_after = pool.trim(queue.completed_ticket());
+        std::printf("INFO region destroyed (%s): trim freed %.0f MiB, %llu bytes still reserved\n",
+                    clear ? "cleared first" : "page still mapped", double(freed_after) / (1 << 20),
+                    (unsigned long long)pool.bytes_reserved());
+        EXPECT(freed_after == kChunkSize);
+    }
 
     const auto stats = mapper.stats();
     std::printf("INFO mapper: %llu calls, %llu submits, %llu binds, %llu pages\n", (unsigned long long)stats.calls,

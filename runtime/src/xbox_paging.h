@@ -250,13 +250,19 @@ private:
     std::uint64_t in_use_ = 0;
 };
 
-// The sparse arena: console VA = offset, device address fixed for its lifetime.
+// The sparse arena: console VA = offset, device address fixed for its lifetime. Its pages come from one PagePool,
+// which must outlive it.
 class PagedRegion {
 public:
     PagedRegion() = default;
     PagedRegion(const PagedRegion&) = delete;
     PagedRegion& operator=(const PagedRegion&) = delete;
     ~PagedRegion() {
+        // Mappings still in place end with the buffer. The chunks keep their last bind's ticket, so trim() still
+        // waits for it.
+        if (pool_)
+            for (PageId id : mapped_)
+                if (id) pool_->note_mapped(id, -1, 0);
         if (buffer_) destroy_(device_, buffer_, nullptr);
     }
 
@@ -338,6 +344,7 @@ public:
 
     // Records `changes` (as left by binds_for) once their bind was submitted at `ticket`.
     void apply(const std::vector<Change>& changes, PagePool& pool, std::uint64_t ticket) {
+        pool_ = &pool;
         for (const auto& [page, id] : changes) {
             PageId& slot = mapped_[std::size_t(page)];
             if (slot) pool.note_mapped(slot, -1, ticket);
@@ -354,6 +361,7 @@ private:
     std::uint32_t memory_type_bits_ = 0;
     std::uint64_t pages_ = 0;
     std::vector<PageId> mapped_;
+    PagePool* pool_ = nullptr;
 };
 
 // D3D12XBOX_PAGE_MAPPING_RANGE_TYPE: only INCREMENTING_PAGE_INDICES is documented publicly (Xbox-GDK-Samples
