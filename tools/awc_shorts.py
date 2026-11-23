@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus as awc  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
-from report_paths import path_key  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 
 FIELDS = ("bank", "stream", "duration_s", "channels", "packets", "file")
 
@@ -117,6 +117,7 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"awc_shorts: cannot list {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
+    catalog = os.path.join(a.out, "shorts.csv")
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
@@ -125,6 +126,10 @@ def main(argv=None) -> int:
     destinations = {}
     for path, bank in banks:
         target = os.path.join(a.out, bank)
+        top_level = os.path.join(a.out, bank.split("/", 1)[0])
+        if same_report_path(top_level, catalog):
+            print(f"awc_shorts: error: exporting {path} would use catalog {catalog} as a folder", file=sys.stderr)
+            return 2
         key = path_key(target)
         if key in destinations:
             print(f"awc_shorts: error: {destinations[key]} and {path} would both export to {target}", file=sys.stderr)
@@ -163,7 +168,6 @@ def main(argv=None) -> int:
     if io_failed:
         return 1
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))
-    catalog = os.path.join(a.out, "shorts.csv")
     try:
         with tempfile.TemporaryDirectory(dir=a.out, prefix=".shorts-") as staging:
             staged = os.path.join(staging, "shorts.csv")

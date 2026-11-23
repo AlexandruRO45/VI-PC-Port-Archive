@@ -155,6 +155,24 @@ class ShortsTest(unittest.TestCase):
             with open(catalog, "rb") as f:
                 self.assertEqual(f.read(), b"previous catalog\n")
 
+    def test_bank_folders_cannot_occupy_the_catalog_path(self):
+        tool = os.path.join(ROOT, "tools", "awc_shorts.py")
+        for bank in ("shorts.csv.awc", os.path.join("shorts.csv", "nested.awc")):
+            for jobs in ("1", "2"):
+                with self.subTest(bank=bank, jobs=jobs), tempfile.TemporaryDirectory(dir=self.tmp.name) as src:
+                    bank_path = os.path.join(src, bank)
+                    os.makedirs(os.path.dirname(bank_path), exist_ok=True)
+                    for path in (bank_path, os.path.join(src, "ordinary.awc")):
+                        with open(path, "wb") as f:
+                            f.write(build_music_bank(0x78, 480000))
+                    out = os.path.join(src, "out")
+                    result = subprocess.run([sys.executable, "-I", tool, src, out, "--jobs", jobs],
+                                            capture_output=True, text=True, errors="replace", timeout=60)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(bank_path, result.stderr)
+                    self.assertIn(os.path.join(out, "shorts.csv"), result.stderr)
+                    self.assertEqual(os.listdir(out), [])
+
     def test_rejects_nonpositive_job_counts(self):
         for jobs in ("0", "-1"):
             with self.subTest(jobs=jobs):
