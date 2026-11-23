@@ -19,8 +19,10 @@ Usage:
     python -I tools/export_diff.py --list-ops
 
 Exit code 0 when every program matches, 1 on the first mismatch (case, seed, program, the listing, and the expected
-against the actual structure), 2 on a harness error, a bare invocation or when no program was compared. Skips are
-counted with reasons: a refusal the model predicts is a skip, one it does not is a mismatch.
+against the actual structure), 2 on a harness error, a bare invocation or when no program was compared. `--show`
+follows the same codes for its one program (a predicted refusal is not a mismatch); `--self-test` exits 0 when
+every canary is caught and 2 when the comparator has gone blind. Skips are counted with reasons: a refusal the
+model predicts is a skip, one it does not is a mismatch.
 
 A mismatch is a finding to post in the coordination issue before anything is fixed: the model is wrong until the
 contract row proves otherwise, and then the translator is.
@@ -86,15 +88,16 @@ def ps_model(shape, exports):
     uncompressed export: the 16-bit compr form is the stencil and sample-mask format and never holds Z.
     """
     locations, refusals = {}, []
+    targets = shape.targets if shape.has_osg1 else []     # the translator reads the target set from the OSG1 alone
     for e in exports:
         if e.kind == "mrtz":
             if e.depth_x and not e.compr:
                 locations["%out_depth"] = "FragDepth"
             continue
-        if shape.targets and e.index >= len(shape.targets):
+        if targets and e.index >= len(targets):
             refusals.append(f"mrt{e.index}")
             break
-        rt = shape.targets[e.index] if shape.targets else e.index
+        rt = targets[e.index] if targets else e.index
         locations[f"%out_mrt{rt}"] = rt
     return PsPrediction(locations, refusals)
 
@@ -163,12 +166,12 @@ def vs_model(shape, exports):
         if e.kind == "param":
             params[e.index] = e.index      # the output is declared for any `exp paramN`, off components included
             continue
-        if not any(e.comps):
-            if e.index:
-                discarded.append(e.index)
-            continue
         if e.index == 0:
-            position = True
+            position = True                 # likewise for any `exp pos0`
+            continue
+        if not any(e.comps):
+            discarded.append(e.index)
+            continue
         elif e.index == 1 and misc:
             if e.comps[2]:
                 layer = D3D_NAME["rtai"] in misc
@@ -256,9 +259,8 @@ def _distance_elements(rng, kind, count):
     return svs
 
 
-def _components(rng, never_empty):
-    comps = tuple(rng.getrandbits(1) for _ in range(4))
-    return (1, 0, 0, 0) if never_empty and not any(comps) else comps
+def _components(rng):
+    return tuple(rng.getrandbits(1) for _ in range(4))
 
 
 def generate(seed, index):
@@ -274,9 +276,9 @@ def generate(seed, index):
             svs = _distance_elements(rng, "clip", rng.choice((0, 1, 2, 2, 3, 4, 6, 8, 9)))
             svs += _distance_elements(rng, "cull", rng.choice((0, 0, 1, 2, 4)))
             svs += [Osg1Element(D3D_NAME[m], 0, MISC_REGISTERS[m], 0x1, 0) for m in MISC_REGISTERS if rng.random() < 0.3]
-        exports = [VsExport("pos", 0, _components(rng, True))]
-        exports += [VsExport("pos", p, _components(rng, False)) for p in (1, 2, 3) if rng.random() < 0.6]
-        exports += [VsExport("param", n, _components(rng, False)) for n in range(8) if rng.random() < 0.25]
+        exports = [VsExport("pos", 0, _components(rng))]
+        exports += [VsExport("pos", p, _components(rng)) for p in (1, 2, 3) if rng.random() < 0.6]
+        exports += [VsExport("param", n, _components(rng)) for n in range(8) if rng.random() < 0.25]
         rng.shuffle(exports)
         return make_case("vs_" + name, "vs", VsShape(svs, has_osg1), exports)
     has_osg1 = rng.random() > 0.15
@@ -287,7 +289,7 @@ def generate(seed, index):
         if rng.random() < 0.3:
             exports.append(PsExport("mrt", k, False, True))
         elif rng.random() < 0.3:
-            exports.append(PsExport("mrt", k, False, False, _components(rng, False)))
+            exports.append(PsExport("mrt", k, False, False, _components(rng)))
         else:
             exports.append(PsExport("mrt", k, False, False))
     if rng.random() < 0.5:
@@ -324,7 +326,8 @@ def run_case(case):
     try:
         spvasm = support.translate_lines(case.name, case.listing, dxbc=case.dxbc)
     except rdna2spirv.Unsupported as refusal:
-        if case.refusals and any(r in str(refusal) for r in case.refusals):
+        # The translator's message: "export mrtK past the N declared SV_Target outputs".
+        if case.refusals and any(f"export {r} past the" in str(refusal) for r in case.refusals):
             return "skip", f"expected refusal: {refusal}"
         return "mismatch", f"the translator refused what the model accepts: Unsupported: {refusal}"
     message = compare(spvasm, case.expected)
@@ -404,18 +407,27 @@ def main(argv=None):
             print(line)
         return 0
     if args.show:
-        case = generate(args.seed, args.program or 0)
-        print(describe(case))
-        status, detail = run_case(case)
+        if args.program is None:
+            parser.print_usage(sys.stderr)
+            print("export_diff: --show requires --program", file=sys.stderr)
+            return 2
+        try:
+            case = generate(args.seed, args.program)
+            print(describe(case))
+            status, detail = run_case(case)
+        except Exception as e:  # noqa: BLE001 - a harness bug must be loud, and never pass for a mismatch
+            print(f"harness error {type(e).__name__}: {e}", file=sys.stderr)
+            return 2
         print("  translator: " + ("matches the model" if status == "match" else detail))
-        return 0
-    if args.programs <= 0:
-        print("no program ran: --programs must be positive")
-        return 2
+        return 1 if status == "mismatch" else 0
     matched, skipped, reasons = 0, 0, Counter()
     for index in range(args.programs):
-        case = generate(args.seed, index)
-        status, detail = run_case(case)
+        try:
+            case = generate(args.seed, index)
+            status, detail = run_case(case)
+        except Exception as e:  # noqa: BLE001 - a harness bug must be loud, and never pass for a mismatch
+            print(f"seed {args.seed}, program {index}: harness error {type(e).__name__}: {e}", file=sys.stderr)
+            return 2
         if status == "match":
             matched += 1
         elif status == "skip":

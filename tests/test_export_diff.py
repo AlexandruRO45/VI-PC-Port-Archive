@@ -77,6 +77,13 @@ class PsModelTest(unittest.TestCase):
         pred = export_diff.ps_model(export_diff.PsShape([], True), [self.E("mrt", 2, False, False)])
         self.assertEqual(pred.locations, {"%out_mrt2": 2})
 
+    def test_targets_without_an_osg1_are_not_declared(self):
+        # The translator reads the SV_Target set from the OSG1 alone (rdna2spirv.py:14340-14342), so a shape that
+        # lists targets without one is contradictory and the model must not map by it.
+        pred = export_diff.ps_model(export_diff.PsShape([0, 2], False),
+                                    [self.E("mrt", 0, False, False), self.E("mrt", 1, False, False)])
+        self.assertEqual(pred.locations, {"%out_mrt0": 0, "%out_mrt1": 1})
+
     def test_past_declared_refused(self):
         pred = export_diff.ps_model(export_diff.PsShape([0], True),
                                     [self.E("mrt", 0, False, False), self.E("mrt", 1, False, False)])
@@ -168,6 +175,15 @@ class VsModelTest(unittest.TestCase):
         self.assertEqual(pred.params, {4: 4})
         self.assertIn("Location %out_param4 4", export_diff.vs_structure(pred))
 
+    def test_all_off_pos0_still_declares_position(self):
+        # The same for "exp pos0 -> Position": the output is registered for any such export.
+        exports = [export_diff.VsExport("pos", 0, (0, 0, 0, 0))]
+        pred = export_diff.vs_model(export_diff.VsShape([], True), exports)
+        self.assertTrue(pred.position)
+        self.assertEqual(export_diff.vs_structure(pred), ["BuiltIn %out_pos Position"])
+        self.assertEqual(export_diff.run_case(export_diff.make_case("vs_all_off_pos0", "vs",
+                                                                    export_diff.VsShape([], True), exports))[0], "match")
+
 
 class HarnessTest(unittest.TestCase):
     E = export_diff.PsExport
@@ -196,7 +212,7 @@ class HarnessTest(unittest.TestCase):
     def test_happy_run_contract(self):
         self.assertIn(export_diff.main(["--programs", "5", "--seed", "1"]), (0, 1))
 
-    def test_all_skipped_is_harness_error(self):
+    def test_zero_programs_is_a_usage_error(self):
         import contextlib
         import io
         out, err = io.StringIO(), io.StringIO()
@@ -205,6 +221,50 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("--programs must be at least 1", err.getvalue())
         self.assertEqual(out.getvalue(), "")
+
+    def test_harness_error_is_not_a_mismatch(self):
+        # A bug in the harness must exit 2, never the 1 that means "first mismatch".
+        import contextlib
+        import io
+        from unittest import mock
+        err = io.StringIO()
+        with mock.patch.object(export_diff.support, "translate_lines", side_effect=ValueError("harness bug")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = export_diff.main(["--programs", "2", "--seed", "1"])
+        self.assertEqual(code, 2)
+        self.assertIn("harness error ValueError: harness bug", err.getvalue())
+
+    def test_every_program_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+        refusing = export_diff.make_case("ps_all_skip", "ps", export_diff.PsShape([0], True),
+                                         [self.E("mrt", 0, False, False), self.E("mrt", 1, False, False)])
+        err = io.StringIO()
+        with mock.patch.object(export_diff, "generate", return_value=refusing), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = export_diff.main(["--programs", "3", "--seed", "1"])
+        self.assertEqual(code, 2)
+        self.assertIn("every one was skipped", err.getvalue())
+
+    def test_show_requires_program(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = export_diff.main(["--show"])
+        self.assertEqual(code, 2)
+        self.assertIn("--show requires --program", err.getvalue())
+
+    def test_show_returns_one_on_a_mismatch(self):
+        import contextlib
+        import io
+        from unittest import mock
+        wrong = export_diff.make_case("ps_show_wrong", "ps", export_diff.PsShape([], False),
+                                      [self.E("mrt", 0, False, False)])._replace(expected=["Location %out_mrt0 7"])
+        with mock.patch.object(export_diff, "generate", return_value=wrong), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(export_diff.main(["--seed", "1", "--program", "0", "--show"]), 1)
 
     def test_no_arguments_prints_usage(self):
         # As tests/test_cf_diff.py: a bare invocation is a usage error, never the start of a long run.
