@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -225,6 +226,7 @@ int main() {
         // once, from its own slot.
         constexpr int kThreads = 8, kRounds = 250;
         std::atomic<int> wrong{0};
+        std::vector<std::vector<uint64_t>> issued(kThreads);
         std::vector<std::thread> threads;
         for (int t = 0; t < kThreads; ++t)
             threads.emplace_back([&, t] {
@@ -237,10 +239,43 @@ int main() {
                         !at<Unregister>(device, unreg)(device, mine, i % 2 == 0) ||
                         at<Unregister>(device, unreg)(device, mine, false))
                         wrong.fetch_add(1);
+                    issued[t].push_back(mine.token);
                 }
             });
         for (std::thread& thread : threads) thread.join();
         check(wrong.load() == 0, "concurrent registrations each unregister once, from their own slot");
+        std::set<uint64_t> distinct;
+        for (const std::vector<uint64_t>& tokens : issued) distinct.insert(tokens.begin(), tokens.end());
+        check(distinct.size() == size_t(kThreads) * kRounds && !distinct.count(0),
+              "tokens handed out on several threads at once are all distinct and non-zero");
+    }
+    {
+        // The same live tokens unregistered by several threads at once: for each token exactly one call returns
+        // true, whichever thread makes it, and the tokens of one registration never succeed on the other's slot.
+        constexpr int kTokens = 200, kThreads = 6;
+        std::vector<XTaskQueueRegistrationToken> tokens(kTokens);
+        bool registered = true;
+        for (int i = 0; i < kTokens; ++i)
+            registered &= at<Register>(device, i % 2 ? 7 : 4)(device, nullptr, nullptr,
+                                                               reinterpret_cast<void*>(&on_state), &tokens[i]) == S_OK;
+        std::vector<std::atomic<int>> successes(kTokens);
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t)
+            threads.emplace_back([&, t] {
+                while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                for (int n = 0; n < kTokens; ++n) {
+                    const int i = (n + t * 37) % kTokens;   // each thread starts at a different token
+                    const bool own = at<Unregister>(device, i % 2 ? 8 : 5)(device, tokens[i], t % 2 == 0);
+                    const bool other = at<Unregister>(device, i % 2 ? 5 : 8)(device, tokens[i], false);
+                    successes[i].fetch_add(int(own) + 100 * int(other));
+                }
+            });
+        go.store(true, std::memory_order_release);
+        for (std::thread& thread : threads) thread.join();
+        bool exactly_once = registered;
+        for (const std::atomic<int>& count : successes) exactly_once &= count.load() == 1;
+        check(exactly_once, "a token unregistered by several threads at once succeeds exactly once, on its own slot");
     }
     wchar_t endpoint[8] = {L'x'};
     size_t used = 99;
