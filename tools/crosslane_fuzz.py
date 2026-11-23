@@ -1453,7 +1453,8 @@ def _nonnegative_index(text):
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
-        epilog="To replay a window, keep the original seed and generation options. Example: "
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="To replay a window, keep the original seed and generation options. Example:\n"
                "python -I tools/crosslane_fuzz.py --seed 7 --ops 24 --wave both --dpp --start-index 159 --programs 3",
     )
     ap.add_argument("--programs", type=_at_least_one, default=100,
