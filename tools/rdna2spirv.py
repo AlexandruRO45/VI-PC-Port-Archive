@@ -7607,12 +7607,14 @@ class Gen:
             # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
             # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
             # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
-            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            # s_lshl_b64); a whole lane-mask source stays Unsupported (#210). A mixed mask/data pair reads
+            # the mask word as the whole wave's bits before scanning the combined 64-bit value.
             x = a[1]
             if self.holds_lane_mask(x):
                 raise Unsupported(op + " of a lane mask")
             if x["k"] == "sgpr" and x.get("n") == 2:
-                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+                lo, hi = self.mixed_pair_words(x) or \
+                    (self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1))
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)

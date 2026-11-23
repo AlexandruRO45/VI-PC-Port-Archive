@@ -83,6 +83,7 @@ _MASK_WORD_READERS = frozenset({
     "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
     "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
     "s_flbit_i32_b32", "s_flbit_i32",
+    "s_flbit_i32_b64", "s_flbit_i32_i64",
 })
 
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.
@@ -751,7 +752,10 @@ def _holds_lane_mask(ins, x, lm_map):
     return False
 
 
-_PAIR_MASK_WORD_READERS = frozenset({"s_bcnt0_i32_b64", "s_bcnt1_i32_b64", "s_ff0_i32_b64", "s_ff1_i32_b64"})
+_PAIR_MASK_WORD_READERS = frozenset({
+    "s_bcnt0_i32_b64", "s_bcnt1_i32_b64", "s_ff0_i32_b64", "s_ff1_i32_b64",
+    "s_flbit_i32_b64", "s_flbit_i32_i64",
+})
 
 
 def _reads_mask_word(ins, x, lm_map):
