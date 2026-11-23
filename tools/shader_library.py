@@ -252,6 +252,8 @@ def main(argv=None) -> int:
     ap.add_argument("--save", help="write the reassembled library file here")
     ap.add_argument("--stages", default="cs,ps,vs,ms",
                     help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
+    ap.add_argument("--program", metavar="ID", type=int, action="append", default=[],
+                    help="write only this zero-based program ID (repeatable, intersected with --stages)")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
@@ -264,6 +266,8 @@ def main(argv=None) -> int:
         ap.error("--jobs must be at least 1")
     if not a.out and not a.save:
         ap.error("give --out, --save or both")
+    if a.program and not a.out:
+        ap.error("--program requires --out")
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
@@ -278,6 +282,11 @@ def main(argv=None) -> int:
             finally:
                 m.close()
     lib = parse(b)
+    program_count = lib["header"]["programs"]
+    for program_id in a.program:
+        if not 0 <= program_id < program_count:
+            ap.error(f"program ID {program_id} is out of range for {program_count} programs")
+    program_ids = sorted(set(a.program)) if a.program else range(program_count)
     if a.save:
         with open(a.save, "wb") as f:
             f.write(b)
@@ -295,7 +304,7 @@ def main(argv=None) -> int:
     sources = carve_digests(a.carve) if a.carve else None
     cs_state = {c["program"]: c["state"] for c in lib["compute"]}
     index, written, work = [], 0, []
-    for i in range(lib["header"]["programs"]):
+    for i in program_ids:
         stages = lib["stage"].get(i, set())
         st = "+".join(sorted(stages)) if stages else "unused"
         if want is not None and not stages & want:

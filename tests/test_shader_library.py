@@ -234,6 +234,33 @@ class Main(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
                              ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
 
+    def test_program_filter_intersects_stages_and_keeps_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            saved = os.path.join(tmp, "saved.bin")
+            rc, _ = self.run_main(src, "--out", out, "--save", saved, "--stages", "cs,vs",
+                                  "--program", "3", "--program", "0", "--program", "1", "--program", "3")
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([entry["program"] for entry in json.load(f)], [1, 3])
+            with open(saved, "rb") as f:
+                self.assertEqual(f.read(), sample())
+
+    def test_rejects_out_of_range_program_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as error:
+                self.run_main(src, "--out", out, "--program", "4")
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("program ID 4 is out of range", stderr.getvalue())
+            self.assertFalse(os.path.exists(out))
+
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
