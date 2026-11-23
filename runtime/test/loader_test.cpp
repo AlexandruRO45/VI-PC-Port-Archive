@@ -886,6 +886,25 @@ void test_datafile_load() {
     if (h && (reinterpret_cast<uintptr_t>(h) & 1)) pass("datafile bare name loads from game directory");
     else failed("datafile bare name loads from game directory", "missing or untagged handle");
     if (h) FreeLibrary(h);
+    using LoadA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+    const auto load_a = reinterpret_cast<LoadA>(rt::shims::find("kernel32.dll", "LoadLibraryExA"));
+    const auto absent = g_dir.parent_path() / "leonida_absent_datafile_dir" / "a.dll";
+    h = load(absent.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (!h) pass("absolute datafile path is not redirected");
+    else { failed("absolute datafile path is not redirected", "unexpected result"); FreeLibrary(h); }
+    h = load_a(absent.string().c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (!h) pass("ANSI absolute datafile path is not redirected");
+    else { failed("ANSI absolute datafile path is not redirected", "unexpected result"); FreeLibrary(h); }
+    h = load(L"a.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) pass("datafile system search excludes game directory");
+    else { failed("datafile system search excludes game directory", "unexpected result"); FreeLibrary(h); }
+    h = load_a("a.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) pass("ANSI datafile system search excludes game directory");
+    else { failed("ANSI datafile system search excludes game directory", "unexpected result"); FreeLibrary(h); }
+    h = load_a("a.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (h) pass("ANSI datafile bare name loads from game directory");
+    else failed("ANSI datafile bare name loads from game directory", "missing handle");
+    if (h) FreeLibrary(h);
     SetLastError(0);
     h = load(L"leonida_missing_datafile_987.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE);
     if (!h) pass("missing datafile falls back to host");

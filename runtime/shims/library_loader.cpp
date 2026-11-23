@@ -182,8 +182,17 @@ HMODULE WINAPI load_library_w(LPCWSTR name) {
     return LoadLibraryW(name);
 }
 
+// Only substitute the game directory when the requested search includes the application directory.
+bool datafile_game_search(DWORD flags) {
+    constexpr DWORD search = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+                             LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_SYSTEM32 |
+                             LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    return !(flags & LOAD_WITH_ALTERED_SEARCH_PATH) &&
+           (!(flags & search) || (flags & (LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)));
+}
+
 HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
-    if (name && !file && (flags & kDataFileLoadFlags) && !std::strpbrk(name, "\\/:")) {
+    if (name && !file && (flags & kDataFileLoadFlags) && datafile_game_search(flags) && !std::strpbrk(name, "\\/:")) {
         bool handled = false;
         const std::string dll = module_name(name);
         if (!dll.empty()) {
@@ -200,7 +209,7 @@ HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
 }
 
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
-    if (name && !file && (flags & kDataFileLoadFlags) && !std::wcspbrk(name, L"\\/:")) {
+    if (name && !file && (flags & kDataFileLoadFlags) && datafile_game_search(flags) && !std::wcspbrk(name, L"\\/:")) {
         bool handled = false;
         HMODULE h = load_bundled_w(name, flags, handled);
         if (handled) return h;
