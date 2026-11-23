@@ -188,20 +188,18 @@ jobs:
           EOF
           )
 
-          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              Leonida-windows-x64.exe \
-              Leonida-linux-x64.tar.gz \
-              Leonida-macos-arm64.zip \
-              SHA256SUMS.txt \
-              --clobber --repo "${GITHUB_REPOSITORY}"
-          else
-            gh release create "$TAG" \
-              Leonida-windows-x64.exe \
-              Leonida-linux-x64.tar.gz \
-              Leonida-macos-arm64.zip \
-              SHA256SUMS.txt \
-              --title "Leonida $TAG" \
-              --notes "$NOTES" \
-              --repo "${GITHUB_REPOSITORY}"
-          fi
+          BASE_TAG="$TAG"
+          N=2
+          while gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; do
+            TAG="${BASE_TAG}-r${N}"
+            N=$((N + 1))
+          done
+
+          gh release create "$TAG" \
+            Leonida-windows-x64.exe \
+            Leonida-linux-x64.tar.gz \
+            Leonida-macos-arm64.zip \
+            SHA256SUMS.txt \
+            --title "Leonida $TAG" \
+            --notes "$NOTES" \
+            --repo "${GITHUB_REPOSITORY}"

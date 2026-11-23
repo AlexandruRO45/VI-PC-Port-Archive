@@ -163,24 +163,20 @@ jobs:
           EOF
           )
 
-          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              llvm-mc-windows-x64.zip \
-              llvm-mc-linux-x64.tar.gz \
-              llvm-mc-macos-arm64.tar.gz \
-              install_llvm.ps1 \
-              install_llvm.py \
-              SHA256SUMS.txt \
-              --clobber --repo "${GITHUB_REPOSITORY}"
-          else
-            gh release create "$TAG" \
-              llvm-mc-windows-x64.zip \
-              llvm-mc-linux-x64.tar.gz \
-              llvm-mc-macos-arm64.tar.gz \
-              install_llvm.ps1 \
-              install_llvm.py \
-              SHA256SUMS.txt \
-              --title "LLVM $VER llvm-mc (AMDGPU)" \
-              --notes "$NOTES" \
-              --repo "${GITHUB_REPOSITORY}"
-          fi
+          BASE_TAG="$TAG"
+          N=2
+          while gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; do
+            TAG="${BASE_TAG}-r${N}"
+            N=$((N + 1))
+          done
+
+          gh release create "$TAG" \
+            llvm-mc-windows-x64.zip \
+            llvm-mc-linux-x64.tar.gz \
+            llvm-mc-macos-arm64.tar.gz \
+            install_llvm.ps1 \
+            install_llvm.py \
+            SHA256SUMS.txt \
+            --title "LLVM $VER llvm-mc (AMDGPU) ($TAG)" \
+            --notes "$NOTES" \
+            --repo "${GITHUB_REPOSITORY}"
