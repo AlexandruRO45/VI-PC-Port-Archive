@@ -433,6 +433,15 @@ class DotAndPkFmacTests(unittest.TestCase):
         ]
         got = mrt0_words(translate_lines("ps_dot_opsel_default", lines))
         self.assertEqual(got, [11, 16, 11, 7])
+        opsel_lines = [
+            "s_mov_b32 s0, 0x00020001",
+            "v_mov_b32 v1, 0x00040003",
+            "v_dot2_i32_i16 v2, s0, v1, 2 op_sel:[1,0,0] op_sel_hi:[0,1,1]",   # 2*3 + 1*4 + 2 = 12
+            "v_dot2_u32_u16 v3, s0, v1, 3 op_sel:[0,1,0] op_sel_hi:[0,1,1]",   # 1*4 + 1*4 + 3 = 11
+            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        self.assertEqual(mrt0_words(translate_lines("ps_dot_opsel_s0s1", opsel_lines)), [12, 11, 12, 11])
 
     def test_pk_fmac_f16_values_and_rounding(self):
         cases = [
@@ -541,13 +550,9 @@ class DotAndPkFmacTests(unittest.TestCase):
 
     def test_rejected_forms(self):
         bad_lines = (
-            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel:[1,0,0]",
-            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[0,0,0]",
-            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel:[0,0,0] op_sel_hi:[0,0,0]",
-            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[0,1,1]",
-            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[1,0,1]",
+            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel:[0,0,1]",
             "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[1,1,0]",
-            "v_dot2_u32_u16 v0, v1, v2, v3 op_sel_hi:[0,0,0]",
+            "v_dot2_u32_u16 v0, v1, v2, v3 op_sel:[0,0,1]",
             "v_dot4_u32_u8 v0, v1, v2, v3 op_sel:[1,0,0]",
             "v_dot4_u32_u8 v0, v1, v2, v3 op_sel_hi:[0,0,0]",
             "v_dot4_u32_u8 v0, v1, v2, v3 op_sel_hi:[0,1,0]",

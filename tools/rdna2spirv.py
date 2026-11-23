@@ -5720,28 +5720,64 @@ class Gen:
             # Packed integer dot products (RDNA2 ISA VOP3P, plus VOP2/VOP3 accumulating v_dot2c_i32_i16 / v_dot8c_i32_i4):
             #   D = sum_{k=0..N-1} (S0.elem[k] * S1.elem[k]) + (D for *c*, S2 otherwise)
             # Wrapping at 32 bits by default; VOP3/VOP3P clamp saturates to [INT32_MIN, INT32_MAX] (signed) or
-            # [0, UINT32_MAX] (unsigned). Hardware default for VOP3P is op_sel:[0,0,0] and op_sel_hi:[1,1,1];
-            # any other op_sel/op_sel_hi (or any op_sel on VOP2/VOP3 *c*), neg_lo/neg_hi, DPP/SDWA, or source
-            # neg/abs are refused.
+            # [0, UINT32_MAX] (unsigned). Hardware default for VOP3P is op_sel:[0,0,0] and op_sel_hi:[1,1,1].
+            # Measured on RDNA2 (gfx1036, tools/dot2_i16_opsel_probe.py): on v_dot2_i32_i16 / v_dot2_u32_u16,
+            # op_sel[0..1] / op_sel_hi[0..1] pick the 16-bit half of S0 / S1 for lane 0 / lane 1 (matching
+            # v_dot4_i32_i8); S2 ignores half-select and non-default S2 bits stay refused; all-zero neg_lo/neg_hi
+            # behaves as plain, while any set neg_lo/neg_hi bit is refused (hardware flips bit 15/31 of S0/S1 and
+            # clears/flips bit 31 of S2). On v_dot4_u32_u8 / v_dot8_* and *c*, non-default op_sel/op_sel_hi,
+            # neg_lo/neg_hi, DPP/SDWA, and source neg/abs are refused.
             is_c = op in ("v_dot2c_i32_i16", "v_dot8c_i32_i4")
+            is_dot2_vop3p = op in ("v_dot2_i32_i16", "v_dot2_u32_u16")
+
             def bits(name, default):
-                m = next((m for m in mods if m.startswith(name + ":")), None)
-                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
-            other = [m for m in mods if m != "clamp" and not (not is_c and m.startswith(("op_sel:", "op_sel_hi:")))]
-            if (other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a) or
-                    (not is_c and (bits("op_sel", [0, 0, 0]) != [0, 0, 0] or
-                                   bits("op_sel_hi", [1, 1, 1]) != [1, 1, 1]))):
+                matches = [m for m in mods if m.startswith(name + ":")]
+                if not matches:
+                    return default
+                if len(matches) > 1:
+                    return None
+                m = matches[0]
+                if "[" not in m or not m.endswith("]"):
+                    return None
+                inner = m.split("[", 1)[1][:-1]
+                try:
+                    vals = [int(v.strip()) for v in inner.split(",")]
+                except ValueError:
+                    return None
+                if len(vals) != 3 or any(v not in (0, 1) for v in vals):
+                    return None
+                return vals
+
+            allowed_prefixes = (("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:") if is_dot2_vop3p
+                                else (("op_sel:", "op_sel_hi:") if not is_c else ()))
+            other = [m for m in mods if m != "clamp" and not (allowed_prefixes and m.startswith(allowed_prefixes))]
+            if other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a):
                 raise Unsupported(op + " modifiers")
+            if is_dot2_vop3p:
+                sel = bits("op_sel", [0, 0, 0])
+                selhi = bits("op_sel_hi", [1, 1, 1])
+                neg_lo = bits("neg_lo", [0, 0, 0])
+                neg_hi = bits("neg_hi", [0, 0, 0])
+                if (sel is None or selhi is None or neg_lo is None or neg_hi is None or
+                        sel[2] != 0 or selhi[2] != 1 or any(neg_lo) or any(neg_hi)):
+                    raise Unsupported(op + " modifiers")
+            elif not is_c:
+                sel = bits("op_sel", [0, 0, 0])
+                selhi = bits("op_sel_hi", [1, 1, 1])
+                if sel != [0, 0, 0] or selhi != [1, 1, 1]:
+                    raise Unsupported(op + " modifiers")
             width = 16 if ("_dot2_" in op or "_dot2c_" in op) else (8 if "_dot4" in op else 4)
             signed = op.endswith(("i16", "i4"))
             clamp = "clamp" in mods
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[0] if is_c else a[3])
+            pairs = (((16 * sel[0], 16 * sel[1]), (16 * selhi[0], 16 * selhi[1])) if is_dot2_vop3p
+                     else tuple((off, off) for off in range(0, 32, width)))
             prods = []
-            for off in range(0, 32, width):
+            for xoff, yoff in pairs:
                 xe, ye, p = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{xe} = {ext} %uint {x} {self.cu(off)} {self.cu(width)}")
-                self.emit(f"{ye} = {ext} %uint {y} {self.cu(off)} {self.cu(width)}")
+                self.emit(f"{xe} = {ext} %uint {x} {self.cu(xoff)} {self.cu(width)}")
+                self.emit(f"{ye} = {ext} %uint {y} {self.cu(yoff)} {self.cu(width)}")
                 self.emit(f"{p} = OpIMul %uint {xe} {ye}")
                 prods.append(p)
             if not clamp:
