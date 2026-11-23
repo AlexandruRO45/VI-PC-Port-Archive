@@ -15,10 +15,14 @@
 ; Measured natively on RDNA2 (gfx1036, Ryzen 9 9950X3D iGPU, driver 26.10.1) through tools/hw_oracle (raw HIP kernel).
 ; On the AMD Windows driver the translated (x * y) & 0xffff of case 0 came out 0x0c229e88: the mask was dropped when the
 ; other half was a constant 0. The translator now computes the low 16 bits as ((x << 16) * y) >> 16.
+; Each lane loads and stores 16 bytes at lane * 16. vk_compute_test gives one group a 64-word (256 B) buffer, so only
+; lanes 0..15 stay active: all 32 would reach 512 B, and lanes 16..31 read and wrote past the buffer through its device
+; address (6 out-of-bounds writes under VK_KHRONOS_VALIDATION_GPUAV_ENABLE=1). The dump checks lanes 0 and 1.
 ; Run: vk_compute_test cs_pk_mul_lo_const.spv 1 dump
 ; out[0..7] = 00009E88 03675433 00230000 00077F6C 00009E88 03675433 00230000 00077F6C (hex)
 s_mov_b32 exec_lo, -1
 v_mov_b32_e32 v20, v0
+v_cmpx_gt_u32_e32 16, v20
 v_lshlrev_b32_e32 v21, 4, v20
 buffer_load_dword v22, v21, s[0:3], 0 offen
 s_waitcnt vmcnt(0)
