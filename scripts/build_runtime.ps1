@@ -83,8 +83,9 @@ $build || exit /b 1
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
     # CMakeLists.txt adds src/crt_timed_wait.cpp to every executable and DLL it builds against the dynamic CRT
     # (#3796: msvcprt.lib's own timed wait holds the mutex for its whole timeout on Wine 9), gta6rt included, and
-    # skips only the /MT targets, which link the whole STL statically. The same source goes on every /MD line here;
-    # the tls host below is /MT and is left out, as CMake leaves it out.
+    # skips only the /MT targets, which link the whole STL statically. The same source goes on every /MD line here.
+    # cl defaults to /MT, so each line below names its CRT: /MD gets the source, /MT (the tls host and
+    # vk_pipeline_check, as in CMakeLists.txt) must not, or the source's _Cnd_timedwait import fails to resolve.
     $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }
     $includes = "/I `"$src\src`" /I `"$src\shims`" /I `"$src\shims\xtaskqueue`" /I `"$xtaskqueueDir\Include`" /I `"$xtaskqueueDir\Source\Task`" /I `"$xtaskqueueDir\Source\Common`""
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
@@ -93,22 +94,22 @@ cd /d "$out" || exit /b 1
 rem BUILD-1457: a game thread with the default stack size gets this program's reserve, and drivers compile on it. The same number as in CMakeLists.txt.
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /Zi $opt /MP$jobs /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE $includes $($files -join ' ') $($xtaskqueueFiles -join ' ') "$src\src\crt_timed_wait.cpp" /Fe:gta6rt.exe /link /OPT:NOREF /STACK:8388608 psapi.lib ole32.lib || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX "$src\src\tls_host.cpp" /LD /Fe:gta6rt_tls_host.dll || exit /b 1
-cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\root_sig_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:root_sig_test.exe /link d3d12.lib || exit /b 1
-cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\device_proxy_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:device_proxy_test.exe /link d3d12.lib dxgi.lib || exit /b 1
-cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\src" "$src\test\descriptor_table_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:descriptor_table_test.exe /link /OPT:NOREF || exit /b 1
-cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\src" "$src\test\command_list_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:command_list_test.exe /link /OPT:NOREF || exit /b 1
+cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\root_sig_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:root_sig_test.exe /link d3d12.lib || exit /b 1
+cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\device_proxy_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:device_proxy_test.exe /link d3d12.lib dxgi.lib || exit /b 1
+cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\src" "$src\test\descriptor_table_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:descriptor_table_test.exe /link /OPT:NOREF || exit /b 1
+cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\src" "$src\test\command_list_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:command_list_test.exe /link /OPT:NOREF || exit /b 1
 rem BUILD-1457: drivers compile on the checker's threads, and 1 MB of stack is too little for AMD's. The same number as in CMakeLists.txt.
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" "$src\test\vk_pipeline_check.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_pipeline_check.exe /link /STACK:8388608 || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_texture_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_texture_test.exe || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_sampler_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_sampler_test.exe || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\gfx10_descriptors_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:gfx10_descriptors_test.exe || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_bindless_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_bindless_test.exe || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_descriptor_bench.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_descriptor_bench.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" "$src\test\vk_pipeline_check.cpp" /Fe:vk_pipeline_check.exe /link /STACK:8388608 || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_texture_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_texture_test.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_sampler_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_sampler_test.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\gfx10_descriptors_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:gfx10_descriptors_test.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_bindless_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_bindless_test.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_descriptor_bench.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_descriptor_bench.exe || exit /b 1
 rem The GPU test harnesses check.py and run_gpu_tests.py require and the fuzzers run (tests\test_build_runtime_fallback.py).
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_harness.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_harness.exe || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_compute_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_compute_test.exe || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_store_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_store_test.exe || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_image_fuzz.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_image_fuzz.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_harness.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_harness.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_compute_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_compute_test.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_store_test.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_store_test.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_image_fuzz.cpp" "$src\src\crt_timed_wait.cpp" /Fe:vk_image_fuzz.exe || exit /b 1
 "@
 }
 

@@ -66,14 +66,24 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         in 0.3 ms), and the loader's task-queue waits stall there."""
         cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn("target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)", cmake)
-        lines = [line for line in self.body.splitlines() if re.search(r"(^|\s)cl ", line)]
+        # ...and the one GPU program CMake keeps on the static CRT ("Keep the checker and its worker threads on the
+        # toolchain's C++ runtime under Wine"), so the fallback must not give it the source either.
+        self.assertRegex(cmake, r"set_property\(TARGET vk_pipeline_check PROPERTY\s+MSVC_RUNTIME_LIBRARY "
+                               r"\"MultiThreaded")
+        lines = [line for line in self.body.splitlines()
+                 if re.match(r"(if defined VULKAN_SDK )?cl ", line)]
         self.assertTrue(lines)
         for line in lines:
             with self.subTest(program=re.search(r"/Fe:(\S+)", line).group(1)):
-                if "/MT" in line.split():
-                    self.assertNotIn("crt_timed_wait.cpp", line, "a /MT target links the STL statically")
-                else:
+                tokens = line.split()
+                dynamic = "/MD" in tokens or "$opt" in tokens  # $opt is /O2 /MD or /Od /MDd
+                # cl defaults to /MT, so a line that names no CRT is the static one whatever it looks like.
+                self.assertTrue(dynamic or "/MT" in tokens,
+                                "each cl line names its CRT: /MD, /MT, or $opt (which is /MD)")
+                if dynamic:
                     self.assertIn("crt_timed_wait.cpp", line, "a /MD target keeps msvcprt.lib's timed wait")
+                else:
+                    self.assertNotIn("crt_timed_wait.cpp", line, "a /MT target links the STL statically")
 
     def test_every_test_source_it_compiles_exists(self):
         sources = re.findall(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', self.body)
