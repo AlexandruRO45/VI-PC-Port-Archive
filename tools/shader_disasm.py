@@ -67,8 +67,19 @@ def probe(mcpu: str) -> None:
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
+LINE_BYTES = 32   # whole words per input line; llvm-mc reads the lines as one byte stream
+
+
+def hex_lines(code: bytes) -> str:
+    """The bytes as llvm-mc input, LINE_BYTES to a line. llvm-mc echoes the whole source line under every
+    'invalid instruction encoding' warning, so one line for the whole program made stderr grow with warnings x
+    program size: a 150 KB program with a data block ran for minutes and wrote hundreds of MB. Lines of whole words
+    keep each warning's word on its echoed line, where tools/shader_profile.py reads it."""
+    return "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + LINE_BYTES]) for i in range(0, len(code), LINE_BYTES))
+
+
 def disasm(code: bytes, mcpu: str):
-    text = " ".join(f"0x{b:02x}" for b in code)
+    text = hex_lines(code)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
                            input=text, capture_output=True, text=True,

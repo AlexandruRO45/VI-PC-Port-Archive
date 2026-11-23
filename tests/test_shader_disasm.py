@@ -188,6 +188,22 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(shader_disasm.code_range(b"FSSM"), (None, None, "scan"))
         self.assertEqual(shader_disasm.code_range(b""), (None, None, "scan"))
 
+    def test_input_lines_hold_whole_words(self):
+        """llvm-mc echoes the whole line under each warning: the program goes in as short lines of whole words."""
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        try:
+            import shader_disasm
+        finally:
+            sys.path.pop(0)
+        code = bytes(range(256)) * 3 + CODE        # 776 bytes
+        text = shader_disasm.hex_lines(code)
+        lines = text.split("\n")
+        self.assertEqual(len(lines), -(-len(code) // shader_disasm.LINE_BYTES))
+        self.assertEqual(shader_disasm.LINE_BYTES % 4, 0)
+        self.assertTrue(all(len(l.split()) == shader_disasm.LINE_BYTES for l in lines[:-1]))
+        self.assertEqual(bytes(int(t, 16) for t in text.split()), code)   # same bytes, same order
+        self.assertEqual(shader_disasm.hex_lines(b""), "")
+
     def test_a_short_blob_does_not_stop_the_others(self):
         self.write("a_good.fssm", fssm())
         self.write("b_short.fssm", b"FSSM" + CODE)   # 12 bytes: no room for the code offset at 0xC0
