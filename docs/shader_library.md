@@ -120,6 +120,8 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   interface.
 * `--save` writes the reassembled library. A saved file is also accepted as input.
 * `--stages` limits the output to some stages.
+* `--program ID` extracts the given zero-based program ID with `--out`. Repeat it to select several IDs.
+  Only selected programs whose stages match `--stages` are written.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest

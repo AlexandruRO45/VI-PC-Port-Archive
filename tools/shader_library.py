@@ -21,7 +21,7 @@ and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
 
 Usage:
     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
-                                [--mcpu gfx1013] [--jobs N]
+                                [--program ID ...] [--mcpu gfx1013] [--jobs N]
     python -I shader_library.py <shaders.rpf> --save library.bin       # the reassembled file, nothing else
 
 DIR/library.json gets the header, both pipeline tables (stage -> program name) and the per-program stage. Programs
