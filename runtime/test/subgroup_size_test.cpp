@@ -174,9 +174,17 @@ int main() {
         // Large dimensions whose 3-way product wraps uint64_t must not bypass maxComputeWorkgroupSubgroups.
         r = decide_subgroup_size(entry("cs", true, {0x1000000u, 0x1000000u, 0x10000u}), amd());
         CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
-        // Zero local_size X (malformed/unknown index entry) must not enable REQUIRE_FULL_SUBGROUPS_BIT.
-        r = decide_subgroup_size(entry("cs", true, {0, 1, 1}), amd());
-        CHECK(r.flags == 0);
+        // Zero local_size in any dimension (malformed/unknown index entry) cannot satisfy -pNext-02756 and must not
+        // chain requiredSubgroupSize or enable REQUIRE_FULL_SUBGROUPS_BIT (even with maxComputeWorkgroupSubgroups == 0).
+        for (const auto bad_local : std::array<std::array<std::uint32_t, 3>, 4>{
+                 {{0, 1, 1}, {64, 0, 1}, {64, 1, 0}, {0, 0, 0}}}) {
+            CHECK(!subgroup_workgroup_fits(bad_local, 1024));
+            CHECK(!subgroup_workgroup_fits(bad_local, 0));
+            r = decide_subgroup_size(entry("cs", true, bad_local), amd());
+            CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+            r = decide_subgroup_size(entry("ms", true, bad_local), amd());
+            CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+        }
         // The limit is for compute and mesh; a pixel shader is not subject to it.
         r = decide_subgroup_size(entry("ps", true), caps);
         CHECK(r.outcome == SubgroupOutcome::required);

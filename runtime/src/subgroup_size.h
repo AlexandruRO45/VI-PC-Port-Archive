@@ -82,9 +82,10 @@ struct SubgroupRequest {
 inline bool subgroup_is_power_of_two(std::uint32_t v) { return v && !(v & (v - 1)); }
 
 // Overflow-safe check of local_size[0] * local_size[1] * local_size[2] <= max_invocations.
+// A zero dimension means the workgroup size is malformed/unknown, so it cannot be proved to fit (-pNext-02756).
 inline bool subgroup_workgroup_fits(const std::array<std::uint32_t, 3>& local_size, std::uint64_t max_invocations) {
+    if (!local_size[0] || !local_size[1] || !local_size[2]) return false;
     const std::uint64_t xy = std::uint64_t(local_size[0]) * local_size[1];
-    if (local_size[2] == 0) return true;
     return xy <= max_invocations / local_size[2];
 }
 
