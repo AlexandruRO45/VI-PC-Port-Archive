@@ -113,5 +113,52 @@ class TestLshlrevReferenceOracle(unittest.TestCase):
                 self.assertEqual(words[1], expected_hi)
 
 
+class Vop3Opcode:
+    """Symbolic AST opcode descriptor for 64-bit VOP3 shift instructions."""
+
+    def __init__(self, mnemonic: str, dst: str, shift: str, src: str) -> None:
+        self.mnemonic = mnemonic
+        self.dst = dst
+        self.shift = shift
+        self.src = src
+
+    def emit_assembly(self) -> str:
+        return f"{self.mnemonic} {self.dst}, {self.shift}, {self.src}"
+
+
+class TestLshlrevASTAndTypes(unittest.TestCase):
+    """Commit 2: symbolic AST opcode definitions and typed expressions for v_lshlrev_b64."""
+
+    def test_ast_emission_and_translation(self):
+        op = Vop3Opcode("v_lshlrev_b64", "v[0:1]", "8", "v[2:3]")
+        self.assertEqual(op.emit_assembly(), "v_lshlrev_b64 v[0:1], 8, v[2:3]")
+        lines = [
+            "v_mov_b32 v2, 0x1234",
+            "v_mov_b32 v3, 0",
+            op.emit_assembly(),
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        spv = support.translate_lines("ps_lshlrev_ast", lines + ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("OpShiftLeftLogical", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x123400)
+        self.assertEqual(words[1], 0)
+
+    def test_ast_sgpr_shift_count(self):
+        op = Vop3Opcode("v_lshlrev_b64", "v[0:1]", "s0", "v[2:3]")
+        lines = [
+            "s_mov_b32 s0, 12",
+            "v_mov_b32 v2, 0xF",
+            "v_mov_b32 v3, 0",
+            op.emit_assembly(),
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_lshlrev_ps(lines, "ps_lshlrev_ast_sgpr")
+        self.assertEqual(words[0], 0xF000)
+        self.assertEqual(words[1], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
