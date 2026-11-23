@@ -825,27 +825,36 @@ def decode_delta2(data, at, nf, stats=None):
         raise DecodeError("type-10 widths need more lane bits than the channel has")
     lw = struct.unpack_from(f"<{8 * c3}I", blob, lane_at // 8)
     lanes = [b"".join(struct.pack("<I", lw[w * 8 + j]) for w in range(c3)) for j in range(8)]
-    raw, lp = [], 0
+    # Lane j holds delta j of every group, k bits each: slice every group once and read it from all 8 lanes.
+    at, size_, shift, masks, lp = [], [], [], [], 0
     for k in widths:
-        for j in range(8):
-            raw.append(_bits(lanes[j], lp, k))
+        at.append(lp >> 3)
+        size_.append((lp & 7) + k + 7 >> 3)
+        shift.append(lp & 7)
+        masks.append((1 << k) - 1)
         lp += k
+    raw = [0] * (8 * ng)
+    for j in range(8):
+        lane = lanes[j]
+        raw[j::8] = [(int.from_bytes(lane[o:o + n], "little") >> sh) & mask
+                     for o, n, sh, mask in zip(at, size_, shift, masks)]
     values = [0.0] * nf
     for ci in range(nc):
         x, v, f0 = starts[ci], 0, ci * 64
         values[f0] = x * quantum + offset
-        for j in range(64):
-            f = f0 + j + 1
-            if f >= nf:
-                break
-            v += zigzag(raw[f0 + j])
+        m = min(64, nf - f0 - 1)            # deltas that land on a frame of this sequence
+        for f in range(f0, f0 + (m if m < 64 else 63)):
+            u = raw[f]
+            v += (u >> 1) if not u & 1 else -((u + 1) >> 1)
             x += v
-            if j == 63:
-                if stats is not None:
-                    stats["delta2_boundaries"] += 1
-                    stats["delta2_boundaries_closed"] += x == starts[ci + 1]
-                break
-            values[f] = x * quantum + offset
+            values[f + 1] = x * quantum + offset
+        if m == 64:                         # the 64th delta lands on the next chunk's start value
+            u = raw[f0 + 63]
+            v += (u >> 1) if not u & 1 else -((u + 1) >> 1)
+            x += v
+            if stats is not None:
+                stats["delta2_boundaries"] += 1
+                stats["delta2_boundaries_closed"] += x == starts[ci + 1]
     return values, size
 
 
@@ -907,21 +916,28 @@ def decode_sequence(s, at, stats=None):
         need = sum(b for _i, b, _q, _o in frame_fields)
         if need > 8 * fl:
             raise DecodeError(f"frame fields need {need} bits, frames have {8 * fl}")
-        columns = {i: [] for i, *_ in frame_fields}
-        for f in range(nf):
-            row = int.from_bytes(data[fo + f * fl:fo + (f + 1) * fl], "little")
+        # Field by field over blocks of 64 frames: the rows are big ints, so only a block of them is alive.
+        cols = {i: [0.0] * nf for i, *_ in frame_fields}
+        for f0 in range(0, nf, 64):
+            f1 = min(nf, f0 + 64)
+            count = f1 - f0
+            rows = ([int.from_bytes(data[o:o + fl], "little") for o in range(fo + f0 * fl, fo + f1 * fl, fl)]
+                    if fl else [0] * count)
+            at = 0
             for i, bits, quantum, offset in frame_fields:
-                x = row & ((1 << bits) - 1)
-                row >>= bits
+                mask = (1 << bits) - 1
                 if quantum == "raw":
-                    columns[i].append(struct.unpack("<f", struct.pack("<I", x))[0])
+                    cols[i][f0:f1] = struct.unpack(f"<{count}f",
+                                                   struct.pack(f"<{count}I", *[(r >> at) & mask for r in rows]))
                 elif quantum == "table":
-                    if x >= len(offset):
+                    idx = [(r >> at) & mask for r in rows]
+                    if max(idx) >= len(offset):
                         raise DecodeError("indirect index past its value table")
-                    columns[i].append(offset[x])
+                    cols[i][f0:f1] = [offset[x] for x in idx]
                 else:
-                    columns[i].append(x * quantum + offset)
-        for i, col in columns.items():
+                    cols[i][f0:f1] = [((r >> at) & mask) * quantum + offset for r in rows]
+                at += bits
+        for i, col in cols.items():
             channels[i][3] = col
     return nf, channels
 
@@ -964,19 +980,38 @@ def assemble_tracks(nf, channels, ntracks, stats=None):
         if normalise and sorted(comps) != [0, 1, 2, 3]:
             raise DecodeError("type-8 channel on a track without four stored components")
         n = 3 if rebuild is not None else (max(comps) + 1 if comps else 0)
-        frames, worst = [], 0.0
-        for f in range(nf):
-            vec = [comps[c][f] if c in comps else 0.0 for c in range(n)]
-            if rebuild is not None:
-                r = 1.0 - sum(a * a for a in vec)
-                worst = max(worst, -r)
-                vec.insert(rebuild, math.sqrt(max(0.0, r)))
-            elif n == 4:
-                worst = max(worst, abs(math.sqrt(sum(a * a for a in vec)) - 1.0))
-            if rebuild is not None or normalise:
-                norm = math.sqrt(sum(a * a for a in vec)) or 1.0
-                vec = [a / norm for a in vec]      # quantisation leaves |q| slightly off 1
-            frames.append(tuple(vec))
+        zeros = [0.0] * nf
+        columns = [comps[c] if c in comps else zeros for c in range(n)]
+        worst, frames = 0.0, []
+        # sum() is kept below (not a + b + c): CPython 3.12 sums floats with compensation.
+        if rebuild is not None:
+            for x, y, z in zip(*columns):
+                r = 1.0 - sum((x * x, y * y, z * z))
+                if -r > worst:
+                    worst = -r
+                w = math.sqrt(r if r > 0.0 else 0.0)
+                if rebuild == 0:
+                    a, b, c, d = w, x, y, z
+                elif rebuild == 1:
+                    a, b, c, d = x, w, y, z
+                elif rebuild == 2:
+                    a, b, c, d = x, y, w, z
+                else:
+                    a, b, c, d = x, y, z, w
+                norm = math.sqrt(sum((a * a, b * b, c * c, d * d))) or 1.0   # quantisation leaves |q| off 1
+                frames.append((a / norm, b / norm, c / norm, d / norm))
+        elif normalise:
+            for a, b, c, d in zip(*columns):
+                norm = math.sqrt(sum((a * a, b * b, c * c, d * d)))
+                worst = max(worst, abs(norm - 1.0))
+                norm = norm or 1.0
+                frames.append((a / norm, b / norm, c / norm, d / norm))
+        else:
+            frames = list(zip(*columns)) if columns else [()] * nf
+            if n == 4 and stats is not None:
+                for a, b, c, d in frames:
+                    worst = max(worst, abs(math.sqrt(sum((a * a, b * b, c * c, d * d))) - 1.0))
+        del columns, zeros                          # not kept alive until the next track
         if stats is not None and (rebuild is not None or n == 4):
             kind = "rebuilt" if rebuild is not None else ("type8_four_stored" if normalise else "four_stored")
             stats[f"quaternion_{kind}"] += 1
@@ -1005,7 +1040,9 @@ def decode_animation(s, anim, stats=None):
                 else:
                     stats["boundary_values"] += 1
                     stats["boundary_values_within_1e-3"] += max(abs(x - y) for x, y in zip(a, b)) < 1e-3
-            have = tracks.setdefault(k, [frames[0]] * total if frames else [])
+            have = tracks.get(k)
+            if have is None:
+                have = tracks[k] = [frames[0]] * total if frames else []
             have.extend(frames[1:] if si else frames)
         total += nf - (1 if si else 0)
         for k, have in tracks.items():
