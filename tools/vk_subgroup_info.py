@@ -35,7 +35,12 @@ false, the shaders are translated with --f16-interp-fallback.
 barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
 advertises fragmentShaderBarycentric but returns a zero BaryCoordKHR.i for translated pixel shaders on Intel Arc B580;
 the pass-through geometry-shader fallback is correct there. The builder therefore selects --bary-fallback for ANV
-until the driver issue is fixed.
+until the driver issue is fixed. It is also true for gfx90c iGPUs (Renoir, Lucienne, Cezanne, Barcelo; GCN 5) under
+AMD's proprietary Windows driver: #5933 found that driver 31.0.21921.13001 on a Vega 8 (PCI 1002:15E7) advertises
+fragmentShaderBarycentric but returns a wrong third BaryCoordKHR component (about 0.99 where a small value is
+expected) in ps_bary, ps_persp_bary and ps_ij_computed, while the fallback passes and RADV on RDNA 3.5 passes natively.
+The check keys on the PCI device ID and the driver ID, not on the driver version, so a fixed driver would still take
+the fallback (correct, one geometry-shader stage slower); LEONIDA_BARY_FALLBACK=0 turns it off.
 
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
@@ -71,6 +76,10 @@ RDNA1_DEVICE_IDS = (0x7310, 0x7312, 0x7318, 0x7319, 0x731A, 0x731B, 0x731E, 0x73
 # crash reports from 0x13C0, 0x164E, 0x73BF (RX 6800) and 0x73DF (RX 6700).
 RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x1435, 0x1435), (0x1681, 0x1681),
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
+# gfx90c (GCN 5) iGPUs: the CHIP_RENOIR entries of Linux amdgpu's chipset table (amdgpu_drv.c), i.e. Renoir, Lucienne,
+# Cezanne and Barcelo. #5933's wrong BaryCoordKHR was measured on 0x15E7 (Vega 8 of a Ryzen 7 5825U). Other GCN 5
+# parts (Raven/Picasso gfx902, Vega 10/12/20 cards) are a different GPU and are not tested, so they are not listed.
+GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
@@ -168,9 +177,18 @@ def rdna2_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
             and any(lo <= device_id <= hi for lo, hi in RDNA2_DEVICE_IDS))
 
 
-def barycentric_fallback(driver_id: int) -> bool:
-    """ANV exposes native barycentrics but currently miscomputes BaryCoordKHR.i on Intel Arc (#SHADER-925)."""
-    return driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
+def gfx90c_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
+    """A gfx90c (GCN 5) iGPU under AMD's proprietary (Windows) driver, whose native BaryCoordKHR is wrong (#5933)."""
+    return (vendor_id == AMD_VENDOR_ID and driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
+            and device_id in GFX90C_DEVICE_IDS)
+
+
+def barycentric_fallback(vendor_id: int, device_id: int, driver_id: int) -> bool:
+    """Drivers that expose native barycentrics but return wrong BaryCoordKHR values for translated pixel shaders:
+    Mesa ANV (BaryCoordKHR.i zero on Intel Arc, SHADER-925) and AMD's Windows driver on gfx90c (wrong third
+    component, #5933)."""
+    return (driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
+            or gfx90c_amd_windows(vendor_id, device_id, driver_id))
 
 
 def physical_devices(vk, instance):
@@ -335,7 +353,7 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
-            "barycentric_fallback": barycentric_fallback(driver),
+            "barycentric_fallback": barycentric_fallback(vendor, device, driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,

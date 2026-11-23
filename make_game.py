@@ -1490,7 +1490,8 @@ def runtime_gpu_per_vertex():
 
 
 def runtime_gpu_barycentric_fallback():
-    """Whether the selected Vulkan GPU needs the known ANV BaryCoordKHR workaround, or None when it can't be told."""
+    """Whether the selected Vulkan GPU's driver has a known BaryCoordKHR bug (Mesa ANV, AMD Windows on gfx90c), or None
+    when it can't be told."""
     try:
         v = runtime_gpu_info().get("barycentric_fallback")
         return v if isinstance(v, bool) else None
@@ -2585,7 +2586,8 @@ def main() -> int:
             else:
                 bary_fallback = runtime_gpu_barycentric_fallback()
                 if bary_fallback is True:
-                    log("shaders: Intel Mesa ANV has a known BaryCoordKHR.i issue: translating with --bary-fallback")
+                    log("shaders: this GPU's driver has a known BaryCoordKHR bug (Mesa ANV, or AMD's Windows driver "
+                        "on gfx90c): translating with --bary-fallback")
                     a.bary_fallback = True
                 elif bary_fallback is None:
                     a.bary_fallback = keep_recorded_fallback("--bary-fallback", work)

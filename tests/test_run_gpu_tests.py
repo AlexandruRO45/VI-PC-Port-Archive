@@ -40,6 +40,22 @@ class BarycentricFallbackSelection(unittest.TestCase):
             with patch.object(rgt.subprocess, "run", return_value=proc):
                 self.assertTrue(rgt.bary_fallback())
 
+    def test_env_override_beats_the_probe(self):
+        """#5933: =0 brings back native barycentrics on a device the probe flags (gfx90c on AMD's Windows driver),
+        and =1 does not need the probe at all."""
+        proc = SimpleNamespace(stdout='{"barycentric_fallback": true, "vendor_id": 4098, "device_id": 5607, '
+                                      '"driver_id": 1}\n')
+        with patch.object(rgt.subprocess, "run", return_value=proc) as run:
+            with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "0"}, clear=False):
+                self.assertIs(rgt.bary_fallback(), False)
+            with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "1"}, clear=False):
+                self.assertIs(rgt.bary_fallback(), True)
+            run.assert_not_called()
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("LEONIDA_BARY_FALLBACK", None)
+                self.assertIs(rgt.bary_fallback(), True)
+            run.assert_called_once()
+
     def test_probe_failure_is_not_a_fallback(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LEONIDA_BARY_FALLBACK", None)

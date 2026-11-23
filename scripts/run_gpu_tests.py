@@ -287,7 +287,8 @@ def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
 
 def bary_fallback() -> bool:
     """LEONIDA_BARY_FALLBACK=1 (or 0): translate raw barycentrics to an ordinary vec3 input and draw it through
-    tools/bary_fallback_gs.py. Unset, SHADER-925 enables it automatically on Mesa ANV."""
+    tools/bary_fallback_gs.py. Unset, it is on where tools/vk_subgroup_info.py reports a driver with a known
+    BaryCoordKHR bug: Mesa ANV (SHADER-925) and AMD's Windows driver on gfx90c iGPUs (#5933)."""
     v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):
         return True
@@ -327,7 +328,8 @@ def _device_per_vertex():
 
 
 def _device_barycentric_fallback():
-    """Mesa ANV's known BaryCoordKHR.i failure from tools/vk_subgroup_info.py (SHADER-925), cached per suite."""
+    """barycentric_fallback from tools/vk_subgroup_info.py (Mesa ANV, SHADER-925; AMD Windows on gfx90c, #5933),
+    cached per suite."""
     if not _BARYCENTRIC_FALLBACK:
         answer = None
         try:
