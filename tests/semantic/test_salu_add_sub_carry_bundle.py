@@ -122,6 +122,27 @@ class TestSAddI32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x80000000)
 
+def ref_s_sub_i32(src0: int, src1: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_sub_i32 -> (res, scc_overflow)."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    res = (s0 - s1) & MASK32
+    # Signed overflow V: ((src0 ^ src1) & (src0 ^ res)) >> 31
+    ovf = (((s0 ^ s1) & (s0 ^ res)) >> 31) & 1
+    return res, ovf
+
+
+class TestSSubI32Oracle(unittest.TestCase):
+    def test_basic_subtraction(self) -> None:
+        self.assertEqual(ref_s_sub_i32(50, 20), (30, 0))
+        self.assertEqual(ref_s_sub_i32(10, 10), (0, 0))
+
+    def test_signed_overflow(self) -> None:
+        # 0x80000000 - 1 -> 0x7FFFFFFF (negative - positive = positive -> overflow)
+        self.assertEqual(ref_s_sub_i32(0x80000000, 1), (0x7FFFFFFF, 1))
+        # 0x7FFFFFFF - (-1) -> 0x80000000 (overflow)
+        self.assertEqual(ref_s_sub_i32(0x7FFFFFFF, 0xFFFFFFFF), (0x80000000, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
