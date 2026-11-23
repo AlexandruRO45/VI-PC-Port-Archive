@@ -289,5 +289,43 @@ class TestVBfeU32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(wave.lanes[lane][0], 0xFFFFFFFF)
 
 
+class TestVBfeU32RegisterAliasing(unittest.TestCase):
+    """Register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = 0x12345678
+        mach.vgprs[1] = 8
+        mach.vgprs[2] = 8
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 2)))
+        self.assertEqual(mach.vgprs[0], 0x56)
+        self.assertEqual(mach.vgprs[1], 8)
+        self.assertEqual(mach.vgprs[2], 8)
+
+    def test_dst_aliases_src1_offset(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = 0xAABBCCDD
+        mach.vgprs[1] = 16
+        mach.vgprs[2] = 8
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 2)))
+        self.assertEqual(mach.vgprs[1], 0xBB)
+        self.assertEqual(mach.vgprs[0], 0xAABBCCDD)
+        self.assertEqual(mach.vgprs[2], 8)
+
+    def test_dst_aliases_src2_width(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = 0xAABBCCDD
+        mach.vgprs[1] = 0
+        mach.vgprs[2] = 8
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 2), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 2)))
+        self.assertEqual(mach.vgprs[2], 0xDD)
+
+    def test_all_operands_aliased(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = 0x3F
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0)))
+        self.assertEqual(mach.vgprs[0], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
