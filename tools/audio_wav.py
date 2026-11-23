@@ -324,12 +324,9 @@ def plan_outputs(items, src, out, ffmpeg):
             directory = os.path.dirname(directory)
         try:
             os.lstat(os.path.join(directory, leaf))
-        except FileNotFoundError:
-            pass
         except OSError as exc:
-            if exc.errno == errno.ENAMETOOLONG:
-                return True
-            raise
+            # Other failures belong to this file's decode, not the whole batch.
+            return exc.errno == errno.ENAMETOOLONG
         return False
 
     folded_parent = cache(lambda directory: fold_name(parent(directory)))

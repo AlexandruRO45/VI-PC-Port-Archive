@@ -665,6 +665,26 @@ class FakeFfmpegDecodeTest(unittest.TestCase):
                 self.assertEqual(len(files), 2)
                 self.assertEqual({p.read_bytes() for p in files}, {b"FAKE:" + name.encode() for name in names})
 
+    @unittest.skipIf(os.name == "nt", "uses POSIX directory permissions")
+    def test_inaccessible_long_name_does_not_block_other_decodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp, "in"), Path(tmp, "out")
+            write_fake_opus_inputs(src, ["independent.ogg"])
+            write_fake_opus_inputs(src / "blocked", ["é" * 124 + ext for ext in (".ogg", ".opus")])
+            blocked = out / "blocked"
+            blocked.mkdir(parents=True)
+            blocked.chmod(0)
+            try:
+                if os.access(blocked, os.X_OK):
+                    self.skipTest("requires an inaccessible output directory")
+                result = subprocess.run([sys.executable, "-I", TOOL, str(src), "--out", str(out),
+                                         "--ffmpeg", write_fake_ffmpeg(tmp)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("1 WAV written, 0 already present, 2 failed", result.stdout)
+                self.assertEqual((out / "independent.wav").read_bytes(), b"FAKE:independent.ogg")
+            finally:
+                blocked.chmod(0o700)
+
     def test_directory_at_wav_destination_counts_as_failed_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in")
