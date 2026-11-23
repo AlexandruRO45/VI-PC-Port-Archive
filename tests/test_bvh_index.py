@@ -334,6 +334,41 @@ class ScanTest(unittest.TestCase):
         self.assertEqual({r["kind"] for r in rows}, {"bvh4", "instance208", "raw"})
         self.assertEqual(summary[0]["streams"], 3)
 
+    def test_directory_with_an_unreadable_payload_keeps_the_others_but_exits_nonzero(self):
+        # The *.rpf branch reports one unreadable archive and carries on; the *.bin branch let the OSError
+        # out of scan_dir, so one unreadable payload was a traceback instead of the same skipped line.
+        folder = os.path.join(self.dir, "carve")
+        os.makedirs(folder)
+        for name, payload in (("good.bin", bvh_payload(3)), ("locked.bin", bvh_payload(2))):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(payload)
+        locked = os.path.join(folder, "locked.bin")
+        real_open = open
+
+        def guarded_open(path, *args, **kwargs):
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(locked):
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+            return real_open(path, *args, **kwargs)
+
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with mock.patch("builtins.open", guarded_open), contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = bvh_index.main([folder, "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("locked.bin: skipped", err.getvalue())
+        self.assertIn("incomplete", err.getvalue())
+        with open(out) as f:
+            self.assertEqual(json.load(f)["summary"]["streams"], 1)   # the readable payload is still reported
+
+        # The same command when every payload is readable: both are reported, and the report is replaced.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = bvh_index.main([folder, "--out", out])
+        self.assertEqual(code, 0, err.getvalue())
+        with open(out) as f:
+            self.assertEqual(json.load(f)["summary"]["streams"], 2)
+
     def test_carved_bvh_fill_requires_all_declared_node_bytes(self) -> None:
         n = 1200
         complete = bvh_payload(n)

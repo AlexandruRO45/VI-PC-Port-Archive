@@ -353,22 +353,28 @@ def scan_dir(path, max_inflate=1 << 28, skipped=None):
             summaries.extend(s)
         return rows, summaries
     for p in bins:
-        size = os.path.getsize(p)
-        with open(p, "rb") as f:
-            head = f.read(HEAD)
-            if size > HEAD:
-                f.seek(-HEAD, os.SEEK_END)
-                tail = f.read(HEAD)
-            else:
-                tail = head
-        row = classify(head, size, tail)
-        row.update(source=p, offset=0, stored=size, size=size)
-        # A chunk exposes the header but has only a prefix of the declared node buffer.
-        if row["kind"] == "bvh4":
+        try:
+            size = os.path.getsize(p)
             with open(p, "rb") as f:
-                body = f.read(HEAD + row["node_count"] * 64)[HEAD:]
-            row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES}
-            row["fill"]["total"] = len(body)
+                head = f.read(HEAD)
+                if size > HEAD:
+                    f.seek(-HEAD, os.SEEK_END)
+                    tail = f.read(HEAD)
+                else:
+                    tail = head
+            row = classify(head, size, tail)
+            row.update(source=p, offset=0, stored=size, size=size)
+            # A chunk exposes the header but has only a prefix of the declared node buffer.
+            if row["kind"] == "bvh4":
+                with open(p, "rb") as f:
+                    body = f.read(HEAD + row["node_count"] * 64)[HEAD:]
+                row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES}
+                row["fill"]["total"] = len(body)
+        except (OSError, ValueError) as e:   # one unreadable payload should not lose the others
+            print(f"{p}: skipped ({e})", file=sys.stderr)
+            if skipped is not None:
+                skipped.append(p)     # the caller still reports the run as incomplete
+            continue
         rows.append(row)
     summary = summarize(rows, path, 0, 0, 0, 0.0)
     summary["span"] = None
