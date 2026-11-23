@@ -169,6 +169,8 @@ def _fd_string(data, at):
     if n is None or not 1 <= n <= 300:
         return None
     raw = data[at + 6:at + 6 + n]
+    if len(raw) != n:   # cut off by the end of the data: not a whole string
+        return None
     if raw.endswith(b"\x00"):
         raw = raw[:-1]
     if not raw or not all(32 <= c < 127 for c in raw):
