@@ -305,7 +305,7 @@ def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
             try:
                 with open(path, "rb") as f:
                     data = f.read(size + 1)  # detect trailing bytes without reading an unbounded file
-            except FileNotFoundError:
+            except OSError:   # a directory or an unreadable file is no usable readback either
                 return "invalid readback", f"{tag}: missing output"
             if len(data) != size:
                 return "invalid readback", f"{tag}: wrong output size"
@@ -375,7 +375,7 @@ def exact_pair(i, left, right):
         try:
             with open(os.path.join(rec["dir"], f"{i}.raw"), "rb") as f:
                 data = f.read(size + 1)
-        except FileNotFoundError:
+        except OSError:
             return "missing", []
         if len(data) != size:
             return "incompatible", []
@@ -416,7 +416,7 @@ def depth_measurements(i, left, right):
         try:
             with open(os.path.join(rec["dir"], f"{i}.raw.depth"), "rb") as f:
                 data = f.read(pixels * 4 + 1)
-        except FileNotFoundError:
+        except OSError:
             return {"depth_class": "missing"}
         if len(data) != pixels * 4:
             return {"depth_class": "incompatible"}
@@ -435,7 +435,7 @@ def depth_measurements(i, left, right):
                 with open(raw, "rb") as first, open(raw + ".zero", "rb") as second:
                     color = first.read(color_size + 1)
                     same_color = len(color) == color_size and color == second.read(color_size + 1)
-            except FileNotFoundError:
+            except OSError:
                 return {"depth_class": "missing"}
             if len(zero) != len(data) or not same_color or rec.get("zero_samples_passed") != passed:
                 return {"depth_class": "incompatible"}
