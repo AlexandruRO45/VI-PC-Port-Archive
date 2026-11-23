@@ -331,5 +331,30 @@ class TestSNotB64ConditionCodes(unittest.TestCase):
         self.assertEqual(flags.scc, 1)
 
 
+class TestSNotB64IEEE754(unittest.TestCase):
+    """IEEE 754 raw bit pattern preservation and subnormal/NaN behavior."""
+
+    def test_ieee754_double_patterns(self):
+        patterns = [
+            0x0000000000000000,  # +0.0
+            0x8000000000000000,  # -0.0
+            0x0000000000000001,  # smallest subnormal
+            0x7FF0000000000000,  # +inf
+            0xFFF0000000000000,  # -inf
+            0x7FF8000000000000,  # quiet NaN
+            0x7FF0000000000001,  # signaling NaN
+        ]
+        for p in patterns:
+            with self.subTest(p=hex(p)):
+                res = ref_not_b64(p)
+                self.assertEqual(res, (~p) & MASK64)
+
+    def test_ieee754_hw_translator_inversion(self):
+        # Invert +inf pattern -> negative word
+        inf64 = 0x7FF0000000000000
+        hw_res = run_hw_not_b64(inf64)
+        self.assertEqual(hw_res, ref_not_b64(inf64))
+
+
 if __name__ == "__main__":
     unittest.main()
