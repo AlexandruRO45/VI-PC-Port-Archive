@@ -226,6 +226,38 @@ int main() {
     EXPECT(compute.execute(clear_lists) == ReplayResult::unsupported);
     std::printf("copy and compute queues refuse a render-target clear\n");
 
+    // 5. A direct queue runs two lists, then one: the second execution runs only the list it is given. The queue
+    // keeps the entries of a larger execution for the next ones, and must not replay them.
+    for (std::uint32_t i = 0; i < kSize; ++i) up[i] = pattern(i, 41);
+    CommandList fill_mid, read_mid;
+    EXPECT(fill_mid.copy_buffer({mid_id, 0, upload_id, 0, kSize}));
+    EXPECT(fill_mid.close());
+    EXPECT(read_mid.copy_buffer({readback_id, 0, mid_id, 0, kSize}));
+    EXPECT(read_mid.close());
+    const CommandList* both[] = {&fill_mid, &read_mid};
+    EXPECT(direct.execute(both) == ReplayResult::success);
+    EXPECT(direct.signal(fence.semaphore(), 5));
+    EXPECT(fence.wait(5, 5'000'000'000ull));
+    bad = 0;
+    for (std::uint32_t i = 0; i < kSize; ++i) bad += rb[i] != pattern(i, 41);
+    EXPECT(bad == 0);
+    std::memset(rb, 0, kSize);
+    for (std::uint32_t i = 0; i < kSize; ++i) up[i] = pattern(i, 42);
+    const CommandList* first_only[] = {&fill_mid};
+    EXPECT(direct.execute(first_only) == ReplayResult::success);
+    EXPECT(direct.signal(fence.semaphore(), 6));
+    EXPECT(fence.wait(6, 5'000'000'000ull));
+    const auto* md = static_cast<const std::uint8_t*>(mid_map);
+    std::uint32_t written = 0;
+    bad = 0;
+    for (std::uint32_t i = 0; i < kSize; ++i) {
+        written += rb[i] != 0;
+        bad += md[i] != pattern(i, 42);
+    }
+    std::printf("two lists, then one: %u bad bytes from the one list, %u bytes written by the list left out\n", bad,
+                written);
+    EXPECT(bad == 0 && written == 0);
+
     EXPECT(direct.idle() && compute.idle() && copy.idle());
     if (d.validation) {
         std::printf("validation errors: %u\n", d.validation_errors());

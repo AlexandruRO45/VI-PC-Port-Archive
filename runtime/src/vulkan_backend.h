@@ -1711,8 +1711,10 @@ private:
         if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
-        auto& prepared = prepared_;
-        prepared.resize(lists.size());
+        // Never shrunk: a queue that alternates a one-list call with a many-list call (a title's pre pass, then its
+        // main pass) would otherwise free the main pass's lists every time and copy every entry in again.
+        if (prepared_.size() < lists.size()) prepared_.resize(lists.size());
+        const std::span<PreparedList> prepared(prepared_.data(), lists.size());
         ReplayFunctions replay = context_.replay_;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
