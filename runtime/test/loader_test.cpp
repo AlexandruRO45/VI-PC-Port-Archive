@@ -654,10 +654,11 @@ void test_initialise_rejects() {
     }
 }
 
-// An image with no relocation directory whose preferred base is taken. Windows' loader (LdrRelocateImage) refuses to
-// move an image only when IMAGE_FILE_RELOCS_STRIPPED is set; with the flag clear it maps it elsewhere and fixes up
-// nothing, as it does for a second copy of such a DLL. The DllMain stub stores through an absolute address in this
-// process, not in the image, so it runs correctly wherever the image lands.
+// IMAGE_FILE_RELOCS_STRIPPED against a relocation directory, when the preferred base is taken. Measured on the
+// Windows 11 (26200) loader with synthetic DLLs (#8847): with no relocation directory the flag refuses the move and
+// an image with the flag clear is moved with nothing fixed up; with a relocation table the image is moved and fixed
+// up whatever the flag says. The DllMain stub stores through an absolute address in this process, not in the image,
+// so it runs correctly wherever the image lands.
 void test_moved_without_relocations() {
     auto img = make_image();
     auto* nt = nt_of(img);
@@ -704,13 +705,16 @@ void test_moved_without_relocations() {
     }
     if (held) VirtualFree(held, 0, MEM_RELEASE);
     {
-        // The flag only forbids moving: at a free base such an image maps as usual.
+        // At a free base such an image maps, as it did before. Not Windows parity: the Windows 11 loader refused these
+        // DLLs (error 487) at a free base too, for a reason not yet known (#8847); runtime/README.md keeps the question.
         auto stripped = img;
         nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
-        expect_loads("an image with IMAGE_FILE_RELOCS_STRIPPED maps at its free base", stripped);
+        expect_loads("an image with IMAGE_FILE_RELOCS_STRIPPED and no relocations maps at its free base", stripped);
     }
     {
-        // Windows refuses on the flag, whatever the relocation directory holds. ImageBase 0 makes the loader move it.
+        // With a relocation table the flag does not stop the move: the table is applied, as Windows does it.
+        // ImageBase 0 makes the loader move it; the one DIR64 entry points at the qword at RVA 0x1100.
+        const char* what = "an image with IMAGE_FILE_RELOCS_STRIPPED and a relocation table is moved and fixed up";
         auto stripped = make_image();
         auto* snt = nt_of(stripped);
         snt->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
@@ -719,8 +723,21 @@ void test_moved_without_relocations() {
         auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(stripped.data() + 0x200);
         block->VirtualAddress = 0x1000;
         block->SizeOfBlock = 0x0A;
-        reinterpret_cast<uint16_t*>(block + 1)[0] = IMAGE_REL_BASED_DIR64 << 12;
-        expect_rejects("an image with IMAGE_FILE_RELOCS_STRIPPED and a relocation table is not moved", stripped);
+        reinterpret_cast<uint16_t*>(block + 1)[0] = (IMAGE_REL_BASED_DIR64 << 12) | 0x100;
+        uint64_t original;
+        std::memcpy(&original, stripped.data() + 0x300, sizeof original);
+        auto p = write_image(stripped);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            uint64_t moved;
+            std::memcpy(&moved, m.base + 0x1100, sizeof moved);
+            if (!m.relocated) failed(what, "it was not moved");
+            else if (moved != original + reinterpret_cast<uint64_t>(m.base)) failed(what, "the pointer wasn't fixed up");
+            else pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
     }
 }
 

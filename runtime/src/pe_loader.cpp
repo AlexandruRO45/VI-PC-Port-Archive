@@ -1325,14 +1325,14 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     }
 
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
-    // Windows' loader (LdrRelocateImage) refuses to move an image only when IMAGE_FILE_RELOCS_STRIPPED is set; with the
-    // flag clear and no relocation directory it moves it and fixes up nothing, so the image is trusted to hold no
-    // absolute addresses. That move is logged so it shows in traces. base_reservation::needed still keeps the main
-    // image's range free when it has no relocation directory, so a main image is moved this way only where the
-    // range could not be had.
+    // A moved image with a relocation table is fixed up, whatever IMAGE_FILE_RELOCS_STRIPPED says. Without a table,
+    // the flag refuses the move; with the flag clear the image is moved and nothing is fixed up, so it is trusted to
+    // hold no absolute addresses. The Windows 11 loader does all three (measured in #8847); that move is logged so
+    // it shows in traces. base_reservation::needed still keeps the main image's range free when it has no
+    // relocation directory, so a main image is moved this way only where the range could not be had.
     const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
     if (delta) m->relocated = true;
-    if (delta && (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED))
+    if (delta && !dir.Size && (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED))
         throw std::runtime_error(m->name + ": preferred base is taken and the image's relocations are stripped");
     if (delta && !dir.Size)
         std::fprintf(stderr, "[rt] loader: %s: preferred base %#llx is taken, moved to %p with no relocations\n",

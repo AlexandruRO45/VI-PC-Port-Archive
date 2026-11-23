@@ -99,8 +99,13 @@ through it.
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
-that base is taken. As on Windows, only `IMAGE_FILE_RELOCS_STRIPPED` refuses the move; an image with the flag
-clear and no relocation directory is moved with nothing fixed up, and the loader logs that. It copies headers and
+that base is taken. An image with a relocation table is moved and fixed up whatever `IMAGE_FILE_RELOCS_STRIPPED`
+says; without one, the flag refuses the move, and an image with the flag clear is moved with nothing fixed up (the
+loader logs that). The Windows 11 loader does the same in these three cases, as measured by Zombins2 with
+synthetic DLLs ([#8847](https://github.com/ItsNotRexed/Leonida/pull/8847#issuecomment-7112587898)). Open
+question from the same measurement: Windows also refused flag-set DLLs without a relocation directory at a free
+preferred base (error 487, linker-built `/FIXED` DLLs included), and why is not known; the loader still maps those
+at their base, as before. It copies headers and
 sections, applies `IMAGE_REL_BASED_DIR64` relocations, binds
 imports by name or ordinal, parses the export table, sets section protections, and registers the
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
