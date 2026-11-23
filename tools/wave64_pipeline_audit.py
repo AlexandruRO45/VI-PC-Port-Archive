@@ -157,7 +157,7 @@ def _reject_constant(constant):
 
 def load_json(path):
     try:
-        with path.open(encoding="utf-8") as source:
+        with path.open(encoding="utf-8-sig") as source:
             return json.load(source, parse_constant=_reject_constant)
     except (OSError, ValueError, RecursionError) as exc:
         raise ValueError(f"cannot read JSON input {path}: {exc}") from exc
