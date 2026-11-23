@@ -312,6 +312,91 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.lgkm_cnt, 2)
 
 
+class WaveSize(Enum):
+    WAVE32 = 32
+    WAVE64 = 64
+
+
+class SIMDWaveState:
+    def __init__(self, size: WaveSize = WaveSize.WAVE32):
+        self.size = size
+        self.num_lanes = size.value
+        self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        self.sgprs = [0] * 106
+        self.exec_mask = (1 << self.num_lanes) - 1
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+
+class SIMDDSBPermuteInterpreter:
+    @staticmethod
+    def step(insn: DSBPermuteB32Instruction, wave: SIMDWaveState):
+        # Extract vdata vector across all lanes before writeback
+        vdata_table = [wave.vgprs[lane][insn.vdata.index] for lane in range(wave.num_lanes)]
+
+        for lane in range(wave.num_lanes):
+            if not wave.is_lane_active(lane):
+                continue
+            vaddr = wave.vgprs[lane][insn.vaddr.index]
+            res = ref_ds_bpermute_b32(
+                lane_id=lane,
+                vaddr=vaddr,
+                vdata_table=vdata_table,
+                exec_mask=wave.exec_mask,
+                offset=insn.offset,
+                wave_size=wave.num_lanes,
+            )
+            wave.vgprs[lane][insn.dst.index] = res
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    def test_wave32_divergence_and_exec_masking(self):
+        wave = SIMDWaveState(WaveSize.WAVE32)
+        # EXEC mask: even lanes active (0x55555555)
+        wave.exec_mask = 0x55555555
+
+        sentinel = 0xDEADBEEF
+        for lane in range(32):
+            wave.vgprs[lane][3] = sentinel
+            wave.vgprs[lane][1] = 0        # vaddr = 0 (reads lane 0)
+            wave.vgprs[lane][2] = 100 + lane  # lane 0 has 100
+
+        insn = DSBPermuteB32Instruction(
+            dst=Operand.vgpr(3),
+            vaddr=Operand.vgpr(1),
+            vdata=Operand.vgpr(2),
+        )
+        SIMDDSBPermuteInterpreter.step(insn, wave)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][3], 100)
+            else:
+                self.assertEqual(wave.vgprs[lane][3], sentinel)
+
+    def test_wave64_half_wave_isolation(self):
+        wave = SIMDWaveState(WaveSize.WAVE64)
+        for lane in range(64):
+            wave.vgprs[lane][1] = 2 * 4       # vaddr = lane 2 within half-wave
+            wave.vgprs[lane][2] = lane + 1000 # lane 2 has 1002, lane 34 has 1034
+
+        insn = DSBPermuteB32Instruction(
+            dst=Operand.vgpr(3),
+            vaddr=Operand.vgpr(1),
+            vdata=Operand.vgpr(2),
+        )
+        SIMDDSBPermuteInterpreter.step(insn, wave)
+
+        # Lanes 0..31 read from lane 2 (1002)
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][3], 1002)
+        # Lanes 32..63 read from lane 32 | 2 = 34 (1034)
+        for lane in range(32, 64):
+            self.assertEqual(wave.vgprs[lane][3], 1034)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
