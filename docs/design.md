@@ -204,7 +204,7 @@ corpus writes; other MODE writes are refused (see Known approximations).
 
 ### GPU tests (RTX 4060 Ti)
 
-`runtime\test\vk_harness.cpp` (build: `runtime\build\test\build_harness.cmd`, MSVC + the Vulkan 1.4 headers from
+`runtime/test/vk_harness.cpp` (build: `scripts/build_runtime.ps1` or CMake target `vk_harness`, MSVC + the Vulkan 1.4 headers from
 Hookshot's CPM cache, loading `vulkan-1.dll` at runtime) draws one triangle with a given VS + FS into an RGBA32F
 target and dumps the floats. Test shaders are in `<work>\gputest`.
 
@@ -214,7 +214,7 @@ target and dumps the floats. Test shaders are in `<work>\gputest`.
 - **400 arithmetic-only translated pixel shaders** (no buffers, descriptors or subgroup ops), driven by a generic
   full-screen VS feeding locations 0–15: the driver compiled every pipeline, every draw completed, and every output
   was finite. This is a stability check, not a value check (there's no reference for these).
-- **Texture path is exact** (`runtime\test\vk_texture_test.cpp`): translated `PS_PassthroughCopy` gives max error
+- **Texture path is exact** (`runtime/test/vk_texture_test.cpp`): translated `PS_PassthroughCopy` gives max error
   **0.0** over all 64×64 pixels against the expected nearest-sampled 8×8 test texture. That covers push-constant
   user data, a heap-relative `s_load_dwordx8` of the T#, the hash-table lookup of the T# and of the shader's
   literal S#, bindless sampling, `v_interp`, and the f16 compressed export. **It also caught a translator bug**
