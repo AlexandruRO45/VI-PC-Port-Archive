@@ -13,6 +13,7 @@ T handle(std::uintptr_t n) { return reinterpret_cast<T>(n); }
 struct Trace {
     unsigned barriers = 0, begins = 0, ends = 0, copies = 0, transfer_resolves = 0;
     VkRect2D render_area{};
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkRenderingAttachmentInfo stencil{};
     bool has_depth = false;
     VkImage copy_src = VK_NULL_HANDLE, copy_dst = VK_NULL_HANDLE;
@@ -29,6 +30,11 @@ VKAPI_ATTR void VKAPI_CALL begin(VkCommandBuffer, const VkRenderingInfo* info) {
     if (info->pStencilAttachment) trace.stencil = *info->pStencilAttachment;
 }
 VKAPI_ATTR void VKAPI_CALL end(VkCommandBuffer) { ++trace.ends; }
+VKAPI_ATTR void VKAPI_CALL begin_pass(VkCommandBuffer, const VkRenderPassBeginInfo* info, VkSubpassContents) {
+    ++trace.begins;
+    trace.render_area = info->renderArea;
+    trace.framebuffer = info->framebuffer;
+}
 VKAPI_ATTR void VKAPI_CALL copy(VkCommandBuffer, VkImage source, VkImageLayout, VkImage dest, VkImageLayout,
                                 std::uint32_t count, const VkImageCopy* regions) {
     trace.copies += count;
@@ -88,10 +94,11 @@ int main() {
                range.baseArrayLayer == (from_source ? 1u : 2u), "render view selects the source or destination slice");
         return from_source ? source_view : dest_view;
     };
-    const auto run = [&](const ResolveRegion& region) {
+    const auto run = [&](const ResolveRegion& region, bool depth_only = false) {
         trace = {};
         CommandList list;
-        expect(list.resolve_subresource({2, 11, 1, 3, region}) && list.close(), "record a closed resolve list");
+        expect(list.resolve_subresource({2, depth_only ? 5u : 11u, 1, depth_only ? 1u : 3u, region}) &&
+               list.close(), "record a closed resolve list");
         return replay(list, VK_NULL_HANDLE, resolve, vk);
     };
 
@@ -139,7 +146,47 @@ int main() {
            trace.begins == 1 && trace.ends == 1 && trace.stencil.resolveImageView == dest_view && !trace.copies,
            "an unshifted resolve keeps the direct path");
 
+    // On drivers that resolve layer zero in dynamic rendering, shifted depth-only array resolves
+    // still need the render pass with a framebuffer that binds the scratch image, not the final target.
+    source.format = dest.format = VK_FORMAT_D32_SFLOAT;
+    source.aspects = dest.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vk.image_view = [&](const ResourceBinding& binding, const VkImageSubresourceRange& range) {
+        expect(binding.image == source.image && range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT &&
+               range.baseArrayLayer == 1, "the source view selects depth from array layer one");
+        return source_view;
+    };
+    vk.depth_resolve_scratch = [&](VkFormat format, VkImageAspectFlags aspect, VkExtent2D extent,
+                                   VkImage& image, VkImageView& view) {
+        expect(format == VK_FORMAT_D32_SFLOAT && aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
+               extent.width == 8 && extent.height == 6, "depth scratch has the source extent and plane");
+        image = scratch;
+        view = scratch_view;
+        return true;
+    };
+    vk.begin_render_pass = begin_pass;
+    vk.end_render_pass = end;
+    const auto framebuffer = handle<VkFramebuffer>(7);
+    bool fail_framebuffer = true;
+    vk.depth_resolve_framebuffer = [&](const ResourceBinding& from, VkImageView from_view, VkImageLayout from_layout,
+                                       const ResourceBinding& to, VkImageView to_view, VkImageLayout to_layout,
+                                       VkResolveModeFlagBits mode, VkExtent2D extent, VkRenderPass& pass) {
+        expect(from.image == source.image && from_view == source_view && to.image == scratch &&
+               to_view == scratch_view && from_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+               to_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL && mode == VK_RESOLVE_MODE_MAX_BIT &&
+               extent.width == 8 && extent.height == 6, "the render pass binds depth source and scratch views");
+        pass = handle<VkRenderPass>(8);
+        return fail_framebuffer ? VK_NULL_HANDLE : framebuffer;
+    };
+    expect(run(shifted, true) == ReplayResult::unsupported && untouched(),
+           "scratch framebuffer failure stops before emission");
+    fail_framebuffer = false;
+    expect(run(shifted, true) == ReplayResult::success && trace.begins == 1 && trace.ends == 1 &&
+           trace.framebuffer == framebuffer && trace.copies == 1 && trace.copy_src == scratch &&
+           trace.region.dstSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT &&
+           trace.region.dstSubresource.baseArrayLayer == 2,
+           "shifted depth uses the render-pass workaround then copies to the selected destination layer");
+
     if (failures) return 1;
-    std::puts("depth/stencil resolve offset: intermediate failures and stencil-only copy verified");
+    std::puts("depth/stencil resolve offset: failures, stencil copy and layered depth render pass verified");
     return 0;
 }

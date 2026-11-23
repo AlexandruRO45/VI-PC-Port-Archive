@@ -2,7 +2,15 @@
 // clears, resolves, copies and Map on both sides: MIN and MAX of either plane, named by the depth format or the
 // plane's own format, and AVERAGE of the depth plane by its own format (R32_FLOAT, R24_UNORM_X8_TYPELESS).
 // Clears write whole pixels, so all samples of a pixel are equal and every mode returns that value: these cases
-// check planes, formats, rectangles and layouts, not the reduction over differing samples.
+// check planes, formats, rectangles and layouts, not the reduction over differing samples. D32_FLOAT_S8X24_UINT takes
+// the same cases as D24S8, by its own format and by its planes' (R32_FLOAT_X8X24_TYPELESS, X32_TYPELESS_G8X24_UINT)
+// (TEST-847).
+// Edge cases (TEST-848) then draw one triangle over the cleared source with a depth-only PSO (depth 0.5, stencil
+// 0x44, test ALWAYS): its diagonal edge leaves the pixels it crosses with samples that differ, so MIN, MAX and
+// AVERAGE reduce over different values. No CPU model of the coverage: the layer must match the host byte for byte,
+// and MIN and MAX must differ somewhere. The layer's VS is a GLSL stand-in (test/glsl/vs_depth_edge.vert, found by
+// the FSSM hash of its container), the host's HLSL compiled by d3dcompiler_47; without glslangValidator at build
+// time the edge cases are skipped.
 // Shifted rectangles verify the source-to-destination mapping, including disjoint and overlapping resolves in a
 // list. Every pixel of both destination planes is checked. Successive lists reuse a DIRECT queue after a fence wait.
 // Refused resolves must fail Close and leave the destination as it was. AVERAGE by the depth format or of stencil,
@@ -13,9 +21,18 @@
 #include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#if defined(LEONIDA_DEPTH_EDGE_VS_SPV)
+#include "d3d12_test_shaders.h"
+#include "../src/shader_library.h"
+
+#include <d3dcompiler.h>
+#endif
 #include <dxgi1_4.h>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 #define CHECK(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -54,8 +71,26 @@ struct Case {
     bool host_refuses = false;    // refused cases: the host's Close fails as well
     DXGI_FORMAT resource = DXGI_FORMAT_UNKNOWN;  // the resources' format, when not `format`
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;      // the DSV format, when not `format`
+    bool edge = false;  // a triangle drawn over the clears, so the samples of the pixels on its edge differ
     const ResolveRegion* second = nullptr;      // optional second resolve on the same resources and plane
     bool enhanced = false;
+};
+
+// The depth plane holds 24-bit UNORM (D24S8 and its typeless and plane formats) rather than a float.
+bool unorm24(const Case& c) {
+    switch (c.resource ? c.resource : c.format) {
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return true;
+    default: return false;
+    }
+}
+
+// The edge draw's PSO on one device: a depth-only pipeline over the source's DSV format, 4 samples.
+struct EdgeDraw {
+    const std::vector<std::uint8_t>* root = nullptr;  // a serialized empty root signature
+    const std::vector<std::uint8_t>* vs = nullptr;    // the host's DXBC, or the layer's shader container
 };
 
 ResolveRegion first_region(const Case& c) {
@@ -71,7 +106,8 @@ struct Planes {
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
 // `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
 // (the layer runs what it recorded; the host runtime must not be given such a list).
-bool resolve_and_read(ID3D12Device* device, ID3D12CommandQueue* queue, const Case& c, Planes& out, bool run_invalid) {
+bool resolve_and_read(ID3D12Device* device, ID3D12CommandQueue* queue, const Case& c, Planes& out, bool run_invalid,
+                      const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
     Ref<ID3D12GraphicsCommandList1> list1;
@@ -129,6 +165,41 @@ bool resolve_and_read(ID3D12Device* device, ID3D12CommandQueue* queue, const Cas
     list->ClearDepthStencilView(source_view, flags, 0.75f, 0x22, 1, &clear_a);
     list->ClearDepthStencilView(source_view, flags, 1.0f, 0x33, 1, &clear_b);
     list->ClearDepthStencilView(target_view, flags, 0.0f, 0x5a, 0, nullptr);
+    Ref<ID3D12RootSignature> root;
+    Ref<ID3D12PipelineState> pso;
+    if (c.edge) {
+        CHECK(edge && edge->root && edge->vs);
+        CHECK(SUCCEEDED(device->CreateRootSignature(0, edge->root->data(), edge->root->size(), IID_PPV_ARGS(&root.p))));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root.p;
+        pd.VS = {edge->vs->data(), edge->vs->size()};
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.DepthStencilState.DepthEnable = TRUE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        pd.DepthStencilState.StencilEnable = c.stencil;
+        pd.DepthStencilState.StencilReadMask = pd.DepthStencilState.StencilWriteMask = 0xff;
+        const D3D12_DEPTH_STENCILOP_DESC replace{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE,
+                                                 D3D12_COMPARISON_FUNC_ALWAYS};
+        pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = replace;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.DSVFormat = c.view ? c.view : c.format;
+        pd.SampleDesc = {4, 0};
+        CHECK(SUCCEEDED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p))));
+        const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
+        const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
+        list->SetGraphicsRootSignature(root.p);
+        list->SetPipelineState(pso.p);
+        list->OMSetRenderTargets(0, nullptr, FALSE, &source_view);
+        list->OMSetStencilRef(0x44);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
 
     constexpr D3D12_BARRIER_SUBRESOURCE_RANGE all{D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES};
     const auto enhanced_barrier = [&](const D3D12_TEXTURE_BARRIER* barriers, UINT count) {
@@ -214,7 +285,7 @@ bool resolve_and_read(ID3D12Device* device, ID3D12CommandQueue* queue, const Cas
     for (UINT row = 0; row < height; ++row)
         std::memcpy(out.depth.data() + row * width * 4, base + placed[0].Offset + row * placed[0].Footprint.RowPitch,
                     width * 4);
-    if (c.stencil)  // D24S8 here
+    if (unorm24(c))
         for (std::size_t i = 3; i < out.depth.size(); i += 4) out.depth[i] = 0;  // the X8 byte is undefined
     out.stencil.clear();
     if (c.stencil) {
@@ -256,7 +327,7 @@ Planes expected_planes(const Case& c, bool resolved = true) {
             if (c.plane == 1) depth = 0.0f;
             else stencil = 0x5a;
             std::uint32_t bits = 0;
-            if (c.stencil)
+            if (unorm24(c))
                 bits = std::uint32_t(double(depth) * 16777215.0 + 0.5);
             else
                 std::memcpy(&bits, &depth, 4);
@@ -285,6 +356,7 @@ const char* mode_name(D3D12_RESOLVE_MODE mode) {
 
 int main() {
     vktest::Device vk;
+    vk.request_buffer_device_address = true;  // the edge draw's graphics pipeline needs it
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -300,22 +372,35 @@ int main() {
     constexpr auto r32 = DXGI_FORMAT_R32_FLOAT, x8 = DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
                    g8 = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
     constexpr auto r32_typeless = DXGI_FORMAT_R32_TYPELESS, r24g8_typeless = DXGI_FORMAT_R24G8_TYPELESS;
+    constexpr auto d32s8 = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, r32x8 = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                   g8x24 = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, r32g8x24_typeless = DXGI_FORMAT_R32G8X24_TYPELESS;
     std::vector<Case> cases;  // resolved, and compared with the host
-    for (const bool rect : {false, true}) {
-        for (const auto mode : {min, max}) {
-            cases.push_back({"D32 depth", d32, false, 0, mode, rect});
-            cases.push_back({"D24S8 depth", d24, true, 0, mode, rect});
-            cases.push_back({"D24S8 stencil", d24, true, 1, mode, rect});
-            cases.push_back({"D24S8 stencil as X24_G8", g8, true, 1, mode, rect, -1, -1, false, d24, d24});
-        }
-        for (const auto mode : {min, max, average}) {
-            cases.push_back({"D32 depth as R32_FLOAT", r32, false, 0, mode, rect, -1, -1, false, d32, d32});
-            cases.push_back({"D24S8 depth as R24_X8", x8, true, 0, mode, rect, -1, -1, false, d24, d24});
+    for (const bool edge : {false, true}) {
+        for (const bool rect : {false, true}) {
+            for (const auto mode : {min, max}) {
+                cases.push_back({"D32 depth", d32, false, 0, mode, rect, -1, -1, false, {}, {}, edge});
+                cases.push_back({"D24S8 depth", d24, true, 0, mode, rect, -1, -1, false, {}, {}, edge});
+                cases.push_back({"D24S8 stencil", d24, true, 1, mode, rect, -1, -1, false, {}, {}, edge});
+                cases.push_back({"D24S8 stencil as X24_G8", g8, true, 1, mode, rect, -1, -1, false, d24, d24, edge});
+                cases.push_back({"D32S8 depth", d32s8, true, 0, mode, rect, -1, -1, false, {}, {}, edge});
+                cases.push_back({"D32S8 stencil", d32s8, true, 1, mode, rect, -1, -1, false, {}, {}, edge});
+                cases.push_back({"D32S8 stencil as X32_G8X24", g8x24, true, 1, mode, rect, -1, -1, false, d32s8, d32s8,
+                                 edge});
+            }
+            for (const auto mode : {min, max, average}) {
+                cases.push_back({"D32 depth as R32_FLOAT", r32, false, 0, mode, rect, -1, -1, false, d32, d32, edge});
+                cases.push_back({"D24S8 depth as R24_X8", x8, true, 0, mode, rect, -1, -1, false, d24, d24, edge});
+                cases.push_back({"D32S8 depth as R32_X8X24", r32x8, true, 0, mode, rect, -1, -1, false, d32s8, d32s8,
+                                 edge});
+            }
         }
     }
     cases.push_back({"R32_TYPELESS depth as D32", d32, false, 0, min, false, -1, -1, false, r32_typeless});
     cases.push_back({"R24G8_TYPELESS stencil as D24S8", d24, true, 1, max, true, -1, -1, false, r24g8_typeless});
     cases.push_back({"R24G8_TYPELESS depth as R24_X8", x8, true, 0, average, true, -1, -1, false, r24g8_typeless, d24});
+    cases.push_back({"R32G8X24_TYPELESS stencil as D32S8", d32s8, true, 1, min, true, -1, -1, false, r32g8x24_typeless});
+    cases.push_back({"R32G8X24_TYPELESS depth as R32_X8X24", r32x8, true, 0, average, false, -1, -1, false,
+                     r32g8x24_typeless, d32s8});
     cases.push_back({"D32 depth to upper left", d32, false, 0, min, true, 0, 0});
     cases.push_back({"D32 depth as R32_FLOAT to lower right", r32, false, 0, max, true, 3, 2, false, d32, d32});
     cases.push_back({"D32 depth as R32_FLOAT to lower left", r32, false, 0, average, true, 0, 2, false, d32, d32});
@@ -328,11 +413,11 @@ int main() {
     cases.push_back({"D24S8 stencil as X24_G8 to lower left", g8, true, 1, min, true, 0, 2, false, d24, d24});
     // Two rectangles in one list. The destinations are disjoint and each ends at the bottom edge.
     constexpr ResolveRegion second{{5, 0, 8, 2}, 0, 4};
-    cases.push_back({"D24S8 depth, two shifted rectangles", d24, true, 0, min, true, 3, 2, false, d24, d24, &second});
+    cases.push_back({"D24S8 depth, two shifted rectangles", d24, true, 0, min, true, 3, 2, false, d24, d24, false, &second});
     // The second resolve covers columns 3 and 4 of rows 2 and 3 again, replacing depth 0.75 with 0.25 there.
     constexpr ResolveRegion overlapping{{5, 0, 8, 2}, 2, 2};
     cases.push_back({"D24S8 depth, overlapping shifted rectangles", d24, true, 0, min, true, 3, 2, false, d24, d24,
-                     &overlapping, true});
+                     false, &overlapping, true});
     const Case refused[] = {
         {"D32 depth", d32, false, 0, average, false, -1, -1, true},
         {"D24S8 depth", d24, true, 0, average, true, -1, -1, true},
@@ -342,18 +427,71 @@ int main() {
         {"D32 depth, rectangle past the right edge", d32, false, 0, min, true, 4, 2},
         {"D24S8 stencil, rectangle past the bottom edge", d24, true, 1, max, true, 3, 3},
         {"D24S8 stencil subresource as R24_X8", x8, true, 1, min, false, -1, -1, false, d24, d24},
+        {"D32S8 depth", d32s8, true, 0, average, false, -1, -1, true},
+        {"D32S8 stencil", d32s8, true, 1, average, true, -1, -1, true},
+        {"D32S8 stencil subresource as R32_X8X24", r32x8, true, 1, max, false, -1, -1, false, d32s8, d32s8},
         {"D32 depth", d32, false, 0, D3D12_RESOLVE_MODE_DECOMPRESS, false},
     };
-    unsigned shifted = 0, matched = 0, failures = 0, refusals = 0, references = 0, lacking = 0;
+    unsigned shifted = 0, matched = 0, failures = 0, refusals = 0, references = 0, lacking = 0, edges = 0, edge_skipped = 0;
+    // The edge draw: the layer's container and index, the host's HLSL, one empty root signature for both.
+    std::vector<std::uint8_t> root_blob, edge_container, edge_host_vs;
+    rt::d3d12::VulkanDeviceInfo info{};
+#if defined(LEONIDA_DEPTH_EDGE_VS_SPV)
+    {
+        const auto program = d3d12test::fssm_program({0x56530848, 0xbf810000});
+        edge_container = d3d12test::shader_container(program);
+        const auto library = std::filesystem::temp_directory_path() / "leonida_depth_resolve_test";
+        std::filesystem::create_directories(library);
+        std::filesystem::copy_file(LEONIDA_DEPTH_EDGE_VS_SPV, library / "vs.spv",
+                                   std::filesystem::copy_options::overwrite_existing);
+        std::ofstream index(library / "index.json", std::ios::binary);
+        index << "{\"vs\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []}}";
+        info.shader_dir = library.string();
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+        root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        root_blob = d3d12test::serialize_root_signature(root_desc);
+        const HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const auto compile = compiler ? reinterpret_cast<pD3DCompile>(reinterpret_cast<void*>(
+                                            GetProcAddress(compiler, "D3DCompile")))
+                                      : nullptr;
+        constexpr char host_vs[] =
+            "float4 main(uint id : SV_VertexID) : SV_Position {" "\n"
+            "    const float2 corners[3] = {float2(-1, -1), float2(-1, 1), float2(1, 1)};" "\n"
+            "    return float4(corners[id], 0.5, 1.0);" "\n"
+            "}" "\n";
+        ID3DBlob* code = nullptr;
+        ID3DBlob* errors = nullptr;
+        if (compile && SUCCEEDED(compile(host_vs, std::strlen(host_vs), nullptr, nullptr, nullptr, "main", "vs_5_0", 0,
+                                         0, &code, &errors)) && code) {
+            const auto* bytes = static_cast<const std::uint8_t*>(code->GetBufferPointer());
+            edge_host_vs.assign(bytes, bytes + code->GetBufferSize());
+        }
+        if (errors) {
+            std::fprintf(stderr, "%s" "\n", static_cast<const char*>(errors->GetBufferPointer()));
+            errors->Release();
+        }
+        if (code) code->Release();
+        if (root_blob.empty() || (edge_host_vs.empty() && !hostwine::host_is_wine())) {
+            std::fprintf(stderr, "the edge draw's root signature or host shader failed" "\n");
+            return 1;
+        }
+    }
+#endif
+    const bool edge_draws = !edge_container.empty();
+    const EdgeDraw ours_edge{&root_blob, &edge_container}, host_edge{&root_blob, &edge_host_vs};
     const auto run = [&]() -> int {
         Ref<ID3D12Device> ours;
-        rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = vk.instance_proc;
         info.instance = vk.instance;
         info.physical = vk.physical;
         info.device = vk.device;
         info.queue = vk.queue;
         info.queue_family = vk.family;
+        info.bindless = vk.bindless;
+        info.bindless_partially_bound = vk.partially_bound;
+        info.host_image_copy = vk.host_image_copy;
+        info.buffer_device_address = vk.buffer_device_address;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         Ref<ID3D12CommandQueue> ours_queue;
         if (FAILED(ours->CreateCommandQueue(&direct_queue, IID_PPV_ARGS(&ours_queue.p)))) return 1;
@@ -366,10 +504,16 @@ int main() {
             const bool can = supported & (c.mode == min   ? VK_RESOLVE_MODE_MIN_BIT
                                           : c.mode == max ? VK_RESOLVE_MODE_MAX_BIT
                                                           : VK_RESOLVE_MODE_AVERAGE_BIT);
-            if (!resolve_and_read(ours.p, ours_queue.p, c, results[i], true)) return 1;
-            // A mode the device lacks is refused like the cases below.
+            if (c.edge && !edge_draws) {
+                ++edge_skipped;
+                continue;
+            }
+            if (!resolve_and_read(ours.p, ours_queue.p, c, results[i], true, &ours_edge)) return 1;
+            // A mode the device lacks is refused like the cases below. An edge case has no CPU model of its
+            // coverage: only its Close is checked here, and its planes against the host below.
             const Planes expected = expected_planes(c, can);
-            if (results[i].close != (can ? S_OK : E_INVALIDARG) || !same_planes(results[i], expected, false, c.plane)) {
+            if (results[i].close != (can ? S_OK : E_INVALIDARG) ||
+                (!c.edge && !same_planes(results[i], expected, false, c.plane))) {
                 std::fprintf(stderr, "%s %s rect %d: Close 0x%08lx, destination %s the clears\n", c.name,
                              mode_name(c.mode), int(c.rect), results[i].close,
                              same_planes(results[i], expected, false, c.plane) ? "matches" : "differs from");
@@ -380,6 +524,24 @@ int main() {
             if (!can) {
                 results[i] = {};  // not compared with the host
                 ++lacking;
+            }
+        }
+        // The edge draw makes the samples differ: for each edge case resolved by MIN, the MAX of the same case must
+        // differ from it somewhere, or the draw did not reach the resolve.
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            const Case& c = cases[i];
+            if (!c.edge || c.mode != min || results[i].depth.empty()) continue;
+            for (std::size_t j = 0; j < cases.size(); ++j) {
+                const Case& o = cases[j];
+                if (!o.edge || o.mode != max || std::strcmp(o.name, c.name) != 0 || o.rect != c.rect ||
+                    results[j].depth.empty())
+                    continue;
+                ++edges;
+                if (same_planes(results[i], results[j], true, c.plane)) {
+                    std::fprintf(stderr, "edge %s rect %d: MIN and MAX agree everywhere; the samples did not differ" "\n",
+                                 c.name, int(c.rect));
+                    ++failures;
+                }
             }
         }
         for (const Case& c : refused) {
@@ -414,17 +576,35 @@ int main() {
                                   options.EnhancedBarriersSupported;
             const char* name = adapter_name.c_str();
             unsigned same = 0, compared = 0, refused_alike = 0, quirks = 0;
+            std::vector<const Case*> quirks_seen;  // cases without the edge where this host differs from the clears
+            const auto quirky = [&](const Case& e) {
+                for (const Case* q : quirks_seen)
+                    if (std::strcmp(q->name, e.name) == 0 && q->mode == e.mode && q->rect == e.rect) return true;
+                return false;
+            };
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 const Case& c = cases[i];
-                if (results[i].depth.empty() || (warp && c.format == d32) || (c.enhanced && !enhanced)) continue;
+                // See the top of the file; D32S8 by its own format is kept off WARP for the same reason.
+                if (results[i].depth.empty() || (warp && (c.format == d32 || c.format == d32s8)) || (c.enhanced && !enhanced)) continue;
                 Planes expected;
-                if (!resolve_and_read(host.p, host_queue.p, c, expected, false)) return 1;
+                if (!resolve_and_read(host.p, host_queue.p, c, expected, false, &host_edge)) return 1;
                 ++compared;
                 // The layer's result was checked against the clears above. A host that differs from the clears is a
                 // host quirk, not a layer bug: report, don't fail. Which D24S8 resolves is the driver's: with stencil
                 // MIN/MAX on both, an RTX 3070 (NVIDIA 610.74) adds "stencil as X24_G8" and "depth as R24_X8" AVERAGE,
                 // a Ryzen 7 9700X iGPU (AMD 32.0.21042.62) depth MIN/MAX; whole subresources and rectangles alike.
-                if (SUCCEEDED(expected.close) && !same_planes(expected, expected_planes(c), warp, c.plane)) {
+                // Edge cases have no clear model: on WARP, or where the host had a quirk on the same case without the
+                // edge, a difference from the layer is only reported.
+                if (c.edge && (warp || quirky(c))) {
+                    if (FAILED(expected.close) || !same_planes(expected, results[i], true, c.plane))
+                        std::printf("edge %s %s rect %d: %s differs from the layer (information)\n", c.name,
+                                    mode_name(c.mode), int(c.rect), name);
+                    else
+                        ++same;
+                    continue;
+                }
+                if (!c.edge && SUCCEEDED(expected.close) && !same_planes(expected, expected_planes(c), warp, c.plane)) {
+                    quirks_seen.push_back(&c);
                     std::printf("%s %s rect %d against %s: host quirk: the host differs from the clears; the layer "
                                 "matches them\n", c.name, mode_name(c.mode), int(c.rect), name);
                     ++quirks;
@@ -466,8 +646,8 @@ int main() {
     const bool need_host = !hostwine::host_is_wine();
     if (need_host && !references) std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
     if (run_failed || failures || validation_errors || (need_host && (!references || !matched))) return 1;
-    std::printf("depth/stencil resolves: %u shifted cases matched the clears, %u host comparisons matched, "
-                "%u refusals kept the destination, %u modes the device lacks were refused\n", shifted, matched,
-                refusals, lacking);
+    std::printf("depth/stencil resolves: %u shifted cases matched the clears, %u host comparisons matched, %u refusals kept the destination, %u modes the "
+                "device lacks were refused; %u edge MIN/MAX pairs differ%s\n", shifted, matched, refusals, lacking, edges,
+                edge_skipped ? " (edge cases skipped: no glslangValidator at build time)" : "");
     return 0;
 }
