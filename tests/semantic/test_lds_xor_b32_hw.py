@@ -161,6 +161,27 @@ class Instruction:
             parts.append("gds")
         return " ".join(parts)
 
+class ScalarLDSInterpreter:
+    """Deterministic scalar instruction interpreter executing LDS instructions."""
+
+    def __init__(self, capacity_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        self.storage: LDSStorage = LDSStorage(capacity_dwords)
+        self.vgprs: list[int] = [0] * 256
+
+    def read_vgpr(self, reg_idx: int) -> int:
+        return self.vgprs[reg_idx & 0xFF]
+
+    def write_vgpr(self, reg_idx: int, val: int) -> None:
+        self.vgprs[reg_idx & 0xFF] = u32(val)
+
+    def execute(self, inst: Instruction) -> tuple[int, int]:
+        addr = self.read_vgpr(inst.vaddr.index)
+        data = self.read_vgpr(inst.vdata.index)
+        old_val, new_val = self.storage.atomic_xor(addr, data, inst.offset)
+        if inst.opcode == Opcode.DS_XOR_RTN_B32 and inst.vdst is not None:
+            self.write_vgpr(inst.vdst.index, old_val)
+        return old_val, new_val
+
 class TestLdsXorB32Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -221,6 +242,39 @@ class TestLdsXorB32AST(unittest.TestCase):
             offset=32,
         )
         self.assertEqual(inst.format_asm(), "ds_xor_rtn_b32 v5, v1, v2 offset:32")
+
+class TestLdsXorB32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter()
+
+    def test_scalar_execution_non_returning(self) -> None:
+        self.interp.storage.write_dword(10, 0x11111111)
+        self.interp.write_vgpr(1, 40)  # byte address 40 -> dword 10
+        self.interp.write_vgpr(2, 0x22222222)
+        inst = Instruction(Opcode.DS_XOR_B32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2))
+        old, new = self.interp.execute(inst)
+        self.assertEqual(old, 0x11111111)
+        self.assertEqual(new, 0x33333333)
+        self.assertEqual(self.interp.storage.read_dword(10), 0x33333333)
+
+    def test_scalar_execution_returning(self) -> None:
+        self.interp.storage.write_dword(10, 0xF0F0F0F0)
+        self.interp.write_vgpr(1, 40)
+        self.interp.write_vgpr(2, 0x0F0F0F0F)
+        self.interp.write_vgpr(5, 0xCAFEFEED)
+        inst = Instruction(
+            Opcode.DS_XOR_RTN_B32,
+            vdst=Register(RegKind.VGPR, 5),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        old, new = self.interp.execute(inst)
+        self.assertEqual(old, 0xF0F0F0F0)
+        self.assertEqual(new, 0xFFFFFFFF)
+        self.assertEqual(self.interp.read_vgpr(5), 0xF0F0F0F0)
+        self.assertEqual(self.interp.storage.read_dword(10), 0xFFFFFFFF)
 
 if __name__ == "__main__":
     unittest.main()
