@@ -147,10 +147,14 @@ python -I tools/saves.py verify  <JSAV>                 # parse every block, reb
 python -I tools/saves.py extract <JSAV|ASAV> <outdir>   # blocks/*.json, index.json, save.pretty.json
 python -I tools/saves.py pack    <outdir> <JSAV>        # after editing blocks/*.json
 python -I tools/saves.py diff    <JSAV a> <JSAV b>
-python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--dry-run] [--force]
+python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]... [--with-packed] [--dry-run] [--force]
 python -I tools/save_keys.py collect <save file or extract folder>...           # distinct $0x… keys
 python -I tools/save_keys.py resolve <saves>... --dict <files>... [--compose N] [--out FILE]
 ```
+
+`import` takes one `--map` per name it overrides (its key is the save folder's name, its payload file name or its
+slot), and `--with-packed` also copies a folder's `chives.dat`, the packed payload beside the save, as a second blob
+in the same container.
 
 `tests/test_saves.py` and `tests/test_save_keys.py` cover all of it on synthetic containers and names built in the
 tests.
