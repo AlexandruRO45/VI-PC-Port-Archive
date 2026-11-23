@@ -357,37 +357,31 @@ def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
         return 11 if name == "image_bvh_intersect_ray" else 12
     if name == "image_get_resinfo":
         return 1
-    if name == "image_get_lod":
-        return _MIMG_DIM_COORDS.get(dim, 2)
     base = _MIMG_DIM_COORDS.get(dim, 2)
-    if name.startswith("image_atomic_"):
+    if name == "image_get_lod" or name.startswith("image_atomic_"):
         return (base + 1) // 2 if a16 else base
-    # Separate 32-bit address components (offset, bias, z-compare, derivatives) from a16-packable coords/lod/clamp.
-    has_o = name.endswith("_o") or "_o_" in name
-    base_name = name[:-2] if name.endswith("_o") else name
-    has_cl = base_name.endswith("_cl")
-    if has_cl:
-        base_name = base_name[:-3]
-    fixed32 = 1 if has_o else 0
-    if "_b" in base_name and not base_name.startswith("image_bvh"):
+    # Separate 32-bit address components (offset, bias, z-compare, derivatives) from a16-packable coords/lod/clamp/mip.
+    tokens = set(name.split("_")[2:])
+    fixed32 = 0
+    if "o" in tokens:
         fixed32 += 1
-    if "_c" in base_name and not base_name.startswith(("image_atomic", "image_get")):
+    if "b" in tokens:
         fixed32 += 1
-    if "_d" in base_name and not base_name.startswith(("image_atomic", "image_get")):
-        fixed32 += 2 * _MIMG_GRAD_COORDS.get(dim, 2)
+    if "c" in tokens:
+        fixed32 += 1
+    if "d" in tokens or "cd" in tokens:
+        g = _MIMG_GRAD_COORDS.get(dim, 2)
+        fixed32 += 2 * ((g + 1) // 2) if "g16" in tokens else 2 * g
     packable = base
-    if "_l" in base_name and "_lz" not in base_name and not base_name.startswith(
-            ("image_load", "image_store", "image_atomic", "image_get")):
+    if "l" in tokens:
         packable += 1
-    if has_cl:
+    if "cl" in tokens:
         packable += 1
-    if base_name in ("image_load_mip", "image_store_mip"):
+    if "mip" in tokens:
         packable += 1
     if a16:
-        # On GFX10, a16 packs coordinates (and lod/clamp after coords) two 16-bit values per VGPR; clamp/lod
-        # after 2D coords starts a new VGPR when coords are even (e.g., 2D + cl -> 1 + 1 = 2 VGPRs).
-        packed = (base + 1) // 2 + (packable - base)
-        return fixed32 + packed
+        # On GFX10, a16 packs coordinates and any trailing lod/clamp/mip two 16-bit values per VGPR.
+        return fixed32 + (packable + 1) // 2
     return fixed32 + packable
 
 

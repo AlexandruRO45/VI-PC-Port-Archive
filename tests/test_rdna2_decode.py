@@ -428,6 +428,49 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
 
+    def test_mimg_addr_counts_across_all_opcodes_and_a16_modes(self):
+        # 1) All 130 MIMG opcodes in rdna2_isa_tables.MIMG match their specification's max VADDR width
+        #    (3D dim=2 for sample/gather/get_lod/mip ops; 2D_MSAA_ARRAY dim=7 for non-mip load/store/atomic/msaa).
+        for opc, (name, spec) in sorted(rdna2_decode.T.MIMG.items()):
+            vaddr_spec = next(w for fn, w, _ in spec if fn == "VADDR")
+            tokens = set(name.split("_")[2:])
+            ref_dim = 7 if (name.startswith(("image_load", "image_store", "image_atomic", "image_msaa"))
+                            and "mip" not in tokens) else 2
+            self.assertEqual(rdna2_decode._mimg_addr_count(name, ref_dim, False), vaddr_spec,
+                             f"0x{opc:02x} {name}")
+
+        # 2) Raw binary decode checks for _cd, _g16, _cl_o, *_mip_pck*, *_mip_by2, image_get_lod a16, and 3D a16+cl.
+        def enc_mimg(opc: int, dim: int, vaddr0: int = 10, a16: int = 0) -> bytes:
+            w0 = (0x3C << 26) | (0xF << 8) | (dim << 3) | ((opc & 0x7F) << 18) | ((opc >> 7) & 1)
+            w1 = vaddr0 | (4 << 8) | (2 << 16) | (4 << 21) | (a16 << 30)
+            return words(w0, w1)
+
+        cases = (
+            # (opc, dim, a16, expected_op, expected_vaddr_width)
+            (0x04, 1, 0, "image_load_mip_pck", 3),          # 2D (2) + mip (1) = 3
+            (0x05, 2, 0, "image_load_mip_pck_sgn", 4),      # 3D (3) + mip (1) = 4
+            (0x0B, 1, 0, "image_store_mip_pck", 3),         # 2D (2) + mip (1) = 3
+            (0x5A, 1, 1, "image_store_mip_by2", 2),         # 2D+mip under a16: ceil(3/2) = 2 (no false _b bias)
+            (0x31, 1, 1, "image_sample_cl_o", 3),           # 2D+cl+o under a16: 1 offset + ceil(3/2) = 3
+            (0x39, 1, 0, "image_sample_c_cl_o", 5),         # 2D (2) + o (1) + c (1) + cl (1) = 5
+            (0x3B, 2, 0, "image_sample_c_d_cl_o", 12),      # 3D (3) + o (1) + c (1) + d (6) + cl (1) = 12
+            (0x5E, 2, 0, "image_gather4_c_b_cl_o", 7),      # 3D (3) + o (1) + c (1) + b (1) + cl (1) = 7
+            (0x68, 1, 0, "image_sample_cd", 6),             # 2D (2) + cd (4) = 6
+            (0x6F, 2, 0, "image_sample_c_cd_cl_o", 12),     # 3D (3) + o (1) + c (1) + cd (6) + cl (1) = 12
+            (0xA2, 1, 0, "image_sample_d_g16", 4),          # 2D (2) + g16 d (2) = 4
+            (0xA2, 2, 0, "image_sample_d_g16", 7),          # 3D (3) + g16 d (4) = 7
+            (0xBB, 2, 0, "image_sample_c_d_cl_o_g16", 10),  # 3D (3) + o (1) + c (1) + g16 d (4) + cl (1) = 10
+            (0xEF, 2, 0, "image_sample_c_cd_cl_o_g16", 10), # 3D (3) + o (1) + c (1) + g16 cd (4) + cl (1) = 10
+            (0x60, 1, 1, "image_get_lod", 1),               # 2D (2 coords) under a16 -> 1 VGPR
+            (0x60, 5, 1, "image_get_lod", 2),               # 2D_ARRAY (3 coords) under a16 -> 2 VGPRs
+            (0x23, 2, 1, "image_sample_d_cl", 8),           # 3D d (6) + a16 (3 coords + 1 clamp) -> 6 + 2 = 8 VGPRs
+        )
+        for opc, dim, a16, exp_op, exp_w in cases:
+            with self.subTest(op=exp_op, dim=dim, a16=a16):
+                ins, = rdna2_decode.decode_bytes(enc_mimg(opc, dim, vaddr0=10, a16=a16))["insns"]
+                self.assertEqual(ins["op"], exp_op)
+                self.assertEqual(ins["args"][1], {"k": "vgpr", "r": 10, "n": exp_w, "neg": False, "abs": False})
+
 
 if __name__ == "__main__":
     unittest.main()
