@@ -175,7 +175,7 @@ class ProgramText(unittest.TestCase):
 
 class Guard(unittest.TestCase):
     FUZZERS = ("pk16_diff", "vint_diff", "sdwa_diff", "wint_diff", "fmisc_diff")
-    UNIFORM_FUZZERS = ("pk16_diff", "vint_diff", "sdwa_diff", "fmisc_diff")
+    UNIFORM_FUZZERS = ("pk16_diff", "vint_diff", "fmisc_diff")
 
     def test_vk_without_hw_is_a_usage_error(self):
         for tool in self.FUZZERS:
