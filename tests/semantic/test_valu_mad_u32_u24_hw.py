@@ -296,5 +296,64 @@ class MadU32U24ExtremeBoundariesTests(unittest.TestCase):
         self.assertEqual(oracle_mad_u32_u24(0, 0xFFFFFF, 0x7FFFFFFF), 0x7FFFFFFF)
         self.assertEqual(oracle_mad_u32_u24(0xFFFFFF, 0, 0x80000000), 0x80000000)
 
+class MadU32U24TranslatorIntegrationTests(unittest.TestCase):
+    def _run_ps(self, lines: list[str]) -> int:
+        lines = list(lines) + [
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mad_u32_u24", lines)
+        words = mrt0_words(spv)
+        return words[0]
+
+    def test_translator_basic_execution(self):
+        lines = [
+            "v_mov_b32 v0, 100",
+            "v_mov_b32 v1, 200",
+            "v_mov_b32 v2, 50",
+            "v_mad_u32_u24 v3, v0, v1, v2",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, (100 * 200) + 50)
+
+    def test_translator_24bit_masking(self):
+        lines = [
+            "v_mov_b32 v0, 0xFF000002",
+            "v_mov_b32 v1, 0xAA000003",
+            "v_mov_b32 v2, 10",
+            "v_mad_u32_u24 v3, v0, v1, v2",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, (2 * 3) + 10)
+
+    def test_translator_with_sgpr_and_inline(self):
+        lines = [
+            "s_mov_b32 s0, 25",
+            "v_mov_b32 v1, 4",
+            "v_mov_b32 v2, 12",
+            "v_mad_u32_u24 v3, s0, v1, v2",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, (25 * 4) + 12)
+
+    def test_translator_wrap_around(self):
+        lines = [
+            "v_mov_b32 v0, 0xFFFFFF",
+            "v_mov_b32 v1, 1",
+            "v_mov_b32 v2, 0xFFFFFFFF",
+            "v_mad_u32_u24 v3, v0, v1, v2",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, (0xFFFFFF + 0xFFFFFFFF) & MASK32)
+
+    def test_translator_in_place_aliasing(self):
+        lines = [
+            "v_mov_b32 v3, 3",
+            "v_mad_u32_u24 v3, v3, v3, v3",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, (3 * 3) + 3)
+
+
 if __name__ == "__main__":
     unittest.main()
