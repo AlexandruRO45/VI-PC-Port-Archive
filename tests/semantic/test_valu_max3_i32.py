@@ -565,5 +565,50 @@ class TestVMax3I32ConditionCodes(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x7FFFFFFF)
 
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes and Two's Complement Edge Cases
+# ==============================================================================
+
+class TestVMax3I32IEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes and two's complement edge cases."""
+
+    def test_twos_complement_extrema_matrix(self) -> None:
+        """Verify behavior at and around two's complement signed 32-bit boundaries."""
+        extrema = (
+            0x80000000,  # INT32_MIN (-2147483648)
+            0x80000001,  # INT32_MIN + 1
+            0xFFFFFFFF,  # -1 as i32
+            0x00000000,  # 0
+            0x00000001,  # 1
+            0x7FFFFFFE,  # INT32_MAX - 1
+            0x7FFFFFFF,  # INT32_MAX (2147483647)
+        )
+        for x in extrema:
+            for y in extrema:
+                self.assertEqual(ref_v_max3_i32(0x7FFFFFFF, x, y), 0x7FFFFFFF)
+
+        self.assertEqual(ref_v_max3_i32(0x80000000, 0x80000000, 0x80000000), 0x80000000)
+        self.assertEqual(ref_v_max3_i32(0x80000000, 0x80000001, 0xFFFFFFFF), 0xFFFFFFFF)
+
+    def test_ieee754_reinterpreted_as_signed_i32(self) -> None:
+        """Verify raw IEEE 754 float bit patterns are evaluated strictly as two's complement integers."""
+        # IEEE 754 +0.0 is 0x00000000; -0.0 is 0x80000000 (INT32_MIN)
+        self.assertEqual(ref_v_max3_i32(0x00000000, 0x80000000, 0x80000000), 0x00000000)
+
+        # IEEE 754 +Inf (0x7F800000) vs -Inf (0xFF800000)
+        self.assertEqual(ref_v_max3_i32(0x7F800000, 0xFF800000, 0), 0x7F800000)
+
+        # IEEE 754 qNaN (0x7FC00000) vs -qNaN (0xFFC00000)
+        self.assertEqual(ref_v_max3_i32(0x7FC00000, 0xFFC00000, 0), 0x7FC00000)
+
+    def test_distinct_signed_unsigned_quad_triple(self) -> None:
+        """On (0x80000000, 0x00000000, 0xFFFFFFFF), signed max is 0, unsigned max is 0xFFFFFFFF."""
+        s0, s1, s2 = 0x80000000, 0x00000000, 0xFFFFFFFF
+        signed_max = ref_v_max3_i32(s0, s1, s2)
+        unsigned_max = max(s0, s1, s2)
+        self.assertEqual(signed_max, 0x00000000)
+        self.assertEqual(unsigned_max, 0xFFFFFFFF)
+        self.assertNotEqual(signed_max, unsigned_max)
+
 if __name__ == "__main__":
     unittest.main()
