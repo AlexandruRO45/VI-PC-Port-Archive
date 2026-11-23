@@ -42,7 +42,7 @@ def synthetic_index():
 TARGET_FLOATS = 32 * 32 * 4
 
 
-def write_target(path, values):
+def write_raw(path, values):
     with open(path, "wb") as f:
         f.write(struct.pack(f"<{len(values)}f", *values))
         f.write(struct.pack("<f", -1.0) * (TARGET_FLOATS - len(values)))
@@ -105,7 +105,7 @@ class Classification(unittest.TestCase):
 
     def raw(self, name, values):
         path = os.path.join(self.tmp.name, name)
-        write_target(path, values)
+        write_raw(path, values)
         return path
 
     @staticmethod
@@ -153,31 +153,6 @@ class Classification(unittest.TestCase):
 
 
 class CompareCommand(unittest.TestCase):
-    def test_rerun_overrides_and_counts(self):
-        with tempfile.TemporaryDirectory() as out:
-            with open(os.path.join(out, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
-                json.dump([{"name": "x", "stratum": [False, "none", "structured"]},
-                           {"name": "y", "stratum": [False, "none", "structured"]}], f)
-            for tag, codes in (("a", (0, 3)), ("b", (0, 0))):
-                d = os.path.join(out, f"{tag}_z")
-                os.makedirs(d)
-                with open(os.path.join(d, "results_0.jsonl"), "w", encoding="utf-8", newline="\n") as f:
-                    for i, c in enumerate(codes):
-                        f.write(json.dumps({"i": i, "code": c, "reason": "", "targets": 1}) + "\n")
-                write_target(os.path.join(d, "0.raw"), [0.25] * 8)
-                write_target(os.path.join(d, "1.raw"), [0.25] * 8)
-            # shader 1 timed out on a while another process was starting: its re-run is clean
-            re = os.path.join(out, "a_z_re")
-            os.makedirs(re)
-            with open(os.path.join(re, "results_0.jsonl"), "w", encoding="utf-8", newline="\n") as f:
-                f.write(json.dumps({"i": 1, "code": 0, "reason": "", "targets": 1}) + "\n")
-            write_target(os.path.join(re, "1.raw"), [0.25] * 8)
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                ps_sweep.main(["compare", "--out", out, "--tags", "a", "b"])
-            self.assertIn("OK on both: 2", buf.getvalue())
-            self.assertNotIn("timeout", buf.getvalue())
-
     def test_readback_shapes(self):
         one = struct.pack("<f", 0.25) * TARGET_FLOATS
         two = one * 2
@@ -219,6 +194,31 @@ class CompareCommand(unittest.TestCase):
                 ps_sweep.main(["compare", "--out", tmp])
             rows = json.loads((out / "classes_z.json").read_text(encoding="utf-8"))
             self.assertEqual([(r["class"], r["sub"]) for r in rows], [case[-2:] for case in cases])
+
+    def test_rerun_overrides_and_counts(self):
+        with tempfile.TemporaryDirectory() as out:
+            with open(os.path.join(out, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"name": "x", "stratum": [False, "none", "structured"]},
+                           {"name": "y", "stratum": [False, "none", "structured"]}], f)
+            for tag, codes in (("a", (0, 3)), ("b", (0, 0))):
+                d = os.path.join(out, f"{tag}_z")
+                os.makedirs(d)
+                with open(os.path.join(d, "results_0.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+                    for i, c in enumerate(codes):
+                        f.write(json.dumps({"i": i, "code": c, "reason": "", "targets": 1}) + "\n")
+                write_raw(os.path.join(d, "0.raw"), [0.25] * 8)
+                write_raw(os.path.join(d, "1.raw"), [0.25] * 8)
+            # shader 1 timed out on a while another process was starting: its re-run is clean
+            re = os.path.join(out, "a_z_re")
+            os.makedirs(re)
+            with open(os.path.join(re, "results_0.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps({"i": 1, "code": 0, "reason": "", "targets": 1}) + "\n")
+            write_raw(os.path.join(re, "1.raw"), [0.25] * 8)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ps_sweep.main(["compare", "--out", out, "--tags", "a", "b"])
+            self.assertIn("OK on both: 2", buf.getvalue())
+            self.assertNotIn("timeout", buf.getvalue())
 
 
 if __name__ == "__main__":
