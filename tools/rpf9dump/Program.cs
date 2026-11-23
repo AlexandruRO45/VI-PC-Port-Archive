@@ -5,15 +5,28 @@ using System.Globalization;
 using System.Text.Json;
 using RpfPreview.Core;
 
-if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir> [--start BYTES] [--length BYTES]"); return 2; }
+if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir> [--start BYTES] [--length BYTES] [--lod N]"); return 2; }
 string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPath(args[2]);
 // --start/--length scan one window of the file instead of the whole archive. A window is a raw slice of an
 // archive (`levels.rpf` cut at an offset), so it need not carry the file's header and it is not an
 // ArchiveDocument: models and textures then read every resource from its own compression blocks
 // (tools/rpf9dump/Segments.cs). A window is how a multi-GiB archive is exported a piece at a time.
-long scanStart = 0; long? scanLength = null;
+// --lod N (models only) exports the drawable's LOD N model list instead of the first: 0 is the pointer at
+// drawable +0x50, 1 to 3 the ones at +0x58, +0x60 and +0x68. docs/bvh.md §7: most interior BLAS are built
+// from LOD 1.
+long scanStart = 0; long? scanLength = null; int lod = 0;
 for (int i = 3; i < args.Length; i += 2)
 {
+    if (args[i] == "--lod")
+    {
+        if (i + 1 >= args.Length || !int.TryParse(args[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out lod)
+            || lod >= RageModelDecoder.LodCount)
+        {
+            Console.WriteLine($"--lod needs a LOD index from 0 to {RageModelDecoder.LodCount - 1}.");
+            return 2;
+        }
+        continue;
+    }
     if (i + 1 >= args.Length || !long.TryParse(args[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out long bytes) || bytes < 0)
     {
         Console.WriteLine($"{args[i]} needs a non-negative byte count.");
@@ -27,6 +40,11 @@ bool window = scanStart != 0 || scanLength is not null;
 if (window && mode is not ("models" or "textures"))
 {
     Console.WriteLine("--start/--length apply to models and textures; other modes need a recognized archive.");
+    return 2;
+}
+if (lod != 0 && mode != "models")
+{
+    Console.WriteLine("--lod applies to models only.");
     return 2;
 }
 var json = new JsonSerializerOptions { WriteIndented = true };
@@ -201,7 +219,9 @@ else if (mode is "models" or "textures")
         });
         return got.SelectMany(g => g).OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
     }
-    string sub = Path.Combine(outDir, mode); Directory.CreateDirectory(sub);
+    // Another LOD goes to its own directory: its OBJs keep the LOD 0 names, and make_game resumes on
+    // models/manifest.json, which a LOD export must not stand in for.
+    string sub = Path.Combine(outDir, lod == 0 ? mode : $"{mode}_lod{lod}"); Directory.CreateDirectory(sub);
     // The manifest is streamed row by row: holding 150k rows (each capturing its decoded model through lazy
     // projections) ran out of memory on levels.rpf. Written to a .partial file and renamed when complete.
     string manifestPath = Path.Combine(sub, "manifest.json"), partial = manifestPath + ".partial";
@@ -210,6 +230,7 @@ else if (mode is "models" or "textures")
     writer.WriteStartObject();
     writer.WriteString("src", src);
     writer.WriteNumber("Count", list.Count);
+    if (mode == "models") writer.WriteNumber("Lod", lod);
     // Scan-level counts. Candidates the recovery step rejects never reach the per-item loop or
     // ModelDecodeFailures, so NotRecovered is the only place they show up. Recovered counts resources (candidate
     // offsets); Entries counts manifest items (one per dictionary child). Null when a cached index does not record
@@ -267,9 +288,15 @@ else if (mode is "models" or "textures")
             var sys = data.AsSpan(0, split); var gfx = data.AsSpan(split);
             if (mode == "models")
             {
-                var m = RageModelDecoder.Decode(sys, gfx, e.ResourceDrawableOffset);
+                var m = RageModelDecoder.Decode(sys, gfx, e.ResourceDrawableOffset, lod);
                 if (m == null)
+                {
+                    // Many drawables have fewer LODs than four. One that decodes at LOD 0 is not a failure of the
+                    // run: it is counted under its own code and left out of the manifest.
+                    if (lod != 0 && RageModelDecoder.Decode(sys, gfx, e.ResourceDrawableOffset) != null)
+                        return new Result(null, 0, 0, 0, new ModelDecodeFailure("lod-unavailable", $"decodes at LOD 0, not at LOD {lod}"), null, 0);
                     return new Result(null, 0, 1, 0, ModelDecodeFailure.Explain(sys, gfx.Length), null, 0);
+                }
                 string obj = Path.Combine(sub, stem + ".obj");
                 string objText = RageModelDecoder.CreateObj(m);
                 // A failed obj write means the model is missing from disk: fatal for the run (retryable),
@@ -277,7 +304,8 @@ else if (mode is "models" or "textures")
                 try { if (!File.Exists(obj)) Util.WriteAllText(obj, objText); }
                 catch (Exception wex) { return new Result(null, 0, 1, 0, null, $"  fail {e.Name}: {wex.GetType().Name} {wex.Message}", 1); }
                 int wfail = 0;
-                if (m.EmbeddedTextures != null && m.EmbeddedTextureDictionaryOffset is int dOff)
+                // Embedded textures belong to the drawable, not to a LOD: a LOD export leaves them to the LOD 0 one.
+                if (lod == 0 && m.EmbeddedTextures != null && m.EmbeddedTextureDictionaryOffset is int dOff)
                 {
                     // A directory or DDS write failure leaves the embedded texture missing from disk: retryable,
                     // so it fails the run like the obj write above. Embedded decode failures count like the

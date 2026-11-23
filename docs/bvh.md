@@ -419,6 +419,10 @@ elsewhere in the archive finds no candidate in it at all, and the tool says so i
 `rpf9dump models` and `rpf9dump textures` take `--start`/`--length` to export a window of a file. A window need not be a
 valid archive - a slice of `levels.rpf` cut at an offset has no `9FPR` header - because both modes read every resource
 from its own compression blocks; a sub-range is never written to the index cache, which describes a whole file.
+`rpf9dump models --lod N` exports the drawable's LOD N model list instead of the first (drawable `+0x50 + 8 * N`)
+into `models_lod<N>/` ([models.md](models.md)). A BLAS is not always built from the first: on the §4a interior most
+match their drawable's LOD 1, which an export without `--lod 1` does not hold, so `bvh_match.py` finds no candidate
+for them there.
 
 ```powershell
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
@@ -433,7 +437,8 @@ repository:
 1. `tools/bvh_index.py` on `core_bvh4.rpf` lists each `bvh4` stream and its descriptor row; the 3x4 at `+0x50` is
    the transform the matching needs, and a carved stream is passed to the next tools with `--header-offset 256`
    (or `0` when the structure was carved from its own header);
-2. export a window of `levels.rpf` that holds that region's drawables (`rpf9dump models`, `--start`/`--length`);
+2. export a window of `levels.rpf` that holds that region's drawables (`rpf9dump models`, `--start`/`--length`),
+   and the same window with `--lod 1` for a BLAS that finds no candidate at LOD 0;
 3. `tools/bvh_match.py` identifies the drawable's geometries against it, and `--write <dir>` stores exactly those
    geometries as the float3 and uint32 buffers the next step takes, with the transform recorded in `export.json`;
 4. `tools/bvh_rehydrate.py` on the same stream with those buffers and `--transform` gives the runtime layout,
