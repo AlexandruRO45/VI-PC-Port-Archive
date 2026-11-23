@@ -65,6 +65,16 @@ class CliErrorTest(unittest.TestCase):
         self.assertTrue(lines[0].startswith(f"ERROR: {sys.executable} failed with exit status 2: "), lines)
         self.assertIn("absent.spv", lines[0])
 
+    def test_spirv_dis_output_in_no_code_page(self):
+        # Bytes undefined in cp1252 and cp1251 and invalid UTF-8: without errors="replace" the reader thread dies on
+        # them and the tool ends in a UnicodeDecodeError traceback instead of one ERROR line.
+        src = os.path.join(self.tmp.name, "undecodable.py")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write('import sys\nsys.stderr.buffer.write(b"bad \\x81\\x98\\xff\\n")\nsys.exit(1)\n')
+        lines = self.assert_failed(self.run_tool(sys.executable, sys.executable, src=src))
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith(f"ERROR: {sys.executable} failed with exit status 1: bad "), lines)
+
     def test_spirv_as_that_cannot_be_started(self):
         lines = self.assert_failed(self.run_tool(sys.executable, self.missing))
         self.assertEqual(len(lines), 1, lines)
