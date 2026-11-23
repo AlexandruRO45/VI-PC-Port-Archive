@@ -188,5 +188,31 @@ class VCvtPkrtzF16F32EdgeCasesTests(unittest.TestCase):
         self.assertEqual(ref_f32_to_f16_rtz(0x00000001), 0x0000)
         self.assertEqual(ref_f32_to_f16_rtz(0.00005) & 0x7C00, 0x0000)
 
+class VCvtPkrtzF16F32TranslatorTests(unittest.TestCase):
+    def test_translation_basic(self):
+        lines = [
+            "v_mov_b32 v1, 1.0",
+            "v_mov_b32 v2, 2.0",
+            "v_cvt_pkrtz_f16_f32 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pkrtz_basic", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word, 0x40003C00)
+
+    def test_translation_boundary_saturation(self):
+        lines = [
+            "v_mov_b32 v1, 70000.0",
+            "v_mov_b32 v2, -80000.0",
+            "v_cvt_pkrtz_f16_f32 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pkrtz_sat", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word & 0xFFFF, 0x7BFF)
+        self.assertEqual((word >> 16) & 0xFFFF, 0xFBFF)
+
 if __name__ == '__main__':
     unittest.main()
