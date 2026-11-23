@@ -734,6 +734,18 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\cache\\from_template", L"GAME:\\cache\\renamed") != FALSE &&
                   std::filesystem::is_directory(overlay / "cache" / "renamed"),
               "an overlay folder is renamed");
+        check(move_w(L"GAME:\\misc\\keep.txt", L"GAME:\\cache") == FALSE &&
+                  GetLastError() == ERROR_ALREADY_EXISTS,
+              "MoveFileW reports an existing destination directory for a file");
+        check(move_w(L"GAME:\\cache\\renamed", L"GAME:\\misc") == FALSE &&
+                  GetLastError() == ERROR_ALREADY_EXISTS,
+              "MoveFileW reports an existing destination directory for a folder");
+        check(move_ex_w(L"GAME:\\misc\\keep.txt", L"GAME:\\cache", MOVEFILE_REPLACE_EXISTING) == FALSE &&
+                  GetLastError() == ERROR_ACCESS_DENIED,
+              "MoveFileExW cannot replace a directory with a file");
+        check(move_ex_w(L"GAME:\\cache\\renamed", L"GAME:\\misc", MOVEFILE_REPLACE_EXISTING) == FALSE &&
+                  GetLastError() == ERROR_ACCESS_DENIED,
+              "MoveFileExW cannot replace a directory with a folder");
         SetLastError(0);
         check(move_w(L"GAME:\\misc", L"GAME:\\misc2") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a package folder is not moved");
