@@ -196,6 +196,11 @@ class TestParentTableBounds(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", out, 0)[0], kept_flags)
         self.assertEqual(struct.unpack_from("<I", out, 16)[0], 0)
 
+    def test_stored_parent_entry_ends_at_offset_to_elements(self):
+        hdr = R.Header(header(0x300, 1, (0, 0, 0, 1, 1, 1), 0x200, ptr(0x200, R.BOX32), 0x100, 0x40))
+        self.assertEqual(hdr.stored_parent_entry(0x200, 0x300), 0x40 + 16)     # unit 4 is inside the table
+        self.assertIsNone(hdr.stored_parent_entry(0x100 + 64 * 48, 0x300))     # entry == offsetToElements
+
 
 class TestLeafFrame(unittest.TestCase):
     def test_scale_and_translation(self):
