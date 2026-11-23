@@ -98,7 +98,8 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertEqual(record, report["runs"]["full"])
             self.assertEqual(record["outcome"], "launch_failed")
             self.assertIsNone(record["returncode"])
-            self.assertEqual(record["cmd"][0], str(bad_loader))
+            # the runner resolves its paths (macOS temp is /var -> /private/var)
+            self.assertEqual(record["cmd"][0], str(bad_loader.resolve()))
             self.assertTrue(record["launch_error"])
             for stream in ("stdout", "stderr"):
                 contents = (out / "logs" / f"full.{stream}.log").read_bytes()
