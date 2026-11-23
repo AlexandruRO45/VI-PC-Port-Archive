@@ -438,6 +438,14 @@ class TestBoundaryExtremes(unittest.TestCase):
         result = ref_sad_u8(0xFFFFFFFF, 0x00000000, 0xFFFFFFFF)
         self.assertEqual(result, (0xFFFFFFFF + 1020) & MASK32)
 
+        words = run_ps_sad_u8([
+            "v_mov_b32 v0, 0x04030201",
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 0xFFFFFFFF",
+            "v_sad_u8 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], 9)
+
     def test_float_bit_patterns_treated_as_raw_bits(self):
         # -0.0 (0x80000000) vs +0.0 (0x00000000):
         # bytes: 0x00, 0x00, 0x00, 0x80 vs 0x00, 0x00, 0x00, 0x00
@@ -483,6 +491,15 @@ class TestNegativeControlsAndMutation(unittest.TestCase):
         self.assertEqual(unsigned_abs_diff, 255)
         self.assertNotEqual(unsigned_abs_diff, (b0 - b1) & MASK32)
 
+        # Translator execution when S0 < S1 catches wrapping difference (S0.b - S1.b)
+        words = run_ps_sad_u8([
+            "v_mov_b32 v0, 0x00000000",
+            "v_mov_b32 v1, 0x04030201",
+            "v_mov_b32 v2, 0",
+            "v_sad_u8 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], 10)
+
     def test_mutation_accumulator_missing(self):
         # Without S2, 0x04030201 vs 0 would give 10, not 60
         correct = ref_sad_u8(0x04030201, 0x00000000, 50)
@@ -497,6 +514,35 @@ class TestNegativeControlsAndMutation(unittest.TestCase):
         self.assertEqual(ref_sad_u8(0x01020304, 0x04030201, 0), 8)
         # But not 10 (what 0x04030201 vs 0x00000000 gives)
         self.assertNotEqual(ref_sad_u8(0x01020304, 0x04030201, 0), 10)
+
+        # Translator-backed execution asserting byte order sensitivity
+        words = run_ps_sad_u8([
+            "v_mov_b32 v0, 0x01020304",
+            "v_mov_b32 v1, 0x04030201",
+            "v_mov_b32 v2, 0",
+            "v_sad_u8 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], 8)
+
+    def test_translator_identical_sources_distinguishes_byte_swap(self):
+        # When S0 == S1 == 0xFF000000 and acc = 5, all 4 byte diffs are 0, so result = 5.
+        # Swapping bytes 2 and 3 of S1 during extraction would erroneously yield 515.
+        words_identical = run_ps_sad_u8([
+            "v_mov_b32 v0, 0xFF000000",
+            "v_mov_b32 v1, 0xFF000000",
+            "v_mov_b32 v2, 5",
+            "v_sad_u8 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words_identical[0], 5)
+
+        # Distinct inputs: 0xFF000000 vs 0x00000000 with acc = 5 -> 255 + 5 = 260.
+        words_diff = run_ps_sad_u8([
+            "v_mov_b32 v0, 0xFF000000",
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 5",
+            "v_sad_u8 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words_diff[0], 260)
 
     def test_translator_emits_sad_u8_spir_v(self):
         lines = [
