@@ -217,18 +217,18 @@ which serves both classes, and every probe call that has no side effect is match
 | capture 3 | `XAppCaptureTakeDiagnosticScreenshot` | not called (takes a screenshot) | `E_INVALIDARG` without a result, else `E_NOINTERFACE` |
 | capture 4 | `XAppCaptureRecordDiagnosticClip` | not called (records) | `E_INVALIDARG` without a result, else `E_NOINTERFACE` |
 | capture 5 | `XAppCaptureTakeScreenshot` | not called (takes a screenshot) | `E_INVALIDARG` without a user or result, else `E_NOINTERFACE` |
-| capture 6 | `XAppCaptureOpenScreenshotStream` | null id `E_INVALIDARG`, unknown id `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`, outputs untouched | the same, for every id |
+| capture 6 | `XAppCaptureOpenScreenshotStream` | null id `E_INVALIDARG`, unknown id `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`, outputs untouched | the same, for every id, and `E_INVALIDARG` for a null handle or size pointer (not measured) |
 | capture 7, 8 | `XAppCaptureRead/CloseScreenshotStream` | `CloseScreenshotStream(nullptr)` dereferences the handle and faults | `E_INVALIDARG`, the handle is never dereferenced |
 | capture 9, 10 | `XAppCaptureEnableRecord` / `DisableRecord` | not called (changes the capture setting) | `S_OK`, nothing records |
 | capture 11 | `XAppCaptureGetVideoCaptureSettings` | `E_NOINTERFACE`, settings untouched, null `E_INVALIDARG` | the same |
 | capture 12 | `XAppCaptureRecordTimespan` | not called (records) | `E_INVALIDARG` without a start time or result, else `E_NOINTERFACE` |
 | capture 13, 14 | `XAppCaptureRead/CloseLocalStream` | not called | `E_INVALIDARG` |
-| capture 15 | `XAppCaptureStartUserRecord` | null user `E_INVALIDARG` | the same, else `E_NOINTERFACE` |
+| capture 15 | `XAppCaptureStartUserRecord` | null user and null buffer in one call `E_INVALIDARG`, so which of the two it checks is not known | `E_INVALIDARG` for a null user or a null buffer (the buffer alone is not measured), else `E_NOINTERFACE` |
 | capture 16, 17 | `XAppCaptureStopUserRecord` / `CancelUserRecord` | null id `E_INVALIDARG`, unknown id `E_NOINTERFACE` | the same, for every id |
 | metadata 3 | `XAppBroadcastIsAppBroadcasting` | `false` | `false` |
 | metadata 4 | `XAppBroadcastShowUI` | not called (opens system UI) | `E_INVALIDARG` without a user, else `E_NOINTERFACE` |
-| metadata 5 | `XAppBroadcastGetStatus` | null user `E_INVALIDARG`, status untouched | the same, and with a user `S_OK` with only `isDisabledBySystem` set |
-| metadata 6, 17 | `XAppBroadcastRegisterIsAppBroadcastingChanged` / `XAppCaptureRegisterMetadataPurged` | `S_OK` with a nonzero token, null token or callback `E_POINTER` | the same, the callbacks never fire |
+| metadata 5 | `XAppBroadcastGetStatus` | null user `E_INVALIDARG`, status untouched | the same, `E_INVALIDARG` for a null status with a user (not measured), and with a user `S_OK` with only `isDisabledBySystem` set |
+| metadata 6, 17 | `XAppBroadcastRegisterIsAppBroadcastingChanged` / `XAppCaptureRegisterMetadataPurged` | `S_OK` with a nonzero token, slot 6 with a null token and slot 17 with a null callback `E_POINTER` | the same, `E_POINTER` for the other null argument of each too (not measured), the callbacks never fire |
 | metadata 7, 18 | the two unregister calls | `true`, an unknown token too | `true` |
 | metadata 8-13 | `XAppCaptureMetadataAdd*Event` / `Start*State` | `S_OK`, null or empty name `E_INVALIDARG`, null string value and any priority accepted | the same, the metadata is dropped |
 | metadata 14, 15 | `XAppCaptureMetadataStopState` / `StopAllStates` | `S_OK`, for a null, empty or unknown name too | the same |
