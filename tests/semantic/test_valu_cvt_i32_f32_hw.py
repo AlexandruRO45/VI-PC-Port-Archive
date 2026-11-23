@@ -473,3 +473,44 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         spv = support.translate_lines("ps_flags_test", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 15)
+
+
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_positive_and_negative(self) -> None:
+        """Verify subnormal floating-point numbers truncate to 0."""
+        self.assertEqual(oracle_cvt_i32_f32(0x0000_0001), 0)
+        self.assertEqual(oracle_cvt_i32_f32(0x007F_FFFF), 0)
+        self.assertEqual(oracle_cvt_i32_f32(0x8000_0001), 0)
+        self.assertEqual(oracle_cvt_i32_f32(0x807F_FFFF), 0)
+
+    def test_just_below_integer_boundaries(self) -> None:
+        """Verify truncation for floats strictly below integers."""
+        # 0.99999994 -> 0
+        self.assertEqual(oracle_cvt_i32_f32(0x3F7F_FFFF), 0)
+        # -0.99999994 -> 0
+        self.assertEqual(oracle_cvt_i32_f32(0xBF7F_FFFF), 0)
+
+    def test_saturation_at_int32_limits(self) -> None:
+        """Verify saturation at +2^31 and -2^31 thresholds."""
+        # 2^31 as float: 0x4F000000 -> saturates to 0x7FFFFFFF
+        self.assertEqual(oracle_cvt_i32_f32(0x4F00_0000), 0x7FFF_FFFF)
+        # -2^31 as float: 0xCF000000 -> saturates to 0x80000000
+        self.assertEqual(oracle_cvt_i32_f32(0xCF00_0000), 0x8000_0000)
+        # Numbers larger than 2^31 (e.g. 1e15)
+        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(1e15)), 0x7FFF_FFFF)
+        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(-1e15)), 0x8000_0000)
+
+    def test_infinities_and_nans(self) -> None:
+        """Verify +inf/-inf saturate and NaNs yield 0."""
+        self.assertEqual(oracle_cvt_i32_f32(0x7F80_0000), 0x7FFF_FFFF)
+        self.assertEqual(oracle_cvt_i32_f32(0xFF80_0000), 0x8000_0000)
+        self.assertEqual(oracle_cvt_i32_f32(0x7FC0_0000), 0)
+        self.assertEqual(oracle_cvt_i32_f32(0xFFC0_0000), 0)
+        self.assertEqual(oracle_cvt_i32_f32(0x7F80_0001), 0)
+        self.assertEqual(oracle_cvt_i32_f32(0xFF80_0001), 0)
