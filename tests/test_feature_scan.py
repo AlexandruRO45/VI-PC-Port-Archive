@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 sys.path.insert(0, TOOLS)
@@ -508,6 +509,24 @@ def test_a_failed_check_fails_only_its_own_test():
     check([r.splitlines()[0] for r in reported] == ["FAIL fails_a_check: 1 check(s) failed"],
           f"with its own count in the message ({reported})")
     assert failures == 0, f"{failures} script-runner check(s) failed"
+
+
+def test_out_write_failure_preserves_previous_report():
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = '{"previous": true}'
+        path = os.path.join(tmp, "feature_scan.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(F, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            raised = False
+            try:
+                F.write_json_report(path, {"shaders": 0})
+            except OSError:
+                raised = True
+            check(raised, "write_json_report raises when replace fails")
+        with open(path, encoding="utf-8") as f:
+            check(f.read() == previous, "failed --out write leaves the previous report intact")
+    assert failures == 0, f"{failures} preserve check(s) failed"
 
 
 def run_tests(tests, report=print):
