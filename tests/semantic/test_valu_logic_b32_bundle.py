@@ -754,3 +754,43 @@ class TestNotB32NegativeAndTranslator(unittest.TestCase):
         ])
         self.assertIn("OpNot", spv)
         self.assertEqual(val, 0xFFFFFF00)
+
+
+# ------------------------------------------------------------------------------
+# v_xnor_b32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_xnor_b32(s0: int, s1: int) -> int:
+    return (~(s0 ^ s1)) & MASK32
+
+
+class TestXnorB32Oracle(unittest.TestCase):
+    def test_oracle_matches_hardware(self):
+        vectors = [
+            (0xFF00, 0x0FF0),
+            (0, 0),
+            (0xFFFF_FFFF, 0xFFFF_FFFF),
+            (0xAAAA_AAAA, 0x5555_5555),
+            (0x1234_5678, 0x8765_4321),
+        ]
+        for idx, (a, b) in enumerate(vectors):
+            val, _ = run_shader(f"ps_xnor_oracle_{idx}", [
+                f"v_mov_b32 v1, {hex(a)}",
+                f"v_mov_b32 v2, {hex(b)}",
+                "v_xnor_b32 v0, v1, v2",
+            ])
+            self.assertEqual(val, ref_xnor_b32(a, b))
+
+    def test_oracle_identities_hardware(self):
+        val_self, _ = run_shader("ps_xnor_self", [
+            "v_mov_b32 v1, 0xCAFEBABE",
+            "v_xnor_b32 v0, v1, v1",
+        ])
+        self.assertEqual(val_self, 0xFFFFFFFF)
+
+        val_opp, _ = run_shader("ps_xnor_opp", [
+            "v_mov_b32 v1, 0x55555555",
+            "v_mov_b32 v2, 0xAAAAAAAA",
+            "v_xnor_b32 v0, v1, v2",
+        ])
+        self.assertEqual(val_opp, 0)
