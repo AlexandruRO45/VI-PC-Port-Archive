@@ -18,6 +18,8 @@ Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
 Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
 Prints coverage and validation results.
 """
+from __future__ import annotations
+
 import argparse
 import hashlib
 import os
