@@ -21,6 +21,9 @@ This page collects the setup steps and the problems testers have run into so far
     `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`.
 
   On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough, if it is 21 or newer.
+  Homebrew's `llvm` is keg-only, so `brew install llvm` does not put `llvm-mc` on `PATH`: add
+  `export PATH="$(brew --prefix llvm)/bin:$PATH"` (or set `LLVM_MC` to it), or `build.py` stops with
+  `'llvm-mc' could not be started: [Errno 2] No such file or directory: 'llvm-mc'`.
 
   An older `llvm-mc` is not enough for everything. Ubuntu 24.04's `llvm-18` (18.1.3) runs `run_gpu_tests.py`,
   `valu_fuzz.py --family mem` and `lds_fuzz.py`, but rejects `op_sel` on the 16-bit integer VOP3 forms that
