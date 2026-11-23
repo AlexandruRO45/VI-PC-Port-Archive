@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -94,6 +95,11 @@ D3D12 = [
 ]
 
 
+def deep_json_record():
+    depth = sys.getrecursionlimit() * 2
+    return '{"kind":"future_event","detail":' + '[' * depth + '0' + ']' * depth + '}'
+
+
 class BootTraceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -171,6 +177,47 @@ class BootTraceTests(unittest.TestCase):
         text = bt.format_text(bt.summarize(bt.parse_startup(self.startup), None), 10)
         self.assertIn("debug strings: 1", text)
         self.assertNotIn("secret game text", text)
+
+    def test_deep_json_does_not_hide_surrounding_events(self):
+        # The runtime does not emit deeply nested records, but a damaged or foreign trace can contain one.
+        deep = deep_json_record()
+        with self.assertRaises(RecursionError):
+            json.loads(deep)
+        self.write_lines(self.startup, [
+            '{"kind":"trace_open","pid":7}', deep, '{"kind":"exit","code":42}',
+        ])
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual((trace["events"], trace["bad_lines"], trace["bad_line_numbers"]), (2, 1, [2]))
+        self.assertEqual((trace["pid"], trace["exit"]), (7, 42))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["startup"]["exit"], 42)
+        self.assertEqual(err.getvalue(), "")
+
+    def test_only_deep_json_reports_no_valid_event(self):
+        deep = deep_json_record()
+        self.write_lines(self.startup, [deep])
+        self.write_lines(self.d3d12, ["[d3d12-trace] #1 CreateDevice ok"])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bt.main([self.startup, "--d3d12", self.d3d12, "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("no valid startup event", err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["d3d12"]["calls"], 1)
+
+    def test_deep_json_real_cli_preserves_other_events(self):
+        self.write_lines(self.startup, [
+            '{"kind":"trace_open","pid":7}', deep_json_record(), '{"kind":"exit","code":42}',
+        ])
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "boot_trace.py"), self.startup, "--json"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        trace = json.loads(result.stdout)["startup"]
+        self.assertEqual((trace["bad_lines"], trace["bad_line_numbers"], trace["exit"]), (1, [2], 42))
+        self.assertEqual(result.stderr, "")
 
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)

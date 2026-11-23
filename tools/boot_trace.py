@@ -78,7 +78,8 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 event = json.loads(line)
                 if isinstance(event, dict) and event.get("kind") == "exit" and type(event.get("code")) is not int:
                     event = None
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                # An unexpectedly deep JSON value can exceed the decoder's recursion limit.
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)
