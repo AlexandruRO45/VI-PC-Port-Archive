@@ -68,6 +68,9 @@ if crasher in active or len(active) > config.get("max_batch", 1000000):
     sys.exit(70)
 # This stand-in's cache contains completed names so the test can detect lost checkpoints and repeated work.
 completed = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else []
+for i, arg in enumerate(args):
+    if arg == "--merge-cache":
+        completed += json.loads(Path(args[i + 1]).read_text(encoding="utf-8"))
 cache.write_text(json.dumps(completed + active), encoding="utf-8", newline="\n")
 record("completed")
 if inflight:
@@ -95,7 +98,7 @@ class PipelineBatchesTest(unittest.TestCase):
         (self.spirv / "index.json").write_text(json.dumps({n: {} for n in reversed(names)}),
                                                 encoding="utf-8", newline="\n")
 
-    def invoke(self, control=None, range_support=True):
+    def invoke(self, control=None, range_support=True, merge_support=True):
         (self.spirv / "control.json").write_text(json.dumps(control or {}), encoding="utf-8", newline="\n")
         def run(args, hint="", check=True, **kwargs):
             args = [str(a) for a in args]
@@ -106,7 +109,7 @@ class PipelineBatchesTest(unittest.TestCase):
                 raise SystemExit(1)
             return done.returncode
         def supports(exe, *options):
-            return range_support or "--start" not in options
+            return (range_support or "--start" not in options) and (merge_support or "--merge-cache" not in options)
         logs, err = [], io.StringIO()
         # create=True keeps the regression runnable on the old implementation, which lacks this constant.
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="synthetic-checker"), \
@@ -128,7 +131,7 @@ class PipelineBatchesTest(unittest.TestCase):
     def test_bounded_processes_cover_the_sorted_index_and_tail(self):
         code, _, err = self.invoke()
         self.assertEqual(code, 0, err)
-        completed = self.calls("completed")
+        completed = [r for r in self.calls("completed") if "--merge-cache" not in r["args"]]
         self.assertEqual([r["selected"] for r in completed], [self.names[:3], self.names[3:6], self.names[6:]])
         self.assertEqual(len({r["pid"] for r in completed}), 3)
         self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), self.names)
@@ -229,6 +232,59 @@ class PipelineBatchesTest(unittest.TestCase):
         code, _, err = self.invoke()
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.commands), 1)
+        self.assertEqual(self.commands[0][2], str(self.out / "pipeline_cache.bin"))
+        self.assertFalse((self.out / "pipeline_cache.parts").exists())
+
+    def batch_and_merge_commands(self):
+        merges = [c for c in self.commands if "--merge-cache" in c]
+        return [c for c in self.commands if c not in merges], merges
+
+    def test_each_batch_keeps_its_own_cache_part_and_the_parts_are_merged_once(self):
+        code, logs, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        batches, merges = self.batch_and_merge_commands()
+        parts = [c[2] for c in batches]
+        self.assertEqual(len(set(parts)), 3)
+        self.assertTrue(all(Path(p).parent == self.out / "pipeline_cache.parts" for p in parts), parts)
+        self.assertEqual(len(merges), 1)
+        merge = merges[0]
+        self.assertEqual([merge[i + 1] for i, a in enumerate(merge) if a == "--merge-cache"], parts)
+        self.assertEqual(merge[merge.index("--start") + 1], str(len(self.names)))   # checks no shader itself
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), self.names)
+        self.assertTrue(all(Path(p).exists() for p in parts))   # they seed the same ranges on the next run
+        self.assertFalse((self.out / "pipeline_cache.bin.merging").exists())
+        self.assertTrue(any("merging 3 batch cache(s)" in line for line in logs), logs)
+
+    def test_a_rerun_seeds_each_batch_from_its_own_part(self):
+        self.assertEqual(self.invoke()[0], 0)
+        first = [c[2] for c in self.batch_and_merge_commands()[0]]
+        self.commands.clear()
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual([c[2] for c in self.batch_and_merge_commands()[0]], first)
+
+    def test_parts_of_an_earlier_batch_layout_are_removed_after_the_merge(self):
+        parts = self.out / "pipeline_cache.parts"
+        parts.mkdir(parents=True)
+        stale = parts / "000000-000500.bin"
+        stale.write_text(json.dumps(["old"]), encoding="utf-8", newline="\n")
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(stale.exists())
+        self.assertNotIn("old", json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")))
+
+    def test_an_interrupted_run_keeps_the_previous_cache(self):
+        self.out.mkdir()
+        (self.out / "pipeline_cache.bin").write_text(json.dumps(["previous"]), encoding="utf-8", newline="\n")
+        code, _, _ = self.invoke({"interrupt": True})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.batch_and_merge_commands()[1], [])
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), ["previous"])
+
+    def test_a_checker_without_merge_cache_seeds_every_batch_with_the_whole_cache(self):
+        code, _, err = self.invoke(merge_support=False)
+        self.assertEqual(code, 0, err)
+        self.assertEqual({c[2] for c in self.commands}, {str(self.out / "pipeline_cache.bin")})
+        self.assertEqual(len(self.commands), 3)
 
 
 if __name__ == "__main__":

@@ -790,7 +790,7 @@ int main(int argc, char** argv) {
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
-            "[--skip-file F]\n");
+            "[--skip-file F] [--merge-cache F ...]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
@@ -804,6 +804,7 @@ int main(int argc, char** argv) {
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
     size_t isolate_batch = 256;
+    std::vector<std::string> merge_paths;   // --merge-cache: other checkers' caches folded into this one
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         auto value = [&]() -> std::string_view {
@@ -845,6 +846,11 @@ int main(int argc, char** argv) {
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
+        else if (a == "--merge-cache") {
+            const auto path = value();
+            valid = !path.empty();
+            if (valid) merge_paths.emplace_back(path);
+        }
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
@@ -875,6 +881,14 @@ int main(int argc, char** argv) {
 
     if (isolate && !stats_path.empty()) {
         std::fprintf(stderr, "--isolate cannot be combined with --stats\n");
+        return 2;
+    }
+    if (isolate && !merge_paths.empty()) {
+        std::fprintf(stderr, "--isolate cannot be combined with --merge-cache\n");
+        return 2;
+    }
+    if (!merge_paths.empty() && cache_path.empty()) {
+        std::fprintf(stderr, "--merge-cache needs a cache path to write the merged cache to\n");
         return 2;
     }
 #ifdef _WIN32
@@ -1237,6 +1251,7 @@ int main(int argc, char** argv) {
     LOADD(vkCreateShaderModule); LOADD(vkDestroyShaderModule); LOADD(vkCreateDescriptorSetLayout);
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateGraphicsPipelines);
     LOADD(vkDestroyPipeline); LOADD(vkCreatePipelineCache); LOADD(vkGetPipelineCacheData);
+    LOADD(vkMergePipelineCaches); LOADD(vkDestroyPipelineCache);
     LOADD(vkGetPipelineExecutablePropertiesKHR); LOADD(vkGetPipelineExecutableStatisticsKHR);
     const VkPipelineCreateFlags capture = stats_path.empty() ? 0 : VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 
@@ -1399,6 +1414,31 @@ int main(int argc, char** argv) {
         }
     }
     std::vector<char>().swap(seed);  // the driver has copied the seed; it can be several GiB
+    for (const auto& path : merge_paths) {
+        std::ifstream mf(path, std::ios::binary);
+        if (!mf) {
+            std::fprintf(stderr, "error: cannot read --merge-cache %s\n", path.c_str());
+            return 2;
+        }
+        std::vector<char> data(std::istreambuf_iterator<char>(mf), {});
+        if (data.empty()) continue;
+        VkPipelineCacheCreateInfo mci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        mci.initialDataSize = data.size();
+        mci.pInitialData = data.data();
+        VkPipelineCache part = VK_NULL_HANDLE;
+        if (VkResult r = vkCreatePipelineCache(dev, &mci, nullptr, &part)) {
+            std::fprintf(stderr, "--merge-cache %s: vkCreatePipelineCache failed: %d\n", path.c_str(), r);
+            return 1;
+        }
+        std::vector<char>().swap(data);
+        const VkResult r = vkMergePipelineCaches(dev, cache, 1, &part);
+        vkDestroyPipelineCache(dev, part, nullptr);
+        if (r != VK_SUCCESS) {
+            std::fprintf(stderr, "--merge-cache %s: vkMergePipelineCaches failed: %d\n", path.c_str(), r);
+            return 1;
+        }
+        std::fprintf(stderr, "merged the pipeline cache from %s\n", path.c_str());
+    }
     auto save_cache = [&](bool final_save) {
         if (cache_path.empty()) return true;
         try {

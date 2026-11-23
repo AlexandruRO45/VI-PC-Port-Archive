@@ -2383,13 +2383,32 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
+    ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
+              for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
+    # With several batches, each range keeps its own cache part, seeded from the same part on the next run, and the
+    # parts are merged into pipeline_cache.bin once at the end. Seeding every batch with the whole cache would read
+    # and rewrite it once per batch: tens of seconds each once the cache holds the full corpus.
+    parts_dir = os.path.join(out, PIPELINE_CACHE_PARTS)
+    use_parts = len(ranges) > 1 and checker_supports(exe, "--merge-cache")
+    used_parts: "list[str]" = []
+
+    def cache_for(start: int, count: "int | None") -> str:
+        if not use_parts or count is None:
+            return cache
+        os.makedirs(parts_dir, exist_ok=True)
+        part = os.path.join(parts_dir, f"{start:06d}-{count:06d}.bin")
+        if part not in used_parts:
+            used_parts.append(part)
+        return part
 
     def check_range(start: int = 0, count: "int | None" = None) -> int:
         selection = ["--start", str(start), "--count", str(count)] if count is not None else []
         allowed = set(names[start:start + count]) if count is not None else None
+        range_cache = cache_for(start, count)
+        checker = [*base[:2], range_cache, *base[3:]]
         for _ in range(PIPELINE_CRASH_RETRIES + 1):
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
-            code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
+            code = run(checker + selection + (["--skip-file", skip] if crashed else []), check=False)
             # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
             # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
             if code == 1 and not os.path.isfile(inflight):
@@ -2401,7 +2420,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                                           if n not in crashed and (allowed is None or n in allowed)))
             # Even the last in-flight module can be innocent after other heavy compiles in the batch.
             if count is not None or len(suspects) > 1:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
+                suspects = [n for n in suspects if crashes_alone(exe, spirv, range_cache, n, inflight)]
             if not suspects:
                 if count is not None and count > 1:
                     # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
@@ -2426,8 +2445,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
              + ", ".join(crashed))
 
     code = 0
-    ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
-              for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
+    stopped = False
     for start, count in ranges:
         if count is not None:
             log(f"pipelines: checking shaders {start + 1}-{start + count} of {len(names)} in a fresh process")
@@ -2435,10 +2453,18 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         if result:
             code = result   # a later successful batch must not erase an earlier validation failure
         if result == 2 or interrupted(result):
+            stopped = True
             break
     if crashed and not code:
         code = 1
     drop(inflight)
+    written = [p for p in used_parts if os.path.isfile(p)]
+    if written and not stopped:
+        merge_cache_parts(exe, spirv, cache, written, len(names))
+        current = {os.path.normcase(os.path.abspath(p)) for p in used_parts}
+        for stale in glob.glob(os.path.join(glob.escape(parts_dir), "*.bin")):
+            if os.path.normcase(os.path.abspath(stale)) not in current:
+                os.remove(stale)   # a range of an earlier batch layout; nothing seeds from it any more
     if code != 0:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
@@ -2450,6 +2476,23 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
 # 10 minutes since the last cache checkpoint, plus loading the cache). Looked up when pipelines() runs.
 PIPELINE_CRASH_RETRIES = 5
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
+PIPELINE_CACHE_PARTS = "pipeline_cache.parts"   # beside pipeline_cache.bin: one cache per batch range
+
+
+def merge_cache_parts(exe: str, spirv: str, cache: str, parts: "list[str]", entries: int) -> None:
+    """Merge the batch caches into `cache` with one checker run that checks no shader (its range starts past the
+    index), then replace `cache` with the result."""
+    merged = cache + ".merging"
+    drop(merged)
+    log(f"pipelines: merging {len(parts)} batch cache(s) into {os.path.basename(cache)}")
+    args = [exe, spirv, merged, "--jobs", "1", "--start", str(entries), "--count", "1"]
+    for part in parts:
+        args += ["--merge-cache", part]
+    code = run(args, check=False)
+    if code != 0 or not os.path.isfile(merged):
+        fail(f"vk_pipeline_check could not merge the batch caches ({exit_label(code)}); they stay in "
+             f"{os.path.dirname(parts[0])} for the next run")
+    os.replace(merged, cache)
 
 
 def interrupted(code: int) -> bool:

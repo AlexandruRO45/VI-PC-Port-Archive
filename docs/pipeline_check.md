@@ -341,10 +341,17 @@ that size. Which threads the game creates pipelines on is not known without its 
 
 `make_game.py` runs the pipelines stage in fresh checker processes over at most **500 index entries** each, on
 Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
-short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
+short range. Each range keeps its own cache part in `pipeline_cache.parts\<start>-<count>.bin`, which seeds the
+same range on the next run, and one more checker run that checks no shader (its `--start` is past the index) merges
+the parts into `pipeline_cache.bin` with `--merge-cache` (`vkMergePipelineCaches`). Parts of an earlier batch layout
+are removed after the merge; an interrupted run merges nothing and keeps the previous `pipeline_cache.bin`. Seeding
+every batch with the whole cache instead reads and rewrites it once per batch: on an RTX 4080 (NVIDIA 621.24) a
+one-shader run takes 0.9 s with an empty cache and 36-51 s with the 5.1 GB cache of the full corpus. A checker
+without `--merge-cache` keeps that single shared cache.
+
 This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
-memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
-options keeps the older invocation; rebuild the runtime to get batching.
+memory. A work folder with at most 500 entries keeps the single invocation and `pipeline_cache.bin` directly. An
+older checker without the range options keeps the older invocation; rebuild the runtime to get batching.
 
 If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
 is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in
