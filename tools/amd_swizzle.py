@@ -18,6 +18,9 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 HEADER = os.environ.get("AMD_SWIZZLE_HEADER", r"<ref>\mesa-addrlib\gfx10SwizzlePattern.h")
 BPE_INDEX = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}
 # Address bits of one block for each pattern table size, as tex_mode_probe.py uses them (12 for 4 KB, 16 for 64 KB).
@@ -175,7 +178,7 @@ def detile(data, eq, bpe, wb, hb, block_bytes=65536):
     return raw[flat]
 
 
-def validate_out_path(out, blob, same_report_path):
+def validate_out_path(out, blob, same_report_path=same_report_path, header=None):
     """Return an error string if `out` cannot be used as an --out image path, or None."""
     if not out or not out.strip():
         return "--out path must not be empty"
@@ -193,14 +196,15 @@ def validate_out_path(out, blob, same_report_path):
         if nxt == cur:
             break
         cur = nxt
-    if same_report_path(out, blob) or (os.path.exists(out) and os.path.exists(blob) and os.path.samefile(out, blob)):
+    if same_report_path(out, blob):
         return f"--out must not overwrite the input {blob}"
+    if header is not None and same_report_path(out, header):
+        return f"--out must not overwrite the swizzle pattern header {header}"
     return None
 
 
 def main(argv=None):
-    sys.path.insert(0, os.path.dirname(__file__))
-    from tile_probe import same_report_path, score
+    from tile_probe import score
     from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
@@ -211,8 +215,9 @@ def main(argv=None):
     ap.add_argument("--modes", default="_64K_")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
+    header_path = os.environ.get("AMD_SWIZZLE_HEADER", HEADER)
     if a.out is not None:
-        err = validate_out_path(a.out, a.blob, same_report_path)
+        err = validate_out_path(a.out, a.blob, same_report_path, header_path)
         if err:
             print(f"ERROR: {err}", file=sys.stderr)
             return 2
@@ -222,7 +227,11 @@ def main(argv=None):
     except OSError as e:
         print(f"ERROR: {a.blob}: {e.strerror or e}", file=sys.stderr)
         return 2
-    nibbles, tables = load()
+    try:
+        nibbles, tables = load()
+    except (OSError, ValueError) as e:
+        print(f"ERROR: {header_path}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
     wb = (a.width + block - 1) // block

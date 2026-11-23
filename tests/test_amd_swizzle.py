@@ -194,6 +194,36 @@ class AmdSwizzleCliGuardTests(unittest.TestCase):
         self.assertIn("unknown file extension: .unknown", err)
         self.assertNotIn("Traceback", err)
 
+    def test_uses_shared_same_report_path_and_guards_header_input_and_load_errors(self):
+        import report_paths
+        self.assertIs(self.mod.same_report_path, report_paths.same_report_path)
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "blob.bin")
+            with open(blob, "wb") as f:
+                f.write(b"\x00" * 64)
+            hdr = os.path.join(tmp, "gfx10SwizzlePattern.h")
+            with open(hdr, "w", encoding="utf-8", newline="\n") as f:
+                f.write("/* header */\n")
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"AMD_SWIZZLE_HEADER": hdr}), \
+                 mock.patch.object(self.mod, "load") as load_mock, \
+                 mock.patch.object(sys, "stderr", stderr):
+                rc = self.mod.main([blob, "--width", "64", "--height", "64", "--out", hdr])
+            self.assertEqual(rc, 2)
+            self.assertIn("must not overwrite the swizzle pattern header", stderr.getvalue())
+            load_mock.assert_not_called()
+
+            missing_hdr = os.path.join(tmp, "missing_header.h")
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"AMD_SWIZZLE_HEADER": missing_hdr}), \
+                 mock.patch.object(self.mod, "load", side_effect=FileNotFoundError(2, "No such file", missing_hdr)), \
+                 mock.patch.object(sys, "stderr", stderr):
+                rc = self.mod.main([blob, "--width", "64", "--height", "64"])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", stderr.getvalue())
+            self.assertIn(missing_hdr, stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
 
 if __name__ == "__main__":
     if HAVE_NUMPY:
