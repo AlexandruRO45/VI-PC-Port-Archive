@@ -518,6 +518,25 @@ class PipelineCheckExeTest(unittest.TestCase):
         os.chmod(fallback, 0o755)
         self.assertEqual(self.exe("posix"), fallback)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
+    def test_pipeline_checker_in_cmake_configuration_subdirectory(self):
+        for config in ("Release", "Verifier", "Unlisted"):
+            os.makedirs(os.path.join(self.build, "linux", config))
+        with open(os.path.join(self.build, "linux", "CMakeCache.txt"), "w",
+                  encoding="utf-8", newline="\n") as cache:
+            cache.write("CMAKE_CONFIGURATION_TYPES:STRING=Release;Verifier\n")
+        os.chmod(self.touch("linux", "Release", "vk_pipeline_check"), 0o644)
+        os.chmod(self.touch("linux", "Unlisted", "vk_pipeline_check"), 0o755)
+        fallback = self.touch("vk_pipeline_check")
+        os.chmod(fallback, 0o755)
+        self.assertEqual(self.exe("posix"), fallback)
+        configured = self.touch("linux", "Verifier", "vk_pipeline_check")
+        os.chmod(configured, 0o755)
+        self.assertEqual(self.exe("posix"), configured)
+        flat = self.touch("linux", "vk_pipeline_check")
+        os.chmod(flat, 0o755)
+        self.assertEqual(self.exe("posix"), flat)
+
     def test_windows_finds_only_the_exe(self):
         self.touch("linux", "vk_pipeline_check")
         self.assertIsNone(self.exe("nt"))

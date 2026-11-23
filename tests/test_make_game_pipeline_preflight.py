@@ -161,14 +161,14 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
 
     def test_a_checker_built_where_it_isnt_looked_for_fails_in_preflight(self):
         with mock.patch.object(make_game, "build_pipeline_check") as build:
-            self.assert_preflight_fails(["shaders", "pipelines"], "delete runtime/build/linux")
+            self.assert_preflight_fails(["shaders", "pipelines"], "no executable was found in runtime/build/linux")
         build.assert_called_once()
 
     def test_missing_built_checker_does_not_initialize_asset_submodule(self):
         with mock.patch.object(make_game, "dotnet_sdk_ok", return_value=True), \
                 mock.patch.object(make_game, "build_pipeline_check") as build, \
                 mock.patch.object(make_game, "ensure_submodule") as initialize:
-            self.assert_preflight_fails(["shaders", "assets", "pipelines"], "delete runtime/build/linux")
+            self.assert_preflight_fails(["shaders", "assets", "pipelines"], "no executable was found in runtime/build/linux")
         build.assert_called_once()
         initialize.assert_not_called()
 

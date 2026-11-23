@@ -902,9 +902,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
         build_pipeline_check(jobs)
         if not pipeline_check_exe():
-            fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
-                 "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
-                 "runtime/build/linux and run the build again.")
+            fail("vk_pipeline_check built, but no executable was found in runtime/build/linux "
+                 "or its configuration subdirectories. Check the output location in the CMake log above.")
     if "assets" in stages:
         ensure_submodule()
 
@@ -2324,15 +2323,30 @@ def positive_int(text: str) -> int:
     return value
 
 
+def cmake_output_dirs(build: str):
+    """Yield the build directory and the output subdirectories of a multi-config tree."""
+    yield build
+    try:
+        with open(os.path.join(build, "CMakeCache.txt"), encoding="utf-8", errors="replace") as cache:
+            configs = next((line.partition("=")[2].strip() for line in cache
+                            if line.startswith("CMAKE_CONFIGURATION_TYPES:")), "")
+    except OSError:
+        return
+    for config in configs.split(";"):
+        if config and config not in (".", "..") and os.path.basename(config) == config:
+            yield os.path.join(build, config)
+
+
 def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     """Find the checker for this host, using a supplied Windows build before the local Windows build."""
     build = os.path.join(ROOT, "runtime", "build")
     windows = os.name == "nt"
     if windows:
         windows_builds = (runtime_build, build) if runtime_build else (build,)
-        found = [os.path.join(d, "vk_pipeline_check.exe") for d in windows_builds]
+        found = (os.path.join(d, "vk_pipeline_check.exe") for d in windows_builds)
     else:
-        found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
+        found = (os.path.join(d, "vk_pipeline_check") for folder in (os.path.join(build, "linux"), build)
+                 for d in cmake_output_dirs(folder))
     return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
