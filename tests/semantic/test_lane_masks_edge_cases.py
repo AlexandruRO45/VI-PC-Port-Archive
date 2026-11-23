@@ -33,6 +33,20 @@ def run_cs(name, asm, nlanes=4):
 
 
 class LaneMasksEndToEndTests(unittest.TestCase):
+    def test_an_and_with_minus_one_keeps_a_lane_mask_a_mask(self):
+        """lane_masks.kind reads the immediate -1 as a constant (EITHER), so s_and_b32 mask, -1 is still a mask."""
+        _, got = run_cs("cs_and_minus_one_mask", [
+            "v_cmp_gt_u32_e64 s4, 3, v0",
+            "s_and_b32 s5, s4, -1",
+            "s_bcnt1_i32_b32 s6, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "global_store_dword v3, v2, s[0:1]",
+            "s_endpgm",
+        ])
+        # s4 holds lanes 0-2, so the popcount is 3 in every lane; as plain data each lane would see its own bit.
+        self.assertEqual(got, [3] * 4)
+
     def test_dpp_bitwise_respects_row_mask_on_mask_operands(self):
         """v_or_b32_dpp must not enter mask_writes and bypass dpp_guard (row_mask:0x0 keeps old v2)."""
         _, got = run_cs("cs_dpp_mask", [
