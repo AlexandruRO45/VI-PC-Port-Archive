@@ -428,6 +428,17 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(index, "rb") as f:
             self.assertEqual(f.read(), before)
 
+    def test_out_that_is_a_folder_is_refused_before_the_harvest(self):
+        # A report path that is already a folder is a usage error, like bvh_index's --out. It also has to stop
+        # before the harvest: reading a real carve takes minutes, so noticing only at the write wastes the run.
+        out = os.path.join(self.dir, "reports")
+        os.makedirs(out)
+        p = self.run_tool(self.carve_dir, "--out", out)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("--out is a folder, not a dictionary file", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("strings so far", p.stdout)
+
     def assert_carved_blob_preserved(self, output, blob):
         with open(blob, "rb") as f:
             original = f.read()

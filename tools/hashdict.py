@@ -101,6 +101,10 @@ def main():
         if not os.path.exists(extra):
             print(f"ERROR: --extra input does not exist: {extra}", file=sys.stderr)
             return 2
+    if os.path.isdir(a.out):
+        # Refuse before the harvest: a full carve takes minutes, and open() would only call the folder a
+        # permission error afterwards, which is not what is wrong with the command.
+        ap.error(f"--out is a folder, not a dictionary file: {a.out}")
     # A folder with its own index.json is one archive's carve (<work>\carve\common, the folder the gamedata_*
     # tools take): harvest it as that archive. Otherwise each subfolder with an index.json is one archive.
     if os.path.isfile(os.path.join(a.carve, "index.json")):
