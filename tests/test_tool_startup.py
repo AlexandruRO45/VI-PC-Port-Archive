@@ -66,6 +66,7 @@ class ToolStartupTests(unittest.TestCase):
                 with open(path, encoding="utf-8") as source:
                     if "argparse.ArgumentParser" in source.read():
                         self.assertIn("usage:", proc.stdout.lower())
+                        self.assertIn(name, proc.stdout.lower())
 
     def test_the_short_help_spelling_starts_the_same_tools(self):
         paths = sibling_importers()
