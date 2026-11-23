@@ -1148,6 +1148,21 @@ class TestGlbWriterMainCli(unittest.TestCase):
                 with open(obj_path, encoding="utf-8", newline="") as f:
                     self.assertEqual(f.read(), text)
 
+    def test_main_cli_uses_same_report_path_for_folding_alias(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            obj_path = os.path.join(tmp_dir, "input.obj")
+            with open(obj_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            alias = os.path.join(tmp_dir, "INPUT.OBJ")
+            err = io.StringIO()
+            with mock.patch.object(glb_writer, "same_report_path", return_value=True) as mocked, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                ret = glb_writer.main([obj_path, alias])
+            self.assertEqual(ret, 1)
+            self.assertIn("overwrite the input", err.getvalue())
+            mocked.assert_called_once_with(obj_path, alias)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ from collections.abc import Iterable, Iterator
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -1384,8 +1385,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # write_glb replaces its target, so naming the OBJ as the output would silently destroy the model.
-        if os.path.exists(args.out_glb) and os.path.exists(args.in_obj) and os.path.samefile(
-                args.in_obj, args.out_glb):
+        if same_report_path(args.in_obj, args.out_glb):
             raise GlbError(f"output must not overwrite the input OBJ: {args.in_obj}")
         primitives = parse_obj(args.in_obj, is_path=True, up_axis=args.up)
         stats = write_glb(args.out_glb, primitives)
