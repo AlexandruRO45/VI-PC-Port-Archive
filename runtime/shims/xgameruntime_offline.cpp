@@ -1,4 +1,5 @@
-// xgameruntime: XGameEventImpl, XGameUiImpl and XGameStreamingImpl, offline: three small classes a title calls early.
+// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and
+// XLauncherImpl, offline: small classes a title calls early.
 //
 // Each XGameEvent*, XGameUi* and XGameStreaming* function in xgameruntime.lib asks QueryApiImpl for its class and
 // calls one slot with its own arguments after `this`. The class and interface ids and the method order are
@@ -13,6 +14,14 @@
 //                       (profile cards, pickers, text entry, web authentication, invites) fails before starting.
 //   XGameStreamingImpl  the game is never streamed: initialising succeeds, IsStreaming is false, there are no
 //                       clients, the connection-state registration hands out a token that never fires.
+//   XDisplayImpl        XDisplayTryEnableHdrMode: Disabled (the host output is SDR), Enabled with LEONIDA_HDR=1.
+//   XUserDeviceImpl     every device belongs to the offline user; associations and audio endpoints never change; the
+//                       user has no audio endpoint of its own; finding a controller shows no UI (as on desktop).
+//   XAccessibilityImpl  high contrast is Off, closed captions can't be configured, no voice is installed (enumerating
+//                       calls back zero times), XSpeechSynthesizerCreate fails (E_FAIL) with a null handle, the other
+//                       speech calls refuse the handle they were never given (E_INVALIDARG), speech-to-text display
+//                       calls fail (E_FAIL).
+//   XLauncherImpl       XLaunchUri and the display timeout deferral calls fail (E_FAIL); nothing is launched.
 //
 // Slots whose signature the public pages don't give answer with a value that is safe whichever way the caller reads
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
@@ -29,6 +38,10 @@
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
+
+namespace rt::shims {
+void* xgameruntime_user_new_handle();   // xgameruntime_user.cpp
+}
 
 namespace {
 
@@ -167,8 +180,9 @@ HRESULT CALLBACK error_dialog_provider(XAsyncOp op, const XAsyncProviderData* da
 // 3: HRESULT XGameUiShowMessageDialogAsync(XAsyncBlock* async, const char* titleText, const char* contentText,
 //        const char* firstButtonText, const char* secondButtonText, const char* thirdButtonText,
 //        XGameUiMessageDialogButton defaultButton, XGameUiMessageDialogButton cancelButton)
-// ASSUMPTION: the parameter list is the one the GDK reference gives; only the result-page and the enum were checked
-// for this file. The dialog is "answered" with its default button.
+// The parameter list is the one the GDK reference gives; only the result-page and the enum were checked for this
+// file. No caller confirms it: tools/gdk_runtime_calls.py finds no thunk for this slot in the executable
+// (docs/runtime_imports.md). The dialog is "answered" with its default button.
 HRESULT STDMETHODCALLTYPE ui_message_dialog_async(void*, XAsyncBlock* async, const char* title, const char* content,
                                                   const char* first, const char* second, const char* third,
                                                   XGameUiMessageDialogButton default_button, XGameUiMessageDialogButton) {
@@ -290,8 +304,8 @@ uint32_t STDMETHODCALLTYPE streaming_client_count(void*) { return 0; }
 
 // 12: HRESULT XGameStreamingRegisterConnectionStateChanged(XTaskQueueHandle queue, void* context,
 //        XGameStreamingConnectionStateChangedCallback* callback, XTaskQueueRegistrationToken* token)
-// ASSUMPTION: that parameter list (the GDK reference's, not re-checked for this file). No client connects, so the
-// callback never runs.
+// That parameter list is the GDK reference's, not re-checked for this file, and no caller confirms it: the executable
+// links no XGameStreamingImpl thunk (docs/runtime_imports.md). No client connects, so the callback never runs.
 HRESULT STDMETHODCALLTYPE streaming_register_connection(void*, XTaskQueueHandle, void*, void* callback,
                                                         XTaskQueueRegistrationToken* token) {
     if (!callback || !token) return E_INVALIDARG;
@@ -317,7 +331,7 @@ template <int Slot> HRESULT STDMETHODCALLTYPE client_not_connected(void*) {
 static_assert((static_cast<uint32_t>(E_GAMESTREAMING_NOT_INITIALIZED) & 0xFF) == 0, "reads as false in al");
 
 // 11: XGameStreamingConnectionState XGameStreamingGetConnectionState(XGameStreamingClientId client): 0, the first
-// enumerator. ASSUMPTION: it is Disconnected; there is no client to ask about either way.
+// enumerator, taken to be Disconnected; there is no client to ask about either way, and the executable has no caller.
 uint32_t STDMETHODCALLTYPE streaming_connection_state(void*) { return 0; }
 
 HRESULT STDMETHODCALLTYPE streaming_query_interface(void*, REFIID iid, void** out);
@@ -362,6 +376,273 @@ HRESULT STDMETHODCALLTYPE streaming_query_interface(void*, REFIID iid, void** ou
     return answer(&g_streaming_object, std::begin(kStreamingInterfaces), std::end(kStreamingInterfaces), iid, out);
 }
 
+
+// ======================= XDisplayImpl =======================
+
+constexpr char kDisplayName[] = "XDisplayImpl";
+constexpr GUID kDisplayClass = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
+const GUID kDisplayInterfaces[] = {
+    kDisplayClass,
+    {0x35f07670, 0x706e, 0x4bfb, {0x94, 0x76, 0x09, 0x07, 0x98, 0xc5, 0xeb, 0xf3}},   // IXDisplayImpl
+};
+
+enum class XDisplayHdrModePreference : uint32_t { PreferHdr = 0, PreferRefreshRate = 1 };
+enum class XDisplayHdrModeResult : uint32_t { Unknown = 0, Enabled = 1, Disabled = 2 };
+struct XDisplayHdrModeInfo {
+    float minToneMapLuminance;            // nits
+    float maxToneMapLuminance;
+    float maxFullFrameToneMapLuminance;
+};
+
+bool hdr_requested() {
+    static const bool on = [] {
+        char value[4] = {};
+        size_t length = 0;
+        return getenv_s(&length, value, "LEONIDA_HDR") == 0 && length == 2 && value[0] == '1';
+    }();
+    return on;
+}
+
+// 4: XDisplayHdrModeResult XDisplayTryEnableHdrMode(XDisplayHdrModePreference preference, XDisplayHdrModeInfo* info)
+// The host swapchain is SDR, so HDR stays off unless LEONIDA_HDR=1; then it is "enabled" with the documented
+// defaults (0.01 / 1000 / 1000 nits).
+uint32_t STDMETHODCALLTYPE display_try_enable_hdr(void*, XDisplayHdrModePreference, XDisplayHdrModeInfo* info) {
+    const bool on = hdr_requested();
+    if (info) *info = on ? XDisplayHdrModeInfo{0.01f, 1000.0f, 1000.0f} : XDisplayHdrModeInfo{};
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XDisplayTryEnableHdrMode: HDR %s\n",
+                     on ? "enabled (LEONIDA_HDR=1)" : "disabled (SDR output; LEONIDA_HDR=1 asks for HDR)");
+    return static_cast<uint32_t>(on ? XDisplayHdrModeResult::Enabled : XDisplayHdrModeResult::Disabled);
+}
+
+template <int Slot> HRESULT STDMETHODCALLTYPE display_unknown(void* self) { return unknown_slot<kDisplayName, Slot>(self); }
+
+HRESULT STDMETHODCALLTYPE display_query_interface(void*, REFIID iid, void** out);
+const void* const kDisplayVtable[] = {
+    FN(display_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(display_unknown<3>),                 // 3 (unknown in the docs)
+    FN(display_try_enable_hdr),             // 4 XDisplayTryEnableHdrMode
+};
+ClassObject g_display_object{kDisplayVtable};
+HRESULT STDMETHODCALLTYPE display_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_display_object, std::begin(kDisplayInterfaces), std::end(kDisplayInterfaces), iid, out);
+}
+
+// ======================= XUserDeviceImpl =======================
+
+constexpr GUID kUserDeviceClass = {0x7d824997, 0x10dc, 0x45ab, {0x86, 0xb7, 0x27, 0x37, 0x76, 0x7c, 0x0b, 0xf1}};
+const GUID kUserDeviceInterfaces[] = {
+    kUserDeviceClass,                                                                  // IXUserDeviceImpl
+    {0x0cc6a956, 0xe7e1, 0x4fdf, {0x93, 0x41, 0x9d, 0x5d, 0xa6, 0x49, 0xeb, 0xc8}},    // IXUserDeviceImpl2 (no methods)
+};
+
+// APP_LOCAL_DEVICE_ID is taken to be 32 bytes (APP_LOCAL_DEVICE_ID_SIZE), not on the pages read for this file. No
+// caller confirms it: the executable links no XUserDeviceImpl thunk (docs/runtime_imports.md).
+struct APP_LOCAL_DEVICE_ID {
+    uint8_t value[32];
+};
+
+const char kFindControllerIdentity = 0;
+
+// 3: HRESULT XUserFindForDevice(const APP_LOCAL_DEVICE_ID* deviceId, XUserHandle* handle): every device belongs to
+// the one offline user.
+HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* device, XUserHandle* out) {
+    if (!device || !out) return E_INVALIDARG;
+    *out = rt::shims::xgameruntime_user_new_handle();
+    return S_OK;
+}
+
+// 4: HRESULT XUserRegisterForDeviceAssociationChanged(XTaskQueueHandle queue, void* context,
+//        XUserDeviceAssociationChangedCallback* callback, XTaskQueueRegistrationToken* token)
+// 7: HRESULT XUserRegisterForDefaultAudioEndpointUtf16Changed(XTaskQueueHandle, void*, callback, token*)
+// Associations and endpoints never change offline: a token, no callback.
+HRESULT STDMETHODCALLTYPE device_register(void*, XTaskQueueHandle, void*, void* callback,
+                                          XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) return E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    token->token = g_next_token++;
+    return S_OK;
+}
+
+// 5, 8: bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait): never pending.
+bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+
+// 6: HRESULT XUserGetDefaultAudioEndpointUtf16(XUserLocalId user, XUserDefaultAudioEndpointKind kind,
+//        size_t endpointIdUtf16Count, wchar_t* endpointIdUtf16, size_t* endpointIdUtf16Used)
+// The user has no audio endpoint of its own (no headset): ERROR_NOT_FOUND, with an empty string written.
+HRESULT STDMETHODCALLTYPE device_audio_endpoint(void*, uint64_t, uint32_t, size_t count, wchar_t* id, size_t* used) {
+    if (id && count) id[0] = L'\0';
+    if (used) *used = 0;
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+HRESULT CALLBACK find_controller_provider(XAsyncOp op, const XAsyncProviderData* data) {
+    switch (op) {
+    case XAsyncOp::Begin:
+        return XAsyncSchedule(data->async, 0);
+    case XAsyncOp::DoWork:
+        XAsyncComplete(data->async, S_OK, sizeof(APP_LOCAL_DEVICE_ID));
+        return S_OK;
+    case XAsyncOp::GetResult:
+        if (!data->buffer || data->bufferSize < sizeof(APP_LOCAL_DEVICE_ID)) return E_INVALIDARG;
+        *static_cast<APP_LOCAL_DEVICE_ID*>(data->buffer) = APP_LOCAL_DEVICE_ID{};
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+// 9: HRESULT XUserFindControllerForUserWithUiAsync(XUserHandle user, XAsyncBlock* async): no UI, as on desktop.
+HRESULT STDMETHODCALLTYPE device_find_controller_async(void*, XUserHandle user, XAsyncBlock* async) {
+    if (!user) return E_INVALIDARG;
+    if (!async) return E_POINTER;
+    return XAsyncBegin(async, nullptr, &kFindControllerIdentity, "XUserFindControllerForUserWithUiAsync",
+                       find_controller_provider);
+}
+
+// 10: HRESULT XUserFindControllerForUserWithUiResult(XAsyncBlock* async, APP_LOCAL_DEVICE_ID* deviceId): all zero,
+// as the GDK documents for desktop.
+HRESULT STDMETHODCALLTYPE device_find_controller_result(void*, XAsyncBlock* async, APP_LOCAL_DEVICE_ID* device) {
+    if (!device) return E_POINTER;
+    return XAsyncGetResult(async, &kFindControllerIdentity, sizeof(*device), device, nullptr);
+}
+
+HRESULT STDMETHODCALLTYPE device_query_interface(void*, REFIID iid, void** out);
+const void* const kUserDeviceVtable[] = {
+    FN(device_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(device_find_user),                   // 3  XUserFindForDevice
+    FN(device_register),                    // 4  XUserRegisterForDeviceAssociationChanged
+    FN(device_unregister),                  // 5  XUserUnregisterForDeviceAssociationChanged
+    FN(device_audio_endpoint),              // 6  XUserGetDefaultAudioEndpointUtf16
+    FN(device_register),                    // 7  XUserRegisterForDefaultAudioEndpointUtf16Changed
+    FN(device_unregister),                  // 8  XUserUnregisterForDefaultAudioEndpointUtf16Changed
+    FN(device_find_controller_async),       // 9  XUserFindControllerForUserWithUiAsync
+    FN(device_find_controller_result),      // 10 XUserFindControllerForUserWithUiResult
+};
+static_assert(std::size(kUserDeviceVtable) == 11, "IUnknown + IXUserDeviceImpl's 8 methods");
+ClassObject g_user_device_object{kUserDeviceVtable};
+HRESULT STDMETHODCALLTYPE device_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_user_device_object, std::begin(kUserDeviceInterfaces), std::end(kUserDeviceInterfaces), iid, out);
+}
+
+// ======================= XAccessibilityImpl =======================
+
+constexpr char kAccessibilityName[] = "XAccessibilityImpl";
+constexpr GUID kAccessibilityClass = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+const GUID kAccessibilityInterfaces[] = {
+    kAccessibilityClass,   // IXAccessibilityImpl: the class id
+    {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}},   // IXAccessibilityImpl2
+};
+
+// 5: HRESULT XHighContrastGetMode(XHighContrastMode* mode): Off, the first enumerator. ASSUMPTION: the signature and
+// that Off is 0 (GDK reference, not re-checked for this file).
+HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
+    if (!mode) return E_POINTER;
+    *mode = 0;
+    return S_OK;
+}
+
+// 4: HRESULT XClosedCaptionSetEnabled(bool enabled): there are no captions to show; accepted and dropped.
+HRESULT STDMETHODCALLTYPE accessibility_captions_set_enabled(void*, bool) { return S_OK; }
+
+// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(callback, void* context): no voice is installed, so the
+// callback runs zero times. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
+HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* callback, void*) {
+    return callback ? S_OK : E_INVALIDARG;
+}
+
+// 9: HRESULT XSpeechSynthesizerCreate(XSpeechSynthesizerHandle* handle): no synthesizer offline.
+HRESULT STDMETHODCALLTYPE speech_create(void* self, void** handle) {
+    if (handle) *handle = nullptr;
+    return offline_failure<kAccessibilityName, 9>(self);
+}
+
+// 10-12, 14: a synthesizer or stream handle is the first argument, and none was ever handed out: E_INVALIDARG.
+HRESULT STDMETHODCALLTYPE speech_bad_handle(void*) { return E_INVALIDARG; }
+
+// 13, 21: HRESULT XSpeechSynthesizerCreateStreamFromText/Ssml(synthesizer, const char* text,
+//                                                             XSpeechSynthesizerStreamHandle* stream)
+HRESULT STDMETHODCALLTYPE speech_create_stream(void*, void*, const char*, void** stream) {
+    if (stream) *stream = nullptr;
+    return E_INVALIDARG;
+}
+
+// 15: HRESULT XSpeechSynthesizerGetStreamDataSize(stream, size_t* size)
+HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void*, size_t* size) {
+    if (size) *size = 0;
+    return E_INVALIDARG;
+}
+
+// 16: HRESULT XSpeechSynthesizerGetStreamData(stream, size_t size, void* buffer, size_t* used)
+HRESULT STDMETHODCALLTYPE speech_stream_data(void*, void*, size_t, void*, size_t* used) {
+    if (used) *used = 0;
+    return E_INVALIDARG;
+}
+
+// The slots with no offline counterpart whose arguments the layout doesn't give: the caption properties (3) and
+// speech-to-text display (6, 7, 17-20). Nothing is written.
+template <int Slot> HRESULT STDMETHODCALLTYPE accessibility_offline(void* self) {
+    return offline_failure<kAccessibilityName, Slot>(self);
+}
+
+HRESULT STDMETHODCALLTYPE accessibility_query_interface(void*, REFIID iid, void** out);
+const void* const kAccessibilityVtable[] = {
+    FN(accessibility_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(accessibility_offline<3>),            // 3  XClosedCaptionGetProperties
+    FN(accessibility_captions_set_enabled),  // 4  XClosedCaptionSetEnabled
+    FN(accessibility_high_contrast),         // 5  XHighContrastGetMode
+    FN(accessibility_offline<6>),            // 6  XSpeechToTextSetPositionHint
+    FN(accessibility_offline<7>),            // 7  XSpeechToTextSendString
+    FN(speech_enumerate_voices),             // 8  XSpeechSynthesizerEnumerateInstalledVoices
+    FN(speech_create),                       // 9  XSpeechSynthesizerCreate
+    FN(speech_bad_handle),                   // 10 XSpeechSynthesizerCloseHandle
+    FN(speech_bad_handle),                   // 11 XSpeechSynthesizerSetDefaultVoice
+    FN(speech_bad_handle),                   // 12 XSpeechSynthesizerSetCustomVoice
+    FN(speech_create_stream),                // 13 XSpeechSynthesizerCreateStreamFromText
+    FN(speech_bad_handle),                   // 14 XSpeechSynthesizerCloseStreamHandle
+    FN(speech_stream_size),                  // 15 XSpeechSynthesizerGetStreamDataSize
+    FN(speech_stream_data),                  // 16 XSpeechSynthesizerGetStreamData
+    FN(accessibility_offline<17>),           // 17 XSpeechToTextBeginHypothesisString
+    FN(accessibility_offline<18>),           // 18 XSpeechToTextUpdateHypothesisString
+    FN(accessibility_offline<19>),           // 19 XSpeechToTextFinalizeHypothesisString
+    FN(accessibility_offline<20>),           // 20 XSpeechToTextCancelHypothesisString
+    FN(speech_create_stream),                // 21 XSpeechSynthesizerCreateStreamFromSsml
+};
+static_assert(std::size(kAccessibilityVtable) == 22, "IUnknown + IXAccessibilityImpl's 19 methods");
+ClassObject g_accessibility_object{kAccessibilityVtable};
+HRESULT STDMETHODCALLTYPE accessibility_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_accessibility_object, std::begin(kAccessibilityInterfaces), std::end(kAccessibilityInterfaces),
+                  iid, out);
+}
+
+// ======================= XLauncherImpl =======================
+
+constexpr char kLauncherName[] = "XLauncherImpl";
+constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+
+// 3: HRESULT XLaunchUri(XUserHandle user, const char* uri): nothing is launched; E_FAIL.
+// 4: HRESULT XDisplayAcquireTimeoutDeferral(XDisplayTimeoutDeferralHandle* handle): none is handed out.
+// 5: XDisplayCloseTimeoutDeferralHandle(handle): no handle exists; E_FAIL, which a void caller ignores.
+HRESULT STDMETHODCALLTYPE launcher_acquire_deferral(void* self, void** handle) {
+    if (handle) *handle = nullptr;
+    return offline_failure<kLauncherName, 4>(self);
+}
+
+HRESULT STDMETHODCALLTYPE launcher_query_interface(void*, REFIID iid, void** out);
+const void* const kLauncherVtable[] = {
+    FN(launcher_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN((offline_failure<kLauncherName, 3>)),   // 3 XLaunchUri
+    FN(launcher_acquire_deferral),             // 4 XDisplayAcquireTimeoutDeferral
+    FN((offline_failure<kLauncherName, 5>)),   // 5 XDisplayCloseTimeoutDeferralHandle
+};
+static_assert(std::size(kLauncherVtable) == 6, "IUnknown + IXLauncherImpl's 3 methods");
+ClassObject g_launcher_object{kLauncherVtable};
+HRESULT STDMETHODCALLTYPE launcher_query_interface(void*, REFIID iid, void** out) {
+    // IXLauncherImpl's id is the class id.
+    return answer(&g_launcher_object, &kLauncherClass, &kLauncherClass + 1, iid, out);
+}
+
 #undef FN
 
 }  // namespace
@@ -380,6 +661,22 @@ bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void*
     }
     if (class_id == kStreamingClass) {
         *hr = streaming_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kDisplayClass) {
+        *hr = display_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kUserDeviceClass) {
+        *hr = device_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kAccessibilityClass) {
+        *hr = accessibility_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kLauncherClass) {
+        *hr = launcher_query_interface(nullptr, interface_id, out);
         return true;
     }
     return false;
