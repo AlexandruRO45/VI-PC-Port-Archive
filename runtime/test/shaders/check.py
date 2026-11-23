@@ -175,6 +175,10 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
           ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed000c, 0, 0xbeef0000, 0xbeef0001])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+CVT_PKNORM_F32_WORDS = [
+    0x7FFF0000, 0x00008001, 0xC0004000, 0x80017FFF,
+    0xFFFF0000, 0x00008000, 0x0000FFFF, 0xBFFF0000,
+]
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
@@ -1539,6 +1543,8 @@ def main():
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
+    results.append(("cs_cvt_pknorm_f32", compute_test(tools, spirv, "cs_cvt_pknorm_f32", "1", "dump",
+                                                      expected_words=CVT_PKNORM_F32_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
