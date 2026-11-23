@@ -418,3 +418,160 @@ class TestSaluAndn2B64BitwiseEdgeCases(unittest.TestCase):
             for cb1 in checkerboards:
                 sdst, scc = ref_andn2_b64(cb0, cb1)
                 self.assertEqual(sdst, cb0 & (~cb1 & MASK64))
+
+
+def parse_s_andn2_b64_asm(asm_line: str) -> ASTInstruction:
+    """Parse a single assembly instruction line for s_andn2_b64."""
+    clean = asm_line.strip()
+    if not clean:
+        raise ValueError("Empty assembly line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0].lower()
+    if mnemonic != "s_andn2_b64":
+        raise ValueError(f"Expected mnemonic s_andn2_b64, got {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError("Missing operands")
+    operands_str = [op.strip() for op in parts[1].split(",")]
+    if len(operands_str) != 3:
+        raise ValueError(f"Expected 3 operands (dst, src0, src1), got {len(operands_str)}")
+
+    def parse_op(op_str: str) -> ASTOperand:
+        op_lower = op_str.lower()
+        if op_lower == "exec":
+            return ASTOperand.exec_mask()
+        elif op_lower == "vcc":
+            return ASTOperand.vcc()
+        elif op_lower.startswith("s[") and op_lower.endswith("]"):
+            idx_pair = op_lower[2:-1].split(":")
+            if len(idx_pair) != 2:
+                raise ValueError(f"Invalid SGPR pair syntax: {op_str}")
+            start, end = int(idx_pair[0]), int(idx_pair[1])
+            if end != start + 1 or start % 2 != 0:
+                raise ValueError(f"SGPR pair must be even-aligned 2-register range: {op_str}")
+            return ASTOperand.sgpr(start, 2)
+        elif op_str.startswith("0x") or op_str.startswith("-") or op_str.isdigit():
+            val = int(op_str, 0)
+            return ASTOperand.literal64(val)
+        else:
+            raise ValueError(f"Invalid operand: {op_str}")
+
+    dst = parse_op(operands_str[0])
+    src0 = parse_op(operands_str[1])
+    src1 = parse_op(operands_str[2])
+
+    inst = ASTInstruction(Opcode.S_ANDN2_B64, dst, src0, src1)
+    inst.validate()
+    return inst
+
+
+# Mutant functions for mutation testing
+def mutant_and(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 1: uses regular AND (omits ~ negation)."""
+    res = (s0 & s1) & MASK64
+    return res, 1 if res != 0 else 0
+
+
+def mutant_orn2(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 2: uses OR instead of AND."""
+    res = (s0 | (~s1 & MASK64)) & MASK64
+    return res, 1 if res != 0 else 0
+
+
+def mutant_swapped_operands(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 3: swaps operand order (s1 & ~s0)."""
+    res = (s1 & (~s0 & MASK64)) & MASK64
+    return res, 1 if res != 0 else 0
+
+
+def mutant_invert_scc(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 4: inverts SCC logic."""
+    res = (s0 & (~s1 & MASK64)) & MASK64
+    return res, 1 if res == 0 else 0
+
+
+class TestSaluAndn2B64NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, mutation detection, and translator execution."""
+
+    def test_syntax_rejection_malformed_syntax(self):
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b64_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b64_asm("s_orn2_b64 s[0:1], s[2:3], s[4:5]")
+
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b64_asm("s_andn2_b64 s[0:1], s[2:3]")
+
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b64_asm("s_andn2_b64 s[1:2], s[2:3], s[4:5]")
+
+    def test_mutation_detection_and(self):
+        s0, s1 = 0x0F, 0x0F
+        correct = ref_andn2_b64(s0, s1)
+        mutated = mutant_and(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_orn2(self):
+        s0, s1 = 0x00, 0x00
+        correct = ref_andn2_b64(s0, s1)
+        mutated = mutant_orn2(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_swapped_operands(self):
+        s0, s1 = 0x0F, 0x00
+        correct = ref_andn2_b64(s0, s1)
+        mutated = mutant_swapped_operands(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_invert_scc(self):
+        s0, s1 = 0x00, 0x00
+        correct = ref_andn2_b64(s0, s1)
+        mutated = mutant_invert_scc(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_andn2_spirv_emission(self):
+        """Verify that support.translate_lines emits expected SPIR-V logic for s_andn2_b64."""
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x9abcdef0",
+            "s_mov_b32 s2, 0x00ff00ff",
+            "s_mov_b32 s3, 0x0f0f0f0f",
+            "s_andn2_b64 s[4:5], s[0:1], s[2:3]",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_test_andn2_b64_emit", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+
+    def test_andn2_hardware_execution(self):
+        """Verify hardware-accurate execution of s_andn2_b64 through support.mrt0_words."""
+        s0_lo, s0_hi = 0x12345678, 0x9ABCDEF0
+        s1_lo, s1_hi = 0x00FF00FF, 0x0F0F0F0F
+        expected_lo = (s0_lo & (~s1_lo & MASK32)) & MASK32
+        expected_hi = (s0_hi & (~s1_hi & MASK32)) & MASK32
+
+        lines = [
+            f"s_mov_b32 s0, {s0_lo:#x}",
+            f"s_mov_b32 s1, {s0_hi:#x}",
+            f"s_mov_b32 s2, {s1_lo:#x}",
+            f"s_mov_b32 s3, {s1_hi:#x}",
+            "s_andn2_b64 s[4:5], s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_mov_b32_e32 v3, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_b64_hw", lines)
+        words = support.mrt0_words(spv)
+
+        self.assertEqual(words[0], expected_lo)
+        self.assertEqual(words[1], expected_hi)
+        self.assertEqual(words[2], 1)
+        self.assertEqual(words[3], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
