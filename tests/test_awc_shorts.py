@@ -275,6 +275,28 @@ class ShortsTest(unittest.TestCase):
         import awc_shorts
         self.check_truncated_bank_skipped(awc_shorts, 2)
 
+    def test_named_file_that_is_not_a_bank_is_refused(self):
+        # awc_manifest / awc_markers / awc_opus refuse the same input (exit 2, "holds no AWC bank"): a wrong
+        # path or format must not read as an empty success. A directory with no bank stays a valid empty answer.
+        path = os.path.join(self.tmp.name, "notes.bin")
+        with open(path, "wb") as f:
+            f.write(b"not an AWC bank")
+        catalog = os.path.join(self.out, "shorts.csv")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shorts.main([path, self.out, "--jobs", "1"]), 2)
+        self.assertIn("holds no AWC bank", err.getvalue())
+        self.assertIn(path, err.getvalue())
+        self.assertFalse(os.path.exists(catalog), "a refused run must not write shorts.csv")
+
+        empty = os.path.join(self.tmp.name, "empty")
+        os.makedirs(empty)
+        empty_out = os.path.join(self.tmp.name, "empty-out")
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as text:
+            self.assertEqual(shorts.main([empty, empty_out, "--jobs", "1"]), 0)
+        self.assertIn("0 banks: 0 short streamed-music channels", text.getvalue())
+        self.assertTrue(os.path.exists(os.path.join(empty_out, "shorts.csv")))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

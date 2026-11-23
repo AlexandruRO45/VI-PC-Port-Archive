@@ -11,6 +11,8 @@ per-channel frame count is `samples / packet_channels`. The output is
 
 This tool never re-encodes: the selected Opus packets are repacked into Ogg Opus exactly as stored.
 It does not transcribe or classify the clips; that is a separate analysis step.
+A named file that holds no AWC bank is refused with exit 2 before `shorts.csv` is written, as
+`awc_manifest.py` / `awc_markers.py` / `awc_opus.py` do; an empty directory scan stays a valid zero-bank answer.
 Usage: `python -I tools/awc_shorts.py --help` lists the options.
 """
 import argparse
@@ -132,6 +134,7 @@ def main(argv=None) -> int:
         destinations[key] = path
     rows = []
     io_failed = False
+    banks_ok = 0
 
     def report_failure(bank, error):
         nonlocal io_failed
@@ -145,6 +148,7 @@ def main(argv=None) -> int:
         for i, (path, bank) in enumerate(banks, 1):
             try:
                 rows += export_bank(path, a.out, a.min_seconds, a.max_seconds, bank=bank)
+                banks_ok += 1
             except (ValueError, struct.error, OSError, IndexError) as e:
                 report_failure(bank, e)
             if i % 200 == 0:
@@ -156,12 +160,19 @@ def main(argv=None) -> int:
             for i, fut in enumerate(as_completed(futures), 1):
                 try:
                     rows += fut.result()
+                    banks_ok += 1
                 except (ValueError, struct.error, OSError, IndexError) as e:
                     report_failure(futures[fut], e)
                 if i % 200 == 0:
                     print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     if io_failed:
         return 1
+    if not os.path.isdir(a.src) and banks_ok == 0:
+        # A named file that is not a bank (or cannot be parsed as one) is a wrong path or format, not an
+        # empty success (awc_manifest / awc_markers / awc_opus refuse the same input). A directory scan
+        # still skips bad banks among good ones and keeps reporting 0 banks for an empty folder.
+        print(f"awc_shorts: error: {a.src}: holds no AWC bank", file=sys.stderr)
+        return 2
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))
     catalog = os.path.join(a.out, "shorts.csv")
     try:
