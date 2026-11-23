@@ -260,7 +260,8 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 // many, how many the runtime's pipeline cache already had, their total creation time, and the bytes the cache
 // started the session with. All zero if not a Vulkan device. The same numbers are logged when the device is destroyed.
 struct PipelineCacheStats {
-    std::uint32_t pipelines = 0;
+    std::uint32_t created = 0;  // every pipeline made, with or without feedback
+    std::uint32_t pipelines = 0;  // of those, the ones with valid feedback
     std::uint32_t cache_hits = 0;
     std::uint64_t create_nanoseconds = 0;
     std::uint64_t loaded_bytes = 0;
