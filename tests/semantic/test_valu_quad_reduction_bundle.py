@@ -304,3 +304,58 @@ class TestQuadmaskB64Oracle(unittest.TestCase):
                 "v_mov_b32 v0, s0",
             ])
             self.assertEqual(val_hw, 1 << i)
+
+
+# ------------------------------------------------------------------------------
+# s_quadmask_b64 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class SQuadmaskB64Instruction:
+    dst_lo: RegisterOperand
+    dst_hi: RegisterOperand
+    src0_lo: RegisterOperand
+    src0_hi: RegisterOperand
+
+
+def step_quadmask_b64(machine: ScalarMachineQuadLogic, insn: SQuadmaskB64Instruction):
+    lo = machine.read_operand(insn.src0_lo)
+    hi = machine.read_operand(insn.src0_hi)
+    val64 = (hi << 32) | lo
+    res = ref_quadmask_b64(val64)
+    machine.sgprs[insn.dst_lo.index] = res & MASK32
+    machine.sgprs[insn.dst_hi.index] = (res >> 32) & MASK32
+    machine.scc = 1 if res != 0 else 0
+
+
+class TestQuadmaskB64ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineQuadLogic()
+        machine.sgprs[2] = 0x00FF_00FF
+        machine.sgprs[3] = 0xFF00_FF00
+        insn = SQuadmaskB64Instruction(
+            dst_lo=RegisterOperand(OperandType.SGPR, 0),
+            dst_hi=RegisterOperand(OperandType.SGPR, 1),
+            src0_lo=RegisterOperand(OperandType.SGPR, 2),
+            src0_hi=RegisterOperand(OperandType.SGPR, 3),
+        )
+        step_quadmask_b64(machine, insn)
+
+        val_hw, _ = run_shader_words("ps_qm64_ast_scalar", [
+            "s_mov_b32 s2, 0x00FF00FF",
+            "s_mov_b32 s3, 0xFF00FF00",
+            "s_quadmask_b64 s[0:1], s[2:3]",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertEqual(machine.sgprs[0], val_hw)
+        self.assertEqual(val_hw, 0xCC33)
+
+    def test_scalar_scc_flag_hardware(self):
+        val_zero, _ = run_shader_words("ps_qm64_scc_zero", [
+            "s_mov_b32 s2, 0",
+            "s_mov_b32 s3, 0",
+            "s_quadmask_b64 s[0:1], s[2:3]",
+            "s_cselect_b32 s4, 10, 20",
+            "v_mov_b32 v0, s4",
+        ])
+        self.assertEqual(val_zero, 20)
