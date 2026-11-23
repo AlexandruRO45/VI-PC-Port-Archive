@@ -92,6 +92,23 @@ class VertexShader(unittest.TestCase):
         self.assertNotIn("out vec4", glsl)
         self.assertIn("gl_Position", glsl)
 
+    def test_f16_halves_are_decoded_from_the_params_own_words(self):
+        # --f16-interp-fallback: the PS reads param 1's halves at locations 26 and 27 and the raw param itself is not an
+        # input, so a default translation would read param 1's words per vertex at location 1.
+        glsl = ps_sweep.vs_glsl([3, 26, 27], set(), {"1": [26, 27]})
+        raw1 = ps_sweep._raw_glsl(1)
+        self.assertIn(f"vec4 r = {raw1};", glsl)
+        self.assertIn("o26 = vec4(unpackHalf2x16(w.x)[0], unpackHalf2x16(w.y)[0], unpackHalf2x16(w.z)[0], "
+                      "unpackHalf2x16(w.w)[0]);", glsl)
+        self.assertIn("o27 = vec4(unpackHalf2x16(w.x)[1],", glsl)
+        self.assertIn(f"o3 = {ps_sweep._raw_glsl(3)};", glsl)
+        self.assertNotIn(f"o26 = {ps_sweep._raw_glsl(26)}", glsl)
+        self.assertNotIn("o1 =", glsl)
+
+    def test_without_halves_the_text_is_unchanged(self):
+        self.assertEqual(ps_sweep.vs_glsl([0, 2], {2}), ps_sweep.vs_glsl([0, 2], {2}, {}))
+        self.assertNotIn("unpackHalf2x16", ps_sweep.vs_glsl([0, 2], {2}, None))
+
 
 class GeometryShaderLookup(unittest.TestCase):
     def test_gs_is_the_bary_gs_file_beside_the_pixel_shader(self):

@@ -1760,8 +1760,20 @@ translation also hits on the RTX 4080 SUPER), and 8 are not translated (`compute
 #3898). Intel against NVIDIA on the same fallback translation: 434 OK on both, 0 differ, 4 NVIDIA device losses
 (the unterminated loop above), 8 not translated, 34 timeouts on both. Intel with the fallbacks against NVIDIA with
 the default translation: 373 OK, 53 differ by more than 0.1 and 8 are NaN on one side. The same 61 differ between the
-two translations on NVIDIA alone (all in the barycentric stratum, none of them one of the 9 that read raw
-barycentrics), so it is the fallback translation, not the GPU: not root-caused. Only 9 of the 480 read raw
+two translations on NVIDIA alone, so it is the translation, not the GPU. **Cause (counted on the same 480 translated
+again, `--bary-fallback` alone, without #4642's `--min-lod-fallback`, against the default):** 199 modules differ between the two translations, 190 that read a
+16-bit interpolant (`v_interp_p1ll/p1lv/p2_f16`) and the 9 that read raw barycentrics; the other 273 translated under
+both are byte-identical, so ordinary `v_interp_p1/p2/mov_f32` is not translated differently (the remaining 8 are not
+translated under the fallback). `--bary-fallback` has no `PerVertexKHR` inputs, so a 16-bit interpolant is read as the
+smooth f32 of its packed word (design.md, "16-bit interpolation"); `--f16-interp-fallback` is its companion, and
+`make_game.py` turns it on with it wherever the device has no per-vertex inputs, as an Intel UHD has none. The sweep
+used the first flag without the second, and its generated vertex shader wrote the decoded halves nowhere. The synthetic
+`ps_interp_f16_high` drawn with `vs_f16_pack` agrees: with `--bary-fallback` alone its f16 halves are off by 0.984 on
+both GPUs, with both flags and by default they are within 2e-3 on both, and `ps_interp_f32_mods` / `ps_interp_mov_mods`
+(plain f32 and mov reads) are exact with `--bary-fallback`. `ps_sweep.py` now builds the vertex shader of a pixel
+shader with `f16_halves` in its index entry so that the halves are decoded from the same words a default translation
+reads per vertex. Not shown: the 61 individually (a 12-shader subset of the 190 agreed between the two translations on
+the RTX 4080 SUPER; draws of these shaders take about 20 s each). Only 9 of the 480 read raw
 barycentrics and need the geometry shader; all 9 agree on both GPUs.
 
 ## Coverage plan and cost

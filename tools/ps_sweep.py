@@ -70,9 +70,23 @@ def pick_sample(ps, n, seed):
     return picked, {s: (len(groups[s]), alloc[s]) for s in groups}
 
 
-def vs_glsl(locations, flats):
+def _raw_glsl(loc):
+    """The generated vec4 of the vertex shader's output at location `loc` (the value a pixel shader reads there)."""
+    return (f"vec4(fract(0.13 * {loc + 1}.0 + p.x * 0.7), fract(0.29 * {loc + 1}.0 + p.y * 0.6),"
+            f" 0.1 + 0.1 * {loc % 7}.0, 1.0)")
+
+
+def vs_glsl(locations, flats, halves=None):
     """A vertex shader for one pixel-shader interface: a viewport-covering triangle from the vertex index and a vec4
-    at each input location (varying across the triangle, constant per vertex for the flat ones)."""
+    at each input location (varying across the triangle, constant per vertex for the flat ones).
+
+    `halves` is the `f16_halves` of a pixel shader translated with --f16-interp-fallback, {param: [low, high]}. The
+    producer of that interface exports the two f16 halves of every param's raw word, decoded to f32, at those two
+    locations (UnpackHalf2x16, docs/design.md "16-bit interpolation without PerVertexKHR"). Here the param is the
+    same vec4 a default translation reads raw (and per vertex) at its own location, so both translations get the same
+    values: the halves are decoded from its bits at each vertex."""
+    halves = {int(n): tuple(pair) for n, pair in (halves or {}).items()}
+    half_locs = {loc for pair in halves.values() for loc in pair}
     lines = ["#version 450"]
     for loc in locations:
         lines.append(f"layout(location={loc}) {'flat ' if loc in flats else ''}out vec4 o{loc};")
@@ -80,10 +94,15 @@ def vs_glsl(locations, flats):
     lines.append("  vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));")
     lines.append("  gl_Position = vec4(p * 2.0 - 1.0, 0.5, 1.0);")
     for loc in locations:
-        lines.append(
-            f"  o{loc} = vec4(fract(0.13 * {loc + 1}.0 + p.x * 0.7), fract(0.29 * {loc + 1}.0 + p.y * 0.6),"
-            f" 0.1 + 0.1 * {loc % 7}.0, 1.0);"
-        )
+        if loc not in half_locs:
+            lines.append(f"  o{loc} = {_raw_glsl(loc)};")
+    for n, pair in sorted(halves.items()):
+        lines.append(f"  {{ vec4 r = {_raw_glsl(n)}; uvec4 w = floatBitsToUint(r);")
+        for half, loc in enumerate(pair):
+            if loc in locations:
+                comps = ", ".join(f"unpackHalf2x16(w.{c})[{half}]" for c in "xyzw")
+                lines.append(f"    o{loc} = vec4({comps});")
+        lines.append("  }")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -98,12 +117,14 @@ def gs_for(spirv, name):
 def make_vs(glslang, meta, cache_dir):
     locs = sorted(meta.get("inputs", []))
     flats = set(meta.get("ps_flat_interpolants", [])) & set(locs)
-    key = "vs_" + ("_".join(map(str, locs)) if locs else "none") + ("_f" + "_".join(map(str, sorted(flats))) if flats else "")
+    halves = meta.get("f16_halves") or {}
+    key = ("vs_" + ("_".join(map(str, locs)) if locs else "none") + ("_f" + "_".join(map(str, sorted(flats))) if flats else "")
+           + "".join(f"_h{n}_{lo}_{hi}" for n, (lo, hi) in sorted(halves.items(), key=lambda kv: int(kv[0]))))
     spv = os.path.join(cache_dir, key + ".spv")
     if not os.path.exists(spv):
         src = spv[:-4] + ".vert"
         with open(src, "w", encoding="utf-8", newline="\n") as f:
-            f.write(vs_glsl(locs, flats))
+            f.write(vs_glsl(locs, flats, halves))
         r = subprocess.run([glslang, "-V", "-S", "vert", src, "-o", spv], capture_output=True, text=True)
         if r.returncode:
             raise SystemExit("glslangValidator failed: " + r.stdout[-300:])
