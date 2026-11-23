@@ -279,3 +279,40 @@ class TestSaluOrn2SaveexecB32SimdDivergence(unittest.TestCase):
         self.assertEqual(new_exec, odd_lanes)
         self.assertEqual(sdst, even_lanes)
         self.assertEqual(scc, 1)
+
+
+class TestSaluOrn2SaveexecB32RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_src0_aliasing(self):
+        # sdst and ssrc0 overlap in s0
+        state = ScalarRegisterState(exec_lo=0xFFFF0000)
+        initial_s0 = 0x000000FF
+        state.write_sgpr_u32(0, initial_s0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_ORN2_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.sgpr(0),
+        )
+        new_exec, sdst, scc = state.execute(inst)
+
+        # Source s0 is read BEFORE destination s0 is overwritten with saved EXEC_LO
+        self.assertEqual(sdst, 0xFFFF0000)
+        self.assertEqual(state.sgpr[0], 0xFFFF0000)
+        self.assertEqual(new_exec, 0x0000FFFF)
+        self.assertEqual(state.exec_lo, 0x0000FFFF)
+        self.assertEqual(state.scc, 1)
+
+    def test_dst_is_exec_lo(self):
+        state = ScalarRegisterState(exec_lo=ALL_LANES_ACTIVE_32)
+        inst = ASTInstruction(
+            opcode=Opcode.S_ORN2_SAVEEXEC_B32,
+            dst=ASTOperand.exec_lo(),
+            src0=ASTOperand.literal32(0x0),
+        )
+        new_exec, sdst, scc = state.execute(inst)
+        # s0 == 0 and old_exec == ~0 -> new_exec is 0
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(state.exec_lo, 0)
+        self.assertEqual(scc, 0)
