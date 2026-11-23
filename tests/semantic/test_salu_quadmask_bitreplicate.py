@@ -101,6 +101,75 @@ VALUES64 = [0, 1, 1 << 63, 1 << 32, 0x00000001_00000000, 0x80000000_00000001, 0x
             0xF0F0F0F0_0F0F0F0F, 0x00000000_FFFFFFFF, 0xFFFFFFFF_00000000, M64]
 
 
+# Measured natively on a Radeon 610M (RDNA2, gfx1036, AMD Windows driver 32.0.21045.29003) through tools/hw_oracle
+# (SHADER-814): (op, S0, SCC before, D low word, D high word, SCC after). For s_quadmask_b32 the high word is the next
+# SGPR, seeded 0xdeadbeef and left alone. A selection of 1,810 cases (every single bit, every cleared bit, every
+# full quad, 200 seeded values per op, both SCC presets), identical in wave32 and wave64 and all equal to the ISA
+# model above.
+MEASURED_GFX1036 = [
+    ("s_quadmask_b32", 0x00000000, 0, 0x00000000, 0xdeadbeef, 0),
+    ("s_quadmask_b32", 0xffffffff, 1, 0x000000ff, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x00000001, 0, 0x00000001, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x80000000, 1, 0x00000080, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x0f0f0f0f, 0, 0x00000055, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0xf0f0f0f0, 1, 0x000000aa, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x11111111, 0, 0x000000ff, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x88888888, 1, 0x000000ff, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x80000001, 0, 0x00000081, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x01020408, 1, 0x00000055, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0xf0000000, 0, 0x00000080, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x0000000f, 1, 0x00000001, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x00010000, 0, 0x00000010, 0xdeadbeef, 1),
+    ("s_quadmask_b32", 0x7fffffff, 1, 0x000000ff, 0xdeadbeef, 1),
+    ("s_quadmask_b64", 0x0000000000000000, 0, 0x00000000, 0x00000000, 0),
+    ("s_quadmask_b64", 0xffffffffffffffff, 1, 0x0000ffff, 0x00000000, 1),
+    ("s_quadmask_b64", 0x0000000000000001, 0, 0x00000001, 0x00000000, 1),
+    ("s_quadmask_b64", 0x8000000000000000, 1, 0x00008000, 0x00000000, 1),
+    ("s_quadmask_b64", 0x0f0f0f0f0f0f0f0f, 0, 0x00005555, 0x00000000, 1),
+    ("s_quadmask_b64", 0xf0f0f0f0f0f0f0f0, 1, 0x0000aaaa, 0x00000000, 1),
+    ("s_quadmask_b64", 0x8888888888888888, 0, 0x0000ffff, 0x00000000, 1),
+    ("s_quadmask_b64", 0x8000000000000001, 1, 0x00008001, 0x00000000, 1),
+    ("s_quadmask_b64", 0x0000000100000000, 0, 0x00000100, 0x00000000, 1),
+    ("s_quadmask_b64", 0xf000000000000000, 1, 0x00008000, 0x00000000, 1),
+    ("s_quadmask_b64", 0x0000000000010000, 0, 0x00000010, 0x00000000, 1),
+    ("s_quadmask_b64", 0x7fffffffffffffff, 1, 0x0000ffff, 0x00000000, 1),
+    ("s_bitreplicate_b64_b32", 0x00000000, 0, 0x00000000, 0x00000000, 0),
+    ("s_bitreplicate_b64_b32", 0xffffffff, 1, 0xffffffff, 0xffffffff, 1),
+    ("s_bitreplicate_b64_b32", 0x00000001, 0, 0x00000003, 0x00000000, 0),
+    ("s_bitreplicate_b64_b32", 0x80000000, 1, 0x00000000, 0xc0000000, 1),
+    ("s_bitreplicate_b64_b32", 0x0f0f0f0f, 0, 0x00ff00ff, 0x00ff00ff, 0),
+    ("s_bitreplicate_b64_b32", 0xf0f0f0f0, 1, 0xff00ff00, 0xff00ff00, 1),
+    ("s_bitreplicate_b64_b32", 0x80000001, 0, 0x00000003, 0xc0000000, 0),
+    ("s_bitreplicate_b64_b32", 0x01020408, 1, 0x003000c0, 0x0003000c, 1),
+    ("s_bitreplicate_b64_b32", 0x00010000, 0, 0x00000000, 0x00000003, 0),
+    ("s_bitreplicate_b64_b32", 0x88888888, 0, 0xc0c0c0c0, 0xc0c0c0c0, 0),
+    ("s_bitreplicate_b64_b32", 0x7fffffff, 1, 0xffffffff, 0x3fffffff, 1),
+]
+MEASURED_OPS = {"s_quadmask_b32": "s_quadmask_b32 s10, s2", "s_quadmask_b64": "s_quadmask_b64 s[10:11], s[2:3]",
+                "s_bitreplicate_b64_b32": "s_bitreplicate_b64_b32 s[10:11], s2"}
+
+
+class MeasuredOnGfx1036(unittest.TestCase):
+    def test_model_matches_the_hardware(self):
+        for op, x, scc, lo, hi, scc_out in MEASURED_GFX1036:
+            with self.subTest(op=op, x=hex(x), scc=scc):
+                if op == "s_bitreplicate_b64_b32":
+                    d, want_scc = bitreplicate(x), scc
+                else:
+                    d = quadmask(x, 16 if op == "s_quadmask_b64" else 8)
+                    want_scc = int(d != 0)
+                self.assertEqual((d & M32, scc_out), (lo, want_scc))
+                if op != "s_quadmask_b32":
+                    self.assertEqual(d >> 32, hi)
+
+    def test_translator_matches_the_hardware(self):
+        for op, x, scc, lo, hi, scc_out in MEASURED_GFX1036:
+            with self.subTest(op=op, x=hex(x), scc=scc):
+                got = run(load64(2, x) + ["s_mov_b32 s10, 0xcafef00d", "s_mov_b32 s11, 0xdeadbeef",
+                                          POISON_SCC[1 - scc], MEASURED_OPS[op]])
+                self.assertEqual(got, (lo, hi, scc_out))
+
+
 class QuadmaskBitreplicateTests(unittest.TestCase):
     def test_reference(self):
         self.assertEqual(quadmask(0x01020408, 8), 0x55)
