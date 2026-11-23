@@ -24,6 +24,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -498,6 +499,33 @@ class OracleTests(unittest.TestCase):
     def test_rejects_a_short_image(self):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
+
+    @unittest.skipUnless(sys.byteorder == "little", "the zero-copy view is the little-endian host path")
+    def test_a_512_square_frame_is_checked_without_expanding_it(self):
+        """BUILD-1052: the whole frame used to become a tuple of Python floats, one object per channel.
+
+        A 512x512 RGBA32F readback is 1,048,576 channels; the tuple peaked at 33,555,456 bytes (29.89 ms) for
+        one check. The channels are read through a float view instead, so the check must not allocate per channel
+        while still counting the coverage and checking the centre UV. Regression test from #3783 (@ezbyDev).
+        """
+        side = 512
+        manifest = {
+            "width": side,
+            "height": side,
+            "min_coverage": 1.0,
+            "max_coverage": 1.0,
+            "centre_uv": [0.25, 0.75],
+        }
+        frame = struct.pack("<4f", 0.25, 0.75, 0.0, 1.0) * (side * side)
+        tracemalloc.start()
+        try:
+            result = check_image(frame, manifest)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result["covered"], side * side)
+        self.assertEqual(result["ratio"], 1.0)
+        self.assertLess(peak, 1 << 20, f"check_image allocated {peak} bytes for one {side}x{side} frame")
 
 
 class ProbeCoordinateTests(unittest.TestCase):

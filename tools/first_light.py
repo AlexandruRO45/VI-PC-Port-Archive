@@ -677,6 +677,11 @@ def check_image(data: bytes, manifest: dict) -> dict:
     """The readback oracle: exact shape, coverage window, a clear corner and the centre UV.
 
     tests/test_first_light.py imports this function, so the test and ``--check`` agree.
+
+    On little-endian hosts the RGBA32F frame is read in place through a float view instead of
+    ``struct.unpack`` over every channel, which built one Python float object per channel
+    (a 512x512 frame peaked at ~33 MB of traced allocation for a handful of checked pixels).
+    A big-endian host keeps the explicit little-endian unpack.
     """
     def check_rgba_shape(values: object, field: str) -> None:
         if not isinstance(values, (list, tuple)) or len(values) != 4:
@@ -698,7 +703,10 @@ def check_image(data: bytes, manifest: dict) -> dict:
         raise AssertionError(
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
-    pixels = struct.unpack(f"<{len(data) // 4}f", data)
+    if sys.byteorder == "little":
+        pixels = memoryview(data).cast("f")
+    else:
+        pixels = struct.unpack(f"<{len(data) // 4}f", data)
     clear_val = manifest.get("clear", CLEAR)
     textured = (
         manifest.get("texture") is not None
@@ -714,7 +722,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             if not all(_close(pixels[i + c], clear_val, 1e-5) for c in range(4))
         )
     else:
-        covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
+        covered = sum(1 for alpha in pixels[3::4] if alpha > 0.5)
     ratio = covered / (width * height)
     if (
         not manifest.get("min_coverage", 0.0)
@@ -729,7 +737,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         i = pixel_offset(clear, "clear_pixel")
         if any(not _close(pixels[i + c], clear_val, 1e-5) for c in range(4)):
             raise AssertionError(
-                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {clear_val}"
+                f"clear pixel {clear} is {tuple(pixels[i : i + 4])}, expected {clear_val}"
             )
     if textured:
         tol = manifest.get("rgba_tolerance", 0.02)
@@ -756,14 +764,14 @@ def check_image(data: bytes, manifest: dict) -> dict:
         for c, want in enumerate(rgba):
             if not _close(pixels[i + c], want, tol):
                 raise AssertionError(
-                    f"centre {centre} is {pixels[i : i + 4]}, expected {rgba} (tol {tol})"
+                    f"centre {centre} is {tuple(pixels[i : i + 4])}, expected {rgba} (tol {tol})"
                 )
     elif (uv := manifest.get("centre_uv")) is not None:
         i = pixel_offset(centre, "centre_pixel")
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
             if not _close(pixels[i + c], want, 2e-3):
                 raise AssertionError(
-                    f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
+                    f"centre {centre} is {tuple(pixels[i : i + 4])}, expected {want} at {c}"
                 )
     if (rgba_probes := manifest.get("rgba_probes")) is not None:
         tol = manifest.get("rgba_tolerance", 0.02)
@@ -774,7 +782,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             for c, want in enumerate(want_rgba):
                 if not _close(pixels[i + c], want, tol):
                     raise AssertionError(
-                        f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
+                        f"RGBA probe {probe['pixel']} is {tuple(pixels[i : i + 4])}, expected {want_rgba} (tol {tol})"
                     )
     uv_probes = manifest.get("uv_probes")
     if uv_probes is None:
@@ -787,7 +795,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         for c, want in enumerate((u, v, 0.0, 1.0)):
             if not _close(pixels[i + c], want, 2e-3):
                 raise AssertionError(
-                    f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
+                    f"UV probe {probe['pixel']} is {tuple(pixels[i : i + 4])}, expected {want} at {c}"
                 )
     return {"covered": covered, "ratio": ratio, "pixels": pixels}
 
