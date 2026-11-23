@@ -107,6 +107,15 @@ class ExeChecklist(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             self.assertIn("Checklist: what to confirm", f.read())
 
+    def test_an_out_that_cannot_be_written_is_exit_1(self):
+        out = os.path.join(self.root, "a-folder")   # writing a directory fails
+        os.makedirs(out)
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            self.assertEqual(ec.main(["--root", self.root, "--out", out]), 1)
+        self.assertIn("cannot write", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_this_repository(self):
         notes = ec.collect(ROOT)
         self.assertTrue(notes)

@@ -170,9 +170,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     text = render(collect(a.root), called)
     if a.out:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as e:
+            print(f"cannot write {a.out}: {e}", file=sys.stderr)
+            return 1
         print(f"wrote {a.out}")
     else:
         print(text, end="")
