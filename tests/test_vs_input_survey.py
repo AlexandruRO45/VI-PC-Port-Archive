@@ -25,7 +25,8 @@ def check(cond, what):
 
 LISTINGS = {
     # vertex id only, legacy exports
-    "a_vs": "\tv_cvt_f32_u32_e32 v1, v0\n\texp pos0 v1, v1, v1, v1 done\n\texp param0 v1, v1, v1, v1\n\ts_endpgm\n",
+    "a_vs": "\tv_cvt_f32_u32_e32 v1, v0 ; no v_mbcnt_lo_u32_b32 instruction here\n"
+            "\texp pos0 v1, v1, v1, v1 done\n\texp param0 v1, v1, v1, v1\n\ts_endpgm\n",
     # vertex and instance id (v3 read before v3 is written)
     "b_vs": "\tv_add_nc_u32_e32 v1, v0, v3\n\tv_mov_b32_e32 v3, 0\n\texp pos0 v1, v1, v1, v3 done\n"
             "\texp param0 v1, v1, v1, v1\n\ts_endpgm\n",
@@ -59,7 +60,8 @@ def test_vs_input_survey():
         r = V.survey(dx)
         check(r["vertex_shaders"] == 4, "only the four vertex shaders are surveyed")
         m = r["markers"]
-        check(m["exp prim"] == 0 and m["s_sendmsg"] == 0 and m["v_mbcnt"] == 0, "no NGG markers in legacy listings")
+        check(m["exp prim"] == 0 and m["s_sendmsg"] == 0 and m["v_mbcnt"] == 0,
+              "an instruction name in a comment is not an NGG marker")
         check(m["exp pos0"] == 4 and m["exp param"] == 4 and m["fetch call"] == 1, "exports and the fetch call counted")
         check(r["input_vgprs_read"].get("v0") == 2 and r["input_vgprs_read"].get("v3") == 1,
               "v0 read on entry by two shaders, v3 by one (before it is written)")
@@ -76,6 +78,10 @@ def test_vs_input_survey():
         check(out.returncode == 0 and "exp prim 1" in out.stdout and "NGG markers present" in out.stdout,
               "a primitive export flips the verdict away from legacy")
         check("a_vs" not in out.stdout and "c_vs" not in out.stdout, "the summary prints counts, not shader names")
+
+        with open(os.path.join(dx, "disasm", "b_vs.s"), "a", encoding="utf-8", newline="\n") as f:
+            f.write("\tv_mbcnt_lo_u32_b32 v2, -1, 0\n\tv_mbcnt_hi_u32_b32 v2, -1, v2\n")
+        check(V.survey(dx)["markers"]["v_mbcnt"] == 1, "real v_mbcnt instructions count once per shader")
     assert failures == 0, f"{failures} vs_input_survey check(s) failed"
 
 

@@ -34,7 +34,7 @@ PRIM_EXPORT = re.compile(r"^\s*exp\s+prim\b", re.M)
 POS0_EXPORT = re.compile(r"^\s*exp\s+pos0\b", re.M)
 PARAM_EXPORT = re.compile(r"^\s*exp\s+param\d+\b", re.M)
 SENDMSG = re.compile(r"^\s*s_sendmsg\b", re.M)
-MBCNT = re.compile(r"\bv_mbcnt_(lo|hi)_u32_b32\b")
+MBCNT_OPS = ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32")
 FETCH_CALL = re.compile(r"^\s*s_swappc_b64\s+s\[4:5\],\s*s\[4:5\]", re.M)
 
 
@@ -88,14 +88,15 @@ def survey(dxbc_dir):
             continue
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
-        _, read_v = read_before_write(shader_ir.parse_file(path)["insns"])
+        insns = shader_ir.parse_file(path)["insns"]
+        _, read_v = read_before_write(insns)
         for r in read_v:
             if r < 16:
                 vgprs[f"v{r}"] += 1
         fetch = bool(FETCH_CALL.search(text))
         markers["exp prim"] += bool(PRIM_EXPORT.search(text))
         markers["s_sendmsg"] += bool(SENDMSG.search(text))
-        markers["v_mbcnt"] += bool(MBCNT.search(text))
+        markers["v_mbcnt"] += any(base_op(ins["op"]) in MBCNT_OPS for ins in insns)
         markers["exp pos0"] += bool(POS0_EXPORT.search(text))
         markers["exp param"] += bool(PARAM_EXPORT.search(text))
         markers["fetch call"] += fetch
