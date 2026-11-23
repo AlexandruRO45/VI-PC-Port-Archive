@@ -428,6 +428,29 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
 
+    def test_truncated_multiword_instruction_tails(self):
+        """A missing second word or literal is invalid without dropping the bytes that follow (BUILD-2404)."""
+        # Each first word declares a second one: VOP3 always, VOP1 and SOP1 because they carry a literal.
+        heads = {
+            "vop3": words(0xD5010000),
+            "vop1_literal": words(0x7E0002FF),
+            "sop1_literal": words(0xBE8003FF),
+        }
+        for name, head in heads.items():
+            for tail, expected_invalid in ((b"", 1), (b"\x00\x00", 2)):
+                with self.subTest(name=name, tail=tail.hex()):
+                    dec = rdna2_decode.decode_bytes(head + tail)
+                    self.assertEqual(dec["invalid"], expected_invalid)
+                    self.assertEqual(dec["insns"], [])
+                    text, bad = rdna2_decode.disasm_bytes(head + tail)
+                    self.assertEqual(bad, expected_invalid)
+                    self.assertEqual(text.strip(), "")
+
+        # A complete instruction before the truncation is still decoded.
+        dec = rdna2_decode.decode_bytes(words(0xBF810000) + heads["vop3"])
+        self.assertEqual(dec["invalid"], 1)
+        self.assertEqual([insn["op"] for insn in dec["insns"]], ["s_endpgm"])
+
 
 if __name__ == "__main__":
     unittest.main()
