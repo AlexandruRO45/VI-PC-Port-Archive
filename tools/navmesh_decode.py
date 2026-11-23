@@ -1094,7 +1094,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.exists(a.input):
         ap.error("%s does not exist" % a.input)
-    if os.path.isdir(a.input) and (a.start is not None or a.limit is not None):
+    is_dir = os.path.isdir(a.input)
+    if is_dir and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to archive inputs only")
     base = os.path.basename(os.path.abspath(a.input)) or "navmesh"
     out = a.out or os.path.splitext(base)[0] + ".navmesh-decode.json"
@@ -1107,13 +1108,16 @@ def main(argv=None):
             ap.error(f"{flag} is a directory: {path}")
         if same_report_path(path, a.input):
             ap.error(f"{flag} would overwrite the input {a.input}")
-        if os.path.isfile(path) and os.path.isdir(a.input):
-            manifest = os.path.join(a.input, "index.json")
-            if same_report_path(path, manifest):
-                ap.error(f"{flag} would overwrite the carve manifest {manifest}")
-            for entry in carved_files(a.input):
-                if same_report_path(path, entry.path):
-                    ap.error(f"{flag} would overwrite the input {entry.path}")
+        if not is_dir:
+            continue
+        manifest = os.path.join(a.input, "index.json")
+        if same_report_path(path, manifest):
+            ap.error(f"{flag} would overwrite the carve manifest {manifest}")
+        if not os.path.isfile(path):
+            continue
+        for entry in carved_files(a.input):
+            if same_report_path(path, entry.path):
+                ap.error(f"{flag} would overwrite the input {entry.path}")
     rows = [] if a.csv else None
     try:
         summary = scan(a.input, a.start, a.limit, a.deep, rows)

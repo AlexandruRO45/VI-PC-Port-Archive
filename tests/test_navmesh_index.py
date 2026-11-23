@@ -291,6 +291,20 @@ class NavmeshIndexTest(unittest.TestCase):
             with open(path, "rb") as f:
                 self.assertEqual(f.read(), originals[path], f"{args} touched the input")
 
+    def test_report_cannot_create_a_carve_manifest(self):
+        for flag in ("--out", "--csv"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                folder = os.path.join(tmp, "carve")
+                os.mkdir(folder)
+                manifest = os.path.join(folder, "index.json")
+                report = os.path.join(tmp, "carve.navmesh-index.json")
+                r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, manifest],
+                                   cwd=tmp, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn(f"{flag} would overwrite the input", r.stderr)
+                self.assertFalse(os.path.exists(manifest))
+                self.assertFalse(os.path.exists(report))
+
     def test_differently_cased_report_path_cannot_be_scanned_input(self):
         # Before: on a case-insensitive filesystem, --out/--csv spelling the input folder in another case
         # passed the containment check and replaced the carved file with the report, exit 0.

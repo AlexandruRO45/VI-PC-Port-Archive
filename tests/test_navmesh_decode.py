@@ -826,6 +826,21 @@ class NavmeshDecodeTest(unittest.TestCase):
                         with open(manifest, "rb") as f:
                             self.assertEqual(f.read(), before)
 
+    def test_reports_do_not_create_a_carve_manifest(self):
+        for flag in ("--out", "--csv"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+                carve = os.path.join(tmp, "carve")
+                os.mkdir(carve)
+                manifest = os.path.join(carve, "index.json")
+                result = subprocess.run(
+                    [sys.executable, "-I", TOOL, carve, flag, manifest],
+                    cwd=tmp, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f"{flag} would overwrite the carve manifest", result.stderr)
+                self.assertFalse(os.path.exists(manifest))
+                self.assertFalse(os.path.exists(os.path.join(tmp, "carve.navmesh-decode.json")))
+
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty.rpf")
