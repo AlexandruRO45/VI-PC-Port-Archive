@@ -39,6 +39,8 @@ folder:
   stage 9: the lit frame; sheet: frame | reference / the G-buffer albedo | mask / one light moved | frame
   stage 10: the 4x resolve and the 1x render side by side; sheet: resolve | reference / 1x | mask (yellow: edge pixels
             whose samples differ, grey: uncertain)
+  stage 11: the ray-traced shadows; sheet: frame | reference / the control (one instance masked) | mask /
+            the second control (two instances swap BLAS references) | frame
 """
 import argparse
 import array
@@ -93,6 +95,12 @@ PASS_LINES = {
          rf"SampleMask 1 << s isolated each sample \(at least {N} pixels only that sample's position explains\)",
          lambda a, b, blended, changed, predicted, e_ok, e, distinct: a == b and blended >= 1000
          and changed == predicted and predicted >= 1000 and e_ok == e and distinct > 0),
+    11: (rf"Lanterns stage 11: PASS, one shadow ray per pixel through a TLAS of {N} instances over 2 BLASes built by "
+         rf"BuildRaytracingAccelerationStructure, traversed with image_bvh_intersect_ray: {N} of {N} single-colour "
+         rf"pixels exact, masking one instance changed {N} of {N} predicted pixels, swapping two BLAS references "
+         rf"changed {N} of {N}; the step cap stopped {N} of {N} stalled rays and a full stack {N} of {N}",
+         lambda inst, a, b, m, mp, s, sp, cap, rays, full, frays: inst >= 2 and a == b and b >= 50000
+         and m == mp and mp > 0 and s == sp and sp > 0 and cap == rays and rays > 0 and full == frays and frays > 0),
 }
 
 
@@ -333,6 +341,9 @@ PANELS = {
                   ["stage9-moved.gpu", "stage9-frame.gpu"]]},
     10: {"main": [["stage10-frame.gpu", "stage10-single.gpu"]],
          "sheet": [["stage10-frame.gpu", "stage10-frame.ref"], ["stage10-single.gpu", "stage10-frame:mask"]]},
+    11: {"main": [["stage11-frame.gpu"]],
+         "sheet": [["stage11-frame.gpu", "stage11-frame.ref"], ["stage11-masked.gpu", "stage11-frame:mask"],
+                   ["stage11-swapped.gpu", "stage11-frame.gpu"]]},
 }
 
 

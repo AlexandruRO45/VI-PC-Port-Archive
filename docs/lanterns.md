@@ -47,6 +47,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [8](#stage-8-a-shadow-map) | A D32 shadow map with PSO depth bias, sampled with 2x2 PCF | The map cleared to far changes the predicted pixels |
 | [9](#stage-9-deferred-lighting-with-tiled-light-culling) | A G-buffer of three render targets, then 256 point lights culled per 16x16 tile in LDS | One light moved changes the predicted pixels; culling off gives the same image |
 | [10](#stage-10-4x-msaa-resolved-with-resolvesubresource) | The frame drawn at 4x MSAA and resolved with `ResolveSubresource` | The 1x render differs on exactly the predicted edge pixels; `SampleMask` isolates each sample |
+| [11](#stage-11-ray-traced-shadows-through-blastlas) | One shadow ray per pixel through a TLAS over two BLASes, walked with `image_bvh_intersect_ray` | Masking one instance or swapping two BLAS references changes the predicted pixels; a stalled BVH stops at the step cap |
 
 ## Stage 1
 
@@ -288,6 +289,31 @@ enumerates every average their sample candidates can give.
 
 ```
 Lanterns stage 10: PASS, 4x MSAA resolved by ResolveSubresource: 97438 of 97438 certain pixels exact at the standard sample positions (1173 edge pixels blended exactly), the 1x render differs on 1068 of 1068 predicted edge pixels and nowhere else certain; 866 of 866 uncertain pixels are one of their enumerated averages; SampleMask 1 << s isolated each sample (at least 188 pixels only that sample's position explains)
+```
+
+## Stage 11: ray-traced shadows through BLAS/TLAS
+
+`BuildRaytracingAccelerationStructure` builds one bottom-level structure per traced mesh (hexagonal prisms and square
+columns) and top-level structures over their ten instances. `cs_lanterns_rt_shadow` then casts one shadow ray per pixel
+of a stage-9 G-buffer towards the light with `image_bvh_intersect_ray`:
+
+- each lane keeps its own stack in LDS, and every push checks it; a lane that would overflow stops and is marked;
+- TLAS boxes are tested with the world ray; instance records are read through a raw V# over the TLAS (mask, BLAS
+  pointer, world-to-object), and the ray moves to object space for that instance's BLAS;
+- the loop stops at a step cap (2048); a ray still tracing or overflowed is drawn magenta, which no reference allows.
+
+How the check works. `lanterns_rt.h` holds the instance transforms and a CPU tracer (Moller-Trumbore in double with a
+barycentric margin), run from the corners of each pixel's position box (the depth's snapping slack).
+
+- Every single-colour pixel must be exact, every other certain pixel within its bounds.
+- Controls: a TLAS with one instance's mask at 0, and one where two instances swap BLAS references, must each change
+  exactly the predicted pixels and keep every other.
+- A BVH whose root box is its own only child must stop every traced ray at the cap, and every background lane must
+  report 0 steps; a root box that is its own four children must stop every ray as overflowed.
+- The output and step buffers start poisoned; no poisoned word may remain.
+
+```
+Lanterns stage 11: PASS, one shadow ray per pixel through a TLAS of 10 instances over 2 BLASes built by BuildRaytracingAccelerationStructure, traversed with image_bvh_intersect_ray: 97452 of 97452 single-colour pixels exact, masking one instance changed 1058 of 1058 predicted pixels, swapping two BLAS references changed 966 of 966; the step cap stopped 54348 of 54348 stalled rays and a full stack 54348 of 54348
 ```
 
 ## Build and run

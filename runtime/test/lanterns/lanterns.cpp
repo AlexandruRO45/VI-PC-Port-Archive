@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8|9|10 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9|10|11 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -54,6 +54,11 @@
 // rasterizes each standard sample position and averages (lanterns_msaa.h). Control: the 1x render must differ from the
 // resolve exactly on the edge pixels the reference predicts.
 //
+// Stage 11: ray-traced shadows. A BLAS (one prism) and a TLAS (ten instances) built through the D3D12 API; a compute
+// shader traces one shadow ray per pixel of a stage-9 G-buffer with image_bvh_intersect_ray, its own stack in LDS
+// (lanterns_rt.h). The CPU traces the same rays. Control: a second TLAS with one instance's mask 0 must change exactly
+// the pixels the reference predicts.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
@@ -67,9 +72,11 @@
 #include "lanterns_shadow.h"
 #include "lanterns_deferred_gpu.h"
 #include "lanterns_msaa.h"
+#include "lanterns_rt_gpu.h"
 #include "lanterns_textures_gpu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -791,6 +798,149 @@ int stage10(const std::filesystem::path& shader_dir, const std::filesystem::path
     return 0;
 }
 
+// Stage 11: ray-traced shadows through BLAS/TLAS and image_bvh_intersect_ray (see the top of this file).
+int stage11(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    lanterns::Shaders shaders;
+    std::vector<std::uint8_t> rt_shader;
+    if (!lanterns::load_shaders(shader_dir, 9, shaders) || !lanterns::load_rt_shader(shader_dir, rt_shader)) return 1;
+    const lanterns::Scene scene = lanterns::stage11();
+    constexpr unsigned kMasked = 1;   // the control TLAS gives this instance mask 0
+    std::vector<std::uint32_t> traced, masked, swapped, steps, steps_masked, steps_swapped, stalled, steps_stalled,
+        overflowed, steps_overflowed;
+    double stall_ms = 0;
+    lanterns::RtSizes sizes;
+    {
+        lanterns::Gpu gpu;
+        lanterns::RtShadows rt;
+        std::vector<Color> albedo;
+        if (!gpu.create(scene, shaders, DXGI_FORMAT_R8G8B8A8_UNORM) || !gpu.submit_frame(scene, true, 0) ||
+            !gpu.finish_frame(albedo))
+            return 1;
+        if (!rt.create(gpu, rt_shader, scene, kMasked)) {
+            std::fprintf(stderr, "lanterns: stage 11 BLOCKED before tracing (see the line above)\n");
+            return 1;
+        }
+        sizes = rt.sizes();
+        if (!rt.run(scene, lanterns::RtRun::traced, traced, steps) ||
+            !rt.run(scene, lanterns::RtRun::masked, masked, steps_masked) ||
+            !rt.run(scene, lanterns::RtRun::swapped, swapped, steps_swapped) ||
+            !rt.run(scene, lanterns::RtRun::overflow, overflowed, steps_overflowed))
+            return 1;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!rt.run(scene, lanterns::RtRun::stall, stalled, steps_stalled) || !gpu.idle()) return 1;
+        stall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    const auto ref = lanterns::rt_reference(scene, lanterns::rt_triangles(scene));
+    const auto ref_masked = lanterns::rt_reference(scene, lanterns::rt_triangles(scene, int(kMasked)));
+    const auto ref_swapped = lanterns::rt_reference(scene, lanterns::rt_triangles(scene, -1, true));
+    const std::vector<Color> frame = lanterns::unpack_rgba8(traced), frame_masked = lanterns::unpack_rgba8(masked),
+                             frame_swapped = lanterns::unpack_rgba8(swapped);
+    const lanterns::Comparison c = lanterns::compare_textured(frame, ref), cm = lanterns::compare_textured(frame_masked, ref_masked),
+                               cs = lanterns::compare_textured(frame_swapped, ref_swapped);
+    const auto single = [](const lanterns::TexturedReference& r, std::size_t i) {
+        return r.certain[i] && lanterns::detail::same(r.bounds[i].lo, r.bounds[i].hi);
+    };
+    unsigned exact = 0, singles = 0, unfinished = 0, poisoned = 0;
+    std::uint64_t step_total = 0, traced_lanes = 0;
+    std::uint32_t step_max = 0;
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        for (const auto* v : {&traced, &masked, &swapped, &steps, &steps_masked, &steps_swapped, &stalled, &steps_stalled,
+                              &overflowed, &steps_overflowed})
+            poisoned += (*v)[i] == lanterns::kRtPoison;
+        unfinished += traced[i] == lanterns::kRtUnfinished || masked[i] == lanterns::kRtUnfinished ||
+                      swapped[i] == lanterns::kRtUnfinished;
+        if (steps[i]) step_total += steps[i], ++traced_lanes, step_max = std::max(step_max, steps[i]);
+        if (!single(ref, i)) continue;
+        ++singles;
+        exact += lanterns::detail::same(frame[i], ref.bounds[i].lo);
+    }
+    // A control changes exactly the single-colour pixels whose expected colour changes, and keeps the others.
+    struct Moved { unsigned expected = 0, changed = 0, still = 0, kept = 0; };
+    const auto moved = [&](const lanterns::TexturedReference& other, const std::vector<std::uint32_t>& px) {
+        Moved mv;
+        for (std::size_t i = 0; i < frame.size(); ++i) {
+            if (!single(ref, i) || !single(other, i)) continue;
+            if (!lanterns::detail::same(ref.bounds[i].lo, other.bounds[i].lo)) ++mv.expected, mv.changed += traced[i] != px[i];
+            else ++mv.still, mv.kept += traced[i] == px[i];
+        }
+        return mv;
+    };
+    const Moved mask_move = moved(ref_masked, masked), swap_move = moved(ref_swapped, swapped);
+    // Which lanes trace at all comes from the CPU, not from the shader: a single-colour pixel that is not the
+    // background has geometry (its view depth is above 0, so its lane starts a ray); the background has none.
+    const Color background{float(lanterns::kBackground & 255u) / 255.0f, float((lanterns::kBackground >> 8) & 255u) / 255.0f,
+                           float((lanterns::kBackground >> 16) & 255u) / 255.0f, 1.0f};
+    unsigned rays = 0, capped = 0, empty = 0, idle = 0, overflow_rays = 0, overflow_marked = 0, bad_uncertain = 0;
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        const bool cap_ok = steps_stalled[i] == lanterns::kRtStepCap && stalled[i] == lanterns::kRtUnfinished;
+        const bool idle_ok = steps_stalled[i] == 0 && stalled[i] == lanterns::kBackground;
+        // The overflow fixture: each step pops one entry and pushes four; the eleventh step's third push has no room.
+        const bool over_ok = steps_overflowed[i] == (11u | lanterns::kRtOverflow) && overflowed[i] == lanterns::kRtUnfinished;
+        const bool over_idle = steps_overflowed[i] == 0 && overflowed[i] == lanterns::kBackground;
+        if (!single(ref, i)) {
+            bad_uncertain += !((cap_ok && over_ok) || (idle_ok && over_idle));
+            continue;
+        }
+        if (lanterns::detail::same(ref.bounds[i].lo, background)) {
+            ++empty, idle += idle_ok && over_idle;
+        } else {
+            ++rays, capped += cap_ok;
+            ++overflow_rays, overflow_marked += over_ok;
+        }
+    }
+    std::printf("lanterns: acceleration structures: 2 BLASes %llu bytes together (a prism of %zu triangles, a column of %zu), "
+                "TLAS %llu bytes (%zu instances), scratch %llu bytes\n", static_cast<unsigned long long>(sizes.blas),
+                lanterns::rt_indices(scene.meshes[0]).size() / 3, lanterns::rt_indices(scene.meshes[1]).size() / 3,
+                static_cast<unsigned long long>(sizes.tlas), lanterns::rt_transforms(scene).size(),
+                static_cast<unsigned long long>(sizes.scratch));
+    std::printf("lanterns: traced frame: %u of %u single-colour pixels exact, %u of %u certain pixels within bounds, %u of "
+                "%u uncertain within bounds; %.1f traversal steps per ray (max %u), %u rays left unfinished, %u "
+                "poisoned words left\n", exact, singles, c.certain_exact, c.certain, c.uncertain_plausible, c.uncertain,
+                traced_lanes ? double(step_total) / double(traced_lanes) : 0.0, step_max, unfinished, poisoned);
+    if (!c.pass()) report("traced frame", c);
+    std::printf("lanterns: control, instance %u masked out: %u of %u predicted pixels changed, %u of %u predicted unchanged "
+                "kept; %u of %u certain pixels within its bounds\n", kMasked, mask_move.changed, mask_move.expected,
+                mask_move.kept, mask_move.still, cm.certain_exact, cm.certain);
+    if (!cm.pass()) report("masked frame", cm);
+    std::printf("lanterns: control, instances %u and %u swap BLAS references: %u of %u predicted pixels changed, %u of %u "
+                "predicted unchanged kept; %u of %u certain pixels within its bounds\n", lanterns::kRtSwapA,
+                lanterns::kRtSwapB, swap_move.changed, swap_move.expected, swap_move.kept, swap_move.still,
+                cs.certain_exact, cs.certain);
+    if (!cs.pass()) report("swapped frame", cs);
+    std::printf("lanterns: faked stall (a BVH whose root box is its only child): %u of %u rays stopped at the %u-step cap and "
+                "marked, %u of %u background lanes idle (0 steps), the pass returned in %.0f ms\n", capped, rays,
+                lanterns::kRtStepCap, idle, empty, stall_ms);
+    std::printf("lanterns: stack overflow (a root box that is its own four children): %u of %u rays stopped at step 11 "
+                "marked as overflowed; %u uncertain pixels with neither outcome\n", overflow_marked, overflow_rays,
+                bad_uncertain);
+    lanterns::Reference shown;
+    shown.color.resize(frame.size());
+    shown.candidates.resize(frame.size());
+    std::vector<std::uint8_t> states(frame.size());
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        for (int k = 0; k < 4; ++k) shown.color[i][k] = (ref.bounds[i].lo[k] + ref.bounds[i].hi[k]) / 2;
+        states[i] = !lanterns::within(frame[i], ref.bounds[i]) ? 2 : single(ref, i) ? 3 : 1;
+    }
+    if (!dump(out_dir, "stage11-frame", frame, shown, &states) || !dump(out_dir, "stage11-masked", frame_masked, shown, &states) ||
+        !dump(out_dir, "stage11-swapped", frame_swapped, shown, &states))
+        return 1;
+    if (!c.pass() || !cm.pass() || !cs.pass() || exact != singles || unfinished || poisoned || mask_move.expected < 300 ||
+        swap_move.expected < 300 || mask_move.changed != mask_move.expected ||
+        mask_move.kept != mask_move.still || swap_move.changed != swap_move.expected || swap_move.kept != swap_move.still ||
+        rays < 50000 || capped != rays || empty < 5000 || idle != empty || overflow_marked != overflow_rays ||
+        bad_uncertain) {
+        std::fprintf(stderr, "lanterns: stage 11 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 11: PASS, one shadow ray per pixel through a TLAS of %zu instances over 2 BLASes built by "
+                "BuildRaytracingAccelerationStructure, traversed with image_bvh_intersect_ray: %u of %u single-colour "
+                "pixels exact, masking one instance changed %u of %u predicted pixels, swapping two BLAS references "
+                "changed %u of %u; the step cap stopped %u of %u stalled rays and a full stack %u of %u\n",
+                lanterns::rt_transforms(scene).size(), exact, singles, mask_move.changed, mask_move.expected,
+                swap_move.changed, swap_move.expected, capped, rays, overflow_marked, overflow_rays);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -814,8 +964,9 @@ int main(int argc, char** argv) {
     case 8: return stage8(shader_dir, out_dir);
     case 9: return stage9(shader_dir, out_dir);
     case 10: return stage10(shader_dir, out_dir);
+    case 11: return stage11(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }
