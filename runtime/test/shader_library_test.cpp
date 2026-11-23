@@ -60,6 +60,47 @@ const std::vector<std::uint8_t> dynamic = {
     0xf2, 0x81, 0x64, 0xff, 0xfb, 0x27, 0x60, 0xbf, 0xd1, 0x31, 0x02, 0xfe, 0x78, 0x7c, 0x3d, 0x44, 0x17, 0x72, 0x10,
     0xd3, 0xe8, 0xe7, 0x36, 0xe7, 0x77, 0x1f, 0x7a, 0xbd, 0xf9, 0x80};
 
+int test_json_raw_utf8() {
+    using namespace leonida;
+    // Invalid raw UTF-8 (RFC 3629 section 4): continuations, overlongs, surrogates, values above U+10FFFF,
+    // missing continuations and obsolete five/six-byte forms. Test both names and values.
+    const std::vector<std::string> invalid = {
+        "\x80", "\xbf", "\xc0\xaf", "\xc1\xbf", "\xc2", "\xc2" "x", "\xc2\\n", std::string("\xc2\0", 2),
+        "\xe0\x80\x80", "\xe0\x9f\xbf", "\xed\xa0\x80", "\xed\xbf\xbf", "\xe2\x82",
+        "\xe2" "A\xac", "\xe2\x82" "A", "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf", "\xf0\x90\x80",
+        "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xf8\x88\x80\x80\x80", "\xfc\x84\x80\x80\x80\x80", "\xff"
+    };
+    for (const auto& bytes : invalid) {
+        const std::string quoted = "\"" + bytes + "\"";
+        for (const auto& text : {quoted, "[" + quoted + "]", "{" + quoted + ":0}", "{\"name\":" + quoted + "}"}) {
+            Json value;
+            CHECK(!JsonReader(text).parse(value));
+        }
+    }
+    // Boundaries on both sides of each restricted second-byte range, plus common text and a noncharacter.
+    for (const std::string bytes : {"\x7f", "\xc2\x80", "\xdf\xbf", "\xe0\xa0\x80", "\xed\x9f\xbf",
+                                    "\xee\x80\x80", "\xef\xbf\xbf", "\xf0\x90\x80\x80", "\xf4\x8f\xbf\xbf",
+                                    "\xc3\xa9", "\xe6\x9d\xb1", "\xf0\x9f\x98\x80"}) {
+        const std::string decoded = "a" + bytes + "z";
+        Json value, object;
+        CHECK(JsonReader("\"" + decoded + "\"").parse(value) && value.string == decoded);
+        CHECK(JsonReader("{\"" + decoded + "\":\"" + decoded + "\"}").parse(object));
+        CHECK(object.find(decoded) && object.find(decoded)->string == decoded);
+        if (bytes.size() > 1) {
+            for (std::size_t length = 1; length < bytes.size(); ++length) {
+                Json truncated;
+                const std::string prefix = "\"" + bytes.substr(0, length);
+                CHECK(!JsonReader(prefix).parse(truncated));  // EOF inside the sequence
+                CHECK(!JsonReader(prefix + "\"").parse(truncated));  // a quote is not a continuation
+            }
+        }
+    }
+    Json mixed;
+    CHECK(JsonReader("\"\xc3\xa9\\u0041\xf0\x9f\x98\x80\\n\"").parse(mixed));
+    CHECK(mixed.string == "\xc3\xa9" "A\xf0\x9f\x98\x80\n");
+    return 0;
+}
+
 void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
 }
@@ -633,6 +674,7 @@ int main() {
         CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
 
+    CHECK(test_json_raw_utf8() == 0);
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");
     return 0;
 }

@@ -158,6 +158,13 @@ int main() {
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
 
+    for (const char* invalid : {"\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80"}) {
+        check(!parse_mod("{\"name\":\"" + std::string(invalid) + "\"}", "m", mod, error) &&
+                  error == "mod.json is not a JSON object", "invalid raw UTF-8 mod names are refused");
+    }
+    check(parse_mod("{\"name\":\"\xc3\xa9 \xf0\x9f\x98\x80\"}", "m", mod, error) &&
+              mod.name == "\xc3\xa9 \xf0\x9f\x98\x80", "valid raw UTF-8 mod names are preserved");
+
     std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

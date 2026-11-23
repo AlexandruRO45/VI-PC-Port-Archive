@@ -426,6 +426,25 @@ private:
         while (pos_ < text_.size()) {
             const char c = text_[pos_++];
             if (c == '"') return true;
+            const auto lead = static_cast<unsigned char>(c);
+            if (lead >= 0x80) {
+                // Raw text is UTF-8 (RFC 3629 section 4). Validate a complete sequence before copying its bytes;
+                // a quote or escape cannot finish a truncated sequence. The ASCII \u escape path is separate.
+                if (lead < 0xc2 || lead > 0xf4) return false;
+                const std::size_t length = lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+                const std::size_t start = pos_ - 1;
+                if (text_.size() - start < length) return false;
+                const auto second = static_cast<unsigned char>(text_[pos_]);
+                if ((lead == 0xe0 && second < 0xa0) || (lead == 0xed && second >= 0xa0) ||
+                    (lead == 0xf0 && second < 0x90) || (lead == 0xf4 && second >= 0x90)) return false;
+                for (std::size_t i = 1; i < length; ++i) {
+                    const auto tail = static_cast<unsigned char>(text_[start + i]);
+                    if (tail < 0x80 || tail > 0xbf) return false;
+                }
+                out.append(text_.substr(start, length));
+                pos_ = start + length;
+                continue;
+            }
             if (c != '\\') {
                 out.push_back(c);
                 continue;
