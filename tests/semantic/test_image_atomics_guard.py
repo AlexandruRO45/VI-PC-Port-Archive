@@ -32,11 +32,16 @@ SPIRV_VAL = shutil.which("spirv-val")
 FSSM = bytes(0x138) + struct.pack("<4I", 0x88 | (12 << 1), 32, 1, 1)
 
 
+# A shader that never writes EXEC has every lane active, and the translator folds the active-lane guard to %true
+# (`exec_static_true`, #4473). Loading EXEC from an SGPR first keeps the guard a real `OpLoad %bool %active`.
+EXEC_FROM_SGPR = "s_mov_b32 exec_lo, s12"
+
+
 def translate(lines, *, emulate=False):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
+        return support.translate_lines("cs_img_atomic_guard", [EXEC_FROM_SGPR] + lines + ["s_endpgm"], fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 

@@ -335,8 +335,8 @@ class ImageStoreD16Tests(unittest.TestCase):
         _validate(spv)
 
     def test_unsupported_dims_and_modifiers_still_refused(self):
+        # A CUBE d16 store is supported since #6805 (tests/semantic/test_image_cube_store_glc.py).
         for bad in (
-            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 tfe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 lwe",
         ):
