@@ -517,6 +517,17 @@ Intel UHD Graphics (Xe-LP, Windows 101.7088) splits it too, words 0, 2, 3 and 5 
 under it, as under `khr`, all 8 words must be strictly fused, and they are on that Intel UHD and on an RTX 3050
 Laptop (617.42).
 
+## Optimized modules (`--opt`)
+
+`make_game.py` translates the game's shaders with `rdna2spirv.py --opt`: every module then goes through
+`tools/spirv_opt.py` (#2298), which forwards register loads within a block, removes duplicate pure values and dead
+code. Over shard 0/40 of the 1.0.2.1 corpus that is a third less SPIR-V (503.6 to 319.7 MiB, every one of the 663
+modules smaller, all valid). `make_game.py --no-spirv-opt` leaves the modules unoptimized. The tests in `tests/` call
+the translator without it, because many of them read the unoptimized instructions.
+
+To run the GPU suite on optimized modules, set `LEONIDA_SPIRV_OPT=1` for `run_gpu_tests.py`. It translates every
+fixture with `--opt`, as `make_game.py` does.
+
 ## Hardware oracle (optional, AMD)
 
 `valu_fuzz.py`, `lds_fuzz.py`, `f32_fuzz.py` and `image_fuzz.py` take `--oracle hw`: the same programs run as native

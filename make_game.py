@@ -1530,10 +1530,13 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
 
 WAVE64_MODES = ("auto", "on", "off")
 
-# The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
+# The translator flags make_game.py can forward, and the argparse attribute each one reads: the fallbacks, and --opt
+# (tools/spirv_opt.py on every module, on unless --no-spirv-opt). They are recorded beside the translation, so a
+# change in any of them translates again.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--opt", "spirv_opt"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -2716,6 +2719,9 @@ def main() -> int:
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
+    ap.add_argument("--no-spirv-opt", dest="spirv_opt", action="store_false",
+                    help="leave the translated SPIR-V unoptimized; by default every module goes through "
+                         "tools/spirv_opt.py (rdna2spirv.py --opt): a third smaller over the corpus, same results")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:

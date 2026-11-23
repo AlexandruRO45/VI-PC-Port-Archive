@@ -250,7 +250,7 @@ class KeepEmulatedFlagTest(unittest.TestCase):
             game = os.path.join(tmp, "game")
             os.makedirs(game)
             argv = ["make_game.py", "--game", game, "--out", os.path.join(tmp, "o"), "--work", os.path.join(tmp, "w"),
-                    "--stages", "shaders", "--no-tui", "--wave64-emulate", mode]
+                    "--stages", "shaders", "--no-tui", "--wave64-emulate", mode, "--no-spirv-opt"]   # the fallbacks alone
             if mesh_compute:
                 argv.append("--mesh-compute")
             with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \

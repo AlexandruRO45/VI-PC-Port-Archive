@@ -184,12 +184,14 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, spirv_opt=False):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
-        # is the user's own.
+        # is the user's own. --opt is on by default; these tests are about the fallbacks, so they leave it off
+        # unless they ask for it.
         out = tempfile.TemporaryDirectory()
         self.addCleanup(out.cleanup)
-        argv = ["make_game.py", "--stages", "shaders", "--out", out.name, "--no-tui", *extra_argv]
+        argv = ["make_game.py", "--stages", "shaders", "--out", out.name, "--no-tui", *extra_argv,
+                *([] if spirv_opt else ["--no-spirv-opt"])]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")), \
@@ -214,6 +216,13 @@ class MainWiringTest(unittest.TestCase):
         pre, sh = self.run_main()
         self.assertEqual(pre, ())
         self.assertEqual(sh, ())
+
+    def test_spirv_opt_is_on_by_default(self):
+        """Every module goes through tools/spirv_opt.py unless --no-spirv-opt; it is forwarded and recorded like
+        the fallbacks, after them, so turning it on or off translates again."""
+        self.assertEqual(self.run_main(spirv_opt=True), (("--opt",),) * 2)
+        self.assertEqual(self.run_main("--no-spirv-opt", spirv_opt=True), ((), ()))
+        self.assertEqual(self.run_main("--bary-fallback", spirv_opt=True), (("--bary-fallback", "--opt"),) * 2)
 
     def test_f16_interp_fallback_follows_the_device(self):
         """On by itself where vk_subgroup_info says the GPU can't take PerVertexKHR inputs (MoltenVK), not where
@@ -328,7 +337,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
             self.touch(spirv, "index.json")
 
         argv = ["make_game.py", "--stages", "shaders", "--out", os.path.join(self.work, "out"),
-                "--work", self.work, *extra_argv]
+                "--work", self.work, *extra_argv, "--no-spirv-opt"]   # about the fallbacks: --opt left off
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.join(self.work, "game")), \
