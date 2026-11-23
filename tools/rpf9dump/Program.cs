@@ -154,7 +154,14 @@ else if (mode is "models" or "textures")
         {
             var cands = Scan(src, 0, null);
             list = Recover(src, length, cands);
-            RecoveryIndexCache.Save(mode, src, list, ScanCounts.Coverage(cands.Count, list.Select(e => e.Offset).Distinct().Count()), complete: true);
+            try
+            {
+                RecoveryIndexCache.Save(mode, src, list, ScanCounts.Coverage(cands.Count, list.Select(e => e.Offset).Distinct().Count()), complete: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"warning: could not write the {mode} recovery index cache for {src}: {ex.Message}");
+            }
             candidates = cands.Count;
         }
         else

@@ -4,8 +4,10 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zlib
 
 
@@ -64,6 +66,23 @@ def run(*args):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class Rpf9dumpExitCodeTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the Linux .NET cache path")
+    def test_unwritable_recovery_cache_does_not_block_texture_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "textures.rpf"
+            texture_dictionary_rpf(src)
+            cache = root / "RpfPreview"
+            cache.touch()
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(root)}):
+                result = run("textures", src, root / "out")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("could not write the textures recovery index cache", result.stderr)
+            sub = root / "out" / "textures" / "textures"
+            self.assertTrue((sub / "manifest.json").is_file())
+            dds = sub / "dictionary_at_0000000000001010" / "000_probe.dds"
+            self.assertEqual(dds.read_bytes()[:4], b"DDS ")
+
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
