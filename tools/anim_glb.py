@@ -504,6 +504,36 @@ def _clip_timeline(start, end, rate, step, frames):
     return timeline
 
 
+def _preserve_rotation_arcs(values, timeline, keys):
+    """Add at most one guard per interval when float32 keys would choose the opposite rotation arc."""
+    def dot(a, b):
+        return sum(x * y for x, y in zip(a, b))
+
+    out = [keys[0]]
+    for index in range(1, len(keys)):
+        left_time, left_frame = timeline[index - 1]
+        right_time, right_frame = timeline[index]
+        # Consecutive exact source keys already are the full clip's serialized interpolation endpoints.
+        if left_frame == math.floor(left_frame) and right_frame == left_frame + 1:
+            out.append(keys[index])
+            continue
+        left, right = (struct.unpack("<4f", struct.pack("<4f", *keys[k][1]))
+                       for k in (index - 1, index))
+        middle = _sample_track(values, left_frame + (right_frame - left_frame) * 0.5, "rotation")
+        # The reference midpoint fixes each endpoint's hemisphere. Zero endpoint dot follows glTF's
+        # nonnegative tie rule too; comparing the product of the three dots would miss that case.
+        desired_flip = (dot(left, middle) < 0.0) != (dot(right, middle) < 0.0)
+        if (dot(left, right) < 0.0) != desired_flip:
+            middle_time = left_time + (right_time - left_time) * 0.5
+            stored_left, stored_middle, stored_right = struct.unpack(
+                "<3f", struct.pack("<3f", left_time, middle_time, right_time))
+            require(stored_left < stored_middle < stored_right,
+                    "cannot preserve rotation arc with float32 timestamps")
+            out.append((middle_time, middle))
+        out.append(keys[index])
+    return out
+
+
 def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
     """-> {(target, path): [(time, value)]} for one clip. target is a joint index or 'mover'."""
     animations = {a["offset"]: a for p in dictionary["packs"] for a in p["animations"]}
@@ -555,7 +585,9 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
             if (target, path) in channels:
                 tally["tracks_overridden"] += 1
             if timeline is not None:
-                channels[(target, path)] = [(time, _sample_track(tracks[t], frame, path)) for time, frame in timeline]
+                keys = [(time, _sample_track(tracks[t], frame, path)) for time, frame in timeline]
+                channels[(target, path)] = (_preserve_rotation_arcs(tracks[t], timeline, keys)
+                                            if path == "rotation" else keys)
             elif fallback:
                 channels[(target, path)] = [(0.0, tuple(tracks[t][k])) for k in keep]
             else:

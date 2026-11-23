@@ -382,8 +382,8 @@ class ClipChannelTest(unittest.TestCase):
 
 
 class ClipBoundaryTest(unittest.TestCase):
-    def channels(self, samples, *, path="translation", start=0.2, end=0.3, rate=1.0):
-        animation = {"offset": 0x100, "duration": 1.0,
+    def channels(self, samples, *, path="translation", start=0.2, end=0.3, rate=1.0, duration=1.0):
+        animation = {"offset": 0x100, "duration": duration,
                      "tracks": [(joaat32("skel_a"), joaat32("bone" + path),
                                  anim_glb.PATH_FORMATS[path])]}
         dictionary = {"packs": [{"animations": [animation]}]}
@@ -526,6 +526,13 @@ class ClipBoundaryTest(unittest.TestCase):
             self.channels([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
                           start=0.0, end=math.ldexp(1.0, -149), rate=4.0)
 
+    def test_a_rotation_arc_guard_without_a_distinct_float32_time_is_refused(self):
+        inputs = [(0.515577495098114, -0.5751855373382568, -0.24126197397708893, 0.5874810814857483),
+                  (-0.3020513653755188, -0.629040539264679, -0.46743080019950867, -0.5427535176277161)]
+        samples = [tuple(x / math.sqrt(sum(y * y for y in q)) for x in q) for q in inputs]
+        with self.assertRaisesRegex(anim_glb.ExportError, "cannot preserve rotation arc with float32 timestamps"):
+            self.channels(samples, path="rotation", start=1e-16, end=1e-7, duration=1e-7, rate=1e38)
+
 
 class SamplerTimeTest(unittest.TestCase):
     def test_fractional_time_bounds_match_the_binary_accessor(self) -> None:
@@ -625,8 +632,9 @@ class ExportTest(unittest.TestCase):
 
         def rotation_at(curve, time):
             times, values = curve
-            fraction = (time - times[0]) / (times[1] - times[0])
-            left, right = values
+            index = next((k for k in range(len(times) - 1) if time <= times[k + 1]), len(times) - 2)
+            fraction = (time - times[index]) / (times[index + 1] - times[index])
+            left, right = values[index:index + 2]
             cosine = sum(x * y for x, y in zip(left, right))
             if cosine < 0.0:
                 right, cosine = tuple(-x for x in right), -cosine
@@ -638,47 +646,66 @@ class ExportTest(unittest.TestCase):
 
         self.offsets = write_archive(self.packs, [[skeleton_resource()],
                                                   list(part_resource([joaat32("skel_a")]))])
-        for delta in (0.0, -2**-20, 2**-20):
-            with self.subTest(delta=delta):
-                endpoint = (b[0] + delta, *b[1:])
-                sequence = clips_fixture.encode_sequence(2, [
-                    (3, 0, j, [a[j], endpoint[j]]) for j in range(4)] + [(8, 0, 0, None)])
-                page = bytearray(clips_fixture.dictionary(
-                    sequences=[sequence], frames=2, tracks=[(joaat32("skel_a"), clips_fixture.BONEROTATION, 0)]))
-                system = anim_clips.System(page)
-                dictionary = anim_clips.parse_dictionary(system)
-                animation = dictionary["packs"][0]["animations"][0]
-                struct.pack_into("<f", page, animation["offset"] + 0x28, 1.0)
-                clip_at = next(at for _key, at in system.atmap(0x48)
-                               if anim_clips.parse_clip(system, at)["kind"] == "clip")
-                entries, _ = system.array(system.ptr(clip_at + 0x68))
-                curves = []
-                for start, end in ((0.0, 1.0), (0.25, 0.75)):
-                    struct.pack_into("<3f", page, entries + 0x28, start, end, 1.0)
-                    struct.pack_into("<f", page, clip_at + 0x78, end - start)
-                    self.dict_offset = clips_fixture.write_rpf(self.anim, [page])[0]
-                    (gltf, binary), _report = self.export("--clip", "one")
-                    exported = gltf["animations"][0]
-                    self.assertEqual(len(exported["channels"]), 1)
-                    self.assertEqual(exported["channels"][0]["target"]["path"], "rotation")
-                    sampler = exported["samplers"][0]
-                    self.assertEqual(sampler["interpolation"], "LINEAR")
-                    curves.append(([v[0] for v in accessor_values(gltf, binary, sampler["input"])],
-                                   accessor_values(gltf, binary, sampler["output"])))
-                self.assertEqual(curves[0][0], [0.0, 1.0])
-                self.assertEqual(curves[1][0], [0.0, 0.5])
-                decoded, _ = anim_clips.decode_animation(system, animation)
-                self.assertEqual(curves[0][1], [struct.unpack("<4f", struct.pack("<4f", *q))
-                                               for q in decoded[0]])
-                for source_time in (0.25, 0.5, 0.75):
-                    full = rotation_at(curves[0], source_time)
-                    trimmed = rotation_at(curves[1], source_time - 0.25)
-                    # q and -q encode the same pose. Compare a point half a unit
-                    # from the joint using an independent rotation matrix.
-                    full_point = [0.5 * row[2] for row in rotation_rows(full)]
-                    trimmed_point = [0.5 * row[2] for row in rotation_rows(trimmed)]
-                    self.assertLess(math.dist(full_point, trimmed_point), 2e-7,
-                                    f"source time {source_time}: {full_point} != {trimmed_point}")
+        pairs = [(a, b, 0.25, 0.75, False),
+                 # The packed trim endpoints choose the opposite half-turn from the packed full clip.
+                 ((0.515577495098114, -0.5751855373382568, -0.24126197397708893, 0.5874810814857483),
+                  (-0.3020513653755188, -0.629040539264679, -0.46743080019950867, -0.5427535176277161),
+                  1e-9, 1.0, True),
+                 # Here the packed trim dot is exactly zero: glTF keeps the second endpoint's sign.
+                 ((0.3230655789375305, -0.4933171570301056, 0.4432689845561981, 0.6215322017669678),
+                  (-0.5114023089408875, -0.33490926027297974, 0.6443177461624146, -0.4595193862915039),
+                  1e-12, 1.0, True)]
+        for a, b, start, end, guard in pairs:
+            for delta in (0.0, -2**-20, 2**-20):
+                for rate in ((1.0, 2.0) if guard else (1.0,)):
+                    with self.subTest(start=start, end=end, delta=delta, rate=rate):
+                        self.check_trimmed_type8_curve(a, b, start, end, delta, rate, guard, rotation_at)
+
+    def check_trimmed_type8_curve(self, a, b, start, end, delta, rate, guard, rotation_at):
+        endpoint = (b[0] + delta, *b[1:])
+        sequence = clips_fixture.encode_sequence(2, [
+            (3, 0, j, [a[j], endpoint[j]]) for j in range(4)] + [(8, 0, 0, None)])
+        page = bytearray(clips_fixture.dictionary(
+            sequences=[sequence], frames=2, tracks=[(joaat32("skel_a"), clips_fixture.BONEROTATION, 0)]))
+        system = anim_clips.System(page)
+        dictionary = anim_clips.parse_dictionary(system)
+        animation = dictionary["packs"][0]["animations"][0]
+        struct.pack_into("<f", page, animation["offset"] + 0x28, 1.0)
+        clip_at = next(at for _key, at in system.atmap(0x48)
+                       if anim_clips.parse_clip(system, at)["kind"] == "clip")
+        entries, _ = system.array(system.ptr(clip_at + 0x68))
+        curves = []
+        for window_start, window_end, window_rate in ((0.0, 1.0, 1.0), (start, end, rate)):
+            struct.pack_into("<3f", page, entries + 0x28, window_start, window_end, window_rate)
+            struct.pack_into("<f", page, clip_at + 0x78, (window_end - window_start) / window_rate)
+            self.dict_offset = clips_fixture.write_rpf(self.anim, [page])[0]
+            (gltf, binary), _report = self.export("--clip", "one")
+            exported = gltf["animations"][0]
+            self.assertEqual(len(exported["channels"]), 1)
+            self.assertEqual(exported["channels"][0]["target"]["path"], "rotation")
+            sampler = exported["samplers"][0]
+            self.assertEqual(sampler["interpolation"], "LINEAR")
+            curves.append(([v[0] for v in accessor_values(gltf, binary, sampler["input"])],
+                           accessor_values(gltf, binary, sampler["output"])))
+        self.assertEqual(curves[0][0], [0.0, 1.0])
+        self.assertEqual(curves[1][0][0], 0.0)
+        duration, = struct.unpack("<f", struct.pack("<f", (end - start) / rate))
+        self.assertEqual(curves[1][0][-1], duration)
+        self.assertTrue(all(y > x for x, y in zip(curves[1][0], curves[1][0][1:])))
+        self.assertLessEqual(len(curves[1][0]), 3)
+        decoded, _ = anim_clips.decode_animation(system, animation)
+        self.assertEqual(curves[0][1], [struct.unpack("<4f", struct.pack("<4f", *q))
+                                       for q in decoded[0]])
+        for source_time in (0.25, 0.5, 0.75):
+            full = rotation_at(curves[0], source_time)
+            trimmed = rotation_at(curves[1], (source_time - start) / rate)
+            # q and -q encode the same pose. Compare a point half a unit
+            # from the joint using an independent rotation matrix.
+            full_point = [0.5 * row[2] for row in rotation_rows(full)]
+            trimmed_point = [0.5 * row[2] for row in rotation_rows(trimmed)]
+            self.assertLess(math.dist(full_point, trimmed_point), 2e-7,
+                            f"source time {source_time}: {full_point} != {trimmed_point}")
+        self.assertEqual(len(curves[1][0]), 3 if guard and delta == 0.0 else 2)
 
     def test_dictionary_lookup_stops_before_adjacent_resource(self):
         data = clips_fixture.two_sequence_dictionary()

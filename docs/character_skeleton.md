@@ -307,7 +307,9 @@ it does and why:
   quaternion interpolation, following [glTF's LINEAR sampler rules](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#interpolation).
   Rotation boundaries use the serialized float32 source keys to choose that path; rounding can
   otherwise make full and trimmed clips choose opposite arcs near a 180-degree turn. Exact source
-  frames retain their original float32 values.
+  frames retain their original float32 values. If rounding the trimmed endpoints would reverse their
+  intended arc, an interpolated midpoint guards that interval; export fails if no distinct float32
+  timestamp can hold the guard.
 - The whole skeleton sits under one node that turns RAGE Z-up into glTF Y-up. Skinned mesh nodes
   sit at the scene root, because glTF ignores a skinned mesh node's own transform.
 
