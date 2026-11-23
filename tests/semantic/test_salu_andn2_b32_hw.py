@@ -253,3 +253,29 @@ class TestSaluAndn2B32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(sdst, expected)
         self.assertEqual(state.sgpr[4], expected)
         self.assertEqual(state.scc, 1)
+
+
+class TestSaluAndn2B32SimdDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32-bit EXEC masking."""
+
+    def test_wave32_lane_mask_isolation(self):
+        lanes = lambda lo, hi: sum(1 << l for l in range(lo, hi))
+        s0 = lanes(0, 24)  # lanes 0..23
+        s1 = lanes(8, 32)  # lanes 8..31
+        # s0 & ~s1 = lanes 0..7
+        sdst, scc = ref_andn2_b32(s0, s1)
+        self.assertEqual(sdst, lanes(0, 8))
+        self.assertEqual(scc, 1)
+
+    def test_divergent_mask_checkerboard(self):
+        even_lanes = 0x55555555
+        odd_lanes = 0xAAAAAAAA
+        # even & ~odd = even & even = even
+        sdst, scc = ref_andn2_b32(even_lanes, odd_lanes)
+        self.assertEqual(sdst, even_lanes)
+        self.assertEqual(scc, 1)
+
+        # even & ~even = 0
+        sdst_zero, scc_zero = ref_andn2_b32(even_lanes, even_lanes)
+        self.assertEqual(sdst_zero, 0)
+        self.assertEqual(scc_zero, 0)
