@@ -55,6 +55,7 @@ if _TOOLS_DIR not in sys.path:
 
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 try:
     import dds_png
@@ -1504,6 +1505,8 @@ def build_world(
             raise ValueError("--placements needs the rpf9dump OBJ axes (--up z)")
         if not os.path.isfile(placements):
             raise FileNotFoundError(f"placements file does not exist: {placements}")
+        if same_report_path(os.path.join(os.path.abspath(out_dir), "world.json"), placements):
+            raise ValueError(f"output world.json must not overwrite placements file: {placements}")
         if region is not None and (len(region) != 4 or not (region[0] < region[2] and region[1] < region[3])):
             raise ValueError(f"region must be MINX,MINY,MAXX,MAXY with min < max, got {region!r}")
         if instancing not in INSTANCING_MODES:

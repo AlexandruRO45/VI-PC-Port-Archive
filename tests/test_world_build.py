@@ -2275,5 +2275,51 @@ class ViewerServeTest(unittest.TestCase):
                 srv.server_close()
 
 
+class PlacementsOverwriteGuardTest(unittest.TestCase):
+    """world_build must refuse --placements that aliases <out>/world.json."""
+
+    def test_cli_refuses_to_overwrite_placements_file_as_world_json(self):
+        import world_names
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = os.path.join(tmp, "assets")
+            out = os.path.join(tmp, "world")
+            os.makedirs(assets)
+            os.makedirs(out)
+            with open(os.path.join(assets, "prop.obj"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            with open(os.path.join(assets, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"Items": [{"Name": "prop", "File": "prop.obj"}]}, f)
+
+            arch_hex = f"{world_names.joaat('prop'):08x}"
+            original = json.dumps({
+                "archetype": arch_hex,
+                "position": [1.0, 2.0, 3.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale_xy": 1.0,
+                "scale_z": 1.0,
+                "lod_level": 0,
+            }) + "\n"
+            pl_path = os.path.join(out, "world.json")
+            with open(pl_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(original)
+
+            candidates = [pl_path]
+            if os.name == "nt":
+                candidates.append(os.path.join(out, "WORLD.JSON"))
+            for alias in candidates:
+                with self.subTest(placements=os.path.basename(alias)):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", os.path.join(TOOLS, "world_build.py"),
+                         assets, "--out", out, "--placements", alias, "--no-textures"],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(proc.returncode, 1)
+                    self.assertIn("ERROR:", proc.stderr)
+                    self.assertIn("must not overwrite placements", proc.stderr)
+                    with open(pl_path, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), original)
+
+
 if __name__ == "__main__":
     unittest.main()
