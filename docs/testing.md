@@ -267,6 +267,37 @@ against Microsoft's answers recorded in the test (`d3d12_subresource_copy` and `
 A few still compare with the host (`root_sig`, `device_proxy`, and some of `d3d12_vulkan_device`'s cases), so some
 of those fail for that reason.
 
+### UMU-Proton's wine
+
+Without Steam, [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) gives the same Proton
+environment. Its UMU-Proton build sits in `~/.local/share/Steam/compatibilitytools.d/UMU-Proton-<version>` and has
+only `files/bin/wine` (no `wine64`). There is no `proton run` step and no `STEAM_COMPAT_*` setup: one `umu-run`
+creates the prefix and lays down vkd3d-proton and DXVK in it. umu uses `WINEPREFIX` itself as the prefix (it adds a
+`pfx` link back to it), not `<data>/pfx`, so the same folder is the `WINEPREFIX` for ctest:
+
+```sh
+UMU="$HOME/.local/share/Steam/compatibilitytools.d/UMU-Proton-11.0-2e-x86_64"
+WINEPREFIX="$HOME/.local/share/leonida-umu" GAMEID=umu-default PROTONPATH="$UMU" umu-run cmd /c exit 0
+cmake -S runtime -B runtime/build/umu --toolchain "$PWD/runtime/cmake/clang-cl-xwin.cmake" \
+      -DXWIN_DIR="$HOME/.local/share/xwin-sdk" -DCMAKE_CROSSCOMPILING_EMULATOR="$UMU/files/bin/wine"
+cmake --build runtime/build/umu --parallel
+WINEPREFIX="$HOME/.local/share/leonida-umu" WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n" \
+      WINEDEBUG=-all ctest --test-dir runtime/build/umu
+```
+
+Without `WINEPREFIX`, `umu-run` makes `~/Games/umu/$GAMEID`. As with Proton, the prefix has to come from the same
+UMU-Proton build as the emulator, and the tests need a real display.
+
+Measured on 2026-11-23 at `867d922f0` with UMU-Proton 11.0-2e (wine-11.0) on an RTX 2060 SUPER (NVIDIA 615.78.08),
+Wayland through XWayland: 272 tests registered, 271 run, 225 passed, 30 skipped, one disabled and 16 failed (run
+one at a time). Most failures are comparisons with the host D3D12 or WARP, which is vkd3d-proton here, as in the
+Proton list above: `d3d12_heap_properties`, `d3d12_residency`, `d3d12_pipeline_library_host` and `dxgi_swapchain`
+report mismatches with the host, and `d3d12_clear`, `d3d12_clear_formats` and `d3d12_noop_copy` with WARP.
+`xbox_present` fails to present (VkResult -11) and `d3d12_present` gets a swapchain of another size.
+`d3d12_vulkan_device`, `d3d12_indirect_rt` and `d3d12_depth_resolve` have a command list refused by the layer, and
+`d3d12_indirect_dispatch_count` exits with a failure and no message. Three CPU tests also fail here:
+`gameinput_host`, `file_system` (only its `MAXIMUM_ALLOWED` package-write cases) and `run_startup_cmdline`.
+
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
 The game's shaders are mostly wave64. A GPU that can't run 64-wide compute subgroups skips the wave64 tests
