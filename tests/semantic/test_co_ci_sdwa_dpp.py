@@ -6,7 +6,7 @@ Covers:
   - _sdwa source selects (src0_sel / src1_sel), sext(src0) / sext(src1), dst_sel / dst_unused,
     unsigned clamp with real carry/borrow preserved in VCC, destination aliasing, wave32 and wave64
   - _dpp DPP16 (quad_perm, row_shr, row_mask, bank_mask, bound_ctrl 0/1, fi 0/1) and DPP8 across
-    all three ops (including subrev shuffling src0, not src1), plus null carry-out
+    all three ops (including subrev shuffling src1, not src0), plus null carry-out
   - carry-out scalar mask write under dpp_guard (disabled row/bank or bound_ctrl:0 invalid source
     writes 0 to VCC, never leaking pre-existing carry-in) and downstream VCC consumers
   - wave32, wave64 native, wave64 --wave64-emulate structure, and CPU verification of the GPU
@@ -80,7 +80,7 @@ GPU_EXPECTED = [
     0x00007777,
     0x0001000A,
     0x0001FFFA,
-    0x00000006,
+    0x00000013,
     0x0000ABCD,
 ]
 
@@ -224,7 +224,8 @@ class CoCiDppSemanticsTests(unittest.TestCase):
                         self.assertEqual(carries[lane], 0, f"lane {lane}")
 
     def test_dpp_bound_ctrl_1_sub_and_subrev(self):
-        # bound_ctrl:1 substitutes 0 for out-of-row src0; subrev shuffles src0 (right subtrahend: v2 - shuf(v1) - cin).
+        # bound_ctrl:1 puts 0 in src0 for v_sub_co_ci_u32_dpp, and in src1 (minuend) for v_subrev_co_ci_u32_dpp;
+        # subrev shuffles src1 (computed: shuf(v2)[l] - v1[l] - cin[l]).
         for wave_size in (32, 64):
             vcc = "vcc_lo" if wave_size == 32 else "vcc"
             # Even lanes get carry-in = 1, odd lanes get carry-in = 0.
@@ -248,7 +249,25 @@ class CoCiDppSemanticsTests(unittest.TestCase):
                     self.assertEqual(vals_sub[lane], diff & M32, f"sub wave{wave_size} lane {lane}")
                     self.assertEqual(borrow_sub[lane], int(diff < 0), f"sub borrow wave{wave_size} lane {lane}")
 
-                # subrev with quad_perm:[3,2,1,0]: lane l reads v1[l^3] as S0, computing v2[l] - v1[l^3] - cin[l].
+                # subrev with row_shr:1 bound_ctrl:1: lane l reads v2[l-1] (0 at row start) as S1 -> shuf(v2) - v1[l] - cin[l].
+                vals_rev_bc, borrow_rev_bc = self._run_dpp_case(
+                    [
+                        "v_add_nc_u32 v1, 1, v0",
+                        "v_add_nc_u32 v2, 10, v0",
+                        "v_mov_b32 v10, 0xBAD",
+                        *cin_setup,
+                        f"v_subrev_co_ci_u32_dpp v10, {vcc}, v1, v2, {vcc} row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+                    ],
+                    wave_size=wave_size,
+                )
+                for lane in range(wave_size):
+                    cin = 1 if (lane % 2 == 0) else 0
+                    src1 = 0 if (lane & 15) == 0 else (10 + lane - 1)
+                    diff = src1 - (1 + lane) - cin
+                    self.assertEqual(vals_rev_bc[lane], diff & M32, f"subrev bc wave{wave_size} lane {lane}")
+                    self.assertEqual(borrow_rev_bc[lane], int(diff < 0), f"subrev bc borrow wave{wave_size} lane {lane}")
+
+                # subrev with quad_perm:[3,2,1,0]: lane l reads v2[l^3] as S1, computing v2[l^3] - v1[l] - cin[l].
                 vals_rev, borrow_rev = self._run_dpp_case(
                     [
                         "v_add_nc_u32 v1, 1, v0",
@@ -261,7 +280,7 @@ class CoCiDppSemanticsTests(unittest.TestCase):
                 )
                 for lane in range(wave_size):
                     cin = 1 if (lane % 2 == 0) else 0
-                    diff = (10 + lane) - (1 + (lane ^ 3)) - cin
+                    diff = (10 + (lane ^ 3)) - (1 + lane) - cin
                     self.assertEqual(vals_rev[lane], diff & M32, f"subrev wave{wave_size} lane {lane}")
                     self.assertEqual(borrow_rev[lane], int(diff < 0), f"subrev borrow wave{wave_size} lane {lane}")
 

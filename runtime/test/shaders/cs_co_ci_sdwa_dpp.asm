@@ -6,10 +6,10 @@
 ;   out[3] = v_add_co_ci_u32_dpp row_shr:1 (BC=0) lane 0 (keeps 0x7777, clears VCC=0) = 0x00007777
 ;   out[4] = v_add_co_ci_u32_dpp row_shr:1 (BC=0) lane 1 (0xFFFFFFFF+10+1 -> 10, VCC=1) = 0x0001000A
 ;   out[5] = v_sub_co_ci_u32_dpp row_shr:1 bound_ctrl:1 lane 0 (0-5-1=0xFFFFFFFA, borrow=1) = 0x0001FFFA
-;   out[6] = v_subrev_co_ci_u32_dpp quad_perm:[1,0,3,2] lane 2 (20-13-1=6, borrow=0) = 0x00000006
+;   out[6] = v_subrev_co_ci_u32_dpp quad_perm:[1,0,3,2] lane 2 (32-12-1=19, borrow=0) = 0x00000013
 ;   out[7] = v_add_co_ci_u32_dpp bank_mask:0x1 lane 4 (bank 1 off: keeps 0xABCD, clears VCC=0) = 0x0000ABCD
 ; group: 32,1,1
-; Run: vk_compute_test cs_co_ci_sdwa_dpp.spv 1 dump -> out[0..7] = 268374580 4294868992 8192 30583 65546 131066 6 43981
+; Run: vk_compute_test cs_co_ci_sdwa_dpp.spv 1 dump -> out[0..7] = 268374580 4294868992 8192 30583 65546 131066 19 43981
 ; mattr: +wavefrontsize32,-wavefrontsize64
 v_mbcnt_lo_u32_b32 v0, -1, 0
 
@@ -53,8 +53,9 @@ v_and_b32 v17, 0xFFFF, v17
 v_lshlrev_b32 v18, 16, v18
 v_or_b32 v17, v17, v18
 
-; ---- 7: v_subrev_co_ci_u32_dpp quad_perm:[1,0,3,2] (lane 2 reads src0 from lane 3 = 13) ----
-v_mov_b32 v19, 20
+; ---- 7: v_subrev_co_ci_u32_dpp quad_perm:[1,0,3,2] (lane 2 reads src1 from lane 3 = 32; 32 - 12 - 1 = 19) ----
+v_lshlrev_b32 v19, 2, v0
+v_add_nc_u32 v19, 20, v19
 v_cmp_eq_u32_e32 vcc_lo, 2, v0
 v_subrev_co_ci_u32_dpp v20, vcc_lo, v12, v19, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 v_cndmask_b32_e64 v21, 0, 1, vcc_lo

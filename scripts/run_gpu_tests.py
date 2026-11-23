@@ -1111,7 +1111,7 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
                 "cs_co_ci_sdwa_dpp": [0x0FFF1234, 0xFFFE8000, 0x00002000, 0x00007777,
-                                      0x0001000A, 0x0001FFFA, 0x00000006, 0x0000ABCD],
+                                      0x0001000A, 0x0001FFFA, 0x00000013, 0x0000ABCD],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
                 # SHADER-99: -0 and NaN survive (SignedZeroInfNanPreserve, cs_signed_zero_nan.asm); 0 in out[4..7]
                 # without it

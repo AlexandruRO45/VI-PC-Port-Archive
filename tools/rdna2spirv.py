@@ -6485,7 +6485,12 @@ class Gen:
             raise Unsupported("DPP mask")
 
         args = [dict(a) for a in ins["args"]]
-        src_idx = self._src0_index(base_op(ins["op"]), args)
+        base = base_op(ins["op"])
+        src_idx = self._src0_index(base, args)
+        if base == "v_subrev_co_ci_u32" and len(args) >= 4:
+            # Like v_subrev_nc_u32_dpp, RDNA2 applies the DPP lane select and bound_ctrl zero
+            # to the second source operand (args[3], the minuend), while args[2] reads the current lane.
+            src_idx += 1
         if src_idx == 0:
             raise Unsupported("DPP operands")
         if len(args) <= src_idx:

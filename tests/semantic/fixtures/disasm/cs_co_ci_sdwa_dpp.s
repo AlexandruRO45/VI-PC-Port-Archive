@@ -32,7 +32,8 @@
 	v_and_b32 v17, 0xFFFF, v17
 	v_lshlrev_b32 v18, 16, v18
 	v_or_b32 v17, v17, v18
-	v_mov_b32 v19, 20
+	v_lshlrev_b32 v19, 2, v0
+	v_add_nc_u32 v19, 20, v19
 	v_cmp_eq_u32_e32 vcc_lo, 2, v0
 	v_subrev_co_ci_u32_dpp v20, vcc_lo, v12, v19, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 	v_cndmask_b32_e64 v21, 0, 1, vcc_lo
