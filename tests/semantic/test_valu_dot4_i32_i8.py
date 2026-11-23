@@ -425,5 +425,51 @@ class TestValuDot4I32I8ConditionCodes(unittest.TestCase):
         self.assertEqual(state.scc, 1)
         self.assertEqual(state.vcc, 0xDEADBEEFCAFEBABE)
 
+class TestValuDot4I32I8IEEE754AndEdgeCases(unittest.TestCase):
+    """Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_raw_bitwise_preservation_subnormal(self) -> None:
+        subnormal = 0x00000001
+        res = ref_dot4_i32_i8(subnormal, pack_i8(1, 0, 0, 0), 0)
+        self.assertEqual(res, 1)
+
+    def test_nan_payload_preservation_as_bytes(self) -> None:
+        qnan = 0x7FC00000
+        # Dot with (0, 0, 1, 0) extracts byte 2 (-64)
+        res = ref_dot4_i32_i8(qnan, pack_i8(0, 0, 1, 0), 0)
+        self.assertEqual(res, (-64) & MASK32)
+
+    def test_signed_zero_float_as_bytes(self) -> None:
+        neg_zero = 0x80000000
+        # Dot with (0, 0, 0, 1) extracts byte 3 (-128)
+        res = ref_dot4_i32_i8(neg_zero, pack_i8(0, 0, 0, 1), 0)
+        self.assertEqual(res, (-128) & MASK32)
+
+
+class TestValuDot4I32I8NegativeControls(unittest.TestCase):
+    """Negative controls and mutation rejection."""
+
+    def test_unsigned_byte_mutation_rejection(self) -> None:
+        def mutant_unsigned(s0: int, s1: int, s2: int) -> int:
+            b0 = [(s0 >> (8 * i)) & 0xFF for i in range(4)]
+            b1 = [(s1 >> (8 * i)) & 0xFF for i in range(4)]
+            return (sum(x * y for x, y in zip(b0, b1)) + s2) & MASK32
+
+        s0 = pack_i8(0xFF, 0, 0, 0)
+        s1 = pack_i8(1, 0, 0, 0)
+        oracle_res = ref_dot4_i32_i8(s0, s1, 0)
+        mutant_res = mutant_unsigned(s0, s1, 0)
+        self.assertEqual(oracle_res, 0xFFFFFFFF)
+        self.assertEqual(mutant_res, 255)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_missing_accumulator_mutation_rejection(self) -> None:
+        def mutant_no_acc(s0: int, s1: int, s2: int) -> int:
+            return ref_dot4_i32_i8(s0, s1, 0)
+
+        s0 = pack_i8(1, 2, 3, 4)
+        s1 = pack_i8(1, 1, 1, 1)
+        self.assertNotEqual(ref_dot4_i32_i8(s0, s1, 100), mutant_no_acc(s0, s1, 100))
+
 if __name__ == "__main__":
     unittest.main()
