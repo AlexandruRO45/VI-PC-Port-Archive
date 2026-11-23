@@ -45,12 +45,19 @@ def _count_after_items(f, buf, pos, chunk, dec):
         nonlocal buf
         while True:
             try:
-                return dec.raw_decode(buf, pos)
+                val, end = dec.raw_decode(buf, pos)
             except json.JSONDecodeError:
-                more = f.read(chunk)
-                if not more:
-                    raise
-                buf, pos = buf[pos:] + more, 0
+                val, end = None, None
+            if end is not None and end < len(buf):
+                return val, end
+            # A value that reaches the end of the buffer may go on in the next read (the digits of a number split
+            # between reads were accepted as a shorter number): read on before accepting it.
+            more = f.read(chunk)
+            if not more:
+                if end is None:
+                    raise ValueError("truncated JSON after the Items array")
+                return val, end
+            buf, pos = buf[pos:] + more, 0
 
     def skip(pos):
         nonlocal buf
