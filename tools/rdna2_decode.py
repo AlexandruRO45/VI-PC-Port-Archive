@@ -397,12 +397,14 @@ def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     if name.startswith("image_atomic_"):
         # The GFX10 atomic dmask selects the total VDATA width, including
         # both compare and swap values for cmpswap (masks 0x3 and 0xf).
+        # tfe adds the status dword after it, as for loads (llvm-mc prints
+        # v[0:1] for a dmask:0x1 atomic with tfe).
         if dmask in (1, 3, 15):
-            return dmask.bit_count()
+            return dmask.bit_count() + (1 if tfe else 0)
         n = 2 if "cmpswap" in name else 1
         if name.endswith("_x2"):
             n *= 2
-        return n
+        return n + (1 if tfe else 0)
     if name.startswith("image_gather4"):
         n = 4
     else:
