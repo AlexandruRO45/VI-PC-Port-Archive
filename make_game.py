@@ -19,7 +19,8 @@ everything it makes under --out. The only thing it downloads is the third_party/
 it is missing. Never share what it makes.
 
 Stages (each skips work that is already done, so a stopped build continues where it left off):
-    check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
+    check     always first: file names and sizes, plus the executable's SHA-256 when recorded
+              (add --full-check for every file's SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
               compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
@@ -1053,13 +1054,13 @@ def ensure_submodule() -> None:
          "\"git submodule update --init --recursive\" in this folder and build again.")
 
 
-def exe_mismatch(version: dict, exe: str, full: bool) -> str:
+def exe_mismatch(version: dict, exe: str) -> str:
     """Why `exe` is not the executable the manifest describes, or "" when it is or the manifest does not say.
 
     `expected_exe_size` and `expected_exe_sha256` are optional: a package that does not contain the executable (an
     older copy) has nothing to compare, and the runtime stage can still be built from its other files. When the
-    manifest records them, a different size fails either way (a truncated copy cannot be run); the hash is compared
-    only with --full, the mode that reads every file.
+    manifest records them, a different size or sha256 is a manipulated copy and fails. The one 120 MB hash is cheap
+    next to --full's 108-file pass, so it runs on every check, not only with --full.
     """
     size = version.get("expected_exe_size")
     if size is not None:
@@ -1067,7 +1068,7 @@ def exe_mismatch(version: dict, exe: str, full: bool) -> str:
         if actual != size:
             return f"{version['expected_exe']} is {actual} bytes, the manifest has {size}."
     digest = version.get("expected_exe_sha256")
-    if full and digest:
+    if digest:
         actual = file_sha256(exe)
         if actual != digest.lower():
             return f"{version['expected_exe']} has sha256 {actual[:12]}, the manifest has {digest[:12]}."
@@ -1090,24 +1091,19 @@ def check(game: str, full: bool) -> dict:
     if bad:
         fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
     exe = os.path.join(game, v["expected_exe"])
-    if os.path.isfile(exe):
-        # The size is one stat, so check it before --full hashes every file: a truncated executable is
-        # already unusable and should not wait for a 108-file pass to be reported.
-        why = exe_mismatch(v, exe, False)
-        if why:
-            fail(f"{why} Use an unmodified {v['expected_exe']} from version {v['version']}.")
-    if full:
-        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     present = "all files present" + (" and hashes match" if full else "")
     if not os.path.isfile(exe):
         log(f"check: {present}. "
             f"{v['expected_exe']} is not in the folder: the runtime stage can be built but not run.")
         return v
-    why = exe_mismatch(v, exe, full)
+    # The size is one stat and the executable's hash is one file: check both before --full reads every file.
+    why = exe_mismatch(v, exe)
     if why:
         fail(f"{why} Use an unmodified {v['expected_exe']} from version {v['version']}.")
+    if full:
+        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     log(f"check: {present}. Executable found"
-        + (" and its sha256 matches." if full and v.get("expected_exe_sha256") else "."))
+        + (" and its sha256 matches." if v.get("expected_exe_sha256") else "."))
     return v
 
 
