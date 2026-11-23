@@ -373,7 +373,7 @@ compile:
   `--eliminate-dead-code-aggressive`, 1,120,512 B) validate and did not finish in 120 s;
   `--eliminate-dead-branches --merge-blocks --cfg-cleanup` returns the module unchanged. Marking every load and
   store of the dispatch variables `%pc` and `%done` `Volatile`, which keeps the module equivalent, did not finish in
-  150 s either (whether that driver honours the flag was not checked). `-Os`, `--merge-return` and
+  150 s either (whether that driver honours the flag was not checked). `spirv-opt`'s `-Os`, `--merge-return` and
   `--scalar-replacement` were not run.
 
 So the AMD compiler's time on this module comes from the dispatch-loop form of this one program: of the eleven
