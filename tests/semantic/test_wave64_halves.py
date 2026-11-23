@@ -422,6 +422,17 @@ class Classification(unittest.TestCase):
             "v_mov_b32_e32 v12, 0", "buffer_atomic_add v11, v12, s[0:3], 0 offen glc",
             "s_or_b64 exec, exec, s[14:15]", "s_mov_b64 exec, s[10:11]"]), "C", ["elected-side-effect"])
 
+    def test_c_elected_lane_plain_store(self):
+        # The same elected lane (exec narrowed to the lane whose mbcnt is 0) doing a plain buffer_store rather than an
+        # atomic: the store is a side effect of one lane per wave, which the two 32-lane halves of a wave64 cannot
+        # reproduce, so the shader stays in tier C.
+        self.tier("ps_c_elect_store", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, 1",
+            "v_mov_b32_e32 v12, 0", "buffer_store_dword v11, v12, s[0:3], 0 offen",
+            "s_or_b64 exec, exec, s[14:15]", "s_mov_b64 exec, s[10:11]"]), "C", ["elected-lane", "elected-side-effect"])
+
     def test_c_rank_into_export_even_with_base(self):
         self.tier("ps_c_slot_exported", ps([
             "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10", "v_add_nc_u32_e32 v6, 1, v10"]),
