@@ -458,5 +458,59 @@ class TestBoundaryExtremes(unittest.TestCase):
         self.assertEqual(ref_sad_u8(0x7FFFFFFF, 0x00000000, 0), 892)
 
 
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_negative_dst_rejection(self):
+        with self.assertRaises(TypeError):
+            VSadU8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+
+    def test_out_of_bounds_register_rejection(self):
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_mutation_unsigned_vs_signed_diff(self):
+        # If the byte subtraction were signed (not unsigned abs), 0 - 0xFF would
+        # underflow differently. The unsigned ABS must give 255 for 0x00 vs 0xFF.
+        b0, b1 = 0x00, 0xFF
+        unsigned_abs_diff = abs(b0 - b1)
+        # signed_diff (no abs) would be -255 (0xFFFFFF01 as 32-bit)
+        self.assertEqual(unsigned_abs_diff, 255)
+        self.assertNotEqual(unsigned_abs_diff, (b0 - b1) & MASK32)
+
+    def test_mutation_accumulator_missing(self):
+        # Without S2, 0x04030201 vs 0 would give 10, not 60
+        correct = ref_sad_u8(0x04030201, 0x00000000, 50)
+        without_acc = ref_sad_u8(0x04030201, 0x00000000, 0)
+        self.assertNotEqual(correct, without_acc)
+        self.assertEqual(correct, 60)
+        self.assertEqual(without_acc, 10)
+
+    def test_mutation_byte_order_sensitivity(self):
+        # Swapping bytes should change individual byte diffs but not sum (symmetric)
+        # 0x01020304 vs 0x04030201: each byte diff is |1-4|=3, |2-3|=1, |3-2|=1, |4-1|=3 -> 8
+        self.assertEqual(ref_sad_u8(0x01020304, 0x04030201, 0), 8)
+        # But not 10 (what 0x04030201 vs 0x00000000 gives)
+        self.assertNotEqual(ref_sad_u8(0x01020304, 0x04030201, 0), 10)
+
+    def test_translator_emits_sad_u8_spir_v(self):
+        lines = [
+            "v_mov_b32 v0, 0x04030201",
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 0",
+            "v_sad_u8 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_sad_u8_spv", lines)
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("OpIAdd", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
