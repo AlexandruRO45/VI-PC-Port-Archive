@@ -406,7 +406,6 @@ chunks on a 256-byte boundary behind zero padding; the walk stops there (`stoppe
 | positions finite | all |
 | positions within 300 m | 29,572,450 (99.9%) |
 | shared edges with neighbouring faces within ~25° | 33,342,470 of 36,707,506 (90.8%); 1.4% opposed |
-| normals within 8° / 25° of their faces | 76.5% / 94.6% of 20,801,089; 2.1% opposed |
 | normals within 8° / 25° of their faces | 76.5% / 94.5% of 20,801,089; 2.1% opposed |
 | tangents perpendicular to the normal | 30,473,135 of 30,569,246 (99.7%) |
 | radius covers the farthest vertex from the stored centre | 257,091 of 275,832 meshlets (93.2%); 94.8% within rounding |
