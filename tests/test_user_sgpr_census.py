@@ -125,7 +125,9 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
                                _same_resolved_name=probe)
            if output_kind == "folding-volume-case" else contextlib.nullcontext())
     with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
-               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
+               if output_kind == "folding-volume-case" else contextlib.nullcontext()), (
+                   mock.patch.object(report_paths.os.path, "realpath", side_effect=os.fspath)
+                   if output_kind == "folding-volume-case" else contextlib.nullcontext()):
         with pytest.raises(SystemExit) as exc:
             usc.main([str(index), "--json", str(output)])
     if output_kind == "folding-volume-case":
