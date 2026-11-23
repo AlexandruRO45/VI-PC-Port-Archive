@@ -786,5 +786,60 @@ class TestMainAndCLI(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
 
 
+class TestBuildWithPythonAssembler(unittest.TestCase):
+    """`run_gpu_tests.py --assembler python` on a machine without SPIRV-Tools: no spirv-as, spirv-val only if asked."""
+    INDEX = {
+        "ps_b": {"stage": "ps", "inputs": [2], "bary_fallback_input": {"location": 0}},
+        "ps_a": {"stage": "ps", "inputs": [0, 3], "bary_fallback_input": {"location": 1}},
+    }
+
+    def _build(self, tmp, **kwargs):
+        with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(self.INDEX, f)
+        return bary_fallback_gs.build_for_index(tmp, assembler="python", **kwargs)
+
+    def test_no_spirv_tools_needed_without_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(bary_fallback_gs.subprocess, "run") as run_mock:
+                built = self._build(tmp, validate=False)
+            run_mock.assert_not_called()
+            self.assertEqual([os.path.basename(p) for p in built], ["ps_a.bary_gs.spv", "ps_b.bary_gs.spv"])
+            for spv in built:
+                self.assertEqual(Path(spv).read_bytes()[:4], (0x07230203).to_bytes(4, "little"))  # SPIR-V magic
+                self.assertTrue(os.path.isfile(spv[: -len(".spv")] + ".spvasm"))
+            self.assertEqual(sorted(os.listdir(tmp)),
+                             ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm", "ps_b.bary_gs.spv",
+                              "ps_b.bary_gs.spvasm"])
+
+    def test_validation_still_runs_spirv_val_on_the_python_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seen = []
+
+            def fake_run(cmd, capture_output=False, text=False):
+                seen.append(cmd[0])
+                self.assertEqual(Path(cmd[-1]).read_bytes()[:4], (0x07230203).to_bytes(4, "little"))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=fake_run):
+                self._build(tmp)
+            self.assertEqual(seen, ["spirv-val", "spirv-val"])
+
+    def test_same_binary_as_spirv_as(self):
+        if not (shutil.which("spirv-as") and shutil.which("spirv-val")):
+            self.skipTest("spirv-as / spirv-val not on PATH")
+        with tempfile.TemporaryDirectory() as py_dir, tempfile.TemporaryDirectory() as tools_dir:
+            python_built = self._build(py_dir)
+            with open(os.path.join(tools_dir, "index.json"), "w", encoding="utf-8") as f:
+                json.dump(self.INDEX, f)
+            tools_built = bary_fallback_gs.build_for_index(tools_dir)
+            for a, b in zip(python_built, tools_built, strict=True):
+                self.assertEqual(Path(a).read_bytes(), Path(b).read_bytes())
+
+    def test_unknown_assembler_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                bary_fallback_gs.build_for_index(tmp, assembler="glslang")
+
+
 if __name__ == "__main__":
     unittest.main()

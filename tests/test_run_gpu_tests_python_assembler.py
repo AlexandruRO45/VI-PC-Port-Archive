@@ -136,6 +136,69 @@ class PythonAssemblerTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), listing)
                 self.assertEqual(working.read_bytes(), listing)
 
+    def test_fallback_helpers_get_the_runners_assembler(self) -> None:
+        """LEONIDA_MESH_COMPUTE=1 and LEONIDA_BARY_FALLBACK=1 build helper shaders with mesh_compute_vs and
+        bary_fallback_gs. They get the runner's assembler and validation choice: before, they always ran spirv-as
+        and spirv-val from PATH, so `--assembler python` without SPIRV-Tools stopped with a traceback."""
+        cases = (("python", None, {"assembler": "python", "validate": False}),           # no SPIRV-Tools at all
+                 ("python", "/usr/bin/spirv-val", {"assembler": "python", "validate": True}),
+                 ("spirv-as", "/usr/bin/spirv-val", {"assembler": "spirv-as", "validate": True}))
+        for assembler, which, expected in cases:
+            with self.subTest(assembler=assembler, spirv_val=which), tempfile.TemporaryDirectory() as tmp:
+                listing = Path(tmp) / "source" / "cs_lds.s"
+                listing.parent.mkdir()
+                listing.write_bytes(b"; synthetic\n\ts_endpgm\n")
+                args = SimpleNamespace(assembler=assembler, no_validate=False, disasm_dir=str(listing.parent),
+                                       filter="cs_lds", build=str(Path(tmp) / "work"), require_pass=False)
+                calls = {}
+
+                def helper(name):
+                    def build_for_index(spirv_dir, **kwargs):
+                        calls[name] = kwargs
+                        return []
+                    return SimpleNamespace(build_for_index=build_for_index)
+
+                with (patch.object(run_gpu_tests, "MESH_COMPUTE", True),
+                      patch.object(run_gpu_tests, "bary_fallback", return_value=True),
+                      patch.object(run_gpu_tests.shutil, "which", return_value=which),
+                      patch.dict(sys.modules, {"mesh_compute_vs": helper("mesh_compute_vs"),
+                                               "bary_fallback_gs": helper("bary_fallback_gs")}),
+                      patch.object(run_gpu_tests, "spirv_as"),
+                      patch.object(run_gpu_tests, "run_cmd", return_value=(0, "")),
+                      patch.object(sys, "stdout", io.StringIO())):
+                    run_gpu_tests.run_suite(args, str(Path(tmp) / "work"))
+                self.assertEqual(calls, {"mesh_compute_vs": expected, "bary_fallback_gs": expected})
+
+    def test_ms_v5_workgroup_runs_spirv_val_only_when_validating(self) -> None:
+        """ms_v5_workgroup checks its module with spirv-val before the draw. Under --no-validate, or --assembler
+        python without spirv-val on PATH, that step is skipped as it is for the translation, not reported as
+        "could not start spirv-val"."""
+        for no_validate, which, validated in ((False, None, False), (True, "/usr/bin/spirv-val", False),
+                                              (False, "/usr/bin/spirv-val", True)):
+            with self.subTest(no_validate=no_validate, spirv_val=which), tempfile.TemporaryDirectory() as tmp:
+                listing = Path(tmp) / "source" / "ms_v5_workgroup.s"
+                listing.parent.mkdir()
+                listing.write_bytes(b"; synthetic\n\ts_endpgm\n")
+                args = SimpleNamespace(assembler="python", no_validate=no_validate, disasm_dir=str(listing.parent),
+                                       filter="ms_v5_workgroup", build=str(Path(tmp) / "work"), require_pass=False)
+                launched = []
+
+                def run(command, env=None, gpu=True):
+                    launched.append(os.path.basename(command[0]))
+                    if run_gpu_tests.TRANSLATOR in command:
+                        out = Path(command[command.index("--out") + 1])
+                        (out / "ms_v5_workgroup.spv").write_bytes(b"\x03\x02\x23\x07")
+                    return 0, ""
+
+                with (patch.object(run_gpu_tests.shutil, "which", return_value=which),
+                      patch.object(run_gpu_tests, "spirv_as"),
+                      patch.object(run_gpu_tests, "mesh_v5_test", return_value="") as draw,
+                      patch.object(run_gpu_tests, "run_cmd", side_effect=run),
+                      patch.object(sys, "stdout", io.StringIO())):
+                    run_gpu_tests.run_suite(args, str(Path(tmp) / "work"))
+                self.assertEqual("spirv-val" in launched, validated, launched)
+                draw.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

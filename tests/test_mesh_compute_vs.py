@@ -85,6 +85,56 @@ class Interface(unittest.TestCase):
                 self.assertEqual(f.read(), vs.vs_spvasm(layout(clip=1)))
 
 
+class PythonAssembler(unittest.TestCase):
+    """`run_gpu_tests.py --assembler python` on a machine without SPIRV-Tools: no spirv-as, spirv-val only if asked."""
+    LAYOUTS = {"ms_plain": layout(), "ms_full": layout(clip=5, cull=2, params=(2, 5)),
+               "ms_large": layout(maxv=128, maxp=64, clip=4, params=(0,))}
+
+    def test_no_spirv_tools_needed_without_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {name: {"mesh_compute": lay} for name, lay in self.LAYOUTS.items()})
+            with (mock.patch.object(vs.shutil, "which", return_value=None),
+                  mock.patch.object(vs.subprocess, "run") as run_mock):
+                built = vs.build_for_index(tmp, assembler="python", validate=False)
+            run_mock.assert_not_called()
+            self.assertEqual([os.path.basename(p) for p in built],
+                             [name + ".mesh_vs.spv" for name in sorted(self.LAYOUTS)])
+            for spv in built:
+                with open(spv, "rb") as f:
+                    self.assertEqual(f.read(4), (0x07230203).to_bytes(4, "little"))  # SPIR-V magic
+
+    def test_validation_still_runs_spirv_val_on_the_python_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout()}})
+            seen = []
+
+            def validate(cmd, **_kwargs):
+                seen.append(cmd[0])
+                with open(cmd[-1], "rb") as f:
+                    self.assertEqual(f.read(4), (0x07230203).to_bytes(4, "little"))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with (mock.patch.object(vs, "tool_path", side_effect=lambda name: name),
+                  mock.patch.object(vs.subprocess, "run", side_effect=validate)):
+                vs.build_for_index(tmp, assembler="python")
+            self.assertEqual(seen, ["spirv-val"])
+
+    def test_same_binary_as_spirv_as(self):
+        if not HAVE_SPIRV_TOOLS:
+            self.skipTest("spirv-as / spirv-val not on PATH")
+        with tempfile.TemporaryDirectory() as py_dir, tempfile.TemporaryDirectory() as tools_dir:
+            for d in (py_dir, tools_dir):
+                write_index(d, {name: {"mesh_compute": lay} for name, lay in self.LAYOUTS.items()})
+            for a, b in zip(vs.build_for_index(py_dir, assembler="python"), vs.build_for_index(tools_dir), strict=True):
+                with open(a, "rb") as fa, open(b, "rb") as fb:
+                    self.assertEqual(fa.read(), fb.read())
+
+    def test_unknown_assembler_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                vs.build_for_index(tmp, assembler="glslang")
+
+
 class Assembly(unittest.TestCase):
     def test_every_layout_assembles_and_validates(self):
         if not HAVE_SPIRV_TOOLS:

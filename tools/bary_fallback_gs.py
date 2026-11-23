@@ -14,6 +14,7 @@ BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
 
 The paired helper forwards a VS ClipDistance or CullDistance array. The suffix identifies the kind and length.
 Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
+With assembler="python" it assembles with tools/spirv_asm.py instead, and validate=False skips spirv-val.
 Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
 import argparse
@@ -167,9 +168,14 @@ def write_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
     return written
 
 
-def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None) -> list[str]:
+def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None, *,
+                    assembler: str = "spirv-as", validate: bool = True) -> list[str]:
     """Assemble and validate each helper with SPIRV-Tools for Vulkan 1.2 before publishing its text and binary.
+    `assembler` is "spirv-as" (from PATH) or "python" (tools/spirv_asm.py, for a machine without SPIRV-Tools, as
+    with `run_gpu_tests.py --assembler python`). `validate=False` skips spirv-val.
     Returns the .spv paths; raises RuntimeError with the tool output on failure."""
+    if assembler not in ("spirv-as", "python"):
+        raise ValueError(f"unknown assembler: {assembler!r}")
     built = []
     for asm, shader in _helpers_for_index(spirv_dir, pair):
         spv = asm[: -len(".spvasm")] + ".spv"
@@ -177,8 +183,14 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
             staged_asm = os.path.join(staging, os.path.basename(asm))
             staged_spv = os.path.join(staging, os.path.basename(spv))
             Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
-            for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
-                        ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
+            commands = []
+            if assembler == "python":
+                python_assemble(shader, asm, staged_spv)
+            else:
+                commands.append(["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv])
+            if validate:
+                commands.append(["spirv-val", "--target-env", "vulkan1.2", staged_spv])
+            for cmd in commands:
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 if r.returncode:
                     raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
@@ -186,6 +198,17 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
             os.replace(staged_spv, spv)
         built.append(spv)
     return built
+
+
+def python_assemble(shader: str, asm: str, spv: str) -> None:
+    """Assemble `shader` (the text of `asm`) into `spv` with tools/spirv_asm.py; RuntimeError names `asm` on failure."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import spirv_asm
+    try:
+        data = spirv_asm.assemble(shader, target_env="vulkan1.2")
+    except spirv_asm.SpirvAsmError as e:
+        raise RuntimeError(f"spirv_asm failed for {asm}:\n{e}") from None
+    Path(spv).write_bytes(data)
 
 
 def main(argv):

@@ -18,7 +18,8 @@ params' f16 halves goes out decoded to f32 at those locations too, as a translat
 
     python -I tools/mesh_compute_vs.py <spirv dir>    # <name>.mesh_vs.spv per --mesh-compute MS in index.json
 
-Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
+Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH. With
+assembler="python" it assembles with tools/spirv_asm.py instead, and validate=False skips spirv-val.
 """
 import json
 import os
@@ -260,15 +261,22 @@ def tool_path(name):
     return path
 
 
-def build_for_index(spirv_dir):
+def build_for_index(spirv_dir, *, assembler="spirv-as", validate=True):
     """write_for_index, then assemble to <name>.mesh_vs.spv and validate (Vulkan 1.2, as for the translator).
+    `assembler` is "spirv-as" (SPIRV-Tools from PATH) or "python" (tools/spirv_asm.py, for a machine without
+    SPIRV-Tools, as with `run_gpu_tests.py --assembler python`). `validate=False` skips spirv-val.
     Returns the .spv paths; raises RuntimeError with the tool output on failure."""
-    steps = [("spirv-as", tool_path("spirv-as")), ("spirv-val", tool_path("spirv-val"))]
+    if assembler not in ("spirv-as", "python"):
+        raise ValueError(f"unknown assembler: {assembler!r}")
+    steps = ([("spirv-as", tool_path("spirv-as"))] if assembler == "spirv-as" else []) + \
+        ([("spirv-val", tool_path("spirv-val"))] if validate else [])
     built = []
     for asm in write_for_index(spirv_dir):
         spv = asm[: -len(".spvasm")] + ".spv"
         with tempfile.TemporaryDirectory(prefix=".mesh-vs-", dir=os.path.dirname(spv)) as staging:
             staged_spv = os.path.join(staging, os.path.basename(spv))
+            if assembler == "python":
+                python_assemble(asm, staged_spv)
             for name, tool in steps:
                 args = [asm, "-o", staged_spv] if name == "spirv-as" else [staged_spv]
                 cmd = [tool, "--target-env", "vulkan1.2"] + args
@@ -278,6 +286,20 @@ def build_for_index(spirv_dir):
             os.replace(staged_spv, spv)
         built.append(spv)
     return built
+
+
+def python_assemble(asm, spv):
+    """Assemble the .spvasm file `asm` into `spv` with tools/spirv_asm.py; RuntimeError names the file on failure."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import spirv_asm
+    with open(asm, encoding="utf-8") as f:
+        text = f.read()
+    try:
+        data = spirv_asm.assemble(text, target_env="vulkan1.2")
+    except spirv_asm.SpirvAsmError as e:
+        raise RuntimeError(f"spirv_asm failed for {asm}:\n{e}") from None
+    with open(spv, "wb") as f:
+        f.write(data)
 
 
 def main(argv):

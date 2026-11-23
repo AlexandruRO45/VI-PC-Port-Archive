@@ -924,12 +924,12 @@ def run_suite(a, work: str) -> int:
         return 1
     if bary_fallback():
         import bary_fallback_gs
-        for gs in bary_fallback_gs.build_for_index(spirv_dir):
+        for gs in bary_fallback_gs.build_for_index(spirv_dir, assembler=assembler, validate=not no_validate):
             print("bary fallback GS:", os.path.basename(gs))
 
     if MESH_COMPUTE:
         import mesh_compute_vs
-        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir):
+        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir, assembler=assembler, validate=not no_validate):
             print("mesh compute VS:", os.path.basename(vs_spv))
 
     # 3. Build helper SPIR-V shaders
@@ -1539,10 +1539,11 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
         elif name == "ms_v5_workgroup":
-            rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
-            if rc:
-                results.append((name, False, msg))
-                continue
+            if not no_validate:   # --no-validate, or --assembler python without spirv-val: as for the translation
+                rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
+                if rc:
+                    results.append((name, False, msg))
+                    continue
             problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
