@@ -394,6 +394,13 @@ def parse_junit(xml):
             except ValueError:
                 secs = None
             detail = scrub((fail.get("message") or "") if fail is not None else "")
+            if (res == "skip" and st == "notrun" and root.tag.rsplit("}", 1)[-1] == "testsuite"
+                    and {"disabled", "hostname"} <= root.attrib.keys()):
+                # CTest writes a skipped element for both intentional skips and missing executables.
+                skipped = tc.find(tc.tag.removesuffix("testcase") + "skipped")
+                reason = skipped.get("message") if skipped is not None else None
+                if reason == "Unable to find executable":
+                    res, detail = "fail", reason
             out.append((name, res, secs, detail))
     return out
 
