@@ -246,6 +246,106 @@ bool deserialize_checks()
     return stripped_hr == E_INVALIDARG && !stripped_reader && null_hr == E_INVALIDARG && !null_reader;
 }
 
+// D3D12ConfigureVirtualMemoryX and XMemRegisterGraphicsMemoryConfiguration: struct layouts
+// from the ERA d3d12_xs.dll and xmem.dll PDBs (GDK 261000 gameKit/symbols).
+struct D3D12VirtualMemoryConfig {
+    std::uint32_t flags;
+    std::uint32_t gpu_page_table_pages;
+    std::uint32_t frame_preserve_buffer_size;
+    std::uint32_t padding;
+    std::uint64_t min_gpu_address;
+    std::uint64_t max_gpu_address;
+};
+static_assert(sizeof(D3D12VirtualMemoryConfig) == 32);
+
+bool configure_vm_checks()
+{
+    using ConfigureFn = HRESULT(WINAPI*)(void*);
+    using RegisterFn = void(WINAPI*)(void*);
+
+    HMODULE shim = GetModuleHandleW(L"d3d12_xs.dll");
+    if (!shim) return false;
+
+    auto configure = reinterpret_cast<ConfigureFn>(
+        GetProcAddress(shim, "D3D12ConfigureVirtualMemoryX"));
+    auto register_gfx = reinterpret_cast<RegisterFn>(
+        GetProcAddress(shim, "XMemRegisterGraphicsMemoryConfiguration"));
+    if (!configure || !register_gfx) {
+        std::fprintf(stderr, "configure=%p register_gfx=%p\n",
+                     reinterpret_cast<void*>(configure), reinterpret_cast<void*>(register_gfx));
+        return false;
+    }
+
+    // Null input must fail.
+    const HRESULT null_hr = configure(nullptr);
+    if (null_hr != E_INVALIDARG) {
+        std::fprintf(stderr, "null_hr=0x%08lx expected E_INVALIDARG\n",
+                     static_cast<unsigned long>(null_hr));
+        return false;
+    }
+
+    // Invalid flags (bit 1 set) must fail.
+    D3D12VirtualMemoryConfig bad_flags{};
+    bad_flags.flags = 2;
+    bad_flags.gpu_page_table_pages = 1;
+    const HRESULT bad_flags_hr = configure(&bad_flags);
+    if (bad_flags_hr != E_INVALIDARG) {
+        std::fprintf(stderr, "bad_flags_hr=0x%08lx expected E_INVALIDARG\n",
+                     static_cast<unsigned long>(bad_flags_hr));
+        return false;
+    }
+
+    // Page table pages > 33 must fail.
+    D3D12VirtualMemoryConfig too_many{};
+    too_many.gpu_page_table_pages = 34;
+    const HRESULT too_many_hr = configure(&too_many);
+    if (too_many_hr != E_INVALIDARG) {
+        std::fprintf(stderr, "too_many_hr=0x%08lx expected E_INVALIDARG\n",
+                     static_cast<unsigned long>(too_many_hr));
+        return false;
+    }
+
+    // Valid input: 8 page-table pages, preserve size 0x100000, flags 0.
+    D3D12VirtualMemoryConfig valid{};
+    valid.gpu_page_table_pages = 8;
+    valid.frame_preserve_buffer_size = 0x100000;
+    const HRESULT valid_hr = configure(&valid);
+    if (FAILED(valid_hr)) {
+        std::fprintf(stderr, "valid_hr=0x%08lx expected success\n",
+                     static_cast<unsigned long>(valid_hr));
+        return false;
+    }
+
+    // The output addresses must be populated: max > 0.
+    if (valid.max_gpu_address == 0) {
+        std::fprintf(stderr, "max_gpu_address not populated\n");
+        return false;
+    }
+
+    // Valid with flags = 1.
+    D3D12VirtualMemoryConfig valid_flag1{};
+    valid_flag1.flags = 1;
+    valid_flag1.gpu_page_table_pages = 1;
+    const HRESULT flag1_hr = configure(&valid_flag1);
+    if (FAILED(flag1_hr)) {
+        std::fprintf(stderr, "flag1_hr=0x%08lx expected success\n",
+                     static_cast<unsigned long>(flag1_hr));
+        return false;
+    }
+
+    // XMemRegisterGraphicsMemoryConfiguration: calling with null must not crash.
+    register_gfx(nullptr);
+
+    std::printf("null_hr=0x%08lx bad_flags_hr=0x%08lx too_many_hr=0x%08lx valid_hr=0x%08lx flag1_hr=0x%08lx max_gpu=0x%llx\n",
+                static_cast<unsigned long>(null_hr),
+                static_cast<unsigned long>(bad_flags_hr),
+                static_cast<unsigned long>(too_many_hr),
+                static_cast<unsigned long>(valid_hr),
+                static_cast<unsigned long>(flag1_hr),
+                static_cast<unsigned long long>(valid.max_gpu_address));
+    return true;
+}
+
 bool warp_root_checks()
 {
     DesktopD3D12 desktop;
@@ -319,6 +419,8 @@ int main(int argc, char** argv)
         passed = serialize_checks();
     } else if (scenario == "deserialize"sv) {
         passed = deserialize_checks();
+    } else if (scenario == "configure_vm"sv) {
+        passed = configure_vm_checks();
     } else if (scenario == "warp_root"sv) {
         passed = warp_root_checks();
     } else {
