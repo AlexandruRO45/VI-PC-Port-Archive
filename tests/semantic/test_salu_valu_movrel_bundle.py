@@ -752,3 +752,42 @@ class TestVMovrelsdB32AST(unittest.TestCase):
         spv = support.translate_lines("ps_vmovrelsd_exec", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0x88888888)
+
+
+class TestVMovrelsdB32Indexing(unittest.TestCase):
+    def test_symmetric_offset_sweep(self):
+        for offset in (1, 2):
+            with self.subTest(offset=offset):
+                val = 0x40404040 * offset
+                lines = [
+                    f"v_mov_b32 v{4 + offset}, {val}",
+                    f"s_mov_b32 m0, {offset}",
+                    "v_movrelsd_b32 v8, v4",
+                    f"v_mov_b32 v0, v{8 + offset}",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_vmovrelsd_sweep_{offset}", lines)
+                out = support.mrt0_words(spv)
+                self.assertEqual(out[0], val)
+
+    def test_unaffected_registers_preserved(self):
+        lines = [
+            "v_mov_b32 v5, 0x11112222",
+            "v_mov_b32 v6, 0x33334444",
+            "v_mov_b32 v7, 0x55556666",
+            "s_mov_b32 m0, 1",
+            "v_movrelsd_b32 v8, v5",
+            "v_mov_b32 v0, v7",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrelsd_preserve", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x55556666)
