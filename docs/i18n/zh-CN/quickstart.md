@@ -42,8 +42,8 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases)，需要 **AMDGPU target**（`llvm-mc`）：
   - Windows 官方 LLVM 发行版**不含** AMDGPU target。
   - Windows 上运行 `scripts\build_llvm_mc.ps1` 构建原生 `llvm-mc.exe`（需要 `git` 和 Visual Studio 的 C++ 工具）
-    并设置 `LLVM_MC`；**或**在 WSL 里安装 `llvm-21` 并设置
-    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`（见 [`docs/design.md`](../../design.md#disassembling-shaders)）。
+    并设置 `LLVM_MC`；**或**在 WSL 里安装 `llvm-21`，然后在 PowerShell 中设置
+    `$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'`（见 [`docs/design.md`](../../design.md#disassembling-shaders)）。
     构建脚本大约需要 20-40 分钟。
   - 如果你用 [conda](https://docs.conda.io/)，更快的办法是 `conda install -c conda-forge llvm-tools`（它的 Windows
     版本包含 AMDGPU target），然后把 `LLVM_MC` 设为安装好的 `llvm-mc.exe` 的完整路径（激活环境后用

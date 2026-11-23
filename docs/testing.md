@@ -17,8 +17,8 @@ This page collects the setup steps and the problems testers have run into so far
   Windows, use one of:
   - `scripts\build_llvm_mc.ps1`, which builds a native `llvm-mc.exe` (needs git and the Visual Studio C++ tools);
   - conda-forge's `llvm-tools` package, whose Windows build includes the AMDGPU target;
-  - `llvm-21` in WSL, with `LLVM_MC` set to the whole command:
-    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`.
+  - `llvm-21` in WSL, with `LLVM_MC` set in PowerShell:
+    `$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'`.
 
   On Linux, the distribution's `llvm-mc` on `PATH` is enough, if it is 21 or newer. On macOS, Homebrew's `llvm` is
   keg-only, so `brew install llvm` doesn't put `llvm-mc` on `PATH`: the pytest suites find it in

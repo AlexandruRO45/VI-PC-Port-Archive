@@ -39,8 +39,8 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
     ```powershell
     powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
     ```
-  - または WSL に `llvm-21` を入れて、`LLVM_MC` にコマンド全体を設定します:
-    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`
+  - または WSL に `llvm-21` を入れて、PowerShell で `LLVM_MC` にコマンド全体を設定します:
+    `$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'`
     （[docs/design.md](../../design.md#disassembling-shaders)）。
   - Linux では `PATH` に `llvm-mc` があれば十分です。
 - **Visual Studio 2022**（**C++ によるデスクトップ開発**）と **Windows SDK 10.0.26100 以降**。
