@@ -32,6 +32,12 @@ PS1_COMMAND = re.compile(
     re.IGNORECASE
 )
 PS1_FLAG = re.compile(r"(?<![\w-])(-[a-zA-Z][\w-]*)")
+# Subcommands that hand their arguments to another script unparsed (`scripts/dev.py`'s run_producer): a fenced
+# `python -I scripts/dev.py boot-trace --d3d12 ...` uses the forwarded tool's flags as well as the script's own.
+FORWARDED = {
+    ("scripts/dev.py", "boot-trace"): "tools/boot_trace.py",
+    ("scripts/dev.py", "guest-scene"): "scripts/run_guest_scene.py",
+}
 
 
 def tracked_files():
@@ -168,8 +174,11 @@ def tool_flag_mismatches(pages, sources):
             tool = m.group(1)
             if '"--" +' in sources[tool] or "'--' +" in sources[tool]:
                 continue
+            words = cmd[m.end():].split()
+            target = FORWARDED.get((tool, words[0] if words else ""))
+            known = sources[tool] + sources.get(target, "")
             for flag in sorted(set(FLAG.findall(cmd))):
-                if flag not in FOREIGN and flag not in sources[tool]:
+                if flag not in FOREIGN and flag not in known:
                     out.append((f"{page}:{n}", tool, flag))
     return out
 
@@ -206,6 +215,21 @@ class DocsCliFlags(unittest.TestCase):
         self.assertEqual(tool_flag_mismatches(pages, sources), [("docs/a.md:3", "tools/x.py", "--old")])
         sources["tools/x.py"] += ' "--" + name'
         self.assertEqual(tool_flag_mismatches(pages, sources), [])
+
+        # a forwarding subcommand may use the forwarded tool's flags, and only on that subcommand
+        dev_pages = {"docs/c.md": "```\npython -I scripts/dev.py boot-trace t.jsonl --d3d12 e.log\n"
+                                  "python -I scripts/dev.py discover --d3d12\n```\n"}
+        dev_sources = {"scripts/dev.py": 'add("--json")', "tools/boot_trace.py": 'add("--d3d12")'}
+        self.assertEqual(tool_flag_mismatches(dev_pages, dev_sources), [("docs/c.md:3", "scripts/dev.py", "--d3d12")])
+
+    def test_forwarded_subcommands_name_their_target(self):
+        # FORWARDED must follow the script: each target path is the one the script forwards to, and it exists.
+        files = set(tracked_files())
+        for (script, sub), target in FORWARDED.items():
+            text = read(script)
+            self.assertIn(f'"{sub}"', text, f"{script} has no {sub} subcommand")
+            self.assertIn(f'"{target}"', text, f"{script} does not forward to {target}")
+            self.assertIn(target, files)
 
         ps1_pages = {"docs/b.md": "```\n.\\scripts\\test.ps1 -ValidParam -BadParam\n```\n"}
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
