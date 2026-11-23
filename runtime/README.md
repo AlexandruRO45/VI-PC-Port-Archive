@@ -184,6 +184,10 @@ Current limits, by design:
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing.
 
+- The window API — `RegisterClassExA/W`, `CreateWindowExA/W`, `DefWindowProcA/W`, `ShowWindow`,
+  `UnregisterClassA/W` and `GetClassInfoExA/W` under the two `ext-ms-win-rtcore-ntuser-window-*` names the
+  executable imports and `user32.dll`. A class or window created with the mapped image's `GetModuleHandle(nullptr)`
+  result is registered against gta6rt's own instance, which user32 knows; the game's `WNDPROC` is left as is.
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
   and trigger haptics where SDL opens the pad as a haptic device, and on a DualSense adaptive-trigger effects and the

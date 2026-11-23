@@ -123,6 +123,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xcrdapi.cpp
     shims/library_loader.cpp
     shims/process.cpp
+    shims/window.cpp
   )
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -603,6 +604,53 @@ if(BUILD_TESTING)
         set_tests_properties(run_module_names PROPERTIES TIMEOUT 90)
       endif()
     endif()
+
+    # Window shim: a mapped guest registers a class whose WNDPROC is in the guest and creates a window with the
+    # guest's hInstance, as the retail executable does with sgaWindowClass. Import stubs give the guest the two
+    # ext-ms DLL names the shipped exe imports; they live in a subfolder so the loader cannot find them beside the
+    # guest, and the shim registry answers all of them. /NODEFAULTLIB:user32.lib keeps the linker from resolving the
+    # calls to the host's user32.lib instead.
+    add_library(window_extms_ansi SHARED test/fixtures/window_ansi_stub.cpp test/fixtures/window_ansi_stub.def)
+    add_library(window_extms_win SHARED test/fixtures/window_win_stub.cpp test/fixtures/window_win_stub.def)
+    foreach(target window_extms_ansi window_extms_win)
+      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(${target} PROPERTIES
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/window/$<CONFIG>"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/window/$<CONFIG>"
+      )
+    endforeach()
+    set_target_properties(window_extms_ansi PROPERTIES OUTPUT_NAME ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0)
+    set_target_properties(window_extms_win PROPERTIES OUTPUT_NAME ext-ms-win-rtcore-ntuser-window-l1-1-0)
+    add_library(window_guest SHARED test/fixtures/window_guest.cpp)
+    target_link_libraries(window_guest PRIVATE window_extms_ansi window_extms_win)
+    target_compile_definitions(window_guest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(window_guest PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(window_guest PRIVATE /NODEFAULTLIB:user32.lib)
+    set_target_properties(window_guest PROPERTIES
+      OUTPUT_NAME window_guest
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+    add_executable(window_test
+      test/window_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/library_loader.cpp
+      shims/window.cpp
+    )
+    target_include_directories(window_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(window_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(window_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(window_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
+    add_dependencies(window_test gta6rt_tls_host window_guest)
+    add_test(NAME window COMMAND window_test "$<TARGET_FILE:window_guest>")
 
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
     # are linked too so the optional LEONIDA_GAME_DIR run classifies the shipped modules' imports exactly like
