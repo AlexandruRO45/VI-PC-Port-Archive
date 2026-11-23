@@ -256,6 +256,17 @@ class TestLdsSubU32Aliasing(unittest.TestCase):
         mem = L.run(body, lanes=1)
         self.assertEqual(L.out(mem, 0, 0), 100 - 0x40)
 
+class TestLdsSubU32BoundariesAndNegative(unittest.TestCase):
+    def test_unsigned_underflow_wrap(self):
+        rtns, fin = L.run_chain([("ds_sub_u32", 0x40, 0, (5,))], {0x40: 2})
+        self.assertEqual(fin[0x40], 0xFFFFFFFF - 2)
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            L.translate(["ds_sub_u32 v0"])
+        with self.assertRaises(Exception):
+            L.translate(["ds_sub_u32_bad_opcode v0, v1"])
+
 
 if __name__ == "__main__":
     unittest.main()
