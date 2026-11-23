@@ -269,7 +269,6 @@ def test_writelane_sdwa_dpp_swaps_stores_and_div_scale():
         assert got_ds == {6: L.MASK_LO, 7: L.MASK_HI}, ds_op
 
 
-
 def test_v_and_or_xnor_bfi_track_vector_masks():
     use = ins("s_and_b32", s(12), s(7), s(8))
     and_or = ins("v_and_or_b32", v(2), sp("vcc_lo"), sp("exec_lo"), imm(0))
@@ -318,6 +317,41 @@ def test_v_and_or_xnor_bfi_track_vector_masks():
         assert id(bad) not in writes, bad["op"]
         assert 7 not in out[id(bad_use)] and ("v", 6) not in out[id(bad_use)], bad["op"]
 
+
+def test_slist_kind():
+    def sl(*items):
+        return {"k": "slist", "r": list(items), "n": len(items)}
+
+    use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
+    # Mask written to an slist (e.g. [s105, vcc_lo]) stays a mask when copied or combined.
+    slist_pair = sl(105, "vcc_lo")
+    got = L.analyse([[ins("v_cmp_eq_u32_e64", slist_pair, v(0), v(1)),
+                      ins("s_mov_b64", s(6, 2), slist_pair), use]], [[]])[0][id(use)]
+    assert got[6] == L.MASK_LO and got[7] == L.MASK_HI
+    # [vcc_lo, vcc_hi] reads VCC's lane mask in bitwise ops, and returns None when VCC holds data.
+    vcc_pair = sl("vcc_lo", "vcc_hi")
+    got_vcc = L.analyse([[ins("v_cmp_eq_u32_e32", sp("vcc"), v(0), v(1)),
+                          ins("s_and_b64", s(6, 2), vcc_pair, sp("exec")), use]], [[]])[0][id(use)]
+    assert got_vcc[6] == L.MASK_LO and got_vcc[7] == L.MASK_HI
+    got_vcc_data = L.analyse([[ins("s_buffer_load_dword", sp("vcc_lo"), s(0, 4), imm(0)),
+                               ins("s_mov_b64", s(6, 2), vcc_pair), use]], [[]])[0][id(use)]
+    assert 6 not in got_vcc_data and 7 not in got_vcc_data
+    # Constant 0 / -1 (EITHER) paired with a mask half in an slist is a mask; plain data paired with a mask is not.
+    got_either = L.analyse([[ins("s_mov_b32", s(105), imm(0)),
+                             ins("v_cmp_eq_u32_e32", sp("vcc"), v(0), v(1)),
+                             ins("s_mov_b64", s(6, 2), slist_pair), use]], [[]])[0][id(use)]
+    assert got_either[6] == L.MASK_LO and got_either[7] == L.MASK_HI
+    got_mixed = L.analyse([[ins("s_buffer_load_dword", s(105), s(0, 4), imm(0)),
+                            ins("v_cmp_eq_u32_e32", sp("vcc"), v(0), v(1)),
+                            ins("s_mov_b64", s(6, 2), slist_pair), use]], [[]])[0][id(use)]
+    assert 6 not in got_mixed and 7 not in got_mixed
+    # Direct kind() edge cases: both-EITHER pair, exec halves, 4-dword descriptor with data, empty list.
+    assert L.kind({104: L.EITHER, 105: L.EITHER}, sl(104, 105)) == L.EITHER
+    assert L.kind({}, sl("exec_lo", "exec_hi")) == L.MASK
+    assert L.kind({"vcc": L.MASK}, sl(104, 105, "vcc_lo", "vcc_hi")) is None
+    assert L.kind({}, sl()) is None
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
@@ -328,4 +362,5 @@ if __name__ == "__main__":
     test_b64_mask_imm_and_include_either()
     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
     test_v_and_or_xnor_bfi_track_vector_masks()
+    test_slist_kind()
     print("ok")

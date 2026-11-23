@@ -85,6 +85,28 @@ def kind(state, a):
         if n == 2 and any(k in MASK_KINDS for k in ks):
             return MASK
         return ks[0] if len(set(ks)) == 1 else None
+    if a["k"] == "slist":
+        ks = []
+        for r in a["r"]:
+            if isinstance(r, int):
+                ks.append(state.get(r))
+            elif r in ("vcc_lo", "vcc_hi"):
+                vk = state.get("vcc")
+                if vk in MASK_KINDS:
+                    ks.append(MASK_LO if r == "vcc_lo" else MASK_HI)
+                else:
+                    ks.append(vk if r == "vcc_lo" else None)
+            elif r == "exec_lo":
+                ks.append(MASK_LO)
+            elif r == "exec_hi":
+                ks.append(MASK_HI)
+            else:
+                ks.append(None)
+        if not ks or None in ks:
+            return None
+        if len(ks) == 2 and any(k in MASK_KINDS for k in ks):
+            return MASK
+        return ks[0] if len(set(ks)) == 1 else None
     if a["k"] == "vgpr" and a.get("n", 1) == 1:
         return state.get(("v", a["r"]))
     if a["k"] == "imm" and a["v"] in (0, -1):
