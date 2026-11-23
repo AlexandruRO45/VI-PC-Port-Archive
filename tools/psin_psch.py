@@ -87,11 +87,14 @@ def decode_pmap(payload: bytes, blob: bytes, first_section: int) -> dict:
 
     if blocks[0]["offset"] != 16:
         raise ValueError(f"first PMAP block starts at {blocks[0]['offset']:#x}, expected 0x10")
-    for idx in range(1, len(blocks)):
-        prev_end = blocks[idx - 1]["offset"] + blocks[idx - 1]["length"]
-        if blocks[idx]["offset"] < prev_end:
+    non_empty = sorted(
+        ((b["offset"], b["offset"] + b["length"], b["id"]) for b in blocks if b["length"] > 0),
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    for (prev_start, prev_end, prev_id), (cur_start, _cur_end, cur_id) in zip(non_empty, non_empty[1:]):
+        if cur_start < prev_end:
             raise ValueError(
-                f"PMAP block {idx + 1} at {blocks[idx]['offset']:#x} overlaps previous block ending at {prev_end:#x}"
+                f"PMAP block {cur_id} at {cur_start:#x} overlaps block {prev_id} ({prev_start:#x}..{prev_end:#x})"
             )
     exact_end = (blocks[-1]["offset"] + blocks[-1]["length"]) == first_section
     if not exact_end and ((blocks[-1]["offset"] + blocks[-1]["length"] + 15) & ~15) != first_section:
@@ -244,12 +247,14 @@ def parse_psch_container(blob: bytes) -> dict:
     if not rec["complete"]:
         raise ValueError(f"incomplete PSIN container: {rec['error']}")
 
+    consumed = ("PMAP", "PSCH", "PSIG", "STNS", "STDN", "STFN")
     secs = {}
     for s in rec["sections"]:
         tag = s["tag"]
-        if tag in secs:
-            raise ValueError(f"duplicate {tag} section")
-        secs[tag] = s
+        if tag in consumed:
+            if tag in secs:
+                raise ValueError(f"duplicate {tag} section")
+            secs[tag] = s
     for required in ("PMAP", "PSCH", "PSIG", "STNS"):
         if required not in secs:
             raise ValueError(f"missing {required} section")
