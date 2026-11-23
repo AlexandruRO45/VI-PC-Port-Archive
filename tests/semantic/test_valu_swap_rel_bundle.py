@@ -333,6 +333,18 @@ class TestVMovRelSOracle(unittest.TestCase):
         self.assertIn("OpAccessChain", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestVMovRelSAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        vgprs = {25: 999}
+        val = model_v_movrels(20, 5, vgprs)
+        self.assertEqual(val, 999)
+
+    def test_translator_v_movrels_ast(self):
+        prog = ["s_mov_b32 m0, 5", "v_mov_b32_e32 v25, 999", "v_movrels_b32 v2, v20", "s_endpgm"]
+        spv = support.translate_lines("cs_v_movrels_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpAccessChain", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
