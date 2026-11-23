@@ -73,12 +73,14 @@ public sealed class LauncherSettings
     public bool AllowGitHub { get; set; } = true;
     /// <summary>The Can I Run checker web page; off, the page shows only this PC's hardware.</summary>
     public bool AllowChecker { get; set; } = true;
+    /// <summary>GTA VI's achievement list from github.com/Dom-in/Gta6AchivmentsList, downloaded when the launcher starts.</summary>
+    public bool AllowAchievements { get; set; } = true;
     /// <summary>1.0.0 and 1.0.1 had one switch for both; a settings file with it off turns both off. Never written.</summary>
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public bool? AllowOnline
     {
         get => null;
-        set { if (value == false) { AllowGitHub = false; AllowChecker = false; } }
+        set { if (value == false) { AllowGitHub = false; AllowChecker = false; AllowAchievements = false; } }
     }
     public bool SoundWhenDone { get; set; }
     /// <summary>A Windows notification when a build ends while the launcher is not in front.</summary>

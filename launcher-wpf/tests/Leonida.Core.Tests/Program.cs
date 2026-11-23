@@ -343,6 +343,21 @@ Check(HardwareDetector.MemoryTypeName(26) == "DDR4" && HardwareDetector.MemoryTy
     Check(LanguageFile.Placeholders("{0} of {1:N0}, {{literal}}").SequenceEqual([0, 1]), "placeholders are found, escaped braces are not");
 }
 
+// ---- Achievement list (Dom-in/Gta6AchivmentsList's format)
+{
+    var list = AchievementList.Parse("""
+        { "game": "x", "achievements": [
+          { "id": 1, "name": "One", "description": "First.", "gamerscore": 5, "secret": true },
+          { "id": 2, "name": "Two", "description": "Second.", "gamerscore": 20, "secret": false },
+          { "id": 3, "name": "", "description": "no name: skipped" } ] }
+        """);
+    Check(list.Count == 2 && list[0] is { Name: "One", Gamerscore: 5, Secret: true } && !list[1].Secret, "the achievement list is read, nameless entries skipped");
+    Check(AchievementList.Parse("""[ { "name": "Bare", "gamerscore": 10, "hidden": true } ]""") is [{ Secret: true, Id: 1 }], "a bare array and the older 'hidden' key are read too");
+    bool Fails(string j) { try { AchievementList.Parse(j); return false; } catch (FormatException) { return true; } }
+    Check(Fails("{ \"x\": 1 }") && Fails("not json"), "a file that is not a list is refused");
+    Check(new LauncherSettings { AllowOnline = false }.AllowAchievements == false, "an old settings file with online off turns the achievement list off too");
+}
+
 try { Directory.Delete(temp, true); } catch (IOException) { }
 Console.WriteLine($"Leonida.Core.Tests: {checks} checks, {failures} failures");
 return failures;

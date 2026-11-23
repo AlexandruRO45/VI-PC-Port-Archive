@@ -1,64 +1,89 @@
-using System.IO;
-using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using Leonida.Core;
 
 namespace Leonida.Launcher.Views;
 
 /// <summary>
-/// Achievements, as a test page: the list comes from a file on this PC (the launcher ships none of the game's text),
-/// and every achievement is locked, since nothing can unlock one until Leonida can take over the game's own unlocks.
+/// Achievements, as a test page: GTA VI's list from github.com/Dom-in/Gta6AchivmentsList (downloaded when the
+/// launcher starts, kept for offline), every achievement locked, since nothing can unlock one until Leonida can take
+/// over the game's own unlocks. A secret achievement's description shows when you click it.
 /// </summary>
 public partial class AchievementsView : UserControl
 {
-    /// <summary>[{ "name": …, "description": …, "gamerscore": 10, "hidden": false }, …]</summary>
-    public static string ListPath => Path.Combine(Path.GetDirectoryName(Leonida.Core.AppPaths.Settings)!, "achievements.json");
+    readonly AppState state = AppState.Instance;
 
-    public sealed record Item(string Name, string Description, int Gamerscore, string State);
+    /// <summary>One card. Revealed is per session; secrets start hidden.</summary>
+    public sealed class Item(Achievement a) : System.ComponentModel.INotifyPropertyChanged
+    {
+        public Achievement A { get; } = a;
+        bool revealed;
+        public string Name => A.Name;
+        public string Gamerscore => A.Gamerscore.ToString();
+        public string Description => A.Secret && !revealed ? Loc.T("Secret achievement: click to show what it is for.") : A.Description;
+        public string State => Loc.T(A.Secret ? "LOCKED · SECRET" : "LOCKED");
+        public Cursor Cursor => A.Secret && !revealed ? Cursors.Hand : Cursors.Arrow;
+        /// <summary>The first letter or digit of the name ("T**s Ass…" → T).</summary>
+        public string Initial => A.Name.FirstOrDefault(char.IsLetterOrDigit) is var c and not '\0' ? char.ToUpperInvariant(c).ToString() : "?";
+        /// <summary>A gradient from the logo's colours, the same one for an achievement every time.</summary>
+        public System.Windows.Media.Brush Art
+        {
+            get
+            {
+                System.Windows.Media.Color[] c =
+                [
+                    System.Windows.Media.Color.FromRgb(0x6B, 0x2F, 0xD6), System.Windows.Media.Color.FromRgb(0xEC, 0x2F, 0x8C),
+                    System.Windows.Media.Color.FromRgb(0xFF, 0x8A, 0x3D), System.Windows.Media.Color.FromRgb(0x2A, 0x14, 0x52),
+                    System.Windows.Media.Color.FromRgb(0xB4, 0x2A, 0x78), System.Windows.Media.Color.FromRgb(0x14, 0x8F, 0xB8),
+                ];
+                var h = A.Name.Aggregate(17, (x, ch) => unchecked(x * 31 + ch)) & 0x7fffffff;
+                var b = new System.Windows.Media.LinearGradientBrush(c[h % c.Length], c[(h / 7 + 1 + h % c.Length) % c.Length], 45 + h % 90);
+                b.Freeze();
+                return b;
+            }
+        }
+        public void Reveal() { revealed = true; PropertyChanged?.Invoke(this, new(null)); }
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+    }
 
     public AchievementsView()
     {
         InitializeComponent();
         Loaded += (_, _) => Load();
+        AchievementList.Updated += () => Dispatcher.BeginInvoke(() => { if (IsLoaded) Load(); });
     }
 
     public void Load()
     {
-        FilePath.Text = ListPath;
-        FileProblem.Visibility = Visibility.Collapsed;
-        var items = new List<Item>();
-        if (File.Exists(ListPath))
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(File.ReadAllText(ListPath), new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
-                foreach (var e in doc.RootElement.EnumerateArray())
-                {
-                    string S(string k) => e.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString()! : "";
-                    var hidden = e.TryGetProperty("hidden", out var h) && h.ValueKind == JsonValueKind.True;
-                    var g = e.TryGetProperty("gamerscore", out var gs) && gs.TryGetInt32(out var n) ? n : 0;
-                    items.Add(new Item(hidden ? Loc.T("Secret achievement") : S("name"),
-                                       hidden ? Loc.T("Details are hidden until it unlocks.") : S("description"), g, Loc.T("LOCKED")));
-                }
-            }
-            catch (Exception ex) when (ex is JsonException or InvalidOperationException or IOException)
-            {
-                FileProblem.Text = Loc.F("The file could not be read: {0}", ex.Message);
-                FileProblem.Visibility = Visibility.Visible;
-                items.Clear();
-            }
-        }
+        var got = AchievementList.Load();
+        var items = got?.List.Select(a => new Item(a)).ToList() ?? [];
         List.ItemsSource = items;
         Empty.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         Count.Text = Loc.F("0 / {0}", items.Count);
-        Score.Text = Loc.F("0 of {0} G unlocked", items.Sum(i => i.Gamerscore));
+        Score.Text = Loc.F("0 of {0} G unlocked", items.Sum(i => i.A.Gamerscore));
+        Source.Text = got is { } g
+            ? g.Source == "file" ? Loc.F("From your own list: {0}", AchievementList.OverridePath)
+                                 : Loc.F("List from {0} · downloaded {1:g}", "github.com/Dom-in/Gta6AchivmentsList", g.When)
+            : "";
+        EmptyText.Text = Loc.T(state.Settings.Current.AllowAchievements
+            ? "The list hasn't been downloaded yet. Are you online? It downloads when the launcher starts, or now with the button below."
+            : "Downloading the achievement list is off (Settings › Online). Turn it on, or download it once with the button below.");
     }
 
-    void OnOpenFolder(object sender, RoutedEventArgs e)
+    void OnCard(object sender, MouseButtonEventArgs e)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(ListPath)!);
-        AppState.Open(Path.GetDirectoryName(ListPath)!);
+        if ((sender as FrameworkElement)?.DataContext is Item { A.Secret: true } i) i.Reveal();
     }
 
-    void OnReload(object sender, RoutedEventArgs e) => Load();
+    async void OnDownload(object sender, RoutedEventArgs e)
+    {
+        DownloadButton.IsEnabled = false;
+        var ok = await AchievementList.RefreshAsync();
+        DownloadButton.IsEnabled = true;
+        if (!ok) await Popup.Show("Achievements", "The list could not be downloaded. Check your connection and try again.", problem: true);
+        Load();
+    }
+
+    void OnOpenList(object sender, RoutedEventArgs e) => AppState.Open(AchievementList.Page);
 }

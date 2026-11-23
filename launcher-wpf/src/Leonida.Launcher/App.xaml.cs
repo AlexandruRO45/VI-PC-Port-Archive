@@ -31,6 +31,7 @@ public partial class App : Application
         Theme.Apply(settings.Theme);
         DeleteOldLogs(settings.KeepLogsDays);
         new MainWindow().Show();
+        if (settings.AllowAchievements) _ = Leonida.Core.AchievementList.RefreshAsync();   // in the background; the page shows it when it arrives
     }
 
     const string ShowSignal = @"Local\LeonidaLauncherShow";

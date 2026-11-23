@@ -82,6 +82,7 @@ public partial class SettingsView : UserControl
         StartCollapsed.IsChecked = c.StartCollapsed;
         AllowGitHub.IsChecked = c.AllowGitHub;
         AllowChecker.IsChecked = c.AllowChecker;
+        AllowAchievements.IsChecked = c.AllowAchievements;
         StopGracefully.IsChecked = c.StopGracefully;
         GraceBox.Text = c.StopGraceSeconds.ToString();
         NotifyDone.IsChecked = c.NotifyWhenDone;
@@ -117,6 +118,7 @@ public partial class SettingsView : UserControl
         c.StartCollapsed = StartCollapsed.IsChecked == true;
         c.AllowGitHub = AllowGitHub.IsChecked == true;
         c.AllowChecker = AllowChecker.IsChecked == true;
+        c.AllowAchievements = AllowAchievements.IsChecked == true;
         c.StopGracefully = StopGracefully.IsChecked == true;
         c.NotifyWhenDone = NotifyDone.IsChecked == true;
         c.SoundWhenDone = SoundDone.IsChecked == true;

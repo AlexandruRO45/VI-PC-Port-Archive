@@ -275,7 +275,7 @@
         <!-- ===== Online ===== -->
         <StackPanel x:Name="PageOnline" Visibility="Collapsed">
           <TextBlock Style="{StaticResource RowText}" Margin="0,6,0,6"
-                     Text="The launcher goes online only for these two. Builds and Play never do."/>
+                     Text="The launcher goes online only for these three. Builds and Play never do."/>
           <Border Style="{StaticResource Row}">
             <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
               <StackPanel Style="{StaticResource RowLeft}">
@@ -294,6 +294,16 @@
                 <TextBlock Text="Off: Can I Run Leonida shows only your hardware." Style="{StaticResource RowText}"/>
               </StackPanel>
               <CheckBox Grid.Column="1" x:Name="AllowChecker" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Can I Run checker"/>
+            </Grid>
+          </Border>
+          <Border Style="{StaticResource Row}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel Style="{StaticResource RowLeft}">
+                <TextBlock Text="Achievement list" Style="{StaticResource RowTitle}"/>
+                <TextBlock Text="GTA VI's achievements from github.com/Dom-in/Gta6AchivmentsList, downloaded when the launcher starts and kept for offline." Style="{StaticResource RowText}"/>
+                <TextBlock Text="Off: the Achievements page shows the last list it downloaded." Style="{StaticResource RowText}"/>
+              </StackPanel>
+              <CheckBox Grid.Column="1" x:Name="AllowAchievements" Style="{StaticResource Tick}" Checked="OnChanged" Unchecked="OnChanged" AutomationProperties.Name="Achievement list"/>
             </Grid>
           </Border>
         </StackPanel>
