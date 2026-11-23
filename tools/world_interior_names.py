@@ -228,7 +228,7 @@ def load_names(path):
     """({key: [position]}, repeated keys in the InteriorNames section, positions that are not three numbers).
 
     Raises ValueError (with OSError and json.JSONDecodeError, which is one) when the file is not such a table."""
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:  # a names file saved with a UTF-8 BOM is still that table
         doc = json.load(f, object_pairs_hook=_pairs)
     if not isinstance(doc, dict):
         raise ValueError(f"expected a JSON object, found {_json_type(doc)}")
