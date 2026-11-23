@@ -8549,17 +8549,47 @@ class Gen:
         elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"):
             # Packed f16x2 (VOP3P). Result lo: source i takes its half from op_sel[i] (0 = lo, 1 = hi), negated by
             # neg_lo[i]. Result hi: half from op_sel_hi[i], negated by neg_hi[i]. Defaults: op_sel [0,0],
-            # op_sel_hi [1,1], no negation.
-            def bits(name, default):
-                m = next((m for m in mods if m.startswith(name + ":")), None)
-                if not m:
-                    return default
-                # a list shorter than the operands (neg_lo:[1,0] on v_pk_fma_f16) is padded with 0, as llvm-mc prints it
-                return ([int(v) for v in m.split("[")[1].rstrip("]").split(",")] + [0] * len(default))[:len(default)]
+            # op_sel_hi [1,1], no negation. VOP3P has no DPP/SDWA encoding, no omod (mul:2/mul:4/div:2), and uses
+            # neg_lo/neg_hi rather than per-operand neg/abs.
             ns = 3 if op == "v_pk_fma_f16" else 2
-            sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
-            nlo, nhi = bits("neg_lo", [0] * ns), bits("neg_hi", [0] * ns)
-            track_pk_nan = op in ("v_pk_min_f16", "v_pk_max_f16") and "clamp" not in mods
+            if ins["op"].endswith(("_dpp", "_sdwa")):
+                raise Unsupported(op + " modifiers")
+            if len(a) != 1 + ns:
+                raise Unsupported(op + " operands")
+            if (a[0].get("k") != "vgpr" or a[0].get("n", 1) != 1
+                    or a[0].get("neg") or a[0].get("abs") or a[0].get("sext")):
+                raise Unsupported(op + " destination")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in a[1:]):
+                raise Unsupported(op + " modifiers")
+            parsed_mods = {}
+            clamp = False
+            for m in mods:
+                if m == "clamp":
+                    if clamp:
+                        raise Unsupported(op + " modifiers")
+                    clamp = True
+                    continue
+                key, sep, rest = m.partition(":")
+                if (not sep or key not in ("op_sel", "op_sel_hi", "neg_lo", "neg_hi")
+                        or key in parsed_mods or not (rest.startswith("[") and rest.endswith("]"))):
+                    raise Unsupported(op + " modifiers")
+                parts = rest[1:-1].split(",")
+                if not 1 <= len(parts) <= 3:
+                    raise Unsupported(op + " modifiers")
+                vals = []
+                for v in parts:
+                    vs = v.strip()
+                    if vs not in ("0", "1"):
+                        raise Unsupported(op + " modifiers")
+                    vals.append(int(vs))
+                # Short lists (e.g. neg_lo:[1,0] on v_pk_fma_f16) are padded with 0, and 3-entry lists on 2-source ops
+                # ignore the unused 3rd bit, matching llvm-mc -mcpu=gfx1030.
+                parsed_mods[key] = (vals + [0] * ns)[:ns]
+            sel = parsed_mods.get("op_sel", [0] * ns)
+            selhi = parsed_mods.get("op_sel_hi", [1] * ns)
+            nlo = parsed_mods.get("neg_lo", [0] * ns)
+            nhi = parsed_mods.get("neg_hi", [0] * ns)
+            track_pk_nan = op in ("v_pk_min_f16", "v_pk_max_f16") and not clamp
             pk_raw, pk_st, pk_h0 = ([], []), ([], []), []
             srcs = []
             for i in range(ns):
@@ -8609,7 +8639,7 @@ class Gen:
                     r = self.sum_toward_zero2(vx, vy, r)
             else:
                 self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
-            if "clamp" in mods:
+            if clamp:
                 c = self.tmp()
                 z2, o2 = self.tmp(), self.tmp()
                 self.emit(f"{z2} = OpCompositeConstruct %v2float %f0 %f0")
