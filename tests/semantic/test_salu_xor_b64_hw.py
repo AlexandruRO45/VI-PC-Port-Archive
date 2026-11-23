@@ -197,5 +197,70 @@ class TestSaluXorB64AST(unittest.TestCase):
             ASTOperand.sgpr(3)  # odd index must be rejected
 
 
+class ScalarMachineState:
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.scc: int = 0
+        self.exec_mask: int = ALL_LANES_ACTIVE
+        self.vcc: int = 0
+
+    def read_operand64(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.SGPR:
+            lo = self.sgprs[op.index] & MASK32
+            hi = self.sgprs[op.index + 1] & MASK32
+            return (hi << 32) | lo
+        if op.kind == OperandKind.EXEC:
+            return self.exec_mask & MASK64
+        if op.kind == OperandKind.VCC:
+            return self.vcc & MASK64
+        return op.value & MASK64
+
+    def write_operand64(self, op: ASTOperand, val: int) -> None:
+        val &= MASK64
+        lo = val & MASK32
+        hi = (val >> 32) & MASK32
+        if op.kind == OperandKind.SGPR:
+            self.sgprs[op.index] = lo
+            self.sgprs[op.index + 1] = hi
+        elif op.kind == OperandKind.EXEC:
+            self.exec_mask = val
+        elif op.kind == OperandKind.VCC:
+            self.vcc = val
+
+
+class ScalarInterpreter:
+    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> tuple[int, int]:
+        s0 = state.read_operand64(instr.src0)
+        s1 = state.read_operand64(instr.src1)
+        res, scc = ref_xor_b64(s0, s1)
+        state.write_operand64(instr.dst, res)
+        state.scc = scc
+        return res, scc
+
+
+class TestSaluXorB64ScalarInterpreter(unittest.TestCase):
+    """Stage 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        state = ScalarMachineState()
+        # Set s[2:3] = 0x00000000FFFFFFFF, s[4:5] = 0x00000000FFFF0000
+        state.sgprs[2] = 0xFFFFFFFF
+        state.sgprs[3] = 0x00000000
+        state.sgprs[4] = 0xFFFF0000
+        state.sgprs[5] = 0x00000000
+
+        instr = ASTInstruction(
+            Opcode.S_XOR_B64,
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(2),
+            ASTOperand.sgpr(4),
+        )
+        res, scc = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, 0x000000000000FFFF)
+        self.assertEqual(scc, 1)
+        self.assertEqual(state.sgprs[0], 0x0000FFFF)
+        self.assertEqual(state.sgprs[1], 0x00000000)
+
+
 if __name__ == "__main__":
     unittest.main()
