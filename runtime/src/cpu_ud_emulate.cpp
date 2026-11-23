@@ -138,13 +138,15 @@ size_t modrm_length(const uint8_t* code, size_t available, size_t at) {
     return at + length <= available ? length : 0;
 }
 
-// CLWB, 66 [REX] 0F AE /6: validate the memory operand before skipping the instruction. Segment overrides are ignored.
+// CLWB, 66 [REX] 0F AE /6: validate the memory operand unless an FS/GS base is needed.
 size_t emulate_clwb(CONTEXT& ctx, const uint8_t* code, size_t available) {
     size_t at = 0;
     bool operand_prefix = false;
+    bool segment_base = false;
     while (at < available) {
         const uint8_t b = code[at];
         if (b == 0x66) operand_prefix = true;
+        else if (b == 0x64 || b == 0x65) segment_base = true;
         else if (b != 0x2e && b != 0x36 && b != 0x3e && b != 0x26 && b != 0x64 && b != 0x65) break;
         ++at;
     }
@@ -157,6 +159,7 @@ size_t emulate_clwb(CONTEXT& ctx, const uint8_t* code, size_t available) {
     if ((modrm >> 6) == 3 || ((modrm >> 3) & 7) != 6) return 0;
     const size_t tail = modrm_length(code, available, at);
     if (!tail) return 0;
+    if (segment_base) return at + tail;
     const DWORD64 regs[] = {ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi,
                             ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15};
     const unsigned mod = modrm >> 6, rm = modrm & 7;

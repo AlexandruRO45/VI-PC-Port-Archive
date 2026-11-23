@@ -83,7 +83,7 @@ void test_fault_addresses() {
     struct Case { const char* name; std::vector<uint8_t> bytes; DWORD64 rax, rcx, rdx, r8, r9, r12, r13; uintptr_t expected; };
     const Case cases[] = {
         {"base", {0x66,0x0f,0xae,0x31}, 0,0x10,0,0,0,0,0,0x10},
-        {"ignored segment override", {0x64,0x66,0x0f,0xae,0x31}, 0,0x10,0,0,0,0,0,0x10},
+        {"ignored segment override", {0x2e,0x66,0x0f,0xae,0x31}, 0,0x10,0,0,0,0,0,0x10},
         {"disp8 negative", {0x66,0x0f,0xae,0x71,0xf0}, 0,0x40,0,0,0,0,0,0x30},
         {"disp32", {0x66,0x0f,0xae,0xb0,0x34,0x12,0,0}, 0x20,0,0,0,0,0,0,0x1254},
         {"SIB scale", {0x66,0x0f,0xae,0x74,0x90,0x08}, 0x20,0,3,0,0,0,0,0x34},
@@ -132,6 +132,14 @@ void test_fault_addresses() {
     check(result == EXCEPTION_CONTINUE_SEARCH && rec.ExceptionCode == STATUS_ACCESS_VIOLATION &&
           rec.ExceptionInformation[1] == reinterpret_cast<DWORD64>(page), "PAGE_GUARD faults");
     VirtualFree(page, 0, MEM_RELEASE);
+}
+
+void test_segment_overrides() {
+    for (uint8_t prefix : {uint8_t{0x64}, uint8_t{0x65}}) {
+        bool kept = false;
+        const long got = run({prefix, 0x66, 0x0f, 0xae, 0x31}, &kept);
+        check(got == 5 && kept, prefix == 0x64 ? "FS override skips address check" : "GS override skips address check");
+    }
 }
 
 void test_lengths() {
@@ -245,6 +253,8 @@ void test_complete_at_page_end() {
     record.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
     record.ExceptionAddress = at;
     context.Rip = reinterpret_cast<DWORD64>(at);
+    context.Rax = reinterpret_cast<DWORD64>(page);
+    context.Rdx = 1;
     pointers.ExceptionRecord = &record;
     pointers.ContextRecord = &context;
     check(ud::emulate(&pointers) == EXCEPTION_CONTINUE_EXECUTION && context.Rip == reinterpret_cast<DWORD64>(at) + 6,
@@ -287,6 +297,7 @@ void test_installed_handler() {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_fault_addresses();
+    test_segment_overrides();
     test_lengths();
     test_other_instructions_pass();
     test_cut_off_by_unreadable_memory();
