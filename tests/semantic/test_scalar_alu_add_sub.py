@@ -31,11 +31,39 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
-import rdna2spirv
+from support import mrt0_words, rdna2spirv, translate_lines  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
+SIGN32 = 0x80000000
+PUSH_VSHARP = [0x1000, 0, 0x1000, 0x31016FAC] + [0] * 28
+
+
+def s32(v: int) -> int:
+    """Interpret a 32-bit unsigned integer as signed two's complement."""
+    u = v & MASK32
+    return u - 0x100000000 if (u & SIGN32) else u
+
+
+def ref_s_add_i32(s0: int, s1: int) -> tuple[int, int]:
+    """Reference implementation of s_add_i32: D = (S0 + S1) mod 2^32, SCC = signed overflow."""
+    a, b = s32(s0), s32(s1)
+    full = a + b
+    res = full & MASK32
+    scc = 1 if (full < -0x80000000 or full > 0x7FFFFFFF) else 0
+    return res, scc
+
+
+def ref_s_sub_i32(s0: int, s1: int) -> tuple[int, int]:
+    """Reference implementation of s_sub_i32: D = (S0 - S1) mod 2^32, SCC = signed overflow."""
+    a, b = s32(s0), s32(s1)
+    full = a - b
+    res = full & MASK32
+    scc = 1 if (full < -0x80000000 or full > 0x7FFFFFFF) else 0
+    return res, scc
 
 
 class ScalarALUInterpreter:
@@ -578,6 +606,32 @@ class TestRdna2SpirvLoweringSemantics(unittest.TestCase):
         self.assertIn("OpLoad %uint %scc", body)
         self.assertIn("OpBitwiseOr %uint", body)
 
+    def test_gen_spirv_emission_add_sub_addk_i32(self):
+        for op, spv_op in (("s_add_i32", "OpIAdd %uint"), ("s_sub_i32", "OpISub %uint")):
+            gen = rdna2spirv.Gen("ps")
+            gen._insn({
+                "op": op,
+                "args": [{"k": "sgpr", "r": 4}, {"k": "sgpr", "r": 5}, {"k": "sgpr", "r": 6}],
+                "mods": [],
+            })
+            body = "\n".join(gen.body)
+            self.assertIn(spv_op, body)
+            self.assertIn("OpBitwiseXor %uint", body)
+            self.assertIn("OpBitwiseAnd %uint", body)
+            self.assertIn("OpShiftRightLogical %uint", body)
+            self.assertIn("OpStore %scc", body)
+
+        gen_k = rdna2spirv.Gen("ps")
+        gen_k._insn({
+            "op": "s_addk_i32",
+            "args": [{"k": "sgpr", "r": 4}, {"k": "imm", "v": 0xFFFE}],
+            "mods": [],
+        })
+        body_k = "\n".join(gen_k.body)
+        self.assertIn("OpIAdd %uint", body_k)
+        self.assertIn("OpBitwiseXor %uint", body_k)
+        self.assertIn("OpStore %scc", body_k)
+
     def test_spirv_model_equivalence_sweep(self):
         rng = random.Random(1337)
         for _ in range(200):
@@ -683,6 +737,409 @@ class TestAddressArithmeticUseCases(unittest.TestCase):
 
         final_addr = ((self.interp.sgpr[5] & MASK32) << 32) | (self.interp.sgpr[4] & MASK32)
         self.assertEqual(final_addr, pc_base - offset)
+
+
+def translate_ps_add_sub(lines: list[str]) -> str:
+    """Translate a hand-written pixel shader listing exporting v0..v3 to mrt0."""
+    return translate_lines(
+        "ps_salu_add_sub",
+        [*lines, "exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"],
+    )
+
+
+class EndToEndScalarAddSubTranslatorTests(unittest.TestCase):
+    """End-to-end rdna2spirv.translate + spirv_mini_interp execution for scalar add/sub ops."""
+
+    def test_runtime_s_add_u32_and_s_sub_u32_carry_borrow_and_scc_transitions(self) -> None:
+        # Both operands (s4, s5) are loaded from buffer memory at runtime so neither is in sgpr_imm,
+        # exercising 0->1, 0->0, 1->0, and 1->1 SCC unsigned carry/borrow transitions.
+        spv = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_add_u32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (verifies active clear when carry = 0)
+            "s_add_u32 s8, s4, s5",
+            "s_cselect_b32 s9, 1, 0",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_sub_u32 s10, s4, s5",
+            "s_cselect_b32 s11, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (verifies active clear when borrow = 0)
+            "s_sub_u32 s12, s4, s5",
+            "s_cselect_b32 s13, 1, 0",
+            # Pack add SCC transitions in v1 (bit0: from 0, bit1: from 1) and sub SCC transitions in v3
+            "s_lshl_b32 s9, s9, 1",
+            "s_or_b32 s7, s7, s9",
+            "s_lshl_b32 s13, s13, 1",
+            "s_or_b32 s11, s11, s13",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        pairs = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (100, 200),
+            (300, 100),
+            (0x7FFFFFFF, 0),
+            (0x7FFFFFFF, 1),
+            (0x7FFFFFFF, 0x7FFFFFFF),
+            (0x7FFFFFFF, 0x80000000),
+            (0x7FFFFFFF, 0x80000001),
+            (0x80000000, 0),
+            (0x80000000, 1),
+            (0x80000000, 0x7FFFFFFF),
+            (0x80000000, 0x80000000),
+            (0xFFFFFFFE, 1),
+            (0xFFFFFFFE, 2),
+            (0xFFFFFFFE, 0xFFFFFFFF),
+            (0xFFFFFFFF, 0),
+            (0xFFFFFFFF, 1),
+            (0, 0xFFFFFFFF),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+            (0xDEADBEEF, 0xCAFEBABE),
+            (0xCAFEBABE, 0xDEADBEEF),
+            (0x12345678, 0x87654321),
+        ]
+        for s0, s1 in pairs:
+            mem = {0x1000: s0 & MASK32, 0x1004: s1 & MASK32}
+            exp_add, exp_add_c = ScalarALUInterpreter.eval_s_add_u32(s0, s1)
+            exp_sub, exp_sub_b = ScalarALUInterpreter.eval_s_sub_u32(s0, s1)
+            exp_add_mask = (exp_add_c << 1) | exp_add_c
+            exp_sub_mask = (exp_sub_b << 1) | exp_sub_b
+            self.assertEqual(
+                mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem),
+                [exp_add, exp_add_mask, exp_sub, exp_sub_mask],
+                f"s0={s0:#010x}, s1={s1:#010x}",
+            )
+
+    def test_runtime_s_addc_u32_and_s_subb_u32_carry_and_borrow_in_propagation(self) -> None:
+        # Both operands (s4, s5) are loaded from buffer memory at runtime; executes s_addc_u32 and
+        # s_subb_u32 under both SCC_in = 0 and SCC_in = 1 and exports (res, scc_out).
+        spv_addc = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC_in = 0
+            "s_addc_u32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC_in = 1
+            "s_addc_u32 s8, s4, s5",
+            "s_cselect_b32 s9, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s9",
+        ])
+        spv_subb = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC_in = 0
+            "s_subb_u32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC_in = 1
+            "s_subb_u32 s8, s4, s5",
+            "s_cselect_b32 s9, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s9",
+        ])
+
+        cases = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (5, 5),
+            (10, 9),
+            (100, 200),
+            (50, 20),
+            (0, 5),
+            (0x7FFFFFFF, 0x80000000),     # addc: c1 = 0, c2 = 1 when SCC_in = 1 -> carry_out = 1
+            (0x80000000, 0x7FFFFFFF),
+            (0x80000000, 0x80000000),     # addc: c1 = 1, c2 = 0 -> carry_out = 1
+            (0xFFFFFFFF, 0),              # addc: c1 = 0, c2 = 1 when SCC_in = 1 -> carry_out = 1
+            (0, 0xFFFFFFFF),              # subb: c1 = 1, r1 = 1, c2 = 0 when SCC_in = 1 -> res = 0, borrow = 1
+            (0xFFFFFFFF, 1),
+            (0xFFFFFFFE, 1),              # addc: c1 = 0, c2 = 1 when SCC_in = 1 -> res = 0, carry_out = 1
+            (0xFFFFFFFF, 5),
+            (0xFFFFFFFF, 0xFFFFFFFF),     # addc: c1 = 1; subb: c1 = 0, c2 = 1 when SCC_in = 1
+            (0xDEADBEEF, 0xCAFEBABE),
+        ]
+        for s0, s1 in cases:
+            mem = {0x1000: s0 & MASK32, 0x1004: s1 & MASK32}
+            add0, add0_c = ScalarALUInterpreter.eval_s_addc_u32(s0, s1, 0)
+            add1, add1_c = ScalarALUInterpreter.eval_s_addc_u32(s0, s1, 1)
+            self.assertEqual(
+                mrt0_words(spv_addc, push_constants=PUSH_VSHARP, memory=mem),
+                [add0, add0_c, add1, add1_c],
+                f"s_addc_u32 s0={s0:#010x}, s1={s1:#010x}",
+            )
+            sub0, sub0_b = ScalarALUInterpreter.eval_s_subb_u32(s0, s1, 0)
+            sub1, sub1_b = ScalarALUInterpreter.eval_s_subb_u32(s0, s1, 1)
+            self.assertEqual(
+                mrt0_words(spv_subb, push_constants=PUSH_VSHARP, memory=mem),
+                [sub0, sub0_b, sub1, sub1_b],
+                f"s_subb_u32 s0={s0:#010x}, s1={s1:#010x}",
+            )
+
+    def test_runtime_chained_64bit_add_and_sub_with_carry_borrow(self) -> None:
+        # Chained 64-bit scalar addition (s_add_u32 + s_addc_u32) and subtraction (s_sub_u32 + s_subb_u32)
+        # on runtime-loaded 64-bit pairs s[4:5] and s[6:7].
+        spv_add64 = translate_ps_add_sub([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_add_u32 s8, s4, s6",
+            "s_cselect_b32 s10, 1, 0",    # low carry-out
+            "s_addc_u32 s9, s5, s7",
+            "s_cselect_b32 s11, 1, 0",    # 64-bit carry-out
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+        spv_sub64 = translate_ps_add_sub([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_sub_u32 s8, s4, s6",
+            "s_cselect_b32 s10, 1, 0",    # low borrow-out
+            "s_subb_u32 s9, s5, s7",
+            "s_cselect_b32 s11, 1, 0",    # 64-bit borrow-out
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        vectors = [
+            (0x00000002, 0x00000001, 0x00000004, 0x00000003),
+            (0xFFFFFFFF, 0x00000001, 0x00000001, 0x00000002),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0x00000001, 0x00000000),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            (0x00000005, 0x00000008, 0x00000002, 0x00000003),
+            (0x00000000, 0x00000005, 0x00000001, 0x00000002),
+            (0x00000000, 0x00000000, 0x00000001, 0x00000000),
+            (0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF),
+            (0xFFFF8000, 0x00007FF8, 0x00010000, 0x00000000),
+            (0x00002000, 0x00007FF8, 0x00008000, 0x00000000),
+            (0x12345678, 0x9ABCDEF0, 0x0FEDCBA9, 0x87654321),
+        ]
+        rng = random.Random(20261123)
+        for _ in range(30):
+            vectors.append((
+                rng.getrandbits(32),
+                rng.getrandbits(32),
+                rng.getrandbits(32),
+                rng.getrandbits(32),
+            ))
+
+        for a_lo, a_hi, b_lo, b_hi in vectors:
+            mem = {0x1000: a_lo, 0x1004: a_hi, 0x1008: b_lo, 0x100C: b_hi}
+            exp_add_lo, exp_add_hi, exp_add_c = reference_add_64(a_lo, a_hi, b_lo, b_hi)
+            _, exp_lo_c = ScalarALUInterpreter.eval_s_add_u32(a_lo, b_lo)
+            got_add = mrt0_words(spv_add64, push_constants=PUSH_VSHARP, memory=mem)
+            self.assertEqual(got_add, [exp_add_lo, exp_add_hi, exp_lo_c, exp_add_c])
+
+            exp_sub_lo, exp_sub_hi, exp_sub_b = reference_sub_64(a_lo, a_hi, b_lo, b_hi)
+            _, exp_lo_b = ScalarALUInterpreter.eval_s_sub_u32(a_lo, b_lo)
+            got_sub = mrt0_words(spv_sub64, push_constants=PUSH_VSHARP, memory=mem)
+            self.assertEqual(got_sub, [exp_sub_lo, exp_sub_hi, exp_lo_b, exp_sub_b])
+
+            # Round-trip (a + b) - b == a through the translated 64-bit sub shader
+            mem_rt = {0x1000: got_add[0], 0x1004: got_add[1], 0x1008: b_lo, 0x100C: b_hi}
+            got_rt = mrt0_words(spv_sub64, push_constants=PUSH_VSHARP, memory=mem_rt)
+            self.assertEqual((got_rt[0], got_rt[1]), (a_lo, a_hi))
+
+    def test_runtime_s_add_i32_s_sub_i32_and_s_addk_i32_signed_overflow(self) -> None:
+        # Runtime-loaded s_add_i32 and s_sub_i32 set SCC on signed two's-complement overflow
+        # (not unsigned carry/borrow), and s_addk_i32 sign-extends its 16-bit immediate.
+        spv = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_add_i32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (verifies active clear when overflow = 0)
+            "s_add_i32 s8, s4, s5",
+            "s_cselect_b32 s9, 1, 0",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_sub_i32 s10, s4, s5",
+            "s_cselect_b32 s11, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (verifies active clear when overflow = 0)
+            "s_sub_i32 s12, s4, s5",
+            "s_cselect_b32 s13, 1, 0",
+            "s_lshl_b32 s9, s9, 1",
+            "s_or_b32 s7, s7, s9",
+            "s_lshl_b32 s13, s13, 1",
+            "s_or_b32 s11, s11, s13",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        signed_cases = [
+            (0, 0),
+            (100, 200),
+            (0xFFFFFFFF, 1),              # -1 + 1 = 0 (unsigned carry = 1, signed overflow = 0!)
+            (0xFFFFFFFF, 0xFFFFFFFF),     # -1 + -1 = -2 (unsigned carry = 1, signed overflow = 0!)
+            (0x7FFFFFFF, 0),              # INT32_MAX + 0 = INT32_MAX (no overflow)
+            (0x7FFFFFFF, 1),              # INT32_MAX + 1 = 0x80000000 (signed overflow = 1!)
+            (0x7FFFFFFF, 0x7FFFFFFF),     # positive + positive -> negative (signed overflow = 1)
+            (0x7FFFFFFF, 0xFFFFFFFF),     # INT32_MAX + (-1) -> no add overflow; INT32_MAX - (-1) -> sub overflow = 1!
+            (0x80000000, 0),
+            (0x80000000, 1),              # INT32_MIN + 1 -> no add overflow; INT32_MIN - 1 -> sub overflow = 1!
+            (0x80000000, 0xFFFFFFFF),     # INT32_MIN + (-1) -> add overflow = 1; INT32_MIN - (-1) -> no sub overflow
+            (0x80000000, 0x80000000),     # INT32_MIN + INT32_MIN -> add overflow = 1; sub = 0, no sub overflow
+            (0xC0000000, 0xC0000000),     # -2^30 + -2^30 = -2^31 (0x80000000, still in range -> overflow = 0)
+            (0xC0000000, 0xBFFFFFFF),     # -2^30 + (-2^30 - 1) -> add overflow = 1
+            (0x40000000, 0x40000000),     # 2^30 + 2^30 = 2^31 -> add overflow = 1
+            (0x40000000, 0x3FFFFFFF),     # 2^30 + (2^30 - 1) = INT32_MAX -> overflow = 0
+        ]
+        for s0, s1 in signed_cases:
+            mem = {0x1000: s0 & MASK32, 0x1004: s1 & MASK32}
+            exp_add, exp_add_ov = ref_s_add_i32(s0, s1)
+            exp_sub, exp_sub_ov = ref_s_sub_i32(s0, s1)
+            self.assertEqual(
+                mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem),
+                [exp_add, (exp_add_ov << 1) | exp_add_ov, exp_sub, (exp_sub_ov << 1) | exp_sub_ov],
+                f"s0={s0:#010x}, s1={s1:#010x}",
+            )
+
+        # SOPK s_addk_i32 with positive (+1, +32767) and sign-extended negative (-1 = 0xFFFF, -32768 = 0x8000) simm16
+        spv_addk = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_mov_b32 s6, s4",
+            "s_addk_i32 s6, 0x0001",      # +1
+            "s_cselect_b32 s7, 1, 0",
+            "s_mov_b32 s8, s5",
+            "s_addk_i32 s8, 0xffff",      # -1 (sign-extended from 16-bit immediate)
+            "s_cselect_b32 s9, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s9",
+        ])
+        for s4, s5 in ((0x7FFFFFFF, 0x80000000), (0x7FFFFFFE, 0x80000001), (0xFFFFFFFF, 0)):
+            mem_k = {0x1000: s4, 0x1004: s5}
+            e_add1, e_ov1 = ref_s_add_i32(s4, 1)
+            e_sub1, e_ov2 = ref_s_add_i32(s5, 0xFFFFFFFF)
+            self.assertEqual(
+                mrt0_words(spv_addk, push_constants=PUSH_VSHARP, memory=mem_k),
+                [e_add1, e_ov1, e_sub1, e_ov2],
+            )
+
+    def test_runtime_in_place_aliasing_and_null_destination(self) -> None:
+        # Verifies D == S0, D == S1, D == S0 == S1 in-place register aliasing and `null` destinations
+        # that update SCC while leaving SGPRs untouched.
+        spv = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            # 1. In-place s_add_u32 (D == S0) + s_addc_u32 (D == S1)
+            "s_mov_b32 s6, s4",
+            "s_mov_b32 s7, s5",
+            "s_add_u32 s6, s6, s5",
+            "s_addc_u32 s7, s4, s7",
+            # 2. In-place s_sub_u32 (D == S0 == S1) -> 0, SCC = 0
+            "s_mov_b32 s8, s4",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1
+            "s_sub_u32 s8, s8, s8",
+            "s_cselect_b32 s9, 1, 0",
+            # 3. `null` destination on s_add_u32, s_sub_u32, s_add_i32, s_sub_i32 updates SCC only
+            "s_cmp_eq_u32 0, 1",
+            "s_add_u32 null, s4, s5",
+            "s_cselect_b32 s10, 1, 0",
+            "s_cmp_eq_u32 0, 1",
+            "s_sub_u32 null, s5, s4",
+            "s_cselect_b32 s11, 1, 0",
+            "s_cmp_eq_u32 0, 1",
+            "s_add_i32 null, s4, s5",
+            "s_cselect_b32 s12, 1, 0",
+            "s_lshl_b32 s11, s11, 1",
+            "s_lshl_b32 s12, s12, 2",
+            "s_or_b32 s10, s10, s11",
+            "s_or_b32 s10, s10, s12",
+            "s_lshl_b32 s9, s9, 3",
+            "s_or_b32 s10, s10, s9",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s10",
+        ])
+        # s4 = 0x7FFFFFFF, s5 = 0x80000002:
+        # s6 = 0x7FFFFFFF + 0x80000002 = 0x00000001 (carry = 1)
+        # s7 = 0x7FFFFFFF + 0x80000002 + 1 = 0x00000002
+        # s8 = s4 - s4 = 0, s9 (SCC) = 0
+        # null s_add_u32(s4, s5): carry = 1 (bit 0)
+        # null s_sub_u32(s5, s4): 0x80000002 >= 0x7FFFFFFF -> borrow = 0 (bit 1)
+        # null s_add_i32(s4, s5): +2147483647 + (-2147483646) = +1 -> signed overflow = 0 (bit 2)
+        mem = {0x1000: 0x7FFFFFFF, 0x1004: 0x80000002}
+        self.assertEqual(
+            mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem),
+            [0x00000001, 0x00000002, 0x00000000, 0b0001],
+        )
+
+
+class TranslatedScalarAddSubMutationTests(unittest.TestCase):
+    """Negative controls verifying that sabotaging emitted scalar add/sub SPIR-V fails execution."""
+
+    def test_translated_add_sub_spirv_mutations_caught(self) -> None:
+        # 1. s_addc_u32: swapping OpIAddCarry -> OpISubBorrow, replacing OpBitwiseOr -> OpBitwiseAnd
+        #    (which drops carry when only one of c1, c2 is 1), or redirecting OpStore %scc must fail.
+        spv_addc = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 1, 1",          # seed SCC_in = 1
+            "s_addc_u32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+        # 0xFFFFFFFE + 1 + 1 -> r1 = 0xFFFFFFFF (c1 = 0), r2 = 0 (c2 = 1), carry = c1 | c2 = 1
+        mem_addc = {0x1000: 0xFFFFFFFE, 0x1004: 1}
+        self.assertEqual(mrt0_words(spv_addc, push_constants=PUSH_VSHARP, memory=mem_addc)[:2], [0, 1])
+
+        bad_op = spv_addc.replace("OpIAddCarry %umul", "OpISubBorrow %umul", 1)
+        self.assertNotEqual(bad_op, spv_addc)
+        self.assertNotEqual(mrt0_words(bad_op, push_constants=PUSH_VSHARP, memory=mem_addc)[:2], [0, 1])
+
+        bad_or = spv_addc.replace("OpBitwiseOr %uint", "OpBitwiseAnd %uint", 1)
+        self.assertNotEqual(bad_or, spv_addc)
+        self.assertNotEqual(mrt0_words(bad_or, push_constants=PUSH_VSHARP, memory=mem_addc)[:2], [0, 1])
+
+        bad_scc = spv_addc.replace("OpStore %scc", "OpStore %vcc_hi")
+        self.assertNotEqual(bad_scc, spv_addc)
+        self.assertNotEqual(mrt0_words(bad_scc, push_constants=PUSH_VSHARP, memory=mem_addc)[:2], [0, 1])
+
+        # 2. s_add_i32: sabotaging the sign-bit shift (OpShiftRightLogical %uint ... 31) in scc_add_overflow
+        spv_addi = translate_ps_add_sub([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",
+            "s_add_i32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+        mem_addi = {0x1000: 0x7FFFFFFF, 0x1004: 1}
+        self.assertEqual(mrt0_words(spv_addi, push_constants=PUSH_VSHARP, memory=mem_addi)[:2], [0x80000000, 1])
+
+        bad_ov_xor = spv_addi.replace("OpBitwiseXor %uint", "OpBitwiseAnd %uint", 1)
+        self.assertNotEqual(bad_ov_xor, spv_addi)
+        self.assertNotEqual(
+            mrt0_words(bad_ov_xor, push_constants=PUSH_VSHARP, memory=mem_addi)[:2],
+            [0x80000000, 1],
+        )
 
 
 if __name__ == "__main__":
