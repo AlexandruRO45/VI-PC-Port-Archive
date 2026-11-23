@@ -323,6 +323,8 @@ class ShadersStageWithTheDll(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             work, game = os.path.join(t, "work"), os.path.join(t, "game")
             os.makedirs(game)
+            with open(os.path.join(game, "shaders.rpf"), "wb") as f:
+                f.write(b"synthetic shader archive")
             dll = os.path.join(game, make_game.FSPX_DLL)
             with open(dll, "wb") as f:
                 f.write(dll_like(container(program())))

@@ -69,6 +69,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
+from build_lock import OutputLockError, exclusive_output  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -820,7 +821,7 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
-              emulate: bool = False, keep_emulated: bool = False,
+              game: str | None = None, emulate: bool = False, keep_emulated: bool = False,
               fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
@@ -875,7 +876,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
     need_gb = sum(need.values())
-    if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
+    if (free_gb < need_gb and need.get("shaders")
+            and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks, game=game)):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
     # An export stopped part-way (no xma.done yet) has already put some of the 370 GB on the drive, and the rerun
@@ -1109,6 +1111,38 @@ def llvm_mc_signature() -> str:
     return json.dumps([command, version])
 
 
+def shader_extraction_signatures(archive: str) -> tuple[str, str]:
+    """Hash the archive in chunks. The unpacker's input also depends on the carver that made the DXBCs."""
+    carve = sources_digest(TOOLS, ("shader_carve.py",), lead=file_sha256(archive))
+    return carve, sources_digest(TOOLS, ("fssm_unpack.py", "shader_stage_manifest.py"), lead=carve)
+
+
+def shader_extraction_current(game: str | None, work: str) -> bool:
+    """Whether both extraction steps finished for this game and these tools, without touching the cache."""
+    if not game or redirected_shader_folder(work):
+        return False
+    dxbc = os.path.join(work, "shaders", "dxbc")
+    saved = (read_shader_setting(os.path.join(dxbc, "carve_inputs.sha256")),
+             read_shader_setting(os.path.join(dxbc, "unpack_inputs.sha256")))
+    if not all(saved):
+        return False
+    try:
+        return saved == shader_extraction_signatures(os.path.join(game, "shaders.rpf"))
+    except OSError:
+        return False
+
+
+def record_shader_input(path: str, signature: str) -> None:
+    pending = tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(path), encoding="utf-8",
+                                          newline="\n", delete=False)
+    try:
+        with pending:
+            pending.write(signature + "\n")
+        replace_retry(pending.name, path)
+    finally:
+        drop(pending.name)
+
+
 def unpacked_shader_stems(dxbc: str) -> set[str] | None:
     """Return current unpacked names, allowing the unpacker to skip non-FSSM containers."""
     try:
@@ -1165,32 +1199,38 @@ def disassembly_status(dxbc: str, signature: str) -> tuple[bool, bool, set[str]]
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
-                            fallbacks: tuple[str, ...] = ()) -> bool:
+                            fallbacks: tuple[str, ...] = (), *, game: str | None = None) -> bool:
     """Check whether the shader stage can resume without carving, unpacking or translating again."""
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
     spirv = os.path.join(sh, "spirv")
     markers = (os.path.join(dxbc, "index.json"), os.path.join(dxbc, "fssm_index.json"),
-               os.path.join(spirv, "index.json"))
+               os.path.join(dxbc, "disasm.done"), os.path.join(spirv, "index.json"))
     if not all(os.path.isfile(path) for path in markers):
         return False
     had = read_shader_setting(os.path.join(spirv, "wave64_emulate.txt"), default="off")
     return (had == requested_shader_mode(had, emulate, keep_emulated)
             and read_shader_setting(os.path.join(spirv, "translator_flags.txt")) == translator_flags_setting(fallbacks)
             and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
-            and os.path.isfile(os.path.join(dxbc, "disasm.done"))
+            and shader_extraction_current(game, work)
             and disassembly_status(dxbc, llvm_mc_signature())[0])
 
 
-def prepare_shader_disassembly(work: str, disasm: str, resume: bool) -> None:
-    """Check the output path and remove old listings before starting a new run."""
-    expected = os.path.join(os.path.realpath(work), "shaders", "dxbc", "disasm")
-    if os.path.normcase(os.path.realpath(disasm)) != os.path.normcase(expected):
-        fail(f"The shader disassembly folder must be inside the work folder: {disasm}")
-    if not resume and os.path.isdir(disasm):
-        with os.scandir(disasm) as entries:
+def redirected_shader_folder(work: str) -> str | None:
+    """Find a generated folder that would make cleanup follow a link outside its intended location."""
+    root = os.path.join(os.path.realpath(work), "shaders")
+    for parts in (("dxbc",), ("dxbc", "fssm"), ("dxbc", "disasm"), ("spirv",)):
+        folder = os.path.join(root, *parts)
+        if os.path.normcase(os.path.realpath(folder)) != os.path.normcase(folder):
+            return folder
+    return None
+
+
+def clear_shader_files(folder: str, *suffixes: str) -> None:
+    if os.path.isdir(folder):
+        with os.scandir(folder) as entries:
             for entry in entries:
-                if entry.name.endswith(".s") and (entry.is_file(follow_symlinks=False) or entry.is_symlink()):
+                if entry.name.endswith(suffixes) and (entry.is_file(follow_symlinks=False) or entry.is_symlink()):
                     os.unlink(entry.path)
 
 
@@ -1207,10 +1247,23 @@ def translated_index_is_empty(index: str) -> bool:
 
 def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False,
             fallbacks: tuple[str, ...] = ()) -> None:
+    os.makedirs(work, exist_ok=True)
+    lock_path = os.path.join(work, ".shaders.lock")
+    try:
+        with exclusive_output(os.path.join(work, "shaders"), "make_game", lock_path=lock_path):
+            _build_shaders(game, work, jobs, emulate, keep_emulated, fallbacks)
+    except OutputLockError as error:
+        fail(str(error))
+
+
+def _build_shaders(game: str, work: str, jobs: int, emulate: bool, keep_emulated: bool,
+                   fallbacks: tuple[str, ...]) -> None:
     src = os.path.join(game, "shaders.rpf")
-    sh = os.path.join(work, "shaders")
-    dxbc = os.path.join(sh, "dxbc")
-    spirv = os.path.join(sh, "spirv")
+    redirected = redirected_shader_folder(work)
+    if redirected:
+        fail(f"The shader output folder must be inside the work folder: {redirected}")
+    dxbc = os.path.join(work, "shaders", "dxbc")
+    spirv = os.path.join(work, "shaders", "spirv")
     # Each stage counts as finished only when the file it writes last is there, never because its folder exists
     # or holds many files: a run stopped part-way leaves both. Re-running a stage drops the later stages' proof.
     carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
@@ -1220,14 +1273,31 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
     shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
     signature = llvm_mc_signature()
-    if not os.path.isfile(carved):
+    carve_stamp = os.path.join(dxbc, "carve_inputs.sha256")
+    unpack_stamp = os.path.join(dxbc, "unpack_inputs.sha256")
+    try:
+        carve_input, unpack_input = shader_extraction_signatures(src)
+    except OSError as error:
+        fail(f"Cannot verify shader extraction inputs: {error}")
+    if not os.path.isfile(carved) or read_shader_setting(carve_stamp) != carve_input:
         log("shaders: carving shaders.rpf")
-        drop(translated, shard_plan, disassembled, disassembly_started, unpacked)
+        drop(carve_stamp, unpack_stamp, translated, shard_plan, disassembled, disassembly_started, unpacked, carved)
+        clear_shader_files(dxbc, ".dxbc")
         py("shader_carve.py", src, dxbc)
-    if unpacked_shader_stems(dxbc) is None:
+        try:
+            current_carve, unpack_input = shader_extraction_signatures(src)
+        except OSError as error:
+            fail(f"Cannot verify shader extraction inputs after carving: {error}")
+        if current_carve != carve_input:
+            fail("The shader archive or carver changed during extraction. Rerun the shaders stage.")
+        record_shader_input(carve_stamp, carve_input)
+    if read_shader_setting(unpack_stamp) != unpack_input or unpacked_shader_stems(dxbc) is None:
         log("shaders: unpacking native code")
-        drop(translated, shard_plan, disassembled, disassembly_started)
+        drop(unpack_stamp, translated, shard_plan, disassembled, disassembly_started, unpacked)
+        clear_shader_files(os.path.join(dxbc, "fssm"), ".fssm")
+        clear_shader_files(spirv, ".spv", ".spvasm")
         py("fssm_unpack.py", dxbc, "--carve-index", carved)
+        record_shader_input(unpack_stamp, unpack_input)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
@@ -1239,7 +1309,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         drop(translated, shard_plan)
         if not resume:
             drop(disassembly_started, disassembled)
-        prepare_shader_disassembly(work, disasm, resume)
+            clear_shader_files(disasm, ".s")
         if not os.path.isfile(disassembly_started) or os.path.isfile(disassembled):
             marker = disassembly_started + ".tmp"
             with open(marker, "w", encoding="utf-8", newline="\n") as f:
@@ -2653,7 +2723,7 @@ def main() -> int:
         cfg = leonida_tui.run_setup(a.jobs, default_overlap=True)
         a.jobs = leonida_tui.clamp_jobs(cfg.jobs)
         overlap = cfg.overlap
-    preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+    preflight(stages, work, a.wav, runtime_build, game=game, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
     if not a.out and icloud_documents():
         for note in icloud_default_notes():

@@ -26,9 +26,7 @@ from __future__ import annotations
 import argparse
 import array
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 import functools
-import hashlib
 import json
 import math
 import os
@@ -38,21 +36,13 @@ import stat
 import statistics
 import sys
 import tempfile
-
-try:
-    import fcntl
-except ImportError:                       # Windows
-    fcntl = None
-try:
-    import msvcrt
-except ImportError:                       # POSIX
-    msvcrt = None
 import threading
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from build_lock import exclusive_output  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 
@@ -1257,52 +1247,10 @@ CHUNK_STAGING_PREFIX = ".chunks-staging-"
 _STAGING_BACKUP = "previous"
 _STAGING_JOURNAL = "publication.json"
 _STAGING_WORLD = "world.json"
-_WORLD_BUILD_LOCK = "leonida-world-build-"
 
 
-@contextmanager
 def _exclusive_output(out_dir: str):
-    """Hold one exclusive build lock for ``out_dir``.
-
-    Staging cleanup, publication and stale-chunk pruning all work on the shared output
-    directory, so two builds must not run there at once.  A killed process releases the
-    OS file lock automatically.
-    """
-    # Keep the lock outside the output: a failed build must still leave no output directory,
-    # and a successful one must contain only chunks/ and world.json.  Key it on the resolved
-    # path so every spelling of one folder (8.3 names, junctions, symlinks) shares a lock; for
-    # a folder that does not exist yet, realpath resolves the part that does and appends the rest.
-    key = hashlib.sha256(
-        os.path.normcase(os.path.realpath(out_dir)).encode("utf-8", "surrogatepass")
-    ).hexdigest()[:20]
-    lock_path = os.path.join(tempfile.gettempdir(), _WORLD_BUILD_LOCK + key)
-    with open(lock_path, "a+b") as fh:
-        fd = fh.fileno()
-        locked = False
-        try:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-            elif msvcrt is not None:
-                if os.fstat(fd).st_size == 0:
-                    fh.write(b"\0")
-                    fh.flush()
-                fh.seek(0)
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                locked = True
-            else:
-                raise RuntimeError("no file-lock implementation available")
-        except OSError as exc:
-            raise RuntimeError(f"another world_build is using {out_dir}") from exc
-        try:
-            yield
-        finally:
-            if locked:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                else:
-                    fh.seek(0)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    return exclusive_output(out_dir, "world_build")
 
 
 def _with_output_lock(fn):

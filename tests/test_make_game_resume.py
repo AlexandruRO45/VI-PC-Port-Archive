@@ -127,10 +127,18 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
 
     def test_disassembling_again_drops_the_plan(self):
         with tempfile.TemporaryDirectory() as work:
+            game = os.path.join(work, "game")
+            os.makedirs(game)
+            archive = os.path.join(game, "shaders.rpf")
+            with open(archive, "wb") as f:
+                f.write(b"synthetic shader archive")
             dxbc = os.path.join(work, "shaders", "dxbc")
             spirv = os.path.join(work, "shaders", "spirv")
             os.makedirs(dxbc)
             os.makedirs(spirv)
+            carve, unpack = make_game.shader_extraction_signatures(archive)
+            make_game.record_shader_input(os.path.join(dxbc, "carve_inputs.sha256"), carve)
+            make_game.record_shader_input(os.path.join(dxbc, "unpack_inputs.sha256"), unpack)
             for name, entries in (("index.json", [{"file": "shader.dxbc"}]),
                                   ("fssm_index.json", [{"name": "shader"}])):
                 with open(os.path.join(dxbc, name), "w", encoding="utf-8") as f:
@@ -152,7 +160,7 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
                     mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                     mock.patch.object(make_game, "translate", side_effect=fake_translate), \
                     mock.patch.object(make_game, "log", lambda *a: None):
-                make_game.shaders("game", work, 2)
+                make_game.shaders(game, work, 2)
             self.assertEqual(seen, {"plan": False})
 
 

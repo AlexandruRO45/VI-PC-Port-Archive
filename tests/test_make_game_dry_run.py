@@ -383,6 +383,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         self.work_dir = os.path.join(self.tmp.name, "work")
         self.out_dir = os.path.join(self.tmp.name, "out")
         os.makedirs(self.game_dir, exist_ok=True)
+        self.archive = Path(self.game_dir, "shaders.rpf")
+        self.archive.write_bytes(b"synthetic shader archive")
         os.makedirs(self.work_dir, exist_ok=True)
         os.makedirs(self.out_dir, exist_ok=True)
 
@@ -392,6 +394,9 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         os.makedirs(os.path.join(dxbc_dir, "disasm"))
         os.makedirs(spirv_dir, exist_ok=True)
 
+        carve, unpack = make_game.shader_extraction_signatures(self.archive)
+        make_game.record_shader_input(os.path.join(dxbc_dir, "carve_inputs.sha256"), carve)
+        make_game.record_shader_input(os.path.join(dxbc_dir, "unpack_inputs.sha256"), unpack)
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
             f.write('[{"file": "shader.dxbc"}]')
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:

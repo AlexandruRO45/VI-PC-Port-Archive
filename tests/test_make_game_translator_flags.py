@@ -122,6 +122,10 @@ class RecordedFlagsTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.work = tmp.name
+        self.game = os.path.join(self.work, "game")
+        os.makedirs(self.game)
+        with open(os.path.join(self.game, "shaders.rpf"), "wb") as f:
+            f.write(b"synthetic shader archive")
         self.dxbc = os.path.join(self.work, "shaders", "dxbc")
         self.spirv = os.path.join(self.work, "shaders", "spirv")
 
@@ -156,7 +160,7 @@ class RecordedFlagsTest(unittest.TestCase):
                 mock.patch.object(make_game, "translate", fake_translate), \
                 mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, fallbacks=fallbacks)
+            make_game.shaders(self.game, self.work, 2, fallbacks=fallbacks)
         return ran
 
     def test_flags_are_recorded_beside_the_translation(self):
@@ -270,7 +274,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 "--work", self.work, *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
-                mock.patch("make_game.choose_game", return_value=os.path.join(self.work, "game")), \
+                mock.patch("make_game.choose_game", return_value=self.game), \
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \

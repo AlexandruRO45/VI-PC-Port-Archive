@@ -483,6 +483,8 @@ class PreflightPrerequisiteTest(PreflightTestBase):
     def test_preflight_charges_space_only_when_shaders_need_to_be_rebuilt(self):
         cases = (
             ("current translation", {}, {}, False, True),
+            ("missing carve fingerprint", {"dxbc/carve_inputs.sha256": None}, {}, False, False),
+            ("stale unpack fingerprint", {"dxbc/unpack_inputs.sha256": "stale"}, {}, False, False),
             ("matching emulation", {"spirv/wave64_emulate.txt": "on"}, {"emulate": True}, False, True),
             ("auto keeps emulation", {"spirv/wave64_emulate.txt": "on"}, {"keep_emulated": True}, False, True),
             ("missing disassembly marker", {"dxbc/disasm.done": None}, {}, False, False),
@@ -500,19 +502,27 @@ class PreflightPrerequisiteTest(PreflightTestBase):
         usage = Usage(500 * 2**30, 485 * 2**30, 15 * 2**30)
         for name, changed, settings, legacy_layout, reusable in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as work:
+                game = os.path.join(work, "game")
+                os.mkdir(game)
+                archive = os.path.join(game, "shaders.rpf")
+                with open(archive, "wb") as f:
+                    f.write(b"synthetic shader archive A")
+                carve, unpack = make_game.shader_extraction_signatures(archive)
                 files = {
                     "dxbc/index.json": '[{"file": "shader.dxbc"}]',
                     "dxbc/fssm_index.json": '[{"name": "shader"}]',
+                    "dxbc/carve_inputs.sha256": carve,
+                    "dxbc/unpack_inputs.sha256": unpack,
                     "dxbc/disasm.done": "test llvm-mc 21",
-                    "spirv/index.json": "{}",
+                    "spirv/index.json": '{"shader": {}}',
                     "spirv/translation_sources.sha256": fingerprint,
                     "spirv/wave64_emulate.txt": "off",
                     **changed,
                 }
                 shader_root = os.path.join(work, "shaders")
-                for name, content in files.items():
+                for rel, content in files.items():
                     if content is not None:
-                        path = os.path.join(shader_root, name)
+                        path = os.path.join(shader_root, rel)
                         os.makedirs(os.path.dirname(path), exist_ok=True)
                         with open(path, "w", encoding="utf-8") as handle:
                             handle.write(content + "\n")
@@ -528,11 +538,17 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                      mock.patch("shutil.disk_usage", return_value=usage), \
                      mock.patch("sys.stdout", io.StringIO()):
                     if reusable:
-                        make_game.preflight(["shaders"], work, **settings)
+                        make_game.preflight(["shaders"], work, game=game, **settings)
                     else:
-                        self.assert_fails(make_game.preflight, ["shaders"], work,
+                        self.assert_fails(make_game.preflight, ["shaders"], work, game=game,
                                           match="about 30 GB is needed", **settings)
-
+                    if name == "current translation":
+                        # The same output folder with no source to verify, or a different archive.
+                        self.assert_fails(make_game.preflight, ["shaders"], work, match="about 30 GB is needed")
+                        with open(archive, "wb") as f:
+                            f.write(b"synthetic shader archive B")
+                        self.assert_fails(make_game.preflight, ["shaders"], work, game=game,
+                                          match="about 30 GB is needed")
 
     def test_preflight_disk_space_stage_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp_work:

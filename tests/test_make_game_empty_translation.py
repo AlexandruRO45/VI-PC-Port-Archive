@@ -180,6 +180,8 @@ class ShadersStageTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.work = tmp.name
+        self.game = os.path.join(self.work, "game")
+        write(os.path.join(self.game, "shaders.rpf"), "synthetic shader archive")
         self.dxbc = os.path.join(self.work, "shaders", "dxbc")
         self.spirv = os.path.join(self.work, "shaders", "spirv")
 
@@ -209,7 +211,7 @@ class ShadersStageTest(unittest.TestCase):
                 mock.patch.object(make_game, "translate", fake_translate), \
                 mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.shaders(os.path.join(self.work, "game"), self.work, 2)
+            make_game.shaders(self.game, self.work, 2)
         return ran
 
     def test_an_empty_saved_index_is_translated_again_without_its_plan(self):

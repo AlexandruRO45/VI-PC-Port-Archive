@@ -130,7 +130,15 @@ can sit on another drive. The runtime maps the package in place, so a read-only 
 `gta6rt --overlay <writable folder>`; `--overlay` is a `gta6rt` option, not a `make_game.py` one. Leave the `.s`
 files in `work/shaders/dxbc/disasm` in place: the next run checks them against the list in `disasm.done` and
 disassembles the missing ones again (all of them for a folder whose `disasm.done` predates that list), then
-translates every shader again. A `disasm` folder that is a symlink is refused when the stage has to clear it.
+translates every shader again. To keep rebuilds inside the selected work folder, keep its generated
+`dxbc`, `dxbc/fssm`, `dxbc/disasm` and `spirv` directories in place. To put the whole cache on another
+drive, pass that location to `--work`.
+
+You can reuse a shader work folder with another copy of the game. The build checks the SHA-256 of
+`shaders.rpf`, so moving an identical archive keeps the finished shaders. Changing the archive or the carver
+runs extraction, disassembly and translation again. Changing only the unpacker runs those steps from
+unpacking onward. The first build with an older work folder rebuilds the shaders once to record their inputs.
+Concurrent shader builds need separate work folders.
 
 **From a terminal**, with the same behaviour and more control:
 

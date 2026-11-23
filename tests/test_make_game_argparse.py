@@ -332,7 +332,7 @@ class JobsHandlingTest(unittest.TestCase):
                                     self.assertEqual(ret, 0)
                                     probe.assert_called_once_with("auto", mesh_compute=False)
                                     mock_preflight.assert_called_once_with(
-                                        ["shaders"], os.path.abspath(work), False, None,
+                                        ["shaders"], os.path.abspath(work), False, None, game=os.path.abspath(game),
                                         emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
                                                                          emulate=True, keep_emulated=True, fallbacks=())
