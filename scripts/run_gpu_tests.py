@@ -951,6 +951,15 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
+        elif name == "cs_f64_trans":
+            # VOP1 reciprocal, inverse square root and square root on doubles (cs_f64_trans.asm header)
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            if rc == 77:
+                results.append((name, None, "SKIP (no shaderFloat64 on this device)"))
+            else:
+                ok, detail = judge_cs_dump(rc, msg, [0, 0x3FD00000, 0, 0x3FE00000, 0x4000000, 0x41900000, 0, 0x3FF00000],
+                                           wave64=False, partial=False, emulated=False, hexwords=True)
+                results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
             wrong = []
