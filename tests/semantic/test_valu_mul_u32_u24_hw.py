@@ -385,3 +385,43 @@ class TestSIMDDivergence(unittest.TestCase):
             else:
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0_in_place(self) -> None:
+        """Verify v0 = v0 * v1 reads initial v0 before writeback."""
+        state = ScalarMachineState()
+        init_v0 = 0xAA00_0007  # low 24 = 7
+        v1_val = 0xBB00_0009   # low 24 = 9
+
+        state.set_vgpr(0, init_v0)
+        state.set_vgpr(1, v1_val)
+
+        interp = ScalarInterpreter()
+        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(1))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 63)
+        self.assertEqual(state.get_vgpr(0), 63)
+
+        # Cross check with translated SPIR-V
+        spv_res = run_translator_mul_u24(init_v0, v1_val, name="ps_alias_dst_src0")
+        self.assertEqual(res, spv_res)
+
+    def test_alias_all_same_register(self) -> None:
+        """Verify v0 = v0 * v0 squaring."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, 12)
+
+        interp = ScalarInterpreter()
+        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(0))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 144)
+        self.assertEqual(state.get_vgpr(0), 144)
