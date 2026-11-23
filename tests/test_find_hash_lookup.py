@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "find_hash_lookup.py")
@@ -127,6 +128,18 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("ERROR: cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "report.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(fhl, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    fhl.write_json_report(path, {"candidates": []})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":
