@@ -291,6 +291,33 @@ class ProbeCliTests(unittest.TestCase):
         self.assertEqual(rc, 77, out)
         self.assertTrue(oracle.closed)
 
+    def test_wrong_result_count_or_none_entry_is_harness_error(self):
+        class ShortResultOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                return super().run(kernels, words=words)[:-1]
+
+        class ExtraResultOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                res = super().run(kernels, words=words)
+                return res + [res[-1]]
+
+        class NoneEntryOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                res = super().run(kernels, words=words)
+                res[0] = None
+                return res
+
+        for oracle, expected_msg in (
+            (ShortResultOracle(), "the hardware runner returned 19 results for 20 kernels"),
+            (ExtraResultOracle(), "the hardware runner returned 21 results for 20 kernels"),
+            (NoneEntryOracle(), "harness error (sweep wave32 v_cvt_norm_u16_f16 plain_p0): no result"),
+        ):
+            with self.subTest(msg=expected_msg):
+                rc, out, err = _run_main(oracle, "--ops", "v_cvt_norm_u16_f16", "--waves", "32")
+                self.assertEqual(rc, 2, out + err)
+                self.assertTrue(oracle.closed)
+                self.assertIn(expected_msg, out)
+
     def test_unavailable_oracle_exits_77(self):
         buf = io.StringIO()
         with mock.patch.object(runner, "open_oracle", side_effect=runner.Unavailable("missing")), redirect_stdout(buf):

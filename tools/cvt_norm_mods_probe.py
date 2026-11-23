@@ -393,10 +393,29 @@ def evaluate_results(waves: list[int], meta, raw_results) -> dict:
     harness_errors: list[dict] = []
     total_words = 0
 
+    if len(raw_results) != len(meta):
+        harness_errors.append({
+            "error": f"the hardware runner returned {len(raw_results)} results for {len(meta)} kernels",
+        })
+        return {
+            "total_words": sum(len(expected) for *_, expected in meta),
+            "mismatches": 0,
+            "wave_diffs": 0,
+            "harness_errors": harness_errors,
+            "mismatch_details": [],
+            "wave_diff_details": [],
+        }
+
     for (kind, op, wave, variant, clamp, expected), res in zip(meta, raw_results):
         total_words += len(expected)
-        if isinstance(res, str):
-            harness_errors.append({"kind": kind, "op": op, "wave": wave, "variant": variant, "error": res})
+        if res is None or isinstance(res, str):
+            harness_errors.append({
+                "kind": kind,
+                "op": op,
+                "wave": wave,
+                "variant": variant,
+                "error": "no result" if res is None else res,
+            })
             continue
         if len(res) != len(expected):
             harness_errors.append({
@@ -529,6 +548,14 @@ def self_test() -> int:
     rep_bad = evaluate_results([32, 64], meta, raw_bad)
     assert rep_bad["mismatches"] == 1 and rep_bad["wave_diffs"] == 1, rep_bad
 
+    rep_short = evaluate_results([32, 64], meta, raw_ok[:-1])
+    assert rep_short["harness_errors"] and "returned 3 results for 4 kernels" in rep_short["harness_errors"][0]["error"], rep_short
+
+    raw_none = [list(w) for w in raw_ok]
+    raw_none[0] = None
+    rep_none = evaluate_results([32, 64], meta, raw_none)
+    assert rep_none["harness_errors"] and rep_none["harness_errors"][0]["error"] == "no result", rep_none
+
     print(
         f"self-test ok ({len(OPS)} ops, {len(VOP3_NORM_MODS)} VOP3 norm mods, "
         f"{len(SDWA_CASES)} SDWA cases, {len(PKNORM_PAIRS)} pknorm pairs)"
@@ -615,7 +642,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"cvt_norm_mods_probe on {device} ({arch}):")
     if summary["harness_errors"]:
         for err in summary["harness_errors"][:8]:
-            print(f"  harness error ({err['kind']} wave{err['wave']} {err['op']} {err['variant']}): {err['error']}")
+            if "kind" in err:
+                print(f"  harness error ({err['kind']} wave{err['wave']} {err['op']} {err['variant']}): {err['error']}")
+            else:
+                print(f"  harness error: {err['error']}")
         return 2
 
     print(
