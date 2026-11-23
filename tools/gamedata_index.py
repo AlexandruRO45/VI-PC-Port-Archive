@@ -314,6 +314,11 @@ def row_for(typ: str, rows: list, group: list, root: str = "", detail: str = "",
 
 
 def summarize(rows: list, source_summary: dict, target: str) -> dict:
+    # The summary property hands back the raw index.json field. A null/list/string/number summary used
+    # to reach .get below and raise AttributeError, which main() does not catch (it catches OSError,
+    # ValueError, KeyError, TypeError), so a malformed index tracebacked instead of one ERROR line.
+    if not isinstance(source_summary, dict):
+        raise ValueError(f"index.json summary is {type(source_summary).__name__}, expected an object")
     by_type = defaultdict(lambda: {"files": 0, "streams": 0, "stored": 0, "inflated": 0})
     by_root = defaultdict(lambda: {"files": 0, "inflated": 0})
     for r in rows:

@@ -122,6 +122,25 @@ class GamedataIndexTest(unittest.TestCase):
                 self.assertEqual(p.stdout, "")
         self.assertFalse(os.path.exists(os.path.join(self.root, "out.json")))
 
+    def test_a_non_object_summary_is_one_line_not_a_traceback(self):
+        # The summary property returns the raw index.json field; a null/list/string/number summary used
+        # to reach summarize()'s .get and raise AttributeError, which main() does not catch, so the tool
+        # tracebacked (exit 1) instead of the one ERROR line exit 2 it uses for every other bad index.
+        out = os.path.join(self.root, "out.json")
+        for summary in (None, [], "x", 0, True):
+            with self.subTest(summary=summary):
+                with open(os.path.join(self.carve, "index.json"), "w", encoding="utf-8") as f:
+                    json.dump({"files": [], "summary": summary}, f)
+                if os.path.exists(out):
+                    os.remove(out)
+                p = self.run_tool(self.carve, "--json", out)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("cannot read", p.stderr)
+                self.assertIn("summary", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertFalse(os.path.exists(out))
+
     def test_directory_groups_chunks_and_roots(self):
         self.add(b'<?xml version="1.0"?>\n<RootA><!-- synthetic fixture, longer than 64 bytes --><Item value="1"/></RootA>')
         second = b'<?xml version="1.0"?>\n<RootB>' + b"x" * (65536 - len(b'<?xml version="1.0"?>\n<RootB>'))
