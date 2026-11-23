@@ -24,6 +24,7 @@ writes only objects, no refs. Standard library only; needs git 2.38 or newer for
 import argparse
 import codecs
 import json
+import os
 import re
 import subprocess
 import sys
@@ -121,7 +122,12 @@ def duplicates(repo, main, tree, min_length, block=3):
             if text:
                 added.append(text)
     def windows(rev, path):
-        r = git(repo, "show", f"{rev}:{path}", check=False)
+        spec = f"{rev}:{path}"
+        if os.name != "nt":
+            # POSIX argv is bytes, and a str is re-encoded in the locale's filesystem encoding, which under a non-UTF-8
+            # locale names another file. Pass the path's bytes from the diff; Windows passes Unicode on to Git as is.
+            spec = os.fsencode(f"{rev}:") + path.encode("utf-8", "surrogateescape")
+        r = git(repo, "show", spec, check=False)
         lines = [l.strip() for l in r.stdout.split("\n") if l.strip()] if r.returncode == 0 else []
         return r.returncode == 0, Counter(tuple(lines[i:i + block]) for i in range(len(lines) - block + 1))
 

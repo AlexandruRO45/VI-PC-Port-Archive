@@ -169,6 +169,34 @@ class MergeCheckTest(unittest.TestCase):
         self.git("config", "core.quotePath", "false")
         self.assertEqual(self.run_check("18=duplicated"), (code, [result]))
 
+    def test_a_non_ascii_path_counts_under_a_non_utf8_posix_locale(self):
+        # Git stores the name's UTF-8 bytes; a non-UTF-8 locale must not turn them into another name for `git show`.
+        env = dict(os.environ)
+        for name in ("C.ISO-8859-1", "en_US.ISO-8859-1", "de_DE.ISO-8859-1", "fr_FR.ISO-8859-1", "en_GB.ISO-8859-1"):
+            env.update(LC_ALL=name, LANG=name)
+            probe = subprocess.run([sys.executable, "-I", "-c", "import codecs, sys; "
+                                    "print(codecs.lookup(sys.getfilesystemencoding()).name)"],
+                                   capture_output=True, text=True, env=env)
+            if probe.returncode == 0 and probe.stdout.strip() == "iso8859-1":
+                break
+        else:
+            self.skipTest("no ISO-8859-1 locale here (Windows and macOS always use UTF-8 for file names)")
+        name = os.path.join(os.fsencode(self.repo), b"docs", "not\u00e9s.md".encode("utf-8"))
+        with open(name, "wb") as f:
+            f.write((PARAGRAPH + "A separator between copies keeps Git's added hunk easy to identify.\n").encode())
+        self.commit("Add a document with a non-ASCII name")
+        self.git("checkout", "-q", "-b", "duplicated")
+        with open(name, "ab") as f:
+            f.write(("\n" + PARAGRAPH).encode())
+        self.commit("Duplicate the paragraph")
+        self.git("checkout", "-q", "main")
+        r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "scripts", "merge_check.py"), "--repo",
+                            os.fsencode(self.repo), "--main", "main", "--json", "20=duplicated"],
+                           capture_output=True, env=env)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        [result] = json.loads(r.stdout)
+        self.assertEqual((result["verdict"], result["duplicates"]), ("duplicates", {"docs/not\u00e9s.md": 3}))
+
     def test_duplicate_blocks_use_git_line_boundaries(self):
         unicode_lines = "".join(f"Paragraph {i} begins with enough text to count as a line.\u2028"
                                 "Its continuation is also longer than forty characters.\n" for i in range(3))
