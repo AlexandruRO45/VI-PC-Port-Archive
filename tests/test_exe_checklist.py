@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -213,6 +214,15 @@ class ExeChecklist(unittest.TestCase):
         self.assertTrue(any(n["file"] == "docs/d3d12_vulkan.md" and n["kind"] == "ASSUMPTION" for n in notes))
         # so does modding.md's note on the three settings only the executable can confirm
         self.assertTrue(any(n["file"] == "docs/modding.md" and n["kind"] == "ASSUMPTION" for n in notes))
+
+    def test_out_write_failure_preserves_previous_report(self):
+        previous = "# previous checklist\n"
+        path = Path(self.root, "checklist.md")
+        path.write_text(previous, encoding="utf-8", newline="\n")
+        with mock.patch.object(ec, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                ec.write_text_report(str(path), "# new checklist\n")
+        self.assertEqual(path.read_text(encoding="utf-8"), previous)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ the ones a boot can reach, so they come first; "not called" ones can wait. The c
 
 Output: Markdown, to stdout or --out (LF). Exit status 0 on success; 1 when a --gdk-calls file can't be read or
 the checklist cannot be written to --out; 2 when --out refers to an input report.
+`--out` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 Standard library only.
 Usage: `python -I tools/exe_checklist.py --help` lists the options.
 """
@@ -25,10 +26,14 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from gdk_runtime_calls import served_classes  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -201,8 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     text = render(collect(a.root), called)
     if a.out:
         try:
-            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
+            write_text_report(a.out, text)
         except OSError as e:
             print(f"cannot write the checklist to {a.out}: {e.strerror or e}", file=sys.stderr)
             return 1
@@ -210,6 +214,39 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(text, end="")
     return 0
+
+
+def write_text_report(path: str, text: str) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".exe_checklist-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
