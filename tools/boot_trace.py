@@ -12,7 +12,7 @@ a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a
 tag is accepted too. The reader accepts UTF-8 and BOM-marked UTF-16, including PowerShell 5.1 stderr redirection.
 
 Usage:
-    python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
+    python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N] [--counts-only]
 
 The traces can quote what the game prints, so they stay on the player's machine: the text report counts debug
 strings instead of printing them, and only the tests' synthetic fixtures go into the repository. Share counts and
@@ -31,6 +31,8 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+D3D12_OUTCOMES = ("called", "failed", "ignored", "ok", "partial", "refused", "unsupported")
+EXCEPTION_CODE = re.compile(r"0x[0-9a-f]{1,8}", re.IGNORECASE)
 
 
 class TraceError(ValueError):
@@ -48,7 +50,7 @@ def _open_text(path: str):
         raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
 
 
-def parse_startup(path: str, limit: int = 10) -> dict:
+def parse_startup(path: str, limit: int = 10, *, count_exception_codes: bool = False) -> dict:
     """Read the `--trace` JSONL into the units the first-boot triage uses."""
     trace = {
         "path": path,
@@ -72,6 +74,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "error": None,
     }
     seen_imports = set()
+    exception_codes = {} if count_exception_codes else None
     with _open_text(path) as fh:
         for number, line in enumerate(fh, 1):
             line = line.strip()
@@ -146,6 +149,13 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["int3_skipped"].append(event.get("at"))
             elif kind == "exception":
                 trace["exception_count"] += 1
+                if exception_codes is not None:
+                    code = event.get("code")
+                    if isinstance(code, str) and EXCEPTION_CODE.fullmatch(code):
+                        category = hex(int(code, 16))
+                    else:
+                        category = "unknown"
+                    exception_codes[category] = exception_codes.get(category, 0) + 1
                 if limit <= 0:
                     continue
                 stack = event.get("stack")
@@ -167,6 +177,8 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["error"] = event.get("what")
     if trace["events"] == 0:
         raise TraceError(f"{path} has no valid startup event")
+    if exception_codes is not None:
+        trace["exception_codes"] = dict(sorted(exception_codes.items()))
     return trace
 
 
@@ -313,6 +325,53 @@ def format_text(summary: dict, limit: int) -> str:
     return "\n".join(out)
 
 
+def counts_only_report(summary: dict) -> dict:
+    """Project the local report onto numeric totals and known outcome labels."""
+    report = {"startup": None, "d3d12": None}
+    if startup := summary["startup"]:
+        report["startup"] = {
+            "events": startup["events"],
+            "bad_lines": startup["bad_lines"],
+            "modules": len(startup["modules"]),
+            "tls_callbacks": startup["tls_callbacks"],
+            "dllmain_ok": startup["dllmain"]["ok"],
+            "dllmain_failed": startup["dllmain"]["failed"],
+            "unimplemented_imports": len(startup["unimplemented"]),
+            "debug_strings": startup["debug_strings"],
+            "failed_file_opens": startup["file_open_failed_count"],
+            "int3_skipped": len(startup["int3_skipped"]),
+            "exceptions": startup["exception_count"],
+            "exception_codes": startup["exception_codes"],
+            "runtime_errors": startup["kinds"].get("error", 0),
+            "exit": startup["exit"],
+        }
+    if d3d12 := summary["d3d12"]:
+        outcomes = {key: d3d12["outcomes"][key] for key in D3D12_OUTCOMES if key in d3d12["outcomes"]}
+        other = d3d12["calls"] - sum(outcomes.values())
+        if other:
+            outcomes["other"] = other
+        report["d3d12"] = {
+            "calls": d3d12["calls"],
+            "ignored_lines": d3d12["ignored_lines"],
+            "outcomes": outcomes,
+        }
+    return report
+
+
+def format_counts_only(report: dict) -> str:
+    lines = []
+    for section, label in (("startup", "Startup"), ("d3d12", "D3D12")):
+        if counts := report[section]:
+            lines.append(label + " counts:")
+            for key, value in counts.items():
+                if value is None:
+                    continue
+                if isinstance(value, dict):
+                    value = ", ".join(f"{name}={count}" for name, count in value.items()) or "none"
+                lines.append(f"  {key.replace('_', ' ')}: {value}")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Summarize gta6rt's startup and D3D12 first-boot traces."
@@ -320,6 +379,10 @@ def main(argv=None) -> int:
     ap.add_argument("startup", nargs="?", help="the JSONL written by gta6rt --trace")
     ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
+    ap.add_argument(
+        "--counts-only", action="store_true",
+        help="omit paths, addresses and free-form details from the report",
+    )
     ap.add_argument(
         "--limit", type=int, default=10, help="items listed per section (default 10)"
     )
@@ -332,17 +395,30 @@ def main(argv=None) -> int:
         return 2
     summary = summarize(None, None)
     exit_code = 0
-    for section, path, parse in (("startup", a.startup, parse_startup), ("d3d12", a.d3d12, parse_d3d12)):
-        if path:
-            try:
-                summary[section] = parse(path, a.limit)
-            except TraceError as e:
+    for section, path in (("startup", a.startup), ("d3d12", a.d3d12)):
+        if not path:
+            continue
+        try:
+            if section == "startup":
+                summary[section] = parse_startup(path, a.limit, count_exception_codes=a.counts_only)
+            else:
+                summary[section] = parse_d3d12(path, a.limit)
+        except (OSError, ValueError, RecursionError) as e:
+            if a.counts_only:
+                print(f"error: could not summarize {section} trace", file=sys.stderr)
+            elif isinstance(e, TraceError):
                 print(f"error: {e}", file=sys.stderr)
-                exit_code = 2
+            else:
+                raise
+            exit_code = 2
     if not any(summary.values()):
         return 2
+    if a.counts_only:
+        summary = counts_only_report(summary)
     if a.json:
         print(json.dumps(summary, indent=1))
+    elif a.counts_only:
+        print(format_counts_only(summary))
     else:
         print(format_text(summary, a.limit))
     return exit_code
