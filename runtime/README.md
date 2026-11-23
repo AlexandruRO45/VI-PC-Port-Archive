@@ -205,6 +205,16 @@ The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs`
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
 imports are unknown until it is available.
 
+## CPU instructions the host may lack
+
+The game executable targets the console's AMD CPU. An instruction a desktop CPU lacks raises #UD
+(`STATUS_ILLEGAL_INSTRUCTION`); `src/cpu_ud_emulate.*` is a vectored handler that emulates the ones in its table and
+resumes after them, and passes every other exception on. Installed at startup only when the host CPU lacks an emulated
+instruction. So far: `CLZERO` (`0F 01 FC`) zeroes the 64-byte line at `RAX & ~63`. If that line is not writable the
+emulator declines and the exception goes on to the next handler, as the real instruction's page fault would. Another
+instruction is one emulator function and one line in `kTable`; `cpu_ud_emulate_test` drives the dispatcher with a
+synthetic `CONTEXT`, so it runs on any CPU.
+
 ## Tests
 
 For a Visual Studio build, pass CTest the same configuration you built above.

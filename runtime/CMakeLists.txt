@@ -103,6 +103,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
+    src/cpu_ud_emulate.cpp
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -484,6 +485,16 @@ if(BUILD_TESTING)
     target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
+
+    # #UD emulation (CLZERO): drives the dispatcher with synthetic CONTEXT/EXCEPTION_RECORD, so it needs no game file
+    # and no CPU that lacks the instruction.
+    add_executable(cpu_ud_emulate_test
+      test/cpu_ud_emulate_test.cpp
+      src/cpu_ud_emulate.cpp
+    )
+    target_compile_definitions(cpu_ud_emulate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(cpu_ud_emulate_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME cpu_ud_emulate COMMAND cpu_ud_emulate_test)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
     # imports it so Loader::load exercises recursive module loading. They contain no game data.
     set(TINY_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/fixtures/$<CONFIG>")
