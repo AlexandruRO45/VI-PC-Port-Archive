@@ -312,6 +312,19 @@ class TestVLogF16Oracle(unittest.TestCase):
         res = ref_v_log_f16(0x4000)
         self.assertEqual(res, 0x3c00)
 
+class TestVLogF16ASTAndInterpreter(unittest.TestCase):
+    def test_ast_disasm(self) -> None:
+        inst = ASTInstruction(Opcode.V_LOG_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        self.assertEqual(inst.disasm(), "v_log_f16 v0, v1")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr_f16(1, 0x4000)
+        inst = ASTInstruction(Opcode.V_LOG_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x3c00)
+        self.assertEqual(state.vgprs[0] & MASK16, 0x3c00)
+
 
 if __name__ == "__main__":
     unittest.main()
