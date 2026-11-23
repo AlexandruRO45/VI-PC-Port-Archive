@@ -777,5 +777,30 @@ class TestVDot2cF32F16Oracle(unittest.TestCase):
         res = ref_v_dot2c_f32_f16(0x3C004000, 0x42003800, old_dst=0x00000000)
         self.assertEqual(res, 0x40800000)
 
+class TestVDot2cF32F16ASTAndInterpreter(unittest.TestCase):
+    def test_ast_disassembly(self) -> None:
+        inst = ASTInstruction(
+            Opcode.V_DOT2C_F32_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+        )
+        self.assertEqual(inst.disasm(), "v_dot2c_f32_f16 v2, v0, v1")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x3C003C00)
+        state.write_vgpr(1, 0x3C003C00)
+        state.write_vgpr(2, 0x3F800000)
+        inst = ASTInstruction(
+            Opcode.V_DOT2C_F32_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x40400000)
+        self.assertEqual(state.vgprs[2], 0x40400000)
+
 if __name__ == "__main__":
     unittest.main()
