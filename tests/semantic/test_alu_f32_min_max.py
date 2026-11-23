@@ -620,6 +620,51 @@ class TestNaNPropagation(unittest.TestCase):
                     self.assertEqual(run_f32_2op("v_max_f32", nan, fin), fin)
                     self.assertEqual(run_f32_2op("v_max_f32", fin, nan), fin)
 
+    def test_signaling_nan_src0_is_ignored_for_binary_and_three_way_ops(self) -> None:
+        for op in ("v_min_f32", "v_max_f32"):
+            with self.subTest(op=op):
+                self.assertEqual(run_f32_2op(op, SNAN, ONE), ONE)
+                self.assertEqual(run_f32_2op(op, 0xFF800123, TWO), TWO)
+        self.assertEqual(run_f32_3op("v_min3_f32", SNAN, ONE, TWO), ONE)
+        self.assertEqual(run_f32_3op("v_max3_f32", SNAN, ONE, TWO), TWO)
+        self.assertEqual(run_f32_3op("v_med3_f32", SNAN, ONE, TWO), ONE)
+
+    def test_nan_operands_are_sanitized_before_nminmax(self) -> None:
+        """Do not pass NaN operands to GLSL NMin/NMax (AMD Windows mishandles sNaN in operand 0)."""
+        if _TMP_DIR is None or _SRC_PATH is None:
+            setUpModule()
+            assert _SRC_PATH is not None
+        for op, sources in (
+            ("v_min_f32", 2), ("v_max_f32", 2), ("v_min3_f32", 3),
+            ("v_max3_f32", 3), ("v_med3_f32", 3),
+        ):
+            with self.subTest(op=op):
+                moves = [f"\tv_mov_b32 v{i}, {SNAN if i == 1 else (ONE if i == 2 else TWO):#x}"
+                         for i in range(1, sources + 1)]
+                operands = ", ".join(f"v{i}" for i in range(1, sources + 1))
+                asm = "; test_nan_sanitization\n" + "\n".join(moves + [
+                    f"\t{op} v0, {operands}",
+                    "\texp mrt0 v0, v0, v0, v0 done vm",
+                    "\ts_endpgm",
+                ]) + "\n"
+                with open(_SRC_PATH, "w", encoding="utf-8") as f:
+                    f.write(asm)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", ResourceWarning)
+                    spv = rdna2spirv.translate(_SRC_PATH)
+
+                sanitized = set()
+                for line in spv.splitlines():
+                    parts = line.split()
+                    if len(parts) == 7 and parts[1:4] == ["=", "OpSelect", "%float"] and parts[5] == "%f0":
+                        sanitized.add(parts[0])
+                ext_ops = [line.split() for line in spv.splitlines()
+                           if "OpExtInst %float %glsl NMin" in line or "OpExtInst %float %glsl NMax" in line]
+                self.assertTrue(ext_ops, "expected at least one NMin/NMax operation")
+                for parts in ext_ops:
+                    for operand in parts[-2:]:
+                        self.assertIn(operand, sanitized, f"raw NaN-capable operand reaches NMin/NMax: {' '.join(parts)}")
+
     def test_both_nan_returns_quiet_nan(self) -> None:
         got_min = run_f32_2op("v_min_f32", QNAN_PAYLOAD, QNAN_PAYLOAD_B)
         self.assertTrue(is_nan_bits(got_min))

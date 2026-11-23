@@ -6274,6 +6274,15 @@ class Gen:
             return (u & 0x7F800000) == 0x7F800000 and bool(u & 0x7FFFFF)
         return None
 
+    def _f32_nan_predicate(self, src, value):
+        """Return a static NaN state or emit one test for a runtime f32 value."""
+        state = self._f32_const_nan(src)
+        if state is not None:
+            return state
+        result = self.tmp()
+        self.emit(f"{result} = OpIsNan %bool {value}")
+        return result
+
     def _select_nan_first(self, res, first, nan_second, second=None, second_src=None):
         """Return ``first`` when ``second`` is NaN, else ``res`` (RDNA2 S0 priority when both operands are NaN)."""
         if nan_second is False:
@@ -6292,10 +6301,49 @@ class Gen:
         self.emit(f"{sel} = OpSelect %float {nan_second} {first} {res}")
         return sel
 
-    def nminmax_f32(self, glsl_op, x, y, y_src=None, nan_y=None):
-        """GLSL.std.450 ``NMin``/``NMax`` returning ``x`` with its bits intact whenever ``y`` is NaN."""
+    def _nminmax_nan_result(self, nan_x, nan_y):
+        """Return whether NMin/NMax is NaN: both inputs must be NaN."""
+        if nan_x is False or nan_y is False:
+            return False
+        if nan_x is True and nan_y is True:
+            return True
+        if nan_x is True:
+            return nan_y
+        if nan_y is True:
+            return nan_x
+        if nan_x is None or nan_y is None:
+            return None
+        if nan_x == nan_y:
+            return nan_x
+        result = self.tmp()
+        self.emit(f"{result} = OpLogicalAnd %bool {nan_x} {nan_y}")
+        return result
+
+    def nminmax_f32(self, glsl_op, x, y, x_src=None, y_src=None, nan_x=None, nan_y=None):
+        """GLSL.std.450 ``NMin``/``NMax`` with explicit NaN selection on both operands.
+
+        NaN inputs are replaced with +0 before the ext-inst, avoiding an AMD Windows driver bug where a signalling
+        NaN as operand 0 yields a quiet NaN. The selects restore ``y`` when only ``x`` is NaN and restore ``x`` for
+        NaN ``y`` last, preserving RDNA2's S0 priority when both operands are NaN.
+        """
+        if nan_x is None:
+            nan_x = self._f32_nan_predicate(x_src, x)
+        if nan_y is None:
+            nan_y = self._f32_nan_predicate(y_src, y)
+        safe_x, safe_y = x, y
+        if nan_x is True:
+            safe_x = "%f0"
+        elif nan_x is not False:
+            safe_x = self.tmp()
+            self.emit(f"{safe_x} = OpSelect %float {nan_x} %f0 {x}")
+        if nan_y is True:
+            safe_y = "%f0"
+        elif nan_y is not False:
+            safe_y = self.tmp()
+            self.emit(f"{safe_y} = OpSelect %float {nan_y} %f0 {y}")
         r = self.tmp()
-        self.emit(f"{r} = OpExtInst %float %glsl {glsl_op} {x} {y}")
+        self.emit(f"{r} = OpExtInst %float %glsl {glsl_op} {safe_x} {safe_y}")
+        r = self._select_nan_first(r, y, nan_x, x, x_src)
         return self._select_nan_first(r, x, nan_y, y, y_src)
 
     def _read_f16_minmax_srcs(self, srcs, sels, mods):
@@ -6329,11 +6377,6 @@ class Gen:
         An inline or literal constant that is not a NaN gets no OpIsNan; with no operand left to check there is no
         select."""
         x, y, z = vals
-        lo, hi, m1, m = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
-        self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
-        self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
-        self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
         checks = []
         preds = []
         for i, (v, s) in enumerate(zip(vals, srcs)):
@@ -6355,6 +6398,22 @@ class Gen:
             self.emit(f"{c} = OpIsNan %bool {v}")
             checks.append(c)
             preds.append(c)
+        if sel is None:
+            nan_x, nan_y, nan_z = preds
+            nan_lo = self._nminmax_nan_result(nan_x, nan_y)
+            nan_hi = nan_lo
+            nan_m1 = self._nminmax_nan_result(nan_z, nan_lo)
+            nan_m = self._nminmax_nan_result(nan_m1, nan_hi)
+            lo = self.nminmax_f32("NMin", x, y, nan_x=nan_x, nan_y=nan_y)
+            hi = self.nminmax_f32("NMax", x, y, nan_x=nan_x, nan_y=nan_y)
+            m1 = self.nminmax_f32("NMax", z, lo, nan_x=nan_z, nan_y=nan_lo)
+            m = self.nminmax_f32("NMin", m1, hi, nan_x=nan_m1, nan_y=nan_hi)
+        else:
+            lo, hi, m1, m = (self.tmp() for _ in range(4))
+            self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
+            self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
+            self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
+            self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
         if not checks:
             return m
         nan = checks[0]
@@ -6364,7 +6423,7 @@ class Gen:
             nan = o
         if sel is None:
             mn1 = self._select_nan_first(lo, x, preds[1])
-            mn = self.nminmax_f32("NMin", mn1, z, nan_y=preds[2])
+            mn = self.nminmax_f32("NMin", mn1, z, nan_x=nan_lo, nan_y=preds[2])
         else:
             mn = self.tmp()
             self.emit(f"{mn} = OpExtInst %float %glsl NMin {lo} {z}")
@@ -6792,8 +6851,10 @@ class Gen:
         elif op in ("v_max3_f32", "v_min3_f32"):
             x, y, z = (self.src_f_sign_mods(t) for t in a[1:4])
             f = "NMax" if "max" in op else "NMin"      # RDNA2: f(f(s0, s1), s2) keeping S0 on all-NaN
-            m = self.nminmax_f32(f, x, y, y_src=a[2])
-            r = self.nminmax_f32(f, m, z, y_src=a[3])
+            nan_x, nan_y, nan_z = (self._f32_nan_predicate(s, v) for s, v in zip(a[1:4], (x, y, z)))
+            nan_m = self._nminmax_nan_result(nan_x, nan_y)
+            m = self.nminmax_f32(f, x, y, nan_x=nan_x, nan_y=nan_y)
+            r = self.nminmax_f32(f, m, z, nan_x=nan_m, nan_y=nan_z)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_and_or_b32":
             x, y, z = (self.src_u(t) for t in a[1:4])
@@ -10746,7 +10807,8 @@ class Gen:
             x, y = read_source(a[1]), read_source(a[2])
             r = self.tmp()
             if F2[op] in ("max", "min"):
-                r = self.nminmax_f32("NMax" if F2[op] == "max" else "NMin", x, y, y_src=a[2])
+                r = self.nminmax_f32("NMax" if F2[op] == "max" else "NMin", x, y,
+                                     x_src=a[1], y_src=a[2])
             else:
                 self.emit(f"{r} = {F2[op]} %float {x} {y}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))

@@ -490,7 +490,8 @@ class AllNaNSrc0PayloadTests(unittest.TestCase):
             6,
         )
         spv_min3_f32 = translate_text(LOAD + "v_min3_f32 v0, v1, v2, 1.0\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
-        self.assertEqual(spv_min3_f32.count("OpIsNan"), 1)
+        # Both dynamic operands in the first pair are classified so sNaN cannot reach NMin as operand 0.
+        self.assertEqual(spv_min3_f32.count("OpIsNan"), 2)
 
     def test_spirv_val_all_nan_variants(self):
         import shutil
