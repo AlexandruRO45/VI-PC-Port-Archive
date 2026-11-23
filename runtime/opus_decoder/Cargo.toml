@@ -1,0 +1,12 @@
+[package]
+name = "leonida-opus-decoder"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+opusdec = { git = "https://github.com/omonkeyz/xbox-emulator", rev = "27122f7dfcceb9a899555362ee0dde2d530e033c" }
