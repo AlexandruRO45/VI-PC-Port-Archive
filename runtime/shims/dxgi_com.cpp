@@ -826,9 +826,10 @@ HRESULT fill_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT* num_modes
     return (to_copy < total) ? DXGI_ERROR_MORE_DATA : S_OK;
 }
 
+// `out` may be `req` itself (FindClosestMatchingMode called in place), so it is written last and only on success, as
+// host dxgi.dll does: a failing call leaves the caller's structure as it was.
 HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IUnknown* concerned_device,
                           DXGI_MODE_DESC& out) {
-    out = {};
     if (req.Format == DXGI_FORMAT_UNKNOWN && !concerned_device) return DXGI_ERROR_INVALID_CALL;
     const DXGI_FORMAT target_fmt = (req.Format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_B8G8R8A8_UNORM : req.Format;
     const std::vector<DXGI_MODE_DESC> modes = collect_modes(info, target_fmt);

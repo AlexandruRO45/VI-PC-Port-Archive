@@ -1300,6 +1300,29 @@ int main() {
             matched.Height == 0 || matched.RefreshRate.Numerator == 0 || matched.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
             return fail("FindClosestMatchingMode(RGBA8 1280x720) failed");
 
+        // The same request in place (pModeToMatch == pClosestMatch) gives the same mode, and a failing call leaves
+        // *pClosestMatch as it was: host dxgi.dll reads the request before it writes, and writes only on success.
+        const auto same_mode = [](const DXGI_MODE_DESC& a, const DXGI_MODE_DESC& b) {
+            return a.Width == b.Width && a.Height == b.Height && a.RefreshRate.Numerator == b.RefreshRate.Numerator &&
+                   a.RefreshRate.Denominator == b.RefreshRate.Denominator && a.Format == b.Format &&
+                   a.ScanlineOrdering == b.ScanlineOrdering && a.Scaling == b.Scaling;
+        };
+        DXGI_MODE_DESC in_place = match_req;
+        if (out0->FindClosestMatchingMode(&in_place, &in_place, nullptr) != S_OK || !same_mode(in_place, matched))
+            return fail("FindClosestMatchingMode in place did not give the mode of the two-struct call");
+        DXGI_MODE_DESC no_format = match_req;
+        no_format.Format = DXGI_FORMAT_UNKNOWN;
+        const DXGI_MODE_DESC no_format_before = no_format;
+        if (out0->FindClosestMatchingMode(&no_format, &no_format, nullptr) != DXGI_ERROR_INVALID_CALL ||
+            !same_mode(no_format, no_format_before))
+            return fail("FindClosestMatchingMode in place without a format or device should fail and write nothing");
+        DXGI_MODE_DESC no_modes = match_req;
+        no_modes.Format = DXGI_FORMAT_R32_UINT;
+        DXGI_MODE_DESC untouched = matched;
+        if (out0->FindClosestMatchingMode(&no_modes, &untouched, nullptr) != DXGI_ERROR_NOT_FOUND ||
+            !same_mode(untouched, matched))
+            return fail("FindClosestMatchingMode(R32_UINT) should fail and leave *pClosestMatch alone");
+
         DXGI_MODE_DESC1 req1{}, matched1{};
         req1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         if (FAILED(out6->FindClosestMatchingMode1(&req1, &matched1, nullptr)) || matched1.Width == 0 ||
@@ -1382,6 +1405,16 @@ int main() {
                                 hfac->Release();
                                 FreeLibrary(host_dxgi);
                                 return fail("FindClosestMatchingMode(empty) did not match host dxgi.dll");
+                            }
+                            // In place, on the host's own output: the same result code as ours.
+                            DXGI_MODE_DESC host_in_place = match_req, our_in_place = match_req;
+                            if (hout0->FindClosestMatchingMode(&host_in_place, &host_in_place, nullptr) !=
+                                out0->FindClosestMatchingMode(&our_in_place, &our_in_place, nullptr)) {
+                                hout0->Release();
+                                hadp->Release();
+                                hfac->Release();
+                                FreeLibrary(host_dxgi);
+                                return fail("FindClosestMatchingMode in place did not match host dxgi.dll");
                             }
                             hout0->Release();
                         }
