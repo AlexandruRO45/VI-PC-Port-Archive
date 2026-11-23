@@ -173,7 +173,12 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
                 if line.strip():
                     trace["ignored_lines"] += 1
                 continue
-            seq, method, outcome = int(match.group(1)), match.group(2), match.group(3)
+            try:
+                seq = int(match.group(1))
+            except ValueError:  # A long decimal can exceed Python's integer conversion limit.
+                trace["ignored_lines"] += 1
+                continue
+            method, outcome = match.group(2), match.group(3)
             trace["calls"] += 1
             trace["last_seq"] = seq
             trace["outcomes"][outcome] = trace["outcomes"].get(outcome, 0) + 1

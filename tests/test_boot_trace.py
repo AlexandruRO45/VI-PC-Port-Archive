@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -213,6 +214,63 @@ class BootTraceTests(unittest.TestCase):
         )
         self.assertEqual(trace["refused"], [{"seq": 6, "method": "MapTiles"}])
         self.assertEqual(trace["last_seq"], 9)
+
+    @unittest.skipUnless(hasattr(sys, "set_int_max_str_digits"), "Python has no integer digit limit")
+    def test_oversized_d3d12_sequence_preserves_surrounding_calls(self):
+        previous = sys.get_int_max_str_digits()
+        maximum = (1 << 64) - 1
+        try:
+            sys.set_int_max_str_digits(640)
+            self.write_lines(self.d3d12, [
+                "[d3d12-trace] #1 Before failed",
+                "[d3d12-trace] #" + "9" * 641 + " Malformed ok",
+                f"[d3d12-trace] #{maximum} After unsupported",
+            ])
+            trace = bt.parse_d3d12(self.d3d12)
+            self.assertEqual((trace["calls"], trace["ignored_lines"], trace["last_seq"]), (2, 1, maximum))
+            self.assertEqual(trace["methods"], ["Before", "After"])
+            self.assertEqual(trace["outcomes"], {"failed": 1, "unsupported": 1})
+            self.assertEqual(trace["first"], {"Before": {"seq": 1, "outcome": "failed"},
+                                              "After": {"seq": maximum, "outcome": "unsupported"}})
+            self.assertEqual(trace["failed"], [{"seq": 1, "method": "Before"}])
+            self.assertEqual(trace["unsupported"], [{"seq": maximum, "method": "After"}])
+            self.assertEqual(trace["refused"], [])
+        finally:
+            sys.set_int_max_str_digits(previous)
+
+    @unittest.skipUnless(hasattr(sys, "set_int_max_str_digits"), "Python has no integer digit limit")
+    def test_d3d12_cli_recovers_text_and_json_after_an_oversized_sequence(self):
+        # -I ignores PYTHONINTMAXSTRDIGITS, so exceed the interpreter's default limit.
+        sequence = "9" * (sys.int_info.default_max_str_digits + 1)
+        self.write_lines(self.d3d12, ["[d3d12-trace] #1 Before ok",
+                                      f"[d3d12-trace] #{sequence} Malformed failed",
+                                      "[d3d12-trace] #3 After refused"])
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags):
+                result = subprocess.run([sys.executable, "-I", bt.__file__, "--d3d12", self.d3d12, *flags],
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                if flags:
+                    trace = json.loads(result.stdout)["d3d12"]
+                    self.assertEqual((trace["calls"], trace["ignored_lines"], trace["last_seq"]), (2, 1, 3))
+                    self.assertEqual(trace["outcomes"], {"ok": 1, "refused": 1})
+                else:
+                    self.assertIn("2 call(s), 1 other line(s)", result.stdout)
+                    self.assertIn("refused: #3 After", result.stdout)
+                self.assertNotIn("Malformed", result.stdout)
+
+    @unittest.skipUnless(hasattr(sys, "set_int_max_str_digits"), "Python has no integer digit limit")
+    def test_all_oversized_d3d12_sequences_keep_the_normal_cli_error(self):
+        sequence = "9" * (sys.int_info.default_max_str_digits + 1)
+        self.write_lines(self.d3d12, [f"[d3d12-trace] #{sequence} Malformed failed"])
+        result = subprocess.run([sys.executable, "-I", bt.__file__, "--d3d12", self.d3d12, "--json"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("no [d3d12-trace] line among 1 line(s)", result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
 
     def test_powershell_error_record_prefix_keeps_the_first_call(self):
         self.write_lines(
