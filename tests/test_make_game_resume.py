@@ -35,12 +35,24 @@ class ResumeShardsTest(unittest.TestCase):
         spirv = self.spirv
 
         class FakeProc:
+            """A shard that has finished by the first poll(): translate() polls every shard until it exits, and
+            _stop_procs() polls and waits on the way out, so both answer with the same exit code."""
+
             def __init__(self, args):
                 self.i = int(args[args.index("--shard") + 1].split("/")[0])
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
+                self.code = None
                 started.append(self.i)
 
-            def wait(self):
+            def poll(self):
+                if self.code is None:
+                    self.code = self.finish()
+                return self.code
+
+            def wait(self, timeout=None):
+                return self.poll()
+
+            def finish(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
