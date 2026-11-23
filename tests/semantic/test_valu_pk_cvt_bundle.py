@@ -439,5 +439,38 @@ class VCvtPknormU16F16TranslatorTests(unittest.TestCase):
         word = mrt0_words(spv)[0]
         self.assertEqual(word, 0x00000000)
 
+# -----------------------------------------------------------------------------
+# Opcode 4: v_pack_b32_f16
+# -----------------------------------------------------------------------------
+
+def ref_pack_half(w: int, sel: int, abs_mod: bool = False, neg_mod: bool = False) -> int:
+    h = (w >> (16 * sel)) & MASK16
+    if abs_mod:
+        h &= 0x7FFF
+    if neg_mod:
+        h ^= 0x8000
+    return h
+
+
+def ref_pack_b32_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0),
+                     abs_mods: tuple[bool, bool] = (False, False),
+                     neg_mods: tuple[bool, bool] = (False, False)) -> int:
+    h0 = ref_pack_half(s0, sel[0], abs_mods[0], neg_mods[0])
+    h1 = ref_pack_half(s1, sel[1], abs_mods[1], neg_mods[1])
+    return ((h1 << 16) | h0) & MASK32
+
+
+class VPackB32F16OracleTests(unittest.TestCase):
+    def test_basic_pack(self):
+        self.assertEqual(ref_pack_b32_f16(0x00003C00, 0x00004000), 0x40003C00)
+        self.assertEqual(ref_pack_b32_f16(0x12345678, 0x9ABCDEF0), 0xDEF05678)
+
+    def test_op_sel(self):
+        s0 = 0x11112222
+        s1 = 0x33334444
+        self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(1, 0)), 0x44441111)
+        self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(0, 1)), 0x33332222)
+        self.assertEqual(ref_pack_b32_f16(s0, s1, sel=(1, 1)), 0x33331111)
+
 if __name__ == '__main__':
     unittest.main()
