@@ -1673,6 +1673,32 @@ public:
     }
 
 private:
+    // What a kept PreparedList holds for later executions: its entry vectors (not the small vectors inside them).
+    static std::size_t kept_bytes(const PreparedList& list) {
+        return list.commands.capacity() * sizeof(detail::Prepared) +
+               list.draws.capacity() * sizeof(detail::PreparedDraw) +
+               list.queries.capacity() * sizeof(detail::PreparedQuery);
+    }
+
+    // The PreparedLists past this execution's `active` ones only keep storage for later, larger executions (a
+    // title's one-list pre pass, then its many-list main pass). Each position keeps its own peak, so a large list
+    // that moves between positions would be kept once per position. What they keep is bounded: twice the largest
+    // execution seen recently (kept_peak_ loses 1/16 an execution), at least kKeptFloor. Above that the largest
+    // are released first.
+    void trim_kept_lists(std::size_t active) {
+        std::size_t used = 0, idle = 0;
+        for (std::size_t i = 0; i < prepared_.size(); ++i) (i < active ? used : idle) += kept_bytes(prepared_[i]);
+        kept_peak_ = std::max(used, kept_peak_ - kept_peak_ / 16);
+        const std::size_t budget = std::max(kKeptFloor, 2 * kept_peak_);
+        while (idle > budget) {
+            std::size_t largest = active;
+            for (std::size_t i = active + 1; i < prepared_.size(); ++i)
+                if (kept_bytes(prepared_[i]) > kept_bytes(prepared_[largest])) largest = i;
+            idle -= kept_bytes(prepared_[largest]);
+            prepared_[largest] = PreparedList{};
+        }
+    }
+
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
@@ -1823,6 +1849,7 @@ private:
             statistics_segments += prepared[i].statistics_segment_count;
             has_queries = has_queries || !prepared[i].queries.empty();
         }
+        trim_kept_lists(lists.size());
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
             const auto& vk = context_.vk;
@@ -2404,6 +2431,8 @@ private:
     // execute's working storage. Per queue like buffers_: one execute at a time on a queue, as acquire() and
     // submit() already assume; other queues prepare concurrently with their own.
     std::vector<PreparedList> prepared_;
+    static constexpr std::size_t kKeptFloor = std::size_t(1) << 20;  // trim_kept_lists keeps at least this
+    std::size_t kept_peak_ = 0;  // the largest execution's entry bytes, decaying (trim_kept_lists)
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
     // Wait-before-Signal. state_mutex_ is outermost (before resource_mutex_ -> tracker_mutex_ -> submit_mutex_) and

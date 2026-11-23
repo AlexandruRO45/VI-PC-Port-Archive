@@ -9,10 +9,43 @@
 #include "../src/vulkan_backend.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <malloc.h>
+#include <new>
 #include <span>
 #include <vector>
+
+// The heap the process holds through operator new, for section 6: what a queue keeps between executions shows here.
+// Counted by the allocator's own block size, so a block freed by a delete that isn't this one only adds noise.
+namespace {
+std::atomic<std::int64_t> g_heap_bytes{0};
+std::size_t block_size(void* p) {
+#ifdef _WIN32
+    return _msize(p);
+#else
+    return malloc_usable_size(p);
+#endif
+}
+}  // namespace
+
+void* operator new(std::size_t size) {
+    void* p = std::malloc(size ? size : 1);
+    if (!p) throw std::bad_alloc();
+    g_heap_bytes += std::int64_t(block_size(p));
+    return p;
+}
+void operator delete(void* p) noexcept {
+    if (!p) return;
+    g_heap_bytes -= std::int64_t(block_size(p));
+    std::free(p);
+}
+void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
+void* operator new[](std::size_t size) { return operator new(size); }
+void operator delete[](void* p) noexcept { operator delete(p); }
+void operator delete[](void* p, std::size_t) noexcept { operator delete(p); }
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -276,6 +309,30 @@ int main() {
         two_others, 43, {{{mid_bytes, 0, 0}, {rb, 0, 0}, {c_bytes, kOffset, kOffset + kHalf}, {d_bytes, 0, kSize}}});
     std::printf("2, then 1, then 2 other lists: %u, %u and %u wrong bytes\n", wrong_two, wrong_one, wrong_others);
     EXPECT(wrong_two == 0 && wrong_one == 0 && wrong_others == 0);
+
+    // 6. One heavy list (1,024 small copies) among empty ones, last in batches that narrow from 32 lists to 1, so it
+    // moves to a new position each time. The queue keeps entries for later executions, but what it keeps must stay
+    // near what one execution needs: not one copy of the heavy list per position it has been at.
+    {
+        const std::int64_t before = g_heap_bytes.load();
+        VulkanQueue narrowing(context, d.queue, d.family, Kind::direct);
+        EXPECT(narrowing.ok());
+        CommandList empty, heavy;
+        EXPECT(empty.close());
+        for (std::uint32_t i = 0; i < 1024; ++i) EXPECT(heavy.copy_buffer({mid_id, i * 4, upload_id, i * 4, 4}));
+        EXPECT(heavy.close());
+        std::int64_t widest = 0, narrowest = 0;
+        for (std::uint32_t width = 32; width > 0; --width) {
+            std::vector<const CommandList*> batch(width, &empty);
+            batch.back() = &heavy;
+            EXPECT(narrowing.execute(batch) == ReplayResult::success);
+            EXPECT(narrowing.idle());
+            (width == 32 ? widest : narrowest) = g_heap_bytes.load() - before;
+        }
+        std::printf("a heavy list moving from position 31 to 0: %lld heap bytes held at 32 lists, %lld at 1\n",
+                    (long long)widest, (long long)narrowest);
+        EXPECT(widest > 0 && narrowest <= 4 * widest);
+    }
 
     EXPECT(direct.idle() && compute.idle() && copy.idle());
     if (d.validation) {
