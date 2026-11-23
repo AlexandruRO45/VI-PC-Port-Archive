@@ -3,7 +3,7 @@
 > [!NOTE]
 > İngilizce dokümantasyon ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) ve
 > [`docs/README.md`](../../README.md)) **yetkili kaynaktır**. Bu rehber yalnızca kararlı kurulum ve derleme
-> yönergelerini kapsar (`561b65a` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
+> yönergelerini kapsar (`867d922` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
 > [`README.md`](../../../README.md) dosyasına bakın.
 
 ## Leonida Nedir?
@@ -55,6 +55,12 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
 - `PATH` içinde [ffmpeg](https://ffmpeg.org/download.html) *(isteğe bağlı: XMA2 ses akışlarını çözer; `--wav` için
   gereklidir)*.
 
+**Bu bilgisayar yeterince güçlü mü?** `python -I tools/pc_checker.py --cli`, uzun bir derlemeye başlamadan önce CPU,
+GPU ve RAM'i tespit ederek bunları referans profillerle karşılaştırır: varsayılan `--profile 1` bir Xbox Series X
+bilgisayar eşdeğeridir, `--profile 2` ise topluluk tahmini 1080p Düşük (Low) profilidir.
+`python -I tools/pc_checker.py --check --json` aynı kararı JSON olarak yazdırır ve bunu bir çıkış kodu olarak döndürür
+(0 iyi, 1 zayıf, 2 bilinmiyor).
+
 ## Nasıl Derlenir?
 
 ### Kolay yöntem (Windows)
@@ -90,6 +96,9 @@ Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runt
 - **`--wave64-emulate`**: Wave64 compute ve mesh shader'larını her subgroup genişliğinde birebir çalışacak şekilde
   çevirir. NVIDIA ve Intel GPU'lar 32 şeritli subgroup kullandığı için buna ihtiyaç duyar. Varsayılan `auto` modu
   `vulkaninfo` çıktısına bakar ve tüm GPU'lar yerel 64 şeritli subgroup bildirmediği sürece emülasyonu otomatik açar.
+- **`--mesh-compute`**: `VK_EXT_mesh_shader` uzantısına sahip olmayan aygıtlar için mesh shader'larını compute
+  shader'ı olarak çevirir. Yerel mesh çizimlerinin çöktüğü Intel Windows Vulkan sürücüsünde (`BUILD-2202`) otomatik
+  olarak devreye girer (`--native-mesh` parametresi verilmedikçe).
 - **`--work`**: Tam derleme için en az 400 GB boş alana sahip bir sürücü seçin (yalnızca çalıştırmak için yaklaşık
   30 GB, `assets` aşaması için yaklaşık 370 GB yeterlidir). En uzun adım shader çevirisidir ve varsayılan olarak
   CPU iş parçacıklarının yarısını kullanır (`--jobs` ile değiştirilebilir).
@@ -121,7 +130,7 @@ Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runt
 
 1. Aynı işi iki kez yapmamak için açık PR'lara ve [koordinasyon issue'suna][coord] göz atın. Başlamadan önce
    `claiming: <ID>` yazarak (veya henüz ID yoksa tek satırlık açıklamayla) görevi sahiplenin.
-2. Sentetik girdilerle ilgili testleri çalıştırın (örneğin depo kökünde `python -I tests/test_manifest_verifier.py`).
+2. Sentetik girdilerle ilgili testleri çalıştırın (örneğin depo kökünde `python -I tests/test_manifest.py`).
 3. PR açıklamasında görev ID'sini, neleri test ettiğinizi ve GPU testi çalıştırdıysanız ekran kartı ile sürücü
    sürümünü belirtin; yapay zekâ desteği kullandıysanız not düşün. Tüm kurallar için
    [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) dosyasına bakın.
