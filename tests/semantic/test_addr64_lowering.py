@@ -144,7 +144,8 @@ class AddressLoweringTests(unittest.TestCase):
         lowered = rdna2spirv.lower_addr64(native)
         self.assertNotIn("OpCapability Int64", lowered)
         self.assertIn("OpUMulExtended %umul", lowered)
-        for stride, records, expected in [(0, 12, MAGIC), (0, 8, 0), (4, 2, 0), (4, 0x40000002, MAGIC)]:
+        for stride, records, expected in [(0, 11, 0), (0, 12, MAGIC), (4, 2, 0), (4, 3, MAGIC),
+                                          (4, 0x40000000, MAGIC), (4, 0x40000002, MAGIC)]:
             desc = [0, stride << 16, records, VSHARP[3]]
             for module in (native, lowered):
                 with self.subTest(stride=stride, records=records, lowered=module == lowered):
