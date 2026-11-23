@@ -67,13 +67,17 @@ class CrashLogTest(unittest.TestCase):
                            check=True)
             index[name] = {"stage": "cs", "subgroup_size": None, "features": []}
         (cls.dir / "index.json").write_text(json.dumps(index))
-        code, log = cls.run_to_log("probe.log")
+        code, log, err = cls.run_to_log("probe.log")
+        # Every exit without a Vulkan device comes before the checker names the device it picked; only that skips.
+        # Once a device is picked, a probe that doesn't check all three pipelines cleanly is a failure, not a skip.
+        if "device: " not in err:
+            raise unittest.SkipTest("no usable Vulkan device (exit %d): %s" % (code, err.strip()[-300:]))
         if code != 0 or "cs pipelines: 3 ok, 0 failed" not in log:
-            raise unittest.SkipTest("no usable Vulkan device (exit %d): %s" % (code, log.strip()[-300:]))
+            raise AssertionError("the run without a crash failed (exit %d):\n%s\n%s" % (code, log, err))
 
     @classmethod
     def run_to_log(cls, log_name, crash=None):
-        """Runs the checker with stdout redirected to a file, as a log is written, and returns (exit code, log)."""
+        """Runs the checker with stdout redirected to a file, as a log is written: (exit code, log, stderr)."""
         env = dict(os.environ)
         env.pop("VK_PIPELINE_CHECK_SIMULATE_CRASH", None)
         if crash:
@@ -82,11 +86,11 @@ class CrashLogTest(unittest.TestCase):
         # --slow 0 prints a SLOW line for every pipeline that finishes, so the log names each module checked.
         cmd = [str(cls.exe), str(cls.dir), "--jobs", "1", "--slow", "0"]
         with open(log, "wb") as out:
-            code = subprocess.run(cmd, env=env, stdout=out, stderr=subprocess.DEVNULL, timeout=300).returncode
-        return code, log.read_text(encoding="utf-8", errors="replace")
+            r = subprocess.run(cmd, env=env, stdout=out, stderr=subprocess.PIPE, timeout=300)
+        return r.returncode, log.read_text(encoding="utf-8", errors="replace"), r.stderr.decode("utf-8", "replace")
 
     def test_results_before_a_crash_reach_the_log(self):
-        code, log = self.run_to_log("crash.log", crash=CRASHER)
+        code, log, _ = self.run_to_log("crash.log", crash=CRASHER)
         self.assertNotIn(code, (0, 1, 2), "the simulated crash must end the process: " + log)
         if os.name == "nt":   # the hook's default SIGFPE ends a Windows process as an integer divide by zero would
             self.assertEqual(code & 0xFFFFFFFF, 0xC0000094, "exit code %#x" % (code & 0xFFFFFFFF))
