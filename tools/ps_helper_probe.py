@@ -19,6 +19,9 @@ check and its result is printed; --json writes the raw words. Standard library o
 
     python -I tools/ps_helper_probe.py --build <runtime build> [--json out.json]
 
+--json is written into a folder that is created if it does not exist, and a --json the tool cannot write is exit 2
+before the measurement, not after it.
+
 Select the GPU with LEONIDA_VK_DEVICE, as for ps_oracle. Exit codes: 0 every check holds (the gfx1036
 measurement), 1 a check differs, 2 a harness error, 77 no pixel-shader oracle on this device (see ps_oracle) or a
 wave32 pixel stage (the programs are wave64).
@@ -255,6 +258,9 @@ def main(argv=None):
     ap.add_argument("--build", required=True, help="runtime build folder with vk_harness")
     ap.add_argument("--json", help="write {device, checks, words} here")
     a = ap.parse_args(argv)
+    if a.json and os.path.isdir(a.json):
+        print(f"ps_helper_probe: --json {a.json} is a directory", file=sys.stderr)
+        return 2
     try:
         device, res = measure(a.build)
     except ps_oracle.Unavailable as e:
@@ -273,10 +279,16 @@ def main(argv=None):
     good = sum(ok for _n, ok, _d in checks)
     print(f"{good}/{len(checks)} checks hold")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"device": device, "checks": [[n, ok, d] for n, ok, d in checks],
-                       "words": {n: {f"{x},{y}": list(w) for (x, y), w in px.items()} for n, px in res.items()}},
-                      fh, indent=1)
+        try:
+            folder = os.path.dirname(os.path.abspath(a.json))  # --json into a folder that does not exist yet
+            os.makedirs(folder, exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"device": device, "checks": [[n, ok, d] for n, ok, d in checks],
+                           "words": {n: {f"{x},{y}": list(w) for (x, y), w in px.items()} for n, px in res.items()}},
+                          fh, indent=1)
+        except OSError as e:
+            print(f"ps_helper_probe: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0 if good == len(checks) else 1
 
 
