@@ -1812,8 +1812,8 @@ class WorldBuildTest(unittest.TestCase):
             p = self._run_cli(missing, out_dir)
             self.assertNotEqual(p.returncode, 0)
 
-    def test_out_inside_or_containing_assets_is_refused_and_preserves_files(self):
-        """--out overlapping the assets tree used to let staging cleanup and chunk pruning delete user files."""
+    def test_out_inside_assets_is_refused_and_preserves_files(self):
+        """--out equal to or inside assets_dir let staging cleanup and chunk pruning delete user files."""
         with tempfile.TemporaryDirectory() as tmp:
             assets = os.path.join(tmp, "assets")
             _write_synthetic_assets(assets, origin_overlap=False)
@@ -1830,17 +1830,25 @@ class WorldBuildTest(unittest.TestCase):
                 f.write(b"user dir")
             before = self._output_snapshot(assets)
 
-            # --out inside assets_dir: refused, nothing under assets changes.
+            # --out inside assets_dir (or equal to it): refused, nothing under assets changes.
             for out in (os.path.join(assets, "world"), assets):
-                with self.assertRaisesRegex(ValueError, "must not be inside or contain"):
+                with self.assertRaisesRegex(ValueError, "must not be the assets directory or inside it"):
                     world_build.build_world(assets, out, textures=False)
                 p = self._run_cli(assets, out, "--no-textures")
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertIn("ERROR:", p.stderr)
-            # --out containing assets_dir: refused the same way.
-            with self.assertRaisesRegex(ValueError, "must not be inside or contain"):
-                world_build.build_world(os.path.join(tmp, "assets", "arch_a"), tmp, textures=False)
             self.assertEqual(self._output_snapshot(assets), before)
+
+    def test_out_containing_assets_still_builds(self):
+        """--out that merely contains assets_dir is a supported layout: cleanup only touches <out>/chunks
+        and <out>/.chunks-staging-*, never the assets tree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = os.path.join(tmp, "assets")
+            _write_synthetic_assets(assets, origin_overlap=False)
+            result = world_build.build_world(assets, tmp, textures=False)
+            self.assertGreater(result["stats"]["models"], 0)
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "world.json")))
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "chunks")))
 
 
 class WorldBuildStagingTest(unittest.TestCase):

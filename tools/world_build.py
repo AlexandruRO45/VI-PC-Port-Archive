@@ -1483,19 +1483,21 @@ def build_world(
     if not os.path.exists(assets_dir):
         raise FileNotFoundError(f"assets path does not exist: {assets_dir}")
 
-    # The output must not overlap the input tree. --out inside assets_dir drops world.json,
-    # chunks/ and .chunks-staging-* into the folder the manifest walk scans, and --out that
-    # contains assets_dir lets _remove_stale_staging/_prune_stale_chunks delete directories
-    # and c_*.glb files the user supplied. Either direction is refused before any write.
+    # --out must not be the assets directory or sit inside it. Then the manifest walk scans the
+    # output's own world.json/chunks/staging directories as inputs, and when the --out folder also
+    # holds a models/manifest.json the build runs far enough for _remove_stale_staging and
+    # _prune_stale_chunks to delete .chunks-staging-* directories and c_*.glb/.tmp files under
+    # <out>/chunks that the user placed there. (--out merely containing assets_dir is allowed:
+    # the cleanup only ever touches <out>/chunks and <out>/.chunks-staging-*.)
     assets_real = os.path.normcase(os.path.realpath(assets_dir))
     out_real = os.path.normcase(os.path.realpath(out_dir))
     try:
-        overlap = os.path.commonpath([assets_real, out_real]) in (assets_real, out_real)
+        inside = os.path.commonpath([assets_real, out_real]) == assets_real
     except ValueError:  # different drives on Windows
-        overlap = False
-    if overlap:
+        inside = False
+    if inside:
         raise ValueError(
-            f"--out {out_dir!r} must not be inside or contain the assets directory {assets_dir!r}; "
+            f"--out {out_dir!r} must not be the assets directory or inside it ({assets_dir!r}); "
             "the build writes world.json, chunks/ and staging directories there"
         )
 
