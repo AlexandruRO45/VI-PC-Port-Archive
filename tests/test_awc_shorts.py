@@ -186,6 +186,14 @@ class ShortsTest(unittest.TestCase):
         self.assertIn("missing.awc", err.getvalue())
         self.assertEqual(len(err.getvalue().splitlines()), 1)
 
+    def test_missing_source_names_the_path_as_typed(self):
+        """The path is printed as typed: repr() doubles every Windows backslash, so `C:\\a\\b` came out `C:\\\\a\\\\b`."""
+        missing = os.path.join(self.tmp.name, "missing.awc")
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            self.assertEqual(shorts.main([missing, self.out]), 2)
+        self.assertIn(missing, stderr.getvalue())
+
     def test_clip_write_error_preserves_catalog_in_both_worker_modes(self):
         path = self.write("blocked.awc", 0xFC, 480000)
         os.makedirs(os.path.join(self.out, "blocked", "00001234.ogg"))
@@ -278,11 +286,10 @@ class ShortsTest(unittest.TestCase):
         with mock.patch.object(shorts.os, "walk", side_effect=walk_err), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", "1"]), 1)
+            self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", "1"]), 2)
         self.assertIn("Permission denied", err.getvalue())
         with open(index, "rb") as f:
             self.assertEqual(f.read(), b"previous catalog\n")
-
 
     def test_truncated_bank_skipped_serial(self):
         self.check_truncated_bank_skipped(shorts, 1)
