@@ -37,6 +37,50 @@ def run(*argv):
     return code, out.getvalue()
 
 
+@contextlib.contextmanager
+def denied(folder):
+    """Hold `folder` so this process cannot list it: chmod 000 on POSIX, an exclusive handle on Windows.
+
+    Both are undone on exit, so the temporary folder can still be removed; no ACL is written.
+    """
+    if os.name == "nt":
+        handle = _open_without_sharing(folder)
+        try:
+            yield
+        finally:
+            _close(handle)
+    else:
+        os.chmod(folder, 0)
+        try:
+            yield
+        finally:
+            os.chmod(folder, 0o700)
+
+
+def _open_without_sharing(folder):
+    """A directory handle held with dwShareMode 0, so os.scandir reports a sharing violation (PermissionError)."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    generic_read, open_existing, file_flag_backup_semantics = 0x80000000, 3, 0x02000000
+    handle = kernel32.CreateFileW(folder, generic_read, 0, None, open_existing, file_flag_backup_semantics, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise unittest.SkipTest("cannot open the folder without sharing it")
+    return handle
+
+
+def _close(handle):
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(handle)
+
+
 class RunnerTest(unittest.TestCase):
     def test_finds_what_discover_finds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,6 +120,24 @@ class RunnerTest(unittest.TestCase):
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 1)
             self.assertIn("no test*.py files", out)
+
+    def test_an_unreadable_package_fails_the_run_instead_of_being_skipped(self):
+        """A package the user cannot list may hold failing files: it is exit 1 and one line, as under -j 1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_outer.py": PASS, "pkg/__init__.py": "", "pkg/test_inner.py": FAIL})
+            folder = os.path.join(tmp, "pkg")
+            with denied(folder):
+                try:
+                    os.scandir(folder).close()
+                except PermissionError:
+                    pass
+                else:
+                    self.skipTest("this platform lets the owner list the folder anyway")
+                code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 1, out)
+            self.assertIn("cannot read", out)
+            self.assertIn(folder, out)
+            self.assertNotIn("boom-msg", out)   # the hidden file did not run; the run is not green either
 
 
 if __name__ == "__main__":
