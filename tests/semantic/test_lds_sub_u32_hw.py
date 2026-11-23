@@ -279,6 +279,66 @@ class ScalarLDSInterpreter:
         return [self.step(inst) for inst in prog.instructions]
 
 
+
+# ---------------------------------------------------------------------------
+# SIMD Wavefront Interpreter (Multi-Lane Divergence & 32/64-Bit EXEC Masking)
+# ---------------------------------------------------------------------------
+
+class SIMDLDSWavefrontInterpreter:
+    """Multi-lane SIMD interpreter modeling Wave32 and Wave64 execution for LDS atomics."""
+
+    def __init__(self, wave_size: int = 64, capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+        self.lds: LDSModel = LDSModel(capacity_dwords)
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg_u32(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[lane][idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_lane_reg_u32(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[lane][idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def step(self, inst: Instruction) -> list[int | None]:
+        """Executes a ds_sub_u32 instruction across all lanes in the wavefront."""
+        lane_vaddrs: list[int] = []
+        lane_vdatas: list[int] = []
+        for lane in range(self.wave_size):
+            va = self.read_lane_reg_u32(lane, RegKind.VGPR, inst.vaddr.index)
+            vd = self.read_lane_reg_u32(lane, RegKind.VGPR, inst.vdata.index)
+            lane_vaddrs.append(va)
+            lane_vdatas.append(vd)
+
+        lane_results: list[int | None] = []
+        for lane in range(self.wave_size):
+            is_active = bool((self.exec_mask >> lane) & 1)
+            if not is_active:
+                lane_results.append(None)
+                continue
+
+            res = self.lds.atomic_sub_u32(
+                vaddr=lane_vaddrs[lane],
+                sub_val=lane_vdatas[lane],
+                offset=inst.offset.offset,
+            )
+            lane_results.append(res)
+
+        return lane_results
+
+
 class TestLdsSubU32ReferenceOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and hardware translator execution."""
 
@@ -440,6 +500,69 @@ class TestLdsSubU32ScalarInterpreter(unittest.TestCase):
         results = self.interp.run_program(prog)
         self.assertEqual(results, [80, 50])
         self.assertEqual(self.interp.lds.read_dword(0x20), 50)
+
+
+
+class TestLdsSubU32SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergent_addresses(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32, capacity_dwords=1024)
+        for lane in range(32):
+            simd.lds.write_dword(lane * 4, 100)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, lane * 4)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, lane)
+
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        results = simd.step(inst)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertEqual(results[lane], 100 - lane)
+            self.assertEqual(simd.lds.read_dword(lane * 4), 100 - lane)
+
+    def test_wave64_exec_masking_partial(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=64, capacity_dwords=1024)
+        simd.set_exec_mask(0x00000000FFFFFFFF)  # Only lower 32 lanes active
+        for lane in range(64):
+            simd.lds.write_dword(lane * 4, 50)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, lane * 4)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 10)
+
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        results = simd.step(inst)
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(results[lane], 40)
+                self.assertEqual(simd.lds.read_dword(lane * 4), 40)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(simd.lds.read_dword(lane * 4), 50)
+
+    def test_translator_simd_divergent_offsets(self) -> None:
+        # Translates a multi-lane compute shader where each lane subtracts lane_id from its own dword
+        # Prologue computes lane * 4 in v1, writes 100, then subtracts v0 (lane_id)
+        lines = [
+            "v_lshlrev_b32_e32 v1, 2, v0",  # v1 = lane * 4
+            "v_mov_b32_e32 v2, 100",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_sub_u32 v1, v0",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "buffer_store_dword v3, v1, s[0:3], 0 offen",
+        ]
+        mem = run_compute_kernel(lines, lanes=8)
+        for lane in range(8):
+            self.assertEqual(mem.get(lane * 4), 100 - lane)
 
 
 if __name__ == "__main__":
