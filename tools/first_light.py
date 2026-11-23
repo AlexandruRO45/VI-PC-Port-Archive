@@ -75,11 +75,28 @@ CAMERA_VIEWPROJ = 0x160
 TABLE_VA, WORLD_VA, VIEW_VA = 0x100, 0x1000, 0x2000  # Xbox VAs inside vk_harness's 64 KiB VKH_HEAP
 
 
+def _checked(cmd: list, program: str | None = None, **kwargs) -> None:
+    """subprocess.run(check=True) for a step that has to finish: one error line and exit 2 when it cannot run.
+
+    The step's own stderr is already on ours (no caller captures it), so this line names the program and its
+    status rather than repeating the message: tools/gamedata_index.py wraps rpf9_carve.py's non-zero in one
+    ERROR line and exits 2, and tools/bvh_gpu_smoke.py words its helper failure "error: <tool> failed"."""
+    name = program or os.path.basename(str(cmd[0]))
+    try:
+        subprocess.run(cmd, check=True, **kwargs)
+    except subprocess.CalledProcessError as e:
+        print(f"error: {name} exited with status {e.returncode}", file=sys.stderr)
+        raise SystemExit(2) from None
+    except OSError as e:
+        print(f"error: cannot start {name}: {e.strerror or e}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
 def run(argv, **kwargs):
-    """Run a repository tool with this interpreter; fail loud with its command in the message."""
+    """Run a repository tool with this interpreter; a step that cannot run is one error line and exit 2."""
     cmd = [sys.executable, "-I"] + argv
     print("+ " + " ".join(cmd), file=sys.stderr)
-    subprocess.run(cmd, check=True, **kwargs)
+    _checked(cmd, program=os.path.basename(str(argv[0])), **kwargs)
 
 
 def reset_run_folders(work: str) -> str:
@@ -829,7 +846,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         del manifest["result"]
         with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(manifest, f, indent=1)
-    subprocess.run(cmd, check=True, env=env)
+    _checked(cmd, env=env)
     if not os.path.isfile(raw):
         raise SystemExit(f"the harness exited successfully but did not write {raw}")
     with open(raw, "rb") as f:

@@ -15,7 +15,7 @@ UV prediction on the CPU.
 """
 
 import contextlib
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -36,6 +36,66 @@ from spirv_stubs import build_ps_stub, build_vs_stub
 CLEAR = fl.CLEAR
 check_image = fl.check_image
 write_ppm = fl.write_ppm
+
+
+class HelperFailureTests(unittest.TestCase):
+    """A helper that cannot run is one error line and exit 2, not a CalledProcessError traceback."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="first-light-helper-")
+        self.addCleanup(tmp.cleanup)
+        self.game = Path(tmp.name) / "game"
+        self.work = Path(tmp.name) / "work"
+        self.game.mkdir()
+
+    def argv(self) -> list[str]:
+        return ["--game", str(self.game), "--work", str(self.work), "--no-fit",
+                "--vs", "vertex", "--ps", "first"]
+
+    def run_main(self) -> tuple[int, str]:
+        err = io.StringIO()
+        with patch.object(fl.subprocess, "run", side_effect=self.failure), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as stopped:
+                fl.main(self.argv())
+        return stopped.exception.code, err.getvalue()
+
+    def assert_one_error_line(self, code: int, err: str, want: str) -> None:
+        self.assertEqual(code, 2)
+        lines = err.splitlines()
+        self.assertEqual([line for line in lines if line.startswith("error:")], [want])
+        self.assertEqual(lines[-1], want)
+        self.assertFalse(any("Traceback" in line for line in lines))
+
+    def test_a_helper_that_fails_is_one_error_line_and_exit_2(self) -> None:
+        self.failure = subprocess.CalledProcessError(2, ["python", "shader_carve.py"])
+        code, err = self.run_main()
+        self.assert_one_error_line(code, err, "error: shader_carve.py exited with status 2")
+
+    def test_a_missing_helper_is_one_error_line_and_exit_2(self) -> None:
+        self.failure = FileNotFoundError(2, "No such file or directory", "shader_carve.py")
+        code, err = self.run_main()
+        self.assert_one_error_line(code, err, "error: cannot start shader_carve.py: No such file or directory")
+
+    def test_a_successful_helper_is_used_by_the_next_step(self) -> None:
+        def carve(cmd, **kwargs):
+            self.assertTrue(kwargs.get("check"))
+            self.assertEqual(Path(cmd[2]).name, "shader_carve.py")
+            out = Path(cmd[-1])
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "index.json").write_text(json.dumps([
+                {"stage": "vs", "name": "vertex", "file": "vertex.dxbc"},
+                {"stage": "ps", "name": "first", "file": "first.dxbc"},
+            ]), encoding="utf-8", newline="\n")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        err = io.StringIO()
+        with patch.object(fl.subprocess, "run", side_effect=carve), redirect_stderr(err):
+            index = fl.ensure_carve(str(self.game), str(self.work))
+        want = "+ " + " ".join([sys.executable, "-I", str(Path(fl.TOOLS) / "shader_carve.py"),
+                                str(self.game / "shaders.rpf"), str(self.work / "shaders" / "dxbc")])
+        self.assertEqual(err.getvalue().splitlines(), [want])
+        self.assertEqual([entry["name"] for entry in fl.choose(index, "vertex", "first")], ["vertex", "first"])
 
 
 def harness() -> str | None:
