@@ -61,8 +61,8 @@ def translate_compute(body: Sequence[str], name: str = "cs_lds_xor_rtn_b64") -> 
     return support.translate_lines(name, lines, fssm=FSSM)
 
 
-def run_compute(body: Sequence[str], lanes: int = 1) -> dict[int, int]:
-    spv = translate_compute(body)
+def run_compute(body: Sequence[str], lanes: int = 1, name: str = "cs_lds_xor_rtn_b64") -> dict[int, int]:
+    spv = translate_compute(body, name=name)
     return si.run_workgroup(
         spv,
         lanes,
@@ -81,6 +81,7 @@ def execute_xor_b64(
     offset: int = 0,
     dst_lo: int = 6,
     dst_hi: int = 7,
+    name: str = "cs_xor_single",
 ) -> tuple[int, int]:
     """Execute a single 64-bit LDS XOR operation on 1 lane.
 
@@ -121,13 +122,13 @@ def execute_xor_b64(
         "v_mov_b32_e32 v31, 12",
         "buffer_store_dword v9, v31, s[0:3], 0 offen",
     ]
-    mem = run_compute(body, lanes=1)
+    mem = run_compute(body, lanes=1, name=name)
     rtn = combine64(mem.get(0, 0), mem.get(4, 0))
     final_mem = combine64(mem.get(8, 0), mem.get(12, 0))
     return rtn, final_mem
 
 
-def execute_xor_b64_batch(cases: Sequence[tuple[int, int, int]]) -> list[tuple[int, int]]:
+def execute_xor_b64_batch(cases: Sequence[tuple[int, int, int]], name: str = "cs_xor_batch") -> list[tuple[int, int]]:
     """Execute multiple (m, d, offset) cases in a single compute shader.
 
     Returns list of (rtn_64, mem_64) for each case.
@@ -160,7 +161,7 @@ def execute_xor_b64_batch(cases: Sequence[tuple[int, int, int]]) -> list[tuple[i
             f"v_mov_b32_e32 v31, {16 * k + 12}",
             "buffer_store_dword v9, v31, s[0:3], 0 offen",
         ]
-    mem = run_compute(body, lanes=1)
+    mem = run_compute(body, lanes=1, name=name)
     results = []
     for k in range(len(cases)):
         base = 16 * k
@@ -173,33 +174,60 @@ def execute_xor_b64_batch(cases: Sequence[tuple[int, int, int]]) -> list[tuple[i
 class TestLdsXorRtnB64Values(unittest.TestCase):
     """Semantic truth-table, involution, identity, and mathematical property tests."""
 
-    TABLE = (
-        # (init_m, data, expected_new_mem)
-        (0x00000000_00000000, 0x00000000_00000000, 0x00000000_00000000),
-        (0xFFFFFFFF_FFFFFFFF, 0xFFFFFFFF_FFFFFFFF, 0x00000000_00000000),
-        (0xFFFFFFFF_FFFFFFFF, 0x00000000_00000000, 0xFFFFFFFF_FFFFFFFF),
-        (0x00000000_00000000, 0xFFFFFFFF_FFFFFFFF, 0xFFFFFFFF_FFFFFFFF),
-        (0x55555555_55555555, 0xAAAAAAAAAAAAAAAA, 0xFFFFFFFF_FFFFFFFF),
-        (0xAAAAAAAAAAAAAAAA, 0xAAAAAAAAAAAAAAAA, 0x00000000_00000000),
-        (0x12345678_9ABCDEF0, 0x0F0F0F0F_F0F0F0F0, 0x1D3B5977_6A4C2E00),
-        (0x80000000_00000000, 0x80000000_00000000, 0x00000000_00000000),
-        (0x80000000_00000001, 0x7FFFFFFF_FFFFFFFE, 0xFFFFFFFF_FFFFFFFF),
-        (0x00000000_FFFFFFFF, 0xFFFFFFFF_00000000, 0xFFFFFFFF_FFFFFFFF),
-        (0xDEADBEEF_CAFEBABE, 0xBAADF00D_12345678, 0x64004EE2_D8CAECC6),
-        (1 << 0, 1 << 0, 0),
-        (1 << 31, 1 << 31, 0),
-        (1 << 32, 1 << 32, 0),
-        (1 << 63, 1 << 63, 0),
-        (1 << 63, 1 << 0, (1 << 63) | 1),
-    )
+    def test_truth_table_all_zeros(self):
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=0, data=0, name="cs_tt_zero"
+        )
+        self.assertEqual(rtn, 0)
+        self.assertEqual(mem, 0)
 
-    def test_truth_table_returning(self):
-        cases = [(m, d, 0) for m, d, _ in self.TABLE]
-        results = execute_xor_b64_batch(cases)
-        for (m, d, want), (got_rtn, got_mem) in zip(self.TABLE, results):
-            with self.subTest(m=hex(m), d=hex(d)):
-                self.assertEqual(got_rtn, m)
-                self.assertEqual(got_mem, want)
+    def test_truth_table_all_ones(self):
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=M64, data=M64, name="cs_tt_ones"
+        )
+        self.assertEqual(rtn, M64)
+        self.assertEqual(mem, 0)
+
+    def test_truth_table_alternating_bits(self):
+        m = 0x55555555_55555555
+        d = 0xAAAAAAAAAAAAAAAA
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, name="cs_tt_alt"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, M64)
+
+    def test_truth_table_high_low_dword_isolation(self):
+        m = 0x00000000_FFFFFFFF
+        d = 0xFFFFFFFF_00000000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, name="cs_tt_words"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, M64)
+
+    def test_truth_table_arbitrary_hash_constants(self):
+        m = 0xDEADBEEF_CAFEBABE
+        d = 0xBAADF00D_12345678
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, name="cs_tt_hash"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, m ^ d)
+
+    def test_truth_table_single_bit_toggles(self):
+        cases = [
+            (1 << 0, 1 << 0, 0),
+            (1 << 31, 1 << 31, 0),
+            (1 << 32, 1 << 32, 0),
+            (1 << 63, 1 << 63, 0),
+            (1 << 63, 1 << 0, 0),
+        ]
+        batch_cases = [(m, d, 0) for m, d, _ in cases]
+        results = execute_xor_b64_batch(batch_cases, name="cs_tt_single_bits")
+        for (m, d, _), (got_rtn, got_mem) in zip(cases, results):
+            self.assertEqual(got_rtn, m)
+            self.assertEqual(got_mem, m ^ d)
 
     def test_involution_property(self):
         # (M ^ D) ^ D == M
@@ -207,14 +235,14 @@ class TestLdsXorRtnB64Values(unittest.TestCase):
         d = 0x55AA55AA_FF00FF00
         # First XOR: M ^ D
         rtn1, mem1 = execute_xor_b64(
-            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, name="cs_invol_1"
         )
         self.assertEqual(rtn1, m)
         self.assertEqual(mem1, m ^ d)
 
         # Second XOR: (M ^ D) ^ D -> returns (M ^ D), restores M in memory
         rtn2, mem2 = execute_xor_b64(
-            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=mem1, data=d
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=mem1, data=d, name="cs_invol_2"
         )
         self.assertEqual(rtn2, m ^ d)
         self.assertEqual(mem2, m)
@@ -225,7 +253,7 @@ class TestLdsXorRtnB64Values(unittest.TestCase):
             (m, 0, 0),    # Identity: M ^ 0 == M
             (m, M64, 0),  # Complement: M ^ ~0 == ~M
         ]
-        results = execute_xor_b64_batch(cases)
+        results = execute_xor_b64_batch(cases, name="cs_identity_comp")
         self.assertEqual(results[0], (m, m))
         self.assertEqual(results[1], (m, m ^ M64))
 
@@ -234,7 +262,7 @@ class TestLdsXorRtnB64Values(unittest.TestCase):
         m = 0x11223344_55667788
         d = 0x00FF00FF_00FF00FF
         rtn, mem = execute_xor_b64(
-            "ds_xor_b64 v1, v[4:5]", init=m, data=d, dst_lo=6, dst_hi=7
+            "ds_xor_b64 v1, v[4:5]", init=m, data=d, dst_lo=6, dst_hi=7, name="cs_non_rtn"
         )
         sentinel = 0xcafebabe_deadbeef
         self.assertEqual(rtn, sentinel)
@@ -244,17 +272,41 @@ class TestLdsXorRtnB64Values(unittest.TestCase):
 class TestLdsXorRtnB64AddressingAndOffsets(unittest.TestCase):
     """Immediate offset and multi-address isolation tests."""
 
-    def test_immediate_offsets(self):
-        cases = []
-        for off in (0, 8, 16, 0x28, 0x100):
-            m = 0x01234567_89ABCDEF ^ (off << 32)
-            d = 0x0000FFFF_FFFF0000
-            cases.append((m, d, off))
-        results = execute_xor_b64_batch(cases)
-        for (m, d, off), (got_rtn, got_mem) in zip(cases, results):
-            with self.subTest(offset=hex(off)):
-                self.assertEqual(got_rtn, m)
-                self.assertEqual(got_mem, m ^ d)
+    def test_offset_zero(self):
+        m = 0x01234567_89ABCDEF
+        d = 0x0000FFFF_FFFF0000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, offset=0, name="cs_off_0"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, m ^ d)
+
+    def test_offset_eight_bytes(self):
+        m = 0x01234567_89ABCDEF ^ (8 << 32)
+        d = 0x0000FFFF_FFFF0000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, offset=8, name="cs_off_8"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, m ^ d)
+
+    def test_offset_sixteen_bytes(self):
+        m = 0x01234567_89ABCDEF ^ (16 << 32)
+        d = 0x0000FFFF_FFFF0000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, offset=16, name="cs_off_16"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, m ^ d)
+
+    def test_offset_two_hundred_fifty_six(self):
+        m = 0x01234567_89ABCDEF ^ (0x100 << 32)
+        d = 0x0000FFFF_FFFF0000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, offset=0x100, name="cs_off_256"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, m ^ d)
 
     def test_adjacent_qword_isolation(self):
         # Verify modifying element at addr=0x40 does not touch element at addr=0x48
@@ -302,7 +354,7 @@ class TestLdsXorRtnB64AddressingAndOffsets(unittest.TestCase):
             "v_mov_b32_e32 v31, 20",
             "buffer_store_dword v17, v31, s[0:3], 0 offen",
         ]
-        mem = run_compute(body, lanes=1)
+        mem = run_compute(body, lanes=1, name="cs_adjacent_iso")
         rtn_a = combine64(mem.get(0, 0), mem.get(4, 0))
         final_a = combine64(mem.get(8, 0), mem.get(12, 0))
         final_b = combine64(mem.get(16, 0), mem.get(20, 0))
@@ -346,7 +398,7 @@ class TestLdsXorRtnB64RegisterAliasing(unittest.TestCase):
             "v_mov_b32_e32 v31, 12",
             "buffer_store_dword v9, v31, s[0:3], 0 offen",
         ]
-        mem = run_compute(body, lanes=1)
+        mem = run_compute(body, lanes=1, name="cs_alias_data")
         rtn = combine64(mem.get(0, 0), mem.get(4, 0))
         final_mem = combine64(mem.get(8, 0), mem.get(12, 0))
 
@@ -383,7 +435,7 @@ class TestLdsXorRtnB64RegisterAliasing(unittest.TestCase):
             "v_mov_b32_e32 v31, 12",
             "buffer_store_dword v9, v31, s[0:3], 0 offen",
         ]
-        mem = run_compute(body, lanes=1)
+        mem = run_compute(body, lanes=1, name="cs_alias_addr")
         rtn = combine64(mem.get(0, 0), mem.get(4, 0))
         final_mem = combine64(mem.get(8, 0), mem.get(12, 0))
 
@@ -394,33 +446,48 @@ class TestLdsXorRtnB64RegisterAliasing(unittest.TestCase):
 class TestLdsXorRtnB64IEEE754Bitwise(unittest.TestCase):
     """IEEE 754 float64 bit-pattern validation: sign-bit toggling, NaNs, and subnormals."""
 
-    def test_float64_bitwise_patterns(self):
+    def test_float64_positive_zero_to_negative_zero(self):
         sign_bit = 0x80000000_00000000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=0, data=sign_bit, name="cs_f64_zero"
+        )
+        self.assertEqual(rtn, 0)
+        self.assertEqual(mem, sign_bit)
+
+    def test_float64_one_to_negative_one(self):
         pos_one = 0x3FF00000_00000000
         neg_one = 0xBFF00000_00000000
+        sign_bit = 0x80000000_00000000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=pos_one, data=sign_bit, name="cs_f64_one"
+        )
+        self.assertEqual(rtn, pos_one)
+        self.assertEqual(mem, neg_one)
+
+    def test_float64_infinity_sign_toggle(self):
         pos_inf = 0x7FF00000_00000000
         neg_inf = 0xFFF00000_00000000
+        sign_bit = 0x80000000_00000000
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=pos_inf, data=sign_bit, name="cs_f64_inf"
+        )
+        self.assertEqual(rtn, pos_inf)
+        self.assertEqual(mem, neg_inf)
+
+    def test_float64_nan_payload_preservation(self):
         qnan = 0x7FF80000_00001234
         mask = 0x00000000_FFFF0000
-
-        cases = [
-            (0, sign_bit, 0),        # +0.0 ^ sign_bit -> -0.0
-            (pos_one, sign_bit, 0),  # +1.0 ^ sign_bit -> -1.0
-            (pos_inf, sign_bit, 0),  # +inf ^ sign_bit -> -inf
-            (qnan, mask, 0),         # quiet NaN payload preservation
-        ]
-        results = execute_xor_b64_batch(cases)
-        self.assertEqual(results[0], (0, sign_bit))
-        self.assertEqual(results[1], (pos_one, neg_one))
-        self.assertEqual(results[2], (pos_inf, neg_inf))
-        self.assertEqual(results[3], (qnan, qnan ^ mask))
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=qnan, data=mask, name="cs_f64_nan"
+        )
+        self.assertEqual(rtn, qnan)
+        self.assertEqual(mem, qnan ^ mask)
 
 
 class TestLdsXorRtnB64ChainedAndRandom(unittest.TestCase):
     """Chained sequential atomic operations and seeded pseudo-random validation."""
 
     def test_chained_sequential_xors(self):
-        # Execute 4 sequential ds_xor_rtn_b64 operations on the same address
         m0 = 0xFEEDFACE_CAFEBABE
         masks = [
             0x12345678_9ABCDEF0,
@@ -456,7 +523,6 @@ class TestLdsXorRtnB64ChainedAndRandom(unittest.TestCase):
             ]
             cur_m ^= d
 
-        # Read back final memory
         final_offset = 8 * len(masks)
         body += [
             "ds_read_b64 v[8:9], v10",
@@ -467,7 +533,7 @@ class TestLdsXorRtnB64ChainedAndRandom(unittest.TestCase):
             "buffer_store_dword v9, v31, s[0:3], 0 offen",
         ]
 
-        mem = run_compute(body, lanes=1)
+        mem = run_compute(body, lanes=1, name="cs_chained")
         for i in range(len(masks)):
             got_rtn = combine64(mem.get(8 * i, 0), mem.get(8 * i + 4, 0))
             self.assertEqual(got_rtn, expected_rtns[i], f"Mismatch at step {i}")
@@ -484,7 +550,7 @@ class TestLdsXorRtnB64ChainedAndRandom(unittest.TestCase):
             off = rng.choice((0, 8, 16, 0x20))
             cases.append((m, d, off))
 
-        results = execute_xor_b64_batch(cases)
+        results = execute_xor_b64_batch(cases, name="cs_seeded_rnd")
         for i, ((m, d, off), (got_rtn, got_mem)) in enumerate(zip(cases, results)):
             with self.subTest(iteration=i, m=hex(m), d=hex(d), off=hex(off)):
                 self.assertEqual(got_rtn, m)
@@ -495,9 +561,7 @@ class TestLdsXorRtnB64MultiLane(unittest.TestCase):
     """Multi-lane SIMD workgroup execution across distinct LDS slots."""
 
     def test_independent_lane_slots(self):
-        # 4 active lanes in the workgroup, each operating on slot: addr = lane_id * 32
         lanes = 4
-        # Setup each lane's address: v1 = v0 * 32
         body = [
             "v_lshlrev_b32_e32 v1, 5, v0",  # v1 = lane_id * 32
             # Seed LDS: v2 = v0 * 0x1111, v3 = v0 * 0x2222
@@ -526,7 +590,7 @@ class TestLdsXorRtnB64MultiLane(unittest.TestCase):
             "v_add_nc_u32_e32 v31, 12, v30",
             "buffer_store_dword v9, v31, s[0:3], 0 offen",
         ]
-        mem = run_compute(body, lanes=lanes)
+        mem = run_compute(body, lanes=lanes, name="cs_multilane")
         for lane in range(lanes):
             base = lane * 16
             rtn_lo = mem.get(base, 0)
@@ -545,27 +609,76 @@ class TestLdsXorRtnB64MultiLane(unittest.TestCase):
             self.assertEqual(mem_hi, exp_mem_hi, f"Lane {lane} mem_hi mismatch")
 
 
+class TestLdsXorRtnB64SpirvLoweringAndMutations(unittest.TestCase):
+    """Direct inspection of translator SPIR-V emission and mutation controls."""
+
+    def test_spirv_structure_rtn_emits_two_atomic_xors(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v4, 0x11111111",
+            "v_mov_b32_e32 v5, 0x22222222",
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]",
+        ]
+        spv = translate_compute(body, name="cs_spirv_rtn_check")
+        atomic_xors = [line.strip() for line in spv.splitlines() if "OpAtomicXor" in line]
+        self.assertEqual(len(atomic_xors), 2, f"Expected 2 OpAtomicXor instructions, got: {atomic_xors}")
+        self.assertIn("%reg_v6", spv)
+        self.assertIn("%reg_v7", spv)
+
+    def test_spirv_structure_non_rtn_emits_two_atomic_xors_no_vdst(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v4, 0x11111111",
+            "v_mov_b32_e32 v5, 0x22222222",
+            "ds_xor_b64 v1, v[4:5]",
+        ]
+        spv = translate_compute(body, name="cs_spirv_non_rtn_check")
+        atomic_xors = [line.strip() for line in spv.splitlines() if "OpAtomicXor" in line]
+        self.assertEqual(len(atomic_xors), 2)
+        self.assertNotIn("%reg_v6", spv)
+        self.assertNotIn("%reg_v7", spv)
+
+    def test_spirv_immediate_offset_calculation(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v4, 0x11111111",
+            "v_mov_b32_e32 v5, 0x22222222",
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5] offset:32",
+        ]
+        spv = translate_compute(body, name="cs_spirv_offset_check")
+        self.assertIn("OpAtomicXor", spv)
+
+    def test_mutation_detection_low_high_word_sensitivity(self):
+        # Asymmetric 64-bit value to ensure low and high 32-bit dwords are not swapped
+        m = 0x12345678_87654321
+        d = 0xFF00FF00_00FF00FF
+        rtn, mem = execute_xor_b64(
+            "ds_xor_rtn_b64 v[6:7], v1, v[4:5]", init=m, data=d, name="cs_mut_sensitivity"
+        )
+        self.assertEqual(rtn, m)
+        self.assertEqual(mem, m ^ d)
+        swapped_d = ((d & 0xFFFFFFFF) << 32) | ((d >> 32) & 0xFFFFFFFF)
+        self.assertNotEqual(m ^ d, m ^ swapped_d)
+
+
 class TestLdsXorRtnB64NegativeControls(unittest.TestCase):
     """Syntax validation and operand rejection tests."""
 
     def test_single_dst_register_rejected(self):
-        # Destination must be a 2-register VGPR pair v[k:k+1], not single register
         with self.assertRaises(rdna2spirv.Unsupported):
-            translate_compute(["ds_xor_rtn_b64 v6, v1, v[4:5]"])
+            translate_compute(["ds_xor_rtn_b64 v6, v1, v[4:5]"], name="cs_bad_dst")
 
     def test_single_data_register_rejected(self):
-        # Data must be a 2-register VGPR pair v[k:k+1], not single register
         with self.assertRaises(rdna2spirv.Unsupported):
-            translate_compute(["ds_xor_rtn_b64 v[6:7], v1, v4"])
+            translate_compute(["ds_xor_rtn_b64 v[6:7], v1, v4"], name="cs_bad_data")
 
     def test_missing_data_operand_rejected(self):
         with self.assertRaises((rdna2spirv.Unsupported, IndexError)):
-            translate_compute(["ds_xor_rtn_b64 v[6:7], v1"])
+            translate_compute(["ds_xor_rtn_b64 v[6:7], v1"], name="cs_missing_data")
 
     def test_non_returning_single_data_register_rejected(self):
-        # ds_xor_b64 requires 64-bit data pair v[k:k+1]
         with self.assertRaises(rdna2spirv.Unsupported):
-            translate_compute(["ds_xor_b64 v1, v4"])
+            translate_compute(["ds_xor_b64 v1, v4"], name="cs_bad_non_rtn")
 
 
 if __name__ == "__main__":
