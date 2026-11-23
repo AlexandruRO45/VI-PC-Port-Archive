@@ -184,6 +184,26 @@ HRESULT create(ID3D12Device* device, const Case& c, Ref<ID3D12Heap>& h, Ref<ID3D
     return E_FAIL;
 }
 
+// A placed case whose heap allows more than one resource kind is a resource heap tier 2 heap. The layer reports tier 2
+// and creates it; a tier 1 host (NVIDIA Pascal, #4420) refuses the heap, which is not a difference (D3D-504).
+bool host_heap_tier1(ID3D12Device* host) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
+    return SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))) &&
+           o.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_1;
+}
+
+bool mixed_heap_case(const std::string& created_name) {
+    constexpr UINT deny = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                          D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+    for (const Case& c : cases()) {
+        if (c.kind != Kind::placed || created_name != std::string(c.name) + ": created") continue;
+        const UINT denied = UINT(c.flags) & deny;
+        return denied != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS && denied != D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES &&
+               denied != D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    }
+    return false;
+}
+
 HRESULT get(ID3D12Resource* r, D3D12_HEAP_PROPERTIES* p, D3D12_HEAP_FLAGS* f) {
     __try {
         return r->GetHeapProperties(p, f);
@@ -248,6 +268,8 @@ int main() {
     } else {
         Record theirs;
         run(host.p, theirs);
+        const bool host_tier1 = host_heap_tier1(host.p);
+        std::printf("heap properties: host resource heap tier %d\n", host_tier1 ? 1 : 2);
         // A resource one side couldn't create has fewer entries: compare case by case on the names both have.
         int mismatches = 0, compared = 0, skipped = 0;
         std::size_t j = 0;
@@ -264,6 +286,12 @@ int main() {
             if (b == kFaulted) {
                 std::printf("heap properties %s: the host faults, not compared (ours 0x%llx)\n", ours.names[i].c_str(),
                             static_cast<unsigned long long>(a));
+                ++skipped;
+                continue;
+            }
+            if (host_tier1 && a == S_OK && b == std::uint32_t(E_INVALIDARG) && mixed_heap_case(ours.names[i])) {
+                std::printf("heap properties %s: the tier 1 host refuses a heap of mixed resources, not compared\n",
+                            ours.names[i].c_str());
                 ++skipped;
                 continue;
             }
