@@ -432,7 +432,9 @@ on the executable, the rest is not:
   `XGameStreamingRegisterConnectionStateChanged` are the GDK reference's, and the executable has no caller to check
   them against. `tools/gdk_runtime_calls.py` finds no thunk for the message dialog and none for any
   `XGameStreamingImpl` or `XUserDeviceImpl` slot. Of `XGameUiImpl` it links slots 7-8 and 17-19 only: the profile
-  card and text entry, which fail before starting.
+  card and text entry, which fail before starting. The executable's text-entry caller (read statically) passes input
+  scope 0 and a 1,024-character limit, and on a failing `HRESULT` logs the call by name and returns false, so the
+  offline `E_FAIL` ends the prompt without an assert.
 
 - **Accessibility and speech** (`IXAccessibilityImpl2`, slots 3-21): `XHighContrastGetMode` (5) answers Off and
   `XClosedCaptionSetEnabled` (4) is accepted. No voice is installed: `XSpeechSynthesizerEnumerateInstalledVoices`
@@ -442,7 +444,9 @@ on the executable, the rest is not:
   and the speech-to-text display calls (6, 7, 17-20) fail with `E_FAIL`, writing nothing: their parameter lists
   are not in the docs' layout.
 - **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri`, `XDisplayAcquireTimeoutDeferral` (null handle)
-  and `XDisplayCloseTimeoutDeferralHandle` fail with `E_FAIL`; nothing is launched.
+  and `XDisplayCloseTimeoutDeferralHandle` fail with `E_FAIL`; nothing is launched. The executable's callers (read
+  statically) take this: the deferral's result is ignored and only a non-null handle is ever closed, so the close
+  slot is not reached offline; an `XLaunchUri` failure takes a logged error branch that returns false.
 - **ASSUMPTION:** the parameter lists of the speech calls and `XHighContrastGetMode` (Off is 0), from the GDK
   reference; only the argument counts were measured, from `tools/gdk_runtime_calls.py` on the executable.
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
