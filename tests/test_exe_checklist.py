@@ -106,7 +106,7 @@ class ExeChecklist(unittest.TestCase):
         for n in notes:
             self.assertTrue(n["text"].strip(), n)
             self.assertGreater(n["line"], 0)
-        # the store shim's one remaining unverified size is on the list, from the source and from the docs
+        # the store shim's remaining unverified sizes (SKU_ID_SIZE, trial-id bound) are on the list
         self.assertTrue(any(n["file"] == "runtime/shims/xgameruntime_store.cpp" and "SKU_ID_SIZE" in n["text"]
                             for n in notes))
         self.assertTrue(any(n["file"] == "docs/runtime_imports.md" and n["kind"] == "UNVERIFIED" for n in notes))
