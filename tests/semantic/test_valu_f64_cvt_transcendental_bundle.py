@@ -674,6 +674,23 @@ class VSqrtF64SimdIeeeTests(unittest.TestCase):
         res = oracle_sqrt_f64(f64_to_u64(sq_val))
         self.assertEqual(u64_to_f64(res), val)
 
+class VSqrtF64TranslatorTests(unittest.TestCase):
+    def test_sqrt_f64_translation(self):
+        lines = [
+            f"v_mov_b32 v2, {f64_to_u64(9.0) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(9.0) >> 32) & MASK32:#010x}",
+            "v_sqrt_f64 v[0:1], v[2:3]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_sqrt_f64_test", lines)
+        self.assertIn("OpCapability Float64", spv)
+        self.assertIn("Sqrt", spv)
+
+    def test_sqrt_f64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_sqrt_f64", ["v_sqrt_f64"])
+
 
 if __name__ == "__main__":
     unittest.main()
