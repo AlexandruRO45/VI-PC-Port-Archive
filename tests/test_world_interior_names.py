@@ -282,5 +282,43 @@ class CliTest(unittest.TestCase):
             self.assertIn("outside the data area", err)
 
 
+    def carved_folder(self):
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder, exist_ok=True)
+        for name, data in (("a.bin", interiors()), ("b.bin", placements())):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        return folder
+
+    def test_out_naming_an_input_is_refused_and_leaves_it_alone(self):
+        # --out naming the names JSON replaced it after the scan and exited 0: the file was the report from then on.
+        folder = self.carved_folder()
+        with open(self.names, "rb") as f:
+            before = f.read()
+        code, err = self.cli_exit([folder, "--names", self.names, "--out", self.names])
+        self.assertEqual(code, 2)
+        self.assertIn("overwrite the input", err)
+        with open(self.names, "rb") as f:
+            self.assertEqual(f.read(), before)
+        # A folder is scanned whole, so a report written under it replaces one of the files the next run reads.
+        code, err = self.cli_exit([folder, "--names", self.names, "--out", os.path.join(folder, "a.bin")])
+        self.assertEqual(code, 2)
+        self.assertIn("inside the scanned folder", err)
+        with open(os.path.join(folder, "a.bin"), "rb") as f:
+            self.assertEqual(f.read(), interiors())
+
+    def test_out_naming_a_folder_or_under_a_file_is_one_error(self):
+        folder = self.carved_folder()
+        code, err = self.cli_exit([folder, "--names", self.names, "--out", self.tmp.name])
+        self.assertEqual(code, 2)
+        self.assertIn("folder", err)
+        blocked = os.path.join(self.tmp.name, "blocked.txt")
+        with open(blocked, "wb"):
+            pass
+        code, err = self.cli_exit([folder, "--names", self.names, "--out", os.path.join(blocked, "r.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("--out", err)
+
+
 if __name__ == "__main__":
     unittest.main()

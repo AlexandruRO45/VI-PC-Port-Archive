@@ -43,6 +43,7 @@ if _TOOLS_DIR not in sys.path:
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
 
 J = WA.joaat_cs
@@ -260,6 +261,14 @@ def resolve(names, found):
     return summary, rows
 
 
+def _inside(path, folder):
+    """True when `path` resolves inside `folder`, whose files the scan reads. A folder is scanned whole, not only
+    its .bin files, so an --out under it replaces one of the inputs that the next run would read."""
+    folder = path_key(folder)
+    parent = path_key(os.path.dirname(os.path.abspath(path)))
+    return parent == folder or parent.startswith(folder.rstrip(os.sep) + os.sep)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="levels.rpf, one carved 0x7a file, or a folder of carved files")
@@ -278,15 +287,32 @@ def main(argv=None):
         ap.error("--start must not be negative")
     if a.limit is not None and a.limit < 1:
         ap.error("--limit must be at least 1")
+    # Check the report path before the scan, as world_archetypes.py does: --out naming the archive or the names JSON
+    # replaced that input (the run exited 0 and the names were gone), --out naming a folder ended in a PermissionError,
+    # and a parent that is a regular file failed in os.makedirs, all after the work was done.
+    for source in (a.path, a.names):
+        if same_report_path(a.out, source):
+            ap.error("--out would overwrite the input %s" % source)
+    if os.path.isdir(a.out):
+        ap.error("--out %s is a folder, not a file" % a.out)
+    if os.path.isdir(a.path) and _inside(a.out, a.path):
+        ap.error("--out %s is inside the scanned folder %s" % (a.out, a.path))
+    out_dir = os.path.dirname(os.path.abspath(a.out))
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
     names = load_names(a.names)
     try:
         found = scan(a.path, a.start, a.limit, a.jobs)
     except ValueError as exc:
         ap.error(str(exc))
     summary, rows = resolve(names, found)
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
+    try:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
+    except OSError as e:
+        ap.error("--out %s: %s" % (a.out, e.strerror or e))
     print(json.dumps(summary, indent=1, sort_keys=True))
     return 0
 
