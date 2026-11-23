@@ -7065,16 +7065,50 @@ int main() {
             EXPECT(placed_mismatches <= 0);
         }
 
-        // D3D-434: a shader-visible heap with zero descriptors is refused with E_INVALIDARG, not E_OUTOFMEMORY from
-        // an empty arena request on this device with the GPU address arena. Not compared with the host: WARP removes
-        // its device on it, the RTX 3060 faults.
-        for (const auto type : {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER}) {
-            const D3D12_DESCRIPTOR_HEAP_DESC empty{type, 0, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
-            void* out = reinterpret_cast<void*>(0x1111);
-            const HRESULT hr = standalone->CreateDescriptorHeap(&empty, __uuidof(ID3D12DescriptorHeap), &out);
-            std::printf("descriptor heap: shader-visible type %d, 0 descriptors: 0x%08lx\n", int(type),
-                        (unsigned long)hr);
-            EXPECT(hr == E_INVALIDARG && out == nullptr);
+        // D3D-434: a shader-visible heap with zero descriptors is created, with CPU and GPU start handles 0, as on the
+        // RX 9070 XT's D3D12, and takes no range of this device's GPU address arena (main answered E_OUTOFMEMORY
+        // from an empty arena request). Not compared with the host: WARP removes its device on it, the RTX 3060
+        // faults. A list that sets both empty heaps closes and executes.
+        {
+            Ref<ID3D12DescriptorHeap> empty_heaps[2];
+            ID3D12DescriptorHeap* bound[2] = {};
+            const D3D12_DESCRIPTOR_HEAP_TYPE types[2] = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                                         D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER};
+            for (int i = 0; i < 2; ++i) {
+                const D3D12_DESCRIPTOR_HEAP_DESC empty{types[i], 0, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+                const HRESULT hr = standalone->CreateDescriptorHeap(&empty, IID_PPV_ARGS(&empty_heaps[i].p));
+                const UINT64 cpu = hr == S_OK && empty_heaps[i].p
+                                       ? UINT64(empty_heaps[i]->GetCPUDescriptorHandleForHeapStart().ptr)
+                                       : ~0ull;
+                const UINT64 gpu = hr == S_OK && empty_heaps[i].p
+                                       ? empty_heaps[i]->GetGPUDescriptorHandleForHeapStart().ptr
+                                       : ~0ull;
+                std::printf("descriptor heap: shader-visible type %d, 0 descriptors: 0x%08lx, heap %s, CPU start "
+                            "0x%llx, GPU start 0x%llx\n",
+                            int(types[i]), (unsigned long)hr, empty_heaps[i].p ? "non-null" : "null",
+                            (unsigned long long)cpu, (unsigned long long)gpu);
+                EXPECT(hr == S_OK && empty_heaps[i].p && cpu == 0 && gpu == 0);
+                bound[i] = empty_heaps[i].p;
+            }
+            if (bound[0] && bound[1]) {
+                Ref<ID3D12CommandAllocator> allocator;
+                Ref<ID3D12GraphicsCommandList> list;
+                Ref<ID3D12Fence> done;
+                EXPECT(SUCCEEDED(standalone->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                    IID_PPV_ARGS(&allocator.p))));
+                EXPECT(SUCCEEDED(standalone->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                               IID_PPV_ARGS(&list.p))));
+                EXPECT(SUCCEEDED(standalone->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+                list->SetDescriptorHeaps(2, bound);
+                EXPECT(SUCCEEDED(list->Close()));
+                ID3D12CommandList* lists[] = {list.p};
+                queue->ExecuteCommandLists(1, lists);
+                const bool executed = rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success;
+                EXPECT(executed && SUCCEEDED(queue->Signal(done.p, 1)) &&
+                       SUCCEEDED(done->SetEventOnCompletion(1, nullptr)));
+                std::printf("descriptor heap: empty shader-visible heaps set on a list, executed: %s\n",
+                            executed ? "success" : "failed");
+            }
         }
 
         auto tiled_2d = [&](UINT w, UINT h, DXGI_FORMAT fmt, UINT16 mips, D3D12_RESOURCE_FLAGS flags,

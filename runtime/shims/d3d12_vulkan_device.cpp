@@ -1515,8 +1515,11 @@ public:
     // heaps (RTV, DSV, non-visible staging heaps) stay in host memory.
     // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
+    // A shader-visible heap with zero descriptors takes no arena range and has CPU and GPU start handles 0, as on
+    // the RX 9070 XT's D3D12 (D3D-434; WARP removes its device on it and the RTX 3060 driver faults).
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
+        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && !bytes) return;
         if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
             if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
@@ -1537,7 +1540,7 @@ public:
                                             DeviceState::arena_descriptor_heap);
     }
 
-    bool ok() const { return cpu_ != nullptr; }
+    bool ok() const { return cpu_ != nullptr || empty_shader_visible(); }
 
     // A node mask of 0 reads back as the one node of a single adapter, as on the PC runtime (d3d12_node_mask_test).
     D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override {
@@ -1550,11 +1553,16 @@ public:
     }
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
-        if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
+        if (!in_arena_ && !empty_shader_visible())
+            log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
 private:
+    bool empty_shader_visible() const {
+        return (desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && !desc_.NumDescriptors;
+    }
+
     DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
     std::unique_ptr<std::byte[]> storage_;
@@ -5050,20 +5058,13 @@ public:
         if (out) *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         // As the host runtime: a null output is a capability check, answered before the rules below (S_FALSE even
-        // for a shader-visible RTV heap). Zero descriptors are allowed, RTV and DSV heaps are never shader-visible,
-        // one flag and one node.
+        // for a shader-visible RTV heap). Zero descriptors are allowed (a shader-visible empty heap answers as the
+        // RX 9070 XT does, see DescriptorHeap), RTV and DSV heaps are never shader-visible, one flag and one node.
         if (!out) return d3d12_trace::result(method, S_FALSE);
         if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
             ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
              (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
-            return d3d12_trace::result(method, E_INVALIDARG);
-        }
-        // A shader-visible heap with zero descriptors has no host answer: the runtime passes it to the driver,
-        // and WARP removes the device (DXGI_ERROR_DRIVER_INTERNAL_ERROR) while the RTX 3060 driver faults (D3D-434).
-        // Refuse it rather than ask the GPU address arena for an empty range (which it refuses as "full").
-        if ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && !desc->NumDescriptors) {
-            log_once("CreateDescriptorHeap refused (shader-visible, 0 descriptors), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
         auto* heap = new DescriptorHeap(state_, *desc);
