@@ -117,6 +117,15 @@ jobs:
           python -I tests/test_ttpf_assets.py
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
+      # The standard-library loop runs these files before the library is built, where the native comparisons skip.
+      - name: Build the native SPIR-V optimizer and compare it with the Python one
+        shell: bash
+        run: |
+          CARGO_HOME="$(mktemp -d)" RUSTFLAGS="-D warnings" cargo build --release --locked --offline --manifest-path tools/spirv_opt_native/Cargo.toml
+          CARGO_HOME="$(mktemp -d)" RUSTFLAGS="-D warnings" cargo test --release --locked --offline --manifest-path tools/spirv_opt_native/Cargo.toml
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import spirv_opt; assert spirv_opt._native_optimize('', 4) is not None"
+          python -I tests/test_spirv_opt_native.py
+          python -I tests/test_spirv_opt.py
   translator-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
