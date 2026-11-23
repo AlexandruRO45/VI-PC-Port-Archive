@@ -257,6 +257,13 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
+def read_spirv_index(path: str) -> dict:
+    """The translator's spirv/index.json. Read as utf-8-sig: an index saved again by a Windows editor or PowerShell
+    starts with a UTF-8 BOM, which json rejects when the file is opened as plain UTF-8."""
+    with open(path, encoding="utf-8-sig") as source:
+        return json.load(source)
+
+
 UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
 
 
@@ -943,8 +950,7 @@ def run_suite(a, work: str) -> int:
     index = {}
     idx_path = os.path.join(spirv_dir, "index.json")
     if os.path.isfile(idx_path):
-        with open(idx_path, encoding="utf-8") as source:
-            index = json.load(source)
+        index = read_spirv_index(idx_path)
 
     ext = ".exe" if os.name == "nt" else ""
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
