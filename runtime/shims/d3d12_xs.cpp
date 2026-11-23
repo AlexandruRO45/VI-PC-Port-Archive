@@ -192,7 +192,11 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     {
         char backend[16] = {};
         size_t backend_length = 0;
-        if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0)
+        // Once per process, and only when the name actually matches: a second successful D3D12XboxCreateDevice
+        // in the same process must stay silent (cdomergue's #8281 check counted two warnings without this flag).
+        static std::atomic<bool> vulkan_ignored_logged{false};
+        if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0 &&
+            !vulkan_ignored_logged.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr,
                          "[rt] d3d12_xs: LEONIDA_D3D12=vulkan ignored: this build has no Vulkan device. "
                          "Reconfigure with -DLEONIDA_VULKAN_HEADERS_FETCH=ON (see docs/testing.md).\n");
