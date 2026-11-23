@@ -4,9 +4,10 @@
 // an empty library StorePipeline / LoadComputePipeline / LoadGraphicsPipeline / LoadPipeline with null, empty and
 // unknown names and null PSOs, descriptions or outputs, and Serialize with null, short and long buffers. Every HRESULT
 // is recorded, with whether the output pointer was written; the two records must be the same, step by step. The
-// serialized size and bytes are each device's own format and are not compared. A step the host runtime faults on is
-// reported and not compared. No shaders or game data. Skips (77) without a Vulkan GPU; without a host D3D12 device
-// only the layer's own record is printed. Set LEONIDA_D3D49_VERBOSE=1 to print every step.
+// serialized size and bytes are each device's own format and are not compared, nor is the answer to its own blob with
+// the last byte changed. A step the host runtime faults on is reported and not compared. No shaders or game data.
+// Skips (77) without a Vulkan GPU; without a host D3D12 device only the layer's own record is printed. Set
+// LEONIDA_D3D49_VERBOSE=1 to print every step.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
@@ -105,7 +106,10 @@ const Step kSteps[] = {
          longer.resize(longer.size() + 64, 0);
          return create(c, longer.data(), longer.size());
      }},
-    {"create: its own blob, last byte flipped", [](Context& c) {
+    // Whether a changed last byte is caught depends on the driver's own blob format: NVIDIA's (and the layer's) checks
+    // cover it, AMD's D3D12 (26.11.2, RX 9070 XT) accepts the blob. Recorded, not compared. A changed first byte (the
+    // header) is refused by every host measured, so that step stays compared.
+    {"create: its own blob, last byte flipped [own format]", [](Context& c) {
          std::vector<std::uint8_t> flipped(c.own);
          flipped.back() ^= 0xFF;
          return create(c, flipped.data(), flipped.size());

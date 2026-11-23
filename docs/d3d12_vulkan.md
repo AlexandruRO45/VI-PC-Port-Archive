@@ -2031,9 +2031,11 @@ Pipeline creation:
   PSO, each run on the host in a process of its own, since a call it faults on leaves its runtime broken and the next
   one failing fast; RTX 3060, driver 610.88):
   - `CreatePipelineLibrary`: a foreign, truncated or corrupt blob, the other device's blob, or a null pointer with a
-    size is `E_INVALIDARG`, and `*ppPipelineLibrary` is left as it was. One of the layer's own blobs from another
-    format version is `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, the documented code for a cache from another driver.
-    A pointer with size 0 is an empty library; a longer blob than the header is accepted; a null output is
+    size is `E_INVALIDARG`, and `*ppPipelineLibrary` is left as it was. Each device's own blob with its last byte
+    changed is recorded but not compared: whether that byte is covered depends on the driver's blob format, and AMD's
+    D3D12 (26.11.2, RX 9070 XT) accepts it where NVIDIA's and the layer refuse it (#5781). One of the layer's own blobs
+    from another format version is `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, the documented code for a cache from another
+    driver. A pointer with size 0 is an empty library; a longer blob than the header is accepted; a null output is
     `S_FALSE`.
   - The library is a device child, not a pageable object: `QueryInterface(ID3D12Pageable)` is `E_NOINTERFACE`.
   - `LoadComputePipeline`/`LoadGraphicsPipeline`/`LoadPipeline` with a null output are `E_INVALIDARG`, as is an
