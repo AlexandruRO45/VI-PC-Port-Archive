@@ -376,5 +376,50 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0], 42)
 
 
+@dataclass
+class IntegerStatusFlags:
+    zero: bool = False
+    overflow: bool = False
+
+
+def classify_status(val: int) -> IntegerStatusFlags:
+    val &= MASK32
+    return IntegerStatusFlags(zero=(val == 0), overflow=(val > 0xFFFF))
+
+
+class TestConditionCodesAndStatus(unittest.TestCase):
+    def test_vcc_and_scc_preservation(self):
+        # v_sad_u8 is a VALU instruction and must not clobber SCC or VCC
+        interp = ScalarInterpreter()
+        interp.state.scc = 1
+        interp.state.vcc = 0xABCDEF0123456789
+        interp.state.vgprs[0] = 0x04030201
+        interp.state.vgprs[1] = 0x00000000
+        interp.state.vgprs[2] = 0
+
+        insn = VSadU8Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        interp.step(insn)
+        self.assertEqual(interp.state.scc, 1)
+        self.assertEqual(interp.state.vcc, 0xABCDEF0123456789)
+
+    def test_zero_sad_result(self):
+        flags = classify_status(ref_sad_u8(0x01010101, 0x01010101, 0))
+        self.assertTrue(flags.zero)
+
+    def test_nonzero_sad_result(self):
+        flags = classify_status(ref_sad_u8(0x04030201, 0x00000000, 0))
+        self.assertFalse(flags.zero)
+
+    def test_32bit_wraparound(self):
+        # Accumulator near overflow: 0xFFFFFFFF + 10 wraps to 9
+        result = ref_sad_u8(0x04030201, 0x00000000, 0xFFFFFFFF)
+        self.assertEqual(result, 9)
+
+
 if __name__ == "__main__":
     unittest.main()
