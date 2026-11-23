@@ -142,5 +142,112 @@ class TestReferenceOracle(unittest.TestCase):
             self.assertEqual(trans_res, expected_res)
             self.assertEqual(trans_scc, expected_scc)
 
+
+# ==============================================================================
+# SECTION 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class OperandKind(Enum):
+    SGPR = auto()
+    IMMEDIATE = auto()
+    VGPR = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: OperandKind
+    value: int
+
+    def __post_init__(self) -> None:
+        if self.kind == OperandKind.SGPR:
+            if not (0 <= self.value <= 105):
+                raise ValueError(f"SGPR index out of architectural range [0, 105]: {self.value}")
+        elif self.kind == OperandKind.IMMEDIATE:
+            if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF):
+                raise ValueError(f"Immediate value out of 32-bit range: {self.value}")
+        elif self.kind == OperandKind.VGPR:
+            if not (0 <= self.value <= 255):
+                raise ValueError(f"VGPR index out of architectural range [0, 255]: {self.value}")
+
+
+def SGPR(idx: int) -> Operand:
+    return Operand(OperandKind.SGPR, idx)
+
+
+def Immediate(val: int) -> Operand:
+    return Operand(OperandKind.IMMEDIATE, u32(val))
+
+
+def VGPR(idx: int) -> Operand:
+    return Operand(OperandKind.VGPR, idx)
+
+
+@dataclass(frozen=True)
+class SXnorB32Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != OperandKind.SGPR:
+            raise TypeError(f"Destination for s_xnor_b32 must be an SGPR, got {self.dst.kind}")
+        if self.src0.kind == OperandKind.VGPR or self.src1.kind == OperandKind.VGPR:
+            raise TypeError("SOP2 scalar ALU instruction cannot accept VGPR source operands directly")
+
+    def format_operand(self, op: Operand) -> str:
+        if op.kind == OperandKind.SGPR:
+            return f"s{op.value}"
+        elif op.kind == OperandKind.IMMEDIATE:
+            return f"{op.value:#x}"
+        else:
+            return f"v{op.value}"
+
+    def to_assembly(self) -> str:
+        d = self.format_operand(self.dst)
+        s0 = self.format_operand(self.src0)
+        s1 = self.format_operand(self.src1)
+        return f"s_xnor_b32 {d}, {s0}, {s1}"
+
+
+class TestASTDefinitions(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_assembly(self) -> None:
+        """Verify AST correctly validates and formats to standard RDNA2 disassembly."""
+        instr = SXnorB32Instruction(dst=SGPR(2), src0=SGPR(0), src1=SGPR(1))
+        self.assertEqual(instr.to_assembly(), "s_xnor_b32 s2, s0, s1")
+
+        instr_imm = SXnorB32Instruction(dst=SGPR(4), src0=SGPR(5), src1=Immediate(0x12345678))
+        self.assertEqual(instr_imm.to_assembly(), "s_xnor_b32 s4, s5, 0x12345678")
+
+    def test_ast_operand_type_guards(self) -> None:
+        """Verify AST rejects malformed operands like VGPR destination or out-of-range registers."""
+        with self.assertRaises(TypeError):
+            SXnorB32Instruction(dst=VGPR(0), src0=SGPR(1), src1=SGPR(2))
+
+        with self.assertRaises(TypeError):
+            SXnorB32Instruction(dst=SGPR(0), src0=VGPR(1), src1=SGPR(2))
+
+        with self.assertRaises(ValueError):
+            SGPR(106)
+
+        with self.assertRaises(ValueError):
+            SGPR(-1)
+
+    def test_ast_translation_validity(self) -> None:
+        """Verify code generated from AST roundtrips through the translator cleanly."""
+        instr = SXnorB32Instruction(dst=SGPR(2), src0=SGPR(0), src1=SGPR(1))
+        lines = [
+            "s_mov_b32 s0, 0xAAAAAAAA",
+            "s_mov_b32 s1, 0xAAAAAAAA",
+            instr.to_assembly(),
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_xnor_valid", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
