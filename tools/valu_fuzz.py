@@ -244,6 +244,8 @@ class Family:
 F16_BIN = {"v_add_f16", "v_sub_f16", "v_mul_f16", "v_max_f16", "v_min_f16"}
 F16_TRI = {"v_fma_f16", "v_med3_f16"}
 PK_F16 = {"v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"}
+PK_INLINE_F16 = {"0.5": 0x3800, "1.0": 0x3C00, "2.0": 0x4000,
+                 "-0.5": 0xB800, "-1.0": 0xBC00, "-2.0": 0xC000}
 PK_SHIFT = {"v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"}
 I16_VOP3 = {"v_add_nc_u16", "v_sub_nc_u16"}
 I16_BOTH = {"v_mul_lo_u16", "v_lshlrev_b16", "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_min_u16",
@@ -423,6 +425,20 @@ class F16Family(Family):
             n = 3 if name == "v_pk_fma_f16" else 2
             op["s"] = [src() for _ in range(n)]
             op["opsel"], op["opsel_hi"] = sel(n), sel(n)
+            if name == "v_pk_fma_f16":
+                form = rng.randrange(4)
+                if form:
+                    op["s"][2] = rng.choice(tuple(PK_INLINE_F16))
+                    op["opsel_hi"][2] = 0
+                if form == 2:
+                    op["s"][1] = rng.choice(tuple(PK_INLINE_F16))
+                    op["opsel_hi"][1] = 0
+                elif form == 3:
+                    # One appended dword. Keep the low half finite; sometimes give
+                    # the high half a NaN to exercise per-half uncertainty.
+                    high = self.nice_half() if rng.randrange(2) else 0x7E00
+                    literal = self.nice_half() | (high << 16)
+                    op["s"][0] = hex(literal)
         elif name == "v_pack_b32_f16":
             op["s"] = [src(), src()]
             op["opsel"] = sel(2)
@@ -434,7 +450,7 @@ class F16Family(Family):
 
     def op_text(self, op):
         n, d, s = op["name"], op["d"], op["s"]
-        vs = ", ".join(f"v{x}" for x in s)
+        vs = ", ".join(f"v{x}" if isinstance(x, int) else x for x in s)
         if op.get("enc") == "e32":
             return f"{n}_e32 v{d}, {vs}"
         if n in F16_BIN:
@@ -539,11 +555,18 @@ class F16Family(Family):
                 lo, hi = hi, lo
             R[d] = Reg(lo | (hi << 16), unc(s[0], sel[0]) or is_f16_snan(lo), unc(s[1], sel[1]) or is_f16_snan(hi))
         elif n in PK_F16 or n in PK_SHIFT:
-            k = len(s)
+            sources = []
+            for src in s:
+                if isinstance(src, int):
+                    sources.append(R[src])
+                elif src in PK_INLINE_F16:
+                    sources.append(Reg(PK_INLINE_F16[src]))
+                else:
+                    sources.append(Reg(int(src, 16)))
             out, us = [], []
             for lane_sel in ((op["opsel_hi"], op["opsel"]) if "pk_swapped" in PERTURB else (op["opsel"], op["opsel_hi"])):
-                vals = [half(s[j], lane_sel[j]) for j in range(k)]
-                u = any(unc(s[j], lane_sel[j]) for j in range(k))
+                vals = [(src.v >> (16 * hi)) & M16 for src, hi in zip(sources, lane_sel)]
+                u = any(src.uhi if hi else src.ulo for src, hi in zip(sources, lane_sel))
                 if n in PK_SHIFT:
                     a, b = vals
                     base = {"v_pk_lshlrev_b16": "v_lshlrev_b16", "v_pk_lshrrev_b16": "v_lshrrev_b16",

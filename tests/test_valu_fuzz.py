@@ -113,6 +113,41 @@ def test_i16_ops():
 
 # ------------------------------------------------------------------ f16 family
 
+def test_packed_fma_generator_covers_constant_forms():
+    programs = vf.programs("f16", 7, 512, (32,))
+    forms = set()
+    for program in programs:
+        for op in program.ops:
+            if op["name"] != "v_pk_fma_f16":
+                continue
+            kinds = tuple("v" if isinstance(src, int) else "literal" if src.startswith("0x") else "inline"
+                          for src in op["s"])
+            if kinds[0] == "literal":
+                word = int(op["s"][0], 16)
+                assert word & 0x7C00 != 0x7C00
+                kinds = ("special" if word & 0x7C000000 == 0x7C000000 else "finite", *kinds[1:])
+            forms.add((kinds, tuple(op["opsel_hi"])))
+    assert (("v", "inline", "inline"), (1, 0, 0)) in forms
+    assert (("v", "v", "inline"), (1, 0, 0)) in forms
+    for literal in ("finite", "special"):
+        assert ((literal, "v", "inline"), (0, 1, 0)) in forms
+    assert any(kinds == ("v", "v", "v") for kinds, _ in forms)
+
+
+def test_packed_fma_literal_and_inline_exact_words(monkeypatch):
+    program = vf.F16Family(1, 0, 32)
+    op = {"name": "v_pk_fma_f16", "d": 20, "s": ["0x42004000", 21, "1.0"],
+          "opsel": [1, 0, 1], "opsel_hi": [0, 1, 0]}
+    # Low = 3*2+0 = 6. High = 2*4+1 = 9. Default high selectors would give 3*4+0 = 12.
+    regs = {20: vf.Reg(0), 21: vf.Reg(0x44004000)}
+    program.step(op, regs)
+    assert (regs[20].v, regs[20].ulo, regs[20].uhi) == (0x48804600, False, False)
+    monkeypatch.syspath_prepend(os.path.join(ROOT, "tests", "semantic"))
+    import support
+    lines = ["v_mov_b32 v21, 0x44004000", program.op_text(op),
+             "exp mrt0 v20, v20, v20, v20 done vm", "s_endpgm"]
+    assert support.mrt0_words(support.translate_lines("ps_pk_fma_constants", lines))[0] == 0x48804600
+
 def test_f16_partial_writes_follow_the_contract():
     p = vf.F16Family(1, 0, 32)
     R = {r: vf.Reg(0xAAAA0000 | 0x3C00) for r in vf.POOL}
