@@ -1930,6 +1930,12 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_texture1d_target_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_texture1d_target COMMAND d3d12_texture1d_target_test)
     set_tests_properties(d3d12_texture1d_target PROPERTIES SKIP_RETURN_CODE 77)  # no Vulkan GPU, or Wine
+    add_executable(d3d12_a8_dimensions_test test/d3d12_a8_dimensions_test.cpp)
+    target_link_libraries(d3d12_a8_dimensions_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_a8_dimensions_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_a8_dimensions_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_a8_dimensions COMMAND d3d12_a8_dimensions_test)
+    set_tests_properties(d3d12_a8_dimensions PROPERTIES SKIP_RETURN_CODE 77)  # no Vulkan GPU, or Wine
 
     # ArraySize -1 in array RTVs and DSVs (every slice from the first on), against the host on the same adapter
     # and WARP.
