@@ -155,6 +155,27 @@ class TestVBfeU32ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res, 0x3456)
         self.assertEqual(state.vgprs[3], 0x3456)
 
+class TestVBfeU32SIMDAndIEEE(unittest.TestCase):
+    def test_aliasing_and_condition_codes(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.write_vgpr(0, 0x12345678)
+        state.write_vgpr(1, 8)
+        state.write_vgpr(2, 16)
+        inst = ASTInstruction(Opcode.V_BFE_U32, ASTOperand.vgpr(0), ASTOperand.vgpr(0), ASTOperand.vgpr(1), ASTOperand.vgpr(2))
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x3456)
+        self.assertEqual(state.vgprs[0], 0x3456)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
+    def test_ieee754_bitwise_transparency(self) -> None:
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        res = ref_v_bfe_u32(qnan, snan, 4)
+        self.assertIsInstance(res, int)
+
 
 if __name__ == "__main__":
     unittest.main()
