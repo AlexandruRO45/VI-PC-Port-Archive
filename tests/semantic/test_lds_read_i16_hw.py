@@ -222,6 +222,50 @@ class Program:
         return "\n".join(inst.to_assembly() for inst in self.instructions)
 
 
+
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarLDSInterpreter:
+    """Deterministic scalar interpreter for ds_read_i16."""
+
+    def __init__(self, capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.lds: LDSModel = LDSModel(capacity_dwords)
+        self.vcc: int = 0
+        self.last_condition_codes: Any | None = None
+        self.last_status_flags: Any | None = None
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def step(self, inst: Instruction) -> int:
+        """Executes a single ds_read_i16 instruction."""
+        vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        res = self.lds.read_i16(vaddr, inst.offset.offset)
+        self.write_reg_u32(RegKind.VGPR, inst.vdst.index, res)
+        self.trace.append(f"{inst.to_assembly()} => {inst.vdst.format_asm()}={res:#010x}")
+        return res
+
+    def run_program(self, prog: Program) -> list[int]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
 class TestLdsReadI16ReferenceOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and hardware translator execution."""
 
@@ -331,6 +375,39 @@ class TestLdsReadI16AST(unittest.TestCase):
         ))
         expected = "ds_read_i16 v5, v1 offset:2\nds_read_i16 v6, v1"
         self.assertEqual(prog.to_assembly(), expected)
+
+
+
+class TestLdsReadI16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(capacity_dwords=1024)
+
+    def test_scalar_execution_basic(self) -> None:
+        # Seed address 0x10 with 0xFFFE (low 16) and 0x0005 (high 16)
+        self.interp.lds.write_dword(0x10, 0x0005FFFE)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+
+        inst_lo = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 3),
+            vaddr=Register(RegKind.VGPR, 1),
+            offset=DSOffset(offset=0),
+        )
+        res_lo = self.interp.step(inst_lo)
+        self.assertEqual(res_lo, 0xFFFFFFFE)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 3), 0xFFFFFFFE)
+
+        inst_hi = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 4),
+            vaddr=Register(RegKind.VGPR, 1),
+            offset=DSOffset(offset=2),
+        )
+        res_hi = self.interp.step(inst_hi)
+        self.assertEqual(res_hi, 5)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 4), 5)
 
 
 if __name__ == "__main__":
