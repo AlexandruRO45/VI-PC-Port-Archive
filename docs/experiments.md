@@ -1617,6 +1617,75 @@ No title startup result is claimed.
 The Windows ABI boundary follows [Microsoft's direction-flag convention](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions).
 MOVS/STOS semantics follow the [Intel SDM](https://cdrdv2-public.intel.com/868137/325462-089-sdm-vol-1-2abcd-3abcd-4.pdf).
 
+## Vector data moves in the control-flow CPU lifter
+
+`tools/cpu_switch_aot.py` translates vector registers that carry data without arithmetic. MOVAPS, MOVUPS, MOVAPD,
+MOVUPD, MOVDQA and MOVDQU in their legacy (XMM) and VEX (XMM and YMM) encodings move 16 or 32 bytes between
+registers, the frame, guest memory and RIP-relative image data. XORPS, XORPD and PXOR, legacy or VEX, are accepted
+only as the zeroing idiom, with both sources naming one register. VZEROUPPER is accepted. Each of XMM0-XMM15 becomes
+a 32-byte value in the generated C++. A legacy write keeps bytes 16-31 of its YMM register, and a VEX write of an XMM
+register clears them. These forms can appear inside branches, loops and translated callees, and between a flag
+producer and its consumer, since none changes RFLAGS.
+
+The existing definedness and saved-register proofs cover the vector registers. No vector register is defined at
+entry, because floating-point arguments are not supported. After a call, XMM0-XMM5 are undefined and only the low
+16 bytes of XMM6-XMM15 stay defined; after VZEROUPPER, only the low 16 bytes of each register do. The low 16 bytes of
+XMM6-XMM15 are saved registers like RBX. A 128-bit move to the frame saves one while it holds its entry value, the
+saved bytes may only be restored into the same register, and every RET and tail jump requires it restored. Frame
+accesses may be 16 or 32 bytes wide. They may also go through the RBP frame anchor described under
+[switch dispatch](#switch-dispatch-through-jump-tables), which can save and restore XMM6-XMM15 too. Alignment is then
+measured from the anchor's offset from entry RSP, which can differ from RSP's offset by 8 mod 16.
+
+The aligned forms fault when an operand is not aligned to its width. On the frame, where the ABI makes entry RSP
+8 mod 16, a misaligned 16-byte access is refused, and so is every 32-byte aligned access, because the frame's
+alignment mod 32 is unknown. A RIP-relative operand is checked by its RVA, since the image mapping is 64 KiB aligned.
+Any other operand is checked when the translation runs, which raises `STATUS_ACCESS_VIOLATION` before the access,
+the code Windows reports for the #GP. A guest read is performed as volatile quadword reads in ascending order. A
+guest write first writes its last byte back with its own value, so a write that reaches an unwritable page faults
+before it changes memory, in either direction across a page boundary.
+
+EVEX forms, registers 16-31, every other vector instruction (arithmetic, shuffles, scalar moves), and transfers
+between vector and integer registers remain refused. Nontemporal stores, memory ordering against other threads,
+exception resumption and the state of physical XMM6-XMM15 inside the translation are not modeled.
+
+The fixture, reference and implementation are original MIT source and use source-built buffers. The same image
+holds 14 refusal controls, which the check translates one at a time:
+- an undefined register at entry;
+- a volatile register read after a call;
+- bytes 16-31 read after a call, after VZEROUPPER and after a legacy write;
+- XMM6 written without a restore, and stored while it holds the caller's value;
+- saved XMM6 bytes read as data;
+- misaligned 16-byte and 32-byte aligned frame accesses;
+- a misaligned aligned access through an RBP anchor, at an address that would look aligned if measured from RSP;
+- a misaligned aligned image operand;
+- a non-idiomatic XORPS;
+- a MOVQ from an integer register.
+
+Two patched copies remove the XMM6 restore and the XMM6 save. Instruction forms are recorded from the decoded,
+compared functions only, not from the refusal controls.
+
+```powershell
+cmake --build --preset dev --target cpu_switch_vectors_lifted cpu_switch_vectors_lifted_o2 cpu_switch_vectors_mutants cpu_guarded_call
+ctest --preset dev --no-tests=error -R '^cpu_aot_switch_vectors$' -V
+```
+
+Results on Windows 11 build 26300 with MSVC/ML64 19.44.35207 and Python 3.12.14:
+- **Comparisons:** 1,848 native, translated (`/Od` and `/O2`) and byte-reference comparisons matched, over 11 exports and source and destination offsets of 0 to 31 bytes. Each comparison covers the whole destination with 32 guard bytes on either side, plus the return value.
+- **Faults:** 24 access violations matched, together with the memory left behind.
+  - Misaligned MOVAPS loads and stores.
+  - A 16-mod-32 VMOVDQA load.
+  - A VMOVDQA store that faults after a VMOVAPD store has completed.
+  - A load that reaches a protected page.
+  - Stores and a 32-byte load that straddle a protected page at its start or its end.
+- **Unbound image:** both translations raise the unbound-image exception before the image is bound.
+- **Mutants:** three compiled `/O2` mutations must fail, and do.
+  - A legacy write that clears bytes 16-31.
+  - An aligned move without its alignment check.
+  - A store without its last-byte write-back, which leaves a partial store before the fault.
+
+No title startup result is claimed. Register volatility follows
+[Microsoft's x64 register conventions](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions).
+
 ## Switch dispatch through jump tables
 
 Compilers lower a dense `switch` to a bounds check and an indirect `JMP` through a table of 32-bit entries. The [jump-table translator](../tools/cpu_switch_aot.py) recognizes the two x64 layouts in common use. MSVC stores image-relative entries and loads them through a register holding `__ImageBase`. LLVM stores signed offsets from the table and adds the table address. The translator reads the table from the PE, then emits a C++ `switch` whose cases jump to labels at the decoded targets. The host compiler builds its own dispatch from that switch.

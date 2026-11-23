@@ -133,6 +133,32 @@ binding: the import is taken to follow the Windows x64 calling convention,
 which the translator cannot check. A tail jump becomes "return import(...);"
 and contributes the binding's number to the return width; a call contributes
 only through the RAX bytes defined at a later RET.
+
+Vector registers carry data but no arithmetic. MOVAPS, MOVUPS, MOVAPD, MOVUPD,
+MOVDQA and MOVDQU (legacy SSE, XMM) and their VEX forms (XMM or YMM) move 16 or
+32 bytes between registers and memory; XORPS, XORPD and PXOR, legacy or VEX, are
+accepted only with both sources the same register, which zeroes the destination;
+VZEROUPPER is accepted. Each of XMM0-XMM15 is tracked as its YMM register, a
+32-byte value in the generated source. A legacy write keeps bytes 16-31 and a VEX
+write of an XMM register clears them. EVEX forms, registers 16-31, every other
+vector instruction and moves between vector and integer registers are refused.
+The definedness pass counts 0, 16 or 32 defined low bytes per vector register:
+none at entry, since floating-point arguments are not supported; after a call
+none of XMM0-XMM5 and at most the low 16 of XMM6-XMM15; after VZEROUPPER at most
+the low 16 of each. The low 16 bytes of XMM6-XMM15 are saved registers like RBX:
+a 128-bit move to the frame while one holds its entry value saves it, the same
+bytes may only be restored into it, and every RET and tail jump needs it
+restored. A frame access may be 16 or 32 bytes. The aligned forms fault on an
+operand not aligned to its width: on the frame, where entry RSP is 8 mod 16, a
+misaligned 16-byte access and every 32-byte aligned access are refused; a
+RIP-relative operand is checked by its RVA, the mapping being 64 KiB aligned; any
+other operand is checked when the translation runs, raising
+STATUS_ACCESS_VIOLATION before the access as Windows reports the #GP. A guest
+read is performed as volatile quadword reads in ascending order. A guest write
+first writes its last byte back with its own value, so a write that reaches an
+unwritable page faults before it changes memory, then stores the quadwords.
+Nontemporal stores, memory ordering against other threads and exception
+resumption are not modelled.
 """
 
 import re
@@ -146,8 +172,8 @@ from typing import NamedTuple
 from cpu_call_aot import resolve_import
 
 import pefile
-from iced_x86 import (Code, ConditionCode as CC, Decoder, FlowControl, InstructionInfoFactory, MemorySizeExt,
-                      Mnemonic as M, OpAccess, OpKind, Register as R, RegisterExt)
+from iced_x86 import (Code, ConditionCode as CC, Decoder, EncodingKind, FlowControl, InstructionInfoFactory,
+                      MemorySizeExt, Mnemonic as M, OpAccess, OpKind, Register as R, RegisterExt)
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -162,6 +188,23 @@ ARGUMENT_COUNTS = (3, 4)
 DEFAULT_ARGUMENTS = 3
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 NONVOLATILE = tuple(sorted(set(NAMES) - VOLATILE - {R.RSP}))  # RBX, RBP, RSI, RDI, R12-R15
+# Vector registers, each tracked as its YMM register: XMMn names bytes 0-15 and YMMn all 32. XMM6-XMM15 are
+# nonvolatile in their low 16 bytes; bytes 16-31 of every register are volatile (Windows x64 ABI).
+VECTORS = tuple(getattr(R, f"YMM{n}") for n in range(16))
+VECTOR_NAMES = {register: f"ymm{n}" for n, register in enumerate(VECTORS)}
+VOLATILE_VECTORS = VECTORS[:6]
+NONVOLATILE_VECTORS = VECTORS[6:]
+# The registers whose entry value every RET must restore, and the save width of each.
+SAVED = NONVOLATILE + NONVOLATILE_VECTORS
+SAVE_WIDTH = {register: 16 if register in NONVOLATILE_VECTORS else 8 for register in SAVED}
+# 128- and 256-bit moves between vector registers and memory. The aligned forms fault on an operand that is not
+# aligned to its own width.
+VECTOR_MOVES = {M.MOVAPS, M.MOVUPS, M.MOVAPD, M.MOVUPD, M.MOVDQA, M.MOVDQU,
+                M.VMOVAPS, M.VMOVUPS, M.VMOVAPD, M.VMOVUPD, M.VMOVDQA, M.VMOVDQU}
+ALIGNED_MOVES = {M.MOVAPS, M.MOVAPD, M.MOVDQA, M.VMOVAPS, M.VMOVAPD, M.VMOVDQA}
+# Bitwise XOR forms, accepted only as the zeroing idiom: both sources name the same register.
+VECTOR_ZEROS = {M.XORPS, M.XORPD, M.PXOR, M.VXORPS, M.VXORPD, M.VPXOR}
+VECTOR_FORMS = VECTOR_MOVES | VECTOR_ZEROS | {M.VZEROUPPER}
 # The caller's home space ends 40 bytes above entry RSP: 8 for the return address and 32 reserved.
 HOME_END = 40
 # Bytes of the frame array. MSVC calls __chkstk before it allocates a page (4096 bytes) or more, and that
@@ -195,7 +238,8 @@ STRING_TRANSFERS = {
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
-                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD,
+                *VECTOR_FORMS}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
@@ -222,6 +266,35 @@ def full(register):
     if full_register not in NAMES:
         raise ValueError(f"unsupported register {register}")
     return full_register
+
+
+def vector(register):
+    """The tracked YMM register of XMM0-XMM15 or YMM0-YMM15, else None."""
+    if RegisterExt.is_xmm(register) or RegisterExt.is_ymm(register):
+        number = RegisterExt.number(register)
+        if number < len(VECTORS):
+            return VECTORS[number]
+    return None
+
+
+def register_name(register):
+    """The C++ name of a general-purpose or tracked vector register."""
+    return NAMES[register] if register in NAMES else VECTOR_NAMES[register]
+
+
+def saved_name(register):
+    """The name of a saved register: XMM6-XMM15 are saved in their low 16 bytes only."""
+    return NAMES[register] if register in NAMES else f"xmm{VECTORS.index(register)}"
+
+
+def _access_width(ins):
+    """Bytes of the memory operand: 16 or 32 for a vector move, else 1, 2, 4 or 8."""
+    if ins.mnemonic in VECTOR_MOVES:
+        width = MemorySizeExt.size(ins.memory_size)
+        if width not in (16, 32):
+            raise ValueError(f"unsupported memory width at RVA {ins.ip:#x}")
+        return width
+    return _memory_width(ins)
 
 
 def implicit_writes(ins):
@@ -645,7 +718,9 @@ class Function:
                 known = {r: v for r, v in known.items() if r not in VOLATILE}
             elif ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register):
                 known[ins.op0_register] = ins.ip_rel_memory_address
-            elif ins.op_count and ins.op0_kind == OpKind.REGISTER and ins.mnemonic not in (M.CMP, M.TEST):
+            elif (ins.op_count and ins.op0_kind == OpKind.REGISTER and ins.mnemonic not in (M.CMP, M.TEST)
+                  and vector(ins.op0_register) is None):
+                # Only general-purpose registers hold the tracked addresses; a vector write changes none.
                 known.pop(full(ins.op0_register), None)
             for register in implicit_writes(ins):
                 known.pop(register, None)
@@ -750,7 +825,7 @@ class Function:
         def step(ins):
             for register in implicit_writes(ins):
                 values[register] = (next(counter), "full")
-            if ins.op_count == 0 or ins.op0_kind != OpKind.REGISTER:
+            if ins.op_count == 0 or ins.op0_kind != OpKind.REGISTER or vector(ins.op0_register) is not None:
                 return
             dst = ins.op0_register
             width = RegisterExt.size(dst)
@@ -790,7 +865,7 @@ def image_target(pe, ins):
     if ins.mnemonic == M.LEA:
         # An address, not an access: it may name any byte of the image, such as __ImageBase in the headers.
         return rva
-    width = _memory_width(ins)
+    width = _access_width(ins)
     section = next((s for s in pe.sections if s.VirtualAddress <= rva < s.VirtualAddress + extent(s)), None)
     if section is None:
         raise ValueError(f"RIP-relative target {rva:#x} outside every section at RVA {ins.ip:#x}")
@@ -819,6 +894,102 @@ class Lifter:
         self.frame = {}  # RVA -> index into the frame array of the stack bytes it accesses (from Frame)
         self.adjustments = set()  # RVAs of SUB or ADD RSP, imm
         self.captured = {}  # RVA -> declaration of the local that holds the instruction's one guest read
+        self.vector_registers = set()  # tracked YMM registers that the function names
+
+    def vector_name(self, register):
+        self.vector_registers.add(register)
+        return VECTOR_NAMES[register]
+
+    def vector_operand(self, ins, number):
+        register = vector(ins.op_register(number))
+        if register is None:
+            raise ValueError(f"unsupported register {ins.op_register(number)}")
+        return register
+
+    def vector_memory(self, ins, width, reads):
+        """(statement prefix, address expression, kind) of a vector move's memory operand. kind is "frame" for
+        the function's own frame array and "guest" for every other access, which may fault."""
+        aligned = ins.mnemonic in ALIGNED_MOVES
+        if ins.ip in self.frame:
+            # An RSP or anchored RBP frame slot, whose base never becomes a C++ value. Frame checked a misaligned
+            # aligned form against the ABI's entry alignment: none reaches here.
+            return "", self.address(ins), "frame"
+        for register in (ins.memory_base, ins.memory_index):
+            if register not in (R.NONE, R.RSP) and (register != R.RIP or self.image is None):
+                reads[full(register)] = max(reads.get(full(register), 0), RegisterExt.size(register))
+        address = self.address(ins)
+        if ins.memory_base == R.RIP:
+            # The mapping base is aligned to 64 KiB, so the RVA decides the alignment of an image operand.
+            if aligned and ins.ip_rel_memory_address % width:
+                raise ValueError(f"misaligned {width}-byte aligned access to RVA {ins.ip_rel_memory_address:#x} "
+                                 f"at RVA {ins.ip:#x}")
+            return f"const word a = {address};", "a", "guest"
+        check = f" vector_alignment(a, {width - 1}ull);" if aligned else ""
+        return f"const word a = {address};{check}", "a", "guest"
+
+    def vector_lower(self, ins):
+        """C++ for a 128- or 256-bit move, a zeroing XOR or VZEROUPPER, with the register effects of lower().
+
+        A legacy SSE write keeps bytes 16-31 of its YMM register and a VEX write of an XMM register clears them.
+        VZEROUPPER emits nothing: the definedness pass forgets bytes 16-31 of every register after it, so no
+        accepted read observes them before a later write defines them again."""
+        if ins.encoding not in (EncodingKind.LEGACY, EncodingKind.VEX):
+            # EVEX adds masking, broadcast and registers 16-31, none of which is modelled.
+            raise ValueError(f"unsupported vector encoding at RVA {ins.ip:#x}: {ins}")
+        if ins.has_segment_prefix or ins.has_lock_prefix:
+            raise ValueError(f"unsupported prefix at RVA {ins.ip:#x}")
+        mnemonic, vex = ins.mnemonic, ins.encoding == EncodingKind.VEX
+        reads, writes = {}, {}
+        if mnemonic == M.VZEROUPPER:
+            return "", reads, writes
+        if mnemonic in VECTOR_ZEROS:
+            # x ^ x is zero whatever x holds, so the idiom reads nothing.
+            operands = [ins.op_kind(n) for n in range(ins.op_count)]
+            if any(kind != OpKind.REGISTER for kind in operands) or len(operands) != (3 if vex else 2):
+                raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+            sources = {self.vector_operand(ins, n) for n in range(1 if vex else 0, len(operands))}
+            if len(sources) != 1:
+                raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+            target = self.vector_operand(ins, 0)
+            name = self.vector_name(target)
+            writes[target] = 32 if vex else 16
+            return (f"{name} = vec{{}};" if vex else f"{name}.q[0] = 0; {name}.q[1] = 0;"), reads, writes
+        if ins.op_count != 2:
+            raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+        register_number = 0 if ins.op0_kind == OpKind.REGISTER else 1
+        width = RegisterExt.size(ins.op_register(register_number))
+        lanes = width // 8
+        if ins.op0_kind == OpKind.REGISTER:
+            target = self.vector_operand(ins, 0)
+            name = self.vector_name(target)
+            writes[target] = 32 if vex else 16
+            if ins.op1_kind == OpKind.REGISTER:
+                source = self.vector_operand(ins, 1)
+                reads[source] = width
+                source_name = self.vector_name(source)
+                parts = [f"{name}.q[{k}] = {source_name}.q[{k}];" for k in range(lanes)]
+            elif ins.op1_kind == OpKind.MEMORY:
+                prefix, address, kind = self.vector_memory(ins, width, reads)
+                if kind == "frame":
+                    parts = [f"{name}.q[{k}] = load<std::uint64_t>({address} + {8 * k}ull);" for k in range(lanes)]
+                else:
+                    parts = [prefix, f"load_vector<{lanes}>({name}, {address});"]
+            else:
+                raise ValueError(f"unsupported operand at RVA {ins.ip:#x}")
+            if vex and width == 16:
+                parts += [f"{name}.q[2] = 0;", f"{name}.q[3] = 0;"]
+            return "{ " + " ".join(part for part in parts if part) + " }", reads, writes
+        if ins.op0_kind == OpKind.MEMORY and ins.op1_kind == OpKind.REGISTER:
+            source = self.vector_operand(ins, 1)
+            reads[source] = width
+            name = self.vector_name(source)
+            prefix, address, kind = self.vector_memory(ins, width, reads)
+            if kind == "frame":
+                parts = [f"store<std::uint64_t>({address} + {8 * k}ull, {name}.q[{k}]);" for k in range(lanes)]
+            else:
+                parts = [prefix, f"store_vector<{lanes}>({address}, {name});"]
+            return "{ " + " ".join(part for part in parts if part) + " }", reads, writes
+        raise ValueError(f"unsupported operand at RVA {ins.ip:#x}")
 
     def slot(self, ins):
         if ins.ip not in self.frame:
@@ -1006,6 +1177,8 @@ class Lifter:
             return f"{{ const word step = direction ? 0ull - {width}ull : {width}ull; {step} }}", reads, writes
         if mnemonic in (M.CLD, M.STD):
             return f"direction = {'true' if mnemonic == M.STD else 'false'};", {}, {}
+        if mnemonic in VECTOR_FORMS:
+            return self.vector_lower(ins)
         width = self.width(ins)
         reads, writes = {}, {}
 
@@ -1317,7 +1490,17 @@ class Frame:
                     or used[0].access not in (OpAccess.READ, OpAccess.WRITE, OpAccess.READ_WRITE)):
                 raise ValueError(f"unsupported stack operand at RVA {ip:#x}: {ins}")
             displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
-            self.access(ins, rsp, stack_base + displacement, _memory_width(ins), used[0].access != OpAccess.WRITE,
+            width = _access_width(ins)
+            if mnemonic in ALIGNED_MOVES:
+                # Entry RSP is 8 mod 16 (the ABI), which fixes each stack address mod 16 but not mod 32.
+                # stack_base is the base register's offset from entry RSP (RSP itself or a fixed RBP anchor).
+                if width == 32:
+                    raise ValueError(f"32-byte aligned stack access at RVA {ip:#x}: the frame is only known to be "
+                                     "16-byte aligned")
+                if (8 + stack_base + displacement) % 16:
+                    raise ValueError(f"misaligned 16-byte aligned stack access at entry RSP"
+                                     f"{stack_base + displacement:+#x} at RVA {ip:#x}")
+            self.access(ins, rsp, stack_base + displacement, width, used[0].access != OpAccess.WRITE,
                         used[0].access != OpAccess.READ)
         if anchor is not None and mnemonic != M.NOP:
             restores_rbp = (mnemonic == M.MOV and ins.op0_kind == OpKind.REGISTER
@@ -1333,13 +1516,19 @@ class Frame:
 
 
 def slot_register(ins):
-    """The nonvolatile register that PUSH, POP or a 64-bit MOV copies whole to or from the frame, else None."""
+    """The saved register that PUSH, POP, a 64-bit MOV or a 128-bit move of XMM6-XMM15 copies whole to or from
+    the frame, else None."""
     if ins.mnemonic in (M.PUSH, M.POP):
         return ins.op0_register
     if ins.mnemonic == M.MOV and ins.memory_base in (R.RSP, R.RBP):
         for number in (0, 1):
             if ins.op_kind(number) == OpKind.REGISTER and ins.op_register(number) in NONVOLATILE:
                 return ins.op_register(number)
+    if ins.mnemonic in VECTOR_MOVES and ins.memory_base in (R.RSP, R.RBP):
+        for number in (0, 1):
+            if (ins.op_kind(number) == OpKind.REGISTER and RegisterExt.is_xmm(ins.op_register(number))
+                    and vector(ins.op_register(number)) in NONVOLATILE_VECTORS):
+                return vector(ins.op_register(number))
     return None
 
 
@@ -1347,15 +1536,20 @@ def prove_frame(function, order, effects, frame):
     """Check that every stack byte is written before it is read and that every RET is reached with each
     nonvolatile register holding its entry value, on every path.
 
-    Per stack byte: 1 once a store writes it; 2 + 8 * i + k while it holds byte k of the entry value of
-    NONVOLATILE[i], saved by PUSH or MOV [RSP+d] while that register holds its entry value; 0 when not
+    Per stack byte: 1 once a store writes it; a code of its own (2 and up, one per byte of each register in
+    SAVED) while it holds byte k of the entry value of a saved register, stored by PUSH, MOV [RSP+d] or, for
+    the low 16 bytes of XMM6-XMM15, a 128-bit move while that register holds its entry value; 0 when not
     written on some path, or released since: when ADD RSP or POP raises RSP, the bytes it leaves below RSP
     become 0 after the POP has read its source, because their contents may change before a later allocation
-    brings them back into the frame. Per nonvolatile register: "entry", "written" since entry or the last restore, or
+    brings them back into the frame. Per saved register: "entry", "written" since entry or the last restore, or
     None when paths disagree. A join keeps what both sides agree on. A save is not a read of the entry value
     as data, so its register read is removed from effects before the register pass."""
     instructions = function.instructions
-    saved = {register: bytes(range(2 + 8 * i, 10 + 8 * i)) for i, register in enumerate(NONVOLATILE)}
+    saved, code = {}, 2
+    for register in SAVED:
+        saved[register] = bytes(range(code, code + SAVE_WIDTH[register]))
+        code += SAVE_WIDTH[register]
+    owner = {value: register for register, codes in saved.items() for value in codes}
 
     def step(ip, status, data):
         if ip in function.calls:
@@ -1365,11 +1559,11 @@ def prove_frame(function, order, effects, frame):
             # function's own home space above entry RSP, is kept.
             index = frame.offsets[ip] - frame.start
             return status, data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
-        status, restored = dict(zip(NONVOLATILE, status)), None
+        status, restored = dict(zip(SAVED, status)), None
         if ip in frame.accesses:
             offset, width, reads, writes = frame.accesses[ip]
             index, register = offset - frame.start, slot_register(instructions[ip])
-            if reads and register is not None and data[index:index + 8] == saved[register]:
+            if reads and register is not None and data[index:index + width] == saved[register]:
                 restored = register
             if writes:
                 value = saved[register] if register is not None and status[register] == "entry" else b"\1" * width
@@ -1382,7 +1576,7 @@ def prove_frame(function, order, effects, frame):
                 status[register] = "entry" if register == restored else "written"
         return tuple(status.values()), data
 
-    state = {function.entry: (("entry",) * len(NONVOLATILE), bytes(frame.size))}
+    state = {function.entry: (("entry",) * len(SAVED), bytes(frame.size))}
     work = [function.entry]
     while work:
         ip = work.pop()
@@ -1396,26 +1590,26 @@ def prove_frame(function, order, effects, frame):
                 work.append(successor)
     for ip in order:
         ins, (status, data) = instructions[ip], state[ip]
-        status, reads, register = dict(zip(NONVOLATILE, status)), effects[ip][0], slot_register(ins)
+        status, reads, register = dict(zip(SAVED, status)), effects[ip][0], slot_register(ins)
         offset, width, loads, stores = frame.accesses.get(ip, (0, 0, False, False))
         if stores and register is not None and status[register] == "entry":
             del reads[register]
         for read in reads:
             if status.get(read, "written") != "written":
-                raise ValueError(f"nonvolatile register {NAMES[read]} may hold the caller's value where RVA "
-                                 f"{ip:#x} reads it")
+                raise ValueError(f"nonvolatile register {saved_name(read)} may hold the caller's value where "
+                                 f"RVA {ip:#x} reads it")
         got = data[offset - frame.start:offset - frame.start + width]
         if loads and got != b"\1" * width and not (register is not None and got == saved[register]):
             if 0 in got:
                 raise ValueError(f"undefined stack byte at entry RSP{offset + got.index(0):+#x} at RVA {ip:#x}")
             raise ValueError(f"stack bytes at entry RSP{offset:+#x} hold the saved "
-                             f"{NAMES[NONVOLATILE[(max(got) - 2) // 8]]}, read as data at RVA {ip:#x}")
+                             f"{saved_name(owner[max(got)])}, read as data at RVA {ip:#x}")
         if ins.mnemonic == M.RET or ip in function.tails:
             site = "tail jump" if ip in function.tails else "RET"
             for register, value in status.items():
                 if value != "entry":
-                    raise ValueError(f"nonvolatile register {NAMES[register]} is not restored on every path to "
-                                     f"the {site} at RVA {ip:#x}")
+                    raise ValueError(f"nonvolatile register {saved_name(register)} is not restored on every "
+                                     f"path to the {site} at RVA {ip:#x}")
 
 
 def flag_producer(function, edges, consumer):
@@ -1673,10 +1867,13 @@ def lift_function(program, entry, symbol, arguments, internal):
               and RegisterExt.size(ins.op0_register) >= 4 and full(ins.op0_register) in effects[ip][1]}
     prove_frame(function, order, effects, frame)
 
-    # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
-    # the translation does not reproduce). Arguments are defined at entry; joins meet as (min, or).
-    state = {ip: dict.fromkeys(NAMES, (8, False)) for ip in order}
-    state[entry] = {r: (8 if r in function.arguments else 0, False) for r in NAMES}
+    # Per register: (low bytes defined on every path: 0, 1, 2 or 8, and 0, 16 or 32 for a vector register;
+    # may hold a guest address that the translation does not reproduce). Integer arguments are defined at
+    # entry; no vector register is, since floating-point arguments are not supported and XMM6-XMM15 hold the
+    # caller's values. Joins meet as (min, or).
+    universe = (*NAMES, *VECTORS)
+    state = {ip: {r: (32 if r in VECTOR_NAMES else 8, False) for r in universe} for ip in order}
+    state[entry] = {r: (8 if r in function.arguments else 0, False) for r in universe}
     changed = True
     while changed:
         changed = False
@@ -1684,23 +1881,35 @@ def lift_function(program, entry, symbol, arguments, internal):
             _, writes, kills = effects[ip]
             out = dict(state[ip])
             for r, width in writes.items():
-                # A 32- or 64-bit write defines all eight bytes; an 8- or 16-bit write keeps the rest.
-                out[r] = (8, False) if width >= 4 else (max(out[r][0], width), out[r][1])
+                if r in VECTOR_NAMES:
+                    # A VEX write defines all 32 bytes; a legacy SSE write defines 16 and keeps bytes 16-31.
+                    out[r] = (max(out[r][0], width), False)
+                else:
+                    # A 32- or 64-bit write defines all eight bytes; an 8- or 16-bit write keeps the rest.
+                    out[r] = (8, False) if width >= 4 else (max(out[r][0], width), out[r][1])
             if ip in copies:
                 dst, src, width = copies[ip]
                 defined, guest = state[ip][src]
                 out[dst] = (8 if defined >= width else defined, guest)
             for r in kills:
                 out[r] = (0, True)
+            if instructions[ip].mnemonic == M.VZEROUPPER:
+                for r in VECTORS:
+                    out[r] = (min(out[r][0], 16), out[r][1])
             if ip in function.calls:
                 # The callee may change every volatile register. RAX keeps the low bytes that the
-                # callee defines at every reachable return; nonvolatile registers are kept.
+                # callee defines at every reachable return; nonvolatile registers are kept, and of
+                # XMM6-XMM15 only their low 16 bytes.
                 for r in VOLATILE:
                     out[r] = (0, False)
                 out[R.RAX] = (callees[ip].return_width, False)
+                for r in VOLATILE_VECTORS:
+                    out[r] = (0, False)
+                for r in NONVOLATILE_VECTORS:
+                    out[r] = (min(out[r][0], 16), out[r][1])
             for successor in function.successors[ip]:
                 old = state[successor]
-                merged = {r: (min(old[r][0], out[r][0]), old[r][1] or out[r][1]) for r in NAMES}
+                merged = {r: (min(old[r][0], out[r][0]), old[r][1] or out[r][1]) for r in universe}
                 if merged != old:
                     state[successor] = merged
                     changed = True
@@ -1715,7 +1924,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if missing:
             if ip in callees:
                 raise ValueError(f"callee argument {NAMES[min(missing)]} is undefined at RVA {ip:#x}")
-            raise ValueError(f"undefined register {NAMES[min(missing)]} at RVA {ip:#x}")
+            raise ValueError(f"undefined register {register_name(min(missing))} at RVA {ip:#x}")
         if ip in function.tails:
             # The callee returns to this function's caller with its own defined RAX bytes.
             widths.append(callees[ip].return_width)
@@ -1741,6 +1950,9 @@ def lift_function(program, entry, symbol, arguments, internal):
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
+    if lifter.vector_registers:
+        named = [VECTOR_NAMES[r] for r in VECTORS if r in lifter.vector_registers]
+        declarations.append("vec " + ", ".join(f"{name} = {{}}" for name in named) + ";")
     if any(ins.code in STRING_TRANSFERS or ins.mnemonic in (M.CLD, M.STD) for ins in instructions.values()):
         declarations.append("bool direction = false;  // Windows x64 ABI entry state")
     function.image_data = lifter.image_used
@@ -1810,6 +2022,29 @@ template <class T> static T load_always(word address) {
 }
 template <class T> static void store(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+}
+// A vector register: q[0] and q[1] are XMMn, all four quadwords YMMn.
+struct vec { std::uint64_t q[4]; };
+extern "C" __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long, unsigned long,
+                                                               const unsigned long long*);
+// An aligned vector move (MOVAPS, MOVAPD, MOVDQA and their VEX forms) of a misaligned operand raises #GP before
+// any access, which Windows reports as STATUS_ACCESS_VIOLATION reading 0xffffffffffffffff.
+static inline void vector_alignment(word address, word mask) {
+    if (address & mask) {
+        const unsigned long long information[2] = {0ull, ~0ull};
+        RaiseException(0xC0000005ul, 0ul, 2ul, information);
+    }
+}
+// A guest vector read: each quadword read once, in ascending address order, so an inaccessible byte faults.
+template <int N> static void load_vector(vec& v, word address) {
+    for (int k = 0; k < N; ++k) v.q[k] = load_always<std::uint64_t>(address + 8ull * k);
+}
+// A guest vector write. The last byte is first written back with its own value, so a store that reaches an
+// unwritable page faults before it changes any byte, as the single original store does.
+template <int N> static void store_vector(word address, const vec& v) {
+    volatile std::uint8_t* const last = reinterpret_cast<volatile std::uint8_t*>(address + 8ull * N - 1);
+    *last = *last;
+    for (int k = 0; k < N; ++k) *reinterpret_cast<volatile std::uint64_t __unaligned*>(address + 8ull * k) = v.q[k];
 }
 """
 

@@ -667,6 +667,36 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${switch_strings_mutants_dll}")
     set_tests_properties(cpu_aot_switch_strings PROPERTIES TIMEOUT 60
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_switch_strings.txt")
+    # Vector data moves, zeroing idioms and VZEROUPPER in the control-flow translator, with refusal controls in
+    # the same image and three compiled incorrect translations that the comparison must detect.
+    cpu_asm_fixture(cpu_switch_vectors switch_vectors)
+    cpu_translation(cpu_switch_vectors cpu_switch_aot
+        copy_legacy,copy_aligned,copy_vex,copy_vex_aligned,upper_halves,zeroing,frame_moves,save_xmm6,loop_blocks,rip_constants,anchored_vectors
+        IMAGE_DATA)
+    set(switch_vectors_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_vectors_lifted_o2.dll")
+    add_custom_command(OUTPUT "${switch_vectors_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_vectors_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_vectors_lifted_o2.obj" "/Fe${switch_vectors_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_vectors_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_switch_vectors_lifted_o2 ALL DEPENDS "${switch_vectors_o2}")
+    set(switch_vectors_mutants "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_vectors_mutants.cpp")
+    add_custom_command(OUTPUT "${switch_vectors_mutants}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/switch_vectors_check.py"
+            mutants "$<TARGET_FILE:cpu_switch_vectors>" "${switch_vectors_mutants}"
+        DEPENDS cpu_switch_vectors tests/cpu/switch_vectors_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    set(switch_vectors_mutants_dll "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_vectors_mutants.dll")
+    add_custom_command(OUTPUT "${switch_vectors_mutants_dll}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${switch_vectors_mutants}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_vectors_mutants.obj" "/Fe${switch_vectors_mutants_dll}"
+        DEPENDS "${switch_vectors_mutants}" VERBATIM)
+    add_custom_target(cpu_switch_vectors_mutants ALL DEPENDS "${switch_vectors_mutants_dll}")
+    add_test(NAME cpu_aot_switch_vectors COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_vectors_check.py" check "$<TARGET_FILE:cpu_guarded_call>"
+        "$<TARGET_FILE:cpu_switch_vectors>" "$<TARGET_FILE:cpu_switch_vectors_lifted>" "${switch_vectors_o2}"
+        "${switch_vectors_mutants_dll}")
+    set_tests_properties(cpu_aot_switch_vectors PROPERTIES TIMEOUT 60
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_switch_vectors.txt")
     cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
     add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_addr32_check.py" "$<TARGET_FILE:cpu_switch_addr32>"

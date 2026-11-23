@@ -1,0 +1,26 @@
+EXPORTS
+    copy_legacy
+    copy_aligned
+    copy_vex
+    copy_vex_aligned
+    upper_halves
+    zeroing
+    frame_moves
+    save_xmm6
+    loop_blocks
+    rip_constants
+    anchored_vectors
+    bad_undefined
+    bad_after_call
+    bad_upper_after_call
+    bad_vzeroupper
+    bad_legacy_upper
+    bad_unrestored
+    bad_caller_xmm6
+    bad_saved_as_data
+    bad_frame_misaligned
+    bad_frame_aligned32
+    bad_anchored_misaligned
+    bad_rip_misaligned
+    bad_xor_logic
+    bad_integer_transfer

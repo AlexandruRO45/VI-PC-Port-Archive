@@ -84,7 +84,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | SPIR-V sampler views at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V` |
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 
-The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#string-memory-transfers-in-the-control-flow-cpu-lifter). MOVS and STOS, with and without REP, copy and fill 1-, 2-, 4- and 8-byte elements in either direction.
+The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#string-memory-transfers-in-the-control-flow-cpu-lifter). MOVS and STOS, with and without REP, copy and fill 1-, 2-, 4- and 8-byte elements in either direction. It also translates [128- and 256-bit vector data moves](docs/experiments.md#vector-data-moves-in-the-control-flow-cpu-lifter), the XOR zeroing idiom and VZEROUPPER, including XMM6-XMM15 saved through the frame. Vector arithmetic remains unsupported.
 
 ### Tests by area
 
