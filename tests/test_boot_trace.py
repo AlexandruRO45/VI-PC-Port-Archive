@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -138,18 +139,23 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["exit"], 0)
 
     def test_exception_stack_keeps_the_runtime_frame_depth(self):
-        frames = [f"fixture.dll+0x{offset:x}" for offset in range(17)]
-        for stack in (frames[:16], frames):
+        header = os.path.join(ROOT, "runtime", "shims", "startup_trace.h")
+        with open(header, encoding="utf-8") as source:
+            match = re.search(r"\bkMaxFrames\s*=\s*(\d+)\s*;", source.read())
+        self.assertIsNotNone(match, "expected the runtime stack depth in startup_trace.h")
+        depth = int(match.group(1))
+        frames = [f"fixture.dll+0x{offset:x}" for offset in range(depth)]
+        for stack in (frames, [*frames, "past-runtime-limit"]):
             with self.subTest(frame_count=len(stack)):
                 self.write(self.startup, [{"kind": "exception", "stack": stack}])
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
                     self.assertEqual(bt.main([self.startup, "--json"]), 0)
                 summary = json.loads(output.getvalue())
-                self.assertEqual(summary["startup"]["exceptions"][0]["stack"], frames[:16])
-                full = bt.format_text(summary, 16)
-                self.assertIn("stack: " + ", ".join(frames[:16]), full)
-                self.assertIn("stack: " + frames[0] + ", ... 15 more", bt.format_text(summary, 1))
+                self.assertEqual(summary["startup"]["exceptions"][0]["stack"], frames)
+                full = bt.format_text(summary, depth)
+                self.assertIn("stack: " + ", ".join(frames), full)
+                self.assertIn(f"stack: {frames[0]}, ... {depth - 1} more", bt.format_text(summary, 1))
 
     def test_exception_limit_keeps_final_observation(self):
         early = [
