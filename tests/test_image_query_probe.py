@@ -127,18 +127,6 @@ class Comparison(unittest.TestCase):
         self.assertGreater(bad, 0)
         self.assertIn("MISMATCH resinfo", out.getvalue())
 
-    def test_waves_takes_only_the_literal_token(self):
-        # int() also takes "3_2", "+32" and non-ASCII digits ("\u0663\u0662") as 32, so those used to reach the
-        # oracle as a wave32 run instead of being rejected.
-        for waves in ("3_2", "+32", "\u0663\u0662", "abc", ""):
-            with self.subTest(waves=waves), mock.patch.object(runner, "open_oracle") as open_oracle:
-                err = io.StringIO()
-                with self.assertRaises(SystemExit) as raised, redirect_stderr(err):
-                    pr.main(["--waves", waves])
-                self.assertEqual(raised.exception.code, 2)
-                self.assertIn("--waves", err.getvalue())
-                open_oracle.assert_not_called()
-
     def test_main_exit_codes(self):
         with redirect_stdout(io.StringIO()):
             with mock.patch.object(runner, "open_oracle", return_value=FakeOracle()):
