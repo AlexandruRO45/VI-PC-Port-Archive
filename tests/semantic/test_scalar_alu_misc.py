@@ -228,6 +228,9 @@ def translate_ps(lines: list[str]) -> str:
     return spv
 
 
+PUSH_VSHARP = [0x1000, 0, 0x1000, 0x31016FAC] + [0] * 28
+
+
 def run_ps_quad(lines: list[str]) -> tuple[int, int, int, int]:
     """Translate PS instructions and return the four exported 32-bit words (v0, v1, v2, v3)."""
     words = mrt0_words(translate_ps(lines))
@@ -396,6 +399,89 @@ class TestScalarAshrI32(unittest.TestCase):
                     "v_mov_b32 v3, 0",
                 ])
                 self.assertEqual((w0, w1), (want_d, want_scc))
+
+    def test_runtime_loaded_operands_modulo32_and_scc_transitions(self):
+        # Translate one shader that loads two (s0, s1) operand pairs from buffer memory at runtime
+        # (so neither operand is known to the translator at compile time) and executes two chained
+        # s_ashr_i32 instructions without re-seeding SCC between them, exercising 0->1, 1->0, 1->1,
+        # and 0->0 SCC transitions and modulo-32 shift masking on runtime SGPRs.
+        spv = translate_ps([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",                 # initial SCC = 0
+            "s_ashr_i32 s8, s4, s5",             # step 1: transition from initial SCC = 0
+            "s_cselect_b32 s9, 1, 0",
+            "s_ashr_i32 s10, s6, s7",            # step 2: transition directly from step 1's SCC
+            "s_cselect_b32 s11, 1, 0",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        transition_pairs = [
+            # 0 -> 1 (negative sign-extend with dirty shift 33 -> shift 1), then 1 -> 0 (positive >> 63 -> 0)
+            (0x80000000, 33, 0x7FFFFFFF, 63),
+            # 0 -> 0 (0 >> 0xFFFFFFE0 -> 0), then 0 -> 1 (-1 >> 0xFFFFFFFF -> -1)
+            (0x00000000, 0xFFFFFFE0, 0xFFFFFFFF, 0xFFFFFFFF),
+            # 0 -> 1 (0x12345678 >> 32 -> 0x12345678), then 1 -> 1 (0x80000001 >> 0x8000001F -> -1)
+            (0x12345678, 32, 0x80000001, 0x8000001F),
+            # 0 -> 1 (0x7FFFFFFF >> 30 -> 1), then 1 -> 0 (0x00000001 >> 0x00000021 -> 0)
+            (0x7FFFFFFF, 30, 0x00000001, 0x00000021),
+            # 0 -> 0 (0x0000000F >> 0x00000024 -> 0), then 0 -> 0 (0x00000000 >> 17 -> 0)
+            (0x0000000F, 0x00000024, 0x00000000, 17),
+        ]
+        for idx, (s0, s1, _, _) in enumerate(ORACLE_ASHR_I32):
+            next_s0, next_s1, _, _ = ORACLE_ASHR_I32[(idx + 1) % len(ORACLE_ASHR_I32)]
+            transition_pairs.append((s0, s1, next_s0, next_s1))
+
+        for s0_a, sh_a, s0_b, sh_b in transition_pairs:
+            want_da, want_scca = ref_s_ashr_i32(s0_a, sh_a)
+            want_db, want_sccb = ref_s_ashr_i32(s0_b, sh_b)
+            mem = {
+                0x1000: s0_a,
+                0x1004: sh_a,
+                0x1008: s0_b,
+                0x100C: sh_b,
+            }
+            with self.subTest(s0_a=hex(s0_a), sh_a=hex(sh_a), s0_b=hex(s0_b), sh_b=hex(sh_b)):
+                got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+                self.assertEqual(got, (want_da, want_scca, want_db, want_sccb))
+
+    def test_runtime_loaded_special_registers_and_aliasing(self):
+        # One translated shader exercising runtime-loaded m0 shift count, dst==src0, dst==src1,
+        # dst==src0==src1, and null destination with SCC transition 1 -> 0.
+        spv = translate_ps([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_mov_b32 m0, s5",                  # runtime shift count with dirty upper bits in m0
+            "s_ashr_i32 s4, s4, m0",             # dst == src0, shift by m0[4:0]
+            "s_ashr_i32 s5, s6, s5",             # dst == src1 (shift count register)
+            "s_ashr_i32 s7, s7, s7",             # dst == src0 == src1
+            "s_cmp_eq_u32 1, 1",                 # pre-seed SCC = 1
+            "s_ashr_i32 null, s6, 31",           # positive s6 >> 31 == 0 -> SCC transitions 1 -> 0
+            "s_cselect_b32 s8, 1, 0",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "v_mov_b32 v2, s7",
+            "v_mov_b32 v3, s8",
+        ])
+        mem = {
+            0x1000: 0x80000000,                  # s4: -2^31
+            0x1004: 0xFFFFFFE4,                  # s5: low 5 bits = 4
+            0x1008: 0x40000000,                  # s6: +2^30 (positive)
+            0x100C: 0xFFFFFFF0,                  # s7: -16 (low 5 bits = 16; -16 >> 16 = -1)
+        }
+        got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+        self.assertEqual(
+            got,
+            (
+                ref_s_ashr_i32(0x80000000, 0xFFFFFFE4)[0],
+                ref_s_ashr_i32(0x40000000, 0xFFFFFFE4)[0],
+                ref_s_ashr_i32(0xFFFFFFF0, 0xFFFFFFF0)[0],
+                0,
+            ),
+        )
 
 
 class TestScalarSubI32(unittest.TestCase):
@@ -791,19 +877,42 @@ class TestNegativeControls(unittest.TestCase):
     """Sabotage checks confirming the SPIR-V assertions catch broken translations."""
 
     def test_sabotage_ashr_sub_lshl3_cmp_and_cselect(self):
-        # 1. s_ashr_i32: replacing arithmetic shift with logical shift breaks negative sign extension.
+        # 1. s_ashr_i32: replacing arithmetic shift with logical shift breaks negative sign extension,
+        #    and sabotaging the runtime modulo-32 mask or SCC store breaks runtime-loaded operands.
         spv_ashr = translate_ps([
-            "s_mov_b32 s2, 0x80000000",
-            "s_ashr_i32 s0, s2, 1",
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",
+            "s_ashr_i32 s0, s4, s5",
+            "s_cselect_b32 s1, 1, 0",
             "v_mov_b32 v0, s0",
-            "v_mov_b32 v1, 0",
+            "v_mov_b32 v1, s1",
             "v_mov_b32 v2, 0",
             "v_mov_b32 v3, 0",
         ])
-        self.assertEqual(mrt0_words(spv_ashr)[0], 0xC0000000)
+        ashr_mem = {0x1000: 0x80000000, 0x1004: 33}  # 33 & 31 == 1 -> 0xC0000000, SCC = 1
+        self.assertEqual(
+            tuple(mrt0_words(spv_ashr, push_constants=PUSH_VSHARP, memory=ashr_mem)[:2]),
+            (0xC0000000, 1),
+        )
         bad_ashr = spv_ashr.replace("OpShiftRightArithmetic %int", "OpShiftRightLogical %int", 1)
         self.assertNotEqual(bad_ashr, spv_ashr)
-        self.assertNotEqual(mrt0_words(bad_ashr)[0], 0xC0000000)
+        self.assertNotEqual(
+            mrt0_words(bad_ashr, push_constants=PUSH_VSHARP, memory=ashr_mem)[0],
+            0xC0000000,
+        )
+        bad_ashr_mask = spv_ashr.replace("OpBitwiseAnd %uint", "OpBitwiseOr %uint")
+        self.assertNotEqual(bad_ashr_mask, spv_ashr)
+        self.assertNotEqual(
+            mrt0_words(bad_ashr_mask, push_constants=PUSH_VSHARP, memory=ashr_mem)[0],
+            0xC0000000,
+        )
+        bad_ashr_scc = spv_ashr.replace("OpStore %scc", "OpStore %vcc_hi")
+        self.assertNotEqual(bad_ashr_scc, spv_ashr)
+        self.assertNotEqual(
+            mrt0_words(bad_ashr_scc, push_constants=PUSH_VSHARP, memory=ashr_mem)[1],
+            1,
+        )
 
         # 2. s_sub_i32: losing overflow detection breaks SCC on INT_MIN - 1.
         spv_sub = translate_ps([
