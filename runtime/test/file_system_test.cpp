@@ -1200,6 +1200,11 @@ void run_checks(const std::filesystem::path& root) {
             check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package only",
                   "a package file in a folder the overlay also has still reads from the package");
             if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            SetLastError(0);
+            check(create_w(L"T:\\missing.bin", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr) ==
+                          INVALID_HANDLE_VALUE &&
+                      GetLastError() == ERROR_FILE_NOT_FOUND,
+                  "a write-open of the missing name on T:\\ answers ERROR_FILE_NOT_FOUND as well");
             check(!std::filesystem::exists(overlay / ".gta6rt-temp" / "missing.bin") &&
                       !std::filesystem::exists(overlay / "titlemade" / "missing.bin"),
                   "and the failed reads leave nothing behind");
