@@ -335,7 +335,13 @@ class Analysis:
         ua = (a["ua"] & b["ua"]) if a["x"] == b["x"] else u
         return {"t": t, "g": g, "x": x, "xg": a["xg"] if a["xg"] == b["xg"] else None, "f": a["f"] and b["f"],
                 "u": u, "ua": ua, "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
-                "r": self.union_map(a["r"], b["r"]), "b": self.union_map(a["b"], b["b"])}
+                "r": self.union_map(a["r"], b["r"]), "b": self.union_map(a["b"], b["b"]),
+                "p": self.join_pre(a["p"], b["p"])}
+
+    @staticmethod
+    def join_pre(a, b):
+        """st["p"] at a join: every (VGPR, EXEC token) either side wrote under a narrowed EXEC, the taints or-ed."""
+        return {k: a.get(k, 0) | b.get(k, 0) for k in set(a) | set(b)}
 
     @staticmethod
     def union_map(a, b):
@@ -343,12 +349,12 @@ class Analysis:
 
     def entry(self):
         return {"t": {}, "g": {}, "x": ("e",), "xg": None, "f": True, "u": frozenset(), "ua": frozenset(), "l": {},
-                "r": {}, "b": {}}
+                "r": {}, "b": {}, "p": {}}
 
     # ---- the transfer function ----
     def block(self, n, st, ev):
         st = {"t": dict(st["t"]), "g": dict(st["g"]), "x": st["x"], "xg": st["xg"], "f": st["f"], "u": st["u"],
-              "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"])}
+              "ua": st["ua"], "l": dict(st["l"]), "r": dict(st["r"]), "b": dict(st["b"]), "p": dict(st["p"])}
         for i, ins in enumerate(self.blocks[n]):
             self.step(n, i, ins, st, ev)
         return st
@@ -442,6 +448,9 @@ class Analysis:
             for r in _regs(a_):
                 if r == "exec":
                     continue
+                if isinstance(r, tuple) and r[0] == "v" and not st["f"]:
+                    # the lanes EXEC has off keep what this VGPR held when it narrowed: widen() brings that back
+                    st["p"].setdefault((r, st["x"]), T.get(r, 0))
                 T[r] = t
                 st["g"].pop(r, None)
                 if tag is not None:
@@ -1030,6 +1039,7 @@ class Analysis:
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
                 st["ua"] = st["u"]
+                self.widen(st, mg[1])
                 if op == "s_or_b64":                            # s_mov_b64 leaves SCC as it was
                     T["scc"] = X
                     st["g"]["scc"] = ("vote", "exec")
@@ -1045,6 +1055,7 @@ class Analysis:
                 self.tok[site] = (None, None, False)
                 st["xg"], st["f"] = None, False
                 st["ua"] = st["u"]
+                self.widen(st, None)                        # an EXEC of unknown extent: any lane can be back
                 if mt & ~0:
                     for b, name in NAMES.items():
                         if mt & b and not (b & ELECT):
@@ -1058,6 +1069,22 @@ class Analysis:
         self.tok[site] = (None, None, False)
         st["xg"], st["f"] = None, False
         st["ua"] = st["u"]
+        self.widen(st, None)
+
+    def widen(self, st, tok):
+        """EXEC widens back to token `tok` (None: to an EXEC of unknown extent). The lanes a narrower EXEC had off
+        read again what they held when it narrowed, so each VGPR written under it (st["p"]) gets that taint back next
+        to the one it has, and loses its tag, which only described the lanes that were on. An elected lane's tag
+        stays: v_readfirstlane reads that lane back (the aggregated-atomic idiom)."""
+        T = st["t"]
+        for (r, t0), pre in list(st["p"].items()):
+            if tok is not None and (t0 == tok or self.ancestor(t0, tok)):
+                continue
+            T[r] = T.get(r, 0) | pre
+            g = st["g"].get(r)
+            if g is not None and g[0] != "elect":
+                del st["g"][r]
+            del st["p"][(r, t0)]
 
     def ancestor(self, anc, tok):
         seen = set()
