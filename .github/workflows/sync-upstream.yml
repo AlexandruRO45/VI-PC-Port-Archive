@@ -17,10 +17,26 @@ jobs:
         run: git remote add upstream https://github.com/ItsNotRexed/Leonida.git
       - name: Fetch upstream
         run: git fetch upstream main
-      - name: Merge upstream
+      # main is upstream main plus only this fork's own workflows. A merge keeps the history tidy when the
+      # two sides touch different files; when they touch the same one, the merge conflicts and the schedule
+      # would stay red until someone resolved it by hand (that is what happened on 2026-11-22: main was
+      # 7583 commits behind and the merge fought over tools/rdna2spirv.py). In that case rebuild main as
+      # upstream main plus the workflows, which is what it is supposed to be anyway.
+      - name: Merge upstream, or mirror it when the merge conflicts
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git merge upstream/main --no-edit || (git merge --abort && echo "Merge conflict" && exit 1)
+          if git merge upstream/main --no-edit; then
+            echo "merged upstream/main"
+          else
+            git merge --abort
+            echo "conflict: rebuilding main as upstream/main plus this fork's workflows"
+            mkdir -p /tmp/fork-workflows
+            cp .github/workflows/sync-upstream.yml .github/workflows/auto-cleanup-fork.yml /tmp/fork-workflows/
+            git reset --hard upstream/main
+            cp /tmp/fork-workflows/*.yml .github/workflows/
+            git add .github/workflows
+            git commit -m "sync: mirror upstream main (conflicting merge)"
+          fi
       - name: Push
-        run: git push origin main
+        run: git push --force-with-lease origin main
