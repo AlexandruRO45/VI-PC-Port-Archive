@@ -276,10 +276,22 @@ def split_irreducible(succ, max_factor=2, max_splits=64):
             return None
         # Pick the smallest irreducible SCC (tie-break by earliest RPO position).
         scc = min(sccs, key=lambda c: (len(c), min(pos[x] for x in c)))
-        entries = [x for x in scc if x == 0 or any(p not in scc for p in preds[x])]
+        # Natural sub-loops headed in `scc` whose dominating back-edges were stripped from `adj`:
+        # ignore those back-edges as SCC entries/external predecessors, and clone their body alongside the header.
+        subloop_of = {}
+        for v, h_loop in back:
+            if h_loop in scc and v not in scc and dominates(h_loop, v):
+                body = subloop_of.setdefault(h_loop, set())
+                work = [v]
+                while work:
+                    x = work.pop()
+                    if x != h_loop and x not in scc and x not in body:
+                        body.add(x)
+                        work.extend(preds[x])
+        entries = [x for x in scc if x == 0 or any(p not in scc and not dominates(x, p) for p in preds[x])]
         # Choose a pair (h, e) of SCC entries (e != h, e != 0) minimizing |R|, where R is the closed region of
-        # SCC nodes reachable from e without passing through h. Cloning all of R at once keeps internal cycles
-        # inside the clone instead of re-entering the original SCC and unrolling infinitely.
+        # SCC nodes (plus any private dominated sub-loops) reachable from e without passing through h. Cloning all
+        # of R at once keeps internal cycles inside the clone instead of re-entering the original SCC and unrolling.
         best = None
         for h in entries:
             for e in entries:
@@ -291,6 +303,10 @@ def split_irreducible(succ, max_factor=2, max_splits=64):
                     u = work.pop()
                     for w in g[u]:
                         if w in scc and w != h and w not in region:
+                            region.add(w)
+                            work.append(w)
+                    for w in subloop_of.get(u, ()):
+                        if w not in region:
                             region.add(w)
                             work.append(w)
                 key = (len(region), pos[h], -pos[e])
@@ -310,7 +326,7 @@ def split_irreducible(succ, max_factor=2, max_splits=64):
             g.append([])
         for u in reg_ordered:
             g[clone_of[u]] = [clone_of[w] if w in clone_of else w for w in g[u]]
-        ext_preds = {p for p in preds[e] if p not in scc}
+        ext_preds = {p for p in preds[e] if p not in scc and not dominates(e, p)}
         ce = clone_of[e]
         for p in ext_preds:
             g[p] = [ce if w == e else w for w in g[p]]

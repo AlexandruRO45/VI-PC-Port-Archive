@@ -247,10 +247,76 @@ def test_deep_sequential_chains_stay_flat_and_iterative():
         assert got == want
 
 
+def test_split_irreducible_dominating_back_edges():
+    """Dominating back-edges inside an SCC must neither create fake entries nor break private sub-loops."""
+    def check_semantics(graph, new_succ, orig, seeds=6, limit=300):
+        tree = S.structure(new_succ)
+        assert tree is not None, f"split_irreducible left graph irreducible: {graph}"
+        placed = blocks_in(tree)
+        assert len(placed) == len(set(placed)), f"a split block is placed twice: {graph}"
+        for seed in range(seeds):
+            want = walk(graph, chooser(graph, seed), limit)
+            visits = {}
+
+            def split_choose(b, _o=orig, _ns=new_succ, _s=seed, _v=visits):
+                ob = _o[b]
+                k = _v[ob] = _v.get(ob, 0) + 1
+                opts = _ns[b]
+                return S.END if not opts else opts[branch_index(_s, ob, k, len(opts))]
+
+            got = [orig[b] for b in S.run(tree, split_choose, limit)]
+            assert got == want, f"graph {graph} seed {seed}: split ran {got}, original runs {want}"
+
+    # 1. Node 3 dominates sub-loop 4->5->8->9->3 (stripped from adj); only {2, 6} needs cloning (+2 blocks).
+    g_fake_entry = [[1, 2], [2, 3, 7], [6], [4, 1], [5], [8], [1], [], [9], [3]]
+    assert S.structure(g_fake_entry) is None
+    res = S.split_irreducible(g_fake_entry)
+    assert res is not None
+    ns, orig = res
+    assert len(ns) == 12 and orig == list(range(10)) + [2, 6], f"unexpected fake-entry split: len={len(ns)} orig={orig}"
+    assert S.split_irreducible(g_fake_entry, max_splits=2) == (ns, orig)
+    check_semantics(g_fake_entry, ns, orig)
+
+    # 2. Graph from the 20k sweep previously refused under default max_factor=2, max_splits=64.
+    g_cap_refused = [[2, 7], [4, 6], [6], [4, 7], [3], [0, 7], [1], [9], [9], [1, 8]]
+    assert S.structure(g_cap_refused) is None
+    res2 = S.split_irreducible(g_cap_refused)
+    assert res2 is not None, "expected g_cap_refused to split within default budget"
+    ns2, orig2 = res2
+    assert len(ns2) == 14, f"unexpected block count for g_cap_refused: {len(ns2)} orig={orig2}"
+    check_semantics(g_cap_refused, ns2, orig2)
+
+    # 3. Genuine entry 2 heads private dominated sub-loop(s) that must clone together with 2 once.
+    g_priv_sub = [[1, 2], [5], [1, 3], [2, 4], [], [6], [2]]
+    res3 = S.split_irreducible(g_priv_sub)
+    assert res3 is not None
+    ns3, orig3 = res3
+    assert len(ns3) == 9 and orig3 == [0, 1, 2, 3, 4, 5, 6, 2, 3], f"unexpected priv-sub split: len={len(ns3)} orig={orig3}"
+    check_semantics(g_priv_sub, ns3, orig3)
+
+    g_priv_nested = [[1, 2], [5], [1, 3], [4, 2], [8, 3], [6], [7], [2], [3, 9], []]
+    res4 = S.split_irreducible(g_priv_nested)
+    assert res4 is not None
+    ns4, orig4 = res4
+    assert len(ns4) == 14 and orig4 == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 8], (
+        f"unexpected nested priv-sub split: len={len(ns4)} orig={orig4}")
+    check_semantics(g_priv_nested, ns4, orig4)
+
+    # 4. Inner irreducible SCC inside outer reducible loop (head 1), with non-entry node 4 heading sub-loop 5->4.
+    g_outer_inner = [[1], [2, 3], [3], [4, 6], [5, 2], [4], [1, 7], []]
+    assert S.structure(g_outer_inner) is None
+    res5 = S.split_irreducible(g_outer_inner)
+    assert res5 is not None
+    ns5, orig5 = res5
+    assert len(ns5) == 9 and orig5 == [0, 1, 2, 3, 4, 5, 6, 7, 2], f"unexpected outer-inner split: len={len(ns5)} orig={orig5}"
+    check_semantics(g_outer_inner, ns5, orig5)
+
+
 if __name__ == "__main__":
     test_depth()
     test_shapes()
     test_deep_sequential_chains_stay_flat_and_iterative()
+    test_split_irreducible_dominating_back_edges()
     structured, refused, loops, split_ok, split_cap = _check_random_graphs()
     print(f"ok: {structured} graphs structured and run, {refused} irreducible "
           f"({split_ok} split-structured, {split_cap} capped), {loops} with loops")
