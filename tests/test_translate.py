@@ -175,7 +175,7 @@ def test_explicit_mip_depth_compare(make_shader, a16, d16):
 ])
 def test_explicit_mip_depth_compare_unmodelled_forms(make_shader, sample):
     shader = make_shader(f"image_sample_c_l {sample}\ns_endpgm\n")
-    with pytest.raises(rdna2spirv.Unsupported, match="scalar 2D depth comparison"):
+    with pytest.raises(rdna2spirv.Unsupported, match="scalar 1D/2D/2D_ARRAY/CUBE depth comparison"):
         shader.translate()
 
 

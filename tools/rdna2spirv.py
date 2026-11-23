@@ -11772,10 +11772,11 @@ class Gen:
             raise Unsupported(op + " destination")
         addr = self.addr_regs(a[1])
         if op == "image_sample_c_l":
-            # Vulkan Dref returns one scalar. Other component masks require the depth view's swizzle.
-            if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
+            # Vulkan Dref returns one scalar and forbids 3D. Other component masks require the depth view's swizzle.
+            expected_addr = 1 + ((ncoord + 2) // 2 if a16 else ncoord + 1)
+            if (is3d or dmask != 1 or len(addr) != expected_addr
                     or any(m not in (dim, dm, "a16", "d16") for m in mods)):
-                raise Unsupported(op + " needs scalar 2D depth comparison")
+                raise Unsupported(op + " needs scalar 1D/2D/2D_ARRAY/CUBE depth comparison")
         img_idx = self.desc_lookup_sgpr(a[2], 8)
         img = None              # a coherent image_load reads the storage view, not this sampled one
         if not coherent:
