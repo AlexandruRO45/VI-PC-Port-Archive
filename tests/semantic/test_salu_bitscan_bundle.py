@@ -334,5 +334,18 @@ class TestSFf1I32B32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 0)
 
 
+class TestSFf1I32B32Bounds(unittest.TestCase):
+    """Bit scanning boundary and edge cases for s_ff1_i32_b32."""
+
+    def test_powers_of_two(self):
+        for b in range(32):
+            self.assertEqual(ref_ff1_i32_b32(1 << b), b)
+
+    def test_dense_and_sparse_patterns(self):
+        self.assertEqual(ref_ff1_i32_b32(0xFFFFFFFF), 0)
+        self.assertEqual(ref_ff1_i32_b32(0x80000001), 0)
+        self.assertEqual(ref_ff1_i32_b32(0x80000000), 31)
+
+
 if __name__ == "__main__":
     unittest.main()
