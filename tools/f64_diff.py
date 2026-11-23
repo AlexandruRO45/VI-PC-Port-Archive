@@ -295,7 +295,10 @@ def ref_program(lines, include_known=False):
                     regs = vgpr if src.startswith("v") else sgpr
                     word = regs.get(int(src[1:]), 0)
                 else: word = int(src, 0)
-                (vgpr if dst.startswith("v") else sgpr)[int(dst[1:])] = word & M32
+                if dst == "vcc_lo":
+                    vcc = word & 1  # the oracle runs lane zero
+                else:
+                    (vgpr if dst.startswith("v") else sgpr)[int(dst[1:])] = word & M32
             continue
         if s.startswith("s_round_mode "):
             mode = (int(s.split(None, 1)[1], 0) >> 2) & 3
@@ -511,6 +514,26 @@ def gen_source(rng, idx, allow_literal=True, bus=None):
     return f"0x{rng.getrandbits(32):08x}"
 
 
+def gen_div_sources(rng, op, allow_literal):
+    # RDNA2 allows two constant-bus sources. FMAS implicitly reads VCC, leaving one slot.
+    slots = 1 if op == "v_div_fmas_f64" else 2
+    bus_sources = set()
+    literal_available = allow_literal
+    sources = []
+    for idx in range(3):
+        source = gen_source(rng, idx, allow_literal)
+        # These decimal operands also encode as a literal dword, unlike the other generated floats.
+        literal = source.startswith("0x") or source in ("-0.0", "1.5", "3.25")
+        if (literal or source.startswith("s[")) and source not in bus_sources:
+            if len(bus_sources) == slots or (literal and not literal_available):
+                source = f"v[{8 + 2*idx}:{9 + 2*idx}]"
+            else:
+                bus_sources.add(source)
+                literal_available = literal_available and not literal
+        sources.append(source)
+    return ", ".join(sources)
+
+
 def maybe_word_modifier(rng, src):
     """Only add modifiers to integer-word paths (round, compare and class), not %double math."""
     if not src.startswith(("v[", "s[")) or rng.random() >= 0.25: return src
@@ -549,10 +572,10 @@ def make_case(rng, op, allow_literal=True, known_case=None):
             setup_lines += ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x7ff80000"]
             body_lines.append(f"{op} v[8:9], v[12:13], 1.0, 2.0")
         else:
-            body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
+            body_lines.append(f"{op} v[8:9], {gen_div_sources(rng, op, allow_literal)}")
     elif op == "v_div_fmas_f64":
         # VCC is initialized true so the f64 scaled FMA path is exercised deterministically.
-        body_lines += ["v_cmp_eq_i32_e32 vcc_lo, 0, 0", f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}"]
+        body_lines += ["s_mov_b32 vcc_lo, -1", f"{op} v[8:9], {gen_div_sources(rng, op, allow_literal)}"]
     elif "class" in op:
         src, mask = maybe_word_modifier(rng, gen_source(rng, 2 if op.startswith("v_cmpx") else 0, allow_literal, bus)), f"0x{rng.randrange(1024):x}"
         if op.startswith("v_cmpx"):

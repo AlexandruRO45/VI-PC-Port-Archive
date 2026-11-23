@@ -97,6 +97,31 @@ class F64DiffTests(unittest.TestCase):
         # the translator now gives the ISA's signed infinity for NaN(S0) too (#4536 was written when it kept the NaN)
         self.assertEqual(known[0], "match")
 
+    def test_division_sources_respect_literal_and_constant_bus_limits(self):
+        for op, allow_literal, candidates, expected in (
+            ("v_div_fixup_f64", True, ("0x12345678", "-0.0", "s[4:5]"),
+             "0x12345678, v[10:11], s[4:5]"),
+            ("v_div_fixup_f64", True, ("s[4:5]", "s[6:7]", "3.25"),
+             "s[4:5], s[6:7], v[12:13]"),
+            ("v_div_fixup_f64", True, ("s[4:5]", "s[6:7]", "s[4:5]"),
+             "s[4:5], s[6:7], s[4:5]"),
+            ("v_div_fmas_f64", True, ("1.5", "s[6:7]", "0.5"),
+             "1.5, v[10:11], 0.5"),
+            ("v_div_fmas_f64", False, ("3.25", "s[6:7]", "2.0"),
+             "v[8:9], s[6:7], 2.0"),
+        ):
+            with self.subTest(op=op, candidates=candidates), \
+                    mock.patch.object(fd, "gen_source", side_effect=candidates):
+                _, body, _, _ = fd.make_case(random.Random(0), op, allow_literal)
+                self.assertEqual(body[-1], f"{op} v[8:9], {expected}")
+
+    def test_div_fmas_initializes_vcc_and_reference_reads_lane_zero(self):
+        _, body, _, _ = fd.make_case(random.Random(0), "v_div_fmas_f64")
+        self.assertEqual(body[0], "s_mov_b32 vcc_lo, -1")
+        fmas = "v_div_fmas_f64 v[8:9], 1.0, 1.0, 1.0"
+        self.assertEqual(fd.ref_program([body[0], fmas])[:2], [0, 0x44000000])
+        self.assertEqual(fd.ref_program(["s_mov_b32 vcc_lo, 2", fmas])[:2], [0, 0x40000000])
+
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
                    "v_cmp_class_f64_e64 s20, v[12:13], 0x3ff"):
