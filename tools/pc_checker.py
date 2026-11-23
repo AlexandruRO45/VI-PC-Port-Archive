@@ -9,6 +9,9 @@ Standard library only; tkinter is needed for the window (Linux: python3-tk).
     python -I tools/pc_checker.py --check      # verdict as exit code: 0 good, 1 weak, 2 unknown
     python -I tools/pc_checker.py --check --json --warn
 
+`--json` and `--warn` change a `--check` run only: either one without `--check` is refused (exit 2) instead of
+being dropped and opening the window.
+
 From Python (e.g. a launcher):
     from pc_checker import SpecChecker
     if not SpecChecker().warn_if_weak():   # popup only if the PC is weak
@@ -961,6 +964,11 @@ def main():
     ap.add_argument("--warn", action="store_true",
                     help="with --check: show a popup when the PC is weak")
     args = ap.parse_args()
+    # Both flags change a --check run only, and every other combination falls through to the window, where they
+    # would be dropped: refuse them instead, so a wrapper that forgets --check sees the mistake rather than a GUI.
+    for flag, given in (("--json", args.json), ("--warn", args.warn)):
+        if given and not args.check:
+            ap.error(f"{flag} needs --check")
     if args.check:
         sys.exit(run_check(args))
     if args.cli or tk is None:
