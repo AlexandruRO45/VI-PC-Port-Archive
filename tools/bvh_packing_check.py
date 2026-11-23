@@ -16,7 +16,9 @@ stream passes when its bytes form exactly one tree under that reading:
 * leaves: every vertex-order byte puts the three vertices in three different slots;
 * stored values: each override lies inside `sceneBounds` mapped through the leaf frame (BOX16 widened to the half
   grid; an infinite BOX16 value only where the bound is outside the half range). Where every slot of the root stores
-  a component, the root's union of that component must equal the bound.
+  a component, the root's union of that component must equal the bound;
+* nothing else: every byte outside the header, the five leaf arrays of each chunk, the used bytes of each group and
+  the level table is zero, so the structure has no other table (docs/bvh.md §3.1, the `BVVDHeader` table).
 
 None of this reads geometry, so it runs on the whole pack. Output holds offsets and counts only.
 
@@ -99,6 +101,16 @@ def _root_equal(value, bound, comp, wide):
     return R.float_to_half(value) == want
 
 
+def _nonzero_outside(src, covered):
+    count, pos = 0, 0
+    for start, end in sorted(covered) + [(len(src), len(src))]:
+        if start > pos:
+            gap = src[pos:start]
+            count += len(gap) - gap.count(0)
+        pos = max(pos, end)
+    return count
+
+
 class Result:
     """Per-stream outcome: failure reasons (counted once each) and summed statistics."""
 
@@ -108,6 +120,11 @@ class Result:
 
     def fail(self, reason, n=1):
         self.fails[reason] += n
+
+    def check_outside(self, src, covered):
+        stray = _nonzero_outside(src, covered)
+        if stray:
+            self.fail("nonzero_outside_packing", stray)
 
 
 def check_stream(buf, at=0):
@@ -134,10 +151,12 @@ def check_stream(buf, at=0):
         return res
     if n and elements + 64 * n > nodes:
         res.fail("leaves_overlap_nodes")
+    covered = [(0, 64)]
     remaining, chunk = n, 0
     while remaining > 0:
         c = min(R.LEAVES_PER_CHUNK, remaining)
         base = elements + chunk * R.CHUNK_STRIDE
+        covered.append((base, base + 11 * c))
         orders = src[base + 10 * c:base + 11 * c]
         bad = orders.translate(VALID_ORDER).count(0)
         if bad:
@@ -149,6 +168,7 @@ def check_stream(buf, at=0):
         st["root_invalid"] += 1
         if n:
             res.fail("invalid_root_with_leaves")
+        res.check_outside(src, covered)
         return res
     root_type = hdr.root & 7
     st["root_type_%d" % root_type] += 1
@@ -156,6 +176,7 @@ def check_stream(buf, at=0):
         # A structure whose root is a single leaf has no box groups or level table to check.
         if root_type == R.TRI0 and n == 1 and ((hdr.root >> 3) << 6) == elements:
             st["root_leaf"] += 1
+            res.check_outside(src, covered)
         else:
             res.fail("root_not_a_box")
         return res
@@ -166,6 +187,7 @@ def check_stream(buf, at=0):
         res.fail("level_table")
         return res
     table_start = total - 4 - 8 * len(lv)
+    covered.append((table_start, total))
     st["levels"] += len(lv)
     st["levels_%d" % len(lv)] += 1
     if lv and nodes + lv[-1][2] + 64 * lv[-1][3] > table_start:
@@ -215,6 +237,7 @@ def check_stream(buf, at=0):
             if used > k * size:
                 res.fail("group_overflow")
                 continue
+            covered.append((base, base + used))
             tail = src[base + used:base + k * size]
             if tail.count(0) != len(tail):
                 st["group_tail_nonzero_bytes"] += len(tail) - tail.count(0)
@@ -233,6 +256,8 @@ def check_stream(buf, at=0):
                     res.fail("too_many_children")
                 if mask >> (6 * min(kids, 4)):
                     res.fail("mask_past_children")
+                if mask:
+                    st["override_slots"] += sum(1 for s in range(4) if mask >> (6 * s) & 63)
                 for ptr in children[ci:ci + kids]:
                     typ = ptr & 7
                     st["child_type_%d" % typ] += 1
@@ -297,6 +322,7 @@ def check_stream(buf, at=0):
         res.fail("leaf_unreferenced", leaf_missing)
     if leaf_shared:
         res.fail("leaf_shared", leaf_shared)
+    res.check_outside(src, covered)
     return res
 
 

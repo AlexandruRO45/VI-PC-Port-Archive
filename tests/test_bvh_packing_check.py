@@ -205,6 +205,47 @@ class TestBroken(unittest.TestCase):
         self.assertEqual(res.stats["root_leaf"], 1)
 
 
+def bvvd(entries):
+    """XboxBvh4BVVDHeader records: u32 variantNodeIndex, then variantChildNode << 6 | variantBitMask, padded to 8."""
+    return b"".join(struct.pack("<IB3x", node, child << 6 | mask) for node, child, mask in entries)
+
+
+class TestNothingOutsidePacking(unittest.TestCase):
+    TABLE = bvvd([(1, 1, 0x09), (2, 0, 0x3F)])
+    STRAY = len(TABLE) - TABLE.count(0)
+
+    def planted(self, at, src=None):
+        src = bytearray(build() if src is None else src)
+        self.assertEqual(src[at:at + len(self.TABLE)].count(0), len(self.TABLE))
+        src[at:at + len(self.TABLE)] = self.TABLE
+        return bytes(src)
+
+    def test_clean_tree(self):
+        self.assertEqual(fails(build()), {})
+
+    def test_table_after_header(self):
+        self.assertEqual(fails(self.planted(64)), {"nonzero_outside_packing": self.STRAY})
+
+    def test_table_after_leaf_arrays(self):
+        self.assertEqual(fails(self.planted(ELEMENTS + 11 * 4)), {"nonzero_outside_packing": self.STRAY})
+
+    def test_table_in_group_tail(self):
+        self.assertEqual(fails(self.planted(NODES + 4 * (2 + 4))), {"nonzero_outside_packing": self.STRAY})
+
+    def test_table_before_level_table(self):
+        self.assertEqual(fails(self.planted(0x2c0)), {"nonzero_outside_packing": self.STRAY})
+
+    def test_table_in_root_leaf_structure(self):
+        src = build(n_leaves=1, root=leaf(0), level0=[], level1=[], table=[])
+        self.assertEqual(fails(self.planted(64, src)), {"nonzero_outside_packing": self.STRAY})
+
+    def test_override_slots(self):
+        src = build(level0=[([leaf(0), leaf(1)], {0: 0.5, 6 + 3: 3.5}), ([leaf(2), leaf(3)], {0: 2.5, 1: 0.5})])
+        res = C.check_stream(src)
+        self.assertEqual(dict(res.fails), {})
+        self.assertEqual((res.stats["override_slots"], res.stats["overrides"]), (3, 4))
+
+
 def payload(structure):
     """A whole bvh4 payload: the 0x100 prefix with the wrapper words, then the structure."""
     end = 0x100 + len(structure)
