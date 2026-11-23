@@ -147,3 +147,104 @@ class TestOracleAndHardwareModel(unittest.TestCase):
             expected = oracle_cvt_i32_f32(bits)
             translated = run_translator_cvt_i32_f32(bits, name=f"ps_oracle_{idx}")
             self.assertEqual(translated, expected, f"Mismatch on bits {bits:#010x}")
+
+
+# ==============================================================================
+# SECTION 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    FLOAT_IMM = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: OperandKind
+    value: Union[int, float]
+    neg: bool = False
+    abs_val: bool = False
+
+    def __post_init__(self) -> None:
+        if self.kind == OperandKind.VGPR:
+            if not isinstance(self.value, int) or not (0 <= self.value <= 255):
+                raise ValueError(f"VGPR index out of range: {self.value}")
+        elif self.kind == OperandKind.SGPR:
+            if not isinstance(self.value, int) or not (0 <= self.value <= 105):
+                raise ValueError(f"SGPR index out of range: {self.value}")
+
+    def format_src(self) -> str:
+        if self.kind == OperandKind.VGPR:
+            base = f"v{self.value}"
+        elif self.kind == OperandKind.SGPR:
+            base = f"s{self.value}"
+        else:
+            base = f"{self.value}"
+        if self.abs_val:
+            base = f"|{base}|"
+        if self.neg:
+            base = f"-{base}"
+        return base
+
+
+def VGPR(idx: int) -> Operand:
+    return Operand(OperandKind.VGPR, idx)
+
+
+def SGPR(idx: int) -> Operand:
+    return Operand(OperandKind.SGPR, idx)
+
+
+def FloatImm(val: float) -> Operand:
+    return Operand(OperandKind.FLOAT_IMM, val)
+
+
+@dataclass(frozen=True)
+class VCvtI32F32Instruction:
+    dst: Operand
+    src: Operand
+    is_e64: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != OperandKind.VGPR:
+            raise ValueError("Destination must be a VGPR")
+
+    def to_asm(self) -> str:
+        op_name = "v_cvt_i32_f32_e64" if self.is_e64 else "v_cvt_i32_f32"
+        dst_str = f"v{self.dst.value}"
+        src_str = self.src.format_src()
+        return f"{op_name} {dst_str}, {src_str}"
+
+
+class TestASTDefinitions(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self) -> None:
+        """Verify AST node string formatting for e32 and e64 encodings."""
+        instr_e32 = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
+        self.assertEqual(instr_e32.to_asm(), "v_cvt_i32_f32 v0, v1")
+
+        instr_sgpr = VCvtI32F32Instruction(dst=VGPR(5), src=SGPR(2))
+        self.assertEqual(instr_sgpr.to_asm(), "v_cvt_i32_f32 v5, s2")
+
+        instr_imm = VCvtI32F32Instruction(dst=VGPR(3), src=FloatImm(4.0))
+        self.assertEqual(instr_imm.to_asm(), "v_cvt_i32_f32 v3, 4.0")
+
+        instr_e64_mods = VCvtI32F32Instruction(
+            dst=VGPR(0),
+            src=Operand(OperandKind.VGPR, 1, neg=True, abs_val=True),
+            is_e64=True,
+        )
+        self.assertEqual(instr_e64_mods.to_asm(), "v_cvt_i32_f32_e64 v0, -|v1|")
+
+    def test_ast_translation_validity(self) -> None:
+        """Verify shader using AST-emitted instructions translates and executes correctly."""
+        instr = VCvtI32F32Instruction(dst=VGPR(0), src=FloatImm(2.0))
+        lines = [
+            instr.to_asm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_cvt", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], 2)
