@@ -1,4 +1,4 @@
-"""Exercise submodule initialization with local Git repositories and a synthetic file."""
+"""Exercise submodule initialization and pin updates with local Git repositories and a synthetic file."""
 from __future__ import annotations
 
 from functools import partial
@@ -37,6 +37,7 @@ class EnsureSubmoduleTest(unittest.TestCase):
             self.git_env.pop(name, None)
 
         dependency = self.root / "dependency"
+        self.dependency = dependency
         self.git(self.root, "init", "-q", dependency)
         (dependency / "Core").mkdir()
         (dependency / "Core" / "fixture.txt").write_text("synthetic\n", encoding="utf-8")
@@ -63,6 +64,31 @@ class EnsureSubmoduleTest(unittest.TestCase):
             make_game.ensure_submodule()
         self.assertEqual(fixture.read_text(encoding="utf-8"), "synthetic\n")
 
+    def run_ensure(self, checkout):
+        commands = []
+        real_run = subprocess.run
+
+        def run_git(*args, **kwargs):
+            commands.extend(args)
+            return real_run(*args, env=self.git_env, **kwargs)
+
+        with (mock.patch.object(make_game, "ROOT", str(checkout)),
+              mock.patch.object(make_game.subprocess, "run", new=run_git)):
+            make_game.ensure_submodule()
+        return commands
+
+    def advance_decoder(self):
+        (self.dependency / "Core" / "fixture.txt").write_text("updated\n", encoding="utf-8")
+        self.git(self.dependency, "add", "Core")
+        self.git(self.dependency, "commit", "-qm", "Update fixture")
+        pin = self.git(self.dependency, "rev-parse", "HEAD").strip()
+        checkout = self.source / self.submodule
+        self.git(checkout, "fetch", "-q", self.dependency.as_posix(), "HEAD")
+        self.git(checkout, "checkout", "-q", pin)
+        self.git(self.source, "add", self.submodule.as_posix())
+        self.git(self.source, "commit", "-qm", "Update submodule pin")
+        return pin
+
     def test_initializes_submodule_in_clone(self):
         checkout = self.root / "clone"
         self.git(self.root, "clone", "-q", "--no-recurse-submodules", self.source, checkout)
@@ -74,6 +100,26 @@ class EnsureSubmoduleTest(unittest.TestCase):
         self.git(self.source, "worktree", "add", "-q", "--detach", checkout)
         self.assertTrue((checkout / ".git").is_file())
         self.assert_initializes_submodule(checkout)
+
+    def test_current_submodule_is_left_alone(self):
+        checkout = self.root / "current"
+        self.git(self.root, "clone", "-q", "--recurse-submodules", self.source, checkout)
+        commands = self.run_ensure(checkout)
+        self.assertFalse(any("submodule" in command for command in commands))
+        fixture = checkout / self.submodule / "Core" / "fixture.txt"
+        self.assertEqual(fixture.read_text(encoding="utf-8"), "synthetic\n")
+
+    def test_updates_stale_submodule_to_parent_pin(self):
+        old_pin = self.git(self.source, "rev-parse", "HEAD:third_party/rpf9-explorer").strip()
+        pin = self.advance_decoder()
+        checkout = self.root / "stale"
+        self.git(self.root, "clone", "-q", "--recurse-submodules", self.source, checkout)
+        self.git(checkout / self.submodule, "checkout", "-q", old_pin)
+        self.run_ensure(checkout)
+        fixture = checkout / self.submodule / "Core" / "fixture.txt"
+        self.assertEqual(fixture.read_text(encoding="utf-8"), "updated\n")
+        actual = self.git(checkout / self.submodule, "rev-parse", "HEAD").strip()
+        self.assertEqual(actual, pin)
 
     def test_initializes_submodule_with_inherited_repository_settings(self):
         git_dir = self.source / ".git"

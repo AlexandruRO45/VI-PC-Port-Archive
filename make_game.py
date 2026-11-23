@@ -16,7 +16,7 @@ and the usual mount points elsewhere (/mnt, /media, /run/media, /Volumes, and th
 (\\server\share\...) can't be listed, so give it to --game. This script never decrypts or works around anything:
 it reads plain files and writes
 everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
-it is missing. Never share what it makes.
+it is missing or out of date. Never share what it makes.
 
 Stages (each skips work that is already done, so a stopped build continues where it left off):
     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
@@ -1031,9 +1031,21 @@ def submodule_ready() -> bool:
     return os.path.isdir(core) and bool(os.listdir(core))
 
 
+def submodule_at_parent_pin() -> bool:
+    git = shutil.which("git")
+    sub = os.path.join(ROOT, "third_party", "rpf9-explorer")
+    if not git or not os.path.exists(os.path.join(sub, ".git")):
+        return True
+    expected = subprocess.run([git, "-C", ROOT, "rev-parse", "HEAD:third_party/rpf9-explorer"],
+                              capture_output=True, text=True)
+    if expected.returncode != 0:
+        return True
+    actual = subprocess.run([git, "-C", sub, "rev-parse", "HEAD"], capture_output=True, text=True)
+    return actual.returncode == 0 and actual.stdout.strip() == expected.stdout.strip()
+
+
 def ensure_submodule() -> None:
-    core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
-    if submodule_ready():
+    if submodule_ready() and submodule_at_parent_pin():
         return
     clone = "git clone --recursive https://github.com/ItsNotRexed/Leonida"
     git = shutil.which("git")
@@ -1046,7 +1058,7 @@ def ensure_submodule() -> None:
              f"Download the project with: {clone}")
     log("fetching third_party/rpf9-explorer")
     r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
-    if r.returncode == 0 and os.path.isdir(core):
+    if r.returncode == 0 and submodule_ready() and submodule_at_parent_pin():
         return
     fail("fetching third_party/rpf9-explorer failed. Check your network connection, then run "
          "\"git submodule update --init --recursive\" in this folder and build again.")
