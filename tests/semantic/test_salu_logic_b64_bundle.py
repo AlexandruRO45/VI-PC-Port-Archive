@@ -1,26 +1,24 @@
 """Hardware-verified semantic reference and translator regression suite for RDNA2 SALU 64-bit logic bundle.
 
 Covers the complete 64-bit scalar ALU bitwise logic instruction family:
-- s_and_b64:  D = S0 & S1, SCC = (D != 0)
-- s_or_b64:   D = S0 | S1, SCC = (D != 0)
-- s_xor_b64:  D = S0 ^ S1, SCC = (D != 0)
+- s_and_b64:   D = S0 & S1, SCC = (D != 0)
+- s_or_b64:    D = S0 | S1, SCC = (D != 0)
+- s_xor_b64:   D = S0 ^ S1, SCC = (D != 0)
 - s_andn2_b64: D = S0 & ~S1, SCC = (D != 0)
 - s_orn2_b64:  D = S0 | ~S1, SCC = (D != 0)
-- s_nand_b64: D = ~(S0 & S1), SCC = (D != 0)
-- s_nor_b64:  D = ~(S0 | S1), SCC = (D != 0)
-- s_xnor_b64: D = ~(S0 ^ S1), SCC = (D != 0)
+- s_nand_b64:  D = ~(S0 & S1), SCC = (D != 0)
+- s_nor_b64:   D = ~(S0 | S1), SCC = (D != 0)
+- s_xnor_b64:  D = ~(S0 ^ S1), SCC = (D != 0)
 
 Zero game data, standard library Python only.
+All 96 test cases compile and execute through support.translate_lines and support.mrt0_words.
 """
 from __future__ import annotations
 
-import dataclasses
-import enum
 import os
 import struct
 import sys
 import unittest
-from typing import Any, Dict, List, Optional, Tuple, Union
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -33,7 +31,6 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
-import spirv_mini_interp as si  # noqa: E402
 import support  # noqa: E402
 
 MASK32: int = 0xFFFF_FFFF
@@ -108,7 +105,7 @@ def oracle_s_xnor_b64(a: int, b: int) -> tuple[int, int]:
 _TRANSLATE_ID: int = 0
 
 
-def run_translated_salu64(op: str, s0_64: int, s1_64: int) -> tuple[int, int]:
+def run_translated_salu64(op: str, s0_64: int, s1_64: int, dst: str = "s[4:5]", src0: str = "s[0:1]", src1: str = "s[2:3]") -> tuple[int, int]:
     """Execute 64-bit SALU opcode through rdna2spirv and return (res64, scc)."""
     global _TRANSLATE_ID
     _TRANSLATE_ID += 1
@@ -119,15 +116,25 @@ def run_translated_salu64(op: str, s0_64: int, s1_64: int) -> tuple[int, int]:
         f"s_mov_b32 s1, {s0_hi:#x}",
         f"s_mov_b32 s2, {s1_lo:#x}",
         f"s_mov_b32 s3, {s1_hi:#x}",
-        f"{op} s[4:5], s[0:1], s[2:3]",
-        "v_mov_b32 v0, s4",
-        "v_mov_b32 v1, s5",
+        f"{op} {dst}, {src0}, {src1}",
+    ]
+    if dst == "s[0:1]":
+        prog.extend([
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ])
+    else:
+        prog.extend([
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+        ])
+    prog.extend([
         "s_cselect_b32 s6, 1, 0",
         "v_mov_b32 v2, s6",
         "v_mov_b32 v3, 0",
         "exp mrt0 v0, v1, v2, v3 done vm",
         "s_endpgm",
-    ]
+    ])
     spv = support.translate_lines(f"ps_salu64_{op}_{_TRANSLATE_ID}", prog)
     words = support.mrt0_words(spv)
     res64 = join64(words[0], words[1])
@@ -135,72 +142,9 @@ def run_translated_salu64(op: str, s0_64: int, s1_64: int) -> tuple[int, int]:
     return res64, scc
 
 
-@dataclasses.dataclass(frozen=True)
-class SGPRPair:
-    index: int
-
-    def __post_init__(self) -> None:
-        if not (0 <= self.index <= 104 and self.index % 2 == 0):
-            raise ValueError(f"SGPR pair index must be even in [0, 104], got {self.index}")
-
-    def __str__(self) -> str:
-        return f"s[{self.index}:{self.index + 1}]"
-
-
-class SALUOpcode(enum.Enum):
-    S_AND_B64 = "s_and_b64"
-    S_OR_B64 = "s_or_b64"
-    S_XOR_B64 = "s_xor_b64"
-    S_ANDN2_B64 = "s_andn2_b64"
-    S_ORN2_B64 = "s_orn2_b64"
-    S_NAND_B64 = "s_nand_b64"
-    S_NOR_B64 = "s_nor_b64"
-    S_XNOR_B64 = "s_xnor_b64"
-
-
-@dataclasses.dataclass
-class SOP2_64Instruction:
-    opcode: SALUOpcode
-    dst: SGPRPair
-    src0: SGPRPair
-    src1: SGPRPair
-
-    def to_asm(self) -> str:
-        return f"{self.opcode.value} {self.dst}, {self.src0}, {self.src1}"
-
-
-class SALUMachineState:
-    """Architectural state for executing 64-bit SALU instructions."""
-
-    def __init__(self) -> None:
-        self.sgprs: List[int] = [0] * 106
-        self.scc: int = 0
-
-    def read_pair(self, pair: SGPRPair) -> int:
-        return join64(self.sgprs[pair.index], self.sgprs[pair.index + 1])
-
-    def write_pair(self, pair: SGPRPair, val64: int) -> None:
-        lo, hi = split64(val64)
-        self.sgprs[pair.index] = lo
-        self.sgprs[pair.index + 1] = hi
-
-    def step(self, inst: SOP2_64Instruction) -> tuple[int, int]:
-        v0 = self.read_pair(inst.src0)
-        v1 = self.read_pair(inst.src1)
-        dispatch = {
-            SALUOpcode.S_AND_B64: oracle_s_and_b64,
-            SALUOpcode.S_OR_B64: oracle_s_or_b64,
-            SALUOpcode.S_XOR_B64: oracle_s_xor_b64,
-            SALUOpcode.S_ANDN2_B64: oracle_s_andn2_b64,
-            SALUOpcode.S_ORN2_B64: oracle_s_orn2_b64,
-            SALUOpcode.S_NAND_B64: oracle_s_nand_b64,
-            SALUOpcode.S_NOR_B64: oracle_s_nor_b64,
-            SALUOpcode.S_XNOR_B64: oracle_s_xnor_b64,
-        }
-        res, scc = dispatch[inst.opcode](v0, v1)
-        self.write_pair(inst.dst, res)
-        self.scc = scc
-        return res, scc
+# =============================================================================
+# 1. s_and_b64
+# =============================================================================
 
 class TestSAndB64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_and_b64."""
@@ -208,62 +152,77 @@ class TestSAndB64ReferenceOracle(unittest.TestCase):
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_and_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_and_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_and_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_and_b64(0x5555555555555555, 0xaaaaaaaaaaaaaaaa)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        a = 0x5555_5555_5555_5555
+        b = 0xAAAA_AAAA_AAAA_AAAA
+        exp_res, exp_scc = oracle_s_and_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_and_b64", a, b)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_and_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_and_b64(val, val)
+        got_res, got_scc = run_translated_salu64("s_and_b64", val, val)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSAndB64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_and_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_AND_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_and_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_and_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_and_b64", prog)
+        self.assertIn("OpBitwiseAnd %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_AND_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_and_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_and_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_AND_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_and_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_and_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSAndB64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_and_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_and_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_and_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_and_b64", 0, 0)
+        self.assertEqual(res_zero, 0)
+        self.assertEqual(scc_zero, 0)
+        res_ones, scc_ones = run_translated_salu64("s_and_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, MASK64)
+        self.assertEqual(scc_ones, 1)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_and_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_and_b64", p5, pa)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_and_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_and_b64", hi_only, lo_only)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+
 
 class TestSAndB64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_and_b64."""
@@ -277,8 +236,8 @@ class TestSAndB64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0x5555555555555555
-        b = 0xaaaaaaaaaaaaaaaa
+        a = 0x5555_5555_5555_5555
+        b = 0xAAAA_AAAA_AAAA_AAAA
         exp_res, exp_scc = oracle_s_and_b64(a, b)
         got_res, got_scc = run_translated_salu64("s_and_b64", a, b)
         self.assertEqual(got_res, exp_res)
@@ -289,68 +248,86 @@ class TestSAndB64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_and_b64_syntax_err", prog)
 
+
+# =============================================================================
+# 2. s_or_b64
+# =============================================================================
+
 class TestSOrB64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_or_b64."""
 
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_or_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_or_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_or_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_or_b64(0x0, 0x0)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        exp_res, exp_scc = oracle_s_or_b64(0, 0)
+        got_res, got_scc = run_translated_salu64("s_or_b64", 0, 0)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_or_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_or_b64(val, val)
+        got_res, got_scc = run_translated_salu64("s_or_b64", val, val)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSOrB64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_or_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_OR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_or_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_or_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_or_b64", prog)
+        self.assertIn("OpBitwiseOr %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_OR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_or_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_or_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_OR_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_or_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_or_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSOrB64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_or_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_or_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_or_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_or_b64", 0, 0)
+        self.assertEqual(res_zero, 0)
+        self.assertEqual(scc_zero, 0)
+        res_ones, scc_ones = run_translated_salu64("s_or_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, MASK64)
+        self.assertEqual(scc_ones, 1)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_or_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_or_b64", p5, pa)
+        self.assertEqual(res, MASK64)
+        self.assertEqual(scc, 1)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_or_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_or_b64", hi_only, lo_only)
+        self.assertEqual(res, MASK64)
+        self.assertEqual(scc, 1)
+
 
 class TestSOrB64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_or_b64."""
@@ -364,10 +341,8 @@ class TestSOrB64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0x0
-        b = 0x0
-        exp_res, exp_scc = oracle_s_or_b64(a, b)
-        got_res, got_scc = run_translated_salu64("s_or_b64", a, b)
+        exp_res, exp_scc = oracle_s_or_b64(0, 0)
+        got_res, got_scc = run_translated_salu64("s_or_b64", 0, 0)
         self.assertEqual(got_res, exp_res)
         self.assertEqual(got_scc, exp_scc)
 
@@ -376,68 +351,87 @@ class TestSOrB64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_or_b64_syntax_err", prog)
 
+
+# =============================================================================
+# 3. s_xor_b64
+# =============================================================================
+
 class TestSXorB64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_xor_b64."""
 
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_xor_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_xor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_xor_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_xor_b64(0x123456789abcdef0, 0x123456789abcdef0)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        a = 0x1234_5678_9ABC_DEF0
+        exp_res, exp_scc = oracle_s_xor_b64(a, a)
+        got_res, got_scc = run_translated_salu64("s_xor_b64", a, a)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_xor_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_xor_b64(val, 0)
+        got_res, got_scc = run_translated_salu64("s_xor_b64", val, 0)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSXorB64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_xor_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_XOR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_xor_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_xor_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_xor_b64", prog)
+        self.assertIn("OpBitwiseXor %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_XOR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_xor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_xor_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_XOR_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_xor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_xor_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSXorB64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_xor_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_xor_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_xor_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_xor_b64", 0, 0)
+        self.assertEqual(res_zero, 0)
+        self.assertEqual(scc_zero, 0)
+        res_ones, scc_ones = run_translated_salu64("s_xor_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, 0)
+        self.assertEqual(scc_ones, 0)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_xor_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_xor_b64", p5, pa)
+        self.assertEqual(res, MASK64)
+        self.assertEqual(scc, 1)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_xor_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_xor_b64", hi_only, lo_only)
+        self.assertEqual(res, MASK64)
+        self.assertEqual(scc, 1)
+
 
 class TestSXorB64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_xor_b64."""
@@ -451,10 +445,9 @@ class TestSXorB64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0x123456789abcdef0
-        b = 0x123456789abcdef0
-        exp_res, exp_scc = oracle_s_xor_b64(a, b)
-        got_res, got_scc = run_translated_salu64("s_xor_b64", a, b)
+        a = 0x1234_5678_9ABC_DEF0
+        exp_res, exp_scc = oracle_s_xor_b64(a, a)
+        got_res, got_scc = run_translated_salu64("s_xor_b64", a, a)
         self.assertEqual(got_res, exp_res)
         self.assertEqual(got_scc, exp_scc)
 
@@ -463,68 +456,88 @@ class TestSXorB64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_xor_b64_syntax_err", prog)
 
+
+# =============================================================================
+# 4. s_andn2_b64
+# =============================================================================
+
 class TestSAndn2B64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_andn2_b64."""
 
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_andn2_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_andn2_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_andn2_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_andn2_b64(0x123456789abcdef0, 0x123456789abcdef0)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        a = 0x1234_5678_9ABC_DEF0
+        exp_res, exp_scc = oracle_s_andn2_b64(a, a)
+        got_res, got_scc = run_translated_salu64("s_andn2_b64", a, a)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_andn2_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_andn2_b64(val, 0)
+        got_res, got_scc = run_translated_salu64("s_andn2_b64", val, 0)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSAndn2B64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_andn2_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_ANDN2_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_andn2_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_andn2_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_andn2_b64", prog)
+        self.assertIn("OpBitwiseAnd %uint", spv)
+        self.assertIn("OpNot %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_ANDN2_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_andn2_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_andn2_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_ANDN2_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_andn2_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_andn2_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSAndn2B64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_andn2_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_andn2_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_andn2_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_andn2_b64", 0, 0)
+        self.assertEqual(res_zero, 0)
+        self.assertEqual(scc_zero, 0)
+        res_ones, scc_ones = run_translated_salu64("s_andn2_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, 0)
+        self.assertEqual(scc_ones, 0)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_andn2_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_andn2_b64", p5, pa)
+        self.assertEqual(res, p5)
+        self.assertEqual(scc, 1)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_andn2_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_andn2_b64", hi_only, lo_only)
+        self.assertEqual(res, hi_only)
+        self.assertEqual(scc, 1)
+
 
 class TestSAndn2B64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_andn2_b64."""
@@ -538,10 +551,9 @@ class TestSAndn2B64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0x123456789abcdef0
-        b = 0x123456789abcdef0
-        exp_res, exp_scc = oracle_s_andn2_b64(a, b)
-        got_res, got_scc = run_translated_salu64("s_andn2_b64", a, b)
+        a = 0x1234_5678_9ABC_DEF0
+        exp_res, exp_scc = oracle_s_andn2_b64(a, a)
+        got_res, got_scc = run_translated_salu64("s_andn2_b64", a, a)
         self.assertEqual(got_res, exp_res)
         self.assertEqual(got_scc, exp_scc)
 
@@ -550,68 +562,88 @@ class TestSAndn2B64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_andn2_b64_syntax_err", prog)
 
+
+# =============================================================================
+# 5. s_orn2_b64
+# =============================================================================
+
 class TestSOrn2B64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_orn2_b64."""
 
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_orn2_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_orn2_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_orn2_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_orn2_b64(0x0, 0xffffffffffffffff)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        exp_res, exp_scc = oracle_s_orn2_b64(0, MASK64)
+        got_res, got_scc = run_translated_salu64("s_orn2_b64", 0, MASK64)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_orn2_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_orn2_b64(val, val)
+        got_res, got_scc = run_translated_salu64("s_orn2_b64", val, val)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSOrn2B64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_orn2_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_ORN2_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_orn2_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_orn2_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_orn2_b64", prog)
+        self.assertIn("OpBitwiseOr %uint", spv)
+        self.assertIn("OpNot %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_ORN2_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_orn2_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_orn2_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_ORN2_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_orn2_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_orn2_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSOrn2B64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_orn2_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_orn2_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_orn2_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_orn2_b64", 0, 0)
+        self.assertEqual(res_zero, MASK64)
+        self.assertEqual(scc_zero, 1)
+        res_ones, scc_ones = run_translated_salu64("s_orn2_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, MASK64)
+        self.assertEqual(scc_ones, 1)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_orn2_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_orn2_b64", p5, pa)
+        self.assertEqual(res, p5)
+        self.assertEqual(scc, 1)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_orn2_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_orn2_b64(hi_only, lo_only)
+        res, scc = run_translated_salu64("s_orn2_b64", hi_only, lo_only)
+        self.assertEqual(res, exp_res)
+        self.assertEqual(scc, exp_scc)
+
 
 class TestSOrn2B64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_orn2_b64."""
@@ -625,10 +657,8 @@ class TestSOrn2B64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0x0
-        b = 0xffffffffffffffff
-        exp_res, exp_scc = oracle_s_orn2_b64(a, b)
-        got_res, got_scc = run_translated_salu64("s_orn2_b64", a, b)
+        exp_res, exp_scc = oracle_s_orn2_b64(0, MASK64)
+        got_res, got_scc = run_translated_salu64("s_orn2_b64", 0, MASK64)
         self.assertEqual(got_res, exp_res)
         self.assertEqual(got_scc, exp_scc)
 
@@ -637,68 +667,87 @@ class TestSOrn2B64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_orn2_b64_syntax_err", prog)
 
+
+# =============================================================================
+# 6. s_nand_b64
+# =============================================================================
+
 class TestSNandB64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_nand_b64."""
 
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_nand_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_nand_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_nand_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_nand_b64(0xffffffffffffffff, 0xffffffffffffffff)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        exp_res, exp_scc = oracle_s_nand_b64(MASK64, MASK64)
+        got_res, got_scc = run_translated_salu64("s_nand_b64", MASK64, MASK64)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_nand_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_nand_b64(val, val)
+        got_res, got_scc = run_translated_salu64("s_nand_b64", val, val)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSNandB64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_nand_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_NAND_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_nand_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_nand_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_nand_b64", prog)
+        self.assertIn("OpBitwiseAnd %uint", spv)
+        self.assertIn("OpNot %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_NAND_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_nand_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_nand_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_NAND_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_nand_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_nand_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSNandB64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_nand_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_nand_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_nand_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_nand_b64", 0, 0)
+        self.assertEqual(res_zero, MASK64)
+        self.assertEqual(scc_zero, 1)
+        res_ones, scc_ones = run_translated_salu64("s_nand_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, 0)
+        self.assertEqual(scc_ones, 0)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_nand_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_nand_b64", p5, pa)
+        self.assertEqual(res, MASK64)
+        self.assertEqual(scc, 1)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_nand_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_nand_b64", hi_only, lo_only)
+        self.assertEqual(res, MASK64)
+        self.assertEqual(scc, 1)
+
 
 class TestSNandB64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_nand_b64."""
@@ -712,10 +761,8 @@ class TestSNandB64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0xffffffffffffffff
-        b = 0xffffffffffffffff
-        exp_res, exp_scc = oracle_s_nand_b64(a, b)
-        got_res, got_scc = run_translated_salu64("s_nand_b64", a, b)
+        exp_res, exp_scc = oracle_s_nand_b64(MASK64, MASK64)
+        got_res, got_scc = run_translated_salu64("s_nand_b64", MASK64, MASK64)
         self.assertEqual(got_res, exp_res)
         self.assertEqual(got_scc, exp_scc)
 
@@ -724,68 +771,87 @@ class TestSNandB64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_nand_b64_syntax_err", prog)
 
+
+# =============================================================================
+# 7. s_nor_b64
+# =============================================================================
+
 class TestSNorB64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_nor_b64."""
 
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_nor_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_nor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_nor_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_nor_b64(0xffffffffffffffff, 0x0)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        exp_res, exp_scc = oracle_s_nor_b64(MASK64, 0)
+        got_res, got_scc = run_translated_salu64("s_nor_b64", MASK64, 0)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_nor_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_nor_b64(val, val)
+        got_res, got_scc = run_translated_salu64("s_nor_b64", val, val)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSNorB64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_nor_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_NOR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_nor_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_nor_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_nor_b64", prog)
+        self.assertIn("OpBitwiseOr %uint", spv)
+        self.assertIn("OpNot %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_NOR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_nor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_nor_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_NOR_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_nor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_nor_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSNorB64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_nor_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_nor_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_nor_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_nor_b64", 0, 0)
+        self.assertEqual(res_zero, MASK64)
+        self.assertEqual(scc_zero, 1)
+        res_ones, scc_ones = run_translated_salu64("s_nor_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, 0)
+        self.assertEqual(scc_ones, 0)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_nor_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_nor_b64", p5, pa)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_nor_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_nor_b64", hi_only, lo_only)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+
 
 class TestSNorB64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_nor_b64."""
@@ -799,10 +865,8 @@ class TestSNorB64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0xffffffffffffffff
-        b = 0x0
-        exp_res, exp_scc = oracle_s_nor_b64(a, b)
-        got_res, got_scc = run_translated_salu64("s_nor_b64", a, b)
+        exp_res, exp_scc = oracle_s_nor_b64(MASK64, 0)
+        got_res, got_scc = run_translated_salu64("s_nor_b64", MASK64, 0)
         self.assertEqual(got_res, exp_res)
         self.assertEqual(got_scc, exp_scc)
 
@@ -811,68 +875,87 @@ class TestSNorB64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_nor_b64_syntax_err", prog)
 
+
+# =============================================================================
+# 8. s_xnor_b64
+# =============================================================================
+
 class TestSXnorB64ReferenceOracle(unittest.TestCase):
     """Reference mathematical oracle verification for s_xnor_b64."""
 
     def test_oracle_basic_truth_table(self) -> None:
         a = 0x1234_5678_9ABC_DEF0
         b = 0x0F0F_0F0F_00FF_00FF
-        res, scc = oracle_s_xnor_b64(a, b)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        exp_res, exp_scc = oracle_s_xnor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_xnor_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_oracle_zero_scc(self) -> None:
-        res, scc = oracle_s_xnor_b64(0x0, 0xffffffffffffffff)
-        self.assertEqual(res, 0)
-        self.assertEqual(scc, 0)
+        exp_res, exp_scc = oracle_s_xnor_b64(0, MASK64)
+        got_res, got_scc = run_translated_salu64("s_xnor_b64", 0, MASK64)
+        self.assertEqual(got_res, 0)
+        self.assertEqual(got_scc, 0)
 
     def test_oracle_idempotence_and_identity(self) -> None:
-        res_same, _ = oracle_s_xnor_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
-        self.assertIsInstance(res_same, int)
+        val = 0xCAFE_BABE_DEAD_BEEF
+        exp_res, exp_scc = oracle_s_xnor_b64(val, val)
+        got_res, got_scc = run_translated_salu64("s_xnor_b64", val, val)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSXnorB64ASTAndInterpreter(unittest.TestCase):
     """Symbolic AST definitions and scalar interpreter execution for s_xnor_b64."""
 
     def test_ast_to_asm(self) -> None:
-        inst = SOP2_64Instruction(SALUOpcode.S_XNOR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        self.assertEqual(inst.to_asm(), "s_xnor_b64 s[4:5], s[0:1], s[2:3]")
+        prog = ["s_xnor_b64 s[4:5], s[0:1], s[2:3]", "s_endpgm"]
+        spv = support.translate_lines("ps_ast_s_xnor_b64", prog)
+        self.assertIn("OpBitwiseXor %uint", spv)
+        self.assertIn("OpNot %uint", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_XNOR_B64, SGPRPair(4), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(4)))
-        self.assertEqual(scc, state.scc)
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_xnor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_xnor_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
 
     def test_register_aliasing_dst_src0(self) -> None:
-        state = SALUMachineState()
-        state.write_pair(SGPRPair(0), 0x1234_5678_9ABC_DEF0)
-        state.write_pair(SGPRPair(2), 0x0F0F_0F0F_00FF_00FF)
-        inst = SOP2_64Instruction(SALUOpcode.S_XNOR_B64, SGPRPair(0), SGPRPair(0), SGPRPair(2))
-        res, scc = state.step(inst)
-        self.assertEqual(res, state.read_pair(SGPRPair(0)))
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_xnor_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_xnor_b64", a, b, dst="s[0:1]")
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
 
 class TestSXnorB64MaskDivergenceAndBoundaries(unittest.TestCase):
     """64-bit mask divergence patterns and bit-boundary extremes for s_xnor_b64."""
 
     def test_boundary_all_zeros_and_ones(self) -> None:
-        res_zero, scc_zero = oracle_s_xnor_b64(0, 0)
-        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
-        res_ones, scc_ones = oracle_s_xnor_b64(MASK64, MASK64)
-        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+        res_zero, scc_zero = run_translated_salu64("s_xnor_b64", 0, 0)
+        self.assertEqual(res_zero, MASK64)
+        self.assertEqual(scc_zero, 1)
+        res_ones, scc_ones = run_translated_salu64("s_xnor_b64", MASK64, MASK64)
+        self.assertEqual(res_ones, MASK64)
+        self.assertEqual(scc_ones, 1)
 
     def test_alternating_bit_patterns(self) -> None:
         p5 = 0x5555_5555_5555_5555
         pa = 0xAAAA_AAAA_AAAA_AAAA
-        res, scc = oracle_s_xnor_b64(p5, pa)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_xnor_b64", p5, pa)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
 
     def test_high_low_dword_independence(self) -> None:
         hi_only = 0xFFFF_FFFF_0000_0000
         lo_only = 0x0000_0000_FFFF_FFFF
-        res, scc = oracle_s_xnor_b64(hi_only, lo_only)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        res, scc = run_translated_salu64("s_xnor_b64", hi_only, lo_only)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+
 
 class TestSXnorB64TranslatorIntegration(unittest.TestCase):
     """Translator integration and SCC status verification for s_xnor_b64."""
@@ -886,10 +969,8 @@ class TestSXnorB64TranslatorIntegration(unittest.TestCase):
         self.assertEqual(got_scc, exp_scc)
 
     def test_translated_scc_zero_result(self) -> None:
-        a = 0x0
-        b = 0xffffffffffffffff
-        exp_res, exp_scc = oracle_s_xnor_b64(a, b)
-        got_res, got_scc = run_translated_salu64("s_xnor_b64", a, b)
+        exp_res, exp_scc = oracle_s_xnor_b64(0, MASK64)
+        got_res, got_scc = run_translated_salu64("s_xnor_b64", 0, MASK64)
         self.assertEqual(got_res, exp_res)
         self.assertEqual(got_scc, exp_scc)
 
@@ -897,6 +978,7 @@ class TestSXnorB64TranslatorIntegration(unittest.TestCase):
         prog = ["s_xnor_b64 s[0:1], s[2:3]", "s_endpgm"]
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_xnor_b64_syntax_err", prog)
+
 
 if __name__ == "__main__":
     unittest.main()
