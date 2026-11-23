@@ -288,3 +288,95 @@ class TestASTDefinitions(unittest.TestCase):
         spv = support.translate_lines("ps_ast_div_valid", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(u64((words[1] << 32) | words[0]), F64_ONE)
+
+
+# ==============================================================================
+# SECTION 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState64:
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def get_vgpr64(self, base_idx: int) -> int:
+        lo = self.vgprs.get(base_idx, 0)
+        hi = self.vgprs.get(base_idx + 1, 0)
+        return u64((hi << 32) | lo)
+
+    def set_vgpr64(self, base_idx: int, val: int) -> None:
+        val = u64(val)
+        self.vgprs[base_idx] = val & MASK_32
+        self.vgprs[base_idx + 1] = (val >> 32) & MASK_32
+
+    def get_sgpr64(self, base_idx: int) -> int:
+        lo = self.sgprs.get(base_idx, 0)
+        hi = self.sgprs.get(base_idx + 1, 0)
+        return u64((hi << 32) | lo)
+
+    def set_sgpr64(self, base_idx: int, val: int) -> None:
+        val = u64(val)
+        self.sgprs[base_idx] = val & MASK_32
+        self.sgprs[base_idx + 1] = (val >> 32) & MASK_32
+
+
+class ScalarInterpreter64:
+    def resolve_operand64(self, op: Operand64, state: ScalarMachineState64) -> int:
+        if op.kind == OperandKind.VGPR_PAIR:
+            return state.get_vgpr64(op.base_reg)
+        elif op.kind == OperandKind.SGPR_PAIR:
+            return state.get_sgpr64(op.base_reg)
+        elif op.kind == OperandKind.IMMEDIATE_F64:
+            return u64(op.imm_val)
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VDivFixup64Instruction, state: ScalarMachineState64) -> int:
+        v0 = self.resolve_operand64(instr.src0, state)
+        v1 = self.resolve_operand64(instr.src1, state)
+        v2 = self.resolve_operand64(instr.src2, state)
+
+        res = oracle_div_fixup_f64(v0, v1, v2, clamp=instr.mods.clamp)
+        state.set_vgpr64(instr.dst.base_reg, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        """Verify interpreter correctly executes across VGPR, SGPR, and Immediate inputs."""
+        state = ScalarMachineState64()
+        state.set_vgpr64(2, F64_ONE)
+        state.set_sgpr64(4, F64_TWO)
+        imm = ImmediateF64(F64_TWO)
+
+        interp = ScalarInterpreter64()
+        instr = VDivFixup64Instruction(
+            dst=VGPRPair(0),
+            src0=VGPRPair(2),
+            src1=SGPRPair(4),
+            src2=imm,
+        )
+        res = interp.step(instr, state)
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(state.get_vgpr64(0), F64_ONE)
+
+    def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
+        """Verify scalar interpreter exactly matches translated SPIR-V execution."""
+        state = ScalarMachineState64()
+        state.set_vgpr64(2, F64_FOUR)
+        state.set_vgpr64(4, F64_TWO)
+        state.set_vgpr64(6, F64_TWO)
+
+        interp = ScalarInterpreter64()
+        instr = VDivFixup64Instruction(
+            dst=VGPRPair(0),
+            src0=VGPRPair(2),
+            src1=VGPRPair(4),
+            src2=VGPRPair(6),
+            mods=VDivFixup64Modifiers(clamp=True),
+        )
+        interp_res = interp.step(instr, state)
+        spv_res = run_translator_div_fixup(F64_FOUR, F64_TWO, F64_TWO, mods="clamp", name="ps_scalar_div_cross")
+        self.assertEqual(interp_res, spv_res)
