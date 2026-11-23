@@ -426,6 +426,25 @@ class TestLdsDecU32Offset(unittest.TestCase):
         self.assertEqual(fin[0x44], 10)
         self.assertEqual(fin[0x48], 10)
 
+class TestLdsDecU32Chaining(unittest.TestCase):
+    def test_chained_decrements_through_zero(self):
+        init = {0x40: 2}
+        ops = [("ds_dec_u32", 0x40, 0, (3,))] * 4
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x40], 2)
+
+    def test_multi_location_independent_decrements(self):
+        init = {0x10: 1, 0x20: 0}
+        ops = [
+            ("ds_dec_u32", 0x10, 0, (5,)),
+            ("ds_dec_u32", 0x20, 0, (5,)),
+            ("ds_dec_u32", 0x10, 0, (5,)),
+            ("ds_dec_u32", 0x20, 0, (5,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x10], 5)
+        self.assertEqual(fin[0x20], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
