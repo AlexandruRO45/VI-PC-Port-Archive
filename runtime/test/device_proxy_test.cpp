@@ -173,6 +173,19 @@ int main(int argc, char** argv) {
     if (slots > 67) check(proxy_vtbl[67] != real_vtbl[67], "slot 67 thunk differs from PC CreateProtectedResourceSession1");
     if (slots > 76) check(proxy_vtbl[76] != real_vtbl[76], "slot 76 thunk differs from PC CreateCommittedResource3");
 
+    // Console methods past the PC device: the retail title calls slot 133 at startup. The table must reach it, and
+    // the call must be refused (E_NOTIMPL), not land on a null pointer past the end of the table.
+    {
+        using ConsoleFn = HRESULT(WINAPI*)(void*, UINT64, UINT64, UINT64, UINT64, UINT64, UINT64);
+        for (unsigned slot : {128u, 133u, 255u}) {
+            check(proxy_vtbl[slot] != nullptr, "the proxy table has an entry for a console slot past 128");
+            void* out = nullptr;
+            const HRESULT console_hr = reinterpret_cast<ConsoleFn>(proxy_vtbl[slot])(
+                device.Get(), 0, 0, 0xffffffff, 0, 0, reinterpret_cast<UINT64>(&out));
+            check(console_hr == E_NOTIMPL && out == nullptr, "a console slot past the PC device is refused");
+        }
+    }
+
     // The hit counters are for tests and count from the first read or reset, so that a title's calls write no
     // shared counter. The QueryInterface of the creation above was before that: its flag is set, its hit is not.
     check(rt::d3d12_xs::device_slot_first_call_seen(0), "slot 0 first-call flag is set by the creation");
