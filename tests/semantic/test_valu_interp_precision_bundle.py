@@ -178,6 +178,19 @@ class TestInterpMovF32VertexSel(unittest.TestCase):
             words = support.mrt0_words(spv)
             self.assertEqual(len(words), 4)
 
+class TestInterpMovF32Flat(unittest.TestCase):
+    def test_mov_f32_flat_channels(self):
+        for chan in ("x", "y", "z", "w"):
+            code = [
+                f"v_interp_mov_f32 v2, p0, attr2.{chan}",
+                "exp mrt0, v2, v2, v2, v2 done",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_mov_f32_flat_{chan}", code)
+            self.assertIn("Flat", spv)
+            words = support.mrt0_words(spv)
+            self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
