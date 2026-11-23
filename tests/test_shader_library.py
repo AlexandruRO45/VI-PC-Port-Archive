@@ -223,6 +223,25 @@ class Main(unittest.TestCase):
             self.assertEqual(summary["graphics"][1]["stages"], {"ps": "lib_ps_00000", "ms": "lib_ms_00002"})
             self.assertEqual(summary["compute"][0]["program"], "lib_cs_00003")
 
+    def test_compute_with_missing_state_blob(self):
+        # A compute record with no state blob (0xFFFFFFFF) unpacks without its decode_kind0 sidecar fields,
+        # instead of crashing the export at blob(b, lib, None).
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(build([], [(NONE, 0, 0, 1)], [kind0(), layout_blob(3, D_CS)], [prog(0x11112222)]))
+            out = os.path.join(tmp, "out")
+            rc, text = self.run_main(src, "--out", out)
+            self.assertEqual(rc, 0)
+            self.assertIn("0 graphics + 1 compute pipelines, 1 programs; 1 written", text)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual(index[0]["stage"], "cs")
+            self.assertNotIn("threads", index[0])
+            with open(os.path.join(out, "fspx", "lib_cs_00000.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+            self.assertNotIn("rsrc2", meta)
+
     def test_stage_filter_and_saved_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "lib.bin")
