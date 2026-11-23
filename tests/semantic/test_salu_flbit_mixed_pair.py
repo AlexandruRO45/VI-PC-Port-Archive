@@ -6,6 +6,7 @@ count leading zeros, signed scans complement negative inputs first, zero returns
 """
 import os
 from pathlib import Path
+import struct
 import sys
 import unittest
 from unittest import mock
@@ -45,9 +46,12 @@ def program(op, word, mul, add, mask, data, scc=1, dest="s20", runtime_data=Fals
     ]
 
 
-def execute(lines, data=None):
-    spv = support.translate_lines("cs_flbit_mixed", lines, fssm=mixed.fssm())
-    memory = si.run_workgroup(spv, 64, 64,
+def execute(lines, data=None, wave64=True):
+    lanes = 64 if wave64 else 32
+    header = bytearray(mixed.fssm(lanes))
+    struct.pack_into("<I", header, 0xD4, 0 if wave64 else 0x20)
+    spv = support.translate_lines("cs_flbit_mixed", lines, fssm=bytes(header))
+    memory = si.run_workgroup(spv, lanes, lanes,
                              inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
                              push_constants=mixed.VSHARP + [0] * 28,
                              memory={} if data is None else {1024: data})
@@ -86,6 +90,35 @@ class MixedFlbitTests(unittest.TestCase):
                     self.assertEqual(memory, {8 * lane + 4 * k: v for lane in range(64)
                                               for k, v in enumerate((7, 1))})
 
+    def test_copied_mask_word_keeps_its_original_half(self):
+        # A mask's tag, rather than its destination SGPR number, selects the ballot half.
+        # The same b64 scan can consume a wave32 mask in either word of its input pair.
+        for wave64 in (False, True):
+            lanes = 64 if wave64 else 32
+            for half in ((0, 1) if wave64 else (0,)):
+                for word in ("lo", "hi"):
+                    for op in OPS:
+                        for data in mixed.DATA:
+                            with self.subTest(wave64=wave64, half=half, word=word, op=op, data=data):
+                                pattern = (3, 1, 37)  # unequal, nontrivial low and high ballot words
+                                lines = program(op, word, *pattern, data, runtime_data=True)
+                                compare = "v_cmp_eq_u32_e64 s[10:11], 0, v3"
+                                at = lines.index(compare)
+                                mask_reg = "s10" if word == "lo" else "s11"
+                                lines[at:at + 1] = [
+                                    f"v_cmp_eq_u32_e64 {'s[14:15]' if wave64 else 's14'}, 0, v3",
+                                    f"s_mov_b32 {mask_reg}, s{14 + half}",
+                                ]
+                                if not wave64:
+                                    lines.remove("v_mbcnt_hi_u32_b32 v1, -1, v1")
+                                mask_word = (mixed.lane_mask(*pattern) >> (32 * half)) & 0xFFFFFFFF
+                                value = (mask_word | (data << 32) if word == "lo"
+                                         else data | (mask_word << 32))
+                                want = leading_bits(value, op.endswith("i64"))
+                                self.assertEqual(execute(lines, data, wave64),
+                                                 {8 * lane + 4 * k: v for lane in range(lanes)
+                                                  for k, v in enumerate((want, 1))})
+
     def test_whole_masks_still_rejected(self):
         for op in OPS:
             for emulate in (False, True):
@@ -93,6 +126,29 @@ class MixedFlbitTests(unittest.TestCase):
                     with self.assertRaisesRegex(rdna2spirv.Unsupported, "lane mask"):
                         support.translate_lines("cs_flbit_whole_mask", [f"{op} s20, exec", "s_endpgm"],
                                                 fssm=mixed.fssm())
+
+    def test_non_data_pairs_still_rejected(self):
+        # Immediate 0/-1 is EITHER, unlike the runtime-loaded DATA above. Those
+        # pairs and pairs of two masks retain the whole-mask rejection (#210),
+        # including the noncanonical layouts reported in #7224's review.
+        for wave64 in (False, True):
+            pairs = (("s14", "0"), ("s14", "-1"), ("0", "s14"), ("s14", "s16"))
+            if wave64:
+                pairs += (("s15", "0"), ("s15", "s16"), ("s14", "s14"), ("s14", "s15"))
+            setup = ["v_mbcnt_lo_u32_b32 v1, -1, 0"]
+            if wave64:
+                setup.append("v_mbcnt_hi_u32_b32 v1, -1, v1")
+            setup += [f"v_cmp_gt_u32_e64 {'s[14:15]' if wave64 else 's14'}, 40, v1",
+                      f"v_cmp_gt_u32_e64 {'s[16:17]' if wave64 else 's16'}, 5, v1"]
+            for lo, hi in pairs:
+                for op in OPS:
+                    for emulate in (False, True):
+                        with self.subTest(wave64=wave64, pair=(lo, hi), op=op, emulate=emulate):
+                            lines = setup + [f"s_mov_b32 s10, {lo}", f"s_mov_b32 s11, {hi}",
+                                             f"{op} s20, s[10:11]", "s_endpgm"]
+                            with mock.patch.object(rdna2spirv, "WAVE64_EMULATE", emulate):
+                                with self.assertRaisesRegex(rdna2spirv.Unsupported, "lane mask"):
+                                    execute(lines, wave64=wave64)
 
     def test_emulated_branch_taken_by_one_wave(self):
         # The first wave enters, the second skips. A mixed-pair scan needs a
