@@ -40,7 +40,9 @@ shimmed module resolves to the shim.
 `owns_dll` (registry.cpp) is false for `api-ms-*`/`ext-ms-*` prefixes and for the eight host DLLs that the tables
 partially override — `kernel32`, `kernelbase`, `msvcrt`, `ucrtbase`, `ucrtbased`, `vulkan-1`, `ntdll`, `user32` —
 and otherwise true exactly when the registry holds at least one `dll!` entry. Owned today: `d3d12_xs.dll`,
-`xgameruntime.dll`, `gameinput.dll`, `xmem.dll`.
+`xgameruntime.dll`, `xmem.dll`, and `gameinput.dll` when the SDL3 GameInput shim is built
+([gameinput.md](gameinput.md); a build without SDL3 has no `gameinput.dll` entries, so the name is not owned
+and its imports bind the host DLL or end unimplemented like any other unserved name).
 
 A title's `LoadLibrary*`/`GetModuleHandle*` for an owned module returns a pseudo-handle
 (`library_loader.cpp`); `GetProcAddress` on it resolves through the registry only — an unserved name is NULL with
@@ -52,8 +54,8 @@ the real `LoadLibrary*`/`GetProcAddress`.
 | DLL | Registry entries | Static import | Run-time load |
 |---|---|---|---|
 | `d3d12_xs.dll` | 4: `D3D12XboxCreateDevice`, `D3D12Serialize{,Versioned}RootSignature`, `D3D12CreateRootSignatureDeserializer` | those → shim; any other → unimplemented (no host namesake) | owned → pseudo-handle |
-| `xgameruntime.dll` | ~40: `*ApiImpl*` entry points, `XGameRuntime*`, `XSystem*`, `XPackage*`, `XTaskQueue*`, `XAsync*`, `GameInputCreate` | registered → shim; unregistered → unimplemented | owned → pseudo-handle (the path `xgameruntime.lib` thunks use) |
-| `gameinput.dll` | `GameInputCreate` | registered → shim; unregistered → unimplemented | owned → pseudo-handle |
+| `xgameruntime.dll` | ~40: `*ApiImpl*` entry points, `XGameRuntime*`, `XSystem*`, `XPackage*`, `XTaskQueue*`, `XAsync*`, plus `GameInputCreate` when the SDL3 shim is built | registered → shim; unregistered → unimplemented | owned → pseudo-handle (the path `xgameruntime.lib` thunks use) |
+| `gameinput.dll` | `GameInputCreate` (only when the SDL3 shim is built) | registered → shim; unregistered → unimplemented | owned → pseudo-handle when the shim is built; otherwise not owned → host DLL |
 | `xmem.dll` | `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` | registered → shim; unregistered → unimplemented | owned → pseudo-handle |
 | `d3d12.dll`, `dxgi.dll` | none | host (the real PC DLLs; the console surface rides on them through the `d3d12_xs` device proxy and the DXGI COM wrappers) | real host DLL |
 | `xaudio2_9.dll`, `xaudio2_9redist.dll` | none | host if installed, else unimplemented | real host DLL |
