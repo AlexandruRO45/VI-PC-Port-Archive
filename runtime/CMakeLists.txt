@@ -745,7 +745,9 @@ if(BUILD_TESTING)
     add_executable(tiny_ga test/fixtures/tiny_ga.cpp)
     target_compile_definitions(tiny_ga PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_ga PRIVATE /W4 /permissive- /utf-8 /GA /GS-)
-    target_link_options(tiny_ga PRIVATE /OPT:NOREF)
+    # /GA reads TEB->ThreadLocalStoragePointer[0] and leaves nothing referencing _tls_index, so lld-link writes no TLS
+    # directory unless the CRT's _tls_used is pulled in; the loader's index-0 view needs that directory.
+    target_link_options(tiny_ga PRIVATE /OPT:NOREF /INCLUDE:_tls_used)
     set_target_properties(tiny_ga PROPERTIES
       OUTPUT_NAME tiny_ga
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"

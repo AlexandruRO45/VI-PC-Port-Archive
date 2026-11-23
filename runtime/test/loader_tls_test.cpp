@@ -778,7 +778,8 @@ void test_ga_tls(const fs::path& exe) {
     std::thread early([&] {
         SetEvent(started);
         WaitForSingleObject(go, INFINITE);
-        early_block = module_tls_slots()[index];
+        // A fixture linked without a TLS directory leaves the index unset: fail the check below, don't fault here.
+        early_block = index == rt::kNoTlsIndex ? nullptr : module_tls_slots()[index];
         early_vector = vector_fn();
         if (early_vector) {
             early_view_block = reinterpret_cast<void**>(early_vector)[0];
@@ -818,7 +819,7 @@ void test_ga_tls(const fs::path& exe) {
         void* late_view_block = nullptr;
         void* late_block = nullptr;
         std::thread late([&] {
-            late_block = module_tls_slots()[index];
+            late_block = index == rt::kNoTlsIndex ? nullptr : module_tls_slots()[index];
             late_vector = vector_fn();
             if (late_vector) {
                 late_view_block = reinterpret_cast<void**>(late_vector)[0];
