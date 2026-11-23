@@ -325,6 +325,37 @@ class PlacementDistinctionTest(unittest.TestCase):
         self.assertEqual((r_tail["placement"], r_tail["framing"], r_tail["complete"]), ("psin_lrsc", "psin_tail", True))
         self.assertEqual((r_tail["root_block"], r_tail["structs"], r_tail["blocks"]), (3, 5, 3))
 
+    def test_zero_prefix_lrsc_chks_stream_classifies_as_psin_tail(self):
+        pay = build_lrsc_payload(root_block=2, structs=4, enums=1, blocks=3)
+        sec = odrp_7a.LRSC_TAG + (88).to_bytes(4, "big") + pay
+        chks = odrp_7a.CHKS_TAG + (20).to_bytes(4, "big") + bytes(12)
+        tail_108 = sec + chks
+        self.assertEqual(len(tail_108), odrp_7a.LRSC_SECTION_SIZE + odrp_7a.CHKS_SECTION_SIZE)
+
+        rec = odrp_7a.classify_blob(tail_108)
+        self.assertIsNotNone(rec)
+        self.assertEqual((rec["placement"], rec["framing"], rec["complete"]), ("psin_lrsc", "psin_tail", True))
+        self.assertEqual((rec["root_block"], rec["structs"], rec["enums"], rec["blocks"]), (2, 4, 1, 3))
+        self.assertEqual(rec["error"], "")
+
+        # Malformed LRSC sections without a valid CHKS tail still fail as lrsc_section.
+        for bad in (sec + b"JUNK", sec + b"BAD!" + (20).to_bytes(4, "big") + bytes(12)):
+            with self.subTest(bad_len=len(bad)):
+                bad_rec = odrp_7a.classify_blob(bad)
+                self.assertIsNotNone(bad_rec)
+                self.assertEqual((bad_rec["placement"], bad_rec["framing"], bad_rec["complete"]), ("psin_lrsc", "lrsc_section", False))
+
+        # Verify scan_rpf also classifies a 108-byte LRSC+CHKS stream as a complete psin_tail.
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "tail108.rpf")
+            raw, offsets, _ = build_rpf9([("zlib", tail_108)])
+            with open(rpf, "wb") as fh:
+                fh.write(raw)
+            rows, summary = odrp_7a.scan_rpf(rpf)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["offset"], rows[0]["framing"], rows[0]["complete"]), (offsets[0], "psin_tail", True))
+            self.assertEqual(summary["psin_lrsc_complete"], 1)
+
     def test_two_placements_are_never_confused(self):
         standalone = build_standalone_resource(root_objects=7, enums=1)
         self.assertIsNone(odrp_7a.parse_psin_lrsc(standalone))
@@ -514,6 +545,74 @@ class ArchiveAndCliTest(unittest.TestCase):
         self.assertEqual(rows[3]["size"], len(self.psin_multi))
         self.assertEqual(rows[3]["root_block"], 3)
         self.assertEqual(rows[4]["root_block"], 1)
+
+    def test_scan_rpf_joins_short_continuation_streams_below_64_bytes(self):
+        with self.subTest(case="standalone_24b_continuation"):
+            part1 = self.map_full[:-24]
+            part2 = self.map_full[-24:]
+            self.assertTrue(odrp_7a.parse_standalone(part1)["needs_continuation"])
+            raw, offsets, stored = build_rpf9([("zlib", part1), ("zlib", part2)])
+            rpf = os.path.join(self.root, "short_standalone.rpf")
+            with open(rpf, "wb") as fh:
+                fh.write(raw)
+            rows, summary = odrp_7a.scan_rpf(rpf)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                (rows[0]["offset"], rows[0]["placement"], rows[0]["complete"], rows[0]["streams"], rows[0]["size"], rows[0]["entities"]),
+                (offsets[0], "standalone", True, 2, len(self.map_full), 4),
+            )
+            self.assertEqual(rows[0]["stored"], stored[0] + stored[1])
+            self.assertEqual(summary["standalone_joined"], 1)
+
+        with self.subTest(case="psin_12b_chks_continuation"):
+            # Split inside the 20-byte CHKS section so part1 requires continuation and part2 is 12 bytes (< 64).
+            part1 = self.psin_single[:-12]
+            part2 = self.psin_single[-12:]
+            self.assertEqual(len(part2), 12)
+            self.assertTrue(odrp_7a._parse_psin_container(part1)["needs_continuation"])
+            raw, offsets, stored = build_rpf9([("zlib", part1), ("zlib", part2)])
+            rpf = os.path.join(self.root, "short_psin.rpf")
+            with open(rpf, "wb") as fh:
+                fh.write(raw)
+            rows, summary = odrp_7a.scan_rpf(rpf)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                (rows[0]["offset"], rows[0]["placement"], rows[0]["framing"], rows[0]["complete"], rows[0]["schema_checked"], rows[0]["streams"], rows[0]["size"]),
+                (offsets[0], "psin_lrsc", "psin", True, True, 2, len(self.psin_single)),
+            )
+            self.assertEqual(rows[0]["stored"], stored[0] + stored[1])
+            self.assertEqual(summary["psin_lrsc_joined"], 1)
+
+    def test_scan_rpf_false_zlib_header_in_padding_does_not_abort_pending_join(self):
+        # Pick a split point whose compressed first stream leaves >= 4 bytes before the 16-byte alignment boundary.
+        split_at = None
+        for cand in range(0x70, 0xA0):
+            comp1 = zlib.compress(self.map_full[:cand])
+            pad = (-len(comp1)) % 16
+            if pad >= 4 and odrp_7a.parse_standalone(self.map_full[:cand])["needs_continuation"]:
+                split_at = cand
+                break
+        self.assertIsNotNone(split_at)
+        part1, part2 = self.map_full[:split_at], self.map_full[split_at:]
+        comp1, comp2 = zlib.compress(part1), zlib.compress(part2)
+        pad = (-len(comp1)) % 16
+        false_zlib = b"\x78\x9c\xff\xff" + bytes(pad - 4)  # invalid deflate bytes sitting before next_off
+
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        rpf = os.path.join(self.root, "false_zhdr_pad.rpf")
+        with open(rpf, "wb") as fh:
+            fh.write(bytes(header) + comp1 + false_zlib + comp2)
+
+        rows, summary = odrp_7a.scan_rpf(rpf)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (rows[0]["offset"], rows[0]["placement"], rows[0]["complete"], rows[0]["streams"], rows[0]["size"], rows[0]["entities"]),
+            (0x100, "standalone", True, 2, len(self.map_full), 4),
+        )
+        self.assertEqual(rows[0]["stored"], len(comp1) + len(comp2))
+        self.assertEqual(summary["standalone_joined"], 1)
 
     def test_scan_limit_excludes_stream_extending_past_window(self):
         # Cut 1 byte before the end of stream 0's compressed body: stream 0 must be left out.

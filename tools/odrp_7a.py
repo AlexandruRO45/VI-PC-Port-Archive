@@ -565,6 +565,39 @@ def _parse_psin_container(blob):
     }
 
 
+def _parse_psin_tail(blob):
+    tail_len = LRSC_SECTION_SIZE + CHKS_SECTION_SIZE
+    if len(blob) < tail_len or parse_standalone_header(blob) is not None:
+        return None
+    lrsc_at = len(blob) - tail_len
+    chks_at = len(blob) - CHKS_SECTION_SIZE
+    if (
+        blob[lrsc_at:lrsc_at + 4] == LRSC_TAG
+        and _be32(blob, lrsc_at + 4) == LRSC_SECTION_SIZE
+        and blob[chks_at:chks_at + 4] == CHKS_TAG
+        and _be32(blob, chks_at + 4) == CHKS_SECTION_SIZE
+    ):
+        parsed = parse_lrsc_payload(blob[lrsc_at + 8:chks_at])
+        if parsed is not None:
+            return {
+                "placement": "psin_lrsc",
+                "framing": "psin_tail",
+                "version": VERSION,
+                "complete": True,
+                "needs_continuation": False,
+                "resource_kind": None,
+                "structs": parsed["structs"],
+                "enums": parsed["enums"],
+                "blocks": parsed["blocks"],
+                "root_objects": None,
+                "root_block": parsed["root_block"],
+                "entities": None,
+                "schema_checked": False,
+                "error": "",
+            }
+    return None
+
+
 def parse_psin_lrsc(blob):
     """Parse a `PSIN` `LRSC` `0DRP`/`0x7a` record from any of its four framings:
 
@@ -587,6 +620,9 @@ def parse_psin_lrsc(blob):
     if len(blob) >= 8 and blob[:4] == LRSC_TAG:
         declared = _be32(blob, 4)
         if declared != LRSC_SECTION_SIZE or len(blob) != LRSC_SECTION_SIZE:
+            tail = _parse_psin_tail(blob)
+            if tail is not None:
+                return tail
             return {
                 "placement": "psin_lrsc",
                 "framing": "lrsc_section",
@@ -661,35 +697,7 @@ def parse_psin_lrsc(blob):
         # `0DRP@0x0` buffers explicitly rather than guessing a placement.
         return None
 
-    tail_len = LRSC_SECTION_SIZE + CHKS_SECTION_SIZE
-    if len(blob) >= tail_len and parse_standalone_header(blob) is None:
-        lrsc_at = len(blob) - tail_len
-        chks_at = len(blob) - CHKS_SECTION_SIZE
-        if (
-            blob[lrsc_at:lrsc_at + 4] == LRSC_TAG
-            and _be32(blob, lrsc_at + 4) == LRSC_SECTION_SIZE
-            and blob[chks_at:chks_at + 4] == CHKS_TAG
-            and _be32(blob, chks_at + 4) == CHKS_SECTION_SIZE
-        ):
-            parsed = parse_lrsc_payload(blob[lrsc_at + 8:chks_at])
-            if parsed is not None:
-                return {
-                    "placement": "psin_lrsc",
-                    "framing": "psin_tail",
-                    "version": VERSION,
-                    "complete": True,
-                    "needs_continuation": False,
-                    "resource_kind": None,
-                    "structs": parsed["structs"],
-                    "enums": parsed["enums"],
-                    "blocks": parsed["blocks"],
-                    "root_objects": None,
-                    "root_block": parsed["root_block"],
-                    "entities": None,
-                    "schema_checked": False,
-                    "error": "",
-                }
-    return None
+    return _parse_psin_tail(blob)
 
 
 def classify_blob(blob):
@@ -867,9 +875,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     last = pos = s + blen
                     continue
 
-                if consumer.pending is not None and consumer.pending["next_off"] != s:
-                    consumer._flush_pending()
-                keep_full = consumer.pending is not None
+                is_continuation = consumer.pending is not None and consumer.pending["next_off"] == s
+                keep_full = is_continuation
 
                 d = zlib.decompressobj()
                 p = s
@@ -921,7 +928,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 except zlib.error:
                     pos = s + 1
                     continue
-                if too_big or not d.eof or total < 64:
+                min_size = 1 if is_continuation else 64
+                if too_big or not d.eof or total < min_size:
                     skipped += 1
                     pos = s + 1
                     continue
