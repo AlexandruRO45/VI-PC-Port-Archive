@@ -309,5 +309,30 @@ class TestDsReadU16Oracle(unittest.TestCase):
         self.assertEqual(self.lds.read_u16(2), 0xFFFF)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_u16 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class DSReadU16Instruction:
+    dst: RegisterOperand
+    addr: RegisterOperand
+    offset: int = 0
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR or self.addr.op_type != OperandType.VGPR:
+            raise TypeError("Operands of ds_read_u16 must be VGPRs")
+
+
+class TestDsReadU16ASTAndScalar(unittest.TestCase):
+    def test_scalar_execution(self):
+        machine = ScalarMachineDS()
+        machine.lds.write_u16(8, 0x1234)
+        machine.vgprs[1] = 8
+        addr = machine.vgprs[1]
+        machine.vgprs[2] = machine.lds.read_u16(addr)
+        self.assertEqual(machine.vgprs[2], 0x1234)
+
+
 if __name__ == '__main__':
     unittest.main()
