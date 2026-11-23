@@ -267,6 +267,17 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                     op = op[:-len(suf)]
             return op
 
+        def norm_mod(mod):
+            """op_sel with its trailing zero bits dropped. The decoder writes one bit per operand plus the destination
+            (op_sel:[0,1,0,0] on v_permlane16_b32); LLVM 23 writes only the bits up to the last one set (op_sel:[0,1]),
+            LLVM 21 all of them. The bits are the same either way. op_sel_hi is left alone: its default is ones."""
+            if mod.startswith("op_sel:[") and mod.endswith("]"):
+                bits = mod[len("op_sel:["):-1].split(",")
+                while len(bits) > 1 and bits[-1] == "0":
+                    bits.pop()
+                return "op_sel:[" + ",".join(bits) + "]"
+            return mod
+
         def norm_arg(a, op=""):
             k = a["k"]
             if k in ("vgpr", "sgpr"):
@@ -344,7 +355,8 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 self.assertEqual([norm_arg(x, di["op"]) for x in di["args"]],
                                  [norm_arg(x, li["op"]) for x in li["args"]],
                                  f"{path}: {li['op']}")
-                self.assertEqual(sorted(di["mods"]), sorted(li["mods"]), f"{path}: {li['op']}")
+                self.assertEqual(sorted(norm_mod(m) for m in di["mods"]), sorted(norm_mod(m) for m in li["mods"]),
+                                 f"{path}: {li['op']}")
                 checked += 1
             # Every assembled byte is accounted for: a short last encoding would otherwise pass unnoticed.
             self.assertEqual(at, len(raw), path)
