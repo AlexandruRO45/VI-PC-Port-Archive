@@ -536,6 +536,46 @@ class TestCli(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     list(A._files(tmp))
 
+    def test_main_reports_unlistable_conversation_dir_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.txt"), "foo\n")
+            bank = write(os.path.join(tmp, "t.awc"), make_bank(["foo"]))
+            conv_dir = os.path.join(tmp, "convs")
+            os.makedirs(conv_dir)
+            def broken_walk(top, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", top))
+                return iter([])
+
+            err = io.StringIO()
+            with mock.patch("os.walk", side_effect=broken_walk):
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([bank, "--words", words, "--conversations", conv_dir])
+            self.assertEqual(rc, 2)
+            self.assertIn("awc_names: error: cannot read conversations:", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_main_reports_unlistable_out_protection_dir_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.txt"), "foo\n")
+            bank_dir = os.path.join(tmp, "banks")
+            os.makedirs(bank_dir)
+            out_file = write(os.path.join(tmp, "existing.csv"), "out")
+            def broken_walk(top, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", top))
+                return iter([])
+
+            err = io.StringIO()
+            with mock.patch("os.walk", side_effect=broken_walk):
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([bank_dir, "--words", words, "--out", out_file])
+            self.assertEqual(rc, 2)
+            self.assertIn("awc_names: error:", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

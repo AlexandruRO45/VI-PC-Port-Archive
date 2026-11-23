@@ -405,8 +405,12 @@ def main(argv=None) -> int:
         for sources, suffix in ((a.banks, ".awc"), (a.conversations, "")):
             for source in sources:
                 if os.path.isdir(source):
-                    protected.extend(full for full in _files(source)
-                                     if full.lower().endswith(suffix) and os.path.isfile(full))
+                    try:
+                        protected.extend(full for full in _files(source)
+                                         if full.lower().endswith(suffix) and os.path.isfile(full))
+                    except OSError as error:
+                        print(f"awc_names: error: {source}: {error}", file=sys.stderr)
+                        return 2
         if any(os.path.samefile(p, a.out) for p in protected):
             ap.error("--out must not overwrite an input")
 
@@ -417,7 +421,11 @@ def main(argv=None) -> int:
         except (OSError, ValueError) as error:
             print(f"awc_names: error: cannot read {path}: {error}", file=sys.stderr)
             return 2
-    waves = conversation_waves(a.conversations)
+    try:
+        waves = conversation_waves(a.conversations)
+    except OSError as error:
+        print(f"awc_names: error: cannot read conversations: {error}", file=sys.stderr)
+        return 2
     dictionary = Dictionary(words + waves)
     bases = dictionary.bases(a.min_token)
     print(f"{len(dictionary.words)} words ({len(waves)} dialogue waves from conversations), "
