@@ -843,7 +843,7 @@ class TestMainAndCli(unittest.TestCase):
                 ["spirv-dis", in_path],
                 ["spirv-as", "--target-env", "spv1.5", "-", "-o", staged],
             ])
-            self.assertEqual(os.path.dirname(os.path.dirname(staged)), os.path.abspath(unicode_dir))
+            self.assertEqual(os.path.dirname(os.path.dirname(staged)), os.path.realpath(unicode_dir))
             self.assertFalse(os.path.exists(os.path.dirname(staged)))
 
             # Original input file is preserved untouched for out-of-place conversion.
@@ -894,7 +894,7 @@ class TestMainAndCli(unittest.TestCase):
                 ["spirv-dis", inplace_path],
                 ["spirv-as", "--target-env", "spv1.5", "-", "-o", staged],
             ])
-            self.assertEqual(os.path.dirname(os.path.dirname(staged)), os.path.abspath(unicode_dir))
+            self.assertEqual(os.path.dirname(os.path.dirname(staged)), os.path.realpath(unicode_dir))
             self.assertFalse(os.path.exists(os.path.dirname(staged)))
             with open(inplace_path, "rb") as f:
                 self.assertEqual(f.read(), out_bytes)
