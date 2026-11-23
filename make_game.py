@@ -26,8 +26,8 @@ Stages, in order (each skips work that is already done, so a stopped build conti
               clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
     pipelines create every translated shader on your GPU's driver as a pipeline, report anything the driver
-              rejects or that has to be skipped, and save the pipeline cache next to the port (the runtime doesn't
-              load that cache yet)
+              rejects or that has to be skipped, and save pipeline_cache.bin beside gta6rt.exe, which the runtime
+              seeds its VkPipelineCache from on the next boot
 """
 import argparse
 import functools
