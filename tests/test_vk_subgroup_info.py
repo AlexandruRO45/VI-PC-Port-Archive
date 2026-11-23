@@ -71,6 +71,8 @@ class FakeDevice:
     fragment_shader_barycentric: bool = True
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
+    driver_name: str = "AMD proprietary driver"
+    driver_info: str = "26.1.1 (LLPC)"
     vendor_id: int = 0
     device_id: int = 0
 
@@ -208,6 +210,10 @@ class FakeVulkan:
                 sg.requiredSubgroupSizeStages = dev.required_subgroup_size_stages
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES:
                 ctypes.c_uint32.from_address(node_addr + 16).value = dev.driver_id
+                ctypes.memmove(node_addr + vk_info.DRIVER_NAME_OFFSET, dev.driver_name.encode() + b"\0",
+                               len(dev.driver_name.encode()) + 1)
+                ctypes.memmove(node_addr + vk_info.DRIVER_INFO_OFFSET, dev.driver_info.encode() + b"\0",
+                               len(dev.driver_info.encode()) + 1)
         if not found_subgroup:
             raise AssertionError("SubgroupProperties missing from vkGetPhysicalDeviceProperties2 pNext chain")
         if not found_sg:
@@ -801,9 +807,26 @@ class QueryTest(unittest.TestCase):
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
+                    "driver_name": "AMD proprietary driver",
+                    "driver_info": "26.1.1 (LLPC)",
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_driver_name_and_info(self):
+        """BUILD-1370: driverName and driverInfo come from VkPhysicalDeviceDriverProperties."""
+        res, _vk = self._run_query(FakeDevice(driver_id=6, driver_name="Intel open-source Mesa driver",
+                                              driver_info="Mesa 26.2.6"))
+        self.assertEqual((res["driver_name"], res["driver_info"]), ("Intel open-source Mesa driver", "Mesa 26.2.6"))
+
+    def test_driver_strings_offsets_and_bounds(self):
+        buf = vk_info.block(vk_info.DRIVER_PROPS_SIZE, vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES)
+        ctypes.memmove(ctypes.addressof(buf) + vk_info.DRIVER_NAME_OFFSET, b"radv\0junk", 9)
+        ctypes.memmove(ctypes.addressof(buf) + vk_info.DRIVER_INFO_OFFSET, b"A" * 256, 256)   # no terminator
+        self.assertEqual(vk_info.driver_strings(buf), ("radv", "A" * 256))
+        self.assertEqual(vk_info.DRIVER_INFO_OFFSET + 256 + 4, vk_info.DRIVER_PROPS_SIZE)    # + conformanceVersion
+        ctypes.memmove(ctypes.addressof(buf) + vk_info.DRIVER_NAME_OFFSET, b"\xff\xfe\0", 3)
+        self.assertEqual(vk_info.driver_strings(buf)[0], "\ufffd\ufffd")
 
     def test_max_push_constants_size(self):
         """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""

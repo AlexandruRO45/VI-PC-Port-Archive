@@ -156,6 +156,21 @@ def load_vulkan():
     raise RuntimeError("no Vulkan loader found (" + ", ".join(names) + ")")
 
 
+DRIVER_NAME_OFFSET = 20      # VkPhysicalDeviceDriverProperties: 16-byte header, driverID, then char driverName[256]
+DRIVER_INFO_OFFSET = 276     # char driverInfo[256]
+VK_MAX_DRIVER_NAME_SIZE = 256
+
+
+def driver_strings(buf) -> tuple[str, str]:
+    """driverName and driverInfo of a VkPhysicalDeviceDriverProperties buffer (BUILD-1370): on a hybrid machine they
+    say which GPU a generic device name (Mesa ANV: "Intel(R) Graphics (RPL-S)") was, without lspci."""
+    raw = bytes(buf)
+
+    def text(off):
+        return raw[off:off + VK_MAX_DRIVER_NAME_SIZE].split(b"\0")[0].decode("utf-8", "replace")
+    return text(DRIVER_NAME_OFFSET), text(DRIVER_INFO_OFFSET)
+
+
 def rdna2_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
     """An RDNA2 GPU under AMD's proprietary (Windows) driver: the one whose compiler crashes on #857's modules."""
     return (vendor_id == AMD_VENDOR_ID and driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
@@ -293,7 +308,8 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          *driver_strings(drv))
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -302,7 +318,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver, driver_name, driver_info) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -328,6 +344,8 @@ def query(*, stage_caps=False) -> dict:
             "vendor_id": vendor,
             "device_id": device,
             "driver_id": driver,
+            "driver_name": driver_name,
+            "driver_info": driver_info,
             "rdna1_amd_windows": (vendor == AMD_VENDOR_ID and driver == VK_DRIVER_ID_AMD_PROPRIETARY
                                   and device in RDNA1_DEVICE_IDS),
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),
