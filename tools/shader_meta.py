@@ -321,6 +321,11 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
     _, writes = _split_operands(ins)
     if not writes:
         return
+    if op in ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32"):
+        sym.clear()
+        scale.clear()
+        ptr_stride.clear()
+        return
 
     new_sym = {}
     new_scale = {}

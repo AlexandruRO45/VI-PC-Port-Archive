@@ -1143,7 +1143,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                      "cs_mask_vgpr_exec"):
+                      "cs_mask_vgpr_exec", "cs_w32_s_movreld"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -1153,6 +1153,9 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_lane_wrap": [25, 16, 777, 777],
                 # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]] (cs_movrelsd_2.asm)
                 "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
+                # s_movreld_b32 / s_movreld_b64 / s_movrelsd_2_b32: relative SGPR writes through M0 (cs_w32_s_movreld.asm)
+                "cs_w32_s_movreld": [0xCAFEBABF, 0x11111111, 0x22222222, 0x0000002A,
+                                     0xDEADBEEF, 0x12345678, 0xDEADBEEF, 0x88888888],
                 # SHADER-90: ds_permute_b32 (cs_w32_permute.asm): scatter, unwritten lane = 0, EXEC gates the write
                 "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
                 # integer ops with CPU-only checks until now (cs_w32_int_ext.asm)
@@ -1256,7 +1259,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_w32_lds_subdword", "cs_w32_lds_wide",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
-                                  "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
+                                  "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec", "cs_w32_s_movreld",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec") and not emulated and not partial
             if partial and not emulated:

@@ -2,8 +2,8 @@
 
 RDNA2 ISA SOP1: s_movrels_b32 D = SGPR[S0 + M0]; s_movrels_b64 reads the pair SGPR[S0 + M0], SGPR[S0 + M0 + 1].
 SCC is not written. Each case translates a synthetic pixel shader with tools/rdna2spirv.py and runs it in
-tests/semantic/spirv_mini_interp.py; results leave through exp as 16-bit halves ORed into 0x40000000. s_movreld (the
-relative write) stays Unsupported. Standard library only; no GPU, no game files.
+tests/semantic/spirv_mini_interp.py; results leave through exp as 16-bit halves ORed into 0x40000000. Standard
+library only; no GPU, no game files.
 """
 import os
 import struct
@@ -111,7 +111,7 @@ class MovrelsTests(unittest.TestCase):
         self.assertEqual(got[:2], (WORDS[2], WORDS[3]))
 
     def test_rejected_forms(self):
-        for lines in (["s_movreld_b32 s10, s20"], ["s_movrels_b32 s10, 5"], ["s_movrels_b64 s10, s[20:21]"]):
+        for lines in (["s_movrels_b32 s10, 5"], ["s_movrels_b64 s10, s[20:21]"]):
             with self.subTest(lines=lines):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate(lines + ["exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"])

@@ -94,6 +94,7 @@ RMW_DEST = (
 MOVREL_OPS = (
     "v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32",
     "v_swaprel_b32", "s_movrels_b32", "s_movrels_b64",
+    "s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32",
 )
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
@@ -265,6 +266,8 @@ class Analysis:
         self.n = len(blocks)
         self.vgprs = sorted({r[1] for b in blocks for ins in b for x in ins["args"]
                              for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"})
+        self.sgprs = sorted({r[1] for b in blocks for ins in b for x in ins["args"]
+                             for r in _regs(x) if isinstance(r, tuple) and r[0] == "s"})
         self.tok = {("e",): (None, None, True)}      # exec token -> (parent token, exec tag after, exec is the entry exec)
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
@@ -934,6 +937,26 @@ class Analysis:
             if any_s & TAG_BITS:
                 any_s |= X
             put(dests[0], t_src | any_s)
+            return
+        if op in ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32") and dests:
+            any_s = 0
+            if op == "s_movrelsd_2_b32":
+                for r, tv in T.items():
+                    if isinstance(r, tuple) and r[0] == "s":
+                        any_s |= tv
+                if any(isinstance(k, int) and v in lane_masks.MASK_KINDS for k, v in self.masks.get(id(ins), {}).items()):
+                    any_s |= MASKD | X
+            wt = t_src | any_s
+            if wt & TAG_BITS:
+                wt |= X
+            for k in [k for k in st["g"] if isinstance(k, tuple) and k[0] == "s"]:
+                del st["g"][k]
+                T[k] = T.get(k, 0) | X
+            if wt:
+                bits_violation(wt)
+                for sr in self.sgprs:
+                    T[("s", sr)] = T.get(("s", sr), 0) | wt
+                put(dests[0], wt)
             return
         if op == "v_movrels_b32" and dests:
             src_base = a[1]["r"] if len(a) > 1 and a[1].get("k") == "vgpr" else 0
@@ -1662,7 +1685,7 @@ class Analysis:
                     rd = st.get(r, frozenset({(-1, 0)}))
                     if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd):
                         stale.add((id(ins), r))
-                if base_op(ins["op"]) in ("s_movrels_b32", "s_movrels_b64") and any(
+                if base_op(ins["op"]) in ("s_movrels_b32", "s_movrels_b64", "s_movrelsd_2_b32") and any(
                         isinstance(r, tuple) and r[0] == "s" and len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd)
                         for r, rd in st.items()):
                     stale.add((id(ins), "m0"))

@@ -8632,9 +8632,7 @@ class Gen:
             # VGPRs. The index wraps to the 128 array slots, so it can't reach the lane-mask parking slots past them
             # (an SGPR that holds a lane mask is handled below);
             # the hardware's own range check (and reads past s105 landing on VCC and the other specials) is not
-            # modelled. SCC is not written. s_movreld (a dynamic SGPR write) stays Unsupported: the translator keeps
-            # translate-time knowledge of SGPR values (literal S# words, descriptor caches) a dynamic write would
-            # invalidate.
+            # modelled. SCC is not written.
             n = 2 if op.endswith("_b64") else 1
             d, src = a[0], a[1]
             if d["k"] != "sgpr" or src["k"] != "sgpr" or d.get("n", 1) != n or src.get("n", 1) != n:
@@ -8667,6 +8665,55 @@ class Gen:
                 vals.append(v)
             for w, v in enumerate(vals):        # every read before the first write (D may overlap the source)
                 self.store_reg("sgpr", d["r"] + w, v)
+        elif op in ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32"):
+            # Relative SGPR writes through M0 (RDNA2 ISA SOP1 0x30 / 0x31 / 0x49):
+            #   s_movreld_b32:    SGPR[D + M0] = S0
+            #   s_movreld_b64:    SGPR[D + M0] = S0.lo; SGPR[D + 1 + M0] = S0.hi
+            #   s_movrelsd_2_b32: SGPR[D + M0[25:16]] = SGPR[S0 + M0[9:0]]  (other M0 bits ignored)
+            # Indices wrap to the 128 SGPR array slots (the hardware range check and specials past s105 are not
+            # modelled). SCC is not written. If any SGPR currently holds a per-lane mask (cur_masks), or the source
+            # holds a lane mask, raise Unsupported rather than corrupting a masked slot. Because the written SGPR
+            # index is dynamic, conservatively invalidate translate-time SGPR caches (sgpr_imm, desc_cache, x_tok,
+            # x_mcache).
+            n = 2 if op.endswith("_b64") else 1
+            d, src = a[0], a[1]
+            if d["k"] != "sgpr" or d.get("n", 1) != n:
+                raise Unsupported(op + " operands")
+            if op == "s_movrelsd_2_b32" and (src["k"] != "sgpr" or src.get("n", 1) != 1):
+                raise Unsupported(op + " operands")
+            if any(isinstance(k, int) and k < self.SGPRS for k in self.cur_masks) or self.holds_lane_mask(src):
+                raise Unsupported(op + " with live lane mask")
+            m0 = self.tmp()
+            self.emit(f"{m0} = OpLoad %uint %m0")
+            if op == "s_movrelsd_2_b32":
+                m0_src, hi, m0_dst = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{m0_src} = OpBitwiseAnd %uint {m0} {self.cu(0x3FF)}")
+                self.emit(f"{hi} = OpShiftRightLogical %uint {m0} {self.cu(16)}")
+                self.emit(f"{m0_dst} = OpBitwiseAnd %uint {hi} {self.cu(0x3FF)}")
+                si, sj, sp, val = (self.tmp() for _ in range(4))
+                self.emit(f"{si} = OpIAdd %uint {self.cu(src['r'])} {m0_src}")
+                self.emit(f"{sj} = OpBitwiseAnd %uint {si} {self.cu(self.SGPRS - 1)}")
+                self.emit(f"{sp} = OpAccessChain %_ptr_Function_uint %sgpr {sj}")
+                self.emit(f"{val} = OpLoad %uint {sp}")
+                vals = [val]
+            elif op == "s_movreld_b64":
+                lo, hi = self.src64_data(src, op)   # read both source words before writing (D + M0 may overlap S0)
+                vals = [lo, hi]
+                m0_dst = m0
+            else:
+                vals = [self.src_u(src)]
+                m0_dst = m0
+            for w, val in enumerate(vals):
+                di, dj, dp = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{di} = OpIAdd %uint {self.cu(d['r'] + w)} {m0_dst}")
+                self.emit(f"{dj} = OpBitwiseAnd %uint {di} {self.cu(self.SGPRS - 1)}")
+                self.emit(f"{dp} = OpAccessChain %_ptr_Function_uint %sgpr {dj}")
+                self.emit(f"OpStore {dp} {val}")
+            self.sgpr_imm.clear()
+            self.desc_cache.clear()
+            for k in [k for k in self.x_tok if isinstance(k, tuple) and k[0] == "sgpr"]:
+                del self.x_tok[k]
+            self.x_mcache.clear()
         elif op == "v_swaprel_b32":
             # GFX10 VOP1 (opcode 104): swap VGPR[D + M0[25:16]] and VGPR[S0 + M0[9:0]], the fields v_movrelsd_2_b32
             # uses (RDNA2 ISA: tmp = VGPR[D + M0[25:16]]; VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]];
