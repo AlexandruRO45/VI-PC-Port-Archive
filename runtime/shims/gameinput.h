@@ -119,6 +119,10 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus);
 // replaces GetCursorPos. nullptr restores the default.
 using CursorPosFn = bool (*)(int* x, int* y);
 void set_cursor_source(CursorPosFn cursor_pos);
+// Cumulative raw wheel units; false means unavailable. nullptr restores the system source.
+using WheelSourceFn = bool (*)(int64_t* x, int64_t* y);
+void set_wheel_source(WheelSourceFn source);
+bool raw_mouse_started();
 
 // Raw HID (RT-175, docs/gameinput.md "Raw HID"). One report a HID report descriptor declares: its kind
 // (GameInputRawDeviceReportKind: 0 input, 1 output, 2 feature), its report id (0 when the descriptor declares none)

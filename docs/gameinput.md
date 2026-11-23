@@ -142,20 +142,20 @@ above is the route for a title that reads only gamepads, and the two can be on t
 - Their readings carry `GameInputKindKeyboard` or `GameInputKindMouse` and nothing else: no gamepad, UI navigation or
   controller state. A reading is added when the keys, buttons or position change.
 - Keyboard: `GetKeyCount`/`GetKeyState` list the held keys in virtual-key order, at most 16
-  (`maxSimultaneousKeys`). The side-neutral Shift, Ctrl and Alt and the mouse buttons are left out; the left and right
+  (`maxSimultaneousKeys`); GDK instead appends newly pressed keys in press order. The side-neutral Shift, Ctrl and Alt and the mouse buttons are left out; the left and right
   keys are listed themselves. `scanCode` is `MapVirtualKey`'s scan code (0xE0xx for extended keys), `codePoint` its
   unshifted character (upper case for letters), `isDeadKey` its dead-key flag.
 - Mouse: `GetMouseState` gives the left, right, middle and X1/X2 buttons, and `positionX`/`positionY` as the sum of the
-  cursor's movement between polls, as GameInput's relative positions are. There is no wheel (no window, so no wheel
-  messages); the mouse info says so (`hasWheelX`/`hasWheelY` false).
+  raw movement between polls, falling back to the cursor if raw input is unavailable. Both wheels report cumulative
+  detents; one detent per `WHEEL_DELTA` is a guess because GDK specifies cumulative change without a unit.
 - Device info: the keyboard's `layout` is the active layout's identifier (`GetKeyboardLayoutNameW`, e.g. 0x0000040E),
   read when the device is made; `keyCount` counts the reportable virtual keys that have a scan code;
   `functionKeyCount` is `GetKeyboardType(2)` (12 if Windows doesn't say); `nativeLanguage` is an empty string. The
   mouse's `sampleRate` is 500, one sample per 2 ms poll; `sensorDpi` is 0 (unknown from the cursor). A key's scan code
   or character changing while it is held (a layout switch) is a new reading, like a key going down or up.
 - Keys and buttons come from `GetAsyncKeyState` with the keyboard pad's focus rule: with `1` only while this
-  process's window has focus, with `always` whatever has focus. Out of focus nothing is held and cursor movement is
-  not counted. Cursor deltas stop at the screen edge, as the keyboard pad's do.
+  process's window has focus, with `always` whatever has focus. Out of focus the devices remain connected with an empty
+  reading and movement is not counted; whether real GameInput drops `InputEnabled` is unverified.
 - They are not gamepads: `connected_count` does not count them, and a gamepad query never answers with their
   readings. Enumeration, `GetCurrentReading`/`GetNextReading`/`GetPreviousReading`, aggregate devices,
   `FindDeviceFromId` and reading callbacks registered for their kind cover them.

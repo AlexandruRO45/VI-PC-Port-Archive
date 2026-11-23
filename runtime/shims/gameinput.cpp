@@ -1688,6 +1688,7 @@ bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 // moved, with no edge and no pointer acceleration. A message-only window (never shown) on its own thread receives
 // WM_INPUT and adds each movement to a running total; system_cursor_pos then returns that total as an edgeless
 // "cursor", and update_keyboard_pad takes the difference between polls exactly as it did with the real cursor.
+std::atomic<long long> g_raw_wheel_x{0}, g_raw_wheel_y{0};
 std::atomic<long long> g_raw_x{0}, g_raw_y{0};  // total raw movement since the thread started, mouse counts
 std::atomic<bool> g_raw_ready{false};           // registration worked; system_cursor_pos uses the totals
 std::atomic<bool> g_raw_started{false};         // the thread is started once per process
@@ -1698,11 +1699,17 @@ LRESULT CALLBACK raw_mouse_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UINT size = sizeof(raw);
         if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) !=
                 static_cast<UINT>(-1) &&
-            raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            raw.header.dwType == RIM_TYPEMOUSE) {
+            if (raw.data.mouse.usButtonFlags & RI_MOUSE_WHEEL)
+                g_raw_wheel_y += static_cast<SHORT>(raw.data.mouse.usButtonData);
+            if (raw.data.mouse.usButtonFlags & RI_MOUSE_HWHEEL)
+                g_raw_wheel_x += static_cast<SHORT>(raw.data.mouse.usButtonData);
+            if (!(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
             // Relative movement only: absolute reports (remote desktop, some VMs, tablets) are positions, not
             // movement, and would make the stick jump.
             g_raw_x += raw.data.mouse.lLastX;
             g_raw_y += raw.data.mouse.lLastY;  // +Y is down, as for the cursor
+            }
         }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);  // also for WM_INPUT, which lets Windows clean up the input
@@ -1758,6 +1765,13 @@ bool system_cursor_pos(int* x, int* y) {
     *y = p.y;
     return true;
 }
+
+bool system_wheel(int64_t* x, int64_t* y) {
+    *x = g_raw_wheel_x.load();
+    *y = g_raw_wheel_y.load();
+    return true;
+}
+std::atomic<rt::gameinput::WheelSourceFn> g_wheel_source{system_wheel};
 
 bool foreground_is_ours() {
     const HWND w = GetForegroundWindow();
@@ -1905,8 +1919,7 @@ void update_keyboard_pad() {
 // Their readings carry GameInputKindKeyboard or GameInputKindMouse and nothing else. Keys and mouse buttons come from
 // the same source as the keyboard pad (GetAsyncKeyState, or the test's set_keyboard_source) under the same focus
 // rule; mouse motion is the cursor's movement between polls (set_cursor_source in tests), summed into GameInput's
-// relative positionX/Y. There is no wheel: without a window there are no wheel messages, and the mouse info says
-// so (hasWheelX/Y false). A reading is pushed when the state changes.
+// relative positionX/Y. Wheel totals come from raw input. A reading is pushed when the state changes.
 //
 // VERIFY: the device family, keyboard kind and layout a console title expects, and whether it reads codePoint;
 // codePoint is MapVirtualKey's unshifted character (upper case for letters), not ToUnicode's shifted one.
@@ -1914,6 +1927,9 @@ struct KbmPoll {
     int cursor_x = 0, cursor_y = 0;
     bool have_cursor = false;  // false after focus loss, so the first poll after it moves nothing
     int64_t position_x = 0, position_y = 0;
+    int64_t wheel_source_x = 0, wheel_source_y = 0, wheel_x = 0, wheel_y = 0;
+    int64_t remainder_x = 0, remainder_y = 0;
+    bool have_wheel = false;
     Snapshot keyboard{}, mouse{};
     bool keyboard_read = false, mouse_read = false;  // a reading exists for this connection
 };
@@ -1965,7 +1981,7 @@ Device* kbm_device(int which) {
         i.supportedInput = GameInputKindMouse;
         d->mouse_info = {GameInputMouseLeftButton | GameInputMouseRightButton | GameInputMouseMiddleButton |
                              GameInputMouseButton4 | GameInputMouseButton5,
-                         500, 0, false, false};  // one sample per 2 ms poll_thread() pass; DPI unknown from the cursor
+                         500, 0, true, true};  // one sample per 2 ms poll_thread() pass; DPI unknown from the cursor
         i.mouseInfo = &d->mouse_info;
     }
     d->name = kKbmNames[which];
@@ -2012,7 +2028,8 @@ bool same_keys(const Snapshot& a, const Snapshot& b) {
 
 bool same_mouse(const Snapshot& a, const Snapshot& b) {
     return a.mouse.buttons == b.mouse.buttons && a.mouse.positionX == b.mouse.positionX &&
-           a.mouse.positionY == b.mouse.positionY;
+           a.mouse.positionY == b.mouse.positionY && a.mouse.wheelX == b.mouse.wheelX &&
+           a.mouse.wheelY == b.mouse.wheelY;
 }
 
 void update_keyboard_mouse(uint64_t now) {
@@ -2029,6 +2046,7 @@ void update_keyboard_mouse(uint64_t now) {
         }
         for (int which = 0; which < 2; ++which) kbm_connect(kbm_device(which), now);
     }
+    start_raw_mouse();
     const bool focus = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
     const rt::gameinput::KeyDownFn key_down = g_key_down.load();
 
@@ -2068,6 +2086,22 @@ void update_keyboard_mouse(uint64_t now) {
     } else {
         g_kbm.have_cursor = false;  // out of focus nothing is held, and the cursor is read afresh on return
     }
+    int64_t wx = 0, wy = 0;
+    const bool have_wheel = g_wheel_source.load()(&wx, &wy);
+    if (focus && have_wheel && g_kbm.have_wheel) {
+        // GDK documents cumulative change but not units: one detent per WHEEL_DELTA is a guess.
+        g_kbm.remainder_x += wx - g_kbm.wheel_source_x;
+        g_kbm.remainder_y += wy - g_kbm.wheel_source_y;
+        g_kbm.wheel_x += g_kbm.remainder_x / WHEEL_DELTA;
+        g_kbm.wheel_y += g_kbm.remainder_y / WHEEL_DELTA;
+        g_kbm.remainder_x %= WHEEL_DELTA;
+        g_kbm.remainder_y %= WHEEL_DELTA;
+    }
+    g_kbm.have_wheel = focus && have_wheel;
+    g_kbm.wheel_source_x = wx;
+    g_kbm.wheel_source_y = wy;
+    mouse.mouse.wheelX = g_kbm.wheel_x;
+    mouse.mouse.wheelY = g_kbm.wheel_y;
     mouse.mouse.positionX = g_kbm.position_x;
     mouse.mouse.positionY = g_kbm.position_y;
 
@@ -2838,6 +2872,8 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
     g_has_focus = has_focus ? has_focus : foreground_is_ours;
 }
 
+void set_wheel_source(WheelSourceFn source) { g_wheel_source = source ? source : system_wheel; }
+bool raw_mouse_started() { return g_raw_started.load(); }
 void set_cursor_source(CursorPosFn cursor_pos) { g_cursor_pos = cursor_pos ? cursor_pos : system_cursor_pos; }
 
 void set_haptic_source(const HapticApi* api) { g_haptic_api = api ? api : &kSdlHaptic; }

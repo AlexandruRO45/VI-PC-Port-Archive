@@ -200,6 +200,9 @@ bool g_keys[256] = {};
 bool g_focus = false;
 bool fake_key_down(int vk) { return vk >= 0 && vk < 256 && g_keys[vk]; }
 bool fake_focus() { return g_focus; }
+int64_t g_wheel_x = 0, g_wheel_y = 0;
+bool g_wheel_available = true;
+bool fake_wheel(int64_t* x, int64_t* y) { *x = g_wheel_x; *y = g_wheel_y; return g_wheel_available; }
 int g_cursor_x = 0, g_cursor_y = 0;
 bool fake_cursor(int* x, int* y) {
     *x = g_cursor_x;
@@ -1611,6 +1614,8 @@ void test_haptic_motors(IGameInput* input) {
 // The keyboard and mouse devices (LEONIDA_KEYBOARD_MOUSE, RT-159), driven by the same fake keys, focus and cursor as
 // the keyboard pad. No pad is connected while this runs.
 void test_keyboard_mouse(IGameInput* input) {
+    check(!rt::gameinput::raw_mouse_started(), "keyboard/mouse: raw thread initially stopped");
+    rt::gameinput::set_wheel_source(fake_wheel);
     rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
     rt::gameinput::set_cursor_source(fake_cursor);
     for (bool& k : g_keys) k = false;
@@ -1663,8 +1668,9 @@ void test_keyboard_mouse(IGameInput* input) {
     check(mi->mouseInfo && static_cast<const GameInputMouseInfo*>(mi->mouseInfo)->sampleRate == 500,
           "keyboard/mouse: mouse sample rate is the 2 ms poll");
     check(mi->supportedInput == GameInputKindMouse && mi->mouseInfo &&
-              !static_cast<const GameInputMouseInfo*>(mi->mouseInfo)->hasWheelY,
-          "keyboard/mouse: mouse info (no wheel)");
+              static_cast<const GameInputMouseInfo*>(mi->mouseInfo)->hasWheelX &&
+              static_cast<const GameInputMouseInfo*>(mi->mouseInfo)->hasWheelY,
+          "keyboard/mouse: mouse info has both wheels");
     check(ki->displayName && std::strcmp(ki->displayName->data, "Keyboard (Leonida)") == 0,
           "keyboard/mouse: keyboard display name");
     IGameInputDevice* found = nullptr;
@@ -1748,6 +1754,25 @@ void test_keyboard_mouse(IGameInput* input) {
     g_keys['W'] = g_keys[VK_LSHIFT] = g_keys[VK_SHIFT] = g_keys[VK_LBUTTON] = true;  // as the mouse checks below expect
     rt::gameinput::poll();
 
+    check(rt::gameinput::raw_mouse_started(), "keyboard/mouse: raw thread starts without keyboard pad");
+    g_wheel_x = 60; g_wheel_y = -60;
+    rt::gameinput::poll();
+    g_wheel_x = 180; g_wheel_y = -240;
+    rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindMouse, mse, &r) == S_OK && r) {
+        GameInputMouseState m{}; r->GetMouseState(&m);
+        check(m.wheelX == 1 && m.wheelY == -2, "keyboard/mouse: wheel totals retain fractional detents");
+        r->Release();
+    } else check(false, "keyboard/mouse: wheel reading");
+    g_wheel_available = false; g_wheel_x = 900;
+    rt::gameinput::poll();
+    g_wheel_available = true; rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindMouse, mse, &r) == S_OK && r) {
+        GameInputMouseState m{}; r->GetMouseState(&m);
+        check(m.wheelX == 1 && m.wheelY == -2, "keyboard/mouse: missing wheel source does not move wheels");
+        r->Release();
+    } else check(false, "keyboard/mouse: reading with missing wheel source");
+
     // The mouse: buttons, and motion summed from the cursor's movement.
     g_cursor_x = 105;
     g_cursor_y = 97;
@@ -1758,7 +1783,7 @@ void test_keyboard_mouse(IGameInput* input) {
         GameInputMouseState m{};
         check(r->GetMouseState(&m) && r->GetKeyCount() == 0, "keyboard/mouse: a mouse reading has mouse state");
         check(m.buttons == GameInputMouseLeftButton, "keyboard/mouse: the left button");
-        check(m.positionX == 8 && m.positionY == -3 && m.wheelY == 0,
+        check(m.positionX == 8 && m.positionY == -3 && m.wheelY == -2,
               "keyboard/mouse: positions sum the cursor's movement (+5 then +3, -3)");
         r->Release();
     } else {
@@ -1772,6 +1797,7 @@ void test_keyboard_mouse(IGameInput* input) {
     // Out of focus nothing is held and moving the cursor does not count.
     g_focus = false;
     g_cursor_x = 300;
+    g_wheel_x += 240; g_wheel_y += 240;
     rt::gameinput::poll();
     g_focus = true;
     rt::gameinput::poll();  // the first poll back in focus takes the cursor as it is
@@ -1781,6 +1807,7 @@ void test_keyboard_mouse(IGameInput* input) {
         GameInputMouseState m{};
         r->GetMouseState(&m);
         check(m.positionX == 8, "keyboard/mouse: cursor movement out of focus is not counted");
+        check(m.wheelX == 1 && m.wheelY == -2, "keyboard/mouse: wheel movement out of focus is not counted");
         r->Release();
     }
     g_focus = false;
@@ -1806,6 +1833,7 @@ void test_keyboard_mouse(IGameInput* input) {
     g_focus = false;
     set_env("LEONIDA_KEYBOARD_MOUSE", nullptr);
     rt::gameinput::reload_config();
+    rt::gameinput::set_wheel_source(nullptr);
     rt::gameinput::set_keyboard_source(nullptr, nullptr);
     rt::gameinput::set_cursor_source(nullptr);
 }
@@ -2316,10 +2344,10 @@ int main() {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "all pads closed after detaching");
 
+    test_keyboard_mouse(input);
     test_active_input();
     test_twins(input);
     test_keyboard_pad(input);
-    test_keyboard_mouse(input);
     test_motion(input);
     test_aggregate_device(input);
     test_force_feedback(input);
