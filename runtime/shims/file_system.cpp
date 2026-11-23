@@ -896,7 +896,7 @@ BOOL WINAPI find_close(HANDLE find) {
     return ::FindClose(find);
 }
 
-BOOL WINAPI delete_file_w(LPCWSTR name) {
+BOOL delete_file_impl(LPCWSTR name, bool write_through, bool& flush_failed) {
     if (!name) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -938,7 +938,12 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             }
             // The package file stays where it is; the marker is what hides it.
             DWORD error = 0;
-            if (!write_marker(marker(r.overlay, parts), error)) return fail_bool(error);
+            const auto mark = marker(r.overlay, parts);
+            if (!write_marker(mark, error)) return fail_bool(error);
+            if (write_through && !flush_file(mark, error)) {
+                flush_failed = true;
+                return fail_bool(error);
+            }
             removed = true;
         }
     }
@@ -947,6 +952,11 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
         return FALSE;
     }
     return TRUE;
+}
+
+BOOL WINAPI delete_file_w(LPCWSTR name) {
+    bool flush_failed = false;
+    return delete_file_impl(name, false, flush_failed);
 }
 
 BOOL WINAPI delete_file_a(LPCSTR name) {
@@ -1066,7 +1076,9 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
             if (error || !flush_file(target.path, error)) return fail_bool(error);
         }
         // Windows reports a successful copy even if it cannot remove the original.
-        delete_file_w(from);
+        bool flush_failed = false;
+        delete_file_impl(from, (flags & MOVEFILE_WRITE_THROUGH) != 0, flush_failed);
+        if (flush_failed) return FALSE;
         return TRUE;
     }
 
