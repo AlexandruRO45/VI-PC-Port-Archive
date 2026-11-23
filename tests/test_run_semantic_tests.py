@@ -4,11 +4,13 @@ or unimportable file always makes it exit 1 with that file named, in parallel an
     python -I tests/test_run_semantic_tests.py
 """
 import contextlib
+import errno
 import io
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -76,6 +78,29 @@ class RunnerTest(unittest.TestCase):
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 1)
             self.assertIn("no test*.py files", out)
+
+    def test_unreadable_discovery_does_not_run_a_partial_suite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_ok.py": PASS,
+                        "locked/__init__.py": "", "locked/test_failure.py": FAIL})
+            scandir = os.scandir
+            for blocked in (os.path.join(tmp, "locked"), tmp):
+                with self.subTest(blocked=blocked):
+                    def scan(path):
+                        if path == blocked:
+                            raise PermissionError(errno.EACCES, "Permission denied", path)
+                        return scandir(path)
+
+                    stderr = io.StringIO()
+                    with (mock.patch.object(r.os, "scandir", side_effect=scan),
+                          mock.patch.object(r, "run_module", wraps=r.run_module) as worker,
+                          contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr)):
+                        code = r.main([tmp, "-j", "2"])
+                    self.assertEqual(code, 1)
+                    worker.assert_not_called()
+                    self.assertEqual(stderr.getvalue().splitlines(), [
+                        f"error: cannot discover semantic tests in {blocked}: Permission denied",
+                    ])
 
 
 if __name__ == "__main__":

@@ -20,10 +20,14 @@ import sys
 import time
 
 
+def _raise_scan_error(error):
+    raise error
+
+
 def test_modules(directory):
     """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only)."""
     names = []
-    for base, dirs, files in os.walk(directory):
+    for base, dirs, files in os.walk(directory, onerror=_raise_scan_error):
         dirs[:] = sorted(d for d in dirs if os.path.isfile(os.path.join(base, d, "__init__.py")))
         prefix = os.path.relpath(base, directory).replace(os.sep, ".")
         for name in sorted(files):
@@ -51,7 +55,12 @@ def main(argv=None):
     if a.jobs <= 1:
         return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
                                 *(["-v"] if a.verbose else [])])
-    modules = test_modules(directory)
+    try:
+        modules = test_modules(directory)
+    except OSError as error:
+        print(f"error: cannot discover semantic tests in {error.filename or directory}: {error.strerror or error}",
+              file=sys.stderr)
+        return 1
     if not modules:
         print(f"no test*.py files in {directory}")
         return 1
