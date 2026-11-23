@@ -267,5 +267,62 @@ class TestValuMin3F16AST(unittest.TestCase):
         self.assertTrue(ast.src2.is_literal)
         self.assertEqual(ast.src2.literal_value, 0x3C00)
 
+
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic scalar instruction interpreter
+# -----------------------------------------------------------------------------
+class ScalarF16Machine:
+    def __init__(self):
+        self.vgprs: dict[str, int] = {}
+        self.sgprs: dict[str, int] = {}
+
+    def get_half(self, op: F16Operand) -> int:
+        if op.is_literal:
+            raw = op.literal_value
+        elif op.is_vgpr:
+            raw = self.vgprs.get(op.reg, 0)
+        else:
+            raw = self.sgprs.get(op.reg, 0)
+        word16 = ((raw >> 16) if op.hi else raw) & MASK16
+        return apply_f16_input_mod(word16, neg=op.neg, abs_val=op.abs_val)
+
+    def execute(self, ast: VMin3F16AST) -> int:
+        w0 = self.get_half(ast.src0)
+        w1 = self.get_half(ast.src1)
+        w2 = self.get_half(ast.src2)
+        res16 = ref_min3_f16(w0, w1, w2, clamp=ast.clamp)
+
+        old_dst = self.vgprs.get(ast.dst_reg, OLD_VAL)
+        if ast.dst_hi:
+            new_val = (old_dst & 0x0000FFFF) | ((res16 & MASK16) << 16)
+        else:
+            new_val = (old_dst & 0xFFFF0000) | (res16 & MASK16)
+        self.vgprs[ast.dst_reg] = new_val
+        return new_val
+
+
+class TestValuMin3F16ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction execution."""
+
+    def test_scalar_interpreter_basic(self):
+        mach = ScalarF16Machine()
+        mach.vgprs["v0"] = 0x12345678
+        mach.sgprs["s0"] = 0x3C00  # 1.0
+        mach.sgprs["s1"] = 0x4000  # 2.0
+        mach.sgprs["s2"] = 0x3800  # 0.5
+        ast = VMin3F16AST.parse("v_min3_f16 v0, s0, s1, s2")
+        out = mach.execute(ast)
+        self.assertEqual(out, 0x12343800)
+
+    def test_scalar_interpreter_high_half_write(self):
+        mach = ScalarF16Machine()
+        mach.vgprs["v0"] = 0x12345678
+        mach.sgprs["s0"] = 0x40003C00  # lo=1.0, hi=2.0
+        mach.sgprs["s1"] = 0x4200      # 3.0
+        mach.sgprs["s2"] = 0x4400      # 4.0
+        ast = VMin3F16AST.parse("v_min3_f16 v0, s0, s1, s2 op_sel:[0, 0, 0, 1]")
+        out = mach.execute(ast)
+        self.assertEqual(out, 0x3C005678)
+
 if __name__ == '__main__':
     unittest.main()
