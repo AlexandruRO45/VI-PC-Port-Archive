@@ -134,5 +134,90 @@ class TestDSWrxchgRtnB32Oracle(unittest.TestCase):
         self.assertEqual(lds.read_dword(0x100), 0x33334444)
 
 
+class DSOpcode(str, enum.Enum):
+    DS_WRXCHG_RTN_B32 = "ds_wrxchg_rtn_b32"
+
+
+@dataclasses.dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class SGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"s{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class OffsetImmediate:
+    value: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= 0xFFFF):
+            raise ValueError(f"OffsetImmediate out of range [0, 0xFFFF]: {self.value}")
+
+    def __str__(self) -> str:
+        return f"offset:{self.value}" if self.value != 0 else ""
+
+
+@dataclasses.dataclass(frozen=True)
+class DSWrxchgInstruction:
+    opcode: DSOpcode
+    vdst: VGPR
+    vaddr: VGPR
+    vdata: VGPR
+    offset: OffsetImmediate = dataclasses.field(default_factory=lambda: OffsetImmediate(0))
+
+    def __post_init__(self) -> None:
+        if self.vdst is None:
+            raise ValueError(f"{self.opcode} requires a destination register")
+
+    def to_asm(self) -> str:
+        off_str = f" {self.offset}" if self.offset.value != 0 else ""
+        return f"{self.opcode.value} {self.vdst}, {self.vaddr}, {self.vdata}{off_str}"
+
+
+class TestDSWrxchgRtnB32AST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction(self) -> None:
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(16),
+        )
+        self.assertEqual(inst.opcode, DSOpcode.DS_WRXCHG_RTN_B32)
+        self.assertEqual(inst.vdst.index, 5)
+        self.assertEqual(inst.vaddr.index, 1)
+        self.assertEqual(inst.vdata.index, 2)
+        self.assertEqual(inst.offset.value, 16)
+        self.assertEqual(inst.to_asm(), "ds_wrxchg_rtn_b32 v5, v1, v2 offset:16")
+
+    def test_ast_zero_offset_omitted_in_asm(self) -> None:
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        self.assertEqual(inst.to_asm(), "ds_wrxchg_rtn_b32 v5, v1, v2")
+
+
 if __name__ == "__main__":
     unittest.main()
