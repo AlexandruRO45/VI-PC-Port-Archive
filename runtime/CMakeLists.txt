@@ -75,12 +75,15 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   # XTaskQueue/XAsync from microsoft/libHttpClient (MIT), vendored in third_party/xtaskqueue; shims/xtaskqueue/pch.h
   # stands in for libHttpClient's pch.h so only the task queue builds. Used by the xgameruntime shim.
+  # The sources are compiled through one-line wrappers in shims/xtaskqueue: CMake names the object of a source outside
+  # runtime/ after its absolute path, and Ninja passes those names to lib.exe unquoted through cmd.exe, so a checkout in
+  # a folder with `&` in its name failed to link (tests/test_runtime_sources_in_tree.py).
   set(XTASKQUEUE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/xtaskqueue)
   add_library(gta6rt_xtaskqueue STATIC
-    ${XTASKQUEUE_DIR}/Source/Task/TaskQueue.cpp
-    ${XTASKQUEUE_DIR}/Source/Task/AsyncLib.cpp
-    ${XTASKQUEUE_DIR}/Source/Task/ThreadPool_win32.cpp
-    ${XTASKQUEUE_DIR}/Source/Task/WaitTimer_win32.cpp
+    shims/xtaskqueue/TaskQueue.cpp
+    shims/xtaskqueue/AsyncLib.cpp
+    shims/xtaskqueue/ThreadPool_win32.cpp
+    shims/xtaskqueue/WaitTimer_win32.cpp
   )
   target_include_directories(gta6rt_xtaskqueue
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims/xtaskqueue ${XTASKQUEUE_DIR}/Source/Task ${XTASKQUEUE_DIR}/Source/Common
