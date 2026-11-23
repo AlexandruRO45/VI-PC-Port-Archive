@@ -436,5 +436,33 @@ class VCubeMaEdgeCasesTests(unittest.TestCase):
         self.assertEqual(f32_to_u32(pos_zero_ma), 0x00000000)
         self.assertEqual(f32_to_u32(neg_zero_ma), 0x00000000)
 
+class VCubeMaTranslatorTests(unittest.TestCase):
+    def test_cubema_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 1.0",
+            "v_mov_b32 v1, 2.0",
+            "v_mov_b32 v2, 3.0",
+            "v_cubema_f32 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cubema_exec", lines)
+        val = u32_to_f32(mrt0_words(spv)[0])
+        self.assertEqual(val, 6.0)  # 2 * 3.0
+
+    def test_cubema_zero_translation(self):
+        lines = [
+            "v_mov_b32 v0, 0.0",
+            "v_mov_b32 v1, 0.0",
+            "v_mov_b32 v2, 0.0",
+            "v_cubema_f32 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cubema_zero_exec", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word, 0x00000000)  # Exactly +0.0
+
+
 if __name__ == "__main__":
     unittest.main()
