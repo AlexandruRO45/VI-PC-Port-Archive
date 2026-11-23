@@ -91,7 +91,9 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
 .view-panel.active { display: flex; }
 
 /* Models Layout */
-#models-view { width: 100%; height: 100%; display: flex; }
+/* No display here: an ID rule outranks .view-panel, so a display on it kept this panel visible under the
+   Textures tab and pushed the gallery off-screen. */
+#models-view { width: 100%; height: 100%; }
 #sidebar {
   width: 340px;
   background: var(--bg-panel);

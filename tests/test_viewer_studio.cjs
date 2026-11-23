@@ -276,3 +276,19 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
     await older;
     assert.equal(output.textContent, 'R = -2.5');
 });
+
+test('a tab panel is shown and hidden by .view-panel alone, so the inactive one leaves the page', () => {
+    const css = html.match(/<style>([\s\S]*?)<\/style>/)[1].replace(/\/\*[\s\S]*?\*\//g, '');
+    const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(([, selectors, body]) => ({
+        selectors: selectors.split(',').map(selector => selector.trim()), body,
+    }));
+    const display = selector => rules.filter(rule => rule.selectors.includes(selector))
+        .flatMap(rule => [...rule.body.matchAll(/(?:^|;)\s*display\s*:\s*([^;]+)/g)].map(match => match[1].trim()));
+    assert.deepEqual(display('.view-panel'), ['none']);
+    assert.deepEqual(display('.view-panel.active'), ['flex']);
+    const panels = [...html.matchAll(/<section id="([^"]+)" class="view-panel[ "]/g)].map(match => match[1]);
+    assert.deepEqual(panels, ['models-view', 'textures-view']);
+    // An ID selector outranks both class rules: a display on it would keep that panel on the page when another
+    // tab is active, beside the active panel (the texture gallery was laid out off-screen this way).
+    for (const id of panels) assert.deepEqual(display(`#${id}`), [], `#${id} must not set display`);
+});
