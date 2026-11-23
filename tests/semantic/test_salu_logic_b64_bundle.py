@@ -592,5 +592,26 @@ class TestSOrn2B64ASTAndInterpreter(unittest.TestCase):
         res, scc = state.step(inst)
         self.assertEqual(res, state.read_pair(SGPRPair(0)))
 
+class TestSOrn2B64MaskDivergenceAndBoundaries(unittest.TestCase):
+    """64-bit mask divergence patterns and bit-boundary extremes for s_orn2_b64."""
+
+    def test_boundary_all_zeros_and_ones(self) -> None:
+        res_zero, scc_zero = oracle_s_orn2_b64(0, 0)
+        self.assertEqual(scc_zero, 1 if res_zero != 0 else 0)
+        res_ones, scc_ones = oracle_s_orn2_b64(MASK64, MASK64)
+        self.assertEqual(scc_ones, 1 if res_ones != 0 else 0)
+
+    def test_alternating_bit_patterns(self) -> None:
+        p5 = 0x5555_5555_5555_5555
+        pa = 0xAAAA_AAAA_AAAA_AAAA
+        res, scc = oracle_s_orn2_b64(p5, pa)
+        self.assertEqual(scc, 1 if res != 0 else 0)
+
+    def test_high_low_dword_independence(self) -> None:
+        hi_only = 0xFFFF_FFFF_0000_0000
+        lo_only = 0x0000_0000_FFFF_FFFF
+        res, scc = oracle_s_orn2_b64(hi_only, lo_only)
+        self.assertEqual(scc, 1 if res != 0 else 0)
+
 if __name__ == "__main__":
     unittest.main()
