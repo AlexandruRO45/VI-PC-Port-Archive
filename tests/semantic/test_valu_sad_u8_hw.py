@@ -251,5 +251,96 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(words[0], 20)
 
 
+class WaveSize(Enum):
+    WAVE32 = 32
+    WAVE64 = 64
+
+
+class SIMDWaveState:
+    def __init__(self, size: WaveSize = WaveSize.WAVE32):
+        self.size = size
+        self.num_lanes = size.value
+        self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        self.sgprs = [0] * 106
+        self.exec_mask = (1 << self.num_lanes) - 1
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def read_operand(self, lane: int, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[lane][op.index]
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index]
+        else:
+            return op.literal_val
+
+    def write_vgpr(self, lane: int, idx: int, val: int):
+        self.vgprs[lane][idx] = val & MASK32
+
+
+class SIMDInterpreter:
+    @staticmethod
+    def step(insn: VSadU8Instruction, wave: SIMDWaveState):
+        for lane in range(wave.num_lanes):
+            if not wave.is_lane_active(lane):
+                continue
+            u0 = wave.read_operand(lane, insn.src0)
+            u1 = wave.read_operand(lane, insn.src1)
+            u2 = wave.read_operand(lane, insn.src2)
+            res = ref_sad_u8(u0, u1, u2)
+            wave.write_vgpr(lane, insn.dst.index, res)
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    def test_simd_wave32_even_lanes_active(self):
+        wave = SIMDWaveState(WaveSize.WAVE32)
+        wave.exec_mask = 0x55555555  # Even lanes active
+
+        for lane in range(32):
+            wave.vgprs[lane][0] = 0x04030201
+            wave.vgprs[lane][1] = 0x00000000
+            wave.vgprs[lane][2] = 0
+            wave.vgprs[lane][3] = 0xDEADBEEF  # Sentinel
+
+        insn = VSadU8Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        SIMDInterpreter.step(insn, wave)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][3], 10)
+            else:
+                self.assertEqual(wave.vgprs[lane][3], 0xDEADBEEF)
+
+    def test_simd_wave64_odd_lanes_active(self):
+        wave = SIMDWaveState(WaveSize.WAVE64)
+        wave.exec_mask = 0xAAAAAAAAAAAAAAAA  # Odd lanes active
+
+        for lane in range(64):
+            wave.vgprs[lane][0] = 0x00000000
+            wave.vgprs[lane][1] = 0xFFFFFFFF
+            wave.vgprs[lane][2] = 0
+            wave.vgprs[lane][3] = 0xCAFEBABE
+
+        insn = VSadU8Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        SIMDInterpreter.step(insn, wave)
+
+        for lane in range(64):
+            if lane % 2 == 1:
+                self.assertEqual(wave.vgprs[lane][3], 1020)
+            else:
+                self.assertEqual(wave.vgprs[lane][3], 0xCAFEBABE)
+
+
 if __name__ == "__main__":
     unittest.main()
