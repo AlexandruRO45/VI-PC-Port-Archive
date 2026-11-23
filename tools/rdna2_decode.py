@@ -1278,10 +1278,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         mods = []
         for fn, nr, _ in spec:
             w = _width(nr, wave32)
-            if fn == "SDATA":
+            if fn == "SDATA" and name.startswith("s_atc_probe"):
+                # The SDATA field is a 7-bit immediate here (the probe mode); llvm-mc prints it in decimal up to 64
+                # and in hex from 65 (`s_atc_probe 0x41, ...`).
+                args.append({"k": "raw", "t": str(sdata) if sdata <= 64 else f"0x{sdata:x}"})
+            elif fn == "SDATA":
                 args.append(_sreg(sdata, w))
-            elif fn == "PROBE":  # s_atc_probe*: the SDATA field is a 7-bit immediate (the probe mode)
-                args.append({"k": "imm", "v": sdata})
             elif fn == "SBASE":
                 args.append(_sreg(sbase, w))
             elif fn in ("OFFSET", "SOFFSET"):

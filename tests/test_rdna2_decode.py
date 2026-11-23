@@ -63,26 +63,6 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                     for field in ("op", "args", "mods"):
                         self.assertEqual(ins[field], expected[field])
 
-    def test_gfx101_smem_stores_atomics_and_probes(self):
-        # What llvm-mc 23.1.6 prints for these SMEM words (sdata s4/s8, sbase s[2:3]/s[4:7], null soffset, offset
-        # 0x10). The scalar stores, scratch ops and atomics exist on gfx101x only; s_atc_probe* on both targets.
-        for opcode, sdata_sbase, asm, gfx103 in (
-            (0x10, (4 << 6) | 1, "s_store_dword s4, s[2:3], 16", False),
-            (0x06, (4 << 6) | 1, "s_scratch_load_dwordx2 s[4:5], s[2:3], 16", False),
-            (0x1a, (8 << 6) | 2, "s_buffer_store_dwordx4 s[8:11], s[4:7], 16", False),
-            (0x81, (4 << 6) | 1, "s_atomic_cmpswap s[4:5], s[2:3], 16", False),
-            (0xa1, (4 << 6) | 1, "s_atomic_cmpswap_x2 s[4:7], s[2:3], 16", False),
-            (0x6c, (8 << 6) | 2, "s_buffer_atomic_dec_x2 s[8:9], s[4:7], 16", False),
-            (0x26, (4 << 6) | 1, "s_atc_probe 4, s[2:3], 16", True),
-            (0x27, (8 << 6) | 2, "s_atc_probe_buffer 8, s[4:7], 16", True),
-        ):
-            code = words(0xF4000000 | opcode << 18 | sdata_sbase, 0x7D << 25 | 0x10)
-            with self.subTest(asm=asm):
-                text, invalid = rdna2_decode.disasm_bytes(code, mcpu="gfx1013")
-                self.assertEqual((text.split(";")[0].strip(), invalid), (asm, 0))
-                text, invalid = rdna2_decode.disasm_bytes(code, mcpu="gfx1030")
-                self.assertEqual(invalid == 0, gfx103)
-
     def test_image_slc_is_independent_of_sampler(self):
         for sampler in (0, 64):
             for slc in (0, 1):
@@ -239,6 +219,32 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             "k": "slist", "r": [100, 101, 102, 103, 104, 105, "vcc_lo", "vcc_hi"], "n": 8,
         })
         self.assertEqual(ins["args"][2], {"k": "special", "t": "null", "neg": False, "abs": False})
+
+    def test_gfx101_smem_stores_atomics_and_probes(self):
+        # What llvm-mc 23.1.6 prints for these SMEM words (sdata s4/s8, sbase s[2:3]/s[4:7], null soffset, offset
+        # 0x10). The scalar stores, scratch ops and atomics exist on gfx101x only; s_atc_probe* on both targets.
+        for opcode, sdata_sbase, asm, gfx103 in (
+            (0x10, (4 << 6) | 1, "s_store_dword s4, s[2:3], 16", False),
+            (0x06, (4 << 6) | 1, "s_scratch_load_dwordx2 s[4:5], s[2:3], 16", False),
+            (0x1a, (8 << 6) | 2, "s_buffer_store_dwordx4 s[8:11], s[4:7], 16", False),
+            (0x81, (4 << 6) | 1, "s_atomic_cmpswap s[4:5], s[2:3], 16", False),
+            (0xa1, (4 << 6) | 1, "s_atomic_cmpswap_x2 s[4:7], s[2:3], 16", False),
+            (0x6c, (8 << 6) | 2, "s_buffer_atomic_dec_x2 s[8:9], s[4:7], 16", False),
+            (0x26, (4 << 6) | 1, "s_atc_probe 4, s[2:3], 16", True),
+            (0x27, (8 << 6) | 2, "s_atc_probe_buffer 8, s[4:7], 16", True),
+            (0x26, (65 << 6) | 1, "s_atc_probe 0x41, s[2:3], 16", True),
+            (0x26, (64 << 6) | 1, "s_atc_probe 64, s[2:3], 16", True),
+        ):
+            code = words(0xF4000000 | opcode << 18 | sdata_sbase, 0x7D << 25 | 0x10)
+            with self.subTest(asm=asm):
+                text, invalid = rdna2_decode.disasm_bytes(code, mcpu="gfx1013")
+                self.assertEqual((text.split(";")[0].strip(), invalid), (asm, 0))
+                text, invalid = rdna2_decode.disasm_bytes(code, mcpu="gfx1030")
+                self.assertEqual(invalid == 0, gfx103)
+        # s_dcache_wb (0x21) has no operands and is gfx101x-only too (llvm-mc's own vector 000084f400000000).
+        code = bytes.fromhex("000084f400000000")
+        self.assertEqual(rdna2_decode.disasm_bytes(code, mcpu="gfx1013")[0].split(";")[0].strip(), "s_dcache_wb")
+        self.assertEqual(rdna2_decode.disasm_bytes(code, mcpu="gfx1030")[1], 2)
 
     def test_mubuf_mtbuf_mimg_global_ds_exp_vintrp(self):
         # MUBUF: buffer_load_format_d16_xyzw v[8:9], v5, s[4:7], 0 offen (encoding verified against llvm-mc)
