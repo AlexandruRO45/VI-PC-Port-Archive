@@ -1120,7 +1120,7 @@ def run_suite(a, work: str) -> int:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
             results.append((name, ok, detail))
-        elif name == "cs_imgstore":
+        elif name in ("cs_imgstore", "cs_imgstore_d16"):
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
