@@ -162,6 +162,8 @@ int main(int argc, char** argv) {
         check(started == S_OK, "issue async starts");
         if (started == S_OK) {
             check(XAsyncGetStatus(&issue, false) == E_PENDING && !called, "issue pending before dispatch");
+            check(at<ResolveResult>(user, slot_index + 1)(user, &issue) == E_PENDING,
+                  "issue result pending before dispatch");
             XTaskQueueDispatch(issue_queue, XTaskQueuePort::Work, 0);
             check(!called, "issue callback waits for completion dispatch");
             XTaskQueueDispatch(issue_queue, XTaskQueuePort::Completion, 0);
