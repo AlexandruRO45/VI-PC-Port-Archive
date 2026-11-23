@@ -102,6 +102,8 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
           ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
+# the default-MODE legacy multiply: one thread, so no 64-wide subgroup requirement (cs_mul_legacy_denorm.asm)
+WAVE32_DUMPS += ("cs_mul_legacy_denorm",)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
 CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
@@ -156,7 +158,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_barrier_loop", [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE]),
             # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC (inactive lanes keep the old VGPR)
             ("cs_mask_vgpr_exec", [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-                                   0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF])]
+                                   0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF]),
+            # the default-MODE legacy multiply: flushes operands and the product, keeps the product's sign, and
+            # overrides a zero operand to +0 (derivations in cs_mul_legacy_denorm.asm)
+            ("cs_mul_legacy_denorm", [0, 0, 0, 0, 0, 0x80000000, 0, 0])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 # The SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm header): one thread too.
 # Never run cs_smem_sload_neg with a translator that zero-extends the s_load immediate: it reads 4 GiB past the heap.

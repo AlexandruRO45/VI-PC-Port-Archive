@@ -1120,6 +1120,13 @@ def run_suite(a, work: str) -> int:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
             results.append((name, ok, detail))
+        elif name == "cs_mul_legacy_denorm":
+            # the default-MODE legacy multiply: operands and product flush, the product's sign is kept and a zero
+            # operand overrides to +0. One thread, so no 64-wide subgroup requirement (cs_mul_legacy_denorm.asm).
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            ok, detail = judge_cs_dump(rc, msg, [0, 0, 0, 0, 0, 0x80000000, 0, 0], wave64=False, partial=False,
+                                       emulated=False)
+            results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
