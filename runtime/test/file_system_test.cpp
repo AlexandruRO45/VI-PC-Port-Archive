@@ -251,6 +251,16 @@ void run_checks(const std::filesystem::path& root) {
         check(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_HIDDEN), "package folder remains hidden");
     }
 
+    // Truncating a package-only directory must fail without leaving an overlay mirror.
+    {
+        std::filesystem::create_directory(package / "truncate_folder");
+        HANDLE h = create_w(L"GAME:\\truncate_folder", GENERIC_WRITE, FILE_SHARE_READ, nullptr, TRUNCATE_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        check(h == INVALID_HANDLE_VALUE, "truncating a directory fails");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(overlay / "truncate_folder"), "failed truncate does not mirror the folder");
+    }
+
     // A writable folder handle needs an overlay mirror, even when only the package has the folder.
     {
         constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;

@@ -457,7 +457,7 @@ Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DW
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
         disposition == OPEN_EXISTING || disposition == OPEN_ALWAYS || disposition == TRUNCATE_EXISTING;
-    return write_target(path, keeps_contents, (flags & FILE_FLAG_BACKUP_SEMANTICS) != 0);
+    return write_target(path, keeps_contents, disposition == OPEN_EXISTING && (flags & FILE_FLAG_BACKUP_SEMANTICS) != 0);
 }
 
 // ---- FindFirstFile: the overlay and the package merged into one listing
