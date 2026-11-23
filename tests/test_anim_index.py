@@ -242,6 +242,21 @@ class RigParseTest(unittest.TestCase):
                          rbf0_blob().find(b"canonical@source") - 6)
         self.assertEqual(r["rigsets"][0]["distinct_rigs"], 2)
 
+    def test_fd_string_needs_its_declared_length(self):
+        whole = _fd(b"anim/rig/synthetic/cut")
+        self.assertEqual(anim_index._fd_string(whole, 0), "anim/rig/synthetic/cut")
+        self.assertIsNone(anim_index._fd_string(whole[:-1], 0))
+        self.assertIsNone(anim_index._fd_string(whole[:-6], 0))
+
+    def test_rbf0_truncated_rig_key_is_not_a_rig(self):
+        head = rbf0_blob()
+        head = head[:head.find(b"\xff" * 6) + 6]   # first rig set with its two entries
+        cut = _entry(b"pipelined@source", b"anim/rig/pipelined/source/synthetic/cut", b"facial")
+        cut = cut[:cut.find(b"synthetic/cut") + len(b"synthetic/")]   # rig key ends mid-string
+        r = anim_index.parse_rbf0(head + cut)
+        self.assertEqual((r["summary"]["entries"], r["summary"]["distinct_rigs"]), (2, 2))
+        self.assertEqual(r["summary"]["sources"]["pipelined@source"]["entries"], 0)
+
     def test_rbf0_rejects_non_rbf0(self):
         with self.assertRaises(ValueError):
             anim_index.parse_rbf0(b"not an RBF0 blob")
