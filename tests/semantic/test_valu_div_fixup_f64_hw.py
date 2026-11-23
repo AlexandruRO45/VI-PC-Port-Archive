@@ -380,3 +380,124 @@ class TestScalarInterpreter(unittest.TestCase):
         interp_res = interp.step(instr, state)
         spv_res = run_translator_div_fixup(F64_FOUR, F64_TWO, F64_TWO, mods="clamp", name="ps_scalar_div_cross")
         self.assertEqual(interp_res, spv_res)
+
+
+# ==============================================================================
+# SECTION 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState64:
+    num_lanes: int = 32
+    exec_mask: int = MASK_32
+    vgprs: List[Dict[int, int]] = field(default_factory=list)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [dict() for _ in range(self.num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr64(self, lane: int, base_idx: int) -> int:
+        lo = self.vgprs[lane].get(base_idx, 0)
+        hi = self.vgprs[lane].get(base_idx + 1, 0)
+        return u64((hi << 32) | lo)
+
+    def set_vgpr64(self, lane: int, base_idx: int, val: int) -> None:
+        val = u64(val)
+        self.vgprs[lane][base_idx] = val & MASK_32
+        self.vgprs[lane][base_idx + 1] = (val >> 32) & MASK_32
+
+    def get_sgpr64(self, base_idx: int) -> int:
+        lo = self.sgprs.get(base_idx, 0)
+        hi = self.sgprs.get(base_idx + 1, 0)
+        return u64((hi << 32) | lo)
+
+    def set_sgpr64(self, base_idx: int, val: int) -> None:
+        val = u64(val)
+        self.sgprs[base_idx] = val & MASK_32
+        self.sgprs[base_idx + 1] = (val >> 32) & MASK_32
+
+
+class SIMDInterpreter64:
+    def resolve_lane_operand64(self, op: Operand64, lane: int, state: SIMDState64) -> int:
+        if op.kind == OperandKind.VGPR_PAIR:
+            return state.get_vgpr64(lane, op.base_reg)
+        elif op.kind == OperandKind.SGPR_PAIR:
+            return state.get_sgpr64(op.base_reg)
+        elif op.kind == OperandKind.IMMEDIATE_F64:
+            return u64(op.imm_val)
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VDivFixup64Instruction, state: SIMDState64) -> List[Optional[int]]:
+        results: List[Optional[int]] = []
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                results.append(None)
+                continue
+
+            v0 = self.resolve_lane_operand64(instr.src0, lane, state)
+            v1 = self.resolve_lane_operand64(instr.src1, lane, state)
+            v2 = self.resolve_lane_operand64(instr.src2, lane, state)
+
+            res = oracle_div_fixup_f64(v0, v1, v2, clamp=instr.mods.clamp)
+            state.set_vgpr64(lane, instr.dst.base_reg, res)
+            results.append(res)
+        return results
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_alternating_lanes(self) -> None:
+        """Verify Wave32 alternating even/odd lane execution and inactive preservation."""
+        mask = 0x5555_5555
+        state = SIMDState64(num_lanes=32, exec_mask=mask)
+        sentinel = 0xDEAD_BEEF_BAAD_F00D
+
+        for lane in range(32):
+            state.set_vgpr64(lane, 0, sentinel)
+            state.set_vgpr64(lane, 2, F64_ONE)
+            state.set_vgpr64(lane, 4, F64_TWO)
+            state.set_vgpr64(lane, 6, F64_TWO)
+
+        interp = SIMDInterpreter64()
+        instr = VDivFixup64Instruction(dst=VGPRPair(0), src0=VGPRPair(2), src1=VGPRPair(4), src2=VGPRPair(6))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], F64_ONE)
+                self.assertEqual(state.get_vgpr64(lane, 0), F64_ONE)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr64(lane, 0), sentinel)
+
+    def test_wave64_divergence(self) -> None:
+        """Verify Wave64 boundary execution across low and high 32-lane words."""
+        mask = (1 << 0) | (1 << 31) | (1 << 32) | (1 << 63)
+        state = SIMDState64(num_lanes=64, exec_mask=mask)
+        sentinel = 0x1234_5678_9ABC_DEF0
+
+        for lane in range(64):
+            state.set_vgpr64(lane, 0, sentinel)
+            state.set_vgpr64(lane, 2, F64_HALF)
+            state.set_vgpr64(lane, 4, F64_TWO)
+            state.set_vgpr64(lane, 6, F64_ONE)
+
+        interp = SIMDInterpreter64()
+        instr = VDivFixup64Instruction(dst=VGPRPair(0), src0=VGPRPair(2), src1=VGPRPair(4), src2=VGPRPair(6))
+        results = interp.step(instr, state)
+
+        for lane in range(64):
+            if lane in (0, 31, 32, 63):
+                self.assertEqual(results[lane], F64_HALF)
+                self.assertEqual(state.get_vgpr64(lane, 0), F64_HALF)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr64(lane, 0), sentinel)
