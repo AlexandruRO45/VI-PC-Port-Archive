@@ -33,6 +33,13 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 - **Fix, don't disable**: a shader the translator rejects gets a rule, not a skip list. A new rule goes into the
   contract table in `docs/design.md` with how it was confirmed (a GPU test, a Mesa/LLVM reference, or a count over
   the corpus).
+- **REA may read the package, but nothing it reads may be published**: analysing the user's own copy with REA
+  (instruction listings, byte reads, recovered types, database annotations) is allowed, and stays on this machine.
+  No game bytes, extracted assets, shaders or REA dumps may appear in commits, issues, pull requests or test
+  fixtures, except the short excerpts below.
+- **Short excerpts are fine**: a few header bytes, one instruction sequence, one line of an REA listing - enough to
+  explain a format - belong in `docs/` and code comments, never as a file, a corpus extract or a whole dump, and
+  never out of the executable.
 
 ## Claim before you start
 

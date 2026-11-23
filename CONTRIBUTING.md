@@ -7,8 +7,13 @@ Thanks for helping. A few rules keep the project safe to host:
   types; check `git status` before you commit anyway.
 - **No keys, decryption or protection workarounds**, and no links to where to get them. The tools only read files
   that are already plain on disk.
-- Short excerpts needed to explain a format (a few header bytes, one instruction sequence) are fine in docs and
-  comments.
+- **REA may read the package, but nothing it reads may be published.** Analysing the game package on your own
+  machine with REA (instruction listings, byte reads, recovered types, database annotations) is allowed. No game
+  bytes, extracted assets, shaders or REA dumps may appear in commits, issues, pull requests or test fixtures; keep
+  them out of the repository and out of anything you post, except the short excerpts below.
+- Short excerpts needed to explain a format (a few header bytes, one instruction sequence, one line of an REA
+  listing) are fine in docs and comments, but not from the executable, and never a whole listing, dump or database
+  export.
 
 ## Before you start
 
