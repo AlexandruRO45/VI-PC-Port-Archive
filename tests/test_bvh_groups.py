@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import bvh_groups  # noqa: E402
 import bvh_index  # noqa: E402
+import report_paths  # noqa: E402
 
 
 def a16(n):
@@ -235,8 +236,18 @@ class ScanTest(unittest.TestCase):
         self.assertNotIn("1111222233334444", json.dumps(doc))
         with contextlib.redirect_stderr(io.StringIO()) as se:
             self.assertEqual(bvh_groups.main([self.rpf, "--json", self.rpf]), 2)
+            self.assertEqual(bvh_groups.main([self.rpf, "--json", os.path.join(self.tmp.name, ".", "t.rpf")]), 2)
             self.assertEqual(bvh_groups.main([self.rpf, "--start", str(10 ** 9)]), 2)
         self.assertIn("bvh_groups:", se.getvalue())
+
+    def test_uses_shared_same_report_path_even_before_archive_exists(self):
+        self.assertIs(bvh_groups.same_report_path, report_paths.same_report_path)
+        missing = os.path.join(self.tmp.name, "missing.rpf")
+        alias = os.path.join(self.tmp.name, ".", "missing.rpf")
+        with contextlib.redirect_stderr(io.StringIO()) as se:
+            self.assertEqual(bvh_groups.main([missing, "--json", alias]), 2)
+        self.assertIn("--json would replace the archive", se.getvalue())
+        self.assertFalse(os.path.exists(missing))
 
     def test_empty_archive(self):
         empty = os.path.join(self.tmp.name, "e.rpf")
