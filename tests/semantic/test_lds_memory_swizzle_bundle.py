@@ -465,6 +465,15 @@ class TestDsReadU16AST(unittest.TestCase):
         expr = LdsReadU16Expr(offset=0x40)
         self.assertEqual(expr.eval(lds, 0), 0x55AA)
 
+class TestDsReadU16SIMD(unittest.TestCase):
+    def test_simd_read_u16_divergent_lanes(self) -> None:
+        lds = LdsModel()
+        for l in range(32):
+            lds.write_u16(l * 4, 0x1000 + l)
+        expr = LdsReadU16Expr(offset=0)
+        for l in range(32):
+            self.assertEqual(expr.eval(lds, l * 4), 0x1000 + l)
+
 
 if __name__ == "__main__":
     unittest.main()
