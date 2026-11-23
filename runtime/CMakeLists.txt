@@ -1443,6 +1443,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_queue_list_type_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_queue_list_type COMMAND d3d12_queue_list_type_test)
     set_tests_properties(d3d12_queue_list_type PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # Seeded random clears (RTV with typed views of typeless textures, DSV, UAV uint/float; mips, slices, rects) on the
+    # layer and on WARP, every byte of every subresource compared.
+    add_executable(d3d12_clear_fuzz_test test/d3d12_clear_fuzz_test.cpp)
+    target_link_libraries(d3d12_clear_fuzz_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_clear_fuzz_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_clear_fuzz_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_clear_fuzz COMMAND d3d12_clear_fuzz_test)
+    set_tests_properties(d3d12_clear_fuzz PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     # Wait-before-Signal with a texture and a buffer handed over between the COPY, COMPUTE and DIRECT queues, in every
     # submission order, on the layer and on the host runtime (docs/d3d12_vulkan.md section 4.4).
     add_executable(d3d12_queue_handover_test test/d3d12_queue_handover_test.cpp)
