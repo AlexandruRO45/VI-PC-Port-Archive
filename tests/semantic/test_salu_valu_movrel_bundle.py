@@ -113,3 +113,38 @@ class TestSMovrelsB32Oracle(unittest.TestCase):
         sgprs[5] = 0x9999AAAA
         expected = oracle_s_movrels_b32(10, 120, 13, sgprs)
         self.assertEqual(expected[10], 0x9999AAAA)
+
+
+class TestSMovrelsB32AST(unittest.TestCase):
+    def test_ast_structure_and_emission(self):
+        lines = [
+            "s_mov_b32 s10, 0x12345678",
+            "s_mov_b32 m0, 0",
+            "s_movrels_b32 s11, s10",
+            "v_mov_b32 v0, s11",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b32_ast", lines)
+        self.assertIn("OpAccessChain %_ptr_Function_uint %sgpr", spv)
+        self.assertIn("OpLoad %uint %m0", spv)
+
+    def test_ast_execution_semantics(self):
+        lines = [
+            "s_mov_b32 s30, 0xABCDEF01",
+            "s_mov_b32 m0, 2",
+            "s_mov_b32 s32, 0xCAFEBABE",
+            "s_movrels_b32 s10, s30",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b32_exec", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0xCAFEBABE)
