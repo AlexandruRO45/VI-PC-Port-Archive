@@ -175,6 +175,86 @@ class TestDialogue(unittest.TestCase):
         self.assertEqual(scan.pairs["ZZ_KEYAU_ABCD"], ["ZZ_TIMELEFT_90s_1"])
 
 
+def make_variant_resource(groups, pad_before_variants=0):
+    """Build a synthetic 0DRP string table with 0x956a9df5 groups and 0x10075946 variant records."""
+    blob = bytearray()
+    var_bytes = bytearray(pad_before_variants)
+    grp_bytes = bytearray()
+    hash_bytes = bytearray()
+    start_rec = len(var_bytes) // 32
+    for g_idx, (label, g_src_a, g_src_b, variants) in enumerate(groups):
+        rec_byte_off = len(var_bytes)
+        for text, gender, plurality, case in variants:
+            str_off = len(blob)
+            blob += text.encode("utf-8") + b"\0"
+            vrec = bytearray(32)
+            struct.pack_into("<QBBB", vrec, 0, (str_off << 20) | 4, gender, plurality, case)
+            var_bytes += vrec
+        grec = bytearray(32)
+        struct.pack_into("<IIIIQ", grec, 0, 0, 0, len(variants), len(variants), (rec_byte_off << 20) | 6)
+        grec[26] = g_src_a
+        grec[27] = g_src_b
+        grp_bytes += grec
+
+        hent = bytearray(16)
+        struct.pack_into("<II", hent, 0, T.joaat(label), 0)
+        hent[8] = 5  # 1-based q38 block index of 0x956a9df5
+        hent[11:14] = (g_idx * 2).to_bytes(3, "little")
+        hash_bytes += hent
+
+    head = bytearray(0x10) + b"0DRP" + bytes(0x0C)
+    desc_at = len(head)
+    desc_len = 0x28 + 16 * 3
+    index_at = desc_at + desc_len
+    hash_at = index_at + 16
+    blob_at = hash_at + len(hash_bytes)
+    grp_at = blob_at + len(blob)
+    var_at = grp_at + len(grp_bytes)
+    desc = (ptr(index_at) + struct.pack("<II", 0, 0x10) + ptr(0) + b"\x01\x01\x00\x00"
+            + struct.pack("<I", len(hash_bytes)) + ptr(hash_at)
+            + struct.pack("<II", 0x10, len(blob)) + ptr(blob_at)
+            + struct.pack("<II", T.VARIANT_GROUP_TAG, len(grp_bytes)) + ptr(grp_at)
+            + struct.pack("<II", T.VARIANT_RECORD_TAG, len(var_bytes)) + ptr(var_at))
+    return bytes(head + desc + bytes(16) + hash_bytes + blob + grp_bytes + var_bytes)
+
+
+class TestVariants(unittest.TestCase):
+    def test_variant_groups_past_4k_byte_offset(self):
+        # 130 dummy records push byte offset to 4160 (>= 4096), verifying (ptr4 >> 20) is a byte offset.
+        res = make_variant_resource([
+            ("ZZ_NOUN_SG_PL", 12, 0, [
+                ("un amigo", 1, 1, 0),
+                ("una amiga", 2, 1, 0),
+                ("unos amigos", 1, 3, 2),
+            ]),
+        ], pad_before_variants=130 * 32)
+        tables = list(T.variant_tables(res))
+        self.assertEqual(len(tables), 1)
+        items = tables[0][T.joaat("ZZ_NOUN_SG_PL")]
+        self.assertEqual(
+            [(x["text"], x["gender"], x["plurality"], x["case"], x["source_a"]) for x in items],
+            [
+                ("un amigo", "Male", "Singular", "None", "Target"),
+                ("una amiga", "Female", "Singular", "None", "Target"),
+                ("unos amigos", "Male", "Many", "Case2", "Target"),
+            ],
+        )
+
+    def test_variants_cli_csv(self):
+        res = make_variant_resource([("ZZ_GREET", 10, 11, [("Bonjour", 0, 1, 0)])])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "fr.bin"), res)
+            out = os.path.join(tmp, "variants.csv")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = T.main([src, "--variants", out])
+            self.assertEqual(rc, 0)
+            with open(out, encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["gender"], rows[0]["plurality"], rows[0]["text"]),
+                             ("None", "Singular", "Bonjour"))
+
+
 class TestCli(unittest.TestCase):
     def test_csv_exports_explicitly_empty_strings(self) -> None:
         strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
