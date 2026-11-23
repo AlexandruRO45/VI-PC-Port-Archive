@@ -698,6 +698,9 @@ struct ShaderEntry {
     // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
     std::uint32_t lds_bytes = 0;
     bool uses_code_base = false;
+    // A compute program that takes its root arguments from the table behind s[0:1] (rt::rootsig::pack_table): the
+    // index says it launches with the 4 driver SGPRs only (user_sgprs) and uses s0 as the low half of a pointer.
+    bool argument_table = false;
     bool wave64 = false;
     // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
     // as one translated with --wave64-emulate does, or has none.
@@ -873,6 +876,16 @@ private:
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
             if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
+            if (const Json* n = meta.find("user_sgprs");
+                e.stage == "cs" && n && n->kind == Json::Kind::number && u32(n) == 4)
+                if (const Json* reads = meta.find("user_sgpr_reads"); reads && reads->kind == Json::Kind::array)
+                    for (const Json& read : reads->array) {
+                        const Json* kind = read.find("kind");
+                        const Json* sgpr = read.find("sgpr");
+                        if (kind && kind->kind == Json::Kind::string && kind->string == "ptr64_lo" && sgpr &&
+                            sgpr->kind == Json::Kind::number && u32(sgpr) == 0)
+                            e.argument_table = true;
+                    }
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
             if (const Json* g = meta.find("subgroup_size"); g && g->kind == Json::Kind::number)
                 e.subgroup_size = u32(g);

@@ -1,0 +1,45 @@
+#version 460
+// A compute shader written to the translator's runtime contract (docs/design.md, "User data" and "Xbox GPU
+// addresses"), standing in for a translated program that takes its root arguments from the table behind s[0:1]
+// (rt::rootsig::pack_table, docs/d3d12_vulkan.md section 3.5), as XboxBvhBuilder.dll's programs do. It builds the
+// 40-bit pointer from s0 and the low byte of s1 and reads, in root-signature order:
+//   +0   a root UAV: the console VA of the output buffer (8 bytes)
+//   +8   three root constants: base, step, and a word it adds to every element (4 bytes each)
+//   +20  a second root UAV: a buffer whose first word it adds too (8 bytes)
+// and writes out[i] = base + step * i + extra + second[0], plus every word of the 15 dwords after the table, which
+// the layer keeps readable and zero for the wider loads a console-compiled program makes.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+Words at(uvec2 va) {
+    return Words(add64(pc.heap_base, va));
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    Words table = at(uvec2(pc.s[0], pc.s[1] & 0xFFu));
+    Words result = at(uvec2(table.w[0], table.w[1]));
+    Words second = at(uvec2(table.w[5], table.w[6]));
+    // A 16-dword load at the last parameter reads past the table; those bytes have to be there and are zero.
+    uint past = 0u;
+    for (uint k = 7u; k < 22u; ++k) past |= table.w[k];
+    result.w[i] = table.w[2] + table.w[3] * i + table.w[4] + second.w[0] + past;
+}

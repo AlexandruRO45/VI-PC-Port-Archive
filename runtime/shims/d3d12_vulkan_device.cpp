@@ -3138,6 +3138,9 @@ public:
 
     bool compute() const { return registered_ && !is_graphics_; }
     bool graphics() const { return registered_ && is_graphics_; }
+    // A compute program that takes its root arguments from the table behind s[0:1] (ShaderEntry::argument_table).
+    bool argument_table() const { return compute() && argument_table_; }
+    DeviceState& device_state() { return device_; }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
 
     // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
@@ -3769,6 +3772,7 @@ public:
                 }
             }
         }
+        argument_table_ = entry->argument_table;
         const std::vector<std::uint32_t> words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
@@ -3947,6 +3951,7 @@ private:
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;
     bool is_graphics_ = false;
+    bool argument_table_ = false;
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
     leonida::cached_pso::Key cache_key_;
 };
@@ -5732,18 +5737,26 @@ public:
         // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
         const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
-        if (!packed.ok && !compute.ok) {
-            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
-                         compute.error.c_str());
+        // A compute program that takes its arguments from the table behind s[0:1] has a third layout, pack_table();
+        // which of the two a dispatch uses is its pipeline's, so the signature keeps both.
+        const rt::rootsig::TablePackResult table = rt::rootsig::pack_table(parsed.sig);
+        if (!packed.ok && !compute.ok && !table.ok) {
+            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s; argument table: %s)\n",
+                         packed.error.c_str(), compute.error.c_str(), table.error.c_str());
             return E_INVALIDARG;
         }
         if (!packed.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
-        if (!compute.ok)
+        if (!compute.ok && !table.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
+        else if (!compute.ok)
+            std::fprintf(stderr, "[rt] d3d12: root signature usable at the compute bind point only by a program "
+                                 "that reads the argument table: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        layout.table_ok = table.ok;
+        layout.table_dwords = table.dwords;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
@@ -5752,7 +5765,8 @@ public:
                     break;
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         table.ok ? table.first_dword[i] : rt::rootsig::kNoSgpr});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
@@ -8309,6 +8323,29 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->compute() ? p->id() : 0;
+}
+
+bool compute_pipeline_reads_argument_table(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && p->argument_table();
+}
+
+std::unique_ptr<ArgumentTableMemory> allocate_argument_tables(ID3D12PipelineState* pipeline, std::size_t bytes) {
+    struct Block final : ArgumentTableMemory {
+        explicit Block(DeviceState& device) : device(device) {}
+        ~Block() override { device.arena_release(va, bytes, DeviceState::arena_buffer); }
+        DeviceState& device;
+    };
+    PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p || !p->compute() || !p->device_state().arena.mapped) return nullptr;
+    DeviceState& device = p->device_state();
+    VkDeviceSize offset = 0;
+    if (!device.arena_allocate(bytes, 256, offset, DeviceState::arena_buffer)) return nullptr;
+    auto block = std::make_unique<Block>(device);
+    block->va = offset;  // a console VA is the offset in the arena
+    block->host = device.arena.mapped + offset;
+    block->bytes = bytes;
+    return block;
 }
 
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {

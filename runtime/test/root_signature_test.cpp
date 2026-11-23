@@ -424,6 +424,37 @@ int main() {
         check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
     }
 
+    // pack_table: the argument table a compute program reads through s[0:1] when it takes nothing in a user SGPR.
+    {
+        RootSignature sig;
+        sig.params = {view(), view(), consts(3), view()};
+        const TablePackResult r = pack_table(sig);
+        check(r.ok && r.first_dword == std::vector<uint32_t>({0, 2, 4, 7}) && r.dwords == 9,
+              "pack_table: root order, a root view 2 dwords, a constant 1, no padding");
+        // The largest shape measured, eight root views and 14 constants: 30 dwords, more than the 28 from s4.
+        RootSignature big;
+        big.params = {view(), view(), view(), view(), view(), view(), view(), view(), consts(14)};
+        check(!pack_stage(big, Stage::Compute).ok && pack_table(big).ok && pack_table(big).dwords == 30 &&
+                  pack_table(big).first_dword.back() == 16,
+              "pack_table: a signature pack_stage refuses has a table");
+        RootSignature with_table;
+        with_table.params = {view(), table()};
+        const TablePackResult refused = pack_table(with_table);
+        check(!refused.ok && refused.first_dword.empty() && refused.error.find("root parameter 1") != std::string::npos,
+              "pack_table: a descriptor table is refused and named (its place is not measured)");
+        RootSignature none;
+        none.params = {consts(0)};
+        check(!pack_table(none).ok, "pack_table: a constant parameter of 0 values is refused");
+        RootSignature costly;
+        costly.params = {consts(63), view()};  // 65 dwords
+        check(!pack_table(costly).ok && pack_table(costly).error.find("64-dword") != std::string::npos,
+              "pack_table: the 64-dword D3D12 cost limit holds");
+        costly.params = {consts(62), view()};
+        check(pack_table(costly).ok && pack_table(costly).dwords == kMaxD3d12Cost,
+              "pack_table: 64 dwords is the largest table");
+        check(pack_table(RootSignature{}).ok && pack_table(RootSignature{}).dwords == 0, "pack_table: empty signature");
+    }
+
     // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
     {
         RootSignature exact;

@@ -349,6 +349,8 @@ int main() {
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
     const std::string hash2 = sha256_hex(bytes("another program"));
+    const std::string hash3 = sha256_hex(bytes("a program that reads the argument table"));
+    const std::string hash4 = sha256_hex(bytes("a program with root arguments in user SGPRs"));
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
         index << "\xef\xbb\xbf" "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
@@ -368,6 +370,14 @@ int main() {
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\", \"lds_bytes\": 33332},\n"
+                 " \"cs_table\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash3 << "\", \"user_sgprs\": 4, "
+                 "\"user_sgpr_reads\": [{\"kind\": \"const32\", \"sgpr\": 1}, "
+                 "{\"kind\": \"ptr64_lo\", \"sgpr\": 0}]},\n"
+                 " \"ps_table\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash3 << "\", \"user_sgprs\": 4, "
+                 "\"user_sgpr_reads\": [{\"kind\": \"ptr64_lo\", \"sgpr\": 0}]},\n"
+                 " \"cs_sgprs\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash4 << "\", \"user_sgprs\": 14, "
+                 "\"user_sgpr_reads\": [{\"kind\": \"ptr64_lo\", \"sgpr\": 0}, "
+                 "{\"kind\": \"ptr32_lo\", \"sgpr\": 4}]},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
         std::ofstream spv(dir / "cs_test.spv", std::ios::binary);
         const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -375,7 +385,7 @@ int main() {
     }
     ShaderLibrary library;
     std::string error;
-    CHECK(library.load(dir.string(), &error) && library.size() == 6);
+    CHECK(library.load(dir.string(), &error) && library.size() == 9);
     const ShaderEntry* vs = library.find("vs", hash);
     CHECK(vs && vs->input_signature.size() == 2 && vs->input_signature[0].semantic == "COLOR");
     CHECK(vs->input_signature[1].register_index == 2 && vs->input_signature[1].system_value == 6 &&
@@ -407,6 +417,11 @@ int main() {
     CHECK(emulated && emulated->wave64 && emulated->subgroup_size == 0 && emulated->wave64_exchange == "workgroup" &&
           emulated->emulated());
     CHECK(emulated->lds_bytes == 33332 && entry->lds_bytes == 0);  // workgroup bytes, emulation included (SHADER-309)
+    // A compute program that launches with the 4 driver SGPRs and uses s0 as a pointer reads the argument table.
+    const ShaderEntry* reads_table = library.find("cs", hash3);
+    CHECK(reads_table && reads_table->argument_table && !entry->argument_table);
+    CHECK(library.find("ps", hash3) && !library.find("ps", hash3)->argument_table);  // compute only
+    CHECK(library.find("cs", hash4) && !library.find("cs", hash4)->argument_table);  // it has root SGPRs
     CHECK(library.spirv(*entry).size() == 5);
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
     {

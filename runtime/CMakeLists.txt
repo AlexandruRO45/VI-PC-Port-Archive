@@ -2399,6 +2399,22 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # Root arguments in the table behind s[0:1] (rt::rootsig::pack_table), for a program that reads them there.
+      set(LEONIDA_TEST_CS_TABLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_argument_table.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_TABLE}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_TABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_argument_table.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_argument_table.comp
+        COMMENT "Compiling the argument-table test shader"
+        VERBATIM)
+      add_executable(d3d12_argument_table_test test/d3d12_argument_table_test.cpp ${LEONIDA_TEST_CS_TABLE})
+      target_link_libraries(d3d12_argument_table_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_argument_table_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_TABLE_SPV="${LEONIDA_TEST_CS_TABLE}")
+      target_compile_options(d3d12_argument_table_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_argument_table COMMAND d3d12_argument_table_test)
+      set_tests_properties(d3d12_argument_table PROPERTIES SKIP_RETURN_CODE 77)
       # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
       add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)

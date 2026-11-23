@@ -355,19 +355,39 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 // carries both layouts:
 //   - graphics: rt::rootsig::pack() (from s0, two dwords per table; D3D-448 keeps it until per-stage user-data windows
 //     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
-//   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
-// A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
+//   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table);
+//   - compute, for a program that takes its arguments from the table behind s[0:1]: rt::rootsig::pack_table().
+// A layout that refuses the signature is marked unusable; binding the signature there invalidates the list. Which
+// of the two compute layouts a dispatch uses is its pipeline's (compute_pipeline_reads_argument_table).
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        std::uint32_t table_offset = rt::rootsig::kNoSgpr;    // compute: first dword in the argument table
     };
     std::vector<Parameter> parameters;
     bool graphics_ok = true;
     bool compute_ok = true;
+    bool table_ok = false;
+    std::uint32_t table_dwords = 0;
 };
+
+// A block of a Vulkan device's GPU address arena for argument tables: CPU-written, read by a dispatch through its
+// console VA. Destroying it returns the memory. A command allocator owns the blocks its lists record into, so they
+// live until the allocator is reset or released, as D3D12 requires of everything a recorded list refers to.
+struct ArgumentTableMemory {
+    virtual ~ArgumentTableMemory() = default;
+    std::uint64_t va = 0;
+    std::uint8_t* host = nullptr;
+    std::size_t bytes = 0;
+};
+// Null when `pipeline` is not a compute PSO of a Vulkan device, or its arena is full.
+std::unique_ptr<ArgumentTableMemory> allocate_argument_tables(ID3D12PipelineState* pipeline, std::size_t bytes);
+// True for a compute PSO of a Vulkan device whose program takes its root arguments from the table behind s[0:1]
+// (leonida::ShaderEntry::argument_table).
+bool compute_pipeline_reads_argument_table(ID3D12PipelineState* pipeline);
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a
 // compute pipeline state (0: not a compute PSO of a Vulkan device).

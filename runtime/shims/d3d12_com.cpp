@@ -155,10 +155,35 @@ public:
     // in an Xbox-ABI allocator proxy only when it answers this tag, because from() below resolves such a proxy.
     static constexpr GUID kTag = d3d12_xs::kLeonidaCommandAllocatorTag;
     explicit CommandAllocator(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
-    // Lists own their recorded commands, so there is nothing to free. As on the PC runtime (D3D-51, measured by
-    // d3d12_vulkan_device_test): E_FAIL while a list is recording into this allocator, and S_OK while its lists are
-    // still executing on the GPU (keeping that safe is the application's job on D3D12 too).
-    HRESULT STDMETHODCALLTYPE Reset() override { return recording_ ? E_FAIL : S_OK; }
+    // Lists own their recorded commands; the allocator owns only the argument tables they refer to, and frees them
+    // here. As on the PC runtime (D3D-51, measured by d3d12_vulkan_device_test): E_FAIL while a list is recording
+    // into this allocator, and S_OK while its lists are still executing on the GPU (keeping that safe is the
+    // application's job on D3D12 too).
+    HRESULT STDMETHODCALLTYPE Reset() override {
+        if (recording_) return E_FAIL;
+        tables_.clear();
+        table_used_ = 0;
+        return S_OK;
+    }
+    // Copies an argument table (rt::rootsig::pack_table) into memory a dispatch of `pipeline` can read and gives its
+    // console VA. The bytes a program may read past the table are there and zero. False when the device has no room.
+    bool place_table(ID3D12PipelineState* pipeline, const std::uint32_t* words, std::uint32_t dwords,
+                     std::uint64_t& va) {
+        constexpr std::size_t kBlockBytes = 64 * 1024;
+        const std::size_t bytes = (std::size_t(dwords) + rt::rootsig::kTableOverreadDwords) * 4;
+        if (tables_.empty() || table_used_ + bytes > tables_.back()->bytes) {
+            auto block = allocate_argument_tables(pipeline, kBlockBytes);
+            if (!block) return false;
+            tables_.push_back(std::move(block));
+            table_used_ = 0;
+        }
+        const ArgumentTableMemory& block = *tables_.back();
+        std::memcpy(block.host + table_used_, words, std::size_t(dwords) * 4);
+        std::memset(block.host + table_used_ + std::size_t(dwords) * 4, 0, rt::rootsig::kTableOverreadDwords * 4);
+        va = block.va + table_used_;
+        table_used_ += (bytes + 7) & ~std::size_t(7);
+        return true;
+    }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
     // The one list that is recording into this allocator, or null. D3D12 allows one at a time.
     const void* recording() const { return recording_; }
@@ -173,6 +198,8 @@ public:
 private:
     D3D12_COMMAND_LIST_TYPE type_;
     const void* recording_ = nullptr;
+    std::vector<std::unique_ptr<ArgumentTableMemory>> tables_;
+    std::size_t table_used_ = 0;  // bytes used of tables_.back()
 };
 
 class GraphicsCommandList final
@@ -798,7 +825,7 @@ public:
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
+            if (!compute_user_data(cmd.user_data)) return check(false);
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1043,6 +1070,11 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        // Compute only: the same arguments as the table a table-reading program takes (rt::rootsig::pack_table),
+        // and where the current contents were placed for the dispatches that use them.
+        std::array<std::uint32_t, rt::rootsig::kMaxD3d12Cost> table{};
+        bool table_placed = false;
+        std::uint64_t table_va = 0;
     };
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
@@ -1058,9 +1090,12 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        state.table = {};
+        state.table_placed = false;
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
-        // CreateRootSignature accepted it for the other bind point only (its log line says why).
-        if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
+        // CreateRootSignature accepted it for the other bind point only (its log line says why). At the compute bind
+        // point either compute layout will do; a dispatch checks the one its pipeline needs (compute_user_data).
+        if (layout && !(is_compute(state) ? layout->compute_ok || layout->table_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
                                    : "SetGraphicsRootSignature(signature that does not fit the graphics layout)");
             check(false);
@@ -1092,6 +1127,17 @@ private:
             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
     }
 
+    // One dword of parameter `p`: into the user registers where the bind point's layout places it, and at the compute
+    // bind point into the argument table too (RootArgumentLayout::table_offset).
+    void write(RootState& state, const RootArgumentLayout::Parameter& p, std::uint32_t index, std::uint32_t value) {
+        if (const std::uint32_t first = first_dword(state, p); first != rt::rootsig::kNoSgpr)
+            write(state, first + index, value);
+        if (is_compute(state) && p.table_offset != rt::rootsig::kNoSgpr) {
+            state.table[p.table_offset + index] = value;
+            state.table_placed = false;
+        }
+    }
+
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
             // The layout is the executing list's, so the range is checked when it runs; no signature takes more
@@ -1113,8 +1159,7 @@ private:
         if (!p) return;
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
-        const std::uint32_t first = first_dword(state, *p);
-        for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
+        for (UINT i = 0; i < count; ++i) write(state, *p, offset + i, values[i]);
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -1124,11 +1169,10 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
-        const std::uint32_t first = first_dword(state, *p);
-        write(state, first, std::uint32_t(va));
+        write(state, *p, 0, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, *p, 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1140,6 +1184,8 @@ private:
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
+    ID3D12PipelineState* compute_pso_ = nullptr;  // the same pipeline, held with the others (held_)
+    bool compute_table_ = false;                  // it takes its root arguments from the table behind s[0:1]
     std::uintptr_t graphics_pipeline_ = 0;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
@@ -1200,6 +1246,8 @@ private:
     void set_pipeline(ID3D12PipelineState* state) {
         hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
+        compute_pso_ = compute_pipeline_ ? state : nullptr;
+        compute_table_ = compute_pipeline_reads_argument_table(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
         if (state && !compute_pipeline_ && !graphics_pipeline_)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
@@ -1237,7 +1285,37 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> user_data;
+        if (!compute_user_data(user_data)) return check(false);
+        check(list_.dispatch({compute_pipeline_, user_data, x, y, z}));
+    }
+
+    // The user-data dwords a dispatch records. A program that takes its root arguments from the table behind s[0:1]
+    // (compute_pipeline_reads_argument_table) gets the table's console VA there: s0 the low half, the low byte of s1
+    // bits 32 to 39, which is all the program reads of s1. The table is placed once per set of arguments.
+    bool compute_user_data(std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs>& out) {
+        const RootArgumentLayout& layout = *compute_.layout;
+        if (!compute_table_) {
+            if (!layout.compute_ok) stub("Dispatch(root signature that does not fit the compute layout)");
+            out = compute_.data;
+            return layout.compute_ok;
+        }
+        if (!layout.table_ok || !allocator_) {
+            stub("Dispatch(root signature with no argument-table layout, for a program that reads the table)");
+            return false;
+        }
+        if (!compute_.table_placed) {
+            if (!allocator_->place_table(compute_pso_, compute_.table.data(), layout.table_dwords,
+                                         compute_.table_va)) {
+                stub("Dispatch(no room in the GPU address arena for the argument table)");
+                return false;
+            }
+            compute_.table_placed = true;
+        }
+        out = compute_.data;
+        out[0] = std::uint32_t(compute_.table_va);
+        out[1] = std::uint32_t(compute_.table_va >> 32) & 0xff;
+        return true;
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.

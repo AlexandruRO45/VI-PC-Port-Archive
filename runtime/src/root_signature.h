@@ -131,8 +131,9 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     pointer s4, one-dword tables).
 //   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
 //     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
-// A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
-// every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
+// A parameter that does not fit goes to the console's array behind s[0:1] (compute, section 7) together with every
+// parameter after it. That split is not measured, so pack_stage refuses such a signature, never truncates it. A
+// program that takes every argument from that array has pack_table's layout instead.
 enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
 
 [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
@@ -177,6 +178,26 @@ struct StagePackResult {
 // Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
 // constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
+
+// The argument table a compute program reads through the 40-bit pointer in s0 and the low byte of s1, when it takes
+// no root argument in a user SGPR (docs/d3d12_vulkan.md section 3.5). Measured on the 52 compute programs of
+// XboxBvhBuilder.dll, each against the RTS0 in its own container (tools/rootsig_census.py --disasm): every parameter
+// is in the table in root-signature order, a root CBV/SRV/UAV as its 64-bit VA (two dwords) and a constant as one
+// dword per value, with no padding. None of those signatures has a descriptor table, so one is refused here.
+// The programs load 2, 4, 8 or 16 dwords at a time and so read up to 24 bytes past the last parameter (measured);
+// kTableOverreadDwords is what a 16-dword load at the last dword can reach, for whoever places the table in memory.
+struct TablePackResult {
+    bool ok = false;
+    std::string error;                  // set when !ok; names the refusing parameter
+    std::vector<uint32_t> first_dword;  // per parameter: its first dword in the table
+    uint32_t dwords = 0;                // the table's size
+};
+
+constexpr uint32_t kTableOverreadDwords = 15;
+
+// Fails like pack_stage() on more than 64 parameters, a constant parameter of 0 values or the 64-dword cost limit,
+// and on a descriptor table.
+[[nodiscard]] TablePackResult pack_table(const RootSignature& sig);
 
 // D3D12 cost of one parameter against the 64-dword limit.
 [[nodiscard]] constexpr uint32_t param_cost(ParamType type, uint32_t num_values) noexcept {

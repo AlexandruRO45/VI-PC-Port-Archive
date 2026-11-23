@@ -90,6 +90,41 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     return out;
 }
 
+TablePackResult pack_table(const RootSignature& sig) {
+    TablePackResult out;
+    if (sig.params.size() > 64) {
+        out.error = "root signature has more than 64 root parameters";
+        return out;
+    }
+    uint64_t cost = 0;  // 64-bit, as in pack()
+    uint32_t next = 0;
+    std::vector<uint32_t> first;
+    first.reserve(sig.params.size());
+    for (size_t i = 0; i < sig.params.size(); ++i) {
+        const RootParameter& p = sig.params[i];
+        if (p.type == ParamType::Table) {
+            out.error = "root parameter " + std::to_string(i) +
+                        " is a descriptor table (its place in the argument table is not measured)";
+            return out;
+        }
+        if (p.type == ParamType::Constants && p.num_values == 0) {
+            out.error = "root constant parameter needs at least 1 dword";
+            return out;
+        }
+        cost += param_cost(p.type, p.num_values);
+        if (cost > kMaxD3d12Cost) {
+            out.error = "root signature exceeds the 64-dword D3D12 cost limit";
+            return out;
+        }
+        first.push_back(next);
+        next += p.type == ParamType::Constants ? p.num_values : 2;  // within the cost limit, so no overflow
+    }
+    out.first_dword = std::move(first);
+    out.dwords = next;
+    out.ok = true;
+    return out;
+}
+
 namespace {
 
 void put_u32(std::vector<uint8_t>& out, uint32_t v) {

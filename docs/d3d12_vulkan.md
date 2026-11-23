@@ -1700,8 +1700,9 @@ Taken together this disagrees with the packing above (from s0, two dwords per ta
 **Console layout, measured for compute (D3D-448).** `rt::rootsig::pack_stage` lays the parameters out for one stage:
 in root order from the stage base, each while it fits whole, a constant taking one dword per value, a root
 CBV/SRV/UAV two (its 64-bit VA), a descriptor table **one** (the 32-bit VA of its first descriptor; the heaps live
-below 4 GiB). A parameter that does not fit goes, with every later one, to the spill array behind `s[0:1]`
-(section 7), which is not modelled, so such a signature is refused. How each part is known:
+below 4 GiB). A parameter that does not fit goes, with every later one, to the array behind `s[0:1]`
+(section 7). That split is not measured, so `pack_stage` refuses such a signature; a program that takes every
+argument from that array is served by `rt::rootsig::pack_table` (below). How each part is known:
 - **Compute, base s4: measured three ways.**
   - The console compiler's output (section 7).
   - The package's FidelityFX DLL, whose 29 compute containers carry their `RTS0` next to the console-compiled
@@ -1724,6 +1725,16 @@ contract (D3D-448 follow-up). A root signature carries both layouts; one that on
 created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
 `s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
 42 `s3`; their meaning is open).
+
+**A program that reads the argument table.** The translator's index says which compute programs take their root
+arguments from the table behind `s[0:1]`: `user_sgprs` is 4 and `s0` is read as the low half of a pointer
+(`ShaderEntry::argument_table`), as for the 52 programs of `XboxBvhBuilder.dll`. A dispatch of such a program gets
+every root argument in a packed table (`rt::rootsig::pack_table`: root order, a root view two dwords, a constant
+one), with the table's console VA in `s0` and the low byte of `s1`. The table is in the GPU address arena, followed
+by 15 zero dwords for the wider loads these programs make, in memory the command allocator owns until its `Reset`.
+A signature carries this layout beside the other two, so one that does not fit from s4 is created and can be
+dispatched by such a program; a signature with a descriptor table has no table layout (none was measured).
+`d3d12_argument_table_test` runs two dispatches and a second recording this way.
 
 **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
 each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the
