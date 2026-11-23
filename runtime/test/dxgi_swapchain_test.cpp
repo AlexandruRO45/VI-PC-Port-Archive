@@ -9,6 +9,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
 #include "vulkan_loader.h"
+#include "host_wine.h"
 #include "../src/vulkan_device_filter.h"
 
 #include <cmath>
@@ -500,8 +501,14 @@ int main() {
     cl->Close();
 
     // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.
-    const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
-    if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
+    // Microsoft's DXGI is the reference. Under Wine or Proton, Wine's and DXVK's DXGI accept 17 descriptions
+    // Microsoft's refuses (ASPECT_RATIO_STRETCH, the alpha modes, several flags and usages, 16385 wide or high),
+    // differences that aren't the layer's, so the comparison is skipped there and the checks below still run.
+    const bool wine = hostwine::host_is_wine();
+    const int argument_mismatches = wine ? -1 : compare_swap_chain_arguments(factory, dev, queue);
+    if (wine) std::printf("CreateSwapChainForHwnd: host DXGI is Wine's, comparison with the host skipped\n");
+    else if (argument_mismatches < 0)
+        std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
     if (argument_mismatches > 0) return fail("CreateSwapChainForHwnd answers differ from the host runtime");
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
