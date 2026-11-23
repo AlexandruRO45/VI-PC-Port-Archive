@@ -19,6 +19,7 @@ struct Trace {
     unsigned draws = 0, draws_outside = 0, pipelines = 0, sets = 0, pushes = 0, viewports = 0, scissors = 0;
     unsigned topologies = 0, restarts = 0, stencils = 0, blends = 0, vertex_binds = 0, index_binds = 0;
     unsigned cond_begins = 0, cond_ends = 0, cond_ends_inside = 0;
+    VkDescriptorSet last_set = VK_NULL_HANDLE;  // the last set 0 bound
     std::vector<std::string> events;  // begin, end, barrier, draw, bind
 };
 
@@ -53,8 +54,9 @@ VKAPI_ATTR void VKAPI_CALL bind_pipeline(VkCommandBuffer, VkPipelineBindPoint, V
     g->events.push_back("bind");
 }
 VKAPI_ATTR void VKAPI_CALL bind_sets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, std::uint32_t, std::uint32_t,
-                                     const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) {
+                                     const VkDescriptorSet* sets, std::uint32_t, const std::uint32_t*) {
     ++g->sets;
+    g->last_set = sets[0];
 }
 VKAPI_ATTR void VKAPI_CALL push(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t,
                                 const void*) {
@@ -111,7 +113,7 @@ void expect_well_formed(const Trace& t, const char* what) {
 }
 
 enum : ResourceId { color_a = 1, color_b, depth_id, vertex_id, index_id, predicate_id };
-enum : std::uintptr_t { pso_a = 100, pso_b, pso_stencil, pso_fullscreen };
+enum : std::uintptr_t { pso_a = 100, pso_b, pso_stencil, pso_fullscreen, pso_after_flush };
 
 }  // namespace
 
@@ -169,6 +171,8 @@ int main() {
         pipeline(pso_stencil, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
     GraphicsPipeline fullscreen = pipeline(pso_fullscreen, VK_IMAGE_ASPECT_DEPTH_BIT);
     fullscreen.vertex_slots = 0;  // vertices from SV_VertexID: no vertex input, so no dynamic stride state
+    GraphicsPipeline after_flush = pipeline(pso_after_flush, VK_IMAGE_ASPECT_DEPTH_BIT);
+    after_flush.bindless_set = handle<VkDescriptorSet>(2);  // made after a flush replaced the bindless set (D3D-314)
 
     ReplayFunctions vk{};
     vk.pipeline_barrier = barrier;
@@ -192,6 +196,7 @@ int main() {
         if (id == pso_b) return &b;
         if (id == pso_stencil) return &with_stencil;
         if (id == pso_fullscreen) return &fullscreen;
+        if (id == pso_after_flush) return &after_flush;
         return nullptr;
     };
     vk.image_view = [](const ResourceBinding& r, const VkImageSubresourceRange& range) {
@@ -219,9 +224,11 @@ int main() {
         Draw d{};
         d.pipeline = pso;
         d.user_data[0] = seed;
-        d.render_targets = {TargetView{target, 0, 0, 1}};
+        DrawViews views;  // render_target_count stays 8: slots 1-7 are unbound (resource 0)
+        views.render_targets = {TargetView{target, 0, 0, 1}};
+        views.vertex_buffers = {VertexBufferView{0x10000, 1024, 16}};
+        d.views = std::make_shared<const DrawViews>(views);
         d.depth = TargetView{depth_id, 0, 0, 1};
-        d.vertex_buffers = {VertexBufferView{0x10000, 1024, 16}};
         d.index = IndexBufferView{0x20000, 1024, 57};
         d.topology = 4;  // triangle list
         d.viewport = {0, 0, 64, 64, 0, 1};
@@ -367,6 +374,34 @@ int main() {
         expect(t.begins == 1 && t.draws == 3, "pipeline without vertex input: one scope");
         expect(t.pipelines == 3, "pipeline without vertex input: three pipeline binds");
         expect(t.vertex_binds == 2, "pipeline without vertex input: the vertex buffer is bound again after it");
+    }
+
+    // 9. Set 0 comes from the device's current bindless generation when replay has one (D3D-314), and the scope caches
+    // the set it bound: two pipelines made before and after a flush (other set handles, same layout) share it.
+    {
+        CommandList list;
+        expect(list.draw(make_draw(pso_a, color_a)), "record a draw");
+        expect(list.draw(make_draw(pso_after_flush, color_a)), "record a draw with a pipeline made after a flush");
+        expect(list.close(), "close the list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare the list");
+
+        Trace own;  // no current generation: each pipeline's own set
+        g = &own;
+        emit(prepared, VK_NULL_HANDLE, vk);
+        expect_well_formed(own, "pipelines' own sets");
+        expect(own.sets == 2 && own.last_set == handle<VkDescriptorSet>(2),
+               "pipelines' own sets: each pipeline's set is bound");
+
+        Trace current;
+        g = &current;
+        vk.bindless_set = handle<VkDescriptorSet>(9);
+        emit(prepared, VK_NULL_HANDLE, vk);
+        vk.bindless_set = VK_NULL_HANDLE;
+        expect_well_formed(current, "current generation");
+        expect(current.begins == 1 && current.draws == 2, "current generation: one scope");
+        expect(current.sets == 1 && current.last_set == handle<VkDescriptorSet>(9),
+               "current generation: the device's set is bound once, for both pipelines");
     }
 
     if (failures) {
