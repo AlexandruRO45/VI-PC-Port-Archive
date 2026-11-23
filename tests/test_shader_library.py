@@ -222,6 +222,21 @@ class Main(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
                              ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
 
+    def test_save_must_not_overwrite_the_input(self):
+        """`--save <src>` would replace the archive it just read with the library inside it: refused, file intact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "shaders.rpf")
+            data = archive(sample())
+            with open(src, "wb") as f:
+                f.write(data)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+                sl.main([src, "--save", src])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("--save must not overwrite the input", err.getvalue())
+            with open(src, "rb") as f:
+                self.assertEqual(f.read(), data)
+
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
