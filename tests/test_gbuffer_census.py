@@ -2,11 +2,13 @@
 import json
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+TOOL = Path(__file__).resolve().parents[1] / "tools" / "gbuffer_census.py"
+sys.path.insert(0, str(TOOL.parent))
 from gbuffer_census import census
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -65,6 +67,51 @@ class CensusTests(unittest.TestCase):
             self.assertEqual(group["coverage"]["signature_unreadable"], 1)
             self.assertEqual(group["coverage"]["listing_incomplete"], 1)
             self.assertEqual(group["observed_exports"], {"mrt0 compr": 2})
+
+
+class BadInputTests(unittest.TestCase):
+    """A wrong carve folder is one error line and exit 2, never a traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", str(TOOL), *map(str, args)],
+                              capture_output=True, text=True, encoding="utf-8")
+
+    def check_error(self, result, path, reason):
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("ERROR: "), lines[0])
+        self.assertIn(str(path), lines[0])
+        self.assertIn(reason, lines[0])
+
+    def test_missing_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "absent"
+            self.check_error(self.run_tool(path), path, "does not exist")
+
+    def test_empty_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.check_error(self.run_tool(temp), temp, "no index.json")
+
+    def test_regular_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "index.json"
+            path.write_text("[]", encoding="utf-8", newline="\n")
+            self.check_error(self.run_tool(path), path, "not a directory")
+
+    def test_malformed_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "index.json").write_text("[{", encoding="utf-8", newline="\n")
+            self.check_error(self.run_tool(temp), Path(temp) / "index.json", "not valid JSON")
+
+    def test_empty_index_is_still_a_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "index.json").write_text("[]", encoding="utf-8", newline="\n")
+            result = self.run_tool(temp)
+            self.assertEqual((result.returncode, result.stderr), (0, ""))
+            self.assertEqual(json.loads(result.stdout)["all indexed ps"]["coverage"], {})
 
 
 if __name__ == "__main__":

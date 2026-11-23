@@ -138,9 +138,28 @@ def main():
     parser.add_argument("--payload-coverage", action="store_true",
                         help="count distinct whole FSSM payloads per cohort and histogram their indexed entry counts")
     args = parser.parse_args()
-    print(json.dumps(census(args.dxbc, args.disasm or args.dxbc / "disasm",
-                            payload_coverage=args.payload_coverage), indent=2, sort_keys=True))
+    index = args.dxbc / "index.json"
+    problem = None
+    if not args.dxbc.exists():
+        problem = f"{args.dxbc}: does not exist (expected a shader_carve directory)"
+    elif not args.dxbc.is_dir():
+        problem = f"{args.dxbc}: not a directory (expected a shader_carve directory)"
+    elif not index.is_file():
+        problem = f"{args.dxbc}: no index.json (expected a shader_carve directory)"
+    else:
+        try:
+            report = census(args.dxbc, args.disasm or args.dxbc / "disasm",
+                            payload_coverage=args.payload_coverage)
+        except OSError as e:
+            problem = f"cannot read {index}: {e.strerror or e}"
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            problem = f"{index}: not valid JSON ({e})"
+    if problem:
+        print(f"ERROR: {problem}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
