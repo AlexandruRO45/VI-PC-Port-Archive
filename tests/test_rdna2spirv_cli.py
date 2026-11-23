@@ -256,6 +256,28 @@ class NothingTranslated(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertEqual(list(json.loads((self.out / "index.json").read_text(encoding="utf-8"))), ["ps_ok"])
 
+    def test_a_limited_rerun_that_fails_drops_the_entry_whose_module_it_removed(self):
+        # --limit skips the index merge, which left ps_a listed after its module was removed (review of #4992).
+        self.shader("ps_a", self.OK)
+        self.shader("ps_b", self.OK)
+        self.assertEqual(self.run_tool().returncode, 0)
+        (self.src / "ps_a.s").write_text(self.BAD, encoding="utf-8")
+        p = self.run_tool("--limit", "1")                   # sorted: the limited run sees ps_a only
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertFalse((self.out / "ps_a.spv").exists())
+        self.assertEqual(list(json.loads((self.out / "index.json").read_text(encoding="utf-8"))), ["ps_b"])
+        self.assertTrue((self.out / "ps_b.spv").is_file())
+
+    def test_a_limited_rerun_that_fails_its_only_indexed_shader_drops_the_index(self):
+        self.shader("ps_old", self.BAD)
+        self.out.mkdir()
+        (self.out / "index.json").write_text(json.dumps({"ps_old": {}}), encoding="utf-8")
+        (self.out / "ps_old.spv").write_bytes(bytes(20))
+        p = self.run_tool("--limit", "1")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertFalse((self.out / "ps_old.spv").exists())
+        self.assertFalse((self.out / "index.json").exists())
+
     def test_a_rerun_where_the_indexed_shader_now_fails_drops_the_index(self):
         self.shader("ps_ok", self.OK)
         self.assertEqual(self.run_tool().returncode, 0)
@@ -417,8 +439,7 @@ class ValidatedOutput(unittest.TestCase):
 
         output = io.StringIO()
         with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
-                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output), \
-                redirect_stderr(io.StringIO()):
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
             self.exit_code = rdna2spirv.main()
         return output.getvalue()
 

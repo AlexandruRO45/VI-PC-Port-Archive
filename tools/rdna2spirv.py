@@ -18191,10 +18191,16 @@ def main():
         if shard is not None:
             Path(idx_path).unlink(missing_ok=True)
             Path(os.path.join(a.out, SHARD_MARKER.format(index=shard))).unlink(missing_ok=True)
-        elif old:
-            write_index(idx_path, old)
-        elif loaded_old:
-            Path(idx_path).unlink(missing_ok=True)
+        elif os.path.isfile(idx_path):
+            if not loaded_old:      # a --limit run or a large corpus: read it now, so no entry outlives its module
+                with open(idx_path, encoding="utf-8") as f:
+                    old = _js.load(f)
+                for name in invalid:
+                    old.pop(name, None)
+            if old:
+                write_index(idx_path, old)
+            else:
+                Path(idx_path).unlink()
         print(f"ERROR: none of the {len(files)} shaders translated; {os.path.basename(idx_path)} not written",
               file=sys.stderr)
         return 1
