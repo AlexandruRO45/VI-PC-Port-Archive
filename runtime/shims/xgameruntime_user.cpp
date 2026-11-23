@@ -174,17 +174,22 @@ HRESULT STDMETHODCALLTYPE msa_async(void*, XUserHandle user, uint32_t, const cha
 HRESULT STDMETHODCALLTYPE signout_async(void*, XUserHandle user, XAsyncBlock* async) {
     return begin_offline<S_OK>(user, async);
 }
+// These operations always fail offline. A successful block belongs to another operation; its zero-payload
+// state may already have been cleaned up, so XAsyncGetResult cannot always detect an identity mismatch.
+HRESULT offline_failure_result(XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
+    const HRESULT hr = XAsyncGetResult(async, &kOfflineIdentity, 0, nullptr, nullptr);
+    return hr == S_OK ? E_INVALIDARG : hr;
+}
 HRESULT STDMETHODCALLTYPE offline_result_size(void*, XAsyncBlock* async, size_t* size) {
-    if (!async || !size) return E_INVALIDARG;
-    return XAsyncGetResultSize(async, size);
+    if (!size) return E_INVALIDARG;
+    return offline_failure_result(async);
 }
 HRESULT STDMETHODCALLTYPE offline_result(void*, XAsyncBlock* async, size_t, void*, void*, size_t*) {
-    if (!async) return E_INVALIDARG;
-    return XAsyncGetStatus(async, false);
+    return offline_failure_result(async);
 }
 HRESULT STDMETHODCALLTYPE picture_result(void*, XAsyncBlock* async, size_t, void*, size_t*) {
-    if (!async) return E_INVALIDARG;
-    return XAsyncGetStatus(async, false);
+    return offline_failure_result(async);
 }
 HRESULT STDMETHODCALLTYPE signout_result(void*, XAsyncBlock* async) {
     if (!async) return E_INVALIDARG;

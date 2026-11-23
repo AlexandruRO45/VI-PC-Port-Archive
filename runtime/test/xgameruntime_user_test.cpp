@@ -176,6 +176,17 @@ int main(int argc, char** argv) {
             HRESULT expected = i == 0 ? E_FAIL : i == 4 ? S_OK : E_GAMEUSER_FAILED_TO_GET_TOKEN;
             check(XAsyncGetStatus(&block, false) == expected, "offline async completion status");
             if (i == 4) {
+                for (int slot : {17, 24, 27, 41}) {
+                    size_t size = 123;
+                    check(at<ResultSize>(user, slot)(user, &block, &size) != S_OK,
+                          "unrelated result size rejects completed sign-out");
+                }
+                char buffer[8]{}; void* data = nullptr; size_t used = 123;
+                check(at<PictureResult>(user, 18)(user, &block, sizeof(buffer), buffer, &used) != S_OK,
+                      "picture result rejects completed sign-out");
+                for (int slot : {25, 28, 40})
+                    check(at<Result>(user, slot)(user, &block, sizeof(buffer), buffer, &data, &used) != S_OK,
+                          "token result rejects completed sign-out");
                 check(at<ResolveResult>(user, 49)(user, &block) == expected, "sign-out result");
             } else {
                 size_t size = 0; char buffer[8]{}; void* data = nullptr;
