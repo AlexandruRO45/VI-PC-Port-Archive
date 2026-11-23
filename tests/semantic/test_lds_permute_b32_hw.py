@@ -580,5 +580,33 @@ class TestDsPermuteCollisionsAndUnwritten(unittest.TestCase):
         # Since lane 1 is inactive, active lane 0 wins!
         self.assertEqual(res[0], 50)
 
+
+class TestDsPermuteBoundaryOffsetsAndWrapping(unittest.TestCase):
+    """Part 7: Boundary offsets and address wrapping extremes."""
+
+    def test_max_aligned_offset_0xfffc(self) -> None:
+        # 0xFFFC = 65532; 65532 >> 2 = 16383; 16383 % 32 = 31
+        target = calc_target_lane(0, offset=0xFFFC)
+        self.assertEqual(target, 31)
+
+    def test_unaligned_subword_offsets(self) -> None:
+        # Offsets 1, 2, 3 do not cross dword boundary from 0
+        self.assertEqual(calc_target_lane(0, offset=1), 0)
+        self.assertEqual(calc_target_lane(0, offset=2), 0)
+        self.assertEqual(calc_target_lane(0, offset=3), 0)
+        self.assertEqual(calc_target_lane(0, offset=4), 1)
+
+    def test_address_wrapping_at_32bit_boundary(self) -> None:
+        # 0xFFFFFFFF + 5 = 4 (modulo 2^32); 4 >> 2 = 1 -> lane 1
+        target = calc_target_lane(0xFFFFFFFF, offset=5)
+        self.assertEqual(target, 1)
+
+    def test_discard_of_upper_address_bits(self) -> None:
+        # Upper address bits (e.g. LDS segment base or large offsets) are masked with & 31
+        target1 = calc_target_lane(0x1000)
+        target2 = calc_target_lane(0x80000000)
+        self.assertEqual(target1, 0)
+        self.assertEqual(target2, 0)
+
 if __name__ == "__main__":
     unittest.main()
