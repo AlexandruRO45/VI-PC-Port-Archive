@@ -509,6 +509,80 @@ int main() {
     CloseHandle(seen.error_event);
     CloseHandle(seen.closing_event);
 
+    // WINHTTP_OPTION_PARENT_HANDLE and WINHTTP_OPTION_URL, as the host's winhttp.dll answers them (Windows 10 22H2).
+    {
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        const HINTERNET connection = connect(session, L"Example.INVALID", 80, 0);
+        const HINTERNET other_port = connect(session, L"example.invalid", 8443, 0);
+        const auto request_on = [&](HINTERNET on, LPCWSTR object, DWORD flags) {
+            return open_request(on, L"GET", object, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        };
+        const auto parent_of = [&](HINTERNET handle) {
+            HINTERNET parent = INVALID_HANDLE_VALUE;
+            DWORD size = sizeof(parent);
+            return query_option(handle, WINHTTP_OPTION_PARENT_HANDLE, &parent, &size) && size == sizeof(parent)
+                       ? parent
+                       : INVALID_HANDLE_VALUE;
+        };
+        const auto url_of = [&](HINTERNET request) {
+            wchar_t url[256] = {};
+            DWORD size = sizeof(url);
+            const BOOL ok = query_option(request, WINHTTP_OPTION_URL, url, &size);
+            return ok && size == std::wcslen(url) * sizeof(wchar_t) ? std::wstring(url) : std::wstring(L"?");
+        };
+        const auto url_for = [&](HINTERNET on, LPCWSTR object, DWORD flags) {
+            const HINTERNET request = request_on(on, object, flags);
+            const std::wstring url = url_of(request);
+            close(request);
+            return url;
+        };
+
+        const HINTERNET request = request_on(connection, L"/p", 0);
+        check(parent_of(request) == connection && parent_of(connection) == session && parent_of(session) == nullptr,
+              "WINHTTP_OPTION_PARENT_HANDLE gives the connection, then the session, and NULL for a session");
+        HINTERNET parent = nullptr;
+        DWORD parent_size = sizeof(parent) / 2;
+        SetLastError(0);
+        check(query_option(request, WINHTTP_OPTION_PARENT_HANDLE, &parent, &parent_size) == FALSE &&
+                  GetLastError() == ERROR_INSUFFICIENT_BUFFER && parent_size == sizeof(parent),
+              "a short buffer for it reports the size it needs");
+
+        constexpr LPCWSTR kObject = L"/a b/c\\d?e f#g";
+        check(url_for(connection, kObject, 0) == L"http://example.invalid/a%20b/c%5Cd?e%20f%23g",
+              "WINHTTP_OPTION_URL gives the scheme, the lowercased server and the escaped object");
+        check(url_for(connection, kObject, WINHTTP_FLAG_ESCAPE_DISABLE) ==
+                      L"http://example.invalid/a%20b/c/d?e%20f#g" &&
+                  url_for(connection, kObject, WINHTTP_FLAG_ESCAPE_DISABLE_QUERY) ==
+                      L"http://example.invalid/a%20b/c%5Cd?e%20f#g" &&
+                  url_for(connection, L"/100%", WINHTTP_FLAG_ESCAPE_PERCENT) == L"http://example.invalid/100%25",
+              "and follows the WINHTTP_FLAG_ESCAPE_* flags");
+        check(url_for(other_port, L"x", WINHTTP_FLAG_SECURE) == L"https://example.invalid:8443/x" &&
+                  url_for(connection, nullptr, WINHTTP_FLAG_SECURE) == L"https://example.invalid:80/" &&
+                  url_for(connection, L"", 0) == L"http://example.invalid/",
+              "with the port unless it is the scheme's default, and / for a missing or relative object");
+
+        DWORD needed = 0;
+        SetLastError(0);
+        const BOOL sized = query_option(request, WINHTTP_OPTION_URL, nullptr, &needed);
+        check(sized == FALSE && GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
+                  needed == sizeof(L"http://example.invalid/p"),
+              "a URL query without a buffer asks for the URL and its NUL");
+        wchar_t url[64] = {};
+        DWORD url_size = needed - sizeof(wchar_t);
+        SetLastError(0);
+        const BOOL short_ok = query_option(request, WINHTTP_OPTION_URL, url, &url_size);
+        check(short_ok == FALSE && GetLastError() == ERROR_INSUFFICIENT_BUFFER && url_size == needed,
+              "and one byte pair short of that is still too small");
+        SetLastError(0);
+        check(query_option(connection, WINHTTP_OPTION_URL, url, &needed) == FALSE &&
+                  GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+              "a connection has no URL");
+        close(request);
+        close(other_port);
+        close(connection);
+        close(session);
+    }
+
     // WINHTTP_OPTION_CONTEXT_VALUE is inherited like the callback: a handle starts with the context its parent has
     // when it is created, and keeps it when the parent's changes later. The host's winhttp.dll gave these values.
     {

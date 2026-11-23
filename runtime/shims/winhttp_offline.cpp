@@ -15,7 +15,8 @@
 //   - Reading a response (WinHttpReceiveResponse, WinHttpQueryHeaders, WinHttpQueryDataAvailable, WinHttpReadData) and
 //     WinHttpWriteData fail with ERROR_WINHTTP_INCORRECT_HANDLE_STATE: no request ever got that far.
 //   - Options, timeouts and request headers are accepted. WINHTTP_OPTION_CONTEXT_VALUE is kept per handle and
-//     WINHTTP_OPTION_HANDLE_TYPE answered; WinHttpQueryOption reports ERROR_WINHTTP_INVALID_OPTION for the rest.
+//     WINHTTP_OPTION_HANDLE_TYPE, WINHTTP_OPTION_PARENT_HANDLE and WINHTTP_OPTION_URL answered; WinHttpQueryOption
+//     reports ERROR_WINHTTP_INVALID_OPTION for the rest.
 //   - A status callback set on a handle is inherited by the handles created under it, as in WinHTTP, and so is
 //     the handle's WINHTTP_OPTION_CONTEXT_VALUE as it is when the child is made.
 //     WINHTTP_CALLBACK_STATUS_HANDLE_CREATED is reported when a child handle is made, and
@@ -61,6 +62,7 @@ struct Handle {
 
     std::wstring server;  // Connect: for the log
     INTERNET_PORT port = 0;
+    std::wstring url;
 };
 
 // Intentionally immortal: a mapped DLL can close handles from DLL_PROCESS_DETACH, after normal statics are gone.
@@ -120,7 +122,7 @@ void release(Handle* h) {
 }
 
 HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nullptr, INTERNET_PORT port = 0,
-                      std::vector<Header> headers = {}) {
+                      std::vector<Header> headers = {}, std::wstring url = {}) {
     std::wstring host = server ? server : L"";
     auto* h = new (std::nothrow) Handle;
     if (!h) {
@@ -132,6 +134,7 @@ HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nu
     h->server = std::move(host);
     h->port = port;
     h->headers = std::move(headers);
+    h->url = std::move(url);
     h->kind = kind;
     h->parent = parent;
     h->async = async;
@@ -165,6 +168,52 @@ std::wstring server_of(const Handle* request) {
     const Handle* connect = request ? request->parent : nullptr;
     if (!connect) return L"?";
     return connect->server + L":" + std::to_wstring(connect->port);
+}
+
+// As the host's winhttp.dll gives it (Windows 10 22H2): the object goes out as UTF-8, escaped per the
+// WINHTTP_FLAG_ESCAPE_* flags, and WINHTTP_OPTION_URL reads it back through the ANSI code page.
+std::wstring request_url(const Handle* connect, LPCWSTR object, DWORD flags) {
+    const bool secure = (flags & WINHTTP_FLAG_SECURE) != 0;
+    std::wstring url = secure ? L"https://" : L"http://";
+    for (const wchar_t ch : connect->server) url += ch >= L'A' && ch <= L'Z' ? static_cast<wchar_t>(ch + 32) : ch;
+    const INTERNET_PORT port = connect->port;
+    if (port != 0 && port != (secure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT))
+        url += L":" + std::to_wstring(port);
+
+    std::string utf8;
+    const int utf8_size = object ? WideCharToMultiByte(CP_UTF8, 0, object, -1, nullptr, 0, nullptr, nullptr) : 0;
+    if (utf8_size > 1) {
+        utf8.resize(static_cast<size_t>(utf8_size));
+        WideCharToMultiByte(CP_UTF8, 0, object, -1, utf8.data(), utf8_size, nullptr, nullptr);
+        utf8.pop_back();
+    }
+    std::string wire = utf8.empty() || utf8[0] != '/' ? "/" : "";
+    bool query = false;
+    for (const char ch : utf8) {
+        const auto byte = static_cast<unsigned char>(ch);
+        const bool raw =
+            (flags & WINHTTP_FLAG_ESCAPE_DISABLE) || (query && (flags & WINHTTP_FLAG_ESCAPE_DISABLE_QUERY));
+        query = query || byte == '?';
+        if (raw && (byte == '\t' || byte == '\n' || byte == '\r')) continue;
+        if (raw && byte == '\\' && !query) {
+            wire += '/';
+            continue;
+        }
+        const bool escape = byte == ' ' || (!raw && (byte < 0x20 || byte == 0x7F ||
+                                                     (byte < 0x80 && std::strchr("\"#<>[\\]^`{|}", byte)) ||
+                                                     (byte == '%' && (flags & WINHTTP_FLAG_ESCAPE_PERCENT))));
+        if (!escape) {
+            wire += ch;
+            continue;
+        }
+        wire += '%';
+        wire += "0123456789ABCDEF"[byte >> 4];
+        wire += "0123456789ABCDEF"[byte & 15];
+    }
+    const int wide_size = MultiByteToWideChar(CP_ACP, 0, wire.data(), static_cast<int>(wire.size()), nullptr, 0);
+    std::wstring path(static_cast<size_t>(wide_size), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, wire.data(), static_cast<int>(wire.size()), path.data(), wide_size);
+    return url + path;
 }
 
 void log_refused(const Handle* request) {
@@ -216,8 +265,8 @@ HINTERNET WINAPI open_connection(HINTERNET session, LPCWSTR server, INTERNET_POR
     return make_handle(Kind::Connect, s, s->async, server, port);  // keeps the reference on the session
 }
 
-HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR referrer, LPCWSTR* accept_types,
-                              DWORD) {
+HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR object, LPCWSTR, LPCWSTR referrer,
+                              LPCWSTR* accept_types, DWORD flags) {
     DWORD error = 0;
     Handle* c = acquire(connection, false, true, false, error);
     if (!c) {
@@ -232,7 +281,7 @@ HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, L
         headers.emplace_back(L"Accept", std::move(accept));
     }
     // Keeps the reference on the connection.
-    return make_handle(Kind::Request, c, c->async, nullptr, 0, std::move(headers));
+    return make_handle(Kind::Request, c, c->async, nullptr, 0, std::move(headers), request_url(c, object, flags));
 }
 
 BOOL WINAPI send_request(HINTERNET request, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR context) {
@@ -420,6 +469,8 @@ BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD 
     if (!h) return fail(error);
     DWORD_PTR value_ptr = 0;
     DWORD value_dword = 0;
+    HINTERNET value_handle = nullptr;
+    std::wstring value_string;
     const void* value = nullptr;
     DWORD size = 0;
     if (option == WINHTTP_OPTION_CONTEXT_VALUE) {
@@ -433,6 +484,18 @@ BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD 
                                                  : WINHTTP_HANDLE_TYPE_REQUEST;
         value = &value_dword;
         size = sizeof(value_dword);
+    } else if (option == WINHTTP_OPTION_PARENT_HANDLE) {
+        value_handle = to_hinternet(h->parent);
+        value = &value_handle;
+        size = sizeof(value_handle);
+    } else if (option == WINHTTP_OPTION_URL) {
+        if (h->kind != Kind::Request) {
+            release(h);
+            return fail(ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+        }
+        value_string = h->url;
+        value = value_string.c_str();
+        size = static_cast<DWORD>((value_string.size() + 1) * sizeof(wchar_t));
     }
     release(h);
     if (!value) return fail(ERROR_WINHTTP_INVALID_OPTION);
@@ -441,7 +504,8 @@ BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD 
         return fail(ERROR_INSUFFICIENT_BUFFER);
     }
     std::memcpy(buffer, value, size);
-    *length = size;
+    // A string's terminating NUL counts in the size asked for, not in the size returned.
+    *length = option == WINHTTP_OPTION_URL ? size - DWORD{sizeof(wchar_t)} : size;
     return TRUE;
 }
 
