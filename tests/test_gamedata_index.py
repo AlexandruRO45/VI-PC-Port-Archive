@@ -245,6 +245,27 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(s["types"]["binary"]["files"], 1)
         self.assertEqual(s["roots"], {"RootA": {"files": 1, "inflated": len(xml)}})
 
+    def test_archive_bink_clip_does_not_absorb_the_next_stream(self):
+        clip = bytearray(65536)
+        clip[:4] = b"KB2n"
+        struct.pack_into("<II", clip, 4, len(clip) - 8, 1)
+        struct.pack_into("<II", clip, 0x14, 64, 64)
+        text = b"independent text payload\n" * 8
+        packed_text = zlib.compress(text)
+        rpf = os.path.join(self.root, "synthetic.rpf")
+        with open(rpf, "wb") as f:
+            f.write(struct.pack("<4sI8x", b"9FPR", 16))
+            f.write(clip)
+            f.write(packed_text)
+
+        out = os.path.join(self.root, "archive.json")
+        result = self.run_tool(rpf, "--json", out)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual([(r["type"], r["chunks"], r["size"], r["stored"]) for r in rows],
+                         [("bink2", 1, len(clip), len(clip)), ("text", 1, len(text), len(packed_text))])
+
     def test_unwritable_csv_or_json_is_one_error_line(self):
         self.add(b'<?xml version="1.0"?><RootA/>')
         self.finish()

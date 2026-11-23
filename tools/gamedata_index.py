@@ -281,12 +281,18 @@ def build_rows(rows: list, source) -> list:
             i = j
             continue
 
-        if kind == "other" or kind == "bink2":
+        if kind == "bink2":
+            # The carver uses the Bink header's length, so each row already represents a complete video.
+            out.append(row_for(kind, rows, [i], detail=magic_name(data)))
+            i += 1
+            continue
+
+        if kind == "other":
             group = [i]
             detail = magic_name(data)
             j = i + 1
             # A resource's first stream may be any whole number of 64 KiB blocks (docs/page_directory.md: 128 and
-            # 192 KiB first streams continue in the next one). Only these headed kinds take that rule: a binary,
+            # 192 KiB first streams continue in the next one). Only this headed kind takes that rule: a binary,
             # text or XML run has no header proving a continuation, so it keeps the exact 64 KiB rule below.
             while j < n and rows[j - 1]["size"] and rows[j - 1]["size"] % 65536 == 0:
                 nxt = source.read(rows[j])
@@ -295,8 +301,7 @@ def build_rows(rows: list, source) -> list:
                     break
                 group.append(j)
                 j += 1
-            typ = "bink2" if kind == "bink2" else "other"
-            out.append(row_for(typ, rows, group, detail=detail))
+            out.append(row_for(kind, rows, group, detail=detail))
             i = j
             continue
 
