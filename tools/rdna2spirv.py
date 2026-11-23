@@ -16243,7 +16243,13 @@ def interp_p2_f16_opsel_dst(raw, printed, op):
 
 def restore_interp_p2_f16_opsel_dst(ins):
     """Record the dropped VOP3 ``op_sel[3]`` destination high-half bit on ``ins``."""
-    if not any(m.startswith("op_sel:") for m in ins["mods"]):
+    updated = False
+    for i, m in enumerate(ins["mods"]):
+        if m.startswith("op_sel:"):
+            sel, _ = Gen.opsel_bits([m], 3)
+            ins["mods"][i] = "op_sel:[" + ",".join(str(b) for b in (*sel, 1)) + "]"
+            updated = True
+    if not updated:
         ins["mods"].append("op_sel:[0,0,0,1]")
 
 

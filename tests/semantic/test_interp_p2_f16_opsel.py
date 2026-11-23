@@ -116,6 +116,18 @@ class InterpP2F16OpselTest(unittest.TestCase):
         words = run_spv(spv)
         self.assertEqual([f"{w:#010x}" for w in words], ["0x48803f00", "0x3c005678", "0x3f00de01", "0x48803f00"])
 
+    def test_printed_zero_opsel_is_updated_to_high_half(self):
+        printed_with_zero_opsel = list(PRINTED)
+        printed_with_zero_opsel[8] = ("v_interp_p2_f16 v6, v1, attr0.x, v2 op_sel:[0,0,0,0]", "06 00 5a d7 00 02 0a 04")
+        spv = translate_listing(NAME, listing(printed_with_zero_opsel), fssm=blob(STORED))
+        words = run_spv(spv)
+        self.assertEqual([f"{w:#010x}" for w in words], ["0x48803f00", "0x3c005678", "0x3f00de01", "0x48803f00"])
+
+        # Also check on the re-anchored path.
+        spv_re = translate_listing(NAME, listing(printed_with_zero_opsel, invalid=True), fssm=blob(STORED))
+        words_re = run_spv(spv_re)
+        self.assertEqual([f"{w:#010x}" for w in words_re], ["0x48803f00", "0x3c005678", "0x3f00de01", "0x48803f00"])
+
     def test_without_blob_llvm_text_writes_low_half(self):
         spv = translate_listing(NAME, listing(PRINTED), fssm=None)
         words = run_spv(spv)
