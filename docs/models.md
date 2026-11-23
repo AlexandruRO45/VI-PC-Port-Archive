@@ -2,8 +2,9 @@
 
 Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
 upstream `rpf9-explorer` fixes that close it. The fixes are merged upstream and the submodule is
-pinned at `e293917`, where a full ten-archive re-count recovers **382,781 models** (**0 decode
-failures**), up from 350,251 at `917e9b9` and 190,792 at `c3708fb`.
+pinned at `7ef5c51` ([re-count](#re-count-at-7ef5c51-asset-128-asset-129)). At the previous pin
+`e293917` a full ten-archive re-count recovered **382,781 models** (**0 decode failures**), up from
+350,251 at `917e9b9` and 190,792 at `c3708fb`.
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -13,8 +14,8 @@ dropped valid models in three validation paths, all in `third_party/rpf9-explore
 
 [Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
 fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged, and
-`third_party/rpf9-explorer` is now pinned at upstream `e293917` (was `917e9b9`, originally
-`48557ea`). Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
+`third_party/rpf9-explorer` is now pinned at upstream `7ef5c51` (was `e293917`, before that
+`917e9b9`, originally `48557ea`). Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
 per entry), the TTPF compact/array/cubemap/volume layouts, and the external drawable-skeleton
 reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8–#12:
 optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
@@ -167,6 +168,37 @@ models**, 130,225 dictionary children, 183,775 standalone. 1,037 candidates are 
 1,009 in the last shard are texture dictionaries, not models, and 28 more in shards 1 to 7 are
 models the probe caps reject (see [rejected candidates](#rejected-candidates-at-917e9b9)). The
 `levels.rpf` full export was not re-run, so its triangle total is not re-run here.
+
+### Re-count at `7ef5c51` (ASSET-128, ASSET-129)
+
+The pin moved from `e293917` to `7ef5c51`, which brings two upstream decoder fixes, both by `cxchhh`:
+breadbbbb/rpf9-explorer#18 reads index buffers with more than 65,535 triangles or vertex references
+(ASSET-128), and #19 scans for model streams on every 16-byte boundary, not only at page starts
+(ASSET-129). The follow-up `b3678413` raises the model index cache schema from 4 to 5, so an index
+cached by the old decoder is scanned again. `tools/rpf9dump models` was run with both pins on the
+same input:
+
+| Input | Models at `e293917` | Models at `7ef5c51` | Only at `7ef5c51` | Only at `e293917` |
+|---|---:|---:|---:|---:|
+| `packs.rpf` (whole) | 26,585 | **27,484** | 899, all mid-page | 0 |
+| `pack/shared_minigame000/...` (whole) | 1,294 | **1,296** | 2, both mid-page | 0 |
+| `pack/core_restofworld/...` (whole) | 936 | **936** | 0 | 0 |
+| `levels.rpf`, bytes `0x10F0000000` + `0x60000000` | 18,946 | **18,950** | 4, all at a page start + 0x10 | 0 |
+| `levels.rpf`, bytes `0x6B0000000` + `0x40000000` | 4,712 | **4,712** | 0 | 0 |
+| `levels.rpf`, first 4 GiB | 1,230 | **1,230** | 0 | 0 |
+
+Every run reported `fail=0 skip=0`. "Mid-page" means the model's offset is not a page start + 0x10,
+where the old scan looked. The two `levels.rpf` byte ranges were chosen around the largest single meshes
+in the `e293917` export (up to 64,288 triangles; that decoder could not read a mesh above 65,535). Of the
+four new `levels.rpf` models, two have a single mesh above 65,535 triangles (66,251 and 76,793); the
+other two have no mesh above 56,095 triangles, so the reason the old decoder dropped them was not
+determined here. The rest of `levels.rpf` and the other archives were not re-run at this pin: a full
+`levels.rpf` export is about 213 GB.
+
+The same pin also carries upstream #13 (Opus playback timing), #15 (RbPlus 64 KiB 4 BPP tiling), #16
+and #17 (clip and PSIN recovery), #22 (external BCPack history tables) and #24 (drawable levels of
+detail). Only the model counts above were re-measured at `7ef5c51`; the audio, texture and animation
+figures elsewhere in `docs/` stay tied to the pins they name.
 
 ### Rejected candidates at `917e9b9`
 
