@@ -1228,9 +1228,12 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         // Queue slot 18 is GetTimestampFrequency(UINT64*) on the console, not GetDesc (measured at the retail
         // executable's RVA 0x24841a6: an 8-byte out and an HRESULT, the value used as 1 / frequency); PC GetDesc
         // wrote 16 bytes there, over the caller's saved RBX. It goes to the PC's slot 16.
-        constexpr unsigned Fwd = (K == ChildKind::queue && Slot == 35)   ? 10u
-                                 : (K == ChildKind::queue && Slot == 18) ? 16u
-                                                                         : Slot;
+        // Queue slots 16..20 sit two past the PC's: the retail title calls slot 16 with (fence, 1) and (fence, 2)
+        // from RVA 0x248260e (Signal), so 16 Signal, 17 Wait, 18 GetTimestampFrequency, 19 GetClockCalibration,
+        // 20 GetDesc go to PC 14..18. PC slot 16 here wrote 1e9 over the fence proxy's vtable.
+        constexpr unsigned Fwd = (K == ChildKind::queue && Slot == 35)                ? 10u
+                                 : (K == ChildKind::queue && Slot >= 16 && Slot <= 20) ? Slot - 2u
+                                                                                      : Slot;
         if (Fwd >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
@@ -1246,9 +1249,16 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
-        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
+        if constexpr (K == ChildKind::queue && (Fwd == kQueueSignal || Fwd == kQueueWait)) a1 = unwrap_object(a1);
         // ExecuteCommandLists(count, lists): command-list probes never reach the real queue.
         std::uint64_t kept[64];
+        if constexpr (K == ChildKind::queue && (Slot == 16 || Slot == 17 || Slot == 18)) {
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] d3d12_xs: queue slot %u from %p args 0x%llx 0x%llx 0x%llx\n", Slot,
+                             _ReturnAddress(), static_cast<unsigned long long>(a1),
+                             static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3));
+        }
         if constexpr (K == ChildKind::queue && Fwd == 10) {
             if (const auto hook = g_before_execute.load(std::memory_order_acquire)) hook();  // placed heaps -> arena
             const auto count = static_cast<std::uint32_t>(a1);

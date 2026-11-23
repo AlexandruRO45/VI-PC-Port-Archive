@@ -230,6 +230,30 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
+            // Diagnostic (1.0.2.1): the handle wait at RVA 0x4fb0aec calls through the object of the type table at
+            // RVA 0x68929d0. Dump the type-0 record (RVA 0x75e0e98: device, flag, the fence at +0x10) and RCX.
+            if (info.ContextRecord && where(reinterpret_cast<std::uint64_t>(r.ExceptionAddress)).find("+0x4fb0aec") !=
+                                          std::string::npos) {
+                const auto image = reinterpret_cast<std::uint64_t>(r.ExceptionAddress) - 0x4fb0aec;
+                auto dump = [&](const char* name, std::uint64_t address, int words) {
+                    std::string s;
+                    for (int k = 0; k < words; ++k) {
+                        std::uint64_t w = 0;
+                        SIZE_T got = 0;
+                        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address + 8 * k), &w,
+                                               8, &got) || got != 8)
+                            break;
+                        if (!s.empty()) s += " ";
+                        s += hex(w);
+                    }
+                    event("dump", "\"name\":" + quote(name) + ",\"at\":" + quote(hex(address)) + ",\"words\":" +
+                                      quote(s));
+                };
+                dump("type_table", image + 0x68929d0, 12);
+                dump("record0", image + 0x75e0e98, 8);
+                dump("rcx", info.ContextRecord->Rcx, 8);
+                dump("r15", info.ContextRecord->R15, 6);
+            }
             // A write to address 0 is how the title's watchdog stops the process when a thread stops making progress
             // (RVA 0x2215c35). The faulting thread's stack names only the watchdog, so log every other thread's.
             if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 &&
