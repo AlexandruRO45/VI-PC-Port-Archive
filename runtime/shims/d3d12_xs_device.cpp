@@ -35,6 +35,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1847,6 +1848,109 @@ void proxy_buffer_view_at_address(DeviceProxy* self, const D3D12_RESOURCE_DESC* 
                      resource_desc ? static_cast<unsigned long long>(resource_desc->Width) : 0ull);
 }
 
+// Device slot 74: (base VA, page count, out). Measured at the retail executable's RVA 0x1e6c2bb: the title allocates
+// 99,776 physical pages (XMemAllocatePhysicalPages attributes 0x380), reserves a large-page range for them
+// (XMemVirtualAlloc 0x20402000), maps them (XMemMapPhysicalPages) and passes the range here with the page count and a
+// global that nothing else reads; a failure stops the title (int3 at 0x1e6c2c5).
+// ASSUMPTION: it registers the mapped range as a pool the GPU may take pages from (as a page pool for tiled
+// resources). The pages are already mapped on the host, so the range is recorded and an opaque 8-byte cookie (the
+// base address) is written. Unmeasured: what the console writes there and the page size of the count.
+struct PagePool {
+    std::uint64_t va;
+    std::uint64_t pages;
+};
+std::mutex g_page_pools_mutex;
+std::vector<PagePool> g_page_pools;
+
+HRESULT proxy_register_page_pool(DeviceProxy* /*self*/, std::uint64_t va, std::uint64_t pages, std::uint64_t* out) {
+    note_slot(74);
+    if (!va || !pages) return E_INVALIDARG;
+    {
+        std::lock_guard lock(g_page_pools_mutex);
+        g_page_pools.push_back({va, pages});
+    }
+    if (out) *out = va;
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 74 page pool at 0x%llx, %llu pages, recorded\n",
+                 static_cast<unsigned long long>(va), static_cast<unsigned long long>(pages));
+    return S_OK;
+}
+
+// Device slot 61: the console's CreateSampler (desc, CPU descriptor handle). The retail title builds an 0x54-byte
+// description (RVA 0x12b96b0, called through 0x12b9800); the fields below are read from that code, not from a header:
+//   +0x04 min, +0x08 mag, +0x0c mip filter (1 = point, 2 = linear), +0x10 a fourth filter word (unused here),
+//   +0x14 reduction (0 standard, 1 comparison, 2 minimum, 3 maximum), +0x18/+0x1c/+0x20 address U/V/W (copied bytes),
+//   +0x24 MinLOD, +0x28 MaxLOD, +0x30 MipLODBias, +0x34 MaxAnisotropy (5 bits), +0x40 ComparisonFunc (1 = NEVER by
+//   default), +0x44 the border colour (float4).
+// ASSUMPTION: the filter, reduction and address values use these encodings; anything out of the PC's range is clamped
+// (address to WRAP, comparison to NEVER) and logged. Unmeasured against the console.
+HRESULT proxy_create_sampler_x(DeviceProxy* self, const std::uint8_t* x, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    note_slot(61);
+    if (!x || !handle.ptr) return E_INVALIDARG;
+    auto u32 = [&](std::size_t o) { std::uint32_t v; std::memcpy(&v, x + o, 4); return v; };
+    auto f32 = [&](std::size_t o) { float v; std::memcpy(&v, x + o, 4); return v; };
+    auto filter_type = [](std::uint32_t v) { return v >= 2 ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT; };
+    auto address = [](std::uint32_t v) {
+        return v >= 1 && v <= 5 ? static_cast<D3D12_TEXTURE_ADDRESS_MODE>(v) : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    };
+    const std::uint32_t reduction_word = u32(0x14);
+    const auto reduction = static_cast<D3D12_FILTER_REDUCTION_TYPE>(reduction_word <= 3 ? reduction_word : 0);
+    D3D12_SAMPLER_DESC desc{};
+    desc.MaxAnisotropy = std::clamp<UINT>(u32(0x34), 1, 16);
+    desc.Filter = desc.MaxAnisotropy > 1
+                      ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction)
+                      : D3D12_ENCODE_BASIC_FILTER(filter_type(u32(0x04)), filter_type(u32(0x08)),
+                                                  filter_type(u32(0x0c)), reduction);
+    desc.AddressU = address(u32(0x18));
+    desc.AddressV = address(u32(0x1c));
+    desc.AddressW = address(u32(0x20));
+    desc.MipLODBias = std::isfinite(f32(0x30)) ? std::clamp(f32(0x30), -16.0f, 15.99f) : 0.0f;
+    const std::uint32_t cmp = u32(0x40);
+    desc.ComparisonFunc = cmp >= 1 && cmp <= 8 ? static_cast<D3D12_COMPARISON_FUNC>(cmp) : D3D12_COMPARISON_FUNC_NEVER;
+    for (int i = 0; i < 4; ++i) desc.BorderColor[i] = f32(0x44 + 4 * i);
+    desc.MinLOD = std::isfinite(f32(0x24)) ? f32(0x24) : 0.0f;
+    desc.MaxLOD = std::isnan(f32(0x28)) ? D3D12_FLOAT32_MAX : f32(0x28);
+    if (desc.MaxLOD < desc.MinLOD) desc.MaxLOD = desc.MinLOD;
+    self->real->CreateSampler(&desc, handle);
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 61 sampler: filters %u/%u/%u/%u reduction %u address %u/%u/%u lod %g..%g "
+                     "bias %g aniso %u cmp %u -> filter 0x%x\n",
+                     u32(0x04), u32(0x08), u32(0x0c), u32(0x10), reduction_word, u32(0x18), u32(0x1c), u32(0x20),
+                     f32(0x24), f32(0x28), f32(0x30), u32(0x34), cmp, static_cast<unsigned>(desc.Filter));
+    return S_OK;
+}
+
+// Device slot 41: CreateCommandSignature (desc, root signature, riid, out), as on the PC. The retail renderer's init
+// (RVA 0x2479430) makes five: DRAW (stride 16), DRAW_INDEXED (20), an argument of type 0x69 (stride 12), DISPATCH
+// (12) and DISPATCH_MESH (12), and stops at the first failure. Type 0x69 is not a PC type.
+// ASSUMPTION: type 0x69 is a console dispatch whose 12 argument bytes are a D3D12_DISPATCH_ARGUMENTS (its stride is
+// exactly that); it is created as DISPATCH. Not measured against a command list that executes it.
+constexpr UINT kXboxIndirectDispatch69 = 0x69;
+
+HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                       ID3D12RootSignature* root, const IID* riid, void** out) {
+    note_slot(41);
+    if (!desc || !riid) return E_INVALIDARG;
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args;
+    if (desc->pArgumentDescs && desc->NumArgumentDescs <= 64)
+        args.assign(desc->pArgumentDescs, desc->pArgumentDescs + desc->NumArgumentDescs);
+    std::string types;
+    for (auto& arg : args) {
+        if (!types.empty()) types += ",";
+        types += std::to_string(static_cast<unsigned>(arg.Type));
+        if (static_cast<UINT>(arg.Type) == kXboxIndirectDispatch69) arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    }
+    D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
+    pc.pArgumentDescs = args.empty() ? desc->pArgumentDescs : args.data();
+    const HRESULT hr = self->real->CreateCommandSignature(&pc, root, *riid, out);
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || FAILED(hr))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 41 CreateCommandSignature: stride %u types [%s] -> 0x%08lx\n",
+                     desc->ByteStride, types.c_str(), static_cast<unsigned long>(hr));
+    return hr;
+}
+
 // Device slot 127: CreateCommittedResource3 with the console's argument order (measured: the retail executable's
 // RVA 0x193e1b4: RDX = D3D12_HEAP_PROPERTIES {DEFAULT, 0, 0, 1, 1}, R8 = heap flags 8, R9 = the resource description,
 // then on the stack the initial barrier layout (0 or 0x1c), a D3D12_CLEAR_VALUE, null, 0, null, IID_ID3D12Resource and
@@ -2148,6 +2252,16 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 74) {
+        return hr_to_u64(proxy_register_page_pool(self, a1, static_cast<std::uint32_t>(a2),
+                                                  reinterpret_cast<std::uint64_t*>(a3)));
+    } else if constexpr (Slot == 61) {
+        proxy_create_sampler_x(self, reinterpret_cast<const std::uint8_t*>(a1), D3D12_CPU_DESCRIPTOR_HANDLE{a2});
+        return 0;
+    } else if constexpr (Slot == 41) {
+        return hr_to_u64(proxy_create_command_signature(self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1),
+                                                        reinterpret_cast<ID3D12RootSignature*>(a2),
+                                                        reinterpret_cast<const IID*>(a3), reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 127) {
         return hr_to_u64(proxy_create_committed_resource3(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1), static_cast<std::uint32_t>(a2),

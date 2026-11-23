@@ -54,6 +54,7 @@
 #include <string>
 #include <type_traits>
 #include <cwchar>
+#include <thread>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -4873,6 +4874,7 @@ public:
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
         state_.info = info;
+        library_preload_ = std::thread([this] { state_.library(); });
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -5313,6 +5315,7 @@ public:
     }
 
     ~Device() override {
+        if (library_preload_.joinable()) library_preload_.join();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
@@ -5665,6 +5668,9 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        // Replayed with vkCmdDrawMeshTasksIndirect(Count)EXT; without VK_EXT_mesh_shader the replay reports it
+        // unsupported, as a direct DispatchMesh is.
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: kind = leonida::IndirectKind::dispatch_mesh; break;
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
@@ -8509,6 +8515,9 @@ private:
     std::vector<std::uint32_t> compute_users_;
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
+    // Reads the translated shader index (26k entries in the retail corpus) and pipeline_cache.bin off the title's
+    // thread: done on the first pipeline instead, a cold read can outlast the retail watchdog (about 30 s).
+    std::thread library_preload_;
     std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device

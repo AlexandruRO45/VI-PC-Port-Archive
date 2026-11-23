@@ -586,6 +586,7 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    dispatch_mesh = 3,  // D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: vkCmdDrawMeshTasksIndirect(Count)EXT
 };
 
 struct ExecuteIndirect {

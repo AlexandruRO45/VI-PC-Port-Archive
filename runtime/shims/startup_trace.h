@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -225,8 +226,38 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             // A write to address 0 is how the title's watchdog stops the process when a thread stops making progress
             // (RVA 0x2215c35). The faulting thread's stack names only the watchdog, so log every other thread's.
             if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 &&
-                r.ExceptionInformation[0] == 1 && r.ExceptionInformation[1] == 0)
+                r.ExceptionInformation[0] == 1 && r.ExceptionInformation[1] == 0) {
                 log_all_threads();
+                // The retail watchdog (1.0.2.1: the store at RVA 0x2215c35) scans 64 records of 0x48 bytes at RVA
+                // 0x6844a20: a word, a count at +4 and up to 8 QPC start times at +8. Log the busy ones.
+                const auto at = reinterpret_cast<std::uint64_t>(r.ExceptionAddress);
+                if (where(at).find("+0x2215c35") != std::string::npos) {
+                    const auto* table = reinterpret_cast<const std::uint8_t*>(at - 0x2215c35 + 0x6844a20);
+                    LARGE_INTEGER now{}, freq{};
+                    QueryPerformanceCounter(&now);
+                    QueryPerformanceFrequency(&freq);
+                    for (int i = 0; i < 64; ++i) {
+                        std::uint8_t rec[0x48];
+                        SIZE_T got = 0;
+                        if (!ReadProcessMemory(GetCurrentProcess(), table + i * 0x48, rec, sizeof(rec), &got) ||
+                            got != sizeof(rec))
+                            break;
+                        std::uint32_t word = 0, count = 0;
+                        std::memcpy(&word, rec, 4);
+                        std::memcpy(&count, rec + 4, 4);
+                        if (!count) continue;
+                        std::string ages;
+                        for (std::uint32_t k = 0; k < count && k < 8; ++k) {
+                            std::int64_t ts = 0;
+                            std::memcpy(&ts, rec + 8 + k * 8, 8);
+                            if (!ages.empty()) ages += ",";
+                            ages += ts ? std::to_string((now.QuadPart - ts) * 1000 / freq.QuadPart) : "0";
+                        }
+                        event("watchdog", "\"record\":" + std::to_string(i) + ",\"word\":" + quote(hex(word)) +
+                                              ",\"count\":" + std::to_string(count) + ",\"age_ms\":[" + ages + "]");
+                    }
+                }
+            }
         }
     } catch (...) {
         // Out of memory while formatting: drop the event rather than disturb the process.

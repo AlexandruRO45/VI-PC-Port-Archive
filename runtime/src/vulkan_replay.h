@@ -853,6 +853,8 @@ struct ReplayFunctions {
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;  // null: indirect mesh draws unsupported
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -1542,6 +1544,7 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
     case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
     case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    case IndirectKind::dispatch_mesh: return sizeof(VkDrawMeshTasksIndirectCommandEXT);
     }
     return 0;
 }
@@ -3013,13 +3016,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                                      ind->stride, ind->max_count, p.counted_dispatch))
                         return ReplayResult::unsupported;
                 } else if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
-                           (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count)) {
+                           (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count) ||
+                           (ind->kind == IndirectKind::dispatch_mesh && !vk.draw_mesh_tasks_indirect_count)) {
                     return ReplayResult::unsupported;
                 }
             } else {
                 if ((ind->kind == IndirectKind::draw && !vk.draw_indirect) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect) ||
-                    (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect))
+                    (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect) ||
+                    (ind->kind == IndirectKind::dispatch_mesh && !vk.draw_mesh_tasks_indirect))
                     return ReplayResult::unsupported;
             }
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
@@ -3913,12 +3918,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 } else if (ind->kind == IndirectKind::draw_indexed) {
                     vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, arguments,
                                                    p.source.buffer, count, ind->max_count, ind->stride);
+                } else if (ind->kind == IndirectKind::dispatch_mesh) {
+                    vk.draw_mesh_tasks_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer,
+                                                      count, ind->max_count, ind->stride);
                 }
             } else {
                 if (ind->kind == IndirectKind::draw) {
                     vk.draw_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::draw_indexed) {
                     vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
+                } else if (ind->kind == IndirectKind::dispatch_mesh) {
+                    vk.draw_mesh_tasks_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count,
+                                                ind->stride);
                 } else if (ind->kind == IndirectKind::dispatch) {
                     if (ind->count_buffer) {
                         // No D3D12 query must count this internal compute pass as an application dispatch.
