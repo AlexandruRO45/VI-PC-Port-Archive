@@ -1761,7 +1761,7 @@ translation also hits on the RTX 4080 SUPER), and 8 are not translated (`compute
 (the unterminated loop above), 8 not translated, 34 timeouts on both. Intel with the fallbacks against NVIDIA with
 the default translation: 373 OK, 53 differ by more than 0.1 and 8 are NaN on one side. The same 61 differ between the
 two translations on NVIDIA alone, so it is the translation, not the GPU. **Cause (counted on the same 480 translated
-again, `--bary-fallback` alone, without #4642's `--min-lod-fallback`, against the default):** 199 modules differ between the two translations, 190 that read a
+again, `--bary-fallback` alone, without the MinLod flag of #4642, against the default):** 199 modules differ between the two translations, 190 that read a
 16-bit interpolant (`v_interp_p1ll/p1lv/p2_f16`) and the 9 that read raw barycentrics; the other 273 translated under
 both are byte-identical, so ordinary `v_interp_p1/p2/mov_f32` is not translated differently (the remaining 8 are not
 translated under the fallback). `--bary-fallback` has no `PerVertexKHR` inputs, so a 16-bit interpolant is read as the
