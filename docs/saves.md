@@ -114,6 +114,14 @@ read back byte-identical through its `XGameSaveReadBlobData`.
 name, and `--map` overrides it. Confirm or fix them from the executable's `XGameSaveCreateContainer` and
 `XGameSaveSubmitBlobWrite` calls.
 
+A container name has to be one the game can open: `XGameSaveCreateContainer`'s rule (the same check in
+`runtime/shims/xgameruntime_gamesave.cpp:136` and `valid_container_name()` in `tools/saves.py`) is at most 256
+characters, a path part of `[A-Za-z0-9_/]` up to the last `/`, then a non-empty file part of `[A-Za-z0-9_.-]`
+that does not end in `.` and holds no `..`. The import warns about a name that breaks it, because the runtime
+lists any folder but the game cannot open such a container by name, and `--map` gives it another. Container and
+blob names are compared case-insensitively (Windows), so two payloads that map to one container and blob stop the
+import before it writes anything. `tests/test_saves.py` holds the rule against `valid_container_name()`.
+
 ## Key names
 
 The hash was found from structure, before trying a dictionary: the code and script group keys are the joaat of names
