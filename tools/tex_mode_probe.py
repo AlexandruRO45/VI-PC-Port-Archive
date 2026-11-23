@@ -92,9 +92,11 @@ def main():
         ap.error(f"{a.index}: texture index must contain a list")
     # A row that is not a descriptor (a non-dict, or missing fmt_name/w/h) used to raise KeyError,
     # AttributeError or TypeError in the filter below. Refuse it like the non-list check above.
+    # type() is int, not isinstance: JSON true/false are bool (an int subclass) and would otherwise
+    # pass, then silently filter out (True >= 256 is False) into an empty "successful" probe.
     for i, t in enumerate(index):
         if not isinstance(t, dict) or not isinstance(t.get("fmt_name"), str) \
-                or not isinstance(t.get("w"), int) or not isinstance(t.get("h"), int):
+                or type(t.get("w")) is not int or type(t.get("h")) is not int:
             ap.error(f"{a.index}: texture row {i} needs fmt_name (string) and w, h (integers)")
     nib, tab = load()
     texs = [t for t in index if t["fmt_name"].startswith(a.fmt)

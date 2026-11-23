@@ -298,12 +298,16 @@ class TestArgumentValidation(unittest.TestCase):
         # Before: a list row that was not a descriptor raised KeyError ('fmt_name'/'w'/'h'),
         # AttributeError (fmt_name=null) or TypeError (non-dict) in the filter, exit 1 with a
         # traceback. The wrong-schema case is plausible: tex_headers emits format_name/width/height.
+        # Boolean w/h are the subtle one: bool is an int subclass, so isinstance(w, int) accepted
+        # them, then True >= 256 filtered the row out into an empty "successful" probe (exit 0).
         rows = (
             [{"w": 256, "h": 256}],                                   # missing fmt_name
             [{"fmt_name": None, "w": 256, "h": 256}],                 # null fmt_name
             [{"fmt_name": "BC1_UNORM", "h": 256}],                    # missing w
             ["BC1_UNORM"],                                            # non-dict row
             [{"format_name": "BC1_UNORM", "width": 256, "height": 256}],  # tex_headers schema
+            [{"fmt_name": "BC1_UNORM", "w": True, "h": 256}],         # boolean w
+            [{"fmt_name": "BC1_UNORM", "w": 256, "h": False}],        # boolean h
         )
         for bad in rows:
             with self.subTest(row=bad), tempfile.TemporaryDirectory() as directory:
