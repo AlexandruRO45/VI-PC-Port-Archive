@@ -437,5 +437,34 @@ class TestMaxF16HardwareTranslator(unittest.TestCase):
             self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on max_f16({s0:#x}, {s1:#x})")
 
 
+# ------------------------------------------------------------------------------
+# v_floor_f16 Reference Oracle
+# ------------------------------------------------------------------------------
+
+def ref_floor_f16(src: int) -> int:
+    u = src & MASK16
+    if is_nan_f16(u) or is_inf_f16(u):
+        return u
+    if (u & 0x7FFF) == 0:
+        return u
+    f = bits_to_f16(u)
+    rf = math.floor(f)
+    return f16_to_bits(rf)
+
+
+class TestFloorF16Oracle(unittest.TestCase):
+    def test_basic_floor(self):
+        self.assertEqual(ref_floor_f16(f16_to_bits(1.5)), f16_to_bits(1.0))
+        self.assertEqual(ref_floor_f16(f16_to_bits(-1.5)), f16_to_bits(-2.0))
+        self.assertEqual(ref_floor_f16(f16_to_bits(2.0)), f16_to_bits(2.0))
+
+    def test_special_cases(self):
+        self.assertEqual(ref_floor_f16(POS_ZERO16), POS_ZERO16)
+        self.assertEqual(ref_floor_f16(NEG_ZERO16), NEG_ZERO16)
+        self.assertEqual(ref_floor_f16(POS_INF16), POS_INF16)
+        self.assertEqual(ref_floor_f16(NEG_INF16), NEG_INF16)
+        self.assertEqual(ref_floor_f16(QNAN16), QNAN16)
+
+
 if __name__ == '__main__':
     unittest.main()
