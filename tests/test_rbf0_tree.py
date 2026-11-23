@@ -5,6 +5,7 @@
 Every byte here is built by the test. No game file, game asset path or game name is used.
 """
 import csv
+import io
 import json
 import os
 import struct
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
@@ -20,6 +22,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import rbf0_tree  # noqa: E402
 import rbf0_index  # noqa: E402
+import report_paths  # noqa: E402
 
 WIDE = b"RBF0" + rbf0_tree.PROLOGUE
 CLOSE = b"\xff\xff"
@@ -514,6 +517,22 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("must be different files", result.stderr)
         self.assertFalse(os.path.exists(out))
+
+    def test_out_and_csv_with_equivalent_unicode_names_are_refused(self):
+        source = os.path.join(self.root, "00000000.bin")
+        with open(source, "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "caf\u00e9.json")
+        csv_out = os.path.join(self.root, "cafe\u0301.json")
+        stderr = io.StringIO()
+        with (patch.object(report_paths, "case_insensitive_volume", return_value=True),
+              redirect_stderr(stderr)):
+            with self.assertRaises(SystemExit) as error:
+                rbf0_tree.main([source, out, "--csv", csv_out, "--quiet"])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("out and --csv must be different files", stderr.getvalue())
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(csv_out))
 
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
