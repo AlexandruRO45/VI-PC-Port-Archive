@@ -1,6 +1,7 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
 
+#include <d3d10_1.h>
 #include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
 #include <d3dkmthk.h>
 
@@ -1157,7 +1158,8 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE CheckInterfaceSupport(REFGUID interface_name, LARGE_INTEGER* umd_version) override {
-        if (interface_name == __uuidof(IDXGIDevice)) {
+        if (interface_name == __uuidof(IDXGIDevice) || interface_name == __uuidof(ID3D10Device) ||
+            interface_name == __uuidof(ID3D10Device1)) {
             if (umd_version) *umd_version = umd_version_;
             return S_OK;
         }
@@ -1328,7 +1330,7 @@ private:
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     DXGI_ADAPTER_DESC2 desc_{};
-    LARGE_INTEGER umd_version_{};  // CheckInterfaceSupport(IDXGIDevice): the adapter's user-mode driver version
+    LARGE_INTEGER umd_version_{};  // CheckInterfaceSupport: the adapter's user-mode driver version
     bool has_memory_budget_ = false;
     std::shared_ptr<ReservationState> reservations_;
 };

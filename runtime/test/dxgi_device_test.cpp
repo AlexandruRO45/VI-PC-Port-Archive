@@ -19,6 +19,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
+#include <d3d10_1.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
@@ -106,6 +107,20 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     char name[128] = {};
     WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
     EXPECT(dxgi->GetAdapter(nullptr) == E_POINTER);
+    {
+        LARGE_INTEGER umd{};
+        EXPECT(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd) == S_OK);
+        for (const GUID& d3d10 : {__uuidof(ID3D10Device), __uuidof(ID3D10Device1)}) {
+            LARGE_INTEGER version{};
+            EXPECT(adapter->CheckInterfaceSupport(d3d10, &version) == S_OK && version.QuadPart == umd.QuadPart);
+            EXPECT(adapter->CheckInterfaceSupport(d3d10, nullptr) == S_OK);
+        }
+        for (const GUID& other : {__uuidof(IDXGIDevice1), __uuidof(ID3D12Device)}) {
+            LARGE_INTEGER version{};
+            version.QuadPart = 7;
+            EXPECT(adapter->CheckInterfaceSupport(other, &version) == DXGI_ERROR_UNSUPPORTED && version.QuadPart == 7);
+        }
+    }
     {
         // GetParent is the same adapter by another road, as any interface it has; the device is not its own parent.
         Ref<IDXGIAdapter> parent;
