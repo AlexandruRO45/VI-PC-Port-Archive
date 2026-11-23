@@ -895,12 +895,19 @@ def main(argv=None) -> int:
 
     summary = summarize(rows)
     print_report(summary, rows)
-    if args.csv:
-        write_csv(args.csv, rows)
-        print("wrote", args.csv)
-    if args.json:
-        write_json(args.json, summary, rows)
-        print("wrote", args.json)
+    for flag, path in (("--csv", args.csv), ("--json", args.json)):
+        if not path:
+            continue
+        try:
+            if flag == "--csv":
+                write_csv(path, rows)
+            else:
+                write_json(path, summary, rows)
+        except OSError as exc:
+            message = f"cannot write {flag} report {path}: {exc.strerror or exc}"
+            print("ERROR:", " ".join(message.splitlines()), file=sys.stderr)
+            return 2
+        print("wrote", path)
     return 0
 
 
