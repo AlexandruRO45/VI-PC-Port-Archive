@@ -199,11 +199,17 @@ function Invoke-Logged {
 }
 
 function Refresh-Path {
-    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
-    $user = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = @()
-    foreach ($p in @($machine, $user)) {
-        if ($p) { $parts += ($p -split ";" | Where-Object { $_ }) }
+    foreach ($group in @(
+        [Environment]::GetEnvironmentVariable("Path", "Machine"),
+        [Environment]::GetEnvironmentVariable("Path", "User"),
+        $env:Path
+    )) {
+        if (-not $group) { continue }
+        foreach ($entry in ($group -split ";")) {
+            $trimmed = $entry.Trim().Trim('"')
+            if ($trimmed -and ($parts -notcontains $trimmed)) { $parts += $trimmed }
+        }
     }
     if ($parts.Count -gt 0) { $env:Path = ($parts -join ";") }
 
@@ -238,19 +244,35 @@ function Test-Command([string]$Name) {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Test-StoreAlias([string]$Path) {
+    # python.exe in WindowsApps is the Store alias: it opens the Store instead of running Python.
+    return ($Path -match '[\\/]Microsoft[\\/]WindowsApps[\\/]')
+}
+
 function Find-Python {
     $candidates = @()
-    if (Test-Command "python") { $candidates += @{ Exe = "python"; Args = @() } }
-    foreach ($v in @("3.14", "3.13", "3.12", "3")) {
-        if (Test-Command "py") { $candidates += @{ Exe = "py"; Args = @("-$v") } }
+    $python = Get-Command "python" -ErrorAction SilentlyContinue
+    if ($python -and $python.CommandType -eq "Application" -and $python.Source -and
+        -not (Test-StoreAlias $python.Source)) {
+        $candidates += @{ Exe = $python.Source; Args = @() }
+    }
+    $launcher = Get-Command "py" -ErrorAction SilentlyContinue
+    if ($launcher -and $launcher.CommandType -eq "Application" -and $launcher.Source -and
+        -not (Test-StoreAlias $launcher.Source)) {
+        foreach ($v in @("3.14", "3.13", "3.12", "3")) {
+            $candidates += @{ Exe = "py"; Args = @("-$v") }
+        }
     }
     foreach ($v in @("314", "313", "312")) {
-        if ($env:LOCALAPPDATA) {
-            $path = Join-Path $env:LOCALAPPDATA ("Programs\Python\Python" + $v + "\python.exe")
+        $roots = @()
+        if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA "Programs\Python") }
+        if ($env:ProgramFiles) { $roots += $env:ProgramFiles }
+        if (${env:ProgramFiles(x86)}) { $roots += ${env:ProgramFiles(x86)} }
+        if ($env:SystemDrive) { $roots += $env:SystemDrive }
+        foreach ($root in ($roots | Select-Object -Unique)) {
+            $path = $root.TrimEnd('\') + "\Python" + $v + "\python.exe"
             if (Test-Path $path) { $candidates += @{ Exe = $path; Args = @() } }
         }
-        $path = "C:\Python" + $v + "\python.exe"
-        if (Test-Path $path) { $candidates += @{ Exe = $path; Args = @() } }
     }
     foreach ($c in $candidates) {
         $old = $ErrorActionPreference
@@ -417,6 +439,19 @@ function Test-FFmpeg {
     return (Test-Command "ffmpeg")
 }
 
+function Get-FreeSpaceGB([string]$Path) {
+    if (-not $Path) { return 0.0 }
+    try {
+        $root = [IO.Path]::GetPathRoot($Path)
+        if (-not $root) { return 0.0 }
+        $drive = New-Object -TypeName System.IO.DriveInfo -ArgumentList $root
+        if (-not $drive.IsReady) { return 0.0 }
+        return [Math]::Round($drive.AvailableFreeSpace / 1GB, 1)
+    } catch {
+        return 0.0
+    }
+}
+
 function Test-LlvmMc {
     if ($env:LLVM_MC -and -not (Test-Path $env:LLVM_MC)) {
         # A command line such as "wsl -d Ubuntu -e .../llvm-mc" is make_game.py's job to validate.
@@ -505,6 +540,13 @@ function Show-Plan {
                 Write-Host "  llvm-mc: would build 21 with AMDGPU from source (20 to 40 minutes)"
             }
         }
+        if ($env:SystemRoot -and ($packages | Where-Object { $_.Id -eq "Microsoft.VisualStudio.2022.BuildTools" })) {
+            $free = Get-FreeSpaceGB $env:SystemRoot
+            if ($free -gt 0) {
+                $root = [IO.Path]::GetPathRoot($env:SystemRoot)
+                Write-Host ("  disk:   {0} GB free on {1} (Visual Studio needs about 20 GB)" -f $free, $root)
+            }
+        }
     }
     Write-Host ("  build:  {0}" -f (Join-Path $script:Dir "make_game.py"))
     if ($Game) { Write-Host ("  game:   {0}" -f $Game) }
@@ -556,6 +598,12 @@ function Install-Prerequisites {
             Note ("{0} is already installed" -f $pkg.Label)
             continue
         }
+        if ($pkg.Id -eq "Microsoft.VisualStudio.2022.BuildTools") {
+            $free = Get-FreeSpaceGB $env:SystemRoot
+            if ($free -gt 0 -and $free -lt 20) {
+                throw ("{0} needs about 20 GB free on {1}; only {2} GB is free. Free some space, or install Visual Studio 2022 with the C++ x64 tools by hand and run again." -f $pkg.Label, [IO.Path]::GetPathRoot($env:SystemRoot), $free)
+            }
+        }
         Set-Label ("installing " + $pkg.Label)
         Note ("installing {0} ({1}) with winget" -f $pkg.Label, $pkg.Id)
         $wingetArgs = @(
@@ -567,10 +615,14 @@ function Install-Prerequisites {
         } else {
             $wingetArgs += @("--silent") + @($pkg.Extra)
         }
-        $null = Invoke-Logged "winget" $wingetArgs $script:Log -AllowFail
+        $code = Invoke-Logged "winget" $wingetArgs $script:Log -AllowFail
         Refresh-Path
         if (-not (& $pkg.Need)) {
-            throw ("winget could not install {0} ({1}). Install it by hand and run again." -f $pkg.Label, $pkg.Id)
+            $tail = Get-Tail $script:Log 20
+            if ($code -eq 3010 -or $code -eq 1641 -or ($tail -match '(?im)\b(reboot|restart)\b')) {
+                throw ("{0} was installed but Windows must be restarted before it is usable. Restart, then run the installer again." -f $pkg.Label)
+            }
+            throw ("winget could not install {0} ({1}), exit code {2}. Install it by hand and run again." -f $pkg.Label, $pkg.Id, $code)
         }
     }
     Set-Percent 1000
@@ -605,9 +657,9 @@ function Clone-Repo {
             if ($LASTEXITCODE -ne 0 -or -not $upstream) {
                 Note "the clone has no upstream branch; not updating it"
             } else {
-                $null = Invoke-Logged "git" @("-C", $script:Dir, "pull", "--ff-only") $script:Log
+                $null = Invoke-Logged "git" @("-c", "core.longpaths=true", "-C", $script:Dir, "pull", "--ff-only") $script:Log
             }
-            $null = Invoke-Logged "git" @("-C", $script:Dir, "submodule", "update", "--init", "--recursive") $script:Log
+            $null = Invoke-Logged "git" @("-c", "core.longpaths=true", "-C", $script:Dir, "submodule", "update", "--init", "--recursive") $script:Log
         }
     } else {
         if (Test-Path $script:Dir) {
@@ -615,7 +667,8 @@ function Clone-Repo {
         }
         $parent = Split-Path $script:Dir -Parent
         if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-        $null = Invoke-Logged "git" @("clone", "--recursive", "https://github.com/ItsNotRexed/Leonida.git", $script:Dir) $script:Log
+        $null = Invoke-Logged "git" @("-c", "core.longpaths=true", "clone", "--recursive", "https://github.com/ItsNotRexed/Leonida.git", $script:Dir) $script:Log
+        $null = Invoke-Logged "git" @("-C", $script:Dir, "config", "core.longpaths", "true") $script:Log
     }
     Set-Percent 1000
 }
@@ -1126,6 +1179,9 @@ try {
     if ($script:Anim) { [LeonidaProgress]::SetLog($script:Log) }
 
     Set-Step 1 "checking prerequisites"
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        throw "Leonida needs 64-bit Windows 10 or 11; this system is 32-bit."
+    }
     if ($SkipDeps) {
         Assert-Prerequisites
     } else {

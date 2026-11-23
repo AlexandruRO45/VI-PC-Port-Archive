@@ -87,6 +87,12 @@ Visual Studio Build Tools and the Windows SDK are large downloads. They are skip
 include `runtime`, or when `-RuntimeBuild` supplies a prebuilt runtime. `winget` changes PATH for new processes only,
 so the installer rebuilds PATH in its own process after every install.
 
+Visual Studio needs about 20 GB free on the system drive; the installer checks that before starting, and `-DryRun`
+prints the free space. A package that asks for a restart (the Windows SDK can) stops the installer with that message:
+restart Windows and run the same command again.
+
+The clone is fetched with `core.longpaths=true`, so the submodule's deep paths fit under the Windows path limit.
+
 The installer checks for CMake and Ninja inside Visual Studio first. When VS 2022 already has them, it adds those
 folders to PATH and does not install a second copy.
 
@@ -167,6 +173,8 @@ folder and skips stages that are already done.
   holds `MicrosoftGame.Config` and the `.rpf` archives as plain files.
 - **A tool is still missing after the install.** Open a new terminal so PATH changes apply, then run with
   `-SkipDeps` / `--skip-deps` to see the full list in one message.
+- **A package asked for a restart.** The installer stops with the package name. Restart Windows and run the same
+  command again; the packages already installed are skipped.
 - **`llvm-mc` has no AMDGPU target.** On Windows, delete `%USERPROFILE%\.leonida\llvm-mc` and run the installer
   again, or run `scripts\build_llvm_mc.ps1` by hand. On Linux, install `llvm-21` or set `LLVM_MC`.
 - **Vulkan SDK is installed but not found.** Reopen the terminal. The installer also looks in `C:\VulkanSDK` and
