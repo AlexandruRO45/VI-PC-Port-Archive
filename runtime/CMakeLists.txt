@@ -1259,6 +1259,85 @@ if(TARGET Vulkan::Headers)
       target_link_options(vk_pipeline_check PRIVATE -Wl,--stack,${LEONIDA_PIPELINE_CHECK_STACK})
     endif()
   endif()
+  # The geometry fallback's draw path (SHADER-1092): the glslang fixtures' stages, through the same tools the
+  # layer's PSO path reads them. gs_double gets the capture module with its buffers as physical addresses and
+  # the record-driven draw VS; vs_pair the fused fetch + vertex + regroup pass. The index.json gs_compute
+  # layout is what spirv_gs_to_compute's --layout writes, enriched the way rdna2spirv publishes it. The python
+  # tools run spirv-as / spirv-dis / spirv-val from PATH, as run_gpu_tests.py does.
+  if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  endif()
+  find_program(LEONIDA_SPIRV_DIS spirv-dis HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE AND LEONIDA_SPIRV_DIS AND Python3_FOUND)
+    set(LEONIDA_GS_FALLBACK ${CMAKE_CURRENT_BINARY_DIR}/generated/gs_fallback)
+    file(MAKE_DIRECTORY ${LEONIDA_GS_FALLBACK})
+    set(LEONIDA_GS_FALLBACK_VS ${LEONIDA_GS_FALLBACK}/vs_pair.spv)
+    set(LEONIDA_GS_FALLBACK_GS ${LEONIDA_GS_FALLBACK}/gs_double.spv)
+    set(LEONIDA_GS_FALLBACK_PS ${LEONIDA_GS_FALLBACK}/ps_draw.spv)
+    set(LEONIDA_GS_FALLBACK_DIS ${LEONIDA_GS_FALLBACK}/vs_pair.spvasm)
+    set(LEONIDA_GS_FALLBACK_LAYOUT ${LEONIDA_GS_FALLBACK}/gs_double.layout.json)
+    set(LEONIDA_GS_FALLBACK_INDEX ${LEONIDA_GS_FALLBACK}/index.json)
+    set(LEONIDA_GS_FALLBACK_INPUT ${LEONIDA_GS_FALLBACK}/vs_pair.gs_input.spv)
+    set(LEONIDA_GS_FALLBACK_CAPTURE ${LEONIDA_GS_FALLBACK}/gs_double.gs_compute_bda.spv)
+    set(LEONIDA_GS_FALLBACK_DRAW_VS ${LEONIDA_GS_FALLBACK}/gs_double.gs_vs.spv)
+    foreach(pair "vs_pair.vert;${LEONIDA_GS_FALLBACK_VS}" "gs_double.geom;${LEONIDA_GS_FALLBACK_GS}"
+                 "ps_draw.frag;${LEONIDA_GS_FALLBACK_PS}")
+      list(GET pair 0 source)
+      list(GET pair 1 output)
+      add_custom_command(
+        OUTPUT ${output}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+        COMMENT "Compiling the geometry fallback test shader ${source}"
+        VERBATIM)
+    endforeach()
+    add_custom_command(
+      OUTPUT ${LEONIDA_GS_FALLBACK_CAPTURE} ${LEONIDA_GS_FALLBACK_LAYOUT}
+      COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/spirv_gs_to_compute.py
+              ${LEONIDA_GS_FALLBACK_GS} ${LEONIDA_GS_FALLBACK_CAPTURE} --buffers bda
+              --layout ${LEONIDA_GS_FALLBACK_LAYOUT}
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/spirv_gs_to_compute.py ${LEONIDA_GS_FALLBACK_GS}
+      COMMENT "Generating gs_double's capture module (SHADER-1092)"
+      VERBATIM)
+    add_custom_command(
+      OUTPUT ${LEONIDA_GS_FALLBACK_INDEX}
+      COMMAND "${Python3_EXECUTABLE}" -I -c "import json;lay=json.load(open(r'${LEONIDA_GS_FALLBACK_LAYOUT}'));lay['num_inputs']=len(lay['inputs']);lay['num_outputs']=len(lay['outputs']);lay['record_stride']=16*lay['num_outputs'];lay['meta_words']=lay['max_verts']+1;json.dump({'gs_double':{'stage':'gs','gs_compute':lay}},open(r'${LEONIDA_GS_FALLBACK_INDEX}','w'))"
+      DEPENDS ${LEONIDA_GS_FALLBACK_LAYOUT}
+      COMMENT "Writing the geometry fallback test's index.json"
+      VERBATIM)
+    add_custom_command(
+      OUTPUT ${LEONIDA_GS_FALLBACK_DRAW_VS}
+      COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gs_compute_stages.py
+              ${LEONIDA_GS_FALLBACK} gs_double
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gs_compute_stages.py ${LEONIDA_GS_FALLBACK_INDEX}
+      COMMENT "Generating gs_double's record-driven draw VS (SHADER-1092)"
+      VERBATIM)
+    add_custom_command(
+      OUTPUT ${LEONIDA_GS_FALLBACK_DIS} ${LEONIDA_GS_FALLBACK_INPUT}
+      COMMAND ${LEONIDA_SPIRV_DIS} ${LEONIDA_GS_FALLBACK_VS} -o ${LEONIDA_GS_FALLBACK_DIS}
+      COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gs_compute_stages.py
+              ${LEONIDA_GS_FALLBACK} --vs-input vs_pair
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gs_compute_stages.py ${LEONIDA_GS_FALLBACK_VS}
+      COMMENT "Generating vs_pair's fused pass (SHADER-1092)"
+      VERBATIM)
+    add_executable(vk_gs_fallback_test test/vk_gs_fallback_test.cpp ${LEONIDA_GS_FALLBACK_INPUT}
+                   ${LEONIDA_GS_FALLBACK_CAPTURE} ${LEONIDA_GS_FALLBACK_DRAW_VS} ${LEONIDA_GS_FALLBACK_PS})
+    target_link_libraries(vk_gs_fallback_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(vk_gs_fallback_test PRIVATE
+      LEONIDA_TEST_VS_INPUT_SPV="${LEONIDA_GS_FALLBACK_INPUT}"
+      LEONIDA_TEST_CAPTURE_SPV="${LEONIDA_GS_FALLBACK_CAPTURE}"
+      LEONIDA_TEST_DRAW_VS_SPV="${LEONIDA_GS_FALLBACK_DRAW_VS}"
+      LEONIDA_TEST_PS_SPV="${LEONIDA_GS_FALLBACK_PS}")
+    if(WIN32)
+      target_compile_definitions(vk_gs_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    if(BUILD_TESTING)
+      add_test(NAME vk_gs_fallback COMMAND vk_gs_fallback_test)
+      set_tests_properties(vk_gs_fallback PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+  endif()
   if(BUILD_TESTING)
     if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.

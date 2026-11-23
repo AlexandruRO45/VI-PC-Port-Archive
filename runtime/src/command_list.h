@@ -386,6 +386,21 @@ struct Dispatch {
     std::uint32_t z;
 };
 
+// What one draw through the geometry fallback records (SHADER-1092): the fused pass's and the capture pass's
+// push-constant tails and grids, and the record-driven draw's own tail. The passes read the game's root
+// arguments from their usual s registers; the tails carry what the generated stages add past the 144-byte
+// block. draw_tail: the record and meta VAs, and the primitive count.
+struct GsDrawCommands {
+    std::uintptr_t input_id = 0;    // the fused pass's compute pipeline
+    std::uintptr_t capture_id = 0;  // the capture pass's
+    std::array<std::uint32_t, 28> input_tail{};   // params, input and index VAs, count, kind, base, the slot table
+    std::array<std::uint32_t, 28> capture_tail{};  // the input, record and meta VAs
+    std::array<std::uint32_t, 8> draw_tail{};
+    std::uint32_t slots = 0;        // the fused pass's grid x: input-primitive vertex slots
+    std::uint32_t prims = 0;        // the capture pass's grid x, and the draw's primitive count
+    std::uint32_t draw_count = 0;   // the record-driven draw's vertex count
+};
+
 // D3D12_VIEWPORT.
 struct Viewport {
     float x;
@@ -444,6 +459,11 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     bool mesh = false;
+    // A generated stage's own parameters past the 144-byte block (the geometry fallback's draw VS,
+    // SHADER-1092): tail dwords at push-constant bytes 144..; a pipeline that takes them declares the larger
+    // range. Appended so a Draw built by the plain fields needs no change.
+    std::array<std::uint32_t, 8> tail{};
+    std::uint32_t tail_words = 0;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
