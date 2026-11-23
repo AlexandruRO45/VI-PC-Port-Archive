@@ -82,19 +82,20 @@ def parse_fspx(data: bytes):
 
 
 def dxbc_parts(c: bytes) -> dict:
-    """Part tag -> payload of a DXBC container, or {} when the header doesn't fit."""
+    """Part tag -> payload of a DXBC container, or {} when the header or any part overflows total."""
     if len(c) < 32 or c[:4] != DXBC:
         return {}
     total, nparts = struct.unpack_from("<II", c, 24)
-    if total > len(c) or 32 + 4 * nparts > len(c):
+    header_end = 32 + 4 * nparts
+    if total > len(c) or total < header_end:
         return {}
     out = {}
     for k in range(nparts):
         po = struct.unpack_from("<I", c, 32 + 4 * k)[0]
-        if po + 8 > len(c):
+        if po < header_end or po + 8 > total:
             return {}
         size = struct.unpack_from("<I", c, po + 4)[0]
-        if po + 8 + size > len(c):
+        if po + 8 + size > total:
             return {}
         out[c[po:po + 4]] = c[po + 8:po + 8 + size]
     return out
@@ -264,21 +265,29 @@ def main(argv=None) -> int:
                 listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
                 if err.strip():
                     listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
-            if container:
-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
-                    f.write(container)
-            with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
-                f.write(blob[6])
-            with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
-                f.write(blob[0])
-            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
-                json.dump(meta, f, indent=1)
-            if listing is not None:
-                with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
-                    f.write(listing)
+            try:
+                if container:
+                    with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                        f.write(container)
+                with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+                    f.write(blob[6])
+                with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
+                    f.write(blob[0])
+                with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(meta, f, indent=1)
+                if listing is not None:
+                    with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+                        f.write(listing)
+            except OSError as error:
+                print(f"ERROR: cannot write output for {name} under {a.out}: {error}", file=sys.stderr)
+                return 2
             index.append(entry)
-    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump(index, f, indent=1)
+    try:
+        with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(index, f, indent=1)
+    except OSError as error:
+        print(f"ERROR: cannot write {os.path.join(a.out, 'index.json')}: {error}", file=sys.stderr)
+        return 2
     print(f"{len(index)} FSPX program(s) unpacked to {a.out}" + (f", {bad} input(s) failed" if bad else ""))
     return 1 if bad else 0
 

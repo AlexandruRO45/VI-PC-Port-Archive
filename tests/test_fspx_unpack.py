@@ -171,6 +171,29 @@ class Containers(unittest.TestCase):
     def test_truncated_container_has_no_parts(self):
         self.assertEqual(fspx_unpack.dxbc_parts(self.container()[:40]), {})
 
+    def test_parts_past_declared_total_or_inside_header_are_rejected(self):
+        valid = bytearray(self.container())
+        # Append trailing bytes past `total`, then extend the last chunk offset/size beyond declared `total`.
+        extended = bytearray(valid + b"\0" * 32)
+        total, nparts = struct.unpack_from("<II", extended, 24)
+        last_po = struct.unpack_from("<I", extended, 32 + 4 * (nparts - 1))[0]
+        last_size = struct.unpack_from("<I", extended, last_po + 4)[0]
+        struct.pack_into("<I", extended, last_po + 4, last_size + 16)
+        self.assertLessEqual(last_po + 8 + last_size + 16, len(extended))
+        self.assertGreater(last_po + 8 + last_size + 16, total)
+        self.assertEqual(fspx_unpack.dxbc_parts(bytes(extended)), {})
+
+        # Declared total smaller than header + part offset table.
+        short_total = bytearray(valid)
+        struct.pack_into("<I", short_total, 24, 32)
+        self.assertEqual(fspx_unpack.dxbc_parts(bytes(short_total)), {})
+
+        # Part offset pointing inside the DXBC header / offset table (offset 8 = "ACCC\4\0\0\0FSPX").
+        overlapping = bytearray(b"DXBC" + b"\0\0\0\0" + b"ACCC" + struct.pack("<I", 4) + b"FSPX"
+                                + struct.pack("<III", 1, 64, 1) + struct.pack("<I", 8) + b"\0" * 28)
+        self.assertEqual(fspx_unpack.dxbc_parts(bytes(overlapping)), {})
+        self.assertEqual(fspx_unpack.find_containers(bytes(overlapping)), [])
+
 
 class Cli(unittest.TestCase):
     def run_tool(self, *argv):
@@ -346,6 +369,18 @@ class Cli(unittest.TestCase):
             self.assertNotIn("Traceback", err)
             with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
                 self.assertEqual(json.load(f), [])
+
+    def test_unwritable_output_target_exits_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "one.fspx")
+            with open(src, "wb") as f:
+                f.write(make_fspx([(0, kind0()), (6, program())]))
+            out = os.path.join(t, "out")
+            os.makedirs(os.path.join(out, "index.json"))  # colliding directory makes open("w") raise OSError
+            code, _, err = self.run_tool(src, "--out", out)
+            self.assertEqual(code, 2, err)
+            self.assertIn("ERROR: cannot write", err)
+            self.assertNotIn("Traceback", err)
 
 
 class CliOutCollision(unittest.TestCase):
