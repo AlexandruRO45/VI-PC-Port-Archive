@@ -108,6 +108,18 @@ class Tests(unittest.TestCase):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
 
+    def test_lasttest_keeps_verdicts_when_duration_is_invalid(self):
+        for duration in ("0..2", "9" * 400):
+            with self.subTest(duration=duration):
+                log = (
+                    f"1/2 Test: bad_time\nTest time = {duration} sec\nTest Failed.\n"
+                    "2/2 Test: next_test\nTest time = 0.25 sec\nTest Passed.\n"
+                )
+                self.assertEqual(pd.parse_lasttest(log), [
+                    ("bad_time", "fail", None),
+                    ("next_test", "pass", 0.25),
+                ])
+
     def test_lasttest_uses_ctest_verdicts_after_captured_output(self) -> None:
         cases = (
             ("required", "ready", "Test Pass Reason:\nRequired regular expression found. Regex=[ready]", "pass"),

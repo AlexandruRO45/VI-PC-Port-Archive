@@ -30,6 +30,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -426,7 +427,12 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             continue
         m = re.match(r"^Test time =\s*([\d.]+) sec", line)
         if m:
-            secs = float(m.group(1))
+            try:
+                duration = float(m.group(1))
+            except ValueError:
+                secs = None
+            else:
+                secs = duration if math.isfinite(duration) else None
             continue
         if line.startswith("Test Passed"):
             res = "pass"
