@@ -17705,6 +17705,16 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     return m
 
 
+def _crash_summary(exc):
+    """One line for an unexpected translator exception: its type, the innermost frame it came from and its message,
+    so a crash over the corpus can be found without a traceback per shader."""
+    import traceback
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = f" at {os.path.basename(frames[-1].filename)}:{frames[-1].lineno} in {frames[-1].name}" if frames else ""
+    message = str(exc).splitlines()[0][:200] if str(exc) else ""
+    return f"{type(exc).__name__}{where}" + (f": {message}" if message else "")
+
+
 def write_index(path, index):
     """Write an index under another name and rename it into place, so a run stopped part-way never leaves half of
     one: make_game.py takes these files as proof that a shard, or the whole translation, finished."""
@@ -18121,6 +18131,7 @@ def main():
     last_progress = 0.0
     label = f"shard {shard}" if shard is not None else "translate"
     missing_inputs = 0
+    crashed = []
 
     def drop_stale(name):
         # A shader that no longer translates must not stay published from an earlier run: remove its old
@@ -18147,6 +18158,19 @@ def main():
         except (IndexError, KeyError, ValueError) as e:
             why[f"translator error {type(e).__name__}"] += 1
             drop_stale(name)
+            continue
+        except (MemoryError, OSError):
+            # Out of memory, or a read error other than the missing input above, is the run's problem, not this
+            # shader's: the next shader would likely fail the same way. It stops the run, as it did before.
+            raise
+        except Exception as e:  # noqa: BLE001 - one translator bug must not stop the other shaders
+            # An exception the handlers above do not expect is a translator bug. The shader is retired like a
+            # refusal and the batch goes on, so one run reports every crash; the run then fails like one with a
+            # missing input (exit 1, and a shard writes no part).
+            crashed.append(name)
+            why[f"translator crash {type(e).__name__}"] += 1
+            drop_stale(name)
+            print(f"ERROR: {name}: unexpected {_crash_summary(e)}", file=sys.stderr)
             continue
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
@@ -18204,7 +18228,7 @@ def main():
         for name in invalid:
             old.pop(name, None)
     old.update(meta)
-    if shard is None or not missing_inputs:
+    if shard is None or not (missing_inputs or crashed):
         write_index(idx_path, old)
     if shard is None:
         import spirv_stubs
@@ -18218,6 +18242,11 @@ def main():
         print(f"  {v:6}  {k}")
     if missing_inputs:
         print(f"{missing_inputs} of {len(files)} selected shaders missing required inputs", file=sys.stderr)
+    if crashed:
+        print(f"{len(crashed)} of {len(files)} selected shaders hit an unexpected translator exception "
+              f"({', '.join(crashed[:5])}{', ...' if len(crashed) > 5 else ''})"
+              + ("; this shard's part was not written" if shard is not None else ""), file=sys.stderr)
+    if missing_inputs or crashed:
         return 1
 
 
