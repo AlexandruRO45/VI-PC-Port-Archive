@@ -48,7 +48,11 @@ Answer measure(ID3D12Device* d, int feature) {
     for (UINT size = 1; size <= kMaxSize; ++size) {
         if (SUCCEEDED(ask(d, feature, size, buffer))) {
             a.size = size;
-            a.bytes.assign(buffer.begin(), buffer.begin() + size);
+            // The payload is read from a buffer poisoned with a nonzero byte, so a query that stops writing its output
+            // (whose expected value is zero) shows as 0xA5 instead of matching the zero-filled buffer.
+            buffer.assign(kMaxSize * 4, 0xA5);
+            if (SUCCEEDED(d->CheckFeatureSupport(static_cast<D3D12_FEATURE>(feature), buffer.data(), size)))
+                a.bytes.assign(buffer.begin(), buffer.begin() + size);
             break;
         }
     }
@@ -139,6 +143,12 @@ int main() {
             std::fprintf(stderr, "), host size %u (hr", hosts[0][f].size);
             for (auto h : hosts[0][f].around) std::fprintf(stderr, " %08x", h);
             std::fprintf(stderr, ")\n");
+            for (int k = 0; k < 2; ++k) {
+                const auto& b = k ? hosts[0][f].bytes : mine[f].bytes;
+                std::fprintf(stderr, "  %s bytes:", k ? "host" : "layer");
+                for (unsigned char c : b) std::fprintf(stderr, " %02x", c);
+                std::fprintf(stderr, "\n");
+            }
         }
     }
     std::printf("feature queries: %d features compared with %zu host adapters, %d differ\n", compared, hosts.size(),
