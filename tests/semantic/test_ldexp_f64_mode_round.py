@@ -142,6 +142,21 @@ class LdexpF64ModeRound(unittest.TestCase):
                         with self.subTest(mode=mode, x=hex(x), n=n):
                             self.assertEqual(run(mode, [(x, n)])[0], ref_ldexp(x, n, ROUND_MODE[mode]))
 
+    def test_nearest_even_does_not_increment_an_even_tie_or_an_odd_value_below_half(self):
+        # Shift by one bit for the even tie and by two bits for the odd quotient with a smaller remainder.
+        inputs = ((0x3FF0000000000001, -1023), (0x3FF0000000000005, -1024))
+        expected = (0x0008000000000000, 0x0004000000000001)
+        for sign in (0, 1 << 63):
+            with self.subTest(negative=bool(sign)):
+                values = [(bits | sign, exponent) for bits, exponent in inputs]
+                self.assertEqual(run(RNE, values), [bits | sign for bits in expected])
+
+    def test_directed_rounding_keeps_remainder_bits_present_in_both_words(self):
+        # A 33-bit shift discards a 1 in both words. The directed modes still increment the truncated result.
+        for mode, sign in ((RUP, 0), (RDN, 1 << 63)):
+            with self.subTest(mode=mode):
+                self.assertEqual(run(mode, [(0x3FF0000100000001 | sign, -1055)]), [0x0000000000080001 | sign])
+
     def test_s_round_mode_switch_uses_modified_sign(self):
         # Toward +inf saturates on negative overflow, then toward -inf goes to negative infinity.
         w = mrt0_words(translate_fixture("ps_ldexp_f64_directed"))
