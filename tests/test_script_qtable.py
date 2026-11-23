@@ -91,6 +91,7 @@ class ScriptQtableTests(unittest.TestCase):
         self.assertTrue(rep["valid"])
         self.assertEqual(rep["record_count"], 7)
         self.assertEqual(rep["root_count"], 2)
+        self.assertEqual(rep["tree_nodes_median"], 3.5)
         self.assertEqual(rep["distinct_root_hashes"], 2)
         self.assertTrue(rep["root_bijection_holds"])
         self.assertTrue(rep["contiguous_preorder"])

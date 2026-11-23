@@ -20,6 +20,7 @@ import argparse
 from collections import Counter
 import json
 import os
+import statistics
 import struct
 import sys
 
@@ -374,7 +375,7 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
         "struct_sizes": {str(k): struct_size_hist[k] for k in sorted(struct_size_hist)},
         "record_sizes": {str(k): size_hist[k] for k in sorted(size_hist)},
         "tree_nodes_min": min(tree_sizes) if tree_sizes else 0,
-        "tree_nodes_median": sorted(tree_sizes)[len(tree_sizes) // 2] if tree_sizes else 0,
+        "tree_nodes_median": statistics.median(tree_sizes) if tree_sizes else 0,
         "tree_nodes_max": max(tree_sizes) if tree_sizes else 0,
         "tree_depth_min": min(tree_depths) if tree_depths else 0,
         "tree_depth_max": max(tree_depths) if tree_depths else 0,
