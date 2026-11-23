@@ -41,6 +41,7 @@ bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** o
 bool xgameruntime_gamesave_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
 bool xgameruntime_store_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
 bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
+bool xgameruntime_launcher_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
 }
 
 namespace {
@@ -606,7 +607,8 @@ bool query_served(const GUID& class_id, REFIID interface_id, void** out, HRESULT
     return rt::shims::xgameruntime_user_query(class_id, interface_id, out, hr) ||       // xgameruntime_user.cpp
            rt::shims::xgameruntime_gamesave_query(class_id, interface_id, out, hr) ||   // xgameruntime_gamesave.cpp
            rt::shims::xgameruntime_store_query(class_id, interface_id, out, hr) ||      // xgameruntime_store.cpp
-           rt::shims::xgameruntime_offline_query(class_id, interface_id, out, hr);      // xgameruntime_offline.cpp
+           rt::shims::xgameruntime_offline_query(class_id, interface_id, out, hr) ||      // xgameruntime_offline.cpp
+           rt::shims::xgameruntime_launcher_query(class_id, interface_id, out, hr);      // xgameruntime_launcher.cpp
 }
 
 // Whether QueryApiImpl serves the class, whichever file serves it (the reference taken to find out is released).
