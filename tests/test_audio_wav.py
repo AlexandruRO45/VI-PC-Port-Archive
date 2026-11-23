@@ -256,6 +256,26 @@ class AudioWavTest(unittest.TestCase):
 
 
 class CliArgumentTest(unittest.TestCase):
+    def test_reports_the_same_failures_in_either_completion_order(self) -> None:
+        with tempfile.TemporaryDirectory() as source:
+            names = [f"input-{index:02d}" for index in range(11)]
+            items = [(os.path.join(source, name + ".ogg"), name) for name in names]
+            expected = [f"FAILED {name}: decode failed" for name in names[:10]]
+            for completion_order in (iter, reversed):
+                with self.subTest(completion_order=completion_order.__name__):
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch.object(audio_wav, "collect", return_value=(items, 0)),
+                        mock.patch.object(audio_wav, "find_ffmpeg", return_value="ffmpeg"),
+                        mock.patch.object(audio_wav, "decode", return_value=(False, "decode failed")),
+                        mock.patch.object(audio_wav.concurrent.futures, "as_completed", side_effect=completion_order),
+                        contextlib.redirect_stdout(stdout),
+                    ):
+                        self.assertEqual(audio_wav.main([source, "--jobs", "3"]), 1)
+                    lines = [line.strip() for line in stdout.getvalue().splitlines()]
+                    self.assertEqual([line for line in lines if line.startswith("FAILED ")], expected)
+                    self.assertIn("... and 1 more failures", lines)
+
     def test_rejects_nonpositive_jobs(self):
         with tempfile.TemporaryDirectory() as source:
             for jobs in ("0", "-1"):

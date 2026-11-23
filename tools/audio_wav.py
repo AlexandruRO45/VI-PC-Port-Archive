@@ -532,7 +532,7 @@ def main(argv=None) -> int:
     print(summary + f" ({seconds:.1f}s)")
     if not_opus:
         print(f"  {not_opus} .ogg/.opus file(s) skipped: not Ogg Opus")
-    for rel, message in failures[:10]:
+    for rel, message in sorted(failures)[:10]:
         first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown error")
         print(f"  FAILED {rel}: {first}")
     if len(failures) > 10:
