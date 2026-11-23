@@ -531,6 +531,19 @@ class TestValuFmaF32SIMDDivergence(unittest.TestCase):
         self.assertAlmostEqual(step1, 0.5, places=6)
         self.assertAlmostEqual(step2, 0.35, places=6)
 
+class TestValuFmaF32BoundaryExtremes(unittest.TestCase):
+    """Stage 23: IEEE 754 boundary extremes and saturation for v_fma_f32."""
+
+    def test_fma_exact_cancellation_clamped(self):
+        # 1.0 * 1.0 - 1.0 = 0.0 -> clamped to 0.0
+        hw = run_ternary_f32("v_fma_f32", 1.0, 1.0, -1.0, clamp=True)
+        self.assertEqual(hw, 0.0)
+
+    def test_fma_inf_saturation(self):
+        # 10.0 * 10.0 + inf = inf -> clamped to 1.0
+        hw = run_ternary_f32("v_fma_f32", 10.0, 10.0, float("inf"), clamp=True)
+        self.assertEqual(hw, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
