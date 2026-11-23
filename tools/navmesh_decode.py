@@ -99,9 +99,13 @@ COLUMNS = [
 
 
 def joaat_cs(text):
-    """Jenkins one-at-a-time over the exact bytes (no lower-casing), as the 0x7a schema hashes use."""
+    """Jenkins one-at-a-time over the Latin-1 bytes (no lower-casing), as the 0x7a schema hashes use.
+
+    Latin-1 (not ASCII) is what fog_volumes, world_archetypes and tools/hashdict.py encode with: a schema
+    name with a non-ASCII byte hashes to the same value everywhere instead of raising UnicodeEncodeError here.
+    """
     h = 0
-    for c in text.encode("ascii"):
+    for c in text.encode("latin-1"):
         h = (h + c) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6
