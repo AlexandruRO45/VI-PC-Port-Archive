@@ -188,6 +188,10 @@ def build_jobs(ops: list[str], waves: list[int]):
 
 def evaluate_results(ops: list[str], waves: list[int], meta, raw_results) -> dict:
     """Compare hardware outputs against expected_pk_int16, plain vs clamp parity, and wave32 vs wave64 parity."""
+    # zip would drop the tail and the counts below would quietly cover fewer kernels than were launched
+    # (tools/d16_image_probe.py raises for the same reason), so a count mismatch is a harness error.
+    if len(raw_results) != len(meta):
+        raise RuntimeError(f"the hardware runner returned {len(raw_results)} results for {len(meta)} kernels")
     by_key: dict[tuple[int, str, bool], list[int]] = {}
     harness_errors: list[dict] = []
     for (wave, op, clamp), res in zip(meta, raw_results):
