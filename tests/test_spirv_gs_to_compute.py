@@ -447,3 +447,22 @@ def test_cli_names_an_assembler_that_cannot_start_or_refuses(tmp_path: Path, mon
     assert "invalid opcode" in err
     assert not output.exists()
 
+
+
+def test_cli_names_an_unwritable_layout_path(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A --layout path whose folder does not exist is one ERROR line, not a traceback."""
+    source = tmp_path / "gs.spv"
+    source.write_bytes(b"\x03\x02#\x07")
+
+    def succeeds(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, PHI_GS if "--raw-id" in command else "", "")
+
+    monkeypatch.setattr(gsc.subprocess, "run", succeeds)
+    layout = tmp_path / "no-such-folder" / "layout.json"
+    assert gsc.main(["spirv_gs_to_compute.py", str(source), str(tmp_path / "cs.spv"),
+                     "--layout", str(layout)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: "), err
+    assert str(layout) in err
+    assert not layout.exists()
+
