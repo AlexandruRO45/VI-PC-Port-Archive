@@ -1,6 +1,7 @@
 """Regression tests for per-shader sidecar I/O deduplication in rdna2spirv / shader_ir / shader_meta."""
 import builtins
 import hashlib
+import json
 import os
 import struct
 import sys
@@ -95,6 +96,7 @@ class ShaderSidecarIOTest(unittest.TestCase):
 
     def test_cs_with_fssm_and_dxbc_opens_each_file_once(self):
         with tempfile.TemporaryDirectory() as td:
+            td = os.path.realpath(td)
             disasm_dir = os.path.join(td, "disasm")
             fssm_dir = os.path.join(td, "fssm")
             os.makedirs(disasm_dir)
@@ -133,6 +135,7 @@ class ShaderSidecarIOTest(unittest.TestCase):
 
     def test_ps_with_fssm_and_dxbc_opens_each_file_once(self):
         with tempfile.TemporaryDirectory() as td:
+            td = os.path.realpath(td)
             disasm_dir = os.path.join(td, "disasm")
             fssm_dir = os.path.join(td, "fssm")
             os.makedirs(disasm_dir)
@@ -170,31 +173,69 @@ class ShaderSidecarIOTest(unittest.TestCase):
 
     def test_shader_meta_hashes_explicit_alternate_paths(self):
         with tempfile.TemporaryDirectory() as td:
+            td = os.path.realpath(td)
             disasm_dir = os.path.join(td, "disasm")
             fssm_dir = os.path.join(td, "fssm")
             os.makedirs(disasm_dir)
             os.makedirs(fssm_dir)
 
             src_path = os.path.join(disasm_dir, "vs_alt.s")
+            own_fssm = os.path.join(fssm_dir, "vs_alt.fssm")
             alt_src = os.path.join(disasm_dir, "other.s")
             alt_fssm = os.path.join(fssm_dir, "other.fssm")
 
             with open(src_path, "wb") as f:
                 f.write(b"; vs_alt synthetic\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+            with open(own_fssm, "wb") as f:
+                f.write(_make_fssm_ps())
             with open(alt_src, "wb") as f:
                 f.write(b"; alternate source bytes\n")
             with open(alt_fssm, "wb") as f:
                 f.write(b"alternate fssm bytes")
 
             asm = rdna2spirv.translate(src_path)
-            meta = rdna2spirv.shader_meta(
-                rdna2spirv.translate.last_gen, asm, src_path=alt_src, fssm_path=alt_fssm
+            meta, opens, _ = self._count_io(
+                lambda: rdna2spirv.shader_meta(
+                    rdna2spirv.translate.last_gen, asm, src_path=alt_src, fssm_path=alt_fssm
+                )
             )
             self.assertEqual(meta["src_sha256"], hashlib.sha256(b"; alternate source bytes\n").hexdigest())
-            self.assertEqual(meta["fssm_sha256"], hashlib.sha256(b"alternate fssm bytes").hexdigest())
+            self.assertEqual(opens.count(os.path.normcase(os.path.abspath(alt_fssm))), 1)
+
+    def test_fspx_without_fssm_records_code_state_and_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = os.path.realpath(td)
+            disasm_dir = os.path.join(td, "disasm")
+            fspx_dir = os.path.join(td, "fspx")
+            os.makedirs(disasm_dir)
+            os.makedirs(fspx_dir)
+
+            src_path = os.path.join(disasm_dir, "cs_fspx.s")
+            code_path = os.path.join(fspx_dir, "cs_fspx.code")
+            state_path = os.path.join(fspx_dir, "cs_fspx.state")
+            json_path = os.path.join(fspx_dir, "cs_fspx.json")
+
+            code_bytes = struct.pack("<I", 0xBF810000)
+            state_bytes = b"synthetic-fspx-state"
+            with open(src_path, "wb") as f:
+                f.write(b"; cs_fspx code 0x0..0x4\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+            with open(code_path, "wb") as f:
+                f.write(code_bytes)
+            with open(state_path, "wb") as f:
+                f.write(state_bytes)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({"wave_size": 32, "threads": [16, 4, 1], "rsrc2": 0x84}, f)
+
+            asm = rdna2spirv.translate(src_path)
+            meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, asm, src_path=src_path)
+            self.assertEqual(meta["stage"], "cs")
+            self.assertEqual(meta["local_size"], [16, 4, 1])
+            self.assertEqual(meta["fspx_code_sha256"], hashlib.sha256(code_bytes).hexdigest())
+            self.assertEqual(meta["fspx_state_sha256"], hashlib.sha256(state_bytes).hexdigest())
 
     def test_direct_helpers_keep_default_signatures(self):
         with tempfile.TemporaryDirectory() as td:
+            td = os.path.realpath(td)
             disasm_dir = os.path.join(td, "disasm")
             fssm_dir = os.path.join(td, "fssm")
             os.makedirs(disasm_dir)
@@ -217,6 +258,7 @@ class ShaderSidecarIOTest(unittest.TestCase):
 
     def test_unreadable_sidecar_propagates_permission_error(self):
         with tempfile.TemporaryDirectory() as td:
+            td = os.path.realpath(td)
             disasm_dir = os.path.join(td, "disasm")
             fssm_dir = os.path.join(td, "fssm")
             fspx_dir = os.path.join(td, "fspx")
