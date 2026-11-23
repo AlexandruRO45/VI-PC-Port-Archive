@@ -1680,7 +1680,10 @@ class Gen:
             return
         if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo") and (
                 self.holds_lane_mask(s) or s["k"] == "imm" or (s["k"] == "special" and s["t"] == "null")):
-            self.emit(f"OpStore %vcc {self.mask_src(s)}")
+            mv = self.mask_src(s)
+            self.emit(f"OpStore %vcc {mv}")
+            if d["t"] == "vcc":
+                self.emit(f"OpStore %vcc_hi {mv}")
             return
         to_vcc = d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")
         if not to_vcc and (d["k"] != "sgpr" or d.get("n") != 2):
@@ -1823,7 +1826,7 @@ class Gen:
                 self.emit(f"OpStore %active {a3}")
                 self.uses_active = True
             elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
-                self.emit(f"OpStore %vcc {r}")
+                self.store_vcc_mask(r, write_hi=(dst["t"] == "vcc"))
             elif dst["k"] == "sgpr":
                 self.mask_dst(dst, r)
             else:
@@ -1881,7 +1884,7 @@ class Gen:
             self.emit(f"OpStore %active {a3}")
             self.uses_active = True
         elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
-            self.emit(f"OpStore %vcc {r}")
+            self.store_vcc_mask(r, write_hi=(dst["t"] == "vcc"))
         elif dst["k"] == "sgpr":
             self.mask_dst(dst, r)
         else:
@@ -4383,7 +4386,7 @@ class Gen:
         r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         d = a[0]
         if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
-            self.emit(f"OpStore %vcc {r}")
+            self.store_vcc_mask(r, write_hi=(len(a) == 2 or d["t"] == "vcc"))
         else:
             self.mask_dst(d, r)
 
@@ -4482,7 +4485,7 @@ class Gen:
         r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         d = a[0]
         if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
-            self.emit(f"OpStore %vcc {r}")
+            self.store_vcc_mask(r, write_hi=(len(a) == 2 or d["t"] == "vcc"))
         else:
             self.mask_dst(d, r)
 
@@ -6126,6 +6129,11 @@ class Gen:
             r = t
         return r
 
+    def store_vcc_mask(self, v, write_hi=True):
+        self.emit(f"OpStore %vcc {v}")
+        if write_hi and self.wave64:
+            self.emit(f"OpStore %vcc_hi {v}")
+
     def mask_dst(self, d, v):
         if d["k"] == "special" and d["t"] in ("exec", "exec_lo"):
             self.set_exec(v)
@@ -6136,7 +6144,7 @@ class Gen:
             if d.get("n") == 2:
                 self.store_reg("sgpr", d["r"] + 1, v)
         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
-            self.emit(f"OpStore %vcc {v}")
+            self.store_vcc_mask(v, write_hi=(d["t"] == "vcc"))
         else:
             raise Unsupported("mask destination")
 
@@ -6798,13 +6806,16 @@ class Gen:
             raise Unsupported(op + ": denormal mode writes are not modelled")
         if op == "s_mov_b32" and a[0]["k"] == "special" and a[0]["t"] in ("exec_lo", "exec_hi") and \
                 (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm") or
-                 (a[1]["k"] == "sgpr" and not self.holds_lane_mask(a[1]))):
+                 ((a[1]["k"] == "sgpr" or (a[1]["k"] == "special" and a[1]["t"] in ("vcc_lo", "vcc_hi"))) and
+                  not self.holds_lane_mask(a[1]))):
             src = a[1]
             const = (src["v"] & 0xFFFFFFFF) if src["k"] == "imm" else None
             if src["k"] == "fimm":
                 const = struct.unpack("<I", struct.pack("<f", src["v"]))[0]
-            # an SGPR that isn't a mask (a constant, say) gives each lane its own bit, as a constant does (mask_src)
-            val = None if const is not None else (self.mask_src(src, wide=False) if src["k"] == "sgpr"
+            # an SGPR or VCC half that isn't a mask gives each lane its own bit, as a constant does (mask_src)
+            unmasked_scalar = (src["k"] == "sgpr" or (src["k"] == "special" and src["t"] in ("vcc_lo", "vcc_hi"))) and \
+                not self.holds_lane_mask(src)
+            val = None if const is not None else (self.mask_src(src, wide=False) if unmasked_scalar
                                                   else self.src_u(src))
             self.exec_half_write(0 if a[0]["t"] == "exec_lo" else 1, val, const)
         elif op == "v_mov_b32" or op == "s_mov_b32":
@@ -8269,7 +8280,7 @@ class Gen:
                 return
             self.emit(f"{r} = OpSelect %uint {ra} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
-                self.emit(f"OpStore %vcc {r}")
+                self.store_vcc_mask(r, write_hi=(d["t"] == "vcc"))
             else:
                 self.mask_dst(d, r)
         elif op == "v_alignbit_b32":
@@ -9061,7 +9072,7 @@ class Gen:
                 self.emit(f"{eqa} = OpLogicalAnd %bool {eq} {self.active_b()}")   # inactive lanes write 0
                 self.emit(f"{r} = OpSelect %uint {eqa} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
-                    self.emit(f"OpStore %vcc {r}")
+                    self.store_vcc_mask(r, write_hi=(d["t"] == "vcc"))
                 else:
                     self.mask_dst(d, r)
         elif op == "s_not_b32":
