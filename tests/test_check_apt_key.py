@@ -4,8 +4,10 @@
 
 GnuPG is stood in for by a small Python program that prints the `--with-colons` listing written in each test's "key
 file", so the tests run anywhere without a real key or gpg: the one key, another key, two primary keys, a primary key
-with subkeys, a file gpg can't read. The workflows are read as text: every `.key`/`.gpg`/`.asc` URL they fetch must go
-to a temporary file that `scripts/check_apt_key.py` checks before anything installs it. Standard library only.
+with subkeys, a file gpg can't read. The command line is run for real: `-h`/`--help` must answer with the usage and the
+description and exit 0, an unknown option must exit 2. The workflows are read as text: every `.key`/`.gpg`/`.asc` URL
+they fetch must go to a temporary file that `scripts/check_apt_key.py` checks before anything installs it. Standard
+library only.
 """
 import os
 import re
@@ -108,8 +110,25 @@ class CommandLine(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", SCRIPT, *args], capture_output=True, text=True)
 
     def test_usage_errors(self):
-        self.assertEqual(self.run_script().returncode, 2)
+        missing = self.run_script()
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("usage: check_apt_key.py", missing.stderr)
         self.assertEqual(self.run_script(__file__, "not-a-fingerprint").returncode, 2)
+
+    def test_help_names_the_arguments_and_exits_zero(self):
+        for flag in ("-h", "--help"):
+            result = self.run_script(flag)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertIn("usage: check_apt_key.py", result.stdout)
+            self.assertIn("KEYFILE", result.stdout)
+            self.assertIn("FINGERPRINT", result.stdout)
+            self.assertIn("the one CI pins", result.stdout)   # the module docstring's first line, as description
+
+    def test_an_unknown_option_is_a_usage_error(self):
+        result = self.run_script("--commits")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: check_apt_key.py", result.stderr)
 
     def test_missing_file(self):
         result = self.run_script(os.path.join(ROOT, "no-such.key"), WINEHQ)
