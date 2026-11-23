@@ -17739,6 +17739,10 @@ def merge_refusal_parts(out):
     import glob as _gl, json as _js
     refusals = {}
     for path in sorted(_gl.glob(os.path.join(out, "refusals.part*.json"))):
+        # Only parts of the shard set just merged: a leftover from another --jobs could cover a real failure.
+        m = re.search(r"refusals\.part(\d+)\.json$", path)
+        if not m or not os.path.isfile(os.path.join(out, f"index.part{m.group(1)}.json")):
+            continue
         try:
             with open(path, encoding="utf-8") as f:
                 doc = _js.load(f)
@@ -18115,8 +18119,8 @@ def main():
         # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
-        write_index(os.path.join(a.out, "index.json"), merged)
         merge_refusal_parts(a.out)
+        write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
     single_file = os.path.isfile(a.src) and a.src.endswith(".s")
@@ -18264,8 +18268,8 @@ def main():
     old.update(meta)
     old_refusals.update(refusals)
     if shard is None or not missing_inputs:
-        write_index(idx_path, old)
         write_refusals(idx_path, old_refusals)
+        write_index(idx_path, old)
     if shard is None:
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)

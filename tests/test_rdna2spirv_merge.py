@@ -343,8 +343,12 @@ class RefusalSidecarTest(unittest.TestCase):
             out = tmp.name
             R.merge_refusal_parts(out)
             self.assertEqual(json.loads(Path(out, "refusals.json").read_text(encoding="utf-8")), {})
+            for i in (0, 2):
+                Path(out, f"index.part{i}.json").write_text("{}", encoding="utf-8")
             Path(out, "refusals.part0.json").write_text(json.dumps({"a": "reason A"}), encoding="utf-8")
             Path(out, "refusals.part2.json").write_text(json.dumps({"b": "reason B"}), encoding="utf-8")
+            # left by a run with more shards: no index part, so it must not hide a real failure
+            Path(out, "refusals.part5.json").write_text(json.dumps({"s2": "stale"}), encoding="utf-8")
             R.merge_refusal_parts(out)
             self.assertEqual(
                 json.loads(Path(out, "refusals.json").read_text(encoding="utf-8")),

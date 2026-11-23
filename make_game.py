@@ -1806,7 +1806,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         # Parts from another --jobs would be merged in too, and parts from another mode, flags or translator are
         # wrong. They go before the new plan is written: a stop in between must not leave old parts under a new plan.
         for f in os.listdir(spirv):
-            if (f.startswith("index.part") and f.endswith(".json")) or re.fullmatch(r"shard\d+\.json", f):
+            if (f.startswith(("index.part", "refusals.part")) and f.endswith(".json")) or re.fullmatch(r"shard\d+\.json", f):
                 os.remove(os.path.join(spirv, f))
         with open(plan_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(plan, f)
@@ -1901,7 +1901,7 @@ def carved_shader_keys(carved: list) -> list[str]:
             continue
         raw = entry.get("file") or entry.get("name")
         if isinstance(raw, str) and raw:
-            keys.append(os.path.splitext(raw)[0])
+            keys.append(os.path.splitext(os.path.basename(raw))[0])
     return keys
 
 
