@@ -157,8 +157,10 @@ int main(int argc, char** argv) {
     check(rt::d3d12_xs::device_slot_overridden(9), "device slot 9 is CreateCommandAllocator (allocator proxies)");
     check(!rt::d3d12_xs::device_slot_overridden(10), "device slot 10 is forwarded (PC CreateGraphicsPipelineState)");
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
+    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 is the GetCustomHeapProperties override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
+    check(rt::d3d12_xs::device_slot_overridden(133), "device slot 133 is the CreatePlacedResourceX override");
     check(rt::d3d12_xs::device_slot_overridden(67),
           "device slot 67 is the DeserializeComputePipelineStateX override (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
 

@@ -1657,6 +1657,16 @@ public:
     // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
+        char env_buf[32] = {};
+        size_t env_len = 0;
+        if (getenv_s(&env_len, env_buf, "LEONIDA_DESCRIPTOR_HEAP_BASE") == 0 && env_len > 0) {
+            cpu_base_override_ = std::strtoull(env_buf, nullptr, 0);
+        }
+        char gpu_env_buf[32] = {};
+        size_t gpu_env_len = 0;
+        if (getenv_s(&gpu_env_len, gpu_env_buf, "LEONIDA_DESCRIPTOR_HEAP_GPU_BASE") == 0 && gpu_env_len > 0) {
+            gpu_base_override_ = std::strtoull(gpu_env_buf, nullptr, 0);
+        }
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
         if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
             if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
@@ -1687,9 +1697,15 @@ public:
         return desc;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetCPUDescriptorHandleForHeapStart() override {
+        if (cpu_base_override_ != 0) {
+            return {cpu_base_override_};
+        }
         return {reinterpret_cast<SIZE_T>(cpu_)};
     }
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
+        if (gpu_base_override_ != 0) {
+            return {gpu_base_override_};
+        }
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
         if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
         return {in_arena_ ? UINT64(arena_offset_) : 0};
@@ -1705,6 +1721,8 @@ private:
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    SIZE_T cpu_base_override_ = 0;
+    UINT64 gpu_base_override_ = 0;
 };
 
 class Resource final

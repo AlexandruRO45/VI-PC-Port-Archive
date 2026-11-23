@@ -44,8 +44,9 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
+constexpr unsigned kMaxSlots = 192;
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
+static_assert(kMaxSlots >= 134, "the proxy table must cover Xbox slot 133");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
@@ -79,6 +80,8 @@ struct HeapProxy {
     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
     void** real_vtable;
     std::atomic<unsigned long> refs;
+    std::uint64_t cpu_base_override{0};
+    std::uint64_t gpu_base_override{0};
 };
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -128,6 +131,7 @@ const char* slot_name(unsigned slot) {
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
+        case 26: return "GetCustomHeapProperties (Xbox swapped args supported)";
         case 27: return "CreateCommittedResource (PC slot 27)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
@@ -147,6 +151,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 133: return "Xbox CreatePlacedResourceX";
         default: return "forwarded";
     }
 }
@@ -522,8 +527,12 @@ HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
 // The PC methods write through the hidden return pointer (RDX) on the measured runtime; the Xbox ABI wants the
 // 8-byte value in RAX. Call with both conventions and keep whichever produced a value, so a runtime that really
 // returns in RAX also works. The extra register is harmless when the callee ignores it.
+// If an explicit CPU or GPU handle override was supplied (e.g. Stop 13 predictable descriptor base), return it.
 D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
     note_heap_slot(9);
+    if (self && self->cpu_base_override != 0) {
+        return {self->cpu_base_override};
+    }
     constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
@@ -535,6 +544,9 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
     note_heap_slot(10);
+    if (self && self->gpu_base_override != 0) {
+        return {self->gpu_base_override};
+    }
     constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
     D3D12_GPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
@@ -588,7 +600,8 @@ void** get_heap_vtable() {
     return vtable;
 }
 
-HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out) {
+HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
+                          std::uint64_t cpu_base_override = 0, std::uint64_t gpu_base_override = 0) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -600,6 +613,8 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->device = device;
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->refs.store(1, std::memory_order_relaxed);
+    proxy->cpu_base_override = cpu_base_override;
+    proxy->gpu_base_override = gpu_base_override;
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
 
     const HRESULT hr = heap_query_interface(proxy, &riid, out);
@@ -1339,16 +1354,125 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     note_slot(14);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
     if (!riid) return E_POINTER;
+    if (!desc) return E_INVALIDARG;
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
+    bool is_extended = false;
+    std::uint64_t cpu_candidate = 0;
+    std::uint64_t size_candidate = 0;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(desc, &mbi, sizeof(mbi)) != 0) {
+        const auto* start = reinterpret_cast<const char*>(desc);
+        const auto* end = static_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (end - start >= 32) {
+            is_extended = true;
+            const auto* words64 = reinterpret_cast<const std::uint64_t*>(desc);
+            cpu_candidate = words64[2];
+            size_candidate = words64[3];
+        }
+    }
+
+    static std::atomic<bool> s_first_heap_logged{false};
+    if (first_call(s_first_heap_logged) || trace_enabled()) {
+        const auto* words = reinterpret_cast<const std::uint32_t*>(desc);
+        if (is_extended) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: CreateDescriptorHeap type=%u num=%u flags=0x%x node=0x%x desc[8]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                         desc->Type, desc->NumDescriptors, static_cast<unsigned>(desc->Flags), desc->NodeMask,
+                         words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        } else {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: CreateDescriptorHeap type=%u num=%u flags=0x%x node=0x%x desc[4]=%08x %08x %08x %08x\n",
+                         desc->Type, desc->NumDescriptors, static_cast<unsigned>(desc->Flags), desc->NodeMask,
+                         words[0], words[1], words[2], words[3]);
+        }
+    }
+
+    // Sanitize descriptor heap flags for the PC runtime: only D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE is recognized on PC.
+    D3D12_DESCRIPTOR_HEAP_DESC clean_desc = *desc;
+    clean_desc.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+    if (clean_desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && clean_desc.NumDescriptors > 2048) {
+        clean_desc.NumDescriptors = 2048;  // D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE
+    }
+
     void* created = nullptr;
-    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    HRESULT hr = self->real->CreateDescriptorHeap(&clean_desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
+    std::uint64_t cpu_override = 0;
+    std::uint64_t gpu_override = 0;
+    char env_buf[32] = {};
+    size_t env_len = 0;
+    if (getenv_s(&env_len, env_buf, "LEONIDA_DESCRIPTOR_HEAP_BASE") == 0 && env_len > 0) {
+        cpu_override = std::strtoull(env_buf, nullptr, 0);
+    }
+    char gpu_env_buf[32] = {};
+    size_t gpu_env_len = 0;
+    if (getenv_s(&gpu_env_len, gpu_env_buf, "LEONIDA_DESCRIPTOR_HEAP_GPU_BASE") == 0 && gpu_env_len > 0) {
+        gpu_override = std::strtoull(gpu_env_buf, nullptr, 0);
+    }
+
+    if (cpu_override == 0 && is_extended) {
+        const std::uint64_t expected_size_32 = static_cast<std::uint64_t>(desc->NumDescriptors) * 32;
+        const std::uint64_t expected_size_48 = static_cast<std::uint64_t>(desc->NumDescriptors) * 48;
+        const std::uint64_t expected_size_64 = static_cast<std::uint64_t>(desc->NumDescriptors) * 64;
+
+        // On Xbox, words64[2] is the CPU base user pointer and words64[3] matches the descriptor allocation size.
+        if (cpu_candidate > 0x10000 && cpu_candidate < 0x00007FFFFFFFFFFF) {
+            if (size_candidate == expected_size_32 || size_candidate == expected_size_48 ||
+                size_candidate == expected_size_64) {
+                cpu_override = cpu_candidate;
+            }
+        }
+    }
+
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
-    hr = create_heap_proxy(heap, self, *riid, out);
+    hr = create_heap_proxy(heap, self, *riid, out, cpu_override, gpu_override);
     if (FAILED(hr)) heap->Release();
+    return hr;
+}
+
+// Xbox device slot 133: CreatePlacedResourceX(va, const D3D12_RESOURCE_DESC* desc, state, clear, riid, out)
+// At the first call, va is the start of a physical-page range the title had just reserved.
+// riid = IID_ID3D12Resource, state = 0xFFFFFFFF (invalid on PC; sanitized to D3D12_RESOURCE_STATE_COMMON).
+// Flags sanitized to PC bits.
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* desc,
+                                       std::uint32_t state, const D3D12_CLEAR_VALUE* clear, const IID* riid,
+                                       void** out) {
+    note_slot(133);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc || !riid) return E_INVALIDARG;
+
+    const D3D12_RESOURCE_STATES real_state = (state == 0xFFFFFFFF)
+                                                 ? D3D12_RESOURCE_STATE_COMMON
+                                                 : static_cast<D3D12_RESOURCE_STATES>(state);
+
+    D3D12_RESOURCE_DESC clean_desc = *desc;
+    constexpr UINT kPcResourceFlagsMask = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                          D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                          D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+                                          D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                          D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                                          D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY;
+    clean_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(clean_desc.Flags & kPcResourceFlagsMask);
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    HRESULT hr = self->real->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc,
+                                                     real_state, clear, *riid, out);
+    if (FAILED(hr)) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 133 CreatePlacedResourceX fallback failed (hr=0x%08lx, va=0x%llx)\n",
+                         static_cast<unsigned long>(hr), static_cast<unsigned long long>(va));
+        }
+    }
     return hr;
 }
 
@@ -1513,6 +1637,21 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 26) {
+        // Xbox slot 26: GetCustomHeapProperties.
+        // Swapped argument detection: (return_buffer, this, node_mask, heap_type)
+        if (!is_device_proxy(self) && is_device_proxy(reinterpret_cast<void*>(a1))) {
+            DeviceProxy* real_self = reinterpret_cast<DeviceProxy*>(a1);
+            void* ret_buf = reinterpret_cast<void*>(self);
+            using Fn = void*(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t);
+            auto fn = reinterpret_cast<Fn>(real_self->real_vtable[26]);
+            fn(real_self->real, ret_buf, a2, a3);
+            return reinterpret_cast<std::uint64_t>(ret_buf);
+        }
+        note_slot(26);
+        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t);
+        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[26]);
+        return fn(self->real, a1, a2, a3);
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -1529,6 +1668,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_placed_resource_x(
+            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
+            static_cast<std::uint32_t>(a3), reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4),
+            reinterpret_cast<const IID*>(a5), reinterpret_cast<void**>(a6)));
     } else {
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
@@ -1704,9 +1848,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
+        slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
