@@ -381,5 +381,48 @@ class TestSaluNandSaveexecB32SIMD(unittest.TestCase):
             else:
                 self.assertTrue(active)
 
+# ==============================================================================
+# Unit Tests: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestSaluNandSaveexecB32Aliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_dst_aliases_src0(self) -> None:
+        # s0 = s_nand_saveexec_b32 s0
+        # S0 must be read before D is written with old EXEC_LO
+        self.state.sgprs[0] = 0x0000_FFFF
+        self.state.exec_lo = 0x5555_5555
+
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 0),
+            src0=Register(RegKind.SGPR, 0),
+        )
+        self.interp.step(inst, self.state)
+        # Destination receives old EXEC_LO
+        self.assertEqual(self.state.sgprs[0], 0x5555_5555)
+        # EXEC_LO receives ~(0x0000_FFFF & 0x5555_5555)
+        exp_exec = (~(0x0000_FFFF & 0x5555_5555)) & MASK32
+        self.assertEqual(self.state.exec_lo, exp_exec)
+
+    def test_src0_is_exec_lo(self) -> None:
+        # s_nand_saveexec_b32 s4, exec_lo
+        # S0 & EXEC_LO = EXEC_LO & EXEC_LO = EXEC_LO -> new EXEC_LO = ~EXEC_LO
+        self.state.exec_lo = 0x1234_5678
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 4),
+            src0=Register(RegKind.EXEC_LO),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.sgprs[4], 0x1234_5678)
+        self.assertEqual(self.state.exec_lo, (~0x1234_5678) & MASK32)
+        self.assertEqual(self.state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
