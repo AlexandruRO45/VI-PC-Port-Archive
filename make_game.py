@@ -2078,14 +2078,20 @@ def windows_launcher(out: str, work: str, image: str) -> str:
 
     cmd decodes a batch file and set /p input in the console's code page, so game_path.txt (UTF-8) and the folder
     names written here are read in code page 65001, which is then put back; the other lines are ASCII. Values are
-    quoted wherever they are expanded, so &, ^, ( and ) in a path stay literal; % is doubled in the names written."""
+    quoted wherever they are expanded, so &, ^, ( and ) in a path stay literal; % is doubled in the names written.
+
+    Package mode needs the mode as the only argument, as gta6rt.sh's "$#" -eq 1 does: an explicitly empty second
+    argument ("") still counts, so `gta6rt.cmd --run "" --trace t.jsonl` passes through. The package folder is entered
+    with pushd, not cd /d, because cmd cannot make a UNC path (\\\\server\\share\\...) its current directory; pushd gives
+    it a temporary drive letter, popd removes it, and the loader's exit code is kept across popd."""
     def literal(text: str) -> str:
         return text.replace("%", "%%")
 
     shaders = os.path.abspath(os.path.join(work, "shaders", "spirv"))
-    # The runtime reads shader_path.txt. Its absolute path needs updating only if the whole port moved.
+    # The runtime reads shader_path.txt. Its absolute path needs updating only if the whole port moved. --out and
+    # --work on different drives (or UNC shares) have no common path: path_is_within answers False for them.
     moved_catalog = ""
-    if os.path.commonpath([os.path.abspath(out), shaders]) == os.path.abspath(out):
+    if path_is_within(shaders, os.path.abspath(out)):
         recorded = literal(os.path.join(os.path.abspath(out), ""))
         relative = literal(os.path.relpath(shaders, out))
         moved_catalog = (f'if /i not "%here%"=="{recorded}" if not defined LEONIDA_SHADERS '
@@ -2095,7 +2101,10 @@ rem Starts gta6rt.exe, as gta6rt.sh does under Wine. --dry-run, --init or --run 
 rem game_path.txt, the port's overlay for writes and the Vulkan backend; other arguments go to gta6rt.exe as given.
 setlocal EnableExtensions DisableDelayedExpansion
 set "here=%~dp0"
+rem Package mode only for the mode on its own: %~2 is empty both without a second argument and with "", so "%2"
+rem tells the two apart and an explicit "" passes through with the rest.
 if not "%~2"=="" goto pass
+if "%2"==\"\"\"\" goto pass
 if "%~1"=="--dry-run" goto package
 if "%~1"=="--init" goto package
 if "%~1"=="--run" goto package
@@ -2110,17 +2119,21 @@ set /p game=<"%here%game_path.txt"
 set "image={literal(image)}"
 {moved_catalog}if defined cp chcp %cp% >nul
 if not defined game goto no_game
-cd /d "%game%" || exit /b 1
+rem pushd, not cd /d: a UNC package folder gets a temporary drive letter, which popd removes again.
+pushd "%game%" || exit /b 1
 if not exist ".\\%image%" goto no_image
 rem The game reads from its package and writes to the port's overlay.
 if not defined LEONIDA_D3D12 set "LEONIDA_D3D12=vulkan"
 "%here%gta6rt.exe" %~1 ".\\%image%" --overlay "%here%overlay"
-exit /b %ERRORLEVEL%
+set "rc=%ERRORLEVEL%"
+popd
+exit /b %rc%
 :no_game
 >&2 echo Cannot read the game folder from "%here%game_path.txt"
 exit /b 1
 :no_image
 >&2 echo Missing game executable: "%CD%\\%image%"
+popd
 exit /b 1
 :pass
 "%here%gta6rt.exe" %*
@@ -2177,8 +2190,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     destinations = [*RUNTIME_FILES, "game_path.txt"]
     if work is not None:
         destinations.append("shader_path.txt")
-    if os.name != "nt":
-        destinations.append("gta6rt.sh")
+    destinations.append("gta6rt.cmd" if os.name == "nt" else "gta6rt.sh")
     # Check the complete set before compiling or copying, so a later conflict leaves the old runtime usable.
     for name in destinations:
         destination = os.path.join(out, name)
@@ -2223,9 +2235,11 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
                 os.unlink(pending.name)
     if os.name == "nt":
         start = os.path.join(out, "gta6rt.cmd")
+        # Built before the file is opened, so a failure leaves any previous gta6rt.cmd as it was.
+        text = windows_launcher(out, work or os.path.join(out, "work"), v["expected_exe"])
         # cmd needs CRLF line ends (.gitattributes keeps *.cmd that way too).
         with open(start, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write(windows_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]))
+            f.write(text)
     else:
         start = os.path.join(out, "gta6rt.sh")
         with open(start, "w", encoding="utf-8", newline="\n") as f:

@@ -351,6 +351,23 @@ class RuntimePackagingTest(unittest.TestCase):
         seen = start(launcher, "--run", "other.exe", "--", "two words")
         self.assertEqual((seen["code"], seen.get("argv"), seen.get("cwd"), seen["env"]),
                          (7, ["--run", "other.exe", "--", "two words"], root, {}))
+        # An explicitly empty second argument is still an argument (gta6rt.sh counts it in "$#"): pass through,
+        # keeping the trace flags, instead of starting the packaged game.
+        seen = start(launcher, "--run", "", "--trace", "trace.jsonl")
+        self.assertEqual((seen["code"], seen.get("argv"), seen.get("cwd"), seen["env"]),
+                         (7, ["--run", "", "--trace", "trace.jsonl"], root, {}))
+        # A UNC package folder: cd /d cannot enter it, pushd maps a drive letter for the run and popd drops it.
+        # Reached through the administrative share of the test's own drive when this account may open it.
+        unc_game = "\\\\localhost\\" + game[0] + "$" + game[2:]
+        if os.path.isdir(unc_game):
+            with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(unc_game)
+            seen = start(launcher, "--run")
+            self.assertEqual(seen["code"], 7, seen["text"])
+            self.assertEqual(seen.get("argv"), ["--run", ".\\" + image, "--overlay", os.path.join(out, "overlay")])
+            self.assertNotEqual(seen.get("cwd", "")[:2].lower(), game[:2].lower(), "pushd maps a new drive letter")
+            with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(game)
 
         work = os.path.join(out, "Shader cache 100% '$HOME'")
         with mock.patch.object(make_game, "log"):
@@ -584,6 +601,49 @@ class RuntimeBuildPackagingTest(unittest.TestCase):
             self.assertIn('set "image=100%% game.exe"', text)
             self.assertIn('"%here%gta6rt.exe" %~1 ".\\%image%" --overlay "%here%overlay"', text)
             self.assertIn('"%here%gta6rt.exe" %*', text)
+            # Package mode needs the mode alone: "%2" tells an explicit "" from no second argument.
+            self.assertIn('if "%2"=="""" goto pass', text)
+            # UNC package folders: pushd (not cd /d) enters them, popd drops the temporary drive letter, and the
+            # loader's exit code survives popd.
+            self.assertIn('pushd "%game%" || exit /b 1', text)
+            self.assertNotIn("cd /d", text)
+            self.assertLess(text.index('set "rc=%ERRORLEVEL%"'), text.index("popd"))
+            self.assertIn("exit /b %rc%", text)
+
+    @unittest.skipUnless(os.name == "nt", "drive letters")
+    def test_on_windows_out_and_work_on_different_drives_still_get_a_launcher(self):
+        # D:\port with E:\work, as the README suggests: the paths have no common path, which commonpath reports
+        # with ValueError, and gta6rt.cmd was opened (truncated) before that was raised.
+        with tempfile.TemporaryDirectory() as root:
+            build, game, out = (os.path.join(root, n) for n in ("build", "game", "out"))
+            os.makedirs(build)
+            os.makedirs(game)
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(build, name), "wb") as f:
+                    f.write(name.encode())
+            other = "D" if root[0].upper() != "D" else "E"
+            work = other + ":\\leonida-work"  # never created: only its name is written
+            with mock.patch.object(make_game, "log"):
+                make_game.runtime(game, out, {"expected_exe": "game.exe"}, build, work=work)
+            with open(os.path.join(out, "gta6rt.cmd"), encoding="utf-8") as f:
+                text = f.read()
+            self.assertTrue(text.startswith("@echo off"))
+            # The shaders are not under the port, so moving the port changes nothing about where they are.
+            self.assertNotIn("LEONIDA_SHADERS", text)
+
+    def test_a_directory_named_gta6rt_cmd_stops_the_windows_runtime_before_copying(self):
+        with tempfile.TemporaryDirectory() as root:
+            build, game, out = (os.path.join(root, n) for n in ("build", "game", "out"))
+            os.makedirs(build)
+            os.makedirs(game)
+            os.makedirs(os.path.join(out, "gta6rt.cmd"))
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(build, name), "wb") as f:
+                    f.write(name.encode())
+            with mock.patch.object(make_game.os, "name", "nt"), mock.patch.object(make_game, "log"), \
+                    self.assertRaises(SystemExit):
+                make_game.runtime(game, out, {"expected_exe": "game.exe"}, build)
+            self.assertFalse(os.path.exists(os.path.join(out, "gta6rt.exe")))
 
 
 class PipelineCheckExeTest(unittest.TestCase):
