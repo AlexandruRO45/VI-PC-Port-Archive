@@ -4,6 +4,7 @@ import io
 import os
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +99,61 @@ class HarnessErrorExit(unittest.TestCase):
     def test_mismatch_still_exits_1(self):
         with mock.patch.object(sd, "run_one", lambda *_a: ("mismatch", "lane word 0")), mock.patch("sys.stdout"):
             self.assertEqual(sd.main(["--programs", "1"]), 1)
+
+
+class CpuOracleErrors(unittest.TestCase):
+    def test_program_errors_next_to_pass_exit_2(self):
+        run = sd.cpu_ref.run
+        cases = (("empty", "listing has no instructions"),
+                 ("missing_end", "listing ended without s_endpgm"),
+                 ("step_limit", "step limit 1 reached"))
+        for case, diagnostic in cases:
+            with self.subTest(case=case):
+                calls = 0
+
+                def fail_second_program(path, inputs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        listing = Path(path)
+                        if case == "empty":
+                            listing.write_text("; synthetic empty program\n", encoding="utf-8", newline="\n")
+                        elif case == "missing_end":
+                            text = listing.read_text(encoding="utf-8").replace("\ts_endpgm\n", "")
+                            listing.write_text(text, encoding="utf-8", newline="\n")
+                        else:
+                            inputs = dict(inputs, max_steps=1)
+                    return run(path, inputs)
+
+                out = io.StringIO()
+                with mock.patch.object(sd.cpu_ref, "run", side_effect=fail_second_program), \
+                        contextlib.redirect_stdout(out):
+                    code = sd.main(["--programs", "2", "--seed", "17", "--max-ops", "1"])
+                self.assertEqual(code, 2, out.getvalue())
+                self.assertEqual(calls, 2)
+                self.assertIn("1 pass, 0 mismatch, 0 skipped, 1 harness errors", out.getvalue())
+                self.assertIn("ProgramError: " + diagnostic, out.getvalue())
+                self.assertIn("Replay: --seed 17 --max-ops 1 --program-index 1", out.getvalue())
+
+    def test_unsupported_next_to_pass_stays_a_skip(self):
+        run = sd.cpu_ref.run
+        calls = 0
+
+        def unsupported_second_program(path, inputs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise sd.cpu_ref.Unsupported("synthetic opcode")
+            return run(path, inputs)
+
+        out = io.StringIO()
+        with mock.patch.object(sd.cpu_ref, "run", side_effect=unsupported_second_program), \
+                contextlib.redirect_stdout(out):
+            code = sd.main(["--programs", "2", "--seed", "17", "--max-ops", "1"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(calls, 2)
+        self.assertIn("1 pass, 0 mismatch, 1 skipped, 0 harness errors", out.getvalue())
+        self.assertIn("cpu_ref unsupported: unsupported instruction synthetic opcode", out.getvalue())
 
 
 class ArgumentValidation(unittest.TestCase):

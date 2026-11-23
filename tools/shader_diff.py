@@ -235,7 +235,7 @@ def run_one(name, lines, writers):
         _write_listing(cpu_path, lines, with_export=False)
         try:
             cpu_res = cpu_ref.run(cpu_path, {"lanes": 1})
-        except cpu_ref.CpuRefError as e:
+        except cpu_ref.Unsupported as e:
             return ("skip", f"cpu_ref unsupported: {e}")
         spv_path = os.path.join(dis, name + ".s")
         _write_listing(spv_path, lines, with_export=True)
