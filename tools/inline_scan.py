@@ -204,17 +204,31 @@ def summarize(sites, instructions=None):
     return "\n".join(out)
 
 
+def image_base(text: str) -> int:
+    try:
+        value = int(text, 16)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid hex value: {text!r}") from e
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return value
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("source", type=Path)
-    p.add_argument("--base", type=lambda s: int(s, 16), help="image base (default: inferred from the first site)")
+    p.add_argument("--base", type=image_base, help="image base (default: inferred from the first site)")
     p.add_argument("--sites", action="store_true", help="print every site")
     args = p.parse_args()
     if not args.source.is_file():
         print(f"{args.source} not found", file=sys.stderr)
         return 2
     stats = {}
-    sites = list(scan(read_lines(args.source), stats))
+    try:
+        sites = list(scan(read_lines(args.source), stats))
+    except OSError as e:
+        print(f"{args.source}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not stats["instructions"]:
         print(f"{args.source}: no instructions found (not a dumpbin listing, or an image without code)",
               file=sys.stderr)

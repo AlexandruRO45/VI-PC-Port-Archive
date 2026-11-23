@@ -5,11 +5,14 @@ here line by line, so the test needs no game files, no dumpbin and no third-part
 
     python -I tests/test_inline_scan.py
 """
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -161,12 +164,12 @@ class InlineScanTests(unittest.TestCase):
 class InlineScanCliTests(unittest.TestCase):
     """An input with no instructions must not read as a clean image ("UNCHECKED 0")."""
 
-    def run_cli(self, text):
+    def run_cli(self, text, *extra_args):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "listing.txt")
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(text)
-            return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "inline_scan.py"), path],
+            return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "inline_scan.py"), *extra_args, path],
                                   capture_output=True, text=True)
 
     def test_empty_input_exits_2_without_a_summary(self):
@@ -185,6 +188,30 @@ class InlineScanCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("instructions scanned: 2", proc.stdout)
         self.assertIn("checked 0, UNCHECKED 0", proc.stdout)
+
+    def test_invalid_hex_base_exits_2_without_lambda_in_error(self):
+        proc = self.run_cli("".join(listing("mov rax,rcx", "ret")), "--base", "xyz")
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("<lambda>", proc.stderr)
+        self.assertIn("invalid hex value: 'xyz'", proc.stderr)
+
+    def test_negative_base_is_rejected(self):
+        proc = self.run_cli("".join(listing("mov rax,rcx", "ret")), "--base=-0x1000")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("must be non-negative", proc.stderr)
+
+    def test_read_oserror_prints_error_and_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "listing.txt")
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("".join(listing("mov rax,rcx", "ret")))
+            stderr = io.StringIO()
+            with mock.patch.object(inline_scan, "read_lines", side_effect=OSError(13, "Permission denied")), \
+                 mock.patch.object(sys, "argv", ["inline_scan.py", path]), \
+                 contextlib.redirect_stderr(stderr):
+                rc = inline_scan.main()
+            self.assertEqual(rc, 2)
+            self.assertIn(f"{path}: Permission denied", stderr.getvalue())
 
 
 if __name__ == "__main__":
