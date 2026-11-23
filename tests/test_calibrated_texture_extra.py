@@ -2018,6 +2018,28 @@ class TestLocalDecoder(unittest.TestCase):
         dds = dec.dds(0)
         self.assertEqual(dds[148:], lin0 + lin1)
 
+    def test_dds_npot_chain_mip_offsets_follow_the_layout(self):
+        # 129x129 BC1 on 4 KiB tiles: mip 1 is 17 blocks wide (ceil(ceil(129/4)/2)), not the 16 that
+        # (129 >> 1 + 3) // 4 gives, so the layout puts first_tail at 2 and mip 0 at 4096 + 8192.
+        # Deriving both here instead gave first_tail 1 and read 16 of mip 1's 17 block columns.
+        lay = ttpf.surface_layout(129, 129, 71, 8, 4096)
+        self.assertEqual(lay["first_tail"], 2)
+        self.assertEqual([m["blocks_w"] for m in lay["mips"][:3]], [33, 17, 9])
+        self.assertEqual([m["offset"] for m in lay["mips"][:3]], [12288, 4096, 0])
+        lin = ttm.solid_chain(lay, 71)
+        tiled = bytearray(lay["size"])
+        for m in lay["mips"]:
+            ttm.retile_to(lay, m, lin[m["index"]], tiled)
+        pool, _ = self._open_pool(
+            "npot.ttpf",
+            [ttm.pack_etpf_record(129, 129, 8, 0, 71, 1, 1, 4, 4096)],
+            [(0, bytes(tiled), lay["size"])],
+        )
+        dec = ct.LocalDecoder(pool, {"version": 1})
+        dds = dec.dds(0)
+        self.assertEqual(tex_headers.parse_dds_header(dds)["mips"], 8)
+        self.assertEqual(dds[148:], b"".join(lin[i] for i in range(8)))
+
     def test_all_supported_formats_and_entries_fallback(self):
         self.assertEqual(ct.LocalDecoder.formats, frozenset((71, 72, 77, 78, 80, 83, 95, 96, 98, 99)))
         base0 = ttpf.align(16 + 10 * 24 + 10 * 32, 4096)
