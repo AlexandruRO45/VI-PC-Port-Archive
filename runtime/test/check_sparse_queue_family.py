@@ -2,7 +2,8 @@
 AND actual VK_SHARING_MODE_CONCURRENT on *every* sparse VkBuffer created by the layer.
 
 Runs the original synthetic `d3d12_sparse_queue_family_test` target.
-Invokes the SDK's VK_LAYER_LUNARG_api_dump in a short-lived isolated directory;
+Invokes the SDK's VK_LAYER_LUNARG_api_dump in a short-lived isolated directory, then reruns the test
+under VK_LAYER_KHRONOS_validation alone (with both loaded, api_dump's vkDestroyDevice crashes on AMD Windows);
 no private-game files, asset paths, device memory dumps, or committed logs.
 
   python -I check_sparse_queue_family.py path/to/d3d12_sparse_queue_family_test.exe
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Mapping
 
 
 SPARSE_FLAGS = "VkBufferCreateFlags = 7 (VK_BUFFER_CREATE_SPARSE_BINDING_BIT"
@@ -63,11 +65,6 @@ def main() -> int:
     if not exe.is_file():
         print(f"ERROR: missing executable {exe}", file=sys.stderr)
         return 2
-    env = os.environ.copy()
-    # An implicit Vulkan layer may be forced by the loader even if the application
-    # enabled VK_LAYER_KHRONOS_validation explicitly via LEONIDA_VK_VALIDATION.
-    env["VK_INSTANCE_LAYERS"] = "VK_LAYER_LUNARG_api_dump"
-    env["LEONIDA_VK_VALIDATION"] = "1"
     with tempfile.TemporaryDirectory(prefix="leonida_sparse_trace_") as td:
         path = Path(td)
         dump_name = path / "sparse_create_info.log"
@@ -79,34 +76,65 @@ def main() -> int:
             "lunarg_api_dump.detailed = true\n",
             encoding="utf-8",
         )
-        env["VK_LAYER_SETTINGS_PATH"] = str(path)
-        run = subprocess.run([str(exe)], cwd=path, env=env, capture_output=True,
-                             text=True, encoding="utf-8", errors="replace", timeout=40)
-        out = run.stdout + "\n" + run.stderr
-        if run.returncode == 77:
-            print("SKIP 77: Leonida Vulkan device / sparse features unavailable")
-            return 77
-        # The loader refuses the instance when a layer named in VK_INSTANCE_LAYERS (or the validation layer
-        # LEONIDA_VK_VALIDATION asks for) is not installed: that is the "layer absent" skip, not a layer failure.
-        if run.returncode != 0 and "vkCreateInstance" in out and "failed" in out:
-            print("SKIP 77: VK_LAYER_LUNARG_api_dump or VK_LAYER_KHRONOS_validation unavailable (vkCreateInstance failed)")
-            return 77
-        if run.returncode != 0:
-            print(out[-7000:], file=sys.stderr)
-            raise AssertionError(f"Leonida GPU test failed exit={run.returncode}")
-        kinds = sorted(CASE.findall(out))
-        if len(kinds) != 3 or "LAYER_FINAL PASS" not in out:
-            raise AssertionError(f"GPU byte verification missing: cases={kinds}; tail={out[-2000:]}")
+        dump_env, validation_env = pass_envs(os.environ, path)
+        # Two runs, one layer each. With api_dump above Khronos validation, the AMD Windows driver crashes
+        # (0xC0000005) in api_dump's vkDestroyDevice: the SDK 1.4.363 layer reads the VkDevice's dispatch key
+        # after the call down the chain has freed the device. Each layer alone passes, so they run apart.
+        dump_out, skip = run_pass(exe, dump_env, path)
+        if skip:
+            return skip
+        validation_out, skip = run_pass(exe, validation_env, path)
+        if skip:
+            return skip
+        errors = [line for line in validation_out.splitlines() if "Validation Error" in line or "VUID-" in line]
+        if errors:
+            raise AssertionError(f"Khronos validation reported {len(errors)} error line(s); first: {errors[0][:300]}")
         candidates = list(path.glob("sparse_create_info.log*"))
         if not candidates:
             print("SKIP 77: Vulkan SDK VK_LAYER_LUNARG_api_dump unavailable or did not write trace")
             return 77
         calls, infos = check_trace(candidates[0], args.expect_baseline_exclusive)
+        kinds = sorted(CASE.findall(dump_out))
         print(f"GPU PASS: {len(kinds)} COPY/COMPUTE sparse queue cases, mapped 65,536 bytes exact, unmapped 65,536 zeros")
         print(f"VK API CONTRACT PASS: {calls} sparse VkBuffer creations / {infos} create-info records = "
               f"{'EXCLUSIVE negative-control' if args.expect_baseline_exclusive else 'CONCURRENT with 2+ unique families'}")
-        print("Khronos validation enabled; no validation errors observed (GPU does not need to corrupt data for this test)")
+        print("Khronos validation run (no api_dump): the same GPU cases pass with no validation errors reported")
         return 0
+
+
+def pass_envs(base: Mapping[str, str], settings_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Environments for the api_dump run and the validation run; each loads exactly one of the two SDK layers."""
+    dump = dict(base)
+    # VK_INSTANCE_LAYERS makes the loader insert api_dump without the runtime asking for it.
+    dump["VK_INSTANCE_LAYERS"] = "VK_LAYER_LUNARG_api_dump"
+    dump["LEONIDA_VK_VALIDATION"] = "0"
+    dump["VK_LAYER_SETTINGS_PATH"] = str(settings_dir)
+    validation = dict(base)
+    validation.pop("VK_INSTANCE_LAYERS", None)
+    validation["LEONIDA_VK_VALIDATION"] = "1"
+    return dump, validation
+
+
+def run_pass(exe: Path, env: Mapping[str, str], cwd: Path) -> tuple[str, int]:
+    """Run the GPU test once: (output, 77) for a skip, (output, 0) when all three cases passed."""
+    run = subprocess.run([str(exe)], cwd=cwd, env=dict(env), capture_output=True,
+                         text=True, encoding="utf-8", errors="replace", timeout=40)
+    out = run.stdout + "\n" + run.stderr
+    if run.returncode == 77:
+        print("SKIP 77: Leonida Vulkan device / sparse features unavailable")
+        return out, 77
+    # The loader refuses the instance when a layer named in VK_INSTANCE_LAYERS (or the validation layer
+    # LEONIDA_VK_VALIDATION asks for) is not installed: that is the "layer absent" skip, not a layer failure.
+    if run.returncode != 0 and "vkCreateInstance" in out and "failed" in out:
+        print("SKIP 77: VK_LAYER_LUNARG_api_dump or VK_LAYER_KHRONOS_validation unavailable (vkCreateInstance failed)")
+        return out, 77
+    if run.returncode != 0:
+        print(out[-7000:], file=sys.stderr)
+        raise AssertionError(f"Leonida GPU test failed exit={run.returncode}")
+    kinds = sorted(CASE.findall(out))
+    if len(kinds) != 3 or "LAYER_FINAL PASS" not in out:
+        raise AssertionError(f"GPU byte verification missing: cases={kinds}; tail={out[-2000:]}")
+    return out, 0
 
 
 if __name__ == "__main__":
