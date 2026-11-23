@@ -350,6 +350,15 @@ def test_slist_kind():
     assert L.kind({}, sl("exec_lo", "exec_hi")) == L.MASK
     assert L.kind({"vcc": L.MASK}, sl(104, 105, "vcc_lo", "vcc_hi")) is None
     assert L.kind({}, sl()) is None
+    # Pin vcc_hi half identity (MASK_HI, not MASK_LO) and non-mask VCC handling (vcc_hi -> None, vcc_lo -> EITHER).
+    assert L.kind({"vcc": L.MASK}, sl("vcc_lo")) == L.MASK_LO
+    assert L.kind({"vcc": L.MASK}, sl("vcc_hi")) == L.MASK_HI
+    assert L.kind({104: L.MASK_HI, 105: L.MASK_HI, "vcc": L.MASK}, sl(104, 105, "vcc_hi")) == L.MASK_HI
+    assert L.kind({104: L.MASK_HI, 105: L.MASK_HI, "vcc": L.MASK}, sl(104, 105, "vcc_lo")) is None
+    assert L.kind({"vcc": L.EITHER}, sl("vcc_lo")) == L.EITHER
+    assert L.kind({"vcc": L.EITHER}, sl("vcc_hi")) is None
+    assert L.kind({105: L.EITHER, "vcc": L.EITHER}, sl(105, "vcc_lo")) == L.EITHER
+    assert L.kind({105: L.EITHER, "vcc": L.EITHER}, sl(105, "vcc_hi")) is None
 
 
 if __name__ == "__main__":
