@@ -331,6 +331,13 @@ class TestNopCycleBounds(unittest.TestCase):
             self.assertIn("OpCapability Shader", spv)
             si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestNopTranslator(unittest.TestCase):
+    def test_translator_pipeline_padding(self):
+        prog = ["v_mov_b32_e32 v0, 1", "s_nop 7", "s_endpgm"]
+        spv = support.translate_lines("cs_nop_trans", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
