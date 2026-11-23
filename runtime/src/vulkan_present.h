@@ -604,10 +604,12 @@ private:
             mark_surface_lost();
             result = VK_SUCCESS;
         }
-        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
             stale_ = true;
             result = VK_SUCCESS;
         }
+        // VK_SUBOPTIMAL_KHR: swapchain is still usable, don't mark stale.
+        // Only VK_ERROR_OUT_OF_DATE_KHR requires a rebuild.
         return result;
     }
 
