@@ -282,8 +282,8 @@ BOOL WINAPI query_auth_schemes(HINTERNET request, LPDWORD, LPDWORD, LPDWORD) {
     return receive_response(request, nullptr);
 }
 
-BOOL WINAPI detect_auto_proxy_config_url(DWORD, LPWSTR*) {
-    return fail(ERROR_WINHTTP_AUTODETECTION_FAILED);
+BOOL WINAPI detect_auto_proxy_config_url(DWORD flags, LPWSTR*) {
+    return fail(flags == 0 ? ERROR_INVALID_PARAMETER : ERROR_WINHTTP_AUTODETECTION_FAILED);
 }
 
 // RFC 7230 tchar grammar for HTTP header field-names (matches native WinHttpAddRequestHeaders):

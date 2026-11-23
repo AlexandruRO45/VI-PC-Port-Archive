@@ -288,6 +288,10 @@ int main() {
             check(native_stub && !native_stub(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url) &&
                       g_native_auto_proxy_calls == 1, "native auto proxy interception observes valid flags");
             g_native_auto_proxy_calls = 0;
+            const BOOL zero_proxy_result = detect_proxy(0, &url);
+            check(!zero_proxy_result && GetLastError() == ERROR_INVALID_PARAMETER && !url &&
+                      g_native_auto_proxy_calls == 0, "auto proxy rejects zero flags without native discovery");
+            g_native_auto_proxy_calls = 0;
             const BOOL proxy_result = detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url);
             check(!proxy_result && GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url &&
                       g_native_auto_proxy_calls == 0, "auto proxy fails offline without native DHCP discovery");
