@@ -15,6 +15,7 @@
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_trace.h"
@@ -768,8 +769,8 @@ int main() {
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const testfiles::ScratchDir scratch("leonida_bundle_test");  // removed on every way out of main
     const auto& library = scratch.path();
-    REQUIRE(testfiles::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv"));
-    REQUIRE(testfiles::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv"));
+    REQUIRE(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv"));
+    REQUIRE(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)

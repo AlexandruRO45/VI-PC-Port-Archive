@@ -11,6 +11,7 @@
 // on this GPU; the control is not judged. No game data. Set LEONIDA_VK_VALIDATION=1 to run under
 // VK_LAYER_KHRONOS_validation; validation errors fail the test.
 #include "test_temp_dir.h"
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
@@ -278,17 +279,23 @@ std::string words_text(const Words& w) {
     return s;
 }
 
+// Where build.py put the translated shaders: the build tree, or generated/subgroup_shaders in an artifact.
+const std::filesystem::path& shaders_root() {
+    static const std::filesystem::path root = vktest::shader_fixture_dir(LEONIDA_TEST_SUBGROUP_SHADERS);
+    return root;
+}
+
 // What the decision function says about the shader's own index entry on this device.
 leonida::SubgroupRequest expected_request(const Shader& shader, const leonida::SubgroupSizeCaps& caps) {
     leonida::ShaderLibrary index;
-    const auto dir = std::filesystem::path(LEONIDA_TEST_SUBGROUP_SHADERS) / shader.folder / "spirv";
+    const auto dir = shaders_root() / shader.folder / "spirv";
     if (!index.load(dir.string())) return {};
     const auto* entry = index.find("cs", leonida::sha256_hex(fixture_fssm()));
     return entry ? leonida::decide_subgroup_size(*entry, caps) : leonida::SubgroupRequest{};
 }
 
 std::filesystem::path shader_dir(const Shader& shader) {
-    return std::filesystem::path(LEONIDA_TEST_SUBGROUP_SHADERS) / shader.folder / "spirv";
+    return shaders_root() / shader.folder / "spirv";
 }
 
 // ---- Probe shaders (GLSL, test/glsl) and the graphics path -----------------------------------------------------------
@@ -335,7 +342,7 @@ std::filesystem::path make_library(const std::string& tag, const std::vector<Lib
 }
 
 std::filesystem::path glsl_spv(const char* name) {
-    return std::filesystem::path(LEONIDA_TEST_SUBGROUP_SHADERS) / "glsl" / (std::string(name) + ".spv");
+    return shaders_root() / "glsl" / (std::string(name) + ".spv");
 }
 
 // The compute probe: a library with cs_sg_probe in the given mode.
@@ -509,7 +516,7 @@ LibraryEntry ps_probe(const Mode& mode) {
 // The wave64 pixel shader with readlane across both halves, translated by the build (test/shaders/ps_w64x_readlane.asm).
 LibraryEntry ps_readlane(const Mode& mode) {
     return {"ps_w64x_readlane", "ps", "\"outputs\": [0], " + mode_json(mode),
-            std::filesystem::path(LEONIDA_TEST_SUBGROUP_SHADERS) / "ps_w64_native" / "spirv" / "ps_w64x_readlane.spv"};
+            shaders_root() / "ps_w64_native" / "spirv" / "ps_w64x_readlane.spv"};
 }
 
 // The subgroup size a probe pixel reports, or 0 when the pixels disagree or do not look like a probe's.

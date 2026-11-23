@@ -22,6 +22,7 @@
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "d3d12_copy_compare.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
@@ -608,7 +609,7 @@ int main() {
         std::printf("SKIP: the device lacks the descriptor indexing features of the bindless set 0\n");
         return 77;
     }
-    const std::filesystem::path root_dir = LEONIDA_TEST_BUFFER_UAV_DIR;
+    const std::filesystem::path root_dir = vktest::shader_fixture_dir(LEONIDA_TEST_BUFFER_UAV_DIR);
 
     unsigned words = 0;
     if (const int status = run_shaders(d, root_dir, words)) return status;

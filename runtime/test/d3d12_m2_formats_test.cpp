@@ -14,6 +14,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -186,7 +187,7 @@ int main() {
     EXPECT(differing(arr, 0, 0, arr, 0, 1) > 0 && differing(arr, 0, 1, arr, 0, 2) > 0);
     EXPECT(bc7_block(0, 0, 0)[0] == 0x40);  // the encoder wrote all 128 bits (mode 6: bit 6 of byte 0)
 
-    const std::filesystem::path root_dir = LEONIDA_TEST_M2F_DIR;
+    const std::filesystem::path root_dir = vktest::shader_fixture_dir(LEONIDA_TEST_M2F_DIR);
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m2.fssm");
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m2.fssm");
     const auto array_program = read_file(root_dir / "fssm" / "ps_m2_array.fssm");

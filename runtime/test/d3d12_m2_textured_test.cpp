@@ -27,6 +27,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -102,7 +103,7 @@ int main() {
         return 77;
     }
 
-    const std::filesystem::path root_dir = LEONIDA_TEST_M2_DIR;
+    const std::filesystem::path root_dir = vktest::shader_fixture_dir(LEONIDA_TEST_M2_DIR);
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m2.fssm");
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m2.fssm");
     EXPECT(vs_program.size() >= 4 && ps_program.size() >= 4);

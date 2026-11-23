@@ -1292,14 +1292,31 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
     # The XDXR BVH builder: the GPU writes every case, then tools/xdxr_bvh.py validates and traces them.
+    # Find the tool from the test's working directory up, so a runtime-windows artifact that ships tools/
+    # next to the executables works without a path from the build machine compiled into the test list.
+    set(LEONIDA_XDXR_CHECK_PY [=[
+import os, runpy, sys
+d = os.getcwd()
+while True:
+    tool = os.path.join(d, "tools", "xdxr_bvh.py")
+    if os.path.isfile(tool):
+        sys.argv = [tool] + sys.argv[1:]
+        runpy.run_path(tool, run_name="__main__")
+        raise SystemExit(0)
+    parent = os.path.dirname(d)
+    if parent == d:
+        sys.exit("xdxr_bvh.py not found: run this test from the build tree or an artifact directory "
+                 "that ships tools/xdxr_bvh.py")
+    d = parent
+]=])
     set(LEONIDA_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_build_cases")
     file(MAKE_DIRECTORY "${LEONIDA_XDXR_OUT}")
     add_test(NAME xdxr_build COMMAND vk_xdxr_build_test "${LEONIDA_XDXR_OUT}")
     set_tests_properties(xdxr_build PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP xdxr_build_cases)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
-      add_test(NAME xdxr_build_check COMMAND "${Python3_EXECUTABLE}" -I
-               "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_XDXR_OUT}" --rays 1000)
+      add_test(NAME xdxr_build_check COMMAND "${Python3_EXECUTABLE}" -I -c "${LEONIDA_XDXR_CHECK_PY}"
+               check-build "${LEONIDA_XDXR_OUT}" --rays 1000)
       set_tests_properties(xdxr_build_check PROPERTIES FIXTURES_REQUIRED xdxr_build_cases SKIP_RETURN_CODE 77)
     endif()
   endif()
@@ -1594,8 +1611,8 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_xdxr_rt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FIXTURES_SETUP d3d12_xdxr_cases)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
-      add_test(NAME d3d12_xdxr_rt_check COMMAND "${Python3_EXECUTABLE}" -I
-               "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_D3D12_XDXR_OUT}" --rays 1000)
+      add_test(NAME d3d12_xdxr_rt_check COMMAND "${Python3_EXECUTABLE}" -I -c "${LEONIDA_XDXR_CHECK_PY}"
+               check-build "${LEONIDA_D3D12_XDXR_OUT}" --rays 1000)
       set_tests_properties(d3d12_xdxr_rt_check PROPERTIES FIXTURES_REQUIRED d3d12_xdxr_cases SKIP_RETURN_CODE 77)
     endif()
 

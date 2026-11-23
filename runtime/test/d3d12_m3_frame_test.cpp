@@ -24,6 +24,7 @@
 // --first-pass-only isolates depth/stencil, MRT, queries and slot reuse from the descriptor-sampling second pass.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
@@ -142,7 +143,7 @@ int main(int argc, char** argv) {
         return 77;
     }
 
-    const std::filesystem::path root_dir = LEONIDA_TEST_M3_DIR;
+    const std::filesystem::path root_dir = vktest::shader_fixture_dir(LEONIDA_TEST_M3_DIR);
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
     const auto program = [&](const char* name) { return read_file(root_dir / "fssm" / (std::string(name) + ".fssm")); };
