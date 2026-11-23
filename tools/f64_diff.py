@@ -506,8 +506,8 @@ def gen_source(rng, idx, allow_literal=True, bus=None):
     if kind == "s": return f"s[{4 + 2*(idx % 2)}:{5 + 2*(idx % 2)}]"
     if kind == "fimm": return rng.choice(("0.0", "-0.0", "1.0", "-1.0", "1.5", "2.0", "0.5", "3.25"))
     if kind == "inline": return str(rng.choice((-16, -1, 0, 1, 2, 16, 64)))
-    if bus is not None and bus[2] == 64:
-        return f"0x{rng.getrandbits(64):016x}"
+    # An f64 literal is one dword supplying bits 63:32 in every form (docs/design.md, "f64 literal
+    # sources"); a VOP3 instruction carries at most one literal dword, so no form takes 64 bits.
     return f"0x{rng.getrandbits(32):08x}"
 
 
@@ -529,8 +529,7 @@ def make_case(rng, op, allow_literal=True, known_case=None):
         vg[r], vg[r + 1] = lo, hi
         setup_lines += [f"v_mov_b32 v{r}, 0x{lo:08x}", f"v_mov_b32 v{r+1}, 0x{hi:08x}"]
     if op == "v_add_f64": body_lines.append(f"s_round_mode {0 if known_case else rng.choice((0, 4, 8, 12))}")
-    high_literal = op in ROUND or op in ("v_add_f64", "v_cvt_f32_f64") or "cmp" in op or "class" in op
-    bus = [set(), False, 32 if high_literal else 64]
+    bus = [set(), False]
     if op in ROUND:
         src = maybe_word_modifier(rng, gen_source(rng, 0, allow_literal, bus))
         body_lines.append(f"{op} v[8:9], {src}")
