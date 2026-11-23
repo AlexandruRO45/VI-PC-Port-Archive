@@ -1,12 +1,17 @@
 """Exercise guest-scene forwarding and persisted results without a native GPU run."""
+import contextlib
+import errno
 import hashlib
+import io
 import json
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -96,8 +101,27 @@ class GuestSceneTests(unittest.TestCase):
         result = self.invoke(self.cli, "guest-scene", *args, "--out", str(output))
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, b"")
-        self.assertTrue(result.stderr)
+        self.assertIn(b"cannot create output directory", result.stderr)
+        self.assertIn(b"occupied", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
         self.assertFalse((self.cwd / output / "report.json").exists())
+
+
+class GuestSceneOutputErrorTests(unittest.TestCase):
+    def test_output_mkdir_failure_is_a_path_specific_error(self):
+        runner = runpy.run_path(str(SCRIPTS / "run_guest_scene.py"))
+        for exc in (PermissionError(errno.EACCES, "permission denied"),
+                    NotADirectoryError(errno.ENOTDIR, "not a directory")):
+            with self.subTest(exc=type(exc).__name__):
+                out = Mock(spec=Path)
+                out.__str__ = Mock(return_value="synthetic-output")
+                out.mkdir.side_effect = exc
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(runner["execute"](None, out, temporary=False), 1)
+                self.assertEqual(err.getvalue(),
+                                 f"error: cannot create output directory synthetic-output: {exc.strerror}\n")
+                out.mkdir.assert_called_once_with(parents=True, exist_ok=True)
 
 
 if __name__ == "__main__":
