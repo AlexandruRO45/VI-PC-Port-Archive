@@ -638,5 +638,68 @@ class TestIEEE754EdgeCases(unittest.TestCase):
         trans_res, _ = run_translator_salu_xnor(F32_SUBNORMAL_MIN, 0, name="ps_subnormal_no_ftz")
         self.assertEqual(trans_res, 0xFFFFFFFE)
 
+
+# ==============================================================================
+# SECTION 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestTranslatorExecutionAndMutations(unittest.TestCase):
+    """Commit 8: Translator-backed execution tests, negative controls, and mutation detection."""
+
+    def test_translator_constant_folding(self) -> None:
+        """Verify translator correctly folds two immediate literals during translation."""
+        lines = [
+            "s_xnor_b32 s0, 0x12345678, 0x12345678",
+            "v_mov_b32 v0, s0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_const_fold_xnor", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], 0xFFFFFFFF)
+
+    def test_mutation_detection_swap_xor(self) -> None:
+        """Mutation detection: replacing XNOR with XOR produces inverted result and is detected."""
+        s0 = 0xF0F0F0F0
+        s1 = 0x0F0F0F0F
+        expected_xnor, _ = ref_s_xnor_b32(s0, s1)
+        mutated_xor = u32(s0 ^ s1)
+
+        self.assertNotEqual(expected_xnor, mutated_xor)
+        self.assertEqual(expected_xnor, u32(~mutated_xor))
+
+        spv_xnor = support.translate_lines("ps_mut_xnor", [
+            f"s_mov_b32 s0, {s0:#x}",
+            f"s_mov_b32 s1, {s1:#x}",
+            "s_xnor_b32 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        spv_xor = support.translate_lines("ps_mut_xor", [
+            f"s_mov_b32 s0, {s0:#x}",
+            f"s_mov_b32 s1, {s1:#x}",
+            "s_xor_b32 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        res_xnor = support.mrt0_words(spv_xnor)[0]
+        res_xor = support.mrt0_words(spv_xor)[0]
+        self.assertEqual(res_xnor, expected_xnor)
+        self.assertEqual(res_xor, mutated_xor)
+        self.assertNotEqual(res_xnor, res_xor)
+
+    def test_mutation_detection_swap_and_or(self) -> None:
+        """Mutation detection: replacing XNOR with AND or OR produces distinct outputs."""
+        s0 = 0x33333333
+        s1 = 0x55555555
+        xnor_val, _ = ref_s_xnor_b32(s0, s1)
+        and_val = u32(s0 & s1)
+        or_val = u32(s0 | s1)
+
+        self.assertNotEqual(xnor_val, and_val)
+        self.assertNotEqual(xnor_val, or_val)
+
+
 if __name__ == "__main__":
     unittest.main()
