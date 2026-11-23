@@ -2872,6 +2872,11 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
         descs = clean.get();
     }
     const UINT mask = static_cast<UINT>(visible_mask);
+    D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
+    apply_console_placement(descs, desc_count, info, nullptr,
+                            [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
+    return call.ret;
 }
 
 void* WINAPI proxy_get_custom_heap_properties(std::uint64_t a0, std::uint64_t a1, std::uint64_t node_mask,
