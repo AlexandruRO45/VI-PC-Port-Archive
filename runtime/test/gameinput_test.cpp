@@ -1521,7 +1521,9 @@ void test_force_feedback(IGameInput* input) {
         check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.length == 60000 &&
                   g_fake.last.constant.attack_length == 50,
               "force feedback: it is SDL's 60 s hold after its attack, not the wrapped sum of the durations");
-        check(held->GetState() == GameInputFeedbackRunning, "force feedback: and it keeps running");
+        Sleep(80);
+        rt::gameinput::poll();
+        check(held->GetState() == GameInputFeedbackRunning, "force feedback: and it is still running once the attack is over");
         held->Release();
         rt::gameinput::poll();
     }
