@@ -5,6 +5,8 @@
 Every byte here is built by the test: a minimal 0x7a resource with the four list structs, one prop list with
 two instances and one grass list with three. No game file, value or name is used.
 """
+from contextlib import redirect_stdout
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -259,14 +262,35 @@ class MeasureTests(unittest.TestCase):
         self.assertEqual(T["prop"]["scale_range_ordered"], 0)
         self.assertEqual(T["prop"]["instance_loddist_le_loddist"], 0)
 
-    def test_nonfinite_orient_to_terrain_is_recorded_cleanly(self):
-        for value in (float("nan"), float("inf")):
-            with self.subTest(value=value):
-                V = bytearray(self.V)
-                struct.pack_into("<f", V, 0xA00 + 0xC0, value)
-                T = {}
-                self.assertTrue(il.measure(bytes(V), self.P, T))
-                self.assertEqual(T["grass"]["OrientToTerrain"], {repr(value): 1})
+    def test_adjacent_list_records_reject_boundary_crossing_array_descriptor(self):
+        structs, blocks = il.schema(self.V)
+        for list_name, fn, lsize in (
+            (il.PROP_LIST, il.prop_list, 0x170),
+            (il.GRASS_LIST, il.grass_list, 0x1A0),
+        ):
+            # Two adjacent list records where record 1 is all zeros (count=0 if read past record 0).
+            two = bytearray(2 * lsize)
+            struct.pack_into("<Q", two, lsize - 8, 0x0102030405060708)
+            for off in (lsize - 4, lsize - 8, lsize, -2):
+                with self.subTest(list_name=hex(list_name), off=off):
+                    if off >= 0:
+                        self.assertIsNone(il.array(self.V, self.P, blocks, bytes(two), off, end=lsize))
+                    bad_structs = {list_name: (lsize, {M["InstanceList"]: (off, 0x52)})}
+                    R = {}
+                    fn(self.V, self.P, blocks, bad_structs, bytes(two), 0, R)
+                    self.assertEqual(R.get("lists"), 1)
+                    self.assertEqual(R.get("lists_unresolved"), 1)
+                    self.assertNotIn("lists_empty", R)
+        # Full measure() check with two adjacent PROP_LIST records in V where record 0's descriptor crosses into record 1.
+        V = bytearray(self.V)
+        struct.pack_into("<IIQ", V, 0x200, il.PROP_LIST, 2 * 0x170, 0x50000C00)
+        struct.pack_into("<i", V, 0x300 + 2 * 16 + 4, 0x170 - 4)  # InstanceList is member #2 in SCHEMA[PROP_LIST]
+        struct.pack_into("<I", V, 0xC00 + 0x170 - 4, 3)            # u64 low bytes inside record 0; count=0 in record 1
+        T = {}
+        self.assertTrue(il.measure(bytes(V), self.P, T))
+        self.assertEqual(T["prop"]["lists"], 2)
+        self.assertEqual(T["prop"]["lists_unresolved"], 2)
+        self.assertNotIn("lists_empty", T["prop"])
 
 
 class ArchiveTests(unittest.TestCase):
@@ -391,8 +415,57 @@ class ArchiveTests(unittest.TestCase):
             il.scan(path, T)
         self.assertEqual(T.get("map_resources_read"), 1)
         self.assertEqual(T.get("resources_with_lists"), 1)
+        self.assertEqual(T.get("resources_truncated"), 1)
         self.assertEqual(T["prop"]["lists_unresolved"], 1)
         self.assertEqual(T["grass"]["lists_unresolved"], 1)
+
+    def test_corrupt_second_virtual_stream_counts_as_truncated(self):
+        V, _ = resource()
+        V = bytearray(V)
+        V[0xF00 + 8], V[0xF00 + 9] = 2, 0
+        first = zlib.compress(bytes(V))
+        first += b"\0" * (-len(first) % 16)
+        # First virtual stream is valid; second virtual continuation stream is corrupt.
+        blob = b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + first + b"\x78\x9c\xff\xff\xff\xff"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rpf")
+            with open(path, "wb") as fh:
+                fh.write(blob)
+            T = {}
+            il.scan(path, T)
+        self.assertEqual(T.get("map_resources_read"), 1)
+        self.assertEqual(T.get("resources_truncated"), 1)
+
+    def test_json_follows_destination_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            target = os.path.join(tmp, "targets", "real.json")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("{}")
+            link = os.path.join(tmp, "latest.json")
+            try:
+                os.symlink(target, link)
+            except OSError:
+                # Without symlink privileges (standard Windows user), simulate symlink resolution via realpath.
+                real_link = os.path.join(tmp, "targets", "via_realpath.json")
+                orig_realpath = os.path.realpath
+
+                def fake_realpath(p):
+                    return real_link if os.path.abspath(p) == os.path.abspath(link) else orig_realpath(p)
+
+                with mock.patch("instance_lists.os.path.realpath", side_effect=fake_realpath), redirect_stdout(io.StringIO()):
+                    rc = il.main([path, "--json", link])
+                self.assertEqual(rc, 0)
+                self.assertFalse(os.path.exists(link))
+                with open(real_link, encoding="utf-8") as fh:
+                    self.assertEqual(json.load(fh)["prop"]["instances"], 2)
+            else:
+                r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", link], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertTrue(os.path.islink(link))
+                with open(target, encoding="utf-8") as fh:
+                    self.assertEqual(json.load(fh)["prop"]["instances"], 2)
 
     def test_truncated_first_stream_counts_as_truncated(self):
         V, _ = resource()

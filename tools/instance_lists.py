@@ -96,9 +96,10 @@ def resolve(V, P, p):
     return None, None
 
 
-def array(V, P, blocks, base_buf, at):
+def array(V, P, blocks, base_buf, at, end=None):
     """Follow a PSO array (u64 block pointer + u16 count) to (buffer, offset, count), or None."""
-    if at < 0 or at + 10 > len(base_buf):
+    limit = len(base_buf) if end is None else min(end, len(base_buf))
+    if at < 0 or at + 10 > limit:
         return None
     p = struct.unpack_from("<Q", base_buf, at)[0]
     count = struct.unpack_from("<H", base_buf, at + 8)[0]
@@ -162,25 +163,31 @@ def _f(buf, at, n=1):
     return struct.unpack_from(f"<{n}f", buf, at)
 
 
+def _record_end(structs, name, buf, lo):
+    lsize = structs.get(name, (0,))[0]
+    return min(len(buf), lo + lsize) if lsize > 0 else len(buf)
+
+
 def list_common(structs, name, buf, lo, R):
     add(R, "lists")
+    if lo < 0:
+        return None
+    end = _record_end(structs, name, buf, lo)
     lvl_at = member(structs, name, "lodLevel")
-    lvl = buf[lo + lvl_at] if lvl_at is not None and 0 <= lo + lvl_at < len(buf) else None
+    lvl = buf[lo + lvl_at] if lvl_at is not None and lvl_at >= 0 and lo + lvl_at < end else None
     add(R.setdefault("lodLevel", {}), str(lvl))
     sr_at = member(structs, name, "ScaleRange")
-    if sr_at is not None and 0 <= lo + sr_at and lo + sr_at + 8 <= len(buf):
+    if sr_at is not None and sr_at >= 0 and lo + sr_at + 8 <= end:
         smin, smax = _f(buf, lo + sr_at, 2)
         add(R, "scale_range_ordered", int(math.isfinite(smin) and math.isfinite(smax) and 0 < smin <= smax))
     ild = member(structs, name, "InstanceLodDist")
     ld = member(structs, name, "lodDist")
-    if (ild is not None and ld is not None
-            and 0 <= lo + ild and lo + ild + 4 <= len(buf)
-            and 0 <= lo + ld and lo + ld + 4 <= len(buf)):
+    if ild is not None and ld is not None and ild >= 0 and ld >= 0 and lo + ild + 4 <= end and lo + ld + 4 <= end:
         a, b = _f(buf, lo + ild)[0], _f(buf, lo + ld)[0]
         add(R, "instance_loddist_le_loddist", int(math.isfinite(a) and math.isfinite(b) and 0 < a <= b))
     bb = member(structs, name, "BatchAABB")
     box = None
-    if bb is not None and 0 <= lo + bb and lo + bb + 28 <= len(buf):
+    if bb is not None and bb >= 0 and lo + bb + 28 <= end:
         mn, mx = _f(buf, lo + bb, 3), _f(buf, lo + bb + 16, 3)
         if all(math.isfinite(x) for x in mn + mx) and all(mn[i] <= mx[i] for i in range(3)):
             add(R, "aabb_valid")
@@ -190,8 +197,9 @@ def list_common(structs, name, buf, lo, R):
 
 def prop_list(V, P, blocks, structs, buf, lo, R):
     box = list_common(structs, PROP_LIST, buf, lo, R)
+    end = _record_end(structs, PROP_LIST, buf, lo)
     il = member(structs, PROP_LIST, "InstanceList")
-    ref = array(V, P, blocks, buf, lo + il) if il is not None else None
+    ref = array(V, P, blocks, buf, lo + il, end=end) if il is not None and il >= 0 and lo >= 0 else None
     if ref == "empty":
         add(R, "lists_empty")
         return
@@ -229,16 +237,17 @@ def prop_list(V, P, blocks, structs, buf, lo, R):
 
 def grass_list(V, P, blocks, structs, buf, lo, R):
     list_common(structs, GRASS_LIST, buf, lo, R)
-    for field, key in (("IsSLODList", "IsSLODList"),):
-        at = member(structs, GRASS_LIST, field)
-        if at is not None and 0 <= lo + at < len(buf):
-            add(R.setdefault(key, {}), str(buf[lo + at]))
-    ot = member(structs, GRASS_LIST, "OrientToTerrain")
-    if ot is not None and 0 <= lo + ot and lo + ot + 4 <= len(buf):
-        val = _f(buf, lo + ot)[0]
-        add(R.setdefault("OrientToTerrain", {}), repr(round(val, 2)) if math.isfinite(val) else repr(val))
+    end = _record_end(structs, GRASS_LIST, buf, lo)
+    if lo >= 0:
+        for field, key in (("IsSLODList", "IsSLODList"),):
+            at = member(structs, GRASS_LIST, field)
+            if at is not None and at >= 0 and lo + at < end:
+                add(R.setdefault(key, {}), str(buf[lo + at]))
+        ot = member(structs, GRASS_LIST, "OrientToTerrain")
+        if ot is not None and ot >= 0 and lo + ot + 4 <= end:
+            add(R.setdefault("OrientToTerrain", {}), repr(round(_f(buf, lo + ot)[0], 2)))
     il = member(structs, GRASS_LIST, "InstanceList")
-    ref = array(V, P, blocks, buf, lo + il) if il is not None else None
+    ref = array(V, P, blocks, buf, lo + il, end=end) if il is not None and il >= 0 and lo >= 0 else None
     if ref == "empty":
         add(R, "lists_empty")
         return
@@ -266,7 +275,7 @@ def grass_list(V, P, blocks, structs, buf, lo, R):
     R["rotation_idx_max"] = max(R.get("rotation_idx_max", 0), rmax)
 
 
-def resource_buffers(m, s, size):
+def resource_buffers(m, s, size, *, truncated=None):
     """The virtual and physical buffers of the resource whose first stream starts at s."""
     data, used, eof, _ = wi._inflate_stream(m, s, size, 64 << 20, keep=True)
     if not eof or len(data) < 0x20:
@@ -283,8 +292,12 @@ def resource_buffers(m, s, size):
         try:
             more, mused, meof, _ = wi._inflate_stream(m, nxt, size, 64 << 20, keep=True)
         except zlib.error:
+            if truncated is not None:
+                truncated.append(True)
             break
         if not meof:
+            if truncated is not None:
+                truncated.append(True)
             break
         parts.append(more)
         total = nxt + mused - s
@@ -325,16 +338,20 @@ def scan(path, T, start=None, limit=None):
                 if head[0x10:0x15] != b"0DRPz":
                     pos = s + 1
                     continue
+                corrupt = []
                 try:
-                    V, P, used = resource_buffers(m, s, size)
+                    V, P, used = resource_buffers(m, s, size, truncated=corrupt)
                 except zlib.error:
                     pos = s + 1
                     continue
                 add(T, "map_resources_read")
                 if V is not None:
+                    is_truncated = bool(corrupt)
                     try:
                         measure(V, P, T)
                     except (struct.error, IndexError):
+                        is_truncated = True
+                    if is_truncated:
                         add(T, "resources_truncated")
                 else:
                     add(T, "resources_truncated")
@@ -362,7 +379,7 @@ def main(argv=None):
     ap.add_argument("inputs", nargs="+", help=".rpf archives")
     ap.add_argument("--start", type=_int_arg)
     ap.add_argument("--limit", type=_int_arg)
-    ap.add_argument("--json")
+    ap.add_argument("--json", help="write JSON report atomically (follows destination symlinks)")
     args = ap.parse_args(argv)
     if args.start is not None and args.start < 0:
         print("error: --start must be >= 0", file=sys.stderr)
@@ -396,13 +413,14 @@ def main(argv=None):
     print(json.dumps(T, indent=1, sort_keys=True))
     if args.json is not None:
         try:
-            out_dir = os.path.dirname(os.path.abspath(args.json))
+            dest = os.path.realpath(args.json)
+            out_dir = os.path.dirname(dest)
             os.makedirs(out_dir, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=out_dir) as staging:
                 staged = os.path.join(staging, "instance_lists.json")
                 with open(staged, "w", encoding="utf-8", newline="\n") as fh:
                     json.dump(T, fh, indent=1, sort_keys=True)
-                os.replace(staged, args.json)
+                os.replace(staged, dest)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2
