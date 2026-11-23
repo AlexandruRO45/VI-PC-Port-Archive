@@ -52,6 +52,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [22](#stage-22-a-g-buffer-round-trip) | Five and six G-buffer targets written through packed half exports, then decoded by a compute pass | A binary16 target in place of the RGBA8 IDs, or UNORM in place of sRGB, breaks the predicted values |
 | [23](#stage-23-alpha-tested-ray-traced-shadows) | Stage 11's shadow rays through non-opaque BLASes, a hit counting only on the opaque side of its barycentrics | u and v swapped in the shader moves the predicted shadows |
 | [24](#stage-24-local-x-and-y-thread-ids) | A compute shader with a 16x8 local size reads local X and local Y | X and Y swapped moves every predicted word |
+| [25](#stage-25-a-title-shaped-frame-at-scale) | A 3840x2160 frame of about 7,000 draws through 58 pipelines on three queues, many frames | Any frame that differs from the first, or from the CPU reference, fails |
 
 ## Stage 1
 
@@ -427,6 +428,39 @@ right, 0 mirror words, 768 positions never written).
 
 ```
 Lanterns stage 24: PASS, a 16x8 local size (four wave32 waves, local X in v0 and local Y in v1) on a 2x3 grid: 768 of 768 positions exact, and 768 of 768 point-mirror words read through LDS after the barrier
+```
+
+## Stage 25: a title-shaped frame at scale
+
+The other stages each test one feature on a small frame. A title's frame has thousands of draws, dozens of pipelines,
+several queues and worker threads, every frame. `lanterns_scale.cpp` (with `lanterns_scale.h` and
+`lanterns_scale_gpu.h`) draws that shape:
+
+- a 3840x2160 `R16G16B16A16_FLOAT` main pass with D32 depth: about 5,000 draws (some instanced) through 58 pipelines and
+  4 graphics root signatures, one `CopyDescriptorsSimple` and descriptor table per draw, recorded by 4 worker threads;
+- a 4x MSAA pass resolved with `ResolveSubresource`, and an RGBA8 pass;
+- particles stepped by compute twice: on a COMPUTE queue (set A, which the main pass draws) and between the passes on
+  the direct queue (set B, which the MSAA pass draws);
+- a COPY queue that streams the instanced draws' records each frame (zeros first, so a frame that reads too early draws
+  nothing there) and 16 MiB of filler;
+- two frames in flight. Frame f: the copy and compute queues wait for the direct queue's frame f - 2, the direct
+  queue waits for both queues' frame f, and the CPU waits for the direct queue's frame f - 2 before it records into
+  frame f's allocators, descriptor ring and readback buffer. Every Wait and Signal must succeed.
+
+How the check works. Every frame draws the same thing, so every readback (the three targets and both particle sets)
+must be byte for byte the first frame's. Frame 1 is checked against the CPU reference at every pixel (certain pixels
+exact, uncertain ones one of their candidates) and both particle sets against the CPU's simulation; every 20th frame
+is checked again at a quarter-density lattice whose offset moves. A frame that differs is written out with the
+queue-level log of the frames around it; a frame that does not finish within the timeout stops the run as a hang.
+Every D3D12 call is timed by class.
+
+The default is 60 frames, which ctest runs. `run_lanterns.py --stage 25 --soak` runs 10,000 frames with a lattice
+check every 1,000 (give `--timeout` to match). The guest also takes `--frames`, `--seconds`, `--draws`,
+`--threads`, `--jitter-us` (random delays before each queue's submission and each recording thread) and
+`--sample-us` (a sampling profiler). `scale_report.py` turns the dumps into PNGs and the samples into hot spots.
+
+```
+Lanterns stage 25: PASS, 60 frames at 3840x2160 identical to the first (hash 99f8df1bea376593), 6880 draws and 88 dispatches per frame on 3 queues, frame 1 exact against the CPU reference at every certain pixel, 3 lattice checks exact
 ```
 
 ## Build and run

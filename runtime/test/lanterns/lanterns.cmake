@@ -26,7 +26,10 @@ elseif(LEONIDA_TEST_LANTERNS)
                           ${_lanterns_src}/lanterns_shadow_gpu.cpp ${_lanterns_src}/lanterns_post_gpu.cpp
                           ${_lanterns_src}/lanterns_deferred_gpu.cpp ${_lanterns_src}/lanterns_rt_gpu.cpp
                           ${_lanterns_src}/lanterns_samplers_gpu.cpp ${_lanterns_src}/lanterns_xy_gpu.cpp
-                          ${_lanterns_src}/lanterns_gbuf6_gpu.cpp)
+                          ${_lanterns_src}/lanterns_gbuf6_gpu.cpp
+                          ${_lanterns_src}/lanterns_scale.cpp
+                          ${_lanterns_src}/lanterns_scale_gpu.cpp
+                          ${_lanterns_src}/lanterns_scale_prof.cpp)
   target_link_libraries(lanterns PRIVATE d3d12_xs_stub Vulkan::Headers)
   target_compile_definitions(lanterns PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
   target_compile_options(lanterns PRIVATE /W4 /permissive- /utf-8)
@@ -80,7 +83,7 @@ elseif(LEONIDA_TEST_LANTERNS)
     add_dependencies(lanterns lanterns_shaders)
     if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING)
       # One test per stage (the runner gives each its own output folder under --out).
-      foreach(_stage 1 3 5 6 8 9 10 11 20 22 23 24)
+      foreach(_stage 1 3 5 6 8 9 10 11 20 22 23 24 25)
         add_test(NAME lanterns_stage${_stage}
                  COMMAND $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/run_lanterns.py
                          --gta6rt $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:lanterns>

@@ -1,7 +1,7 @@
 """Run Lanterns under gta6rt --run, check what it printed, and turn its frame dumps into PNGs.
 
     python -I runtime/test/lanterns/run_lanterns.py --gta6rt <gta6rt.exe> --guest <lanterns.exe>
-        --shaders <folder fssm_pack.py wrote> --out <folder> [--stage 1] [--wine] [--timeout 240] [--png FILE]
+        --shaders <folder fssm_pack.py wrote> --out <folder> [--stage 1] [--wine] [--timeout 240] [--png FILE] [--soak]
 
 It sets LEONIDA_D3D12=vulkan and LEONIDA_SHADERS=<shaders>/spirv and runs
 "gta6rt --run lanterns.exe -- --stage N --shaders <shaders> --out <out>" (under Wine with --wine, paths turned into
@@ -45,6 +45,7 @@ folder:
   stage 22: the sRGB albedo target of the 6-target run; sheet: target | reference / target | mask
   stage 23: the alpha-tested shadows; sheet: frame | reference / the opaque traversal | mask
   stage 24: the 32x24 grid (own word left, mirror word right in each cell); sheet: grid | reference
+  stage 25: none here (3840x2160 frames, many of them): scale_report.py draws them from the guest's dumps
 """
 import argparse
 import array
@@ -123,6 +124,10 @@ PASS_LINES = {
          rf"against the opaque traversal the cut-outs changed {N} of {N} predicted pixels and kept {N} of {N}",
          lambda a, b, changed, predicted, kept, still: a == b and changed == predicted and predicted >= 300
          and kept == still),
+    25: (rf"Lanterns stage 25: PASS, {N} frames at 3840x2160 identical to the first \(hash [0-9a-f]{{16}}\), {N} draws "
+         rf"and {N} dispatches per frame on 3 queues, frame 1 exact against the CPU reference at every certain pixel, "
+         rf"{N} lattice checks exact",
+         lambda frames, draws, dispatches, checks: frames >= 2 and draws >= 8 and dispatches >= 1),
     24: (rf"Lanterns stage 24: PASS, a 16x8 local size \(four wave32 waves, local X in v0 and local Y in v1\) on a 2x3 "
          rf"grid: {N} of {N} positions exact, and {N} of {N} point-mirror words read through LDS after the barrier",
          lambda a, b, c, d: a == b == c == d == 768),
@@ -412,9 +417,11 @@ def main(argv=None):
     ap.add_argument("--guest", required=True)
     ap.add_argument("--shaders", required=True, help="the folder fssm_pack.py wrote (with spirv/index.json)")
     ap.add_argument("--out", required=True, help="each run makes a new folder in it")
-    ap.add_argument("--stage", type=int, default=1, choices=sorted(PANELS))
+    ap.add_argument("--stage", type=int, default=1, choices=sorted(set(PANELS) | set(PASS_LINES)))
     ap.add_argument("--wine", action="store_true", help="run gta6rt.exe under wine (paths become Z:\\...)")
     ap.add_argument("--timeout", type=float, default=240.0, help="seconds before the run is killed and fails")
+    ap.add_argument("--soak", action="store_true",
+                    help="stage 25 only: 10,000 frames with a lattice check every 1,000 (give --timeout to match)")
     ap.add_argument("--png", help="where to write the main PNG (default: lanterns-stage<N>.png in the run's folder)")
     a = ap.parse_args(argv)
     for path in (a.gta6rt, a.guest, os.path.join(a.shaders, "spirv", "index.json")):
@@ -434,6 +441,11 @@ def main(argv=None):
     env = dict(os.environ, LEONIDA_D3D12="vulkan", LEONIDA_SHADERS=conv(os.path.join(a.shaders, "spirv")))
     cmd = (["wine"] if a.wine else []) + [a.gta6rt, "--run", conv(a.guest), "--", "--stage", str(a.stage),
                                           "--shaders", conv(a.shaders), "--out", conv(run_dir)]
+    if a.soak:
+        if a.stage != 25:
+            print("ERROR: --soak is for stage 25 only", file=sys.stderr)
+            return 2
+        cmd += ["--frames", "10000", "--ref-every", "1000"]
     if a.wine:
         stuck = stop_wineserver(env)
         if stuck:
@@ -452,12 +464,13 @@ def main(argv=None):
         print(f"lanterns: FAILED: no exit after {a.timeout:g} s; everything the run started was killed", file=sys.stderr)
         return TIMEOUT_EXIT
     failures = check_transcript(a.stage, code, out, err)
-    try:
-        main_png = a.png or os.path.join(run_dir, f"lanterns-stage{a.stage}.png")
-        sheet = write_pngs(run_dir, a.stage, main_png)
-        print(f"lanterns: wrote {main_png} and {sheet}")
-    except (OSError, ValueError) as e:
-        failures.append(f"no frame dumps to draw: {e}")
+    if a.stage in PANELS:   # stage 25 (4K frames, many of them) draws its PNGs with scale_report.py
+        try:
+            main_png = a.png or os.path.join(run_dir, f"lanterns-stage{a.stage}.png")
+            sheet = write_pngs(run_dir, a.stage, main_png)
+            print(f"lanterns: wrote {main_png} and {sheet}")
+        except (OSError, ValueError) as e:
+            failures.append(f"no frame dumps to draw: {e}")
     if failures:
         print("lanterns: FAILED: " + "; ".join(failures), file=sys.stderr)
         return 1

@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20|22|23|24 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20|22|23|24|25 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -75,6 +75,12 @@
 // Stage 22: a G-buffer round trip. A fullscreen pixel shader writes six targets (RGBA8 IDs, RGB10A2 codes, RG16F motion,
 // sRGB albedo, RGBA16F emissive, more RGBA8 IDs), every export packed as half floats; a compute pass reads them back
 // and decodes them as a lighting pass does (lanterns_gbuf6.h). Run with 5 and with 6 targets bound.
+//
+// Stage 25 (lanterns_scale.cpp): a title-shaped frame at scale. 3840x2160 R16G16B16A16_FLOAT with D32, about 5,000 draws
+// (some instanced) through 58 pipelines and 4 root signatures, one descriptor copy and table per draw, recorded on worker
+// threads; particles by compute on a COMPUTE queue and between the passes on the direct queue, a COPY queue streaming,
+// fences across the three; a 4x MSAA pass and an RGBA8 pass. Many frames, each byte for byte the first; the first
+// exact against the CPU reference at every certain pixel, a moving lattice later; every D3D12 call timed by class.
 //
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
@@ -1237,6 +1243,10 @@ int stage22(const std::filesystem::path& shader_dir, const std::filesystem::path
 
 }  // namespace
 
+namespace lanterns::scale {
+int stage25(int argc, char** argv, const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir);
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // the marker reaches the launcher even if the process dies after it
     int stage = 0;
@@ -1263,8 +1273,9 @@ int main(int argc, char** argv) {
     case 22: return stage22(shader_dir, out_dir);
     case 23: return stage23(shader_dir, out_dir);
     case 24: return stage24(shader_dir, out_dir);
+    case 25: return lanterns::scale::stage25(argc, argv, shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20|22|23|24 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20|22|23|24|25 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }
