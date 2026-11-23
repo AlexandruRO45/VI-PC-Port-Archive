@@ -74,6 +74,12 @@ std::wstring module_name_w(std::wstring path) {
     return path;
 }
 
+// Whether the module a wide name refers to has an ASCII name. Only the last component decides: the directory may be
+// outside ASCII (narrow() turns it into '?', which the basename-only lookups never see) while the module is a shim's.
+bool ascii_basename(const wchar_t* name) {
+    return is_ascii(module_name_w(name).c_str());
+}
+
 // LoadLibrary's file-name rules for the module a path names: the last path component, lower case, and ".dll" added
 // when there is no extension (a trailing '.' means "no extension, add nothing").
 std::string module_name(std::string path) {
@@ -168,7 +174,7 @@ HMODULE load_bundled_w(LPCWSTR name, DWORD flags, bool& handled) {
 HMODULE WINAPI load_library_w(LPCWSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = is_ascii(name) ? load_shim_or_bundled(narrow(name), 0, handled) : load_bundled_w(name, 0, handled);
+        HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), 0, handled) : load_bundled_w(name, 0, handled);
         if (handled) return h;
     }
     return LoadLibraryW(name);
@@ -186,7 +192,7 @@ HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = is_ascii(name) ? load_shim_or_bundled(narrow(name), flags, handled)
+        HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), flags, handled)
                                    : load_bundled_w(name, flags, handled);
         if (handled) return h;
     }
@@ -207,7 +213,7 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
     if (name) {
-        if (is_ascii(name)) {
+        if (ascii_basename(name)) {
             const std::string path = narrow(name);
             if (HMODULE h = owned_handle(path)) return h;
             const std::string dll = module_name(path);

@@ -79,6 +79,10 @@ def main() -> int:
                 required = ["self_w=1", "case_w=1", "load_w=1"]
                 if exact_acp(image.name) is not None:
                     required += ["representable=1", "self_a=1", "ascii_case_a=1", "acp_case_a=1"]
+                # Under the loader, a shim-served DLL named through a directory outside ASCII is answered by basename
+                # (natively the probe depends on what the machine has installed, so it is only checked here).
+                if mode == "--run":
+                    required += ["shim_dir_w=1", "shim_dir_load_w=1"]
                 missing = [field for field in required if not entry or field not in entry.split()]
                 if missing:
                     errors.append("guest lookups not retained: " + " ".join(missing))

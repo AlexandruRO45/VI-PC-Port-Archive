@@ -47,10 +47,16 @@ int wmain(int argc, wchar_t** argv) {
     const HMODULE loaded = LoadLibraryW(argv[1]);
     const bool load_w = loaded == self;
     if (loaded) FreeLibrary(loaded);
+    // A shim-served module named through a directory outside ASCII: under the loader, the shims answer for it by
+    // basename whatever the directory is spelt in (the directory need not exist). Not meaningful natively.
+    const wchar_t* shim_path = L"C:\\" L"漢" L"\\" L"xgameruntime.dll";
+    const bool shim_dir_w = GetModuleHandleW(shim_path) != nullptr;
+    const bool shim_dir_load_w = LoadLibraryW(shim_path) != nullptr;   // an owned module's handle is never freed
     std::printf("NAME_PROBE entered=1 acp=%u representable=%u self_a=%u ascii_case_a=%u acp_case_a=%u "
-                "self_w=%u case_w=%u load_w=%u\n",
+                "self_w=%u case_w=%u load_w=%u shim_dir_w=%u shim_dir_load_w=%u\n",
                 page, !substituted ? 1u : 0u, exact ? 1u : 0u, ascii_case ? 1u : 0u, acp_case ? 1u : 0u,
-                self_w ? 1u : 0u, case_w ? 1u : 0u, load_w ? 1u : 0u);
+                self_w ? 1u : 0u, case_w ? 1u : 0u, load_w ? 1u : 0u, shim_dir_w ? 1u : 0u,
+                shim_dir_load_w ? 1u : 0u);
     const bool a_ok = substituted || (exact && ascii_case && acp_case);
     return a_ok && self_w && case_w && load_w ? 0 : 23;
 }
