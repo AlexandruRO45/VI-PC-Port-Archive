@@ -1148,6 +1148,12 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "usage: gta6rt"
         FAIL_REGULAR_EXPRESSION "running |module\\(s\\) mapped")
     endforeach()
+    # The value of --trace/--game-dir/--overlay/--mods is a path: a following option is a missing value and the usage
+    # error (exit 2), never a value. `--trace --trace-d3d12` used to write the trace to a file named --trace-d3d12 and
+    # exit 0, so a mistyped command line read as a clean run with the D3D12 trace off.
+    add_test(NAME gta6rt_option_values COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_option_value.cmake")
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)

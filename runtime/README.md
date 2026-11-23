@@ -50,7 +50,9 @@ available until these notifications finish, so DLLs can release resources such a
 argument is null (explicit unload). A map-only load receives no detach notifications.
 
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
-print the usage and exit 2 before anything is mapped.
+print the usage and exit 2 before anything is mapped. The value of `--trace`, `--game-dir`, `--overlay` and `--mods` is
+a path, so another option there (`--trace --trace-d3d12`) is a missing value: the usage and exit 2, instead of a trace
+file named `--trace-d3d12` and a run that looks clean with the trace off.
 
 The report line is:
 

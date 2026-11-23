@@ -76,10 +76,17 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--init") init = true;
         else if (a == L"--run") run = true;
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
-        else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
-        else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
-        else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
-        else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
+        // The value of these options is a path, so a following option is a missing value and the usage error, never a
+        // value. `--trace --trace-d3d12` used to take the option as the file name and exit 0, so a mistyped command
+        // line read as a clean run: a file named --trace-d3d12 appeared and the D3D12 trace stayed off.
+        else if (a == L"--trace" || a == L"--game-dir" || a == L"--overlay" || a == L"--mods") {
+            if (i + 1 >= argc || std::wstring(argv[i + 1]).rfind(L"--", 0) == 0) return usage();
+            const wchar_t* value = argv[++i];
+            if (a == L"--trace") trace_file = value;
+            else if (a == L"--game-dir") game_dir = value;
+            else if (a == L"--overlay") overlay_dir = value;
+            else mods_dir = value;
+        }
         else if (a == L"--view-mode-getter" && i + 1 < argc) {
             wchar_t* end = nullptr;
             const unsigned long rva = std::wcstoul(argv[++i], &end, 16);
