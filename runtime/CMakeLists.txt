@@ -908,6 +908,8 @@ if(BUILD_TESTING)
     add_dependencies(bink_decode_test gta6rt_tls_host)
     add_test(NAME bink_decode COMMAND bink_decode_test)
     set_tests_properties(bink_decode PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME bink_os_file_callbacks COMMAND bink_decode_test --file-callbacks)
+    set_tests_properties(bink_os_file_callbacks PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_BINK_INDEX are set. Measures the HBINK/BINKSUMMARY
     # offsets and the decode return values over every stream of movies.rpf (docs/movies.md section 5).

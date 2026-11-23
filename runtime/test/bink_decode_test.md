@@ -14,8 +14,29 @@ set LEONIDA_RUN_DLLMAIN=1     # optional; not needed for the measured streams
 runtime\build\bink_decode_test.exe
 ```
 
-With either required variable unset it prints `SKIP (no package/movie)` and exits 0, so `ctest` is green on a machine
-without the package. Frames are written as raw BGRA and PPM under `%TEMP%\leonida_bink`; they are never committed.
+With either required variable unset the executable prints `SKIP (no package/movie)` and exits 77. CTest reports the
+test as skipped. The default decode test writes raw BGRA and PPM frames under `%TEMP%\leonida_bink`.
+
+## OS file callbacks
+
+With the same two variables set, run the callback test from the repository root.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^bink_os_file_callbacks$' --output-on-failure
+```
+
+The title registers four callbacks with `BinkSetOSFileCallbacks`. Its open callback reads a source object, and two
+call sites pass the options pointer second and the flags third to `BinkOpenWithOptions`. The test supplies two
+original objects with identical text. Its open callback accepts one object's address and refuses the other.
+It compares the first decoded BGRA frame with a normal `BinkOpen`, clears the four callbacks, and decodes the
+same frame from the path again. Each comparison initializes every destination byte to the inverse of its expected
+value. The test also checks that the reset path makes zero custom callback calls. It keeps two BGRA buffers in
+memory, each limited to 128 MiB. Both trailing arguments to `BinkOpenWithOptions` use their defaults in this test.
+
+On Windows x64 with the 1.0.2.1 decoder, both a 1920×1080 stream and a 3840×2160 stream passed. The accepted
+source returned 1,310,720 bytes in 13 reads for the first stream and 6,553,600 bytes in 53 reads for the second.
+Each opened and closed once. Both first frames decoded sequentially, with zero seek calls. These are CPU decoder
+measurements. Playback through the title and the seek callback remain unmeasured here.
 
 ## Measured on 1.0.2.1
 

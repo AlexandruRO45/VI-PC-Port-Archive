@@ -7,10 +7,11 @@
 //   LEONIDA_RUN_DLLMAIN=1             (optional: call the image entry point as DllMain before BinkOpen)
 //
 // With either required variable unset the test prints "SKIP (no package/movie)" and exits 77 (CTest skip).
-// Output frames are written under %TEMP%\leonida_bink and are never committed.
+// The normal decode test writes frames under %TEMP%\leonida_bink. --file-callbacks compares frames in memory.
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -162,9 +163,120 @@ void* symbol(rt::Module& m, const char* name) {
     return it->second;
 }
 
+// Both tokens start with the same text. Only the accepted object's address owns a movie.
+// The decoder passes this opaque source to open and gives the other callbacks private handle storage.
+struct MovieToken { char label[24]; int id; };
+MovieToken accepted{"leonida://callback", 1}, missing{"leonida://callback", 2};
+std::filesystem::path callback_movie;
+std::atomic<unsigned> open_calls{}, opens{}, refusals{}, reads{}, seeks{}, closes{}, io_errors{};
+std::atomic<uint64_t> bytes_read{};
+
+int file_open(HANDLE* slot, const void* source, uint64_t* size) {
+    ++open_calls;
+    if (source != &accepted) {
+        if (source == &missing) ++refusals;
+        return 0;
+    }
+    HANDLE file = CreateFileW(callback_movie.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    if (size) {
+        LARGE_INTEGER bytes{};
+        if (!GetFileSizeEx(file, &bytes)) {
+            CloseHandle(file);
+            return 0;
+        }
+        *size = static_cast<uint64_t>(bytes.QuadPart);
+    }
+    *slot = file;
+    ++opens;
+    return 1;
+}
+
+uint64_t file_read(HANDLE* slot, void* dest, uint64_t requested) {
+    ++reads;
+    auto* out = static_cast<uint8_t*>(dest);
+    uint64_t done = 0;
+    while (done < requested) {
+        const DWORD chunk = static_cast<DWORD>(std::min<uint64_t>(requested - done, 1u << 20));
+        DWORD count = 0;
+        if (!ReadFile(*slot, out + done, chunk, &count, nullptr)) {
+            ++io_errors;
+            break;
+        }
+        done += count;
+        if (count < chunk) break;
+    }
+    bytes_read += done;
+    return done;
+}
+
+void file_seek(HANDLE* slot, int64_t position) {
+    LARGE_INTEGER target{};
+    target.QuadPart = position;
+    if (!SetFilePointerEx(*slot, target, nullptr, FILE_BEGIN)) ++io_errors;
+    ++seeks;
+}
+
+void file_close(HANDLE* slot) {
+    if (!CloseHandle(*slot)) ++io_errors;
+    *slot = INVALID_HANDLE_VALUE;
+    ++closes;
+}
+
+int test_file_callbacks(rt::Module& bink, const BinkApi& api, const std::filesystem::path& movie,
+                        const MovieHeader& header) {
+    using SetCallbacks = void (*)(decltype(&file_open), decltype(&file_read), decltype(&file_seek), decltype(&file_close));
+    using OpenWithOptions = void* (*)(const void* source, const void* options, uint32_t flags);
+    const auto set_callbacks = reinterpret_cast<SetCallbacks>(symbol(bink, "BinkSetOSFileCallbacks"));
+    const auto open_with_options = reinterpret_cast<OpenWithOptions>(symbol(bink, "BinkOpenWithOptions"));
+    const auto path = movie.string();
+    const uint64_t pixels = static_cast<uint64_t>(header.width) * header.height;
+    constexpr size_t max_frame_bytes = 128u * 1024 * 1024;
+    if (pixels > max_frame_bytes / 4) fatal("callback test frame exceeds its 128 MiB buffer limit");
+    std::vector<uint8_t> reference(static_cast<size_t>(pixels) * 4, 0xcd);
+    std::vector<uint8_t> actual(reference.size());
+    auto first_frame = [&](void* handle, std::vector<uint8_t>& frame) {
+        if (!handle) return false;
+        api.wait(handle);
+        api.do_frame(handle);
+        api.copy(handle, frame.data(), header.width * 4, header.height, 0, 0, 3);
+        api.close(handle);
+        return true;
+    };
+    auto matches_reference = [&](void* handle) {
+        // Every byte must change, including for solid-color frames.
+        std::transform(reference.begin(), reference.end(), actual.begin(), [](uint8_t b) {
+            return static_cast<uint8_t>(~b);
+        });
+        return first_frame(handle, actual) && actual == reference;
+    };
+
+    if (!first_frame(api.open(path.c_str(), 0), reference)) fatal("BinkOpen could not open the reference movie");
+    callback_movie = movie;
+    set_callbacks(file_open, file_read, file_seek, file_close);
+    void* unexpected = open_with_options(&missing, nullptr, 0);
+    check(!unexpected && refusals > 0 && opens == 0 && reads == 0 && seeks == 0 && closes == 0,
+          "a rejected source fails open without reading or closing a file");
+    if (unexpected) api.close(unexpected);
+
+    check(matches_reference(open_with_options(&accepted, nullptr, 0)),
+          "callback-backed first frame matches native file I/O byte for byte");
+    check(opens == 1 && bytes_read > 0 && closes == 1 && io_errors == 0, "one callback file returned data and closed");
+    std::printf("callbacks: open=%u read=%u bytes=%llu seek=%u close=%u\n", opens.load(), reads.load(),
+                static_cast<unsigned long long>(bytes_read.load()), seeks.load(), closes.load());
+
+    const auto count_calls = [] { return open_calls.load() + reads.load() + seeks.load() + closes.load(); };
+    const auto before_reset = count_calls();
+    set_callbacks(nullptr, nullptr, nullptr, nullptr);
+    check(matches_reference(open_with_options(path.c_str(), nullptr, 0)), "native path decodes the same frame after reset");
+    check(count_calls() == before_reset, "no custom callback runs after reset");
+    return g_failures ? 1 : 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     const std::string movie_arg = env("LEONIDA_MOVIE");
     if (game_dir_arg.empty() || movie_arg.empty()) {
@@ -234,6 +346,9 @@ int main() {
             check(dll_main(reinterpret_cast<HMODULE>(bink.base), DLL_PROCESS_ATTACH, nullptr) != FALSE,
                   "DllMain(DLL_PROCESS_ATTACH) returned TRUE");
         }
+
+        if (argc == 2 && std::strcmp(argv[1], "--file-callbacks") == 0)
+            return test_file_callbacks(bink, api, movie, header);
 
         void* handle = api.open(movie.string().c_str(), 0);
         if (!handle) {
