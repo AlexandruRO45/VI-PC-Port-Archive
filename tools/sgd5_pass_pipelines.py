@@ -32,7 +32,11 @@ def stage_key(group, entry):
 
 def census(archive, index, databases=None):
     """Return (rows, counts); one row per stored pass with a program in the carve index."""
-    by_offset = {e["offset"]: e for e in index}
+    by_offset = {}
+    for entry in index:
+        # Two different entries at one carve offset would make the result depend on the index order.
+        if by_offset.setdefault(entry["offset"], entry) != entry:
+            raise ValueError(f"carve index has two different entries at offset {entry['offset']:#x}")
     counts = collections.Counter()
     rows = []
     with open(archive, "rb") as stream:
@@ -128,7 +132,11 @@ def main(argv=None):
     args = ap.parse_args(argv)
     with open(args.index, encoding="utf-8") as f:
         index = json.load(f)
-    rows, counts = census(args.archive, index)
+    try:
+        rows, counts = census(args.archive, index)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     pipelines = pipelines_from(rows, counts, args.spirv_dir)
     if pipelines:
         # `shader_link_check.py batch` refuses an empty list, so an empty manifest is never written.

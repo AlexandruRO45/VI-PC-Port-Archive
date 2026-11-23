@@ -87,6 +87,23 @@ class PassPipelinesTest(unittest.TestCase):
                      "2  distinct graphics sets with a PS"):
             self.assertIn(line, summary)
 
+    def test_conflicting_index_entries_are_refused_in_either_order(self):
+        clash = dict(self.index[2], file="Pix2.dxbc")
+        for index in (self.index + [clash], [clash] + self.index):
+            with self.subTest(first=index[0]["file"]):
+                with patch.object(sgd5_effects, "DATABASES", [self.layout]), self.assertRaisesRegex(
+                        ValueError, "two different entries"):
+                    with tempfile.TemporaryDirectory() as folder:
+                        path = Path(folder) / "a.rpf"
+                        path.write_bytes(self.data)
+                        sgd5_pass_pipelines.census(str(path), index)
+        # The same entry listed twice is not a conflict.
+        with tempfile.TemporaryDirectory() as folder, patch.object(sgd5_effects, "DATABASES", [self.layout]):
+            path = Path(folder) / "a.rpf"
+            path.write_bytes(self.data)
+            rows, _ = sgd5_pass_pipelines.census(str(path), self.index + [dict(self.index[2])])
+        self.assertEqual(len(rows), 5)
+
     def test_spirv_dir_leaves_out_missing(self):
         manifest, _, summary = self.run_tool(["Vert", "Pix", "Geo"])
         self.assertEqual(self.sets(manifest), [{"vs": "Vert", "ps": "Pix"}])
