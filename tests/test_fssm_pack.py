@@ -6,10 +6,14 @@ All programs here are a few hand-written instructions; nothing comes from the ga
 
     python -I tests/test_fssm_pack.py
 """
+import contextlib
+import io
 import os
 import struct
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -93,6 +97,46 @@ class Pack(unittest.TestCase):
             with self.subTest(name):
                 with self.assertRaises(fssm_pack.PackError):
                     fssm_pack.pack(stage="ps", name="ps_t", **kwargs)
+
+
+class Names(unittest.TestCase):
+    """Every output file is named after its shader, so two names equal but for case would share files on a
+    case-insensitive volume. The packer must refuse them before it writes anything."""
+
+    def run_main(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for rel, text in files:
+                path = os.path.join(tmp, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                paths.append(path)
+            out = os.path.join(tmp, "out")
+            err = io.StringIO()
+            with mock.patch.object(fssm_pack, "assemble", return_value=struct.pack("<I", ENDPGM)), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = fssm_pack.main([out] + paths)
+            written = sorted(os.listdir(out)) if os.path.isdir(out) else []
+            return code, err.getvalue(), written
+
+    def test_names_differing_only_in_case_are_refused_before_any_write(self):
+        code, err, written = self.run_main([("a/ps_tile.asm", "s_endpgm\n"), ("b/ps_Tile.asm", "s_endpgm\n")])
+        self.assertEqual(code, 1)
+        self.assertIn("ps_tile (", err)
+        self.assertIn("ps_Tile (", err)
+        self.assertEqual(written, [])
+
+    def test_a_native_variant_clashing_in_case_is_refused(self):
+        code, err, written = self.run_main([("ps_tile.asm", "; native-variant: PS_TILE\ns_endpgm\n")])
+        self.assertEqual(code, 1)
+        self.assertIn("PS_TILE (", err)
+        self.assertEqual(written, [])
+
+    def test_distinct_names_each_get_their_own_container(self):
+        code, err, written = self.run_main([("a/ps_tile.asm", "s_endpgm\n"), ("b/ps_tile2.asm", "s_endpgm\n")])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(written, ["index.json", "ps_tile.dxbc", "ps_tile2.dxbc"])
 
 
 if __name__ == "__main__":

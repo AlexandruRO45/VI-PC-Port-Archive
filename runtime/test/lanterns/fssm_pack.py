@@ -286,9 +286,9 @@ def assemble(text, name, mcpu="gfx1013", wave=32):
     return text_section(r.stdout, name)
 
 
-def pack_file(path, out, mcpu="gfx1013"):
-    """Assemble and pack one .asm (and its native variant, if it names one); writes <out>/<name>.dxbc for each.
-    Returns [(name, stage, fssm blob, native)]."""
+def pack_file(path, mcpu="gfx1013"):
+    """Assemble and pack one .asm (and its native variant, if it names one). Writes nothing: main() checks every name
+    first. Returns [(name, stage, fssm blob, native, container, path)]."""
     name = os.path.splitext(os.path.basename(path))[0]
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -301,10 +301,18 @@ def pack_file(path, out, mcpu="gfx1013"):
     packed = []
     for packed_name, native in ((name, False),) + (((variant, True),) if variant else ()):
         blob = pack(code, name=packed_name, **fields)
-        with open(os.path.join(out, packed_name + ".dxbc"), "wb") as f:
-            f.write(container(blob, position, first))
-        packed.append((packed_name, fields["stage"], blob, native))
+        packed.append((packed_name, fields["stage"], blob, native, container(blob, position, first), path))
     return packed
+
+
+def name_clashes(entries):
+    """Names that would share an output file on a case-insensitive volume (Windows, macOS): every output is named
+    after the shader (<name>.dxbc, fssm/<name>.fssm, disasm/<name>.s, the SPIR-V), so two names equal after casefold()
+    would overwrite each other's files. Returns one message per clash, naming the inputs."""
+    seen = {}
+    for name, _, _, native, _, path in entries:
+        seen.setdefault(name.casefold(), []).append(f"{name} ({path}{', native variant' if native else ''})")
+    return [" and ".join(names) for names in seen.values() if len(names) > 1]
 
 
 def run_tool(tool, *args):
@@ -367,12 +375,17 @@ def main(argv=None):
     # As build.py: CMake names the spirv-as/spirv-val folder instead of passing a whole PATH.
     if os.environ.get("LEONIDA_SPIRV_TOOLS"):
         os.environ["PATH"] = os.environ["LEONIDA_SPIRV_TOOLS"] + os.pathsep + os.environ.get("PATH", "")
-    os.makedirs(a.out, exist_ok=True)
     try:
-        packed = [entry for p in a.asm for entry in pack_file(p, a.out, a.mcpu)]
-        names = [entry[0] for entry in packed]
-        if len(set(names)) != len(names):
-            raise PackError("two shaders have the same name: " + ", ".join(sorted({n for n in names if names.count(n) > 1})))
+        entries = [entry for p in a.asm for entry in pack_file(p, a.mcpu)]
+        clashes = name_clashes(entries)
+        if clashes:
+            raise PackError("shader names must differ in more than case, since each names its output files; nothing "
+                            "was written: " + "; ".join(clashes))
+        os.makedirs(a.out, exist_ok=True)
+        for name, _, _, _, data, _ in entries:
+            with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                f.write(data)
+        packed = [entry[:4] for entry in entries]
         carve = [{"name": n, "file": n + ".dxbc", "stage": s, "size": os.path.getsize(os.path.join(a.out, n + ".dxbc"))}
                  for n, s, _, _ in packed]
         with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
