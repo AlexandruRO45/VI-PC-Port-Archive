@@ -616,3 +616,6 @@ python -I tools/pc_checker.py --cli --check    # spec lines, then exit 0 good, 1
 python -I tools/pc_checker.py --cli --check --json
 ```
 
+`--cpu`, `--gpu` and `--ram` override the detected values when a VM or a remote session hides them. Its scores are
+rough estimates made for this tool, not benchmarks, so put the detected model names in the #166 entry, not the score.
+`python -I tests/test_pc_checker.py` checks the parsing and the comparison with the window mocked.
