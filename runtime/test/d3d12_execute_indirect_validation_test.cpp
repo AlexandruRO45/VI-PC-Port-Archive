@@ -1,6 +1,8 @@
 // Host-parity validation and GPU execution sanity test for ID3D12GraphicsCommandList::ExecuteIndirect.
 // Compares Close() verdicts between the Vulkan layer, live Windows WARP, and live hardware D3D12 (0 disagreements),
 // then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. No game data.
+// The expected verdicts are Windows 11's; Windows 10's in-box D3D12 refuses five of them (Case::older_runtime_refuses),
+// which the host may do there, while the layer is still held to Windows 11.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
@@ -127,7 +129,26 @@ struct Case {
     const char* name;
     bool expected_ok;  // Measured on Windows 11 WARP and RTX 5090 HW D3D12
     std::function<void(Env&)> record;
+    // Windows 10's in-box D3D12 (WARP and hardware alike) refuses this case: it needs
+    // offset + stride * max_count <= width, also when max_count is 0, where Windows 11 skips max_count == 0 and
+    // counts the last command's argument size instead of a whole stride. See older_runtime_rule().
+    bool older_runtime_refuses = false;
 };
+
+// Whether a live host device follows the older bounds rule above: it refuses every case flagged
+// older_runtime_refuses, and it is a runtime without ID3D12Device10 (Windows 10's d3d12.dll). Only then is the host
+// compared with the older verdicts on those cases; everything else, and the layer always, keeps the Windows 11 table.
+bool older_runtime_rule(ID3D12Device* device, const std::vector<Case>& table, const std::vector<HRESULT>& hr) {
+    Ref<ID3D12Device10> device10;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p)))) return false;
+    bool any = false;
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        if (!table[i].older_runtime_refuses) continue;
+        if (SUCCEEDED(hr[i])) return false;
+        any = true;
+    }
+    return any;
+}
 
 bool run_case(Env& env, const Case& c, HRESULT& out_hr) {
     Ref<ID3D12CommandAllocator> alloc;
@@ -213,11 +234,11 @@ std::vector<Case> parity_cases() {
         {"arg_offset=256 ==width (max=0 no-op)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 256, nullptr, 0); }},
         {"arg_offset=260 >width (max=0 no-op)", true,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }},
+         [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }, true},
         {"arg_offset=U64MAX-3 wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max - 3, nullptr, 0); }},
         {"arg_offset=U64MAX-3 aligned (max=0 no-op)", true,
-         [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }},
+         [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }, true},
         {"arg_offset=U64MAX unaligned+wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max, nullptr, 0); }},
         {"arg_offset=240 max=2 cnt=null (OOB)", false,
@@ -235,14 +256,14 @@ std::vector<Case> parity_cases() {
 
         // Padded stride exact-fit: (max_count - 1) * stride + record_size
         {"draw stride=20 off=240 max=1 (240+16==256)", true,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }},
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }, true},
         {"draw stride=20 off=220 max=2 (220+20+16==256)", true,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }},
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }, true},
         {"dispatch stride=20 off=244 max=1 (244+12==256)", true,
          [](Env& e) {
              e.bind_compute_if_available();
              e.list->ExecuteIndirect(e.dispatch20.p, 1, e.buf256.p, 244, nullptr, 0);
-         }},
+         }, true},
         {"draw_indexed stride=24 off=240 max=1 (OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw_indexed24.p, 1, e.buf256.p, 240, nullptr, 0); }},
 
@@ -389,6 +410,8 @@ int main() {
 
     bool warp_ran = false;
     bool hw_ran = false;
+    bool warp_older = false;   // the host follows Windows 10's bounds rule (Case::older_runtime_refuses)
+    bool hw_older = false;
     std::string hw_name;
     if (!hostwine::host_is_wine()) {
         Ref<IDXGIFactory4> factory;
@@ -402,6 +425,7 @@ int main() {
                 for (std::size_t i = 0; i < table.size(); ++i) REQUIRE(run_case(env, table[i], warp_hr[i]));
                 REQUIRE(warp_dev->GetDeviceRemovedReason() == S_OK);
                 warp_ran = true;
+                warp_older = older_runtime_rule(warp_dev.p, table, warp_hr);
             }
             for (UINT i = 0;; ++i) {
                 Ref<IDXGIAdapter1> adapter;
@@ -419,6 +443,7 @@ int main() {
                     std::snprintf(name_buf, sizeof(name_buf), "%ls", desc.Description);
                     hw_name = name_buf;
                     hw_ran = true;
+                    hw_older = older_runtime_rule(hw_dev.p, table, hw_hr);
                     break;
                 }
             }
@@ -430,21 +455,33 @@ int main() {
 
     unsigned failures = 0;
     std::printf("%-48s | %-10s | %-10s | %-10s\n", "case", "layer", "WARP", hw_ran ? hw_name.c_str() : "HW");
+    unsigned older_cases = 0;
     for (std::size_t i = 0; i < table.size(); ++i) {
         const bool layer_ok = SUCCEEDED(layer_hr[i]);
-        const bool warp_ok = warp_ran ? SUCCEEDED(warp_hr[i]) : table[i].expected_ok;
-        const bool hw_ok = hw_ran ? SUCCEEDED(hw_hr[i]) : table[i].expected_ok;
+        const bool older = table[i].older_runtime_refuses;
+        if (older && (warp_older || hw_older)) ++older_cases;
+        const bool warp_expected = table[i].expected_ok && !(older && warp_older);
+        const bool hw_expected = table[i].expected_ok && !(older && hw_older);
+        const bool warp_ok = warp_ran ? SUCCEEDED(warp_hr[i]) : warp_expected;
+        const bool hw_ok = hw_ran ? SUCCEEDED(hw_hr[i]) : hw_expected;
         std::printf("%-48s | 0x%08lx | %-10s | %-10s\n",
                     table[i].name,
                     static_cast<unsigned long>(layer_hr[i]),
                     warp_ran ? (SUCCEEDED(warp_hr[i]) ? "S_OK" : "FAIL") : (warp_ok ? "(S_OK)" : "(FAIL)"),
                     hw_ran ? (SUCCEEDED(hw_hr[i]) ? "S_OK" : "FAIL") : (hw_ok ? "(S_OK)" : "(FAIL)"));
-        if (layer_ok != warp_ok || layer_ok != hw_ok || layer_ok != table[i].expected_ok) {
+        if (warp_ok != warp_expected || hw_ok != hw_expected || layer_ok != table[i].expected_ok) {
             std::fprintf(stderr, "FAIL %s: layer=%d warp=%d hw=%d expected=%d\n",
                          table[i].name, int(layer_ok), int(warp_ok), int(hw_ok), int(table[i].expected_ok));
             ++failures;
         }
     }
+
+    if (older_cases)
+        std::printf("Windows 10's bounds rule on the host (%s%s%s, no ID3D12Device10): it refuses %u cases the "
+                    "Windows 11 runtime accepts (offset + stride * max_count <= width, also for max_count 0); the "
+                    "layer is held to the Windows 11 verdicts\n",
+                    warp_older ? "WARP" : "", warp_older && hw_older ? ", " : "", hw_older ? hw_name.c_str() : "",
+                    older_cases);
 
     const unsigned validation_errors = vk.validation_errors() - errors_before;
     if (validation_errors) {
