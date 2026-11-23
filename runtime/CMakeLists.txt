@@ -142,11 +142,20 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   if(DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKLibVersion})
     list(APPEND _sdk_lib_hints "$ENV{WindowsSdkDir}Lib/$ENV{WindowsSDKLibVersion}um/x64")
   endif()
-  get_filename_component(_kits_root
-    "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots;KitsRoot10]" ABSOLUTE)
-  if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION AND EXISTS "${_kits_root}")
-    list(APPEND _sdk_lib_hints "${_kits_root}/Lib/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/um/x64")
-  endif()
+  # KitsRoot10 can differ between the registry views: on some machines the 64-bit view names
+  # "C:\Program Files\Windows Kits\10" (only App Certification Kit and References) while the SDK libraries are
+  # under the 32-bit view's "C:\Program Files (x86)\Windows Kits\10". Try both; missing folders are skipped.
+  foreach(_view 64 32)
+    cmake_host_system_information(RESULT _kits_root QUERY WINDOWS_REGISTRY
+      "HKLM/SOFTWARE/Microsoft/Windows Kits/Installed Roots" VALUE KitsRoot10 VIEW ${_view})
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION AND _kits_root)
+      file(TO_CMAKE_PATH "${_kits_root}" _kits_root)
+      set(_kits_lib "${_kits_root}/Lib/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/um/x64")
+      if(EXISTS "${_kits_lib}")
+        list(APPEND _sdk_lib_hints "${_kits_lib}")
+      endif()
+    endif()
+  endforeach()
   find_library(D3D12_LIBRARY NAMES d3d12 HINTS ${_sdk_lib_hints})
   find_library(DXGI_LIBRARY NAMES dxgi HINTS ${_sdk_lib_hints})
   if(D3D12_LIBRARY)
