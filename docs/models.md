@@ -199,8 +199,9 @@ determined here. The rest of `levels.rpf` and the other archives were not export
 
 A reviewer ran the full `levels.rpf` scan and recovery at `7ef5c51` (`FindCandidateOffsets` and
 `RecoverAtOffsets` only, no export; [PR #4687
-comment](https://github.com/ItsNotRexed/Leonida/pull/4687#issuecomment-7092314127)); it was not
-re-run for this page:
+comment](https://github.com/ItsNotRexed/Leonida/pull/4687#issuecomment-7092314127)). A second run of
+the same two calls on another 1.0.2.1 copy (76,155,065,056 bytes) gave the same counts and the same 7
+reject offsets:
 
 | `levels.rpf` | `e293917` | `7ef5c51` |
 |---|---:|---:|
