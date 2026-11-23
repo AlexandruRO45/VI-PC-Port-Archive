@@ -13,6 +13,17 @@ import make_game
 
 
 class PackagingTest(unittest.TestCase):
+    def test_stage_runner_forwards_private_configuration(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap), mock.patch.object(make_game, "runtime") as runtime, \
+                    mock.patch.object(make_game, "log"):
+                make_game.run_build_stages(
+                    ["runtime"], game="game", work="work", out="output", v={}, wav=False, jobs=1,
+                    runtime_build=None, emulate=False, keep_emulated=True, fallbacks=(), overlap=overlap,
+                    discord_presence="private.json")
+                runtime.assert_called_once_with("game", "output", {}, None, 1, work="work",
+                                                discord_presence="private.json")
+
     def test_configuration_and_launcher_are_bundled_without_touching_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
