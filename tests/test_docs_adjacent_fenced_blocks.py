@@ -5,8 +5,9 @@ rebased copy leaves behind: the page shows the same snippet twice, and an edit t
 leaves the other stale next to it. That is how `docs/character_models.md` carried the same
 `manifest.json` block twice (lines 312-320 and 322-330) until it was dropped.
 
-The rule is deliberately narrow: the blocks must be identical and adjacent, so the same command
-quoted again in a later section, or two blocks that differ in one line, are not reported.
+The rule is deliberately narrow: the blocks must be identical, carry the same language tag, and be adjacent, so the
+same command quoted again in a later section, two blocks that differ in one line, or one expression shown for two
+languages are not reported.
 
     python -I tests/test_docs_adjacent_fenced_blocks.py
 
@@ -24,22 +25,22 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def fenced_blocks(lines):
-    """[(index of the opening fence, index of the closing fence, content lines)] for `lines`."""
+    """[(opening fence index, closing fence index, info string, content lines)] for `lines`."""
     blocks, opened = [], None
     for index, line in enumerate(lines):
         match = FENCE.match(line)
         if opened is None:
             if match:
                 marker = match.group(1)
-                opened = (index, marker[0], len(marker), [])
+                opened = (index, marker[0], len(marker), match.group(2).strip().lower(), [])
             continue
         # A closing fence is the same character, at least as long, and nothing after it.
         if match and match.group(1)[0] == opened[1] and len(match.group(1)) >= opened[2] \
                 and not match.group(2).strip():
-            blocks.append((opened[0], index, opened[3]))
+            blocks.append((opened[0], index, opened[3], opened[4]))
             opened = None
             continue
-        opened[3].append(line)
+        opened[4].append(line)
     return blocks
 
 
@@ -47,13 +48,14 @@ def adjacent_repeats(text):
     """[(first block's line number, second block's line number)] for identical blocks back to back.
 
     Line numbers are 1-based and name the opening fence. Blocks with prose between them are not
-    back to back, and empty blocks are ignored.
+    back to back, blocks with different info strings are different examples even when the text matches
+    (a Python and a Ruby snippet can read the same), and empty blocks are ignored.
     """
     lines = text.splitlines()
     found = []
     blocks = fenced_blocks(lines)
-    for (start_a, end_a, body_a), (start_b, _end_b, body_b) in zip(blocks, blocks[1:]):
-        if body_a != body_b or not any(line.strip() for line in body_a):
+    for (start_a, end_a, info_a, body_a), (start_b, _end_b, info_b, body_b) in zip(blocks, blocks[1:]):
+        if body_a != body_b or info_a != info_b or not any(line.strip() for line in body_a):
             continue
         if all(not line.strip() for line in lines[end_a + 1:start_b]):
             found.append((start_a + 1, start_b + 1))
@@ -95,6 +97,14 @@ class AdjacentFencedBlocks(unittest.TestCase):
             "~~~~",                                     # 30
             "print('d')",                               # 31
             "~~~~",                                     # 32
+            "",                                         # 33
+            "~~~python",                                # 34
+            "print('e')",                               # 35
+            "~~~",                                      # 36
+            "",                                         # 37
+            "~~~ruby",                                  # 38
+            "print('e')",                               # 39
+            "~~~",                                      # 40 same text, another language: allowed
         ])
         self.assertEqual(adjacent_repeats(src), [(3, 7), (17, 21)])
 
