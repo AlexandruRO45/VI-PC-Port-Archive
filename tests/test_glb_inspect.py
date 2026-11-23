@@ -167,6 +167,50 @@ def animated_gltf():
 
 
 class GlbInspectTests(unittest.TestCase):
+    def test_json_integer_digit_limit_preserves_report(self):
+        payload = b'{"extras":' + b"7" * (sys.int_info.str_digits_check_threshold + 1) + b"}"
+        payload += b" " * (-len(payload) % 4)
+        data = container(payload)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "integer.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(data)
+            for previous in (None, b"previous report\n"):
+                with self.subTest(existing_report=previous is not None):
+                    if previous is not None:
+                        with open(out, "wb") as handle:
+                            handle.write(previous)
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-X",
+                         f"int_max_str_digits={sys.int_info.str_digits_check_threshold}",
+                         TOOL, path, "--json", out],
+                        capture_output=True, text=True, timeout=60, errors="replace",
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("malformed JSON chunk:", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    with open(path, "rb") as handle:
+                        self.assertEqual(handle.read(), data)
+                    if previous is None:
+                        self.assertFalse(os.path.exists(out))
+                    else:
+                        with open(out, "rb") as handle:
+                            self.assertEqual(handle.read(), previous)
+
+    def test_non_json_constants_keep_one_format_error_prefix(self):
+        for value in (b"NaN", b"Infinity", b"-Infinity"):
+            with self.subTest(value=value):
+                payload = b'{"extras":' + value + b"}"
+                payload += b" " * (-len(payload) % 4)
+                result = self.run_bytes(container(payload))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(value.decode() + " is not a JSON number", result.stderr)
+                self.assertEqual(result.stderr.count("malformed JSON chunk:"), 1)
+                self.assertNotIn("Traceback", result.stderr)
+
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args],
                               capture_output=True, text=True, timeout=60, errors="replace")

@@ -101,7 +101,7 @@ def _text(value: object) -> str | None:
 
 
 def _reject_json_constant(value: str) -> None:
-    raise GlbError(f"malformed JSON chunk: {value} is not a JSON number")
+    raise ValueError(f"{value} is not a JSON number")
 
 
 def parse_glb(data: bytes) -> dict:
@@ -161,6 +161,8 @@ def parse_glb(data: bytes) -> dict:
         raise GlbError(f"malformed JSON chunk: not UTF-8 ({exc.reason} at byte {exc.start})") from exc
     except RecursionError as exc:
         raise GlbError("malformed JSON chunk: nesting is too deep") from exc
+    except ValueError as exc:
+        raise GlbError(f"malformed JSON chunk: {exc}") from exc
     if not isinstance(gltf, dict):
         raise GlbError("malformed JSON chunk: root is not a JSON object")
 
