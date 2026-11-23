@@ -207,12 +207,11 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);
 
-    const uint32_t W = 8, FLOAT_VIEW_MIPS = 4;
+    const uint32_t W = 8;
     VkImage img[3]; VkImageView view[3];
     for (int k = 0; k < 3; k++) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1};
-        ii.mipLevels = k == 0 ? FLOAT_VIEW_MIPS : 1; ii.arrayLayers = 1;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
         ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -227,20 +226,12 @@ int main(int argc, char** argv) {
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view[k]));
     }
-    // A 1x1 float-view fallback in the slots for integer images catches a bounds query through the wrong class.
-    VkImageView float_small_view;
-    {
-        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = img[0]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[0];
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, FLOAT_VIEW_MIPS - 1, 1, 0, 1};
-        CHECK(vkCreateImageView(dev, &vi, nullptr, &float_small_view));
-    }
     VkImage wide; VkImageView wide_view;
     {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[0]; ii.extent = {WIDE_W, WIDE_H, 1};
         ii.mipLevels = WIDE_MIPS; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
-        ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
         CHECK(vkCreateImage(dev, &ii, nullptr, &wide));
         VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, wide, &mr);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -251,6 +242,14 @@ int main(int argc, char** argv) {
         vi.image = wide; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[0];
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, WIDE_MIPS, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &wide_view));
+    }
+    // A 1x1 float-view fallback in the slots for integer images catches a bounds query through the wrong class.
+    VkImageView float_small_view;
+    {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = wide; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[0];
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, WIDE_MIPS - 1, 1, 0, 1};
+        CHECK(vkCreateImageView(dev, &vi, nullptr, &float_small_view));
     }
     VkImage vol; VkImageView vol_view;
     {
@@ -399,7 +398,7 @@ int main(int argc, char** argv) {
         ib[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
         ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         ib[k].srcQueueFamilyIndex = ib[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, k == 0 ? FLOAT_VIEW_MIPS : 1, 0, 1};
+        ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         if (filled && k > 0) {   // filled by a copy first
             ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         }
