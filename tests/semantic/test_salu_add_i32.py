@@ -737,5 +737,138 @@ class TestSAddI32IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(dst, 0xFF000002)
         self.assertEqual(scc, 1)
 
+try:
+    import support  # noqa: E402
+    from spirv_mini_interp import run_fragment  # noqa: E402
+    TRANSLATOR_AVAILABLE = True
+except Exception:
+    support = None  # type: ignore
+    run_fragment = None  # type: ignore
+    TRANSLATOR_AVAILABLE = False
+
+
+ADD_BOUNDARY_CASES = [
+    (0, 0, "zero + zero"),
+    (0, 0x7FFFFFFF, "zero + INT32_MAX"),
+    (0, 0x80000000, "zero + INT32_MIN"),
+    (0x7FFFFFFF, 1, "positive overflow: INT32_MAX + 1"),
+    (0x7FFFFFFF, 0x7FFFFFFF, "positive overflow: INT32_MAX + INT32_MAX"),
+    (0x40000000, 0x40000000, "positive overflow: 2^30 + 2^30"),
+    (0x80000000, 0x80000000, "negative overflow: INT32_MIN + INT32_MIN"),
+    (0x80000000, 0xFFFFFFFF, "negative overflow: INT32_MIN + (-1)"),
+    (0xC0000000, 0xBFFFFFFF, "negative overflow: -2^30 + (-2^30 - 1)"),
+    (0xFFFFFFFF, 1, "unsigned wrap without signed overflow: (-1) + 1"),
+    (0xFFFFFFFF, 0xFFFFFFFF, "unsigned wrap without signed overflow: (-1) + (-1)"),
+    (0x80000000, 0x7FFFFFFF, "opposite signs: INT32_MIN + INT32_MAX"),
+    (0x7FFFFFFF, 0x80000000, "opposite signs: INT32_MAX + INT32_MIN"),
+    (0x12345678, 0xEDCBA988, "opposite signs cancelling to zero"),
+]
+
+
+def run_translator_add_i32(x: int, y: int, scc_in: int = 0) -> tuple[int, int]:
+    """Assemble, translate, and execute a pixel shader running s_add_i32."""
+    if not TRANSLATOR_AVAILABLE or support is None:
+        raise unittest.SkipTest("tools/rdna2spirv.py translator not available")
+
+    lines = [
+        f"s_mov_b32 s2, {x:#x}",
+        f"s_mov_b32 s3, {y:#x}",
+        f"s_mov_b32 s4, {scc_in}",
+        "s_cmp_eq_u32 s4, 1",
+        "s_add_i32 s0, s2, s3",
+        "s_cselect_b32 s1, 1, 0",
+        "v_mov_b32 v0, s0",
+        "v_mov_b32 v1, s1",
+        "exp mrt0 v0, v1, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spvasm = support.translate_lines("ps_salu_add_i32", lines)
+    words = support.mrt0_words(spvasm)
+    return words[0], words[1]
+
+
+def run_translator_add_i32_imm(x: int, imm_str: str, scc_in: int = 0) -> tuple[int, int]:
+    """Assemble, translate, and execute s_add_i32 with an immediate / inline constant."""
+    if not TRANSLATOR_AVAILABLE or support is None:
+        raise unittest.SkipTest("tools/rdna2spirv.py translator not available")
+
+    lines = [
+        f"s_mov_b32 s2, {x:#x}",
+        f"s_mov_b32 s4, {scc_in}",
+        "s_cmp_eq_u32 s4, 1",
+        f"s_add_i32 s0, s2, {imm_str}",
+        "s_cselect_b32 s1, 1, 0",
+        "v_mov_b32 v0, s0",
+        "v_mov_b32 v1, s1",
+        "exp mrt0 v0, v1, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spvasm = support.translate_lines("ps_salu_add_i32_imm", lines)
+    words = support.mrt0_words(spvasm)
+    return words[0], words[1]
+
+
+class TestSAddI32TranslatorExecution(unittest.TestCase):
+    """Translator-backed execution tests verifying SPIR-V generation against hardware semantics."""
+
+    def test_translator_all_boundary_cases(self) -> None:
+        for x, y, desc in ADD_BOUNDARY_CASES:
+            want_dst, want_scc = ref_s_add_i32(x, y)
+            for prior_scc in (0, 1):
+                with self.subTest(case=desc, x=hex(x), y=hex(y), prior_scc=prior_scc):
+                    got_dst, got_scc = run_translator_add_i32(x, y, scc_in=prior_scc)
+                    self.assertEqual(got_dst, want_dst, f"Destination mismatch in {desc}")
+                    self.assertEqual(got_scc, want_scc, f"SCC mismatch in {desc}")
+
+    def test_translator_immediate_operands(self) -> None:
+        cases = [
+            (100, "0", 0),
+            (100, "1", 1),
+            (100, "-1", -1),
+            (0x7FFFFFFF, "1", 1),
+            (0x80000000, "-1", -1),
+            (50, "64", 64),
+            (10, "-16", -16),
+            (0x10000000, "0x20000000", 0x20000000),
+        ]
+        for reg_val, imm_str, imm_val in cases:
+            want_dst, want_scc = ref_s_add_i32(reg_val, imm_val)
+            with self.subTest(reg=hex(reg_val), imm=imm_str):
+                got_dst, got_scc = run_translator_add_i32_imm(reg_val, imm_str, scc_in=0)
+                self.assertEqual(got_dst, want_dst)
+                self.assertEqual(got_scc, want_scc)
+
+    def test_translator_seeded_random(self) -> None:
+        rng = random.Random(0xADD132)
+        edge_vals = [0, 1, -1, INT32_MAX, INT32_MIN, 0x40000000, -0x40000000]
+        for _ in range(25):
+            x = rng.choice(edge_vals) if rng.random() < 0.4 else rng.getrandbits(32)
+            y = rng.choice(edge_vals) if rng.random() < 0.4 else rng.getrandbits(32)
+            scc_in = rng.randint(0, 1)
+            want_dst, want_scc = ref_s_add_i32(x, y)
+            with self.subTest(x=hex(x), y=hex(y), scc_in=scc_in):
+                got_dst, got_scc = run_translator_add_i32(x, y, scc_in=scc_in)
+                self.assertEqual(got_dst, want_dst)
+                self.assertEqual(got_scc, want_scc)
+
+    def test_negative_controls_and_mutation_detection(self) -> None:
+        # Mutation 1: s_add_u32 carry-out used instead of signed overflow
+        # On (-1) + 1: s_add_u32 sets SCC=1, s_add_i32 sets SCC=0
+        correct_dst, correct_scc = ref_s_add_i32(0xFFFFFFFF, 1)
+        mutated_dst, mutated_scc = ref_s_add_u32(0xFFFFFFFF, 1)
+        self.assertEqual(correct_scc, 0)
+        self.assertEqual(mutated_scc, 1)
+        self.assertNotEqual(correct_scc, mutated_scc)
+
+        # Mutation 2: Overflow condition inverted
+        inv_scc = 1 - correct_scc
+        self.assertNotEqual(correct_scc, inv_scc)
+
+        # Mutation 3: SCC hardcoded to 0
+        ovf_dst, ovf_scc = ref_s_add_i32(INT32_MAX, 1)
+        self.assertEqual(ovf_scc, 1)
+        zero_scc = 0
+        self.assertNotEqual(ovf_scc, zero_scc)
+
 if __name__ == "__main__":
     unittest.main()
