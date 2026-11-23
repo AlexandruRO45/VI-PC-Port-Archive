@@ -154,11 +154,14 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
     for name in names:
         meta = index[name]
         fb = meta.get("bary_fallback_input") if isinstance(meta, dict) else None
-        if not fb:
+        if fb is None:      # the translator omits the key when there is no fallback; an explicit {} is a bad entry
             continue
         if not isinstance(fb, dict):
             raise ValueError(f"{index_path}: index entry {name!r} has a bary_fallback_input that is not a "
                              f"JSON object: {fb!r}")
+        if not fb:
+            raise ValueError(f"{index_path}: index entry {name!r} has an empty bary_fallback_input object; "
+                             f"it needs a location")
         location = fb.get("location")
         if type(location) is not int:
             raise ValueError(f"{index_path}: index entry {name!r} has a bary_fallback_input location that is "
@@ -167,6 +170,13 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
         if not isinstance(inputs, list):
             raise ValueError(f"{index_path}: index entry {name!r} has inputs that are not a list of integers: "
                              f"{inputs!r}")
+        for n in inputs:
+            # an integer location, or the numeric string a stale index can carry (gs_spvasm reads both);
+            # null / bool / float / nested values are not locations and used to reach int() as a TypeError
+            if type(n) is int or (type(n) is str and n.strip().lstrip("-").isdigit()):
+                continue
+            raise ValueError(f"{index_path}: index entry {name!r} has an input location that is not an "
+                             f"integer: {n!r}")
         path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
         shader = gs_spvasm(inputs, location, clip_count, cull_count)
         yield path, shader

@@ -297,7 +297,6 @@ class TestWriteForIndex(unittest.TestCase):
             "vs_main": {"stage": "vs", "outputs": [0, 1]},
             "ps_no_fb": {"stage": "ps", "inputs": [0]},
             "ps_none_fb": {"stage": "ps", "inputs": [0], "bary_fallback_input": None},
-            "ps_empty_fb": {"stage": "ps", "inputs": [0], "bary_fallback_input": {}},
             "ps_z": {"stage": "ps", "inputs": [2, 0, 2], "bary_fallback_input": {"location": 1}},
             "ps_a": {"stage": "ps", "bary_fallback_input": {"location": 0}},
         }
@@ -443,6 +442,7 @@ class TestWriteForIndex(unittest.TestCase):
             "int": (5, "bary_fallback_input that is not a JSON object"),
             "string": ("5", "bary_fallback_input that is not a JSON object"),
             "list": ([5], "bary_fallback_input that is not a JSON object"),
+            "empty object": ({}, "empty bary_fallback_input object"),
             "missing location": ({"component_type": "f32"}, "location that is not an integer"),
             "null location": ({"location": None}, "location that is not an integer"),
             "string location": ({"location": "5"}, "location that is not an integer"),
@@ -466,6 +466,21 @@ class TestWriteForIndex(unittest.TestCase):
                     self._write_index(tmp, {"ps_a": {"stage": "ps", "inputs": inputs,
                                                      "bary_fallback_input": {"location": 5}}})
                     with self.assertRaisesRegex(ValueError, "inputs that are not a list of integers") as caught:
+                        bary_fallback_gs.write_for_index(tmp)
+                    self.assertIn("index entry 'ps_a'", str(caught.exception))
+                    self.assertEqual(os.listdir(tmp), ["index.json"])
+
+    def test_rejects_non_integer_input_elements(self):
+        # inputs [null] used to reach int(None) in gs_spvasm as a TypeError traceback; each element that is
+        # not an integer location (or the numeric string a stale index carries) is one error line instead.
+        cases = {"null": [None], "bool": [True], "float": [1.5], "list": [[0]],
+                 "object": [{"0": 1}], "non_numeric_string": ["abc"], "mixed": [0, None]}
+        with tempfile.TemporaryDirectory() as tmp:
+            for tag, inputs in cases.items():
+                with self.subTest(case=tag):
+                    self._write_index(tmp, {"ps_a": {"stage": "ps", "inputs": inputs,
+                                                     "bary_fallback_input": {"location": 5}}})
+                    with self.assertRaisesRegex(ValueError, "input location that is not an integer") as caught:
                         bary_fallback_gs.write_for_index(tmp)
                     self.assertIn("index entry 'ps_a'", str(caught.exception))
                     self.assertEqual(os.listdir(tmp), ["index.json"])
