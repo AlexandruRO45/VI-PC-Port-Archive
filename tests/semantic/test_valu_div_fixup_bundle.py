@@ -268,5 +268,29 @@ class TestVDivFmasF32Reference(unittest.TestCase):
         self.assertAlmostEqual(ref_div_fmas_f32(1.0, 1.0, 2.0, 1), 3.0 * (2.0 ** 64), delta=1e10)
 
 
+def step_scalar_div_fmas_f32(state: ValuDivState, instr: Instruction) -> None:
+    if instr.opcode != "v_div_fmas_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    s0 = state.read_f32(instr.src0)
+    s1 = state.read_f32(instr.src1)
+    s2 = state.read_f32(instr.src2)
+    res = ref_div_fmas_f32(s0, s1, s2, state.vcc)
+    state.write_f32(int(instr.dst.index_or_val), res)
+
+
+class TestVDivFmasF32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_div_fmas_f32."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuDivState()
+        state.write_f32(1, 2.0)
+        state.write_f32(2, 3.0)
+        state.write_f32(3, 4.0)
+        state.vcc = 0
+        instr = Instruction("v_div_fmas_f32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_scalar_div_fmas_f32(state, instr)
+        self.assertEqual(bits_to_f32(state.vgprs[0]), 10.0)
+
+
 if __name__ == "__main__":
     unittest.main()
