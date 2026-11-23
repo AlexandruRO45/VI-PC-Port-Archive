@@ -36,9 +36,15 @@ def psin():
         data[pos:pos + 4] = tag
         data[pos + 4:pos + 8] = size.to_bytes(4, "big")
         if tag == b"LRSC":
-            data[pos + 8:pos + 12] = b"0DRP"
-            struct.pack_into("<I", data, pos + 12, 122)
-            struct.pack_into("<I", data, pos + 8 + 0x0C, 7)
+            # docs/restofworld.md: the LRSC payload is the 80-byte 0DRP frame with a zero qword at +0x08,
+            # root_block at +0x10, 0xbb pointer slots and (structs, enums, blocks, 0) at +0x38.
+            lrsc = pos + 8
+            data[lrsc:lrsc + 4] = b"0DRP"
+            struct.pack_into("<I", data, lrsc + 4, 122)
+            struct.pack_into("<I", data, lrsc + 0x10, 7)
+            data[lrsc + 0x18:lrsc + 0x38] = b"\xbb" * 32
+            struct.pack_into("<4H", data, lrsc + 0x38, 18, 2, 8, 0)
+            data[lrsc + 0x40:lrsc + 0x48] = b"\xbb" * 8
         pos += size
     return bytes(data)
 
@@ -53,11 +59,15 @@ def page():
 
 
 def page_at_zero():
-    """The LRSC placement as docs/restofworld.md measures it: zero at +0x08..+0x0f, root_block at +0x10."""
-    data = bytearray(0x60)
+    """The LRSC placement as docs/restofworld.md measures it: the 80-byte frame with a zero qword at
+    +0x08..+0x0f, root_block 7 at +0x10, 0xbb pointer slots, and (structs, enums, blocks, 0) at +0x38."""
+    data = bytearray(0x50)
     data[:4] = b"0DRP"
     struct.pack_into("<I", data, 4, 122)
     struct.pack_into("<I", data, 0x10, 7)
+    data[0x18:0x38] = b"\xbb" * 32
+    struct.pack_into("<4H", data, 0x38, 18, 2, 8, 0)
+    data[0x40:0x48] = b"\xbb" * 8
     return bytes(data)
 
 
@@ -180,16 +190,20 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual((row["signature"], row["version"], row["count"], row["detail"]),
                          ("0drp", 122, 3, "0DRP@0x10"))
 
-    def test_page_at_zero_uses_lrsc_count(self):
-        row = restofworld_index.classify(page_at_zero(), 0x200, 40)
-        self.assertEqual((row["signature"], row["version"], row["count"]), ("0drp", 122, 7))
-        # In the LRSC form +0x08..+0x0f is zero and root_block is at +0x10; a dword written at +0x0c only is
-        # not a count. Reading +0x0c reported 0 for every real LRSC stream (docs/restofworld.md line 78, the
-        # 1-based root_block indices at +0x10).
+    def test_page_at_zero_counts_blocks_and_names_root_block(self):
+        # docs/restofworld.md: the LRSC +0x10 field is a 1-based root_block index and the block count is the
+        # third u16 at +0x38 ("(structs, enums, blocks, 0)"), the two odrp_7a.py returns as root_block and
+        # blocks. The measured third record is root_block 7 within 8 blocks, so the count column is 8.
+        row = restofworld_index.classify(page_at_zero(), 0x200, 0x50)
+        self.assertEqual((row["signature"], row["version"], row["count"]), ("0drp", 122, 8))
+        self.assertEqual(row["detail"], "0DRP@0x0 root_block=7")
+        # +0x08..+0x0f is zero in the LRSC form; a dword written at +0x0c only is not a count (and +0x10 is
+        # an index, not one either).
         stray = bytearray(page_at_zero())
         struct.pack_into("<I", stray, 0x10, 0)
         struct.pack_into("<I", stray, 0x0C, 7)
-        self.assertEqual(restofworld_index.classify(bytes(stray), 0x200, 40)["count"], 0)
+        stray_row = restofworld_index.classify(bytes(stray), 0x200, 0x50)
+        self.assertEqual((stray_row["count"], stray_row["detail"]), (8, "0DRP@0x0 root_block=0"))
 
     def test_rsc8_header(self):
         row = restofworld_index.classify(rsc8(), 0x300, 50)
@@ -423,7 +437,7 @@ class ArchiveTest(unittest.TestCase):
         rows, summary = restofworld_index.scan_dir(folder)
         self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200, 0x1300])
         self.assertEqual([r["signature"] for r in rows], ["psin", "0drp", "0drp", "rsc8"])
-        self.assertEqual(rows[2]["count"], 7)
+        self.assertEqual(rows[2]["count"], 8)
         self.assertEqual(summary["mode"], "directory")
         self.assertEqual(summary["files"], 4)
 

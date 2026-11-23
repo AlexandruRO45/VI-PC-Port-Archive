@@ -121,6 +121,10 @@ def is_pg_tex_dictionary(data, count):
     return (p20 >> 28) == 5 and (p30 >> 28) == 5 and c28 == c38 == count
 
 
+def _u16(data, at):
+    return struct.unpack_from("<H", data, at)[0] if len(data) >= at + 2 else None
+
+
 def _u32(data, at):
     return struct.unpack_from("<I", data, at)[0] if len(data) >= at + 4 else None
 
@@ -207,12 +211,17 @@ def classify(data, offset, stored):
         return row
     for at in (0x10, 0):
         if data[at:at + 4] == b"0DRP":
-            # The count sits at frame +0x10 in both placements: root_objects for the standalone form (stream
-            # +0x20, its +0x14 zero) and root_block for an LRSC payload (docs/restofworld.md, tools/odrp_7a.py).
-            # +0x0c belongs to the zero qword at +0x08 and is never a count.
-            count = _u64(data, at + 0x10) if at == 0x10 else _u32(data, at + 0x10)
-            row.update(signature="0drp", version=_u32(data, at + 4), count=count,
-                       detail=f"0DRP@{at:#x}")
+            if at == 0x10:
+                # Standalone form: root_objects is a count, at frame +0x10 (stream +0x20, its +0x14 zero).
+                row.update(signature="0drp", version=_u32(data, at + 4), count=_u64(data, at + 0x10),
+                           detail="0DRP@0x10")
+                return row
+            # LRSC form: +0x10 is a 1-based root_block index, not a count. The block count is the third of the
+            # four u16 at +0x38 (docs/restofworld.md: "(structs, enums, blocks, 0)"; tools/odrp_7a.py
+            # parse_lrsc_payload unpacks the same four u16). +0x0c is part of the zero qword at +0x08.
+            root_block = _u32(data, at + 0x10)
+            row.update(signature="0drp", version=_u32(data, at + 4), count=_u16(data, at + 0x3C),
+                       detail=f"0DRP@0x0 root_block={root_block}")
             return row
     if data[:4] in (b"RSC8", b"RSC7"):
         row.update(signature=data[:4].decode("ascii").lower(), version=_u32(data, 4),
