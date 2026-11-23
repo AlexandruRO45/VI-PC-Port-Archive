@@ -450,6 +450,29 @@ class ScanDirCollisionAndTrailingTest(unittest.TestCase):
         self.assertEqual(len(blob), 131072)
         self.assertEqual(parsed["status"], "trailing")
 
+    def test_join_resource_stops_on_first_chunk_trailing_or_bad(self):
+        # A 64 KiB first chunk whose parse already ended in "trailing" or "bad"
+        # cannot be completed by appending more bytes; it must not swallow the
+        # following unrelated stream.
+        trailing_c1 = wide_blob().ljust(65536, b"\x00")
+        bad_c1 = (WIDE + bytes([9, 0x10]) + struct.pack("<Q", 1)).ljust(65536, b"\x00")
+        unrelated = b"UNRELATED_NON_RBF0_CHUNK" + b"\x00" * 100
+        for expected_status, c1 in (("trailing", trailing_c1), ("bad", bad_c1)):
+            with self.subTest(status=expected_status):
+                rows = [
+                    {"offset": 0, "stored": len(c1), "size": len(c1), "head": c1[:8]},
+                    {"offset": len(c1), "stored": len(unrelated), "size": len(unrelated), "head": unrelated[:8]},
+                ]
+                blobs = {0: c1, len(c1): unrelated}
+                blob, chunks, parsed = rbf0_index.join_resource(
+                    rows, 0, lambda r: blobs[r["offset"]], check_gap=False
+                )
+                self.assertEqual(chunks, 1)
+                self.assertEqual(len(blob), 65536)
+                self.assertEqual(parsed["status"], expected_status)
+                if expected_status == "trailing":
+                    self.assertIn(f"{65536 - len(wide_blob())} bytes after the root closed", parsed["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -240,7 +240,7 @@ def join_resource(rows, index, read, check_gap=True):
     blob = read(row)
     chunks = 1
     parsed = parse_rbf0(blob, string_limit=None)
-    if parsed["complete"] or row["size"] != MAX_CHUNK:
+    if parsed["status"] != "truncated" or row["size"] != MAX_CHUNK:
         return blob, chunks, parsed
     j = index + 1
     while j < len(rows) and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES:
