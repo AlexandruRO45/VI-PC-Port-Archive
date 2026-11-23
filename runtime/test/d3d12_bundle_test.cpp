@@ -667,7 +667,9 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
     }
 
     // A root-constant call of zero dwords is as valid in a bundle as on a direct list; a closed bundle takes no more
-    // state calls (they are ignored) and a draw on it makes it invalid, so a parent that executes it fails.
+    // calls: state calls and draws on it are ignored, as WARP and native AMD D3D12 ignore them
+    // (d3d12_close_parity_test, "closed bundle" cases), so a parent that executes it still closes and draws what the
+    // bundle recorded.
     {
         Rig r;
         CHECK(r.init(device, vs, ps));
@@ -695,9 +697,9 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
         b->IASetPrimitiveTopology(tlist);  // closed: ignored, so the bundle still draws the whole quad
         CHECK(run(b));
         CHECK(close == S_OK && grid_text == ROWS4("RRRRBBBB") " " BLANK4);
-        b->DrawInstanced(4, 1, 0, 0);  // closed: invalid
+        b->DrawInstanced(4, 1, 0, 0);  // closed: ignored, the bundle stays valid
         CHECK(run(b));
-        CHECK(close == E_INVALIDARG);
+        CHECK(close == S_OK && grid_text == ROWS4("RRRRBBBB") " " BLANK4);
     }
 
     // The application may release the pipeline state and root signature as soon as it has recorded them, and the

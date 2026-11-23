@@ -48,6 +48,11 @@ struct Env {
     Ref<ID3D12QueryHeap> occlusion;
     Ref<ID3D12CommandAllocator> closed_bundle_allocator;
     Ref<ID3D12GraphicsCommandList> closed_bundle;
+    // CBV/SRV/UAV descriptor heaps, one not shader-visible and one shader-visible.
+    Ref<ID3D12DescriptorHeap> cbv_heap, visible_cbv_heap;
+    // The bundle fresh_closed_bundle() made last.
+    Ref<ID3D12CommandAllocator> fresh_bundle_allocator;
+    Ref<ID3D12GraphicsCommandList> fresh_bundle;
     // The list being recorded, and the same list as ID3D12GraphicsCommandList2 (null when not given).
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12GraphicsCommandList2* list2 = nullptr;
@@ -105,7 +110,27 @@ struct Env {
         CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, closed_bundle_allocator.p,
                                                   nullptr, IID_PPV_ARGS(&closed_bundle.p))));
         CHECK(SUCCEEDED(closed_bundle->Close()));
+        const D3D12_DESCRIPTOR_HEAP_DESC cbv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                                  D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const D3D12_DESCRIPTOR_HEAP_DESC visible_cbv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        CHECK(SUCCEEDED(device->CreateDescriptorHeap(&cbv_desc, IID_PPV_ARGS(&cbv_heap.p))));
+        CHECK(SUCCEEDED(device->CreateDescriptorHeap(&visible_cbv_desc, IID_PPV_ARGS(&visible_cbv_heap.p))));
         return true;
+    }
+
+    // A new bundle, closed with nothing recorded, for a case whose calls on a closed bundle must not reach the
+    // shared closed_bundle (and every case after it). Null if it cannot be made.
+    ID3D12GraphicsCommandList* fresh_closed_bundle() {
+        fresh_bundle.reset();
+        fresh_bundle_allocator.reset();
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                  IID_PPV_ARGS(&fresh_bundle_allocator.p))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, fresh_bundle_allocator.p, nullptr,
+                                             IID_PPV_ARGS(&fresh_bundle.p))) ||
+            FAILED(fresh_bundle->Close()))
+            return nullptr;
+        return fresh_bundle.p;
     }
 };
 
@@ -149,6 +174,14 @@ struct Case {
 };
 
 #define CALLS(...) [](Env& e) { __VA_ARGS__; return true; }
+// The calls on a fresh closed bundle `b`, then ExecuteBundle of `b` on the list.
+#define ON_CLOSED_BUNDLE(...) [](Env& e) { \
+    ID3D12GraphicsCommandList* const b = e.fresh_closed_bundle(); \
+    if (!b) return false; \
+    __VA_ARGS__; \
+    e.list->ExecuteBundle(b); \
+    return true; \
+}
 #define RECORD_COPY(dst_location, x, src_location, box) do { \
     const auto d = dst_location; const auto s = src_location; e.list->CopyTextureRegion(&d, x, 0, 0, &s, box); \
 } while (0)
@@ -345,6 +378,58 @@ std::vector<Case> cases() {
                e.closed_bundle->OMSetStencilRef(9);
                e.closed_bundle->ClearState(nullptr);
                e.list->ExecuteBundle(e.closed_bundle.p))},
+        // A call on a closed bundle, then a list that executes the bundle: WARP and native AMD D3D12 (RX 6750 XT)
+        // ignore the call and close the list. Each case has a bundle of its own.
+        {"closed bundle executed once, then DrawInstanced on it", true, match,
+         [](Env& e) {
+             ID3D12GraphicsCommandList* const b = e.fresh_closed_bundle();
+             Ref<ID3D12CommandAllocator> allocator;
+             Ref<ID3D12GraphicsCommandList> first;
+             if (!b || FAILED(e.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                               IID_PPV_ARGS(&allocator.p))) ||
+                 FAILED(e.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                    IID_PPV_ARGS(&first.p))))
+                 return false;
+             first->ExecuteBundle(b);
+             if (FAILED(first->Close())) return false;
+             b->DrawInstanced(3, 1, 0, 0);
+             e.list->ExecuteBundle(b);
+             return true;
+         }},
+        {"closed bundle: DrawIndexedInstanced", true, match, ON_CLOSED_BUNDLE(b->DrawIndexedInstanced(3, 1, 0, 0, 0))},
+        {"closed bundle: Dispatch", true, match, ON_CLOSED_BUNDLE(b->Dispatch(1, 1, 1))},
+        {"closed bundle: SetDescriptorHeaps of a heap that is not shader-visible", true, match,
+         ON_CLOSED_BUNDLE(ID3D12DescriptorHeap* heaps[] = {e.cbv_heap.p}; b->SetDescriptorHeaps(1, heaps))},
+        {"closed bundle: SetDescriptorHeaps of an RTV heap", true, match,
+         ON_CLOSED_BUNDLE(ID3D12DescriptorHeap* heaps[] = {e.rtv_heap.p}; b->SetDescriptorHeaps(1, heaps))},
+        {"closed bundle: SetDescriptorHeaps of two CBV/SRV/UAV heaps", true, match,
+         ON_CLOSED_BUNDLE(ID3D12DescriptorHeap* heaps[] = {e.visible_cbv_heap.p, e.visible_cbv_heap.p};
+                          b->SetDescriptorHeaps(2, heaps))},
+        // The one call measured here that the PC runtime does not ignore on a closed bundle: the parent (which has no
+        // heap bound) then fails its Close on WARP and AMD. The layer ignores it.
+        {"closed bundle: SetDescriptorHeaps of a shader-visible heap", false, looser,
+         ON_CLOSED_BUNDLE(ID3D12DescriptorHeap* heaps[] = {e.visible_cbv_heap.p}; b->SetDescriptorHeaps(1, heaps))},
+        {"closed bundle: IASetVertexBuffers(30, 4)", true, match,
+         ON_CLOSED_BUNDLE(const D3D12_VERTEX_BUFFER_VIEW views[4] = {}; b->IASetVertexBuffers(30, 4, views))},
+        {"closed bundle: RSSetViewports", true, match,
+         ON_CLOSED_BUNDLE(const D3D12_VIEWPORT v{0, 0, 8, 8, 0, 1}; b->RSSetViewports(1, &v))},
+        {"closed bundle: RSSetScissorRects", true, match,
+         ON_CLOSED_BUNDLE(const D3D12_RECT r{0, 0, 8, 8}; b->RSSetScissorRects(1, &r))},
+        {"closed bundle: OMSetRenderTargets", true, match,
+         ON_CLOSED_BUNDLE(b->OMSetRenderTargets(1, &e.rtv, FALSE, nullptr))},
+        {"closed bundle: ClearRenderTargetView", true, match,
+         ON_CLOSED_BUNDLE(const FLOAT color[4] = {}; b->ClearRenderTargetView(e.rtv, color, 0, nullptr))},
+        {"closed bundle: ResourceBarrier", true, match,
+         ON_CLOSED_BUNDLE(const auto t = barrier(e.tex.p, common, copy_dest); b->ResourceBarrier(1, &t))},
+        {"closed bundle: CopyBufferRegion", true, match,
+         ON_CLOSED_BUNDLE(b->CopyBufferRegion(e.buffer.p, 0, e.upload.p, 0, 16))},
+        {"closed bundle: DiscardResource", true, match, ON_CLOSED_BUNDLE(b->DiscardResource(e.target.p, nullptr))},
+        {"closed bundle: SetPredication(nullptr)", true, match,
+         ON_CLOSED_BUNDLE(b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO))},
+        {"closed bundle: BeginQuery", true, match,
+         ON_CLOSED_BUNDLE(b->BeginQuery(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0))},
+        {"closed bundle: SetMarker", true, match, ON_CLOSED_BUNDLE(b->SetMarker(0, "x", 2))},
+        {"closed bundle: BeginEvent", true, match, ON_CLOSED_BUNDLE(b->BeginEvent(0, "x", 2))},
         {"RSSetViewports(0, nullptr)", true, match, CALLS(e.list->RSSetViewports(0, nullptr))},
         {"RSSetViewports(17)", true, stricter,
          CALLS(D3D12_VIEWPORT v[17]; for (auto& x : v) x = {0, 0, 8, 8, 0, 1}; e.list->RSSetViewports(17, v))},

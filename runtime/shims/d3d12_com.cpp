@@ -998,8 +998,11 @@ private:
         return out;
     }
 
+    // A failed call makes Close return E_INVALIDARG. A call on a list that is already closed records nothing and
+    // fails nothing: WARP and native AMD D3D12 ignore it, so a closed bundle stays valid for every list that executes
+    // it afterwards (d3d12_close_parity_test, the "closed bundle" cases).
     void check(bool ok) {
-        if (!ok) invalid_ = true;
+        if (!ok && !list_.closed()) invalid_ = true;
     }
 
     void stop_recording() {
@@ -1220,14 +1223,10 @@ private:
 
     // Every deferred call replays through a private member that does not trace: the trace line is written once, when
     // the application makes the call, and not again at each ExecuteBundle. After Close nothing is appended, since
-    // another list may be executing the bundle: a state call is ignored, and a draw or dispatch (`command`) makes
-    // the list invalid.
-    bool defer(std::function<void(GraphicsCommandList&)> run, bool command = false) {
+    // another list may be executing the bundle: the call is ignored, a draw or dispatch (`command`) too (check()).
+    bool defer(std::function<void(GraphicsCommandList&)> run, [[maybe_unused]] bool command = false) {
         if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) return false;
-        if (list_.closed()) {
-            if (command) check(false);
-            return true;
-        }
+        if (list_.closed()) return true;
         calls_.push_back({list_.commands().size(), std::move(run)});
         return true;
     }
