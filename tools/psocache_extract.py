@@ -12,7 +12,8 @@ How the search stays bounded and deterministic:
    between streams is zero padding or unread bytes. Every stream is inflated in 1 MiB pieces so the walk learns
    where it ends; only the first 4 inflated bytes are kept for the test. The output is discarded otherwise.
 2. The first stream whose inflated bytes start with ``PS\\0\\x09`` wins and the scan stops. If none is found
-   before ``--budget`` compressed bytes (default 8 GiB) or ``--max-streams`` streams (default 200,000), or at the
+   within ``--budget`` bytes from the archive data offset (default 8 GiB), within ``--max-streams``
+   streams (default 200,000), or by the
    end of the archive, the tool exits 2 without writing anything.
 3. The header of that stream declares the total: ``0x80 + graphics*0x70 + compute*0x18 + meta_index*8 +
    shader_index*8 + meta_size + code_size``. The tool appends following streams after at most 1 MiB of zero
@@ -109,23 +110,23 @@ def declared_total(header):
 
 def find_match(m, size, start, budget, max_streams):
     """Walk the stream table from ``start`` and return the first stream whose output starts with the magic."""
+    end = min(size, start + budget)
     pos = start
-    spent = 0
     streams = 0
-    while pos < size and streams < max_streams and spent < budget:
-        found = ZHDR.search(m, pos, size)
+    while pos < end and streams < max_streams:
+        found = ZHDR.search(m, pos, end)
         if not found:
             break
         s = found.start()
-        used, head = inflate(m, s, size)
+        used, head = inflate(m, s, end)
         if used is None:
             pos = s + 1  # a false zlib header inside another stream
             continue
         streams += 1
-        spent += used - s
         if head == MAGIC:
-            return {"offset": s, "streams": streams, "spent": spent}
+            return {"offset": s, "streams": streams, "spent": used - start}
         pos = used
+    spent = (pos if streams >= max_streams else end) - start
     return {"offset": None, "streams": streams, "spent": spent}
 
 
@@ -215,7 +216,7 @@ def extract(
                 if search["offset"] is None:
                     if not quiet:
                         print(
-                            "archive #%d: size %d, %d streams, no cache in %d compressed bytes"
+                            "archive #%d: size %d, %d streams, no cache in %d archive data bytes"
                             % (index, size, search["streams"], search["spent"])
                         )
                     continue
@@ -245,7 +246,7 @@ def extract(
                     {"size": size, **search, "archive_stream_offset": search["offset"]},
                 )
     raise NotFound(
-        "no cache found: %d archives, %d streams, %d compressed bytes examined"
+        "no cache found: %d archives, %d streams, %d archive data bytes examined"
         % (len(paths), streams, spent)
     )
 
@@ -260,7 +261,7 @@ def main(argv=None):
         "--budget",
         type=int,
         default=DEFAULT_BUDGET,
-        help="compressed bytes to examine before giving up (default %(default)s)",
+        help="archive data bytes to search before giving up (default %(default)s)",
     )
     ap.add_argument(
         "--max-streams",
@@ -285,7 +286,7 @@ def main(argv=None):
         return 2
     if not a.quiet:
         print(
-            "archive #%d: size %d, %d streams scanned, %d compressed bytes"
+            "archive #%d: size %d, %d streams scanned, %d archive data bytes"
             % (index, search["size"], search["streams"], search["spent"])
         )
         print(

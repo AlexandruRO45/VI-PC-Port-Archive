@@ -130,6 +130,29 @@ class PsocacheExtractTest(unittest.TestCase):
         self.assertIn("no cache found", p.stderr)
         self.assertFalse(os.path.exists(self.out))
 
+    def test_budget_must_include_the_whole_candidate_stream(self):
+        match_end = len(zlib.compress(b"noise" * 100)) + 1 + len(zlib.compress(self.cache[:SPLIT]))
+        p = run(self.archive, self.out, "--budget", str(match_end - 1))
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(self.out))
+        p = run(self.archive, self.out, "--budget", str(match_end))
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_budget_is_shared_across_archive_data_regions(self):
+        folder = os.path.join(self.tmp.name, "archives")
+        os.mkdir(folder)
+        first = bytearray(0x40)
+        first[:4] = b"9FPR"
+        struct.pack_into("<I", first, 4, 0x40)
+        first += bytes(256)
+        with open(os.path.join(folder, "01.rpf"), "wb") as f:
+            f.write(first)
+        with open(os.path.join(folder, "02.rpf"), "wb") as f:
+            f.write(build_archive(self.cache))
+        p = run(folder, self.out, "--budget", "256")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(self.out))
+
     def test_stream_limit_stops_the_search(self):
         p = run(self.archive, self.out, "--max-streams", "1")
         self.assertEqual(p.returncode, 2)
