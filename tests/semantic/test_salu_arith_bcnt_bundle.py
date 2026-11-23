@@ -368,6 +368,13 @@ class TestSBcnt0I32B64SIMDAndEdgeCases(unittest.TestCase):
                 words = run_salu_bundle_ps(prog, f"ps_edge_s_bcnt0_i32_b64_{idx}")
                 self.assertEqual(words[0], expected)
 
+class TestSBcnt0I32B64TranslatorAndControls(unittest.TestCase):
+    """Stage 4 for s_bcnt0_i32_b64: translator integration and negative controls."""
+
+    def test_s_bcnt0_i32_b64_negative_controls(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_s_bcnt0_i32_b64", ["s_bcnt0_i32_b64", "s_endpgm"])
+
 
 if __name__ == '__main__':
     unittest.main()
