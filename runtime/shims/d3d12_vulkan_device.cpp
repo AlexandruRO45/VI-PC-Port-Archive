@@ -1125,6 +1125,9 @@ struct DeviceState {
         if (sampler_entries.count(key)) return true;
         const g::Sampler sampler = g::decode(words);
         VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias);
+        // D3D12 accepts MaxLOD < MinLOD (clamping to MinLOD); Vulkan requires maxLod >= minLod
+        // (VUID-VkSamplerCreateInfo-maxLod-01973).
+        if (sampler_info.maxLod < sampler_info.minLod) sampler_info.maxLod = sampler_info.minLod;
         // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
         if (sampler_info.anisotropyEnable && !info.sampler_anisotropy) {
             log_once("anisotropic sampler without samplerAnisotropy; anisotropy", int(sampler.max_anisotropy));
@@ -4047,11 +4050,46 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     return true;
 }
 
+// Why the PC runtime refuses a sampler description's common fields, or null. Verified against Windows D3D12
+// (WARP and hardware) for both CreateSampler and CreateSampler2.
+const char* sampler_desc_refusal(D3D12_FILTER filter, D3D12_TEXTURE_ADDRESS_MODE address_u,
+                                 D3D12_TEXTURE_ADDRESS_MODE address_v, D3D12_TEXTURE_ADDRESS_MODE address_w,
+                                 FLOAT mip_lod_bias, UINT max_anisotropy, D3D12_COMPARISON_FUNC comparison_func,
+                                 FLOAT min_lod, FLOAT max_lod) {
+    const UINT f = UINT(filter);
+    // D3D12_FILTER encodes reduction in [8:7], anisotropic in bit 6, and min/mag/mip (point=0, linear=1) in
+    // [5:4]/[3:2]/[1:0]. Anisotropic filters require min=linear and mag=linear (mip may be point or linear).
+    const bool valid_filter = (f & ~0x1ffu) == 0 &&
+                              ((f & D3D12_ANISOTROPIC_FILTERING_BIT) ? ((f & 0x3eu) == 0x14u) : ((f & 0x2au) == 0));
+    if (!valid_filter) return "sampler refused: invalid filter; filter";
+    const auto valid_address = [](D3D12_TEXTURE_ADDRESS_MODE m) {
+        return m >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && m <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    };
+    if (!valid_address(address_u) || !valid_address(address_v) || !valid_address(address_w))
+        return "sampler refused: invalid address mode; filter";
+    if (max_anisotropy > D3D12_REQ_MAXANISOTROPY)
+        return "sampler refused: MaxAnisotropy out of range; filter";
+    if (D3D12_DECODE_FILTER_REDUCTION(filter) == D3D12_FILTER_REDUCTION_TYPE_COMPARISON &&
+        UINT(comparison_func) > UINT(D3D12_COMPARISON_FUNC_ALWAYS))
+        return "sampler refused: invalid comparison function; filter";
+    if (!(mip_lod_bias >= D3D12_MIP_LOD_BIAS_MIN && mip_lod_bias <= D3D12_MIP_LOD_BIAS_MAX))
+        return "sampler refused: MipLODBias out of range or NaN; filter";
+    if (std::isnan(min_lod) || std::isnan(max_lod))
+        return "sampler refused: NaN LOD clamp; filter";
+    return nullptr;
+}
+
+const char* sampler_desc_refusal(const D3D12_SAMPLER_DESC& desc) {
+    return sampler_desc_refusal(desc.Filter, desc.AddressU, desc.AddressV, desc.AddressW, desc.MipLODBias,
+                                desc.MaxAnisotropy, desc.ComparisonFunc, desc.MinLOD, desc.MaxLOD);
+}
+
 // The S# of a D3D12 sampler.
 leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc, DeviceState* state = nullptr) {
     namespace g = leonida::gfx10;
     const auto address = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
         switch (mode) {
+        case D3D12_TEXTURE_ADDRESS_MODE_WRAP: return g::AddressMode::wrap;
         case D3D12_TEXTURE_ADDRESS_MODE_MIRROR: return g::AddressMode::mirror;
         case D3D12_TEXTURE_ADDRESS_MODE_CLAMP: return g::AddressMode::clamp_last_texel;
         case D3D12_TEXTURE_ADDRESS_MODE_BORDER: return g::AddressMode::clamp_border;
@@ -4075,7 +4113,10 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc, Devic
     out.max_anisotropy = anisotropic ? std::clamp<UINT>(desc.MaxAnisotropy, 1, 16) : 1;
     const D3D12_FILTER_REDUCTION_TYPE reduction = D3D12_DECODE_FILTER_REDUCTION(desc.Filter);
     // D3D12's comparison functions are 1 (NEVER) to 8 (ALWAYS); the S#'s are 0 to 7 in the same order.
-    if (reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON && desc.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER)
+    // D3D12_COMPARISON_FUNC_NONE (0) leaves compare at never with compare_never false (no comparison).
+    if (reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON &&
+        desc.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER &&
+        desc.ComparisonFunc <= D3D12_COMPARISON_FUNC_ALWAYS)
         out.compare = g::CompareFunction(desc.ComparisonFunc - D3D12_COMPARISON_FUNC_NEVER);
     out.compare_never = reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON &&
                         desc.ComparisonFunc == D3D12_COMPARISON_FUNC_NEVER;
@@ -5759,13 +5800,17 @@ public:
     }
 
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
+    // A description the PC runtime refuses leaves the slot untouched, as CreateSampler2 does.
     void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* desc,
                                          D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateSampler");
-        if (!destination.ptr) return;
-        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
-        if (!desc) return;
+        if (!destination.ptr || !desc) return;
+        if (const char* refusal = sampler_desc_refusal(*desc)) {
+            log_once(refusal, int(desc->Filter));
+            return;
+        }
         const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc, &state_));
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         state_.bind_sampler(words);
     }
@@ -5864,9 +5909,14 @@ public:
         }
     }
 
-    // Why the PC runtime refuses a D3D12_SAMPLER_DESC2, or null. The non-normalized rules are its debug layer's
-    // messages, which match Vulkan's for unnormalizedCoordinates; AddressW is free in both.
+    // Why the PC runtime refuses a D3D12_SAMPLER_DESC2, or null. Shares the common sampler field checks with
+    // CreateSampler; the non-normalized rules are its debug layer's messages, which match Vulkan's for
+    // unnormalizedCoordinates; AddressW is free in both.
     static const char* sampler2_refusal(const D3D12_SAMPLER_DESC2& desc) {
+        if (const char* refusal = sampler_desc_refusal(desc.Filter, desc.AddressU, desc.AddressV, desc.AddressW,
+                                                       desc.MipLODBias, desc.MaxAnisotropy, desc.ComparisonFunc,
+                                                       desc.MinLOD, desc.MaxLOD))
+            return refusal;
         if (desc.Flags & ~UINT(D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR | D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES))
             return "CreateSampler2 refused: unknown sampler flags; flags";
         if (!(desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)) return nullptr;
