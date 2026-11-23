@@ -540,8 +540,8 @@ void redirect_pc_to_file_header_at(const void* resolved) {
 }  // namespace
 
 // Every name a mapped image can import RtlPcToFileHeader by: kernel32 (the classic import libraries), kernelbase,
-// ntdll, and the API sets the umbrella libraries bind it to. The package's XCurl.dll, vcruntime140.dll and
-// msvcp140.dll import it from api-ms-win-core-rtlsupport-l1-1-0.dll.
+// ntdll, and the API sets the umbrella libraries bind it to. The package's XCurl.dll, msvcp140.dll, vcruntime140.dll
+// and vcruntime140_1.dll import it from api-ms-win-core-rtlsupport-l1-1-0.dll.
 SHIM_TABLE(pc_to_file_header,
     {"kernel32.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
     {"kernelbase.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
@@ -549,6 +549,7 @@ SHIM_TABLE(pc_to_file_header,
     {"api-ms-win-core-rtlsupport-l1-1-0.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
     {"api-ms-win-core-rtlsupport-l1-2-0.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
 );
+
 // Declared in pe_loader.h; the body needs the internal clone registry above.
 void cleanup_tls_clones() { cleanup_tls_clones_internal(); }
 
