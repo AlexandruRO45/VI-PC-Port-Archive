@@ -7055,20 +7055,36 @@ class Gen:
             # any other op_sel/op_sel_hi, neg_lo/neg_hi, DPP/SDWA, or source neg/abs are refused. For VOP2
             # v_dot*c_*, only optional clamp (VOP3 _e64) is accepted and D must be a VGPR.
             is_c = op in ("v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4")
+            expected_args = 3 if is_c else 4
+            if len(a) != expected_args:
+                raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " destination")
+            if ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a):
+                raise Unsupported(op + " modifiers")
             if is_c:
-                if a[0]["k"] != "vgpr":
-                    raise Unsupported(op + " destination")
-                if any(m != "clamp" for m in mods) or ins["op"].endswith(("_dpp", "_sdwa")) or any(
-                        s.get("neg") or s.get("abs") for s in a):
+                if any(m != "clamp" for m in mods) or mods.count("clamp") > 1:
                     raise Unsupported(op + " modifiers")
                 x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[0])
             else:
                 def bits(name, default):
-                    m = next((m for m in mods if m.startswith(name + ":")), None)
-                    return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+                    matches = [m for m in mods if m.startswith(name + ":")]
+                    if not matches:
+                        return default
+                    if len(matches) > 1:
+                        raise Unsupported(op + " modifiers")
+                    m = matches[0]
+                    prefix = name + ":["
+                    if not (m.startswith(prefix) and m.endswith("]")):
+                        raise Unsupported(op + " modifiers")
+                    parts = m[len(prefix):-1].split(",")
+                    if any(p not in ("0", "1") for p in parts):
+                        raise Unsupported(op + " modifiers")
+                    return [int(p) for p in parts]
                 other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:"))]
-                if (other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a) or
-                        bits("op_sel", [0, 0, 0]) != [0, 0, 0] or bits("op_sel_hi", [1, 1, 1]) != [1, 1, 1]):
+                if (other or mods.count("clamp") > 1
+                        or bits("op_sel", [0, 0, 0]) != [0, 0, 0]
+                        or bits("op_sel_hi", [1, 1, 1]) != [1, 1, 1]):
                     raise Unsupported(op + " modifiers")
                 x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[3])
             width = 16 if ("_dot2_" in op or "_dot2c_" in op) else (8 if "_dot4" in op else 4)
@@ -7129,22 +7145,36 @@ class Gen:
         elif op in ("v_dot2_f32_f16", "v_dot2c_f32_f16"):
             # Half-to-float dot product (RDNA2 ISA): D = S0.lo*S1.lo + S0.hi*S1.hi + acc (acc = S2 for VOP3P
             # v_dot2_f32_f16, old D for VOP2 v_dot2c_f32_f16).
-            if a[0]["k"] != "vgpr":
+            expected_args = 4 if op == "v_dot2_f32_f16" else 3
+            if len(a) != expected_args:
+                raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
                 raise Unsupported(op + " destination")
             if ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a):
                 raise Unsupported(op + " modifiers")
             if op == "v_dot2_f32_f16":
                 def bits(name, default):
-                    m = next((m for m in mods if m.startswith(name + ":")), None)
-                    return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+                    matches = [m for m in mods if m.startswith(name + ":")]
+                    if not matches:
+                        return default
+                    if len(matches) > 1:
+                        raise Unsupported(op + " modifiers")
+                    m = matches[0]
+                    prefix = name + ":["
+                    if not (m.startswith(prefix) and m.endswith("]")):
+                        raise Unsupported(op + " modifiers")
+                    parts = m[len(prefix):-1].split(",")
+                    if any(p not in ("0", "1") for p in parts):
+                        raise Unsupported(op + " modifiers")
+                    return [int(p) for p in parts]
                 other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:"))]
-                if other:
+                if other or mods.count("clamp") > 1:
                     raise Unsupported(op + " modifiers")
                 sel = bits("op_sel", [0, 0, 0])
                 selhi = bits("op_sel_hi", [1, 1, 1])
                 nlo = bits("neg_lo", [0, 0, 0])
                 nhi = bits("neg_hi", [0, 0, 0])
-                if any(len(v) != 3 or any(b not in (0, 1) for b in v) for v in (sel, selhi, nlo, nhi)):
+                if any(len(v) != 3 for v in (sel, selhi, nlo, nhi)):
                     raise Unsupported(op + " modifiers")
                 if sel[2] != 0 or selhi[2] != 1 or nhi[2] != 0:
                     raise Unsupported(op + " modifiers")
@@ -7174,7 +7204,7 @@ class Gen:
                     self.emit(f"{t} = OpFNegate %float {acc}")
                     acc = t
             else:
-                if any(m != "clamp" for m in mods):
+                if any(m != "clamp" for m in mods) or mods.count("clamp") > 1:
                     raise Unsupported(op + " modifiers")
                 a0 = self.f16_in(a[1], 0)
                 a1 = self.f16_in(a[1], 1)
@@ -7199,30 +7229,38 @@ class Gen:
             # lowering and not a value change: on 200,010 inputs (0, 1, 0xFFFF, 0x10000, 0x80000000, 0xFFFFFFFF,
             # 0x7FFFFFFF, 0x8000 and random) BitField{S,U}Extract(x, 16, 16) equals x >> 16 with the matching
             # right shift, and BitFieldUExtract(x, 16, 4) equals (x >> 16) & 15.
-            def bits(name, default):
-                m = next((m for m in mods if m.startswith(name + ":")), None)
-                if m is None:
-                    return default
-                try:
-                    body = m.split("[", 1)[1]
-                    if not body.endswith("]"):
-                        raise Unsupported(op + " modifiers")
-                    return [int(v) for v in body[:-1].split(",")]
-                except (IndexError, ValueError):
-                    raise Unsupported(op + " modifiers") from None
+            if len(a) != 3:
+                raise Unsupported(op + " operands")
+            if a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " destination")
             if "clamp" in mods:
                 raise Unsupported(op + " clamp")
-            if (any(not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
+            if (ins["op"].endswith(("_dpp", "_sdwa"))
+                    or any(not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
                     or any(s.get("neg") or s.get("abs") for s in a)):
                 raise Unsupported(op + " modifiers")
+            def bits(name, default):
+                matches = [m for m in mods if m.startswith(name + ":")]
+                if not matches:
+                    return default
+                if len(matches) > 1:
+                    raise Unsupported(op + " modifiers")
+                m = matches[0]
+                prefix = name + ":["
+                if not (m.startswith(prefix) and m.endswith("]")):
+                    raise Unsupported(op + " modifiers")
+                parts = m[len(prefix):-1].split(",")
+                if any(p not in ("0", "1") for p in parts):
+                    raise Unsupported(op + " modifiers")
+                return [int(p) for p in parts]
             sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
             neg_lo, neg_hi = bits("neg_lo", [0, 0]), bits("neg_hi", [0, 0])
-            # a three-entry list (op_sel:[1,0,0], as in tests/semantic/fixtures/disasm/ps_ops6.s) is read by its first
-            # two entries, as before #3853
-            sel, selhi, neg_lo, neg_hi = (v[:2] if len(v) == 3 else v for v in (sel, selhi, neg_lo, neg_hi))
-            if (len(sel) != 2 or len(selhi) != 2 or len(neg_lo) != 2 or len(neg_hi) != 2
-                    or any(b not in (0, 1) for b in sel + selhi) or any(neg_lo) or any(neg_hi)):
+            # a three-entry list (op_sel:[1,0,0], as in tests/semantic/fixtures/disasm/ps_ops6.s) is validated in full
+            # before reading its first two entries, as before #3853
+            if (any(len(v) not in (2, 3) for v in (sel, selhi, neg_lo, neg_hi))
+                    or any(neg_lo) or any(neg_hi)):
                 raise Unsupported(op + " modifiers")
+            sel, selhi = sel[:2], selhi[:2]
             sh_src, val_src = self.src_u(a[1]), self.src_u(a[2])
             signed = op.endswith("i16")
             halves = []
