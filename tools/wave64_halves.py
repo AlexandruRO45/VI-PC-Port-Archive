@@ -1609,8 +1609,8 @@ class Analysis:
                 if any(_half(d) and d["t"].startswith("vcc") for d in dests):
                     regs.append("vcc")
                 if base_op(ins["op"]) == "v_writelane_b32" and len(ins["args"]) == 3 \
-                        and ins["args"][0].get("k") == "vgpr" and ins["args"][0]["r"] in self.pure_spill_vgprs \
-                        and ins["args"][2].get("k") == "imm":
+                        and ins["args"][0].get("k") == "vgpr" and ins["args"][2].get("k") == "imm" \
+                        and ((ins["args"][2]["v"] & 63) < 32 or ins["args"][0]["r"] in self.pure_spill_vgprs):
                     regs.append(("spill", ins["args"][0]["r"], ins["args"][2]["v"] & 63))
                 defs_of[(b, i)] = regs
 
@@ -1656,8 +1656,8 @@ class Analysis:
                 if base_op(ins["op"]).startswith(("buffer_atomic", "global_atomic")) or dests and False:
                     read |= {r for x in ins["args"] for r in sregs(x)}
                 if base_op(ins["op"]) == "v_readlane_b32" and len(ins["args"]) == 3 \
-                        and ins["args"][1].get("k") == "vgpr" and ins["args"][1]["r"] in self.pure_spill_vgprs \
-                        and ins["args"][2].get("k") == "imm":
+                        and ins["args"][1].get("k") == "vgpr" and ins["args"][2].get("k") == "imm" \
+                        and ((ins["args"][2]["v"] & 63) < 32 or ins["args"][1]["r"] in self.pure_spill_vgprs):
                     read.add(("spill", ins["args"][1]["r"], ins["args"][2]["v"] & 63))
                 for r in read:
                     rd = st.get(r, frozenset({(-1, 0)}))

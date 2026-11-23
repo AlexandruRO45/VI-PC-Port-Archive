@@ -202,6 +202,23 @@ class Classification(unittest.TestCase):
             "v_writelane_b32 v20, s5, 40", "v_readlane_b32 s21, v20, 40",
             "v_mov_b32_e32 v6, s21"]), "C", contains=["stale-scalar"])
 
+    def test_c_non_pure_spill_in_divergent_vote_branch_is_stale_scalar(self):
+        # A non-pure-spill VGPR (also written by a vector op) spilling into lane < 32 before and inside a
+        # wave-voted EXEC skip must still be tracked as stale-scalar, not misclassified as tier B.
+        self.tier("ps_c_nonpure_spill_stale", ps([
+            "v_mov_b32_e32 v20, 0", "v_writelane_b32 v20, s4, 2",
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 2",
+            "v_writelane_b32 v20, s5, 2", "s_or_b64 exec, exec, s[12:13]",
+            "v_readlane_b32 s21, v20, 2", "v_mov_b32_e32 v6, s21"]), "C", ["stale-scalar"])
+
+    def test_b_non_pure_spill_unmodified_by_vote_branch_stays_tier_b(self):
+        # A non-pure-spill VGPR spilled before a wave-voted skip and not rewritten inside is not stale.
+        self.tier("ps_b_nonpure_spill_clean", ps([
+            "v_mov_b32_e32 v20, 0", "v_writelane_b32 v20, s4, 2",
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 1",
+            "v_add_nc_u32_e32 v7, 1, v7", "s_or_b64 exec, exec, s[12:13]",
+            "v_readlane_b32 s21, v20, 2", "v_add_nc_u32_e32 v6, s21, v0"]), "B", [], ["lane-spill"])
+
     def test_c_spill_of_tainted_count_stays_tier_c(self):
         # Spilling a tainted scalar (lane-count) into lane 40 and reloading must still report lane-count.
         self.tier("ps_c_spill_cnt", ps([
@@ -572,6 +589,32 @@ class Execution(unittest.TestCase):
         self.assertEqual({w[0] for w in whole}, {8})                      # vertex 0 is on, the whole wave adds
         self.assertEqual({w[0] for w in halves[:32]}, {8})
         self.assertEqual({w[0] for w in halves[32:]}, {7})                # the other half voted no
+
+    def test_c_non_pure_spill_behind_vote_differs(self):
+        # Only the lane-2 spill slot of non-pure-spill v20 changes inside the vote branch (s4/s5 themselves
+        # are clean): halves[32:] skips the branch and reloads 7 instead of 9, so it must classify C.
+        tier, whole, halves = self.run_both("vs_c_nonpure_spill", vs([
+            "v_mov_b32_e32 v20, 0", "s_mov_b32 s4, 7", "s_mov_b32 s5, 9",
+            "v_writelane_b32 v20, s4, 2",
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 2",
+            "v_writelane_b32 v20, s5, 2", "s_or_b64 exec, exec, s[12:13]",
+            "v_readlane_b32 s6, v20, 2", "v_mov_b32_e32 v6, s6"]))
+        self.assertEqual(tier, "C")
+        self.assertEqual({w[0] for w in whole}, {9})
+        self.assertEqual({w[0] for w in halves[:32]}, {9})
+        self.assertEqual({w[0] for w in halves[32:]}, {7})
+
+    def test_b_non_pure_spill_unmodified_by_vote_invariant(self):
+        # Control: non-pure-spill v20 lane 2 written only before the vote branch stays tier B and identical.
+        tier, whole, halves = self.run_both("vs_b_nonpure_spill", vs([
+            "v_mov_b32_e32 v20, 0", "s_mov_b32 s4, 7",
+            "v_writelane_b32 v20, s4, 2",
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 1",
+            "v_add_nc_u32_e32 v7, 1, v7", "s_or_b64 exec, exec, s[12:13]",
+            "v_readlane_b32 s6, v20, 2", "v_add_nc_u32_e32 v6, s6, v0"]))
+        self.assertEqual(tier, "B")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [7 + k for k in range(64)])
 
 
 AGG_HEAD = ["v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc"]
