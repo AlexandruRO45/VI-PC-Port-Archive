@@ -2,7 +2,6 @@
 
 #include <condition_variable>
 #include <cstdint>
-#include <cstdlib>
 #include <mutex>
 
 namespace leonida {
@@ -103,17 +102,59 @@ inline std::uint64_t compile_weight(std::uint64_t spirv_bytes) {
     return weight < kMinimum ? kMinimum : weight;
 }
 
-// The gate's budget in bytes. `env` is LEONIDA_COMPILE_BUDGET_MIB: a whole number of MiB, where 0 means no gate.
-// Without it (or when it isn't a whole number) the budget is half of `available_physical` bytes, at least 2 GiB.
-inline std::uint64_t compile_budget(const char* env, std::uint64_t available_physical) {
-    if (env && *env) {
-        char* end = nullptr;
-        const unsigned long long mib = std::strtoull(env, &end, 10);
-        if (end && *end == '\0' && *env != '-') return static_cast<std::uint64_t>(mib) << 20;
+// LEONIDA_COMPILE_BUDGET_MIB as read: unset (or only spaces and tabs), not a usable number, or a number of MiB.
+struct BudgetSetting {
+    enum Kind { missing, invalid, value } kind = missing;
+    std::uint64_t mib = 0;  // set when kind == value; 0 means no gate
+};
+
+// The largest MiB count whose byte value still fits in 64 bits.
+constexpr std::uint64_t kMaxBudgetMib = UINT64_MAX >> 20;
+
+// Parses LEONIDA_COMPILE_BUDGET_MIB. Spaces and tabs around the number are allowed; what is left must be decimal
+// digits only (no sign, no exponent, no suffix) and at most kMaxBudgetMib, checked digit by digit before any scaling.
+inline BudgetSetting parse_budget_mib(const char* env) {
+    BudgetSetting out;
+    if (!env) return out;
+    const char* begin = env;
+    while (*begin == ' ' || *begin == '\t') ++begin;
+    const char* end = begin;
+    while (*end) ++end;
+    while (end > begin && (end[-1] == ' ' || end[-1] == '\t')) --end;
+    if (begin == end) return out;
+    std::uint64_t mib = 0;
+    for (const char* p = begin; p != end; ++p) {
+        if (*p < '0' || *p > '9') {
+            out.kind = BudgetSetting::invalid;
+            return out;
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(*p - '0');
+        if (mib > (kMaxBudgetMib - digit) / 10) {  // mib * 10 + digit would pass kMaxBudgetMib
+            out.kind = BudgetSetting::invalid;
+            return out;
+        }
+        mib = mib * 10 + digit;
     }
+    out.kind = BudgetSetting::value;
+    out.mib = mib;
+    return out;
+}
+
+// The default budget: half of `available_physical` bytes, at least 2 GiB.
+inline std::uint64_t default_compile_budget(std::uint64_t available_physical) {
     constexpr std::uint64_t kFloor = 2ull << 30;
     const std::uint64_t half = available_physical / 2;
     return half < kFloor ? kFloor : half;
+}
+
+// The gate's budget in bytes: the setting's MiB when it is a usable number (0 = no gate), otherwise the default.
+inline std::uint64_t compile_budget(const BudgetSetting& setting, std::uint64_t available_physical) {
+    if (setting.kind == BudgetSetting::value) return setting.mib << 20;  // fits: mib <= kMaxBudgetMib
+    return default_compile_budget(available_physical);
+}
+
+inline std::uint64_t compile_budget(const char* env, std::uint64_t available_physical) {
+    return compile_budget(parse_budget_mib(env), available_physical);
 }
 
 }  // namespace leonida

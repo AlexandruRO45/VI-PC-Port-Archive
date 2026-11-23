@@ -74,9 +74,21 @@ leonida::CompileGate& compute_compile_gate() {
     static leonida::CompileGate gate([] {
         MEMORYSTATUSEX status{sizeof(status)};
         const std::uint64_t available = GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
-        char env[32] = {};
+        char env[64] = {};
         const DWORD got = GetEnvironmentVariableA("LEONIDA_COMPILE_BUDGET_MIB", env, sizeof(env));
-        return leonida::compile_budget(got > 0 && got < sizeof(env) ? env : nullptr, available);
+        leonida::BudgetSetting setting;  // unset: the default
+        if (got >= sizeof(env))
+            setting.kind = leonida::BudgetSetting::invalid;  // longer than any usable value
+        else if (got > 0)
+            setting = leonida::parse_budget_mib(env);
+        const std::uint64_t budget = leonida::compile_budget(setting, available);
+        if (setting.kind == leonida::BudgetSetting::invalid)
+            std::fprintf(stderr,
+                         "[rt] d3d12: LEONIDA_COMPILE_BUDGET_MIB is not a whole number of MiB up to %llu; using the "
+                         "default compile budget of %llu MiB\n",
+                         static_cast<unsigned long long>(leonida::kMaxBudgetMib),
+                         static_cast<unsigned long long>(budget >> 20));
+        return budget;
     }());
     return gate;
 }

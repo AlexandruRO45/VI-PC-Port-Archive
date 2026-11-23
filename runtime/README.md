@@ -294,7 +294,9 @@ compiles it, and the retail title starts many at once on its job threads, so unb
 machine and the driver fails them. Each compile waits until its estimated weight (1 KiB per byte of SPIR-V, at least
 64 MiB) fits in a budget: half the free physical memory at the first compile, at least 2 GiB. A compile is always
 admitted when none is in flight, and waiters go in arrival order. `LEONIDA_COMPILE_BUDGET_MIB=<MiB>` sets the budget;
-`0` turns the gate off. The first wait logs the budget once.
+`0` turns the gate off. The value is decimal digits only, with spaces or tabs around it allowed; anything else, or a
+number of MiB too large to express in bytes, is reported once and the default is used. The first wait logs the budget
+once.
 
 ## Current limits
 

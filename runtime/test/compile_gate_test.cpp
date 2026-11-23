@@ -51,6 +51,27 @@ int main() {
     check(leonida::compile_budget("12abc", 20 * GiB) == 10 * GiB, "a non-number override falls back to the default");
     check(leonida::compile_budget("-5", 20 * GiB) == 10 * GiB, "a negative override falls back to the default");
 
+    // The parser keeps missing, invalid and an explicit value apart, and checks the range before scaling to bytes.
+    using S = leonida::BudgetSetting;
+    const auto kind = [](const char* s) { return leonida::parse_budget_mib(s).kind; };
+    const auto mib = [](const char* s) { return leonida::parse_budget_mib(s).mib; };
+    check(kind(nullptr) == S::missing && kind("") == S::missing && kind(" \t ") == S::missing,
+          "unset, empty and whitespace-only are missing");
+    check(kind("0") == S::value && mib("0") == 0, "an explicit 0 is a value, not missing");
+    check(kind(" 512\t") == S::value && mib(" 512\t") == 512, "spaces and tabs around the number are allowed");
+    check(kind(" -5") == S::invalid, "a sign after leading whitespace is invalid");
+    check(kind("+5") == S::invalid, "a plus sign is invalid");
+    check(kind("1e3") == S::invalid && kind("512MB") == S::invalid, "exponents and suffixes are invalid");
+    check(kind("5 12") == S::invalid, "whitespace inside the number is invalid");
+    check(kind("17592186044415") == S::value && mib("17592186044415") == leonida::kMaxBudgetMib,
+          "the largest MiB count that fits in bytes is accepted");
+    check(kind("17592186044416") == S::invalid, "one past the largest is invalid, not wrapped");
+    check(kind("18446744073709551616") == S::invalid, "a number past 64 bits is invalid");
+    check(leonida::compile_budget(leonida::parse_budget_mib("17592186044415"), 20 * GiB) == (leonida::kMaxBudgetMib << 20),
+          "the largest accepted value scales without overflow");
+    check(leonida::compile_budget("17592186044416", 20 * GiB) == 10 * GiB,
+          "an out-of-range value falls back to the default instead of wrapping");
+
     // The weight: 1 KiB per byte of SPIR-V, at least 64 MiB.
     check(leonida::compile_weight(8 * MiB) == 8 * GiB, "an 8 MiB module weighs 8 GiB");
     check(leonida::compile_weight(4096) == 64 * MiB, "a small module weighs the 64 MiB minimum");
