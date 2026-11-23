@@ -86,6 +86,19 @@ class NativeFolder(unittest.TestCase):
             self.assertEqual(run_gpu_tests.native_folder("/tmp/work-" + MARK), "/tmp/work-" + MARK)
 
     @unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows thing")
+    def test_a_successful_short_name_lookup_is_kept(self):
+        work, short = "C:\\work-" + MARK, r"C:\WORK~1"
+
+        def get_short_path(path, buf, _size):
+            self.assertEqual(path, work)
+            buf.value = short
+            return len(short)
+
+        with patch("ctypes.windll.kernel32.GetShortPathNameW", side_effect=get_short_path) as lookup:
+            self.assertEqual(run_gpu_tests.native_folder(work, ansi="ascii"), short)
+        lookup.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows thing")
     def test_a_folder_outside_the_code_page_gets_its_short_name_or_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "leonida_gpu_work_" + MARK)
