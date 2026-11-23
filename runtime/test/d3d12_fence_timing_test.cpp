@@ -249,7 +249,11 @@ int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
 // 0-1.9 ms later. The host runtime runs B's batch every time (an application may release a fence right after using
 // it; a queue Wait/Signal takes no COM reference). On the layer, a release before the GPU reached 1 lost the postponed
 // Signal, and remove_fence then dropped B's held batch: every even iteration, and 16-24 of 200 racing ones with #4663 +
-// #4282. With a released fence's wait counted as reached (D3D-496 case 2), B runs every time. `label` names the device.
+// #4282. With a released fence's wait counted as reached (D3D-496 case 2), B runs every time. Since that Wait no longer
+// pins F, F's last reference can also go inside A's release while B still waits on it: under load B was then
+// submitted still waiting on F and its queue never ran again, until remove_fence had every queue forget F first
+// (queue_holds_pump_release_test checks that without a GPU). After 3 misses in a row the check stops early: B's
+// queue has stalled and the rest would only wait. `label` names the device.
 int check_released_postponed_signal(ID3D12Device* device, ID3D12CommandQueue* queue, const char* label) {
     D3D12_COMMAND_QUEUE_DESC desc{};
     Ref<ID3D12CommandQueue> queue_b;
@@ -281,9 +285,18 @@ int check_released_postponed_signal(ID3D12Device* device, ID3D12CommandQueue* qu
         }
         Event event;
         EXPECT(SUCCEEDED(done->SetEventOnCompletion(UINT64(i), event.h)));
-        if (event.set_within(2000)) ++ran;
+        if (event.set_within(2000)) {
+            ++ran;
+            continue;
+        }
+        // Reported at once (stderr is not buffered): a run killed by a time limit still says where it stopped.
+        std::fprintf(stderr, "fence released after a postponed CPU Signal (%s): iteration %d, B's batch did not run "
+                             "within 2 s (done=%llu)\n",
+                     label, i, static_cast<unsigned long long>(done->GetCompletedValue()));
+        if (i - ran >= 3) break;  // B's queue has stalled: the remaining iterations would each wait 2 s for nothing
     }
     std::printf("fence released after a postponed CPU Signal (%s): B's batch ran %d/%d\n", label, ran, iterations);
+    std::fflush(stdout);
     EXPECT(ran == iterations);
     return 0;
 }
