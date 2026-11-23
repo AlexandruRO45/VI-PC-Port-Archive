@@ -4145,6 +4145,26 @@ class Gen:
                 fc2 = swiz2(fc)
                 ic2 = swiz2(ic)
                 signed_ic2 = swiz2(signed_ic) if d16 else ic2
+            def emit_byte3_hi(dword_arr, al_host, lo3, val, is_two=None):
+                """When a 2-byte element starts at byte 3 of a dword, merge byte 1 into byte 0 of the next dword."""
+                cross = self.tmp()
+                self.emit(f"{cross} = OpIEqual %bool {lo3} {self.cu(3)}")
+                if is_two is not None:
+                    both = self.tmp()
+                    self.emit(f"{both} = OpLogicalAnd %bool {is_two} {cross}")
+                    cross = both
+                lbl_hi, lbl_hi_end = self.tmp() + "_hi", self.tmp() + "_hie"
+                self.emit(f"OpSelectionMerge {lbl_hi_end} None")
+                self.emit(f"OpBranchConditional {cross} {lbl_hi} {lbl_hi_end}")
+                self.emit(f"{lbl_hi} = OpLabel")
+                ap1 = self.buf_dword_ptr(dword_arr, al_host, step, 1, same_base=True)
+                hi8, t3, t4 = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{hi8} = OpBitFieldUExtract %uint {val} {self.cu(8)} {self.cu(8)}")
+                self.emit(f"{t3} = OpAtomicAnd %uint {ap1} {self.cu(1)} {self.cu(0)} {self.cu(0xFFFFFF00)}")
+                self.emit(f"{t4} = OpAtomicOr %uint {ap1} {self.cu(1)} {self.cu(0)} {hi8}")
+                self.emit(f"OpBranch {lbl_hi_end}")
+                self.emit(f"{lbl_hi_end} = OpLabel")
+
             if fmt is None:     # tbuffer_store: its own format, encoded in line
                 code = fixed_fmt
                 size, kind, widths = self.FORMATS[code]
@@ -4173,8 +4193,8 @@ class Gen:
                         sh24 = self.tmp()
                         self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
                         # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                        dword_arr = self.tmp()
-                        self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                        dword_arr, al_host = self.tmp(), self.host_addr(al)
+                        self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {al_host}")
                         self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
                         self.emit(f"{mk} = OpCopyObject %uint {self.cu((1 << (8 * size)) - 1)}")
                         self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
@@ -4183,6 +4203,8 @@ class Gen:
                         self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
                         self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
                         self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
+                        if size == 2:
+                            emit_byte3_hi(dword_arr, al_host, lo3, val)
             else:
                 pad = lambda xs: (list(xs) + [self.cu(0)] * 4)[:4]      # noqa: E731
                 two = norm2 + fc2 + ic2 + signed_ic2 if fixed_fmt is None else [self.cu(0)] * 8
@@ -4216,8 +4238,8 @@ class Gen:
                 sh24 = self.tmp()
                 self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
                 # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                dword_arr = self.tmp()
-                self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                dword_arr, al_host = self.tmp(), self.host_addr(al)
+                self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {al_host}")
                 self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
                 self.emit(f"{one} = OpIEqual %bool {size} {self.cu(1)}")
                 self.emit(f"{mk} = OpSelect %uint {one} {self.cu(0xFF)} {self.cu(0xFFFF)}")
@@ -4227,6 +4249,9 @@ class Gen:
                 self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
                 self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
                 self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
+                is_two = self.tmp()
+                self.emit(f"{is_two} = OpLogicalNot %bool {one}")
+                emit_byte3_hi(dword_arr, al_host, lo3, val, is_two)
                 self.emit(f"OpBranch {le}")
                 self.emit(f"{le} = OpLabel")
         self.emit(f"OpBranch {lbl_end}")
