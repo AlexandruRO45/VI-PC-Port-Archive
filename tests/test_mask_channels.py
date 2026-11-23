@@ -3,6 +3,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -79,6 +80,19 @@ class MaskChannelTests(unittest.TestCase):
                     finally:
                         sys.stderr = saved_err
                 self.assertEqual(cm.exception.code, 2)
+
+    def test_unreadable_input_is_one_error_line(self):
+        """A missing file and a file that is not a DDS: exit 2 and one message, not a traceback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, "empty.dds")
+            open(empty, "wb").close()
+            for path in (empty, os.path.join(tmp, "no-such.dds")):
+                with self.subTest(path=os.path.basename(path)):
+                    p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "mask_channels.py"),
+                                        path], capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn(f"mask_channels: error: {path}: ", p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
 
     def test_json_cannot_replace_the_input(self):
         with tempfile.TemporaryDirectory() as tmp:
