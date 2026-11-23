@@ -246,5 +246,18 @@ class VMulHiU32U24SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(i, 2), 0x99999999)
 
+class VMulHiU32U24TranslatorTests(unittest.TestCase):
+    def test_mul_hi_u24_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0xFFFFFF",
+            "v_mov_b32 v1, 0xFFFFFF",
+            "v_mul_hi_u32_u24 v2, v0, v1",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mul_hi_u24_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, 0x0000FFFF)
+
 if __name__ == "__main__":
     unittest.main()
