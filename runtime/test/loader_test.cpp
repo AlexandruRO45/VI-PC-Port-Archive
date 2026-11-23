@@ -503,7 +503,18 @@ void test_imports() {
             return failed("GetModuleFileName(nullptr) names the main image's load path", "it did not");
         if (!own_path || *own_path != m.path)
             return failed("GetModuleFileName(module) names the module's own load path", "it did not");
-        pass("GetModuleHandle(nullptr)/GetModuleFileName answer for mapped images through the bundled ops");
+        // GetModuleHandleEx(FROM_ADDRESS) resolves the module whose image covers an address: inside the image is
+        // its own handle, just past the end and inside no image is nothing.
+        const uint64_t base = reinterpret_cast<uint64_t>(m.base);
+        if (rt::shims::bundled_module_for_address(base) != m.base ||
+            rt::shims::bundled_module_for_address(base + m.size - 1) != m.base)
+            return failed("GetModuleHandleEx(FROM_ADDRESS) finds the mapped module covering an address",
+                          "it did not");
+        if (rt::shims::bundled_module_for_address(base + m.size) != nullptr ||
+            rt::shims::bundled_module_for_address(base - 1) != nullptr)
+            return failed("GetModuleHandleEx(FROM_ADDRESS) misses addresses outside every mapped module",
+                          "it answered for one");
+        pass("GetModuleHandle(nullptr)/GetModuleFileName/GetModuleHandleEx answer for mapped images through the bundled ops");
     } catch (const std::exception& e) {
         failed("the bundled-module ops answer module identity for mapped images", e.what());
     }

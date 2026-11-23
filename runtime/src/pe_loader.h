@@ -131,6 +131,9 @@ public:
     // from (nullptr for the main image), for GetModuleFileName. Null when the handle is not this loader's.
     void* main_module() const;
     const std::filesystem::path* module_path_for(void* module_handle) const;
+    // The handle of the mapped module whose image covers `address` (base..base+size), for
+    // GetModuleHandleEx(FROM_ADDRESS); null when no mapped module contains it.
+    void* module_for_address(uint64_t address) const;
 
 private:
     void initialise(Module& m);

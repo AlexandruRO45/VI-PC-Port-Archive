@@ -75,6 +75,9 @@ struct BundledModuleOps {
     // The path a mapped module was loaded from, for GetModuleFileName: `module` nullptr asks for the main image,
     // a handle asks for that module; null when the handle is not the loader's (or it has no main image).
     const std::filesystem::path* (*module_path)(void* ctx, void* module);
+    // The handle of the mapped module whose image covers `address`, for GetModuleHandleEx(FROM_ADDRESS); null
+    // when no mapped module contains it. Optional: loaders that cannot answer it leave it null.
+    void* (*module_for_address)(void* ctx, uint64_t address);
 };
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
@@ -87,6 +90,7 @@ void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_
 bool owns_bundled_module_handle(void* module);
 void* bundled_main_module();
 const std::filesystem::path* bundled_module_path(void* module);
+void* bundled_module_for_address(uint64_t address);
 
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).

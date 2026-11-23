@@ -496,6 +496,13 @@ const std::filesystem::path* bundled_module_path(void* module) {
     return nullptr;
 }
 
+void* bundled_module_for_address(uint64_t address) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->module_for_address)
+            if (void* h = entry.ops->module_for_address(entry.ctx, address)) return h;
+    return nullptr;
+}
+
 Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }

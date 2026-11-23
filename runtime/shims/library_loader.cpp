@@ -236,6 +236,66 @@ HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
     return GetModuleHandleW(name);
 }
 
+// GetModuleHandleEx shares GetModuleHandle's answers for mapped and owned modules. PIN and UNCHANGED_REFCOUNT are
+// no-ops for them: mapped images live until the loader unwinds and owned pseudo-handles have no count to change.
+// With FROM_ADDRESS the name argument is an address and the answer is the mapped module covering it.
+BOOL WINAPI get_module_handle_ex_a(DWORD flags, LPCSTR name, HMODULE* out) {
+    if ((flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) && name) {
+        if (void* h = bundled_module_for_address(reinterpret_cast<uint64_t>(name))) {
+            if (out) *out = reinterpret_cast<HMODULE>(h);
+            return TRUE;
+        }
+        return GetModuleHandleExA(flags, name, out);
+    }
+    if (!name) {
+        if (void* h = bundled_main_module()) {
+            if (out) *out = reinterpret_cast<HMODULE>(h);
+            return TRUE;
+        }
+        return GetModuleHandleExA(flags, name, out);
+    }
+    if (HMODULE h = owned_handle(name)) {
+        if (out) *out = h;
+        return TRUE;
+    }
+    const std::string dll = module_name(name);
+    if (!dll.empty())
+        if (void* h = find_loaded_bundled_module(dll)) {
+            if (out) *out = reinterpret_cast<HMODULE>(h);
+            return TRUE;
+        }
+    return GetModuleHandleExA(flags, name, out);
+}
+
+BOOL WINAPI get_module_handle_ex_w(DWORD flags, LPCWSTR name, HMODULE* out) {
+    if ((flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) && name) {
+        if (void* h = bundled_module_for_address(reinterpret_cast<uint64_t>(name))) {
+            if (out) *out = reinterpret_cast<HMODULE>(h);
+            return TRUE;
+        }
+        return GetModuleHandleExW(flags, name, out);
+    }
+    if (!name) {
+        if (void* h = bundled_main_module()) {
+            if (out) *out = reinterpret_cast<HMODULE>(h);
+            return TRUE;
+        }
+        return GetModuleHandleExW(flags, name, out);
+    }
+    const std::string path = narrow(name);
+    if (HMODULE h = owned_handle(path)) {
+        if (out) *out = h;
+        return TRUE;
+    }
+    const std::string dll = module_name(path);
+    if (!dll.empty())
+        if (void* h = find_loaded_bundled_module(dll)) {
+            if (out) *out = reinterpret_cast<HMODULE>(h);
+            return TRUE;
+        }
+    return GetModuleHandleExW(flags, name, out);
+}
+
 // The Win32 spelling of a stored module path: backslashes throughout, and a unix-absolute path (a leading "/", only
 // possible under Wine) becomes Z:\..., the drive Wine maps at the filesystem root. A relative stored path is made
 // absolute through the host first, so the result is always drive-qualified.
@@ -321,6 +381,11 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         return GetProcAddress(module, name);
     }
 
+    // GetProcAddress(NULL, name) answers with the process image's exports on the real loader; here the process
+    // image is the mapped guest, so a null module asks for the main image's exports.
+    if (!module)
+        if (void* h = bundled_main_module()) module = reinterpret_cast<HMODULE>(h);
+
     const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
     bool owns_handle = false;
     void* fn = get_bundled_proc_address(module, what, owns_handle);
@@ -363,6 +428,8 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "LoadLibraryExW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_w)},                   \
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
+    {dll, "GetModuleHandleExA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_ex_a)},          \
+    {dll, "GetModuleHandleExW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_ex_w)},          \
     {dll, "GetModuleFileNameA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_a)},          \
     {dll, "GetModuleFileNameW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_w)},          \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \

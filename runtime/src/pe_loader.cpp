@@ -932,6 +932,10 @@ const std::filesystem::path* bundled_module_path(void* ctx, void* module) {
     return static_cast<Loader*>(ctx)->module_path_for(module);
 }
 
+void* bundled_module_for_address(void* ctx, uint64_t address) {
+    return static_cast<Loader*>(ctx)->module_for_address(address);
+}
+
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
@@ -941,6 +945,7 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_load_w,
     &bundled_main_module,
     &bundled_module_path,
+    &bundled_module_for_address,
 };
 
 // Marks what a run-time load maps as a dynamic load for as long as it is in scope (the caller holds the mutex).
@@ -1202,6 +1207,15 @@ const std::filesystem::path* Loader::module_path_for(void* module_handle) const 
     if (!module_handle) return order_.empty() ? nullptr : &order_.front()->path;
     for (Module* m : order_)
         if (m->base == module_handle) return &m->path;
+    return nullptr;
+}
+
+void* Loader::module_for_address(uint64_t address) const {
+    std::lock_guard lock(mutex_);
+    for (Module* m : order_)
+        if (address >= reinterpret_cast<uint64_t>(m->base) &&
+            address - reinterpret_cast<uint64_t>(m->base) < m->size)
+            return m->base;
     return nullptr;
 }
 
