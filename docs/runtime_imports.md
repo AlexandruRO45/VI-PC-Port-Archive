@@ -486,7 +486,7 @@ So `XCurl.dll` needs threading, error reporting and networking from the runtime,
 ### The retail executable's runtime classes (RT-5)
 
 `python -I tools/gdk_runtime_calls.py game_scarlett_master.exe` (from the file alone, nothing executed; `main`
-`1cc6e3c1`) finds one `QueryApiImpl` helper at RVA `0x55de048` and **161** `xgameruntime.lib` thunks that reach **17**
+`028548ac`) finds one `QueryApiImpl` helper at RVA `0x55de048` and **161** `xgameruntime.lib` thunks that reach **17**
 runtime classes. 158 of the thunks are referenced from the image; three are present and unreferenced (one each in
 `XPackageImpl`, `XThreadingImpl` and `XAccessibilityImpl`).
 
@@ -499,9 +499,9 @@ therefore needs no module name beyond the `xgameruntime.dll` it already has, whi
 
 | Class | Thunks | Referenced | Served |
 |---|---:|---:|---|
-| `XAccessibilityImpl` | 10 | 9 | no |
+| `XAccessibilityImpl` | 10 | 9 | yes |
 | `XAppCaptureImpl` | 1 | 1 | no |
-| `XLauncherImpl` | 3 | 3 | no |
+| `XLauncherImpl` | 3 | 3 | yes |
 | `XDisplayImpl` | 1 | 1 | yes |
 | `XGameEventImpl` | 1 | 1 | yes |
 | `XGameImpl` | 2 | 2 | yes |
@@ -517,10 +517,11 @@ therefore needs no module name beyond the `xgameruntime.dll` it already has, whi
 | `XThreadingImpl` | 18 | 17 | yes |
 | `XUserImpl` | 21 | 21 | yes |
 
-"Served" is the tool's answer for the runtime sources at that commit. The three that are not: `XAccessibilityImpl`
-(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not), `XAppCaptureImpl` (slot 5,
-`XAppCaptureTakeScreenshot`) and `XLauncherImpl` (slots 3-5: `XLaunchUri` and the two display timeout-deferral calls).
-Open pull requests serve them: #4235, #4307 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
+"Served" is the tool's answer for the runtime sources at that commit; `tests/test_runtime_imports_classes.py`
+fails when a row and the shims disagree. The one that is not: `XAppCaptureImpl` (slot 5, `XAppCaptureTakeScreenshot`);
+open pull request #4307 serves it. `XAccessibilityImpl` is served too: its speech-synthesizer slots 8-13, 15, 16 and
+21 are referenced and slot 14 is not. So is `XLauncherImpl` (slots 3-5: `XLaunchUri` and the two display
+timeout-deferral calls). The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
 executable calls, and the argument counts the tool estimates from the registers, are in the report the tool writes.
 `XErrorImpl`, which `XCurl.dll` and `libHttpClient.GDK.dll` call, is not among the executable's classes.
 
