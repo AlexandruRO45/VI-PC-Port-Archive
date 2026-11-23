@@ -71,6 +71,16 @@ class RunnerTest(unittest.TestCase):
             suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS})
             self.assertEqual(run(tmp, "-j", "1")[0], 0)
 
+    def test_a_job_count_below_one_is_a_usage_error(self):
+        # `-j 0` used to take the -j 1 path, so a run that asked for no workers ran the whole suite one file at a
+        # time and exited 0: a passing run nobody could tell from a real one.
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_ok.py": "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n"})
+            for value in ("0", "-2"):
+                with self.assertRaises(SystemExit) as caught:
+                    run(tmp, "-j", value)
+                self.assertEqual(caught.exception.code, 2, value)
+
     def test_an_empty_suite_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, out = run(tmp, "-j", "2")
