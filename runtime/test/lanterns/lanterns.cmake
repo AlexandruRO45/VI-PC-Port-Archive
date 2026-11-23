@@ -73,11 +73,15 @@ elseif(LEONIDA_TEST_LANTERNS)
     add_custom_target(lanterns_shaders DEPENDS ${LEONIDA_LANTERNS_SHADERS}/spirv/index.json)
     add_dependencies(lanterns lanterns_shaders)
     if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING)
-      add_test(NAME lanterns_stage1
-               COMMAND $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/run_lanterns.py
-                       --gta6rt $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:lanterns>
-                       --shaders ${LEONIDA_LANTERNS_SHADERS} --out ${CMAKE_CURRENT_BINARY_DIR}/lanterns_out --stage 1)
-      set_tests_properties(lanterns_stage1 PROPERTIES TIMEOUT 300)
+      # One test per stage (the runner gives each its own output folder under --out).
+      foreach(_stage 1 3 5 6 8 9 10)
+        add_test(NAME lanterns_stage${_stage}
+                 COMMAND $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/run_lanterns.py
+                         --gta6rt $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:lanterns>
+                         --shaders ${LEONIDA_LANTERNS_SHADERS} --out ${CMAKE_CURRENT_BINARY_DIR}/lanterns_out
+                         --stage ${_stage})
+        set_tests_properties(lanterns_stage${_stage} PROPERTIES TIMEOUT 300)
+      endforeach()
     endif()
   else()
     message(STATUS "llvm-mc (set LLVM_MC), spirv-as or Python 3 not found: lanterns.exe builds without its shaders")

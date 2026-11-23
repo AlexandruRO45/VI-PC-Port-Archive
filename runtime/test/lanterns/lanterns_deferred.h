@@ -244,7 +244,9 @@ inline TexturedReference deferred_reference(const Scene& scene, const std::vecto
 // wrote (read back) and the pass's constants: the tile's box of rebuilt world positions p = eye + t (d0 + cx R + cy U)
 // over its pixels with t > 0, then the squared distance from each light to the box against the box test's r^2 (k[14]),
 // in double. A light within 2e-3 of the threshold is "either": the GPU forms the same numbers in float. An empty tile
-// keeps nothing. Index: tile * kLights + light.
+// keeps nothing. Index: tile * kLights + light. At most kMaxEitherPairs pairs may be "either": the check reports how many,
+// so a culling error hiding inside that band would have to stay this small.
+constexpr unsigned kMaxEitherPairs = 32;   // of kTilesX * kTilesY * kLights = 98304
 inline std::vector<std::uint8_t> tile_light_states(const std::vector<float>& depth, const std::array<float, 16>& k,
                                                    const std::vector<PointLight>& lights) {
     std::vector<std::uint8_t> out(std::size_t(kTilesX) * kTilesY * kLights, 0);

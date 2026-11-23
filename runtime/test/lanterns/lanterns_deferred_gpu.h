@@ -35,7 +35,7 @@ private:
     Ref<ID3D12RootSignature> root_;
     Ref<ID3D12PipelineState> pso_;
     Ref<ID3D12DescriptorHeap> heap_;
-    Ref<ID3D12Resource> lights_, output_, counts_, lists_, poison_, readback_, gbuffer_readback_;
+    Ref<ID3D12Resource> lights_, lights_upload_, output_, counts_, lists_, poison_, readback_, gbuffer_readback_;
     Ref<ID3D12CommandAllocator> allocator_;
     Ref<ID3D12GraphicsCommandList> list_;
     Ref<ID3D12Fence> fence_;
