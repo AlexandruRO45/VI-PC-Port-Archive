@@ -104,6 +104,18 @@ class Tests(unittest.TestCase):
                  '<testcase classname="tests.a" name="t[1_2]"><skipped/></testcase></testsuite></testsuites>'
         self.assertEqual([(n, r) for n, r, _, _ in pd.parse_junit(pytest)], [("tests.a::t[1-2]", "pass"), ("tests.a::t[1_2]", "skip")])
 
+    def test_junit_omits_invalid_durations_without_losing_results(self):
+        for value in ("NaN", "inf", "-inf", "1e999", "-1", "invalid"):
+            with self.subTest(value=value):
+                report = (
+                    f'<testsuite><testcase name="failed" time="{value}"><failure/></testcase>'
+                    '<testcase name="passed" time="0"/></testsuite>'
+                )
+                self.assertEqual(pd.parse_junit(report), [
+                    ("failed", "fail", None, ""),
+                    ("passed", "pass", 0.0, ""),
+                ])
+
     def test_lasttest_log(self):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
