@@ -148,7 +148,7 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 |---|---|
 | `rpf9dump audio <audio.rpf> <out>` | `<out>/audio/awc/<path>.awc` (the original banks) and `<out>/audio/audio_manifest.json` |
 | `rpf9dump xma <audio.rpf> <out>` | `<out>/audio/xma/<bank>/<stream id>.xma.wav` for every codec-5 stream |
-| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N] [--pre-skip N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
+| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N] [--pre-skip N] [--limit N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once, `--limit` stops after that many banks |
 | `python -I tools/opus_tags.py <ogg dir> --names <csv> [--dialogue <csv>]` | the same `.ogg` files, with names, dialogue labels and subtitles in their `OpusTags` header (see *Tags: names and subtitles*) |
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
