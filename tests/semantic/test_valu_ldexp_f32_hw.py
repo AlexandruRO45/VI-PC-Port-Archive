@@ -445,5 +445,59 @@ class TestVLdexpF32ConditionCodes(unittest.TestCase):
         self.assertEqual(vcc, canary_vcc)
         self.assertEqual(scc, canary_scc)
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestVLdexpF32IEEE754EdgeCases(unittest.TestCase):
+    """Unit tests verifying IEEE 754 float32 boundary handling according to RDNA2 hardware semantics."""
+
+    FLOAT32_PATTERNS = {
+        "pos_zero": 0x0000_0000,
+        "neg_zero": 0x8000_0000,
+        "pos_inf": 0x7F80_0000,
+        "neg_inf": 0xFF80_0000,
+        "qnan": 0x7FC0_0000,
+        "snan": 0x7F80_0001,
+        "min_subnormal": 0x0000_0001,
+        "max_subnormal": 0x007F_FFFF,
+        "min_normal": 0x0080_0000,
+        "max_normal": 0x7F7F_FFFF,
+        "one_point_zero": 0x3F80_0000,
+    }
+
+    def test_signed_zero_preserved(self):
+        # +/-0.0 scaled by any exponent remains +/-0.0
+        pos_z = self.FLOAT32_PATTERNS["pos_zero"]
+        neg_z = self.FLOAT32_PATTERNS["neg_zero"]
+        for scale in (-100, -1, 0, 1, 100):
+            with self.subTest(scale=scale):
+                self.assertEqual(ref_ldexp_f32(pos_z, scale), pos_z)
+                self.assertEqual(ref_ldexp_f32(neg_z, scale), neg_z)
+
+    def test_infinities_pass_through(self):
+        pos_inf = self.FLOAT32_PATTERNS["pos_inf"]
+        neg_inf = self.FLOAT32_PATTERNS["neg_inf"]
+        for scale in (-10, 0, 10):
+            with self.subTest(scale=scale):
+                self.assertEqual(ref_ldexp_f32(pos_inf, scale), pos_inf)
+                self.assertEqual(ref_ldexp_f32(neg_inf, scale), neg_inf)
+
+    def test_nans_pass_through_bit_exact(self):
+        qnan = self.FLOAT32_PATTERNS["qnan"]
+        snan = self.FLOAT32_PATTERNS["snan"]
+        self.assertEqual(ref_ldexp_f32(qnan, 5), qnan)
+        self.assertEqual(ref_ldexp_f32(snan, -5), snan)
+
+    def test_subnormals_flushed_to_signed_zero(self):
+        # Under default RDNA2 denormal-off mode, subnormals are read as zero
+        min_sub = self.FLOAT32_PATTERNS["min_subnormal"]
+        max_sub = self.FLOAT32_PATTERNS["max_subnormal"]
+        self.assertEqual(ref_ldexp_f32(min_sub, 10), 0)
+        self.assertEqual(ref_ldexp_f32(max_sub, 10), 0)
+        # Negative subnormal flushes to -0.0
+        neg_sub = min_sub | SIGN_MASK
+        self.assertEqual(ref_ldexp_f32(neg_sub, 10), SIGN_MASK)
+
 if __name__ == "__main__":
     unittest.main()
