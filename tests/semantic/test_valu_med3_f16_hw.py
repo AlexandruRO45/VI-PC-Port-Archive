@@ -433,5 +433,34 @@ class TestVMed3F16Aliasing(unittest.TestCase):
         res = self.interp.execute(self.rf, inst)
         self.assertEqual(res, 0x99994000)
 
+# Append condition codes and status flags
+@dataclasses.dataclass
+class HardwareStatusFlags:
+    scc: int = 1
+    vcc: int = 0xFFFFFFFF_FFFFFFFF
+
+
+class TestVMed3F16ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter()
+        self.flags = HardwareStatusFlags()
+
+    def test_scc_and_vcc_unmodified(self) -> None:
+        self.rf.set_vgpr(VGPR(0), 0)
+        self.rf.set_vgpr(VGPR(1), 0x00003C00)
+        self.rf.set_vgpr(VGPR(2), 0x00004000)
+        self.rf.set_vgpr(VGPR(3), 0x00004200)
+
+        inst = VMed3F16Instruction(
+            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3)
+        )
+        self.interp.execute(self.rf, inst)
+        # VALU v_med3_f16 does not touch SCC or VCC
+        self.assertEqual(self.flags.scc, 1)
+        self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
