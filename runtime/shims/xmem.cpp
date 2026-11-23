@@ -463,7 +463,9 @@ DWORD view_protect(const Window& window) {
     return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
 }
 
-bool aligned_page_address(uintptr_t address) { return address != 0 && (address & (kPhysicalPageSize - 1)) == 0; }
+// A physical page maps only at a non-null, 64 KiB-aligned address: every measured caller passes an address inside a
+// window XMemVirtualAlloc reserved, and none relies on NULL meaning "let the system pick".
+bool valid_page_address(uintptr_t address) { return address != 0 && (address & (kPhysicalPageSize - 1)) == 0; }
 
 // gta6rt --trace FILE: the first XMemAllocatePhysicalPages for each distinct attribute word goes to the startup trace
 // as an "xmem_physical_pages" event with the page count and the caller.
@@ -560,7 +562,7 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // without touching its neighbours. A failure part-way leaves the pages before it mapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
-    if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
+    if (!valid_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
         start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -591,11 +593,19 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
 // BOOL XMemMapPhysicalPagesScatter(PVOID* addresses, UINT32 pageCount, UINT64* pageArray). Measured at two call sites:
 // RCX is an array of addresses, EDX a 32-bit count, R8 the page for each address (an entry of 0, or a null array,
 // unmaps). The result is tested as a 32-bit BOOL. Like MapUserPhysicalPagesScatter: entry i maps pageArray[i] at
-// addresses[i].
+// addresses[i]. Every address is checked before any entry is mapped, so an invalid one fails the call with nothing
+// changed; a later failure (an address outside any window, a page that is not live) leaves the entries before it
+// mapped, as XMemMapPhysicalPages does.
 BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_count, const uint64_t* page_array) {
     if (page_count && !addresses) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
+    }
+    for (uint32_t i = 0; i < page_count; ++i) {
+        if (!valid_page_address(reinterpret_cast<uintptr_t>(addresses[i]))) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
     }
     if (!placeholder_api().available()) {
         SetLastError(ERROR_NOT_SUPPORTED);
@@ -604,10 +614,6 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
     const std::lock_guard lock(g_phys_mutex);
     for (uint32_t i = 0; i < page_count; ++i) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
-        if (!aligned_page_address(address)) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return FALSE;
-        }
         const uint64_t page = page_array ? page_array[i] : 0;
         if (page == 0) {
             if (!unmap_page(address)) return FALSE;

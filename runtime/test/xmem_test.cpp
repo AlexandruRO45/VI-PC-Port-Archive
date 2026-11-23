@@ -414,6 +414,22 @@ void test_physical_pages(const PhysicalApi& api) {
           "mapping at an address that is not 64 KiB-aligned fails");
     const uint64_t bogus = 0x1fffff0;  // the highest page number, far above the few this test allocates
     check(api.map(window, 1, &bogus) == nullptr, "mapping a page number that was never allocated fails");
+    SetLastError(0);
+    check(api.map(nullptr, 1, pages) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "mapping live pages at a null address fails with ERROR_INVALID_PARAMETER");
+
+    // Scatter checks every address before it maps any entry, so a bad entry after a valid one leaves nothing mapped.
+    const uint64_t two_pages[2] = {pages[0], pages[1]};
+    void* const valid_then_null[2] = {window + 3 * kPage64k, nullptr};
+    SetLastError(0);
+    check(api.scatter(valid_then_null, 2, two_pages) == FALSE && GetLastError() == ERROR_INVALID_PARAMETER &&
+              reserved_only(window + 3 * kPage64k),
+          "a null address after a valid one fails without mapping the valid entry");
+    void* const valid_then_unaligned[2] = {window + 3 * kPage64k, window + 2 * kPage64k + 1};
+    SetLastError(0);
+    check(api.scatter(valid_then_unaligned, 2, two_pages) == FALSE && GetLastError() == ERROR_INVALID_PARAMETER &&
+              reserved_only(window + 3 * kPage64k),
+          "an unaligned address after a valid one fails without mapping the valid entry");
 
     check(api.map(second, kPages, nullptr) == second, "unmap the second window");
     check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees the pages");
