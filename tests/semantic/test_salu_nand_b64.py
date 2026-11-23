@@ -237,6 +237,124 @@ class SaluNandB64AstTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SaluOperand("invalid_operand_string")
 
+class ScalarState:
+    """Models 64-bit RDNA2 scalar execution state: SGPRs, EXEC, VCC, SCC, and NULL."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs = [0] * num_sgprs
+        self.exec: int = MASK64
+        self.vcc: int = 0
+        self.scc: int = 0
+
+    def read_sgpr64(self, idx: int) -> int:
+        lo = self.sgprs[idx] & MASK32
+        hi = self.sgprs[idx + 1] & MASK32
+        return (hi << 32) | lo
+
+    def write_sgpr64(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+        self.sgprs[idx + 1] = (val >> 32) & MASK32
+
+    def resolve_src64(self, src: int | str) -> int:
+        if isinstance(src, int):
+            return src & MASK64
+        if src == "exec":
+            return self.exec & MASK64
+        if src == "vcc":
+            return self.vcc & MASK64
+        if src == "null":
+            return 0
+        if src.startswith("s[") and ":" in src:
+            idx = int(src[2:].split(":")[0])
+            return self.read_sgpr64(idx)
+        raise ValueError(f"Unknown 64-bit source operand: {src}")
+
+    def write_dst64(self, dst: str, val: int) -> None:
+        val = val & MASK64
+        if dst == "exec":
+            self.exec = val
+        elif dst == "vcc":
+            self.vcc = val
+        elif dst == "null":
+            pass
+        elif dst.startswith("s[") and ":" in dst:
+            idx = int(dst[2:].split(":")[0])
+            self.write_sgpr64(idx, val)
+        else:
+            raise ValueError(f"Unknown 64-bit destination operand: {dst}")
+
+    def execute_nand_b64(self, dst: str, src0: int | str, src1: int | str) -> int:
+        """Executes one s_nand_b64 instruction and updates SCC."""
+        s0_val = self.resolve_src64(src0)
+        s1_val = self.resolve_src64(src1)
+        res = ref_nand_b64(s0_val, s1_val)
+        self.write_dst64(dst, res)
+        self.scc = ref_scc(res)
+        return res
+
+
+class SaluNandB64InterpreterTests(unittest.TestCase):
+    """Scalar interpreter execution tests for s_nand_b64."""
+
+    def test_interpreter_basic_execution(self):
+        state = ScalarState()
+        v0 = 0x01234567_89ABCDEF
+        v1 = 0xFEEDBEEF_CAFED00D
+        state.write_sgpr64(0, v0)
+        state.write_sgpr64(2, v1)
+
+        res = state.execute_nand_b64("s[4:5]", "s[0:1]", "s[2:3]")
+        expected = ref_nand_b64(v0, v1)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.read_sgpr64(4), expected)
+        self.assertEqual(state.scc, ref_scc(expected))
+
+    def test_interpreter_inline_constants(self):
+        state = ScalarState()
+        v0 = 0x55555555_55555555
+        state.write_sgpr64(0, v0)
+
+        # NAND with 0 -> all ones (MASK64)
+        res = state.execute_nand_b64("s[2:3]", "s[0:1]", 0)
+        self.assertEqual(res, MASK64)
+        self.assertEqual(state.read_sgpr64(2), MASK64)
+        self.assertEqual(state.scc, 1)
+
+        # NAND with MASK64 -> bitwise NOT of v0
+        res = state.execute_nand_b64("s[2:3]", "s[0:1]", MASK64)
+        self.assertEqual(res, (~v0) & MASK64)
+        self.assertEqual(state.read_sgpr64(2), (~v0) & MASK64)
+        self.assertEqual(state.scc, 1)
+
+    def test_interpreter_null_destination(self):
+        state = ScalarState()
+        state.write_sgpr64(0, 0x11111111_22222222)
+        state.write_sgpr64(2, 0x33333333_44444444)
+
+        # Execute to null sink
+        res = state.execute_nand_b64("null", "s[0:1]", "s[2:3]")
+        self.assertEqual(res, ref_nand_b64(0x11111111_22222222, 0x33333333_44444444))
+        self.assertEqual(state.scc, 1)
+        # Verify source registers were untouched
+        self.assertEqual(state.read_sgpr64(0), 0x11111111_22222222)
+        self.assertEqual(state.read_sgpr64(2), 0x33333333_44444444)
+
+    def test_interpreter_randomized_trace(self):
+        state = ScalarState()
+        rng = random.Random(0x1337_5A10)
+        current = rng.getrandbits(64)
+        state.write_sgpr64(0, current)
+
+        for step in range(20):
+            val = rng.getrandbits(64)
+            state.write_sgpr64(2, val)
+            res = state.execute_nand_b64("s[0:1]", "s[0:1]", "s[2:3]")
+            expected = ref_nand_b64(current, val)
+            self.assertEqual(res, expected)
+            self.assertEqual(state.read_sgpr64(0), expected)
+            self.assertEqual(state.scc, ref_scc(expected))
+            current = expected
+
 
 if __name__ == "__main__":
     unittest.main()
