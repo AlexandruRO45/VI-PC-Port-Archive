@@ -365,9 +365,11 @@ class GlbSkinningTests(unittest.TestCase):
         self.assertIn("inverseBindMatrices count 1 < joint count 2", proc.stderr)
 
     def test_surplus_inverse_bind_matrices_are_allowed(self):
+        # Use distinct joints for both nonzero influences on the last vertex.
+        joints = ((0, 0, 0, 0), (0, 1, 0, 0), (0, 1, 0, 0))
         for count in (3, 4):
             with self.subTest(count=count):
-                data = make_glb(ibm_count=count)
+                data = make_glb(joints=joints, ibm_count=count)
                 report = glb_skinning.analyze_glb(data)
                 self.assertTrue(report["ok"], report["errors"])
                 skin = report["skins"][0]
