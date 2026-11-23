@@ -118,9 +118,10 @@ process lifetime and answers as Windows does when no `Loader` is alive.
 different index space from the `TlsAlloc` slots, and only the OS loader can allocate a module index.
 The runtime therefore ships a minimal `gta6rt_tls_host.dll`; the loader reuses the index the OS assigns
 it, writes that index into the image's `AddressOfIndex`, and copies the image's TLS template into the
-slot. This reserves one index, so **one manually mapped TLS module can be live at a time**; a second
-one is rejected with an error instead of sharing the slot. Images without a TLS directory (or with an
-all-zero one) load normally.
+slot. This reserves one index; every additional simultaneous TLS module gets its own by mapping a fresh
+clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16 modules can be live at
+once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
+directory (or with an all-zero one) load normally.
 
 Current limits, by design:
 
@@ -164,8 +165,9 @@ Current limits, by design:
   section 3.2 for what is missing.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
-  (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, and on a
-  DualSense adaptive-trigger effects and the lightbar. Optional and CMake-only: built when an installed SDL3 is found,
+  (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
+  and trigger haptics where SDL opens the pad as a haptic device, and on a DualSense adaptive-trigger effects and the
+  lightbar. Optional and CMake-only: built when an installed SDL3 is found,
   or with `-DLEONIDA_SDL3_FETCH=ON` to download the pinned release; nothing is downloaded otherwise, and the
   `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
   unverified.
@@ -204,11 +206,16 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
   translator-style index, root arguments through the GPU address arena, and two dispatches.
+- `d3d12_fspx_compute_test` — compute PSOs from synthetic FSPX programs (`docs/fspx.md`): an `ACCC` container
+  through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
+  dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
+  are refused with `E_INVALIDARG`.
 - `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
   bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
   the bindless set the layer binds.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
-  Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
+  Vulkan, resizes it and presents 10 more, and checks the colour in the presented images (the presenter's
+  capture) and on screen where GDI can read it. A driver double then injects an
   out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit
   submission, which the presenter must survive. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
@@ -272,6 +279,48 @@ Each trace line contains a sequence number, a fixed API name and an outcome. `ca
 whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
 Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
 
+### Startup trace: `--trace FILE`
+
+`--trace FILE` (with `--dry-run`, `--init` or `--run`, before the `--` separator) writes one JSON object per line
+to FILE, flushed per event so the file survives a crash ([shims/startup_trace.h](shims/startup_trace.h)). FILE must
+not exist yet: the trace is created before the loader reads anything, so gta6rt refuses an existing path (exit code 2)
+rather than risk truncating an input such as the image. The file is UTF-8; `OutputDebugStringA` text is converted
+from the ANSI code page.
+
+| `kind` | When | Fields |
+|---|---|---|
+| `trace_open` | first line | `pid` |
+| `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
+| `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
+| `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
+| `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
+| `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
+| `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
+| `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
+
+Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,
+`host:name.dll+0xRVA` for host modules. The exception handler only records: it returns `EXCEPTION_CONTINUE_SEARCH`,
+so the process behaves the same with or without the trace. It works with any `LEONIDA_UNIMPLEMENTED` policy.
+
+The file can quote what the game prints, so it stays on your machine. In issues and pull requests, share counts or
+lines from synthetic fixtures only.
+
+```powershell
+.\runtime\build\gta6rt.exe --run $gameExe --trace startup.jsonl
+Get-Content startup.jsonl | ConvertFrom-Json | Group-Object kind | Select-Object Count, Name
+```
+
+[tools/boot_trace.py](../tools/boot_trace.py) prints the first-boot summary of this file and of the
+`--trace-d3d12` log (modules, unimplemented calls with their callers, DllMain/TLS results, exceptions with their
+stack, the exit, and the D3D12 calls by outcome and first call per method):
+
+```powershell
+python -I tools\boot_trace.py startup.jsonl --d3d12 d3d12.log
+```
+
+[docs/boot.md](../docs/boot.md) is the runbook around it: the commands, the triage order and the open questions'
+trace signals.
+
 ### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
@@ -305,7 +354,8 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 
 `d3d12_rgb96_test` compares footprints, uploads, readbacks, boxes, texture-to-texture copies and CPU copies of
 `R32G32B32_FLOAT/UINT/SINT/TYPELESS` textures (2D arrays with mips, and volumes) with Windows WARP, bit for bit,
-and prints how long an upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
+checks that WARP and the hardware adapter report no resource tiling for all four formats, and prints how long an
+upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
 is registered in CTest (`d3d12_rgb96`).
 
 ```powershell
