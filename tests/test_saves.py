@@ -128,6 +128,26 @@ class JsavTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, "verify", p], capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
 
+    def test_verify_batch_reports_every_input_and_keeps_the_worst_status(self):
+        data, _, _ = make_jsav()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad, missing, changed, good = (os.path.join(tmp, n) for n in
+                                           ("bad.jsav", "missing.jsav", "changed.jsav", "good.jsav"))
+            write(bad, b"JSAV")
+            write(changed, data + bytes(16))  # excess padding: parses but does not rebuild identically
+            write(good, data)
+            for paths, status in [([bad, missing, changed, good], 2), ([changed, good], 1)]:
+                with self.subTest(paths=paths):
+                    r = subprocess.run([sys.executable, "-I", TOOL, "verify", *paths],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, status, r.stderr)
+                    self.assertIn(f"{changed}: MISMATCH", r.stdout)
+                    self.assertIn(f"{good}: OK", r.stdout)
+                    errors = r.stderr.splitlines()
+                    self.assertEqual(len(errors), len(paths) - 2)
+                    for path, line in zip(paths[:-2], errors):
+                        self.assertIn(path, line)
+
     def test_extract_edit_pack(self):
         d, _, _ = make_jsav()
         with tempfile.TemporaryDirectory() as tmp:
