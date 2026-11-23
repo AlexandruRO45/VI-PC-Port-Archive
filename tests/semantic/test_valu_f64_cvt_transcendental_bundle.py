@@ -558,6 +558,27 @@ class VRsqF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 0, res)
         self.assertEqual(wave.get_f64(0, 0), f64_to_u64(0.1))
 
+class VRsqF64SimdIeeeTests(unittest.TestCase):
+    def test_rsq_f64_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x33333333
+        powers_of_four = [float(4**i) for i in range(32)]
+        for i in range(32):
+            wave.set_f64(i, 0, 0xFEEDFACECAFEBABE)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 0, oracle_rsq_f64(f64_to_u64(powers_of_four[i])))
+        for i in range(32):
+            if (0x33333333 >> i) & 1:
+                expected = 1.0 / math.sqrt(powers_of_four[i])
+                self.assertEqual(wave.get_f64(i, 0), f64_to_u64(expected))
+            else:
+                self.assertEqual(wave.get_f64(i, 0), 0xFEEDFACECAFEBABE)
+
+    def test_rsq_f64_near_zero(self):
+        small = 1e-100
+        res = oracle_rsq_f64(f64_to_u64(small))
+        self.assertEqual(u64_to_f64(res), 1e50)
+
 
 if __name__ == "__main__":
     unittest.main()
