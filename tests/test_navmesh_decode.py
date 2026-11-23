@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -868,6 +869,18 @@ class OutputPathTest(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("--out is a directory", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = os.path.join(tmp, "out.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(nd, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    nd.write_json_report(path, {"resources": 0})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

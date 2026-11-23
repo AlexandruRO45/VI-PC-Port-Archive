@@ -38,6 +38,8 @@ Usage:
               stream past the window's end is reported under past_window, not in the carver counts
     --deep    also walk every navmesh polygon, quadtree node and grid hash-table slot (slower)
     --quiet   do not print the summary
+
+A JSON `--out` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 import argparse
 import csv
@@ -46,8 +48,10 @@ import math
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import time
 import unicodedata
 import zlib
@@ -57,6 +61,8 @@ from collections.abc import Iterator
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 BASE = 0x50000000
@@ -1122,9 +1128,7 @@ def main(argv=None):
         return 2
     report_path = out
     try:
-        _make_parent(out)
-        with open(out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(summary, f, indent=1, allow_nan=False)
+        write_json_report(out, summary)
         if a.csv:
             report_path = a.csv
             write_csv(a.csv, rows)
@@ -1135,6 +1139,39 @@ def main(argv=None):
         print(json.dumps(summary, indent=1, allow_nan=False))
         print("wrote %s" % out + (", %s" % a.csv if a.csv else ""))
     return 0
+
+
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    _make_parent(path)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1, allow_nan=False)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".navmesh_decode-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, allow_nan=False)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
