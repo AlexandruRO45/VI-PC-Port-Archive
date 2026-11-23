@@ -10794,14 +10794,18 @@ class Gen:
                 self.emit(f"{lc} = OpExtInst %float %glsl FMax {raw_lod} {minlod}")
                 raw_lod = lc
 
-        lv, lvm, rl, mi, mc, mz = (self.tmp() for _ in range(6))
+        lv, lvm, mi, mc, mz = (self.tmp() for _ in range(5))
         self.emit(f"{lv} = OpImageQueryLevels %int {img}")
         self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
         lod = self.clamp_gather_lod(raw_lod, a[3]["r"] + 1)
-        biased = self.tmp()
-        self.emit(f"{biased} = OpFAdd %float {lod} %fhalf_g")
-        self.emit(f"{rl} = OpExtInst %float %glsl Floor {biased}")
-        self.emit(f"{mi} = OpConvertFToS %int {rl}")
+        # Share #4321's RDNA2 8-fraction-bit LOD rounding so ordinary and depth-compare gathers agree at
+        # mip boundaries such as 0x3eff0000 (127.5/256) and 0x3eff0001: mip = (RoundEven(lod * 256) + 128) >> 8.
+        sc, q, qi, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{sc} = OpFMul %float {lod} {self.fconst(256.0)}")
+        self.emit(f"{q} = OpExtInst %float %glsl RoundEven {sc}")
+        self.emit(f"{qi} = OpConvertFToS %int {q}")
+        self.emit(f"{b} = OpIAdd %int {qi} {self.as_int(self.cu(128))}")
+        self.emit(f"{mi} = OpShiftRightArithmetic %int {b} {self.cu(8)}")
         self.emit(f"{mz} = OpExtInst %int %glsl SMax {mi} {self.as_int(self.cu(0))}")
         self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
 

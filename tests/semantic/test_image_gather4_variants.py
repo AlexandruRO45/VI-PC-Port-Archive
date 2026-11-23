@@ -11,7 +11,9 @@ Covers:
       image_gather4_c_b, image_gather4_c_b_o,
       image_gather4_c_b_cl, image_gather4_c_b_cl_o
 """
+import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -85,7 +87,66 @@ def _validate(spvasm: str) -> None:
                 raise AssertionError(f"{cmd[0]} failed:\n{r.stderr}")
 
 
-def _ps_shader(inst: str, s0_lit: int | None = 0x3092, runtime_s: bool = False) -> list[str]:
+def _f32(x: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def _f32_bits(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _translated_gather_mip(spvasm: str, lod: float, levels: int) -> int:
+    """Evaluate the emitted mip level operand of OpImageQuerySizeLod in binary32 (mirrors #4321)."""
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", spvasm, re.M))
+    raw, = re.findall(r"= OpExtInst %float %glsl FClamp (%\w+) %\w+ %\w+$", spvasm, re.M)
+    env: dict[str, object] = {raw: _f32(lod), "%fhalf_g": 0.5}
+
+    def ev(name: str):
+        if name in env:
+            return env[name]
+        e = defs[name].split()
+        op, args = e[0], e[2:]
+        if op == "OpConstant":
+            v = float(args[0]) if e[1] == "%float" else int(args[0], 0)
+            return v - (1 << 32) if e[1] == "%int" and v >= (1 << 31) else v
+        if op == "OpBitcast":
+            v = ev(args[0])
+            if e[1] == "%float":
+                return _f32_bits(v & 0xFFFFFFFF)
+            return v if e[1] == "%int" else v & 0xFFFFFFFF
+        if op == "OpImageQueryLevels":
+            return levels
+        if op == "OpExtInst":
+            fn, a = args[1], [ev(x) for x in args[2:]]
+            out = {
+                "Floor": lambda: float(math.floor(a[0])),
+                "RoundEven": lambda: float(round(a[0])),
+                "FClamp": lambda: min(max(a[0], a[1]), a[2]),
+                "FMax": lambda: max(a),
+                "FMin": lambda: min(a),
+                "SMax": lambda: max(a),
+                "SMin": lambda: min(a),
+                "SClamp": lambda: min(max(a[0], a[1]), a[2]),
+            }[fn]()
+            return _f32(out) if isinstance(out, float) else out
+        a = [ev(x) for x in args]
+        return {
+            "OpFAdd": lambda: _f32(a[0] + a[1]),
+            "OpFSub": lambda: _f32(a[0] - a[1]),
+            "OpFMul": lambda: _f32(a[0] * a[1]),
+            "OpShiftRightArithmetic": lambda: a[0] >> a[1],
+            "OpIAdd": lambda: a[0] + a[1],
+            "OpISub": lambda: a[0] - a[1],
+            "OpConvertFToS": lambda: int(a[0]),
+            "OpFOrdGreaterThanEqual": lambda: a[0] >= a[1],
+            "OpSelect": lambda: a[1] if a[0] else a[2],
+        }[op]()
+
+    level, = re.findall(r"= OpImageQuerySizeLod %v2int %\w+ (%\w+)$", spvasm, re.M)
+    return ev(level)
+
+
+def _ps_shader(inst: str, s0_lit: int | None = 0x3092, runtime_s: bool = False, s1_lit: int = 0xc00000) -> list[str]:
     lines = [
         "s_load_dwordx8 s[8:15], s[0:1], 0x0",
         "s_waitcnt lgkmcnt(0)",
@@ -98,7 +159,7 @@ def _ps_shader(inst: str, s0_lit: int | None = 0x3092, runtime_s: bool = False) 
     else:
         lines += [
             f"s_mov_b32 s16, {hex(s0_lit)}",
-            "s_mov_b32 s17, 0xc00000",
+            f"s_mov_b32 s17, {hex(s1_lit)}",
             "s_mov_b32 s18, 0",
             "s_mov_b32 s19, 0",
         ]
@@ -273,6 +334,44 @@ class TestImageGather4Variants(unittest.TestCase):
         spv = support.translate_lines("ps_c_l_o_border", lines)
         _validate(spv)
         self.assertIn("OpSelect %float", spv)
+
+    def test_explicit_lod_compare_mip_boundary_matches_rdna2(self) -> None:
+        # Both explicit-LOD depth-compare forms must match #4321's 8-fraction-bit LOD rounding
+        # (RoundEven(lod * 256) + 128) >> 8 so ordinary and compare gathers select the same mip
+        # at 0x3eff0000 (127.5/256) and 0x3eff0001 (mip 1) and one step below (0x3efeffff -> mip 0).
+        cases = (
+            (0x100000, 0x3efeffff, 0),  # one ULP below 127.5/256 -> mip 0
+            (0x100000, 0x3eff0000, 1),  # 127.5/256 -> rounds to 128/256 -> mip 1
+            (0x100000, 0x3eff0001, 1),  # one ULP above 127.5/256 -> mip 1
+            (0x100000, 0x3f000000, 1),  # 0.5 -> mip 1
+            (0xfff000, 0x3fbfbfff, 1),  # one ULP below 383.5/256 -> mip 1
+            (0xfff000, 0x3fbfc000, 2),  # 383.5/256 -> rounds to 384/256 -> mip 2
+            (0xfff000, 0x3fc00000, 2),  # 1.5 -> mip 2
+        )
+        for op, vaddr in (("image_gather4_c_l", "v[0:3]"), ("image_gather4_c_l_o", "v[0:4]")):
+            inst = f"{op} v[8:11], {vaddr}, s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D"
+            for word1 in (0x100000, 0xfff000):
+                spv = support.translate_lines(f"ps_{op}_mip_{word1:x}", _ps_shader(inst, s1_lit=word1))
+                _validate(spv)
+                self.assertNotRegex(spv, r"= OpFAdd %float %\w+ %fhalf_g")
+                self.assertRegex(spv, r"= OpExtInst %float %glsl RoundEven %\w+")
+                self.assertRegex(spv, r"= OpShiftRightArithmetic %int %\w+ %c8\b")
+                for w1, lod_bits, expected_mip in cases:
+                    if w1 != word1:
+                        continue
+                    with self.subTest(op=op, word1=hex(word1), lod_bits=hex(lod_bits)):
+                        self.assertEqual(_translated_gather_mip(spv, _f32_bits(lod_bits), 4), expected_mip)
+
+    def test_ps_gather4_c_l_fixture_emits_dynamic_depth_compare(self) -> None:
+        # Guard against constant-folding S# word 0 in the GPU fixture's run-time S# case (G).
+        asm_path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_gather4_c_l.asm")
+        with open(asm_path, "r", encoding="utf-8") as f:
+            lines = [ln.split(";")[0].strip() for ln in f if ln.split(";")[0].strip()]
+        spv = support.translate_lines("ps_gather4_c_l_fixture", lines)
+        _validate(spv)
+        self.assertRegex(spv, r"= OpBitFieldUExtract %uint %\w+ %cc %c3\b")
+        # Case G is the only case that emits OpFOrdEqual (4 taps) via the dynamic compare path.
+        self.assertEqual(spv.count("OpFOrdEqual %bool"), 4)
 
 
 if __name__ == "__main__":

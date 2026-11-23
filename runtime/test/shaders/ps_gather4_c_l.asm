@@ -25,9 +25,10 @@ s_waitcnt vmcnt(0)
 v_fma_f32 v16, v8, 2.0, v9
 v_fma_f32 v16, v16, 2.0, v10
 v_fma_f32 v4, v16, 2.0, v11
-; g: image_gather4_c_l_o (run-time S#, GREATER_EQUAL, offset x=+2)
-s_mov_b32 s16, 0x6092
-s_add_u32 s16, s16, 0
+; g: image_gather4_c_l_o (run-time S# word 0 loaded from descriptor heap, GREATER_EQUAL, offset x=+2)
+s_load_dword s16, s[0:1], 0x20
+s_waitcnt lgkmcnt(0)
+s_or_b32 s16, s16, 0x6000
 v_mov_b32_e32 v19, 2
 v_mov_b32_e32 v20, 0x3f333333
 v_mov_b32_e32 v21, 0.5
