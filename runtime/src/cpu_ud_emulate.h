@@ -5,6 +5,9 @@
 // instruction raises #UD, which Windows reports as STATUS_ILLEGAL_INSTRUCTION. The handler here looks the faulting
 // instruction up in a table of emulators, performs its effect on the saved CONTEXT and resumes after it.
 //
+// INSERTQ follows Zen 2 for both forms: it zeroes the destination XMM high quadword and discards inserted bits
+// beyond bit 63 of the low quadword.
+//
 // Adding an instruction: write one emulator in cpu_ud_emulate.cpp, with the signature of `Emulator::fn`, and add one
 // line to `kTable` in the same file. The dispatcher does the rest (reading the code bytes,
 // advancing RIP, passing on what it does not recognise).

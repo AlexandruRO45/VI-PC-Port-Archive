@@ -83,10 +83,9 @@ size_t emulate_clzero(CONTEXT& ctx, const uint8_t* code, size_t available) {
 // INSERTQ (SSE4a), F2 [REX] 0F 79 /r (xmm1, xmm2: length and index come from the high quadword of xmm2) and
 // F2 [REX] 0F 78 /r ib ib (xmm1, xmm2, length, index). Both take ModRM.reg as xmm1 (destination, also a source) and
 // ModRM.rm as xmm2, register forms only. The low `length` bits of the low quadword of xmm2 replace the bits of the low
-// quadword of xmm1 from bit `index` up; the high quadword of xmm1 is unchanged. Length and index are 6-bit fields
+// quadword of xmm1 from bit `index` up; the high quadword of xmm1 is zeroed. Length and index are 6-bit fields
 // (bits 5:0 of the immediate, or bits 69:64 and 77:72 of xmm2; the bits around them are ignored); a length of 0
-// means 64. A field that reaches past bit 63 (index + length > 64, which includes length 64 at a non-zero index) is
-// undefined in the APM (vol. 4), so the emulator declines it rather than invent a result.
+// means 64. For fields extending past bit 63, the unsigned shifts discard the excess bits, as measured on Zen 2.
 size_t emulate_insertq(CONTEXT& ctx, const uint8_t* code, size_t available) {
     size_t at = 0;
     if (available < 1 || code[at++] != 0xF2) return 0;
@@ -113,9 +112,9 @@ size_t emulate_insertq(CONTEXT& ctx, const uint8_t* code, size_t available) {
         at += 2;
     }
     if (length == 0) length = 64;
-    if (index + length > 64) return 0;
     const ULONGLONG mask = length == 64 ? ~0ULL : (1ULL << length) - 1;
     dst.Low = (dst.Low & ~(mask << index)) | ((src.Low & mask) << index);
+    dst.High = 0;
     return at;
 }
 

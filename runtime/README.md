@@ -213,8 +213,8 @@ resumes after them, and passes every other exception on. Installed at startup on
 instruction. So far: `CLZERO` (`0F 01 FC`) zeroes the 64-byte line at `RAX & ~63`. Legacy prefixes, a trailing REX and
 `67` (EAX as the address) are accepted; `LOCK` is left as the real #UD. If the line is not writable the exception record
 is rewritten into the page fault the CPU would raise (`STATUS_ACCESS_VIOLATION`, write, line address) and passed on. `INSERTQ` (SSE4a, `F2 0F 79 /r` and `F2 0F 78 /r ib ib`, register forms) inserts the low bits of one XMM
-register's low quadword into another's; a field the APM leaves undefined (index + length > 64) is declined, and the
-high quadword of the destination is left as it was. Another
+register's low quadword into another's. Like Zen 2, it zeroes the destination's high quadword and discards inserted
+bits beyond bit 63 of the low quadword. The APM leaves these two behaviors undefined. Another
 instruction is one emulator function and one line in `kTable`; `cpu_ud_emulate_test` drives the dispatcher with a
 synthetic `CONTEXT`, so it runs on any CPU.
 

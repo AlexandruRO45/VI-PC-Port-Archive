@@ -80,6 +80,12 @@ const Case kCases[] = {
     {kOnes, 16, 48, 0xCDEFFFFFFFFFFFFFull},
     {kOnes, 63, 0, 0x8123456789ABCDEFull},  // bit 63 is outside the field and stays set
     {0x5555555555555555ull, 0, 0, 0x0123456789ABCDEFull},
+    // Zen 2 discards the part of the field that extends past bit 63.
+    {0x77, 0, 8, 0x23456789ABCDEF77ull},
+    {0x77, 40, 30, 0xE26AF37BC0000077ull},
+    {0x77, 2, 63, 0x8000000000000077ull},
+    {0x77, 63, 2, 0x048D159E26AF37BFull},
+    {0x77, 32, 33, 0x13579BDE00000077ull},
 };
 
 // F2 0F 79 /r: xmm1 = ModRM.reg, xmm2 = ModRM.rm. The length and index travel in the high quadword of xmm2, with
@@ -98,7 +104,7 @@ void run_register_form(const Case& c, const char* label) {
     char text[160];
     std::snprintf(text, sizeof text, "register form %s: dst low, dst high, source and RIP", label);
     check(r == EXCEPTION_CONTINUE_EXECUTION && static_cast<ULONGLONG>(f.xmm(0).Low) == c.expected &&
-              static_cast<ULONGLONG>(f.xmm(0).High) == kDstHigh && std::memcmp(&f.xmm(1), &src_before, sizeof src_before) == 0 &&
+              f.xmm(0).High == 0 && std::memcmp(&f.xmm(1), &src_before, sizeof src_before) == 0 &&
               f.context.Rip == reinterpret_cast<DWORD64>(f.bytes.data()) + 4,
           text);
 }
@@ -114,7 +120,7 @@ void run_immediate_form(const Case& c, const char* label) {
     char text[160];
     std::snprintf(text, sizeof text, "immediate form %s: dst low, dst high, source and RIP", label);
     check(r == EXCEPTION_CONTINUE_EXECUTION && static_cast<ULONGLONG>(f.xmm(0).Low) == c.expected &&
-              static_cast<ULONGLONG>(f.xmm(0).High) == kDstHigh && std::memcmp(&f.xmm(1), &src_before, sizeof src_before) == 0 &&
+              f.xmm(0).High == 0 && std::memcmp(&f.xmm(1), &src_before, sizeof src_before) == 0 &&
               f.context.Rip == reinterpret_cast<DWORD64>(f.bytes.data()) + 6,
           text);
 }
@@ -164,34 +170,8 @@ void test_rex_registers() {
         char text[96];
         std::snprintf(text, sizeof text, "%s: field lands in the right register, the other 15 are untouched", form.what);
         check(r == EXCEPTION_CONTINUE_EXECUTION && static_cast<ULONGLONG>(f.xmm(form.dst).Low) == 0x000089ABCDEF0000ull &&
-                  static_cast<ULONGLONG>(f.xmm(form.dst).High) == kDstHigh && others_unchanged,
+                  f.xmm(form.dst).High == 0 && others_unchanged,
               text);
-    }
-}
-
-void test_undefined_fields_decline() {
-    struct Undef {
-        unsigned length, index;
-        const char* what;
-    } cases[] = {
-        {0, 8, "length 64 at index 8"},
-        {40, 30, "length 40 at index 30 (70 bits)"},
-        {2, 63, "length 2 at index 63 (65 bits)"},
-        {63, 2, "length 63 at index 2 (65 bits)"},
-        {32, 33, "length 32 at index 33 (65 bits)"},
-    };
-    for (const Undef& u : cases) {
-        for (int imm = 0; imm < 2; ++imm) {
-            Fault f(imm ? std::initializer_list<uint8_t>{0xF2, 0x0F, 0x78, 0xC1, static_cast<uint8_t>(u.length), static_cast<uint8_t>(u.index)}
-                        : std::initializer_list<uint8_t>{0xF2, 0x0F, 0x79, 0xC1});
-            f.xmm(0).Low = 0x77;
-            f.xmm(1).Low = static_cast<LONGLONG>(kSrcLow);
-            f.xmm(1).High = static_cast<LONGLONG>(field_quad(u.length, u.index));
-            const CONTEXT before = f.context;
-            char text[128];
-            std::snprintf(text, sizeof text, "%s form, %s: declined, nothing modified", imm ? "immediate" : "register", u.what);
-            check(ud::emulate(&f.pointers) == EXCEPTION_CONTINUE_SEARCH && std::memcmp(&before, &f.context, sizeof before) == 0, text);
-        }
     }
 }
 
@@ -267,7 +247,7 @@ void test_against_the_cpu() {
     for (ULONGLONG dst : dsts) {
         for (unsigned length = 0; length < 64; ++length) {
             for (unsigned index = 0; index < 64; ++index) {
-                if (index + (length ? length : 64) > 64) continue;  // undefined: the emulator declines these
+                if (index + (length ? length : 64) > 64) continue;  // compare native low bits only for APM-defined fields
                 alignas(16) M128A cpu_dst, cpu_src;
                 cpu_dst.Low = static_cast<LONGLONG>(dst);
                 cpu_dst.High = static_cast<LONGLONG>(kDstHigh);
@@ -280,7 +260,7 @@ void test_against_the_cpu() {
                 f.xmm(0).High = static_cast<LONGLONG>(kDstHigh);
                 f.xmm(1) = cpu_src;
                 const bool ok = ud::emulate(&f.pointers) == EXCEPTION_CONTINUE_EXECUTION && f.xmm(0).Low == cpu_dst.Low &&
-                                static_cast<ULONGLONG>(f.xmm(0).High) == kDstHigh;
+                                f.xmm(0).High == 0;
                 ++compared;
                 if (ok) ++equal;
                 if (cpu_dst.High == 0) ++cpu_zeroed_high;
@@ -290,7 +270,7 @@ void test_against_the_cpu() {
     char text[96];
     std::snprintf(text, sizeof text, "emulated low quadword equals the CPU's for every defined length and index (%d of %d)", equal, compared);
     check(compared > 0 && equal == compared, text);
-    // The APM calls the high quadword of the result undefined; the emulator leaves it as it was.
+    // Native high quadwords are informational because the APM leaves them undefined.
     std::printf("      (the CPU zeroed the high quadword in %d of %d runs; not compared)\n", cpu_zeroed_high, compared);
     VirtualFree(mem, 0, MEM_RELEASE);
 }
@@ -308,7 +288,7 @@ void test_installed_handler() {
     std::memcpy(mem, code, sizeof code);
     alignas(16) M128A dst{0, static_cast<LONGLONG>(kDstHigh)}, src{static_cast<LONGLONG>(kSrcLow), static_cast<LONGLONG>(field_quad(32, 16))};
     reinterpret_cast<InsertqFn>(mem)(&dst, &src);
-    check(static_cast<ULONGLONG>(dst.Low) == 0x000089ABCDEF0000ull && static_cast<ULONGLONG>(dst.High) == kDstHigh,
+    check(static_cast<ULONGLONG>(dst.Low) == 0x000089ABCDEF0000ull && dst.High == 0,
           "INSERTQ on a CPU without SSE4a: emulated by the installed handler");
     VirtualFree(mem, 0, MEM_RELEASE);
     ud::uninstall();
@@ -320,7 +300,6 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_known_values();
     test_rex_registers();
-    test_undefined_fields_decline();
     test_other_instructions_pass();
     test_against_the_cpu();
     test_installed_handler();
