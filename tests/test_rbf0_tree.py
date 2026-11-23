@@ -497,6 +497,35 @@ class OutputTest(unittest.TestCase):
                     self.assertEqual(f.read(), blob)
                 self.assertEqual(sorted(os.listdir(self.root)), ["00000000.bin"])
 
+    def test_xml_export_over_a_stream_or_the_report_is_refused(self):
+        # A stream named 00000000.xml carries the first XML export name, so --xml on its folder replaced it.
+        blob = wide_blob()
+        source = os.path.join(self.root, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(blob)
+        xml_dir = os.path.join(self.root, "xml")
+        os.makedirs(xml_dir)
+        stream = os.path.join(xml_dir, "00000000.xml")
+        with open(stream, "wb") as f:
+            f.write(blob)
+        out = os.path.join(self.root, "tree.json")
+        empty = os.path.join(self.root, "xml2")
+        os.makedirs(empty)
+        cases = (((stream, out, "--xml", xml_dir), stream),
+                 ((source, os.path.join(empty, "00000000.xml"), "--xml", empty), None))
+        for argv, kept in cases:
+            with self.subTest(argv=argv):
+                result = self._run_cli(*argv)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--xml would overwrite", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                if kept:
+                    with open(kept, "rb") as f:
+                        self.assertEqual(f.read(), blob)
+        self.assertEqual(os.listdir(xml_dir), ["00000000.xml"])
+        self.assertEqual(os.listdir(empty), [])
+        self.assertFalse(os.path.exists(out))
+
     def test_reports_beside_the_streams_are_still_allowed(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
