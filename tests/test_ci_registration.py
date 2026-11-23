@@ -183,9 +183,10 @@ def job_of(root: str, rel: str, rules: tuple[str, str, str, str, str]) -> str | 
 
 
 DOCS_ONLY_STEP = "Check documentation when only documentation changed"
-# The tests that read only the documents. `check` is skipped for a docs-only pull request, so the docs-only step
-# of `change-scope` is the one place they run for it.
-DOCUMENT_TESTS = ("tests/test_docs_*.py", "tests/test_i18n_index.py")
+# The tests that read only the documents, or that a document edit alone can break (test_exe_checklist.py reads the
+# notes of three docs/*.md). `check` is skipped for a docs-only pull request, so the docs-only step of
+# `change-scope` is the one place they run for it.
+DOCUMENT_TESTS = ("tests/test_docs_*.py", "tests/test_i18n_index.py", "tests/test_exe_checklist.py")
 
 
 def docs_only_patterns(root):
