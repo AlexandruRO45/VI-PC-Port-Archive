@@ -33,7 +33,12 @@ def strip_fences(text):
     kept = []
     opening = 0
     for line in text.splitlines(keepends=True):
-        stripped = line.lstrip()
+        indent = len(line) - len(line.lstrip(" "))
+        if indent > 3:
+            # CommonMark: four or more leading spaces are an indented code block,
+            # not a fence, and its contents are not rendered as Markdown.
+            continue
+        stripped = line[indent:]
         run = len(stripped) - len(stripped.lstrip("`"))
         if run >= 3:
             # A closing fence carries no info string; a line like ```python inside a
@@ -148,6 +153,15 @@ class SlugTest(unittest.TestCase):
             with open(page, "w", encoding="utf-8") as f:
                 f.write("# Same\n\n# Same\n")
             self.assertEqual(anchors(page), {"same", "same-1"})
+
+    def test_four_space_indented_backticks_are_literal_code(self):
+        # A fence can be indented at most three spaces; four means an indented code
+        # block, which must not swallow the real heading after it.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("    ```\n    example command\n\n## Real heading\n")
+            self.assertEqual(anchors(page), {"real-heading"})
 
     def test_fence_with_info_string_inside_a_block_is_not_a_closer(self):
         # A closing fence has no info string. Regex-pairing arbitrary ``` runs pairs
