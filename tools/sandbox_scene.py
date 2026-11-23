@@ -110,7 +110,7 @@ def build(args):
         key = (os.path.normcase(obj), id(item))   # archetypes sharing an OBJ can differ in materials
         if key not in mesh_ids:
             try:
-                prims = glb_writer.parse_obj(obj, is_path=True, up_axis="y")
+                prims = glb_writer.parse_obj(obj, is_path=True, up_axis="y", flip_v=False)
             except (OSError, glb_writer.GlbError, ValueError):
                 prims = []
             tex_map = world_build.resolve_model_textures(models_dir, item, ttpf, LAYER0_ALBEDO)

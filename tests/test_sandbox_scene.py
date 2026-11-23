@@ -152,6 +152,27 @@ class TestCliErrors(unittest.TestCase):
         with open(out, "rb") as f:
             self.assertEqual(f.read(4), b"LSB1")
 
+    def test_preserves_top_left_uvs(self):
+        obj_path = os.path.join(self.models, "prop.obj")
+        with open(obj_path, "w", encoding="utf-8") as f:
+            f.write("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0.25 0.75\nvt 0.5 0.2\nvt 0.0 1.0\nf 1/1 2/2 3/3\n")
+        import hashdict
+        arch = hashdict.joaat("prop")
+        with open(os.path.join(self.models, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"Items": [{"Name": "prop.#dr", "File": "prop.obj", "BoundsMin": [0, 0, 0], "BoundsMax": [1, 1, 1]}]}, f)
+        ent = os.path.join(self.tmp.name, "e_uv.jsonl")
+        with open(ent, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"archetype": f"{arch:08x}", "position": [0, 0, 0], "rotation": [0, 0, 0, 1], "lod_level": 0}) + "\n")
+        out = os.path.join(self.tmp.name, "uv.bin")
+        rc = sandbox_scene.main(["--entities", ent, "--models", self.models, "--center", "0", "0", "--out", out])
+        self.assertEqual(rc, 0)
+        with open(out, "rb") as f:
+            data = f.read()
+        # Header: 32B (b"LSB1" + <4I3f); first mesh starts at +32: uint32 nv, uint32 ni, then nv * 8 floats
+        u0, v0 = struct.unpack_from("<2f", data, 32 + 8 + 24)
+        self.assertAlmostEqual(u0, 0.25, places=5)
+        self.assertAlmostEqual(v0, 0.75, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()
