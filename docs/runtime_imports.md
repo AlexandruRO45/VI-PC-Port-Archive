@@ -4,10 +4,8 @@
 registry or the host, and prints a report. It does **not** call `DllMain`, TLS callbacks or the entry point, so
 this page measures mapping and binding only; it does not claim the modules work.
 
-The game executable is not in the package. Every other PE that the package ships is present, and all of them are
-Xbox Series builds. Running the dry-run over those images is the closest thing to a loader test that does not need
-the executable; [The retail executable](#the-retail-executable-rt-5) below is the dry-run over the executable
-itself, supplied separately.
+The original dry run used the package's Xbox Series DLLs. A later dry run used a separately supplied executable
+from the same release. See [The retail executable](#the-retail-executable-rt-5) for that run.
 
 ## Reproduce
 
@@ -636,10 +634,10 @@ asynchronous paths with `.invalid` names; it opens no connection.
   | `vcomp140.dll` | 195 | covered |
   | `vcruntime140.dll` | 236 | covered |
   | `vcruntime140_1.dll` | 79 | covered |
-- It does **not** prove any imported function behaves correctly when called. That needs the executable, or a
-  harness that calls a known entry point.
-- The executable's own imports are unknown. `MicrosoftGame.Config` names `game_scarlett_master.exe`; the package
-  here does not contain it, so its import table cannot be measured yet.
+- Testing an imported function's behavior requires executing it from the title or from a test harness.
+- The original DLL-only run did not measure the executable's imports. The
+  [retail dry run](#the-retail-executable-rt-5) records the import counts and unresolved symbols at `1cc6e3c1`.
+  Use that table as a snapshot of that revision's bindings.
 - The CRT images are present in the package, but `pe_loader.cpp` prefers the host copies for the `vcruntime`/
   `msvcp`/`concrt`/`vccorlib`/`vcomp` families. The table above maps the packaged images only to test the
   parser; a real run binds the host copies.
