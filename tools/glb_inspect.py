@@ -60,6 +60,13 @@ def _index(value: object) -> int | None:
     return value if _is_int(value) and value >= 0 else None
 
 
+def _channel_index(value: object) -> int | None:
+    # glTF indices can be written as 0.0 or 1e0 if their value is integral.
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return _index(value)
+
+
 def _chunk_type_name(chunk_type: int) -> str:
     if chunk_type == CHUNK_TYPE_JSON:
         return "JSON"
@@ -309,9 +316,9 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             channels.append({"index": channel_index, "sampler": None, "node": None,
                              "node_name": None, "path": None})
             continue
-        sampler_index = _index(channel.get("sampler"))
+        sampler_index = _channel_index(channel.get("sampler"))
         target = _object(channel.get("target"))
-        node_index = _index(target.get("node"))
+        node_index = _channel_index(target.get("node"))
         path = _text(target.get("path"))
         node = _entry(gltf, "nodes", node_index)
         if sampler_index is None or sampler_index >= len(raw_samplers):
@@ -344,8 +351,11 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             "node_name": _text(node.get("name")) if node is not None else None,
             "path": path,
         })
-        # A core channel without a node is ignored. Extensions can supply their own target.
-        if sampler_index is not None and (node is not None or _object(target.get("extensions"))):
+        # A pointer channel supplies its own target instead of a node.
+        extensions = _object(target.get("extensions"))
+        pointer = _object(extensions.get("KHR_animation_pointer")).get("pointer")
+        has_pointer = path == "pointer" and isinstance(pointer, str) and pointer.startswith("/")
+        if sampler_index is not None and (node is not None or has_pointer):
             used_samplers.add(sampler_index)
 
     used_durations = (sampler["duration"] for sampler in samplers

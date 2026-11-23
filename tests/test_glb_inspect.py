@@ -697,9 +697,12 @@ class GlbInspectTests(unittest.TestCase):
     def test_animation_duration_uses_only_samplers_used_by_channels(self):
         # Two time tracks share the same translation values.
         payload = struct.pack("<10f", 0, 1, 0, 30, 0, 0, 0, 1, 1, 1)
-        short = {"sampler": 0, "target": {"node": 0, "path": "translation"}}
+        # glTF permits integer indices to be written with a decimal point.
+        short = {"sampler": 0.0, "target": {"node": 0.0, "path": "translation"}}
         long = {"sampler": 1, "target": {"node": 0, "path": "scale"}}
         ignored = {"sampler": 1, "target": {"path": "scale"}}
+        metadata = {"sampler": 1, "target": {"path": "scale", "extensions": {"VENDOR_metadata": {}}}}
+        empty_pointer = {"sampler": 1, "target": {"path": "pointer", "extensions": {"KHR_animation_pointer": {}}}}
         pointer = {"sampler": 1, "target": {"path": "pointer", "extensions": {
             "KHR_animation_pointer": {"pointer": "/nodes/0/scale"}}}}
         invalid = {"sampler": 99, "target": {"node": 0, "path": "scale"}}
@@ -717,7 +720,8 @@ class GlbInspectTests(unittest.TestCase):
                 {"bufferView": 2, "componentType": 5126, "type": "VEC3", "count": 2},
             ],
             "animations": [{"samplers": samplers, "channels": channels}
-                           for channels in ([short], [long, short], [short, ignored], [pointer], [invalid])],
+                           for channels in ([short], [long, short], [short, ignored, metadata, empty_pointer],
+                                            [pointer], [invalid])],
         }
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "timelines.glb")
