@@ -462,16 +462,22 @@ int main() {
             const auto& mixed = data[0];
             const auto& mesh_only = data[1];
             const auto& vertex_only = data[2];
-            std::printf("statistics, mixed: IA %llu/%llu VS %llu C %llu/%llu PS %llu CS %llu; mesh only: C %llu/%llu "
-                        "PS %llu; vertex only: C %llu PS %llu\n",
-                        mixed.IAVertices, mixed.IAPrimitives, mixed.VSInvocations, mixed.CInvocations,
-                        mixed.CPrimitives, mixed.PSInvocations, mixed.CSInvocations, mesh_only.CInvocations,
-                        mesh_only.CPrimitives, mesh_only.PSInvocations, vertex_only.CInvocations,
-                        vertex_only.PSInvocations);
+            std::printf("statistics, mixed: IA %llu/%llu VS %llu GS %llu C %llu/%llu PS %llu CS %llu; "
+                        "mesh only: C %llu/%llu PS %llu; vertex only: GS %llu C %llu PS %llu\n",
+                        mixed.IAVertices, mixed.IAPrimitives, mixed.VSInvocations, mixed.GSInvocations,
+                        mixed.CInvocations, mixed.CPrimitives, mixed.PSInvocations, mixed.CSInvocations,
+                        mesh_only.CInvocations, mesh_only.CPrimitives, mesh_only.PSInvocations,
+                        vertex_only.GSInvocations, vertex_only.CInvocations, vertex_only.PSInvocations);
             EXPECT(mixed.IAVertices == 6 && mixed.IAPrimitives == 2 && mixed.VSInvocations >= 1);
             EXPECT(vertex_only.IAVertices == 6 && vertex_only.IAPrimitives == 2);
-            EXPECT(mixed.GSInvocations == 0 && mixed.GSPrimitives == 0 && mixed.HSInvocations == 0 &&
-                   mixed.DSInvocations == 0 && mixed.CSInvocations == 0);
+            // Mesh draws add no GS/HS/DS/CS work, so the mixed query counts what its two vertex draws count. That is
+            // not always 0: RADV (RX 6700 XT, Mesa 26.3.1) reports one GS invocation per primitive of a vertex draw
+            // with no geometry shader bound.
+            EXPECT(mixed.GSInvocations == vertex_only.GSInvocations &&
+                   mixed.GSPrimitives == vertex_only.GSPrimitives &&
+                   mixed.HSInvocations == vertex_only.HSInvocations &&
+                   mixed.DSInvocations == vertex_only.DSInvocations &&
+                   mixed.CSInvocations == vertex_only.CSInvocations);
             EXPECT(mixed.CInvocations > vertex_only.CInvocations && mixed.PSInvocations > vertex_only.PSInvocations);
             EXPECT(mesh_only.IAVertices == 0 && mesh_only.IAPrimitives == 0 && mesh_only.VSInvocations == 0 &&
                    mesh_only.GSInvocations == 0 && mesh_only.GSPrimitives == 0 && mesh_only.HSInvocations == 0 &&
