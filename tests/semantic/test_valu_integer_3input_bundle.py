@@ -229,5 +229,23 @@ class TestAdd3U32SIMDBoundaries(unittest.TestCase):
         self.assertEqual(oracle_add3_u32(0x8000_0000, 0x8000_0000, 0), 0)
         self.assertEqual(oracle_add3_u32(MASK32, MASK32, MASK32), MASK32 - 2)
 
+# ---------------------------------------------------------------------------
+# Opcode 1: v_add3_u32 - Translator Integration
+# ---------------------------------------------------------------------------
+
+class TestAdd3U32Translator(unittest.TestCase):
+    def test_translated_execution(self) -> None:
+        triples = [
+            (10, 20, 30),
+            (0, 0, 0),
+            (MASK32, 1, 0),
+            (0x12345678, 0x11111111, 0x22222222),
+            (0x7FFFFFFF, 1, 0x80000000),
+        ]
+        for a, b, c in triples:
+            expected = oracle_add3_u32(a, b, c)
+            actual = run_translated_triop("v_add3_u32", a, b, c)
+            self.assertEqual(actual, expected)
+
 if __name__ == "__main__":
     unittest.main()
