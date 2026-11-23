@@ -726,6 +726,31 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
 
+    def test_directory_scan_does_not_depend_on_subfolder_order(self):
+        root = os.path.join(self.dir, "tree")
+        for name, map_file in (("c", True), ("a", False), ("b", True)):
+            os.makedirs(os.path.join(root, name))
+            with open(os.path.join(root, name, "x.bin"), "wb") as f:
+                f.write(make_resource(map_file=map_file))
+        walk = os.walk
+
+        def ordered(reverse):
+            def fake(top, **kwargs):
+                for r, dirs, files in walk(top, **kwargs):
+                    dirs[:] = sorted(dirs, reverse=reverse)
+                    yield r, dirs, files
+            return fake
+
+        results = []
+        for reverse in (False, True):
+            with mock.patch.object(WI.os, "walk", side_effect=ordered(reverse)):
+                files = list(WI._directory_files(root))
+                rows, _ = WI.scan_path(root)
+            results.append((files, [r["kind"] for r in rows]))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0][0], [os.path.join(root, d, "x.bin") for d in "abc"])
+        self.assertEqual(results[0][1], ["meta", "map", "map"])
+
     def carve(self, parts, gap=0):
         """A carve folder as rpf9_carve.py writes it: <offset>.bin per stream plus index.json (off, stored)."""
         folder = os.path.join(self.dir, "carve")

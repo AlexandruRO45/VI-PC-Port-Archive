@@ -538,7 +538,8 @@ def _directory_files(path):
         raise error
 
     # A partial walk must fail before the caller starts writing reports.
-    for root, _, files in os.walk(path, onerror=scan_failed):
+    for root, dirs, files in os.walk(path, onerror=scan_failed):
+        dirs.sort()
         for name in sorted(files):
             yield os.path.join(root, name)
 
