@@ -623,6 +623,22 @@ class TestReadGlbSummaryValidation(unittest.TestCase):
         with self.assertRaises(glb_writer.GlbError):
             glb_writer.read_glb_summary("not bytes")  # type: ignore
 
+    def test_contiguous_memoryviews_are_parsed_in_bytes(self):
+        raw = self._container({"asset": {"version": "2.0"}})
+        expected = glb_writer.read_glb_summary(raw)
+        view = memoryview(raw)
+        for data in (bytearray(raw), view, view.cast("I"), view.cast("B", (len(raw) // 4, 4))):
+            with self.subTest(input_type=type(data).__name__, format=getattr(data, "format", None),
+                              shape=getattr(data, "shape", None)):
+                self.assertEqual(glb_writer.read_glb_summary(data), expected)
+
+    def test_noncontiguous_memoryview_reports_a_glb_error(self):
+        raw = self._container({"asset": {"version": "2.0"}})
+        padded = bytearray(len(raw) * 2)
+        padded[::2] = raw
+        with self.assertRaisesRegex(glb_writer.GlbError, "C-contiguous"):
+            glb_writer.read_glb_summary(memoryview(padded)[::2])
+
     def test_truncated_header_rejected(self):
         with self.assertRaises(glb_writer.GlbError):
             glb_writer.read_glb_summary(b"glTF\x02\x00\x00\x00")

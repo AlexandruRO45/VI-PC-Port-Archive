@@ -1268,11 +1268,15 @@ def write_instanced_glb(path: str, meshes: list[dict], materials: dict[str, dict
     return stats
 
 
-def read_glb_summary(data: bytes) -> dict:
-    """Validate binary glTF 2.0 container headers/chunks and return parsed summary."""
+def read_glb_summary(data: bytes | bytearray | memoryview) -> dict:
+    """Validate binary glTF 2.0 headers and chunks from a C-contiguous buffer."""
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise GlbError("GLB data must be bytes-like")
     buf = memoryview(data)
+    if not buf.c_contiguous:
+        raise GlbError("GLB data must be C-contiguous")
+    # Container lengths, slice indices and struct offsets are all measured in bytes.
+    buf = buf.cast("B")
     actual_len = len(buf)
     if actual_len < 20:
         raise GlbError(f"GLB data too short: {actual_len} bytes")
