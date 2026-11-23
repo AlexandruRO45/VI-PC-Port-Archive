@@ -39,12 +39,15 @@ numbers, for a re-count without a re-scan; it is a local working file, not somet
 """
 import argparse
 import array as array_module
+from contextlib import nullcontext
 import json
 import mmap
 import multiprocessing
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
@@ -318,17 +321,19 @@ def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
                 handle.close()
         return total
     ranges = split_ranges(start, end, jobs)
-    work = [(path, lo, hi, f"{records}.{i}" if records else None) for i, (lo, hi) in enumerate(ranges)]
-    with multiprocessing.Pool(len(work)) as pool:
-        for part in pool.imap_unordered(worker, work):
-            merge(total, part)
-    if records:   # join the per-range files in range order
-        with open(records, "w", encoding="utf-8", newline="\n") as out:
-            for i in range(len(work)):
-                part = f"{records}.{i}"
-                with open(part, encoding="utf-8") as fh:
-                    out.write(fh.read())
-                os.remove(part)
+    staging = (tempfile.TemporaryDirectory(prefix=".fragment-children-", dir=os.path.dirname(os.path.abspath(records)))
+               if records else nullcontext())
+    with staging as directory:
+        work = [(path, lo, hi, os.path.join(directory, f"{i}.jsonl") if directory else None)
+                for i, (lo, hi) in enumerate(ranges)]
+        with multiprocessing.Pool(len(work)) as pool:
+            for part in pool.imap_unordered(worker, work):
+                merge(total, part)
+        if records:   # join the per-range files in range order
+            with open(records, "w", encoding="utf-8", newline="\n") as out:
+                for _, _, _, part_path in work:
+                    with open(part_path, encoding="utf-8") as fh:
+                        shutil.copyfileobj(fh, out)
     return total
 
 

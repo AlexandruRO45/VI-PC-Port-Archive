@@ -212,8 +212,14 @@ class TestCommandLine(unittest.TestCase):
             with open(path, "wb") as fh:
                 fh.write(archive(fragment(drawables=3), fragment()))
             totals, records = os.path.join(tmp, "t.json"), os.path.join(tmp, "r.jsonl")
+            neighbor = records + ".0"
+            with open(neighbor, "wb") as fh:
+                fh.write(b"unrelated file\n")
             result = self.run_tool(path, "--json", totals, "--records", records, "--jobs", "2")
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.isfile(neighbor), "the scan removed an unrelated file")
+            with open(neighbor, "rb") as fh:
+                self.assertEqual(fh.read(), b"unrelated file\n")
             with open(totals, encoding="utf-8") as fh:
                 data = json.load(fh)
             self.assertEqual((data["fragments"], data["child_drawables"], data["child_arrays"]), (2, 2, 1))
