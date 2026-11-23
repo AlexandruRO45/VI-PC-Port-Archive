@@ -429,3 +429,81 @@ class TestSIMDDivergence(unittest.TestCase):
             else:
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0_in_place(self) -> None:
+        """Verify v0 = min3(v0, v1, v2) reads initial v0 before writeback."""
+        state = ScalarMachineState()
+        init_v0 = 30
+        v1_val = 10
+        v2_val = 50
+
+        state.set_vgpr(0, init_v0)
+        state.set_vgpr(1, v1_val)
+        state.set_vgpr(2, v2_val)
+
+        interp = ScalarInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(1), src2=VGPR(2))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 10)
+        self.assertEqual(state.get_vgpr(0), 10)
+
+        spv_res = run_translator_min3_i32(init_v0, v1_val, v2_val, name="ps_alias_dst_src0")
+        self.assertEqual(res, spv_res)
+
+    def test_alias_dst_equals_src1(self) -> None:
+        """Verify v0 = min3(v1, v0, v2)."""
+        state = ScalarMachineState()
+        init_v0 = from_signed_i32(-5)
+        v1_val = from_signed_i32(-2)
+        v2_val = from_signed_i32(10)
+
+        state.set_vgpr(0, init_v0)
+        state.set_vgpr(1, v1_val)
+        state.set_vgpr(2, v2_val)
+
+        interp = ScalarInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(0), src2=VGPR(2))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, from_signed_i32(-5))
+        self.assertEqual(state.get_vgpr(0), from_signed_i32(-5))
+
+    def test_alias_dst_equals_src2(self) -> None:
+        """Verify v0 = min3(v1, v2, v0)."""
+        state = ScalarMachineState()
+        init_v0 = from_signed_i32(-100)
+        v1_val = 50
+        v2_val = 20
+
+        state.set_vgpr(0, init_v0)
+        state.set_vgpr(1, v1_val)
+        state.set_vgpr(2, v2_val)
+
+        interp = ScalarInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(0))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, from_signed_i32(-100))
+        self.assertEqual(state.get_vgpr(0), from_signed_i32(-100))
+
+    def test_complete_aliasing_all_sources_same(self) -> None:
+        """Verify v0 = min3(v1, v1, v1) idempotency."""
+        state = ScalarMachineState()
+        v1_val = from_signed_i32(-42)
+        state.set_vgpr(1, v1_val)
+
+        interp = ScalarInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(1), src2=VGPR(1))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, v1_val)
+        self.assertEqual(state.get_vgpr(0), v1_val)
