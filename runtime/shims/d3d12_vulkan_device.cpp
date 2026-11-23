@@ -441,6 +441,69 @@ UINT view_slices(const D3D12_RESOURCE_DESC& resource, UINT first_layer, UINT lay
     return remaining ? resource.DepthOrArraySize - first_layer : layer_count;
 }
 
+// Validate a depth-stencil view against D3D12 rules; invalid descriptions produce a null TargetView.
+leonida::TargetView depth_stencil_view(leonida::ResourceId id, const D3D12_RESOURCE_DESC& rd,
+                                       const D3D12_DEPTH_STENCIL_VIEW_DESC* desc) {
+    if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return {};
+    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+        rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        return {};
+    const Format res_fmt = vulkan_format(rd.Format, true);
+    if (!(res_fmt.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) return {};
+
+    Format view_fmt = res_fmt;
+    if (!desc || desc->Format == DXGI_FORMAT_UNKNOWN) {
+        if (res_fmt.typeless) return {};
+    } else {
+        view_fmt = vulkan_format(desc->Format, true);
+        if (!(view_fmt.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) || view_fmt.typeless ||
+            view_fmt.format != res_fmt.format)
+            return {};
+    }
+
+    if (!desc) return {id, 0, 0, rd.DepthOrArraySize};
+
+    constexpr UINT kKnownFlags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+    if (UINT(desc->Flags) & ~kKnownFlags) return {};
+    if ((desc->Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) && !(view_fmt.aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+        return {};
+
+    const bool msaa = rd.SampleDesc.Count > 1;
+    auto slice_range = [&](UINT mip, UINT first_layer, UINT raw_count) -> leonida::TargetView {
+        if (mip >= rd.MipLevels || first_layer >= rd.DepthOrArraySize) return {};
+        const UINT remaining = UINT(rd.DepthOrArraySize) - first_layer;
+        const UINT count = raw_count == UINT_MAX ? remaining : raw_count;
+        if (!count || count > remaining) return {};
+        return {id, mip, first_layer, count};
+    };
+
+    switch (desc->ViewDimension) {
+    case D3D12_DSV_DIMENSION_TEXTURE1D:
+        if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || msaa) return {};
+        return slice_range(desc->Texture1D.MipSlice, 0, 1);
+    case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+        if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || msaa) return {};
+        return slice_range(desc->Texture1DArray.MipSlice, desc->Texture1DArray.FirstArraySlice,
+                           desc->Texture1DArray.ArraySize);
+    case D3D12_DSV_DIMENSION_TEXTURE2D:
+        if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || msaa) return {};
+        return slice_range(desc->Texture2D.MipSlice, 0, 1);
+    case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+        if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || msaa) return {};
+        return slice_range(desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
+                           desc->Texture2DArray.ArraySize);
+    case D3D12_DSV_DIMENSION_TEXTURE2DMS:
+        if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !msaa) return {};
+        return slice_range(0, 0, 1);
+    case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+        if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !msaa) return {};
+        return slice_range(0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize);
+    default:
+        log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
+        return {};
+    }
+}
+
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
@@ -5701,28 +5764,7 @@ public:
         leonida::TargetView view{};
         if (const Resource* r = Resource::from<Resource>(resource)) {
             const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
-            view = {r->id(), 0, 0, rd.DepthOrArraySize};
-            if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1D) {
-                view = line_target_view(r->id(), rd, desc->Texture1D.MipSlice, 0, 1);
-            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY) {
-                view = line_target_view(r->id(), rd, desc->Texture1DArray.MipSlice,
-                                        desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize);
-            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) {
-                view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
-            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS) {
-                view = {r->id(), 0, 0, 1};
-            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
-                view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
-                        view_slices(rd, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize)};
-            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY) {
-                // Multisample textures have one mip, so only the slice range is chosen.
-                view = {r->id(), 0, desc->Texture2DMSArray.FirstArraySlice,
-                        view_slices(rd, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize)};
-            } else if (desc) {
-                log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
-                view = {};
-            }
-            if (r->desc().Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) view = {};
+            view = depth_stencil_view(r->id(), rd, desc);
         } else if (resource) {
             stub("ID3D12Device::CreateDepthStencilView(resource from another device)");
         }

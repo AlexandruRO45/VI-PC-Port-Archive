@@ -6349,8 +6349,8 @@ int main() {
         }
 
         // A depth-stencil view of a slice range of a 4x multisampled depth array (D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY):
-        // the view captures the range, a clear through it replays, and a range past the last slice is refused when
-        // the list runs. D3D12 can't copy a multisampled texture to a buffer, so the clear itself isn't read back.
+        // the view captures the range, a clear through it replays, and a range past the last slice yields a null view
+        // and is refused at Close. D3D12 can't copy a multisampled texture to a buffer, so the clear itself isn't read back.
         {
             Ref<ID3D12Resource> ms_depth;
             Ref<ID3D12Fence> ms_fence;
@@ -6378,12 +6378,11 @@ int main() {
 
             ms_view.Texture2DMSArray.FirstArraySlice = 3;  // slices 3 and 4 of a 4-slice texture
             device->CreateDepthStencilView(ms_depth.p, &ms_view, dsv0);
+            std::memcpy(&captured, reinterpret_cast<const void*>(dsv0.ptr), sizeof(captured));
+            EXPECT(captured.resource == 0);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list->ClearDepthStencilView(dsv0, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0, nullptr);
-            EXPECT(list->Close() == S_OK);
-            queue->ExecuteCommandLists(1, lists);
-            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
-            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
+            EXPECT(list->Close() == E_INVALIDARG);
         }
 
         // A render-target view of a slice range of a 4x multisampled colour array (D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY):

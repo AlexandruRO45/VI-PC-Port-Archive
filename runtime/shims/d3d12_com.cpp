@@ -505,6 +505,7 @@ public:
                                      const D3D12_TILE_REGION_SIZE* size, ID3D12Resource* linear,
                                      UINT64 linear_offset, D3D12_TILE_COPY_FLAGS flags) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTiles");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         const auto direction = flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD;
         const bool to_linear = direction == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
         const auto grid = tile_grid(tiled);

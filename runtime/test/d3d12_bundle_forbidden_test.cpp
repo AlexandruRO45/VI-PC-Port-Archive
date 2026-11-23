@@ -39,7 +39,7 @@ struct Env {
     ID3D12Device* device = nullptr;
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12Fence> fence;
-    Ref<ID3D12Resource> target, buffer;
+    Ref<ID3D12Resource> target, buffer, reserved, tile_buffer;
     Ref<ID3D12DescriptorHeap> rtv_heap;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
     UINT64 fence_value = 0;
@@ -63,6 +63,12 @@ struct Env {
         CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                         IID_PPV_ARGS(&buffer.p))));
+        const auto tile_desc = buffer_desc(65536);
+        CHECK(SUCCEEDED(device->CreateReservedResource(&tile_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&reserved.p))));
+        CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tile_desc,
+                                                        D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                                                        IID_PPV_ARGS(&tile_buffer.p))));
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         CHECK(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
         rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -104,6 +110,11 @@ std::vector<Call> calls() {
         {"OMSetRenderTargets", [](Env& e, ID3D12GraphicsCommandList* b) {
              b->OMSetRenderTargets(1, &e.rtv, FALSE, nullptr); }},
         {"ClearState", [](Env&, ID3D12GraphicsCommandList* b) { b->ClearState(nullptr); }},
+        {"CopyTiles", [](Env& e, ID3D12GraphicsCommandList* b) {
+             const D3D12_TILED_RESOURCE_COORDINATE start{0, 0, 0, 0};
+             const D3D12_TILE_REGION_SIZE size{1, FALSE, 0, 0, 0};
+             b->CopyTiles(e.reserved.p, &start, &size, e.tile_buffer.p, 0,
+                          D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE); }},
         // Controls: calls the layer already refuses in a bundle.
         {"ResourceBarrier", [](Env& e, ID3D12GraphicsCommandList* b) {
              const auto barrier = transition(e.target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
