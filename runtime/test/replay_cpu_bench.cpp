@@ -57,6 +57,15 @@ using namespace leonida;
 
 namespace {
 
+// Whether constructing an empty std::vector allocates. MSVC's debug iterators (the default of a Debug build) give
+// every container a heap proxy, an empty one included, so the allocation columns of a Debug build count those too
+// and "emit allocates nothing" cannot be checked there.
+bool empty_vector_allocates() {
+    const std::size_t before = g_allocations;
+    { const std::vector<int> probe; }
+    return g_allocations != before;
+}
+
 std::size_t g_vk_calls = 0;
 
 // A no-op for any vkCmd* signature that counts its calls.
@@ -581,9 +590,15 @@ int main(int argc, char** argv) {
         check(kind.name, r);
         // One image barrier for each piece: emit keeps the usual one or two on the stack.
         if (std::strcmp(kind.name, texture_barrier_kind) == 0 && r.emit.allocations != 0) {
-            std::fprintf(stderr, "FAIL %s: emit makes %.2f heap allocations per command\n", kind.name,
-                         r.emit.allocations);
-            ++failures;
+            if (empty_vector_allocates()) {
+                std::fprintf(stderr, "SKIP %s: an empty std::vector allocates in this build (debug iterators), so "
+                             "emit's %.2f heap allocations per command are not checked\n", kind.name,
+                             r.emit.allocations);
+            } else {
+                std::fprintf(stderr, "FAIL %s: emit makes %.2f heap allocations per command\n", kind.name,
+                             r.emit.allocations);
+                ++failures;
+            }
         }
         if (!self_test) print_row(kind.name, r, csv);
     }

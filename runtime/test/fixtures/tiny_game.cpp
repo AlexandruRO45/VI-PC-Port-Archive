@@ -27,6 +27,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(_MSC_VER) && defined(_DEBUG)
+#include <crtdbg.h>
+#endif
+
 extern "C" __declspec(dllimport) HRESULT __stdcall XGameRuntimeInitialize();
 extern "C" __declspec(dllimport) void __stdcall XGameRuntimeUninitialize();
 extern "C" __declspec(dllimport) uint32_t __stdcall XSystemGetDeviceType();
@@ -61,6 +65,19 @@ void abort_crt_exit_handler(int) {
     std::exit(43);  // the same through the shimmed exit() import
 }
 void abort_return_handler(int) {}
+
+// abort() with `disposition` for SIGABRT. A Debug build's CRT reports abort() before it raises the signal, and by
+// default in a modal "Microsoft Visual C++ Runtime Library" dialog: a native run then waits for a click, and its exit
+// code is the pressed button's (3, or 0x80000003 for Retry). The report goes to stderr instead, where a Release
+// build's CRT writes nothing, and abort() goes on to the signal and _exit(3).
+[[noreturn]] void abort_with(void (*disposition)(int)) {
+#if defined(_MSC_VER) && defined(_DEBUG)
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+#endif
+    std::signal(SIGABRT, disposition);
+    std::abort();
+}
 
 // The reserved stack of the calling thread, in bytes, written to *out (a size_t).
 DWORD WINAPI stack_reserve(void* out) {
@@ -165,26 +182,11 @@ int main(int argc, char** argv) {
         std::printf("tiny_game: SKIP GAME: file (argument game-file)\n");
     }
 
-    if (has_arg(argc, argv, "abort-handler")) {
-        std::signal(SIGABRT, abort_exit_handler);
-        std::abort();
-    }
-    if (has_arg(argc, argv, "abort-crt-exit")) {
-        std::signal(SIGABRT, abort_crt_exit_handler);
-        std::abort();
-    }
-    if (has_arg(argc, argv, "abort-return")) {
-        std::signal(SIGABRT, abort_return_handler);
-        std::abort();
-    }
-    if (has_arg(argc, argv, "abort-ignore")) {
-        std::signal(SIGABRT, SIG_IGN);
-        std::abort();
-    }
-    if (has_arg(argc, argv, "abort-default")) {
-        std::signal(SIGABRT, SIG_DFL);
-        std::abort();
-    }
+    if (has_arg(argc, argv, "abort-handler")) abort_with(abort_exit_handler);
+    if (has_arg(argc, argv, "abort-crt-exit")) abort_with(abort_crt_exit_handler);
+    if (has_arg(argc, argv, "abort-return")) abort_with(abort_return_handler);
+    if (has_arg(argc, argv, "abort-ignore")) abort_with(SIG_IGN);
+    if (has_arg(argc, argv, "abort-default")) abort_with(SIG_DFL);
 
     std::printf("tiny_game: %s\n", g_failures ? "FAILED" : "OK");
     std::fflush(stdout);

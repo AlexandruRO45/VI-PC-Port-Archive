@@ -68,6 +68,16 @@ void VKAPI_CALL record_barrier2(VkCommandBuffer, const VkDependencyInfo* info) {
         g_barriers.push_back(info->pImageMemoryBarriers[i]);
 }
 
+// Whether constructing an empty std::vector allocates. MSVC's debug iterators (the default of a Debug build) give
+// every container a heap proxy, an empty one included; emit's vectors stay empty for a barrier with one piece, which
+// is free in a release build and one allocation each there. "emit allocates nothing" can be checked only where an
+// empty vector is free.
+bool empty_vector_allocates() {
+    const std::size_t before = g_allocations;
+    { const std::vector<int> probe; }
+    return g_allocations != before;
+}
+
 int failures = 0;
 void expect(bool ok, const char* what) {
     if (!ok) {
@@ -117,9 +127,14 @@ int main() {
         const std::size_t before = g_allocations;
         emit(prepared, cb, vk, &tracker);
         const std::size_t allocations = g_allocations - before;
-        if (allocations)
-            std::fprintf(stderr, "emit made %zu heap allocations for a barrier with one piece\n", allocations);
-        expect(allocations == 0, "emit allocates nothing for a barrier with one piece");
+        if (empty_vector_allocates()) {
+            std::printf("SKIP: an empty std::vector allocates in this build (debug iterators), so the %zu allocations "
+                        "of emit for a barrier with one piece are not checked\n", allocations);
+        } else {
+            if (allocations)
+                std::fprintf(stderr, "emit made %zu heap allocations for a barrier with one piece\n", allocations);
+            expect(allocations == 0, "emit allocates nothing for a barrier with one piece");
+        }
         expect(g_calls == 1 && g_barriers.size() == 1, "one call with one image barrier");
         if (g_barriers.size() == 1) {
             const VkImageMemoryBarrier2& b = g_barriers[0];
