@@ -35,12 +35,15 @@ class ResumeShardsTest(unittest.TestCase):
         spirv = self.spirv
 
         class FakeProc:
-            def __init__(self, args):
+            """Popen stand-in. The shard runs at spawn and has already exited, so poll() and wait() return its exit
+            code (None only before exit, which never happens here), as subprocess.Popen does for a finished child."""
+            def __init__(self, args, **kwargs):
                 self.i = int(args[args.index("--shard") + 1].split("/")[0])
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
+                self.returncode = self._run()
 
-            def wait(self):
+            def _run(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
@@ -48,6 +51,12 @@ class ResumeShardsTest(unittest.TestCase):
                 with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
                     json.dump({"tag": tag, "n": self.n}, f)
                 return 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
         with mock.patch.object(make_game.subprocess, "Popen", side_effect=FakeProc), \
                 mock.patch.object(make_game, "py") as py, \
                 mock.patch.object(make_game, "translator_digest", return_value=digest), \
