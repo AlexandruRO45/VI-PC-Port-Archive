@@ -14,10 +14,10 @@ have no magic and stay with the extension check.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
 each member of a zip (found by its central directory too, so with bytes in front of it) or a tar, and the stream of
-a gzip, bzip2 or xz file, nested up to three levels, is matched the same way. What's inside is read into memory
-under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb can't make the check run long.
-7-Zip, Zstandard and RAR files, which it can't open, archives that fail to open and archives over the budget are
-reported as archives that can't be checked.
+a gzip, bzip2, xz or LZMA-alone (.lzma) file, nested up to three levels, is matched the same way. What's inside
+is read into memory under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb can't make the
+check run long. 7-Zip, Zstandard, RAR and Unix compress (.Z) files, which it can't open, archives that fail to open
+and archives over the budget are reported as archives that can't be checked.
 
 Prints one line per match, `<path>: <format>` (`<format> in <archive> (<member>)` for a match inside an archive), and
 exits 1 if there is any. Standard library only, no game files.
@@ -106,18 +106,41 @@ def read_head(path):
 
 
 ZIP = b"PK\x03\x04"
-# Single compressed streams the standard library opens: (name, magic, opener of a binary file object). GzipFile
-# gets its mode explicitly: it reads the file object's own `mode`, which for a GzipFile inside it isn't a string.
+
+
+def is_lzma_alone(head):
+    """Whether `head` starts with a plausible LZMA-alone (.lzma) header, which has no magic: a properties byte
+    (lc + 9 * (lp + 5 * pb), so under 225), a 4-byte little-endian dictionary size, an 8-byte uncompressed size
+    (all 0xFF when unknown). The encoders write a dictionary size of 2^n or 2^n + 2^(n-1), at least 4 KiB (xz's
+    minimum) and at most 1.5 GiB (xz's maximum), and xz's decoder takes a known size only below 2^38. A dictionary
+    size like that has zero bytes in it, which text doesn't, so a file starting with "]" (0x5D, the default
+    properties) isn't taken for one."""
+    if len(head) < 13 or head[0] >= 225:
+        return False
+    size = int.from_bytes(head[1:5], "little")
+    if not 1 << 12 <= size <= 3 << 29:
+        return False
+    if head[5:13] != b"\xff" * 8 and int.from_bytes(head[5:13], "little") >= 1 << 38:
+        return False
+    third, rest = divmod(size, 3)  # 2^n + 2^(n-1) is 3 * 2^(n-1)
+    return size & (size - 1) == 0 or (rest == 0 and third & (third - 1) == 0)
+
+
+# Single compressed streams the standard library opens: (name, magic, opener of a binary file object). The magic is
+# a prefix of the file, or a function of its first bytes where the format has none. GzipFile gets its mode
+# explicitly: it reads the file object's own `mode`, which for a GzipFile inside it isn't a string.
 STREAMS = (
     ("gzip stream", b"\x1f\x8b", lambda f: gzip.GzipFile(fileobj=f, mode="rb")),
     ("bzip2 stream", b"BZh", lambda f: bz2.BZ2File(f)),
     ("xz stream", b"\xfd7zXZ\x00", lambda f: lzma.LZMAFile(f)),
+    ("LZMA-alone stream", is_lzma_alone, lambda f: lzma.LZMAFile(f, format=lzma.FORMAT_ALONE)),
 )
 # Archives the standard library can't open, so what they hold can't be checked.
 OPAQUE = (
     ("7-Zip archive", b"7z\xbc\xaf\x27\x1c"),
     ("Zstandard stream", b"\x28\xb5\x2f\xfd"),
     ("RAR archive", b"Rar!\x1a\x07"),
+    ("Unix compress (.Z) stream", b"\x1f\x9d"),  # not gzip's \x1f\x8b, which STREAMS opens
 )
 MAX_DEPTH = 3  # an archive inside an archive inside an archive; deeper ones are reported as unchecked
 # What looking into one file may cost: the bytes decompressed or copied out of its archives in all, and the archive
@@ -171,7 +194,7 @@ def printable(name):
 
 def archive_kind(f, head):
     """The kind of archive the seekable file `f` (first bytes `head`) is, or None."""
-    stream = next((s for s in STREAMS if head.startswith(s[1])), None)
+    stream = next((s for s in STREAMS if (s[1](head) if callable(s[1]) else head.startswith(s[1]))), None)
     if stream:
         return stream[0]
     if head[TAR_MAGIC[0]:TAR_MAGIC[0] + len(TAR_MAGIC[1])] == TAR_MAGIC[1]:

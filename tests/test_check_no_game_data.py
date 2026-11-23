@@ -78,6 +78,15 @@ PASSED = [
     ("bones.md", b"# SKEL_HEAD, MoVE and SCRP name formats; none of them starts this file\n"),
     ("riff.bin", b"RIFF" + bytes(4) + b"AVI LIST"),
     ("empty.txt", b""),
+    # "]" is 0x5D, the properties byte of a default LZMA-alone stream; text after it is not a dictionary size
+    ("bracket.txt", b"]\nA text file that starts with a closing bracket, as LZMA-alone streams do.\n"),
+    ("bracket_short.txt", b"]"),
+    ("bracket_json.txt", b"]]]]]]]]]]]]]]]]]]]]\n" * 4),
+    ("bracket_dict_3.bin", b"\x5d" + (3).to_bytes(4, "little") + bytes(8)),  # dictionary size 3: not a power of two
+    ("bracket_dict_small.bin", b"\x5d" + (1 << 11).to_bytes(4, "little") + b"\xff" * 8),  # under 4 KiB
+    ("bracket_dict_huge.bin", b"\x5d" + (1 << 31).to_bytes(4, "little") + b"\xff" * 8),  # over 1.5 GiB
+    ("bracket_props.bin", b"\xe1" + (1 << 23).to_bytes(4, "little") + b"\xff" * 8),  # properties byte 225
+    ("bracket_size.bin", b"\x5d" + (1 << 23).to_bytes(4, "little") + (1 << 40).to_bytes(8, "little")),  # 1 TiB
     ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
     ("mz_cut_signature.txt", pe_header(0x300)[:-2]),  # only "PE" of the signature is there
     ("mz_not_pe.txt", pe_header(0x80)[:-4] + b"NE\0\0"),
@@ -127,6 +136,12 @@ DDS = b"DDS " + (124).to_bytes(4, "little") + bytes(8)
 FSSM = b"FSSM" + bytes(12)
 RPF = b"9FPR" + bytes(12)
 
+
+def lzma_alone(data, **filter_options):
+    """`data` as an LZMA-alone (.lzma) stream: properties byte, dictionary size, uncompressed size, then the data."""
+    filters = [{"id": lzma.FILTER_LZMA1, **filter_options}]
+    return lzma.compress(data, format=lzma.FORMAT_ALONE, filters=filters)
+
 # file name, contents, the line the script must print after "<name>: "
 CAUGHT_IN_ARCHIVES = [
     ("notes.zip.txt", zipped({"readme.txt": b"text\n", "tex/a.png": DDS}), "DDS texture in zip archive (tex/a.png)"),
@@ -134,10 +149,29 @@ CAUGHT_IN_ARCHIVES = [
     ("tool.bin", bz2.compress(pe_header()), "PE executable in bzip2 stream"),
     ("pack.bin", lzma.compress(RPF), "RPF9 archive in xz stream"),
     ("far.bin", gzip.compress(pe_header(0x400)), "PE executable in gzip stream"),
+    # LZMA-alone has no magic: the header is told by its properties byte and dictionary size
+    ("tex.bin", lzma.compress(DDS, format=lzma.FORMAT_ALONE), "DDS texture in LZMA-alone stream"),
+    ("tex.lzma", lzma.compress(DDS, format=lzma.FORMAT_ALONE), "DDS texture in LZMA-alone stream"),
+    ("small_dict.bin", lzma_alone(FSSM, preset=1, dict_size=1 << 16, lc=0, lp=2, pb=2),
+     "FSSM shader in LZMA-alone stream"),  # properties byte 108, not the default 0x5D
+    ("odd_dict.bin", lzma_alone(RPF, dict_size=3 << 20), "RPF9 archive in LZMA-alone stream"),  # 2^21 + 2^20
+    ("in_gzip.bin", gzip.compress(lzma.compress(DDS, format=lzma.FORMAT_ALONE)),
+     "DDS texture in LZMA-alone stream in gzip stream"),
+    ("tar.lzma", lzma.compress(tarred({"x.dds": DDS}), format=lzma.FORMAT_ALONE),
+     "DDS texture in tar archive (x.dds) in LZMA-alone stream"),
+    # a header that passes, a body that doesn't decompress: reported like a corrupt gzip
+    ("corrupt.lzma", b"\x5d" + (1 << 23).to_bytes(4, "little") + b"\xff" * 8 + b"\xff" * 16,
+     "LZMA-alone stream that can't be opened (contents can't be checked)"),
+    ("truncated.lzma", lzma.compress(DDS * 64, format=lzma.FORMAT_ALONE)[:20],
+     "LZMA-alone stream that can't be opened (contents can't be checked)"),
     ("nested.bin", gzip.compress(zipped({"inner/x.bin": RPF})), "RPF9 archive in zip archive (inner/x.bin) in gzip stream"),
     ("a.bin", b"7z\xbc\xaf\x27\x1c" + bytes(26), "7-Zip archive (contents can't be checked)"),
     ("b.bin", b"\x28\xb5\x2f\xfd" + bytes(12), "Zstandard stream (contents can't be checked)"),
     ("c.bin", b"Rar!\x1a\x07\x01\x00" + bytes(8), "RAR archive (contents can't be checked)"),
+    ("d.bin", b"\x1f\x9d\x90" + bytes(12), "Unix compress (.Z) stream (contents can't be checked)"),
+    ("e.Z", b"\x1f\x9d\x90" + b"filler " * 8, "Unix compress (.Z) stream (contents can't be checked)"),
+    ("gzip_in_z.bin", gzip.compress(b"\x1f\x9d\x90" + bytes(12)),
+     "Unix compress (.Z) stream (contents can't be checked) in gzip stream"),
     ("broken.bin", b"PK\x03\x04" + bytes(40), "zip archive that can't be opened (contents can't be checked)"),
     ("broken.gz", b"\x1f\x8b\x09\x00" + bytes(12), "gzip stream that can't be opened (contents can't be checked)"),
     # broken.gz names compression method 9, which isn't deflate; deep.bin is a DDS under four gzip layers
@@ -167,6 +201,9 @@ PASSED_ARCHIVES = [
     ("notes.gz", gzip.compress(b"The RPF9 magic is stored as 9FPR.\n")),
     ("notes.bz2", bz2.compress(b"plain text\n")),
     ("notes.xz", lzma.compress(b"plain text\n")),
+    ("notes.lzma", lzma.compress(b"plain text\n", format=lzma.FORMAT_ALONE)),
+    ("tar.lzma", lzma.compress(tarred({"a.txt": b"plain text\n"}), format=lzma.FORMAT_ALONE)),
+    ("notes.gz.lzma", lzma.compress(gzip.compress(b"The RPF9 magic is stored as 9FPR.\n"), format=lzma.FORMAT_ALONE)),
     ("nested_clean.gz", gzip.compress(zipped({"a.txt": b"text\n"}))),
 ]
 
