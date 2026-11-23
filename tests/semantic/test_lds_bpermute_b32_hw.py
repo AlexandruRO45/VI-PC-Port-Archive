@@ -102,50 +102,147 @@ def run_cs_bpermute(instructions: Sequence[str], wave_size: int = 32) -> list[in
 
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     def test_identity_permute(self):
-        # Each lane reads from itself: lane_id * 4
         vdata = [1000 + i for i in range(32)]
         for lane in range(32):
-            res = ref_ds_bpermute_b32(lane, lane * 4, vdata)
-            self.assertEqual(res, vdata[lane])
+            self.assertEqual(ref_ds_bpermute_b32(lane, lane * 4, vdata), vdata[lane])
 
     def test_broadcast_permute(self):
-        # All lanes read from lane 7
         vdata = [500 + i for i in range(32)]
         for lane in range(32):
-            res = ref_ds_bpermute_b32(lane, 7 * 4, vdata)
-            self.assertEqual(res, vdata[7])
+            self.assertEqual(ref_ds_bpermute_b32(lane, 7 * 4, vdata), vdata[7])
 
     def test_reverse_permute(self):
-        # Lane i reads from 31 - i
         vdata = [i * 10 for i in range(32)]
         for lane in range(32):
-            res = ref_ds_bpermute_b32(lane, (31 - lane) * 4, vdata)
-            self.assertEqual(res, vdata[31 - lane])
+            self.assertEqual(ref_ds_bpermute_b32(lane, (31 - lane) * 4, vdata), vdata[31 - lane])
 
     def test_offset_handling(self):
-        # vaddr = 0, offset = 16 (reads lane 4)
         vdata = [i * 3 for i in range(32)]
         for lane in range(32):
-            res = ref_ds_bpermute_b32(lane, 0, vdata, offset=16)
-            self.assertEqual(res, vdata[4])
+            self.assertEqual(ref_ds_bpermute_b32(lane, 0, vdata, offset=16), vdata[4])
 
     def test_inactive_source_lane_reads_zero(self):
-        # Source lane 5 is inactive
         vdata = [100 + i for i in range(32)]
         exec_mask = 0xFFFFFFFF ^ (1 << 5)
-        res = ref_ds_bpermute_b32(0, 5 * 4, vdata, exec_mask=exec_mask)
-        self.assertEqual(res, 0)
+        self.assertEqual(ref_ds_bpermute_b32(0, 5 * 4, vdata, exec_mask=exec_mask), 0)
 
     def test_translator_backed_broadcast(self):
-        # Compute shader broadcast of lane 7 (value = 705)
         lines = [
-            "v_mov_b32_e32 v1, 28",            # addr = 7 * 4
-            "v_mad_u32_u24 v2, v0, 100, 5",    # data = 100 * lane + 5
+            "v_mov_b32_e32 v1, 28",
+            "v_mad_u32_u24 v2, v0, 100, 5",
             "ds_bpermute_b32 v3, v1, v2",
         ]
         results = run_cs_bpermute(lines, 32)
         self.assertEqual(len(results), 32)
         self.assertTrue(all(v == 705 for v in results))
+
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+
+    @classmethod
+    def vgpr(cls, idx: int) -> Operand:
+        return cls(RegType.VGPR, idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> Operand:
+        return cls(RegType.SGPR, idx)
+
+    def to_asm(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class DSBPermuteB32Instruction:
+    dst: Operand
+    vaddr: Operand
+    vdata: Operand
+    offset: int = 0
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination must be a VGPR for ds_bpermute_b32")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise TypeError("vaddr must be a VGPR for ds_bpermute_b32")
+        if self.vdata.reg_type != RegType.VGPR:
+            raise TypeError("vdata must be a VGPR for ds_bpermute_b32")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"Offset {self.offset} out of bounds [0, 65535]")
+
+    def to_asm(self) -> str:
+        off_str = f" offset:{self.offset}" if self.offset else ""
+        return f"ds_bpermute_b32 {self.dst.to_asm()}, {self.vaddr.to_asm()}, {self.vdata.to_asm()}{off_str}"
+
+    @classmethod
+    def parse(cls, asm: str) -> DSBPermuteB32Instruction:
+        parts = asm.replace(",", " ").split()
+        if not parts or parts[0] != "ds_bpermute_b32":
+            raise ValueError(f"Invalid mnemonic in: {asm}")
+        if len(parts) < 4:
+            raise ValueError(f"Not enough operands in: {asm}")
+        dst_str, vaddr_str, vdata_str = parts[1], parts[2], parts[3]
+        if not dst_str.startswith("v") or not vaddr_str.startswith("v") or not vdata_str.startswith("v"):
+            raise TypeError(f"All register operands must be VGPRs: {asm}")
+        dst = Operand.vgpr(int(dst_str[1:]))
+        vaddr = Operand.vgpr(int(vaddr_str[1:]))
+        vdata = Operand.vgpr(int(vdata_str[1:]))
+        offset = 0
+        for p in parts[4:]:
+            if p.startswith("offset:"):
+                val_s = p.split(":")[1]
+                offset = int(val_s, 0)
+                if not (0 <= offset <= 65535):
+                    raise ValueError(f"Offset out of bounds: {offset}")
+            else:
+                raise ValueError(f"Unknown modifier: {p}")
+        return cls(dst, vaddr, vdata, offset=offset)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_ast_construction_and_formatting(self):
+        insn = DSBPermuteB32Instruction(
+            dst=Operand.vgpr(3),
+            vaddr=Operand.vgpr(1),
+            vdata=Operand.vgpr(2),
+            offset=16,
+        )
+        self.assertEqual(insn.to_asm(), "ds_bpermute_b32 v3, v1, v2 offset:16")
+
+    def test_ast_parsing(self):
+        insn = DSBPermuteB32Instruction.parse("ds_bpermute_b32 v3, v1, v2 offset:28")
+        self.assertEqual(insn.dst.index, 3)
+        self.assertEqual(insn.vaddr.index, 1)
+        self.assertEqual(insn.vdata.index, 2)
+        self.assertEqual(insn.offset, 28)
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(TypeError):
+            DSBPermuteB32Instruction(
+                dst=Operand.sgpr(3),
+                vaddr=Operand.vgpr(1),
+                vdata=Operand.vgpr(2),
+            )
+        with self.assertRaises(ValueError):
+            DSBPermuteB32Instruction(
+                dst=Operand.vgpr(3),
+                vaddr=Operand.vgpr(1),
+                vdata=Operand.vgpr(2),
+                offset=70000,
+            )
 
 
 if __name__ == "__main__":
