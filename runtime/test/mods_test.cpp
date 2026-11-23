@@ -39,6 +39,8 @@ int main() {
     check(parse_model_id("cs_monalisa", id) && id == 0x9CB9BCC6u, "a name is hashed");
     check(!parse_model_id("0x123456789", id), "a hash wider than 32 bits is refused");
     check(!parse_model_id("0xZZ", id), "a malformed hash is refused");
+    check(!parse_model_id("0x", id), "a bare 0x prefix is refused");
+    check(!parse_model_id("0X", id), "a bare 0X prefix is refused");
     check(!parse_model_id("", id), "an empty name is refused");
 
     Mod mod;
