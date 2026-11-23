@@ -66,6 +66,15 @@ class CensusTests(unittest.TestCase):
             self.assertEqual(group["coverage"]["listing_incomplete"], 1)
             self.assertEqual(group["observed_exports"], {"mrt0 compr": 2})
 
+    def test_reads_index_saved_with_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows = [{"file": "missing.dxbc", "name": "deferred", "stage": "ps"}]
+            (root / "index.json").write_bytes(b"\xef\xbb\xbf" +json.dumps(rows).encode("utf-8"))
+            report = census(root, root)
+            self.assertEqual(report["all indexed ps"]["coverage"]["indexed"], 1)
+            self.assertEqual(report["entry contains deferred (casefold)"]["coverage"]["container_missing"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

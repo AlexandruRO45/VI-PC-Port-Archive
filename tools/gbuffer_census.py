@@ -83,7 +83,7 @@ def census(directory, listings, *, payload_coverage=False):
     if payload_coverage:
         for group in report.values():
             group["payload_coverage"] = dict(identified=0, ambiguous=0, unavailable=0)
-    for row in json.loads((directory / "index.json").read_text(encoding="utf-8")):
+    for row in json.loads((directory / "index.json").read_text(encoding="utf-8-sig")):
         if row["stage"] != "ps":
             continue
         path = directory / row["file"]
