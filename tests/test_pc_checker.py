@@ -1,5 +1,6 @@
 """Tests for tools/pc_checker.py. Run with: python -I tests/test_pc_checker.py"""
 import os
+import subprocess
 import sys
 import unittest
 
@@ -152,6 +153,22 @@ class Api(unittest.TestCase):
         os.environ[pc.SKIP_ENV] = "1"
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
+
+
+class RamOverride(unittest.TestCase):
+    def test_nonpositive_ram_override_is_a_usage_error(self):
+        tool = os.path.join(os.path.dirname(pc.__file__), "pc_checker.py")
+        for mode in ("--cli", "--check"):
+            for ram in ("0", "-1"):
+                with self.subTest(mode=mode, ram=ram):
+                    result = subprocess.run(
+                        [sys.executable, "-I", tool, mode, "--cpu", "Ryzen 5 5600",
+                         "--gpu", "RTX 3070", "--ram", ram],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--ram must be a positive integer", result.stderr)
+                    self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":
