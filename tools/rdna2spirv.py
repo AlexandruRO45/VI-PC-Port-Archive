@@ -12489,6 +12489,10 @@ class Gen:
         if vdata["k"] != "vgpr":          # `off`, an SGPR or a constant where the VGPR range of the result goes
             raise Unsupported(op + " destination")
         addr = self.addr_regs(a[1])
+        if op.startswith("image_sample_l") and a[1]["k"] == "vgpr":
+            needed = ncoord + 1 + (1 if op.endswith("_o") else 0)
+            if len(addr) < needed:
+                addr = [a[1]["r"] + i for i in range(needed)]
         if op == "image_sample_c_l":
             # Vulkan Dref returns one scalar. Other component masks require the depth view's swizzle.
             if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
