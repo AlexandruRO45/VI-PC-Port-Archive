@@ -305,5 +305,37 @@ class TestOperandFormsAndAliasing(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x40a00000)
 
+class TestSignedZeroAndBoundaries(unittest.TestCase):
+    """Signed zeros (-0.0 < +0.0), infinities, and subnormal float boundary tests."""
+
+    def _eval_words(self, s0: int, s1: int, s2: int) -> int:
+        prog = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            f"v_mov_b32 v3, {s2:#x}",
+            "v_max3_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_boundary", prog)
+        return support.mrt0_words(spv)[0]
+
+    def test_signed_zero_combinations(self):
+        self.assertEqual(self._eval_words(POS_ZERO_BITS, NEG_ZERO_BITS, NEG_ZERO_BITS), POS_ZERO_BITS)
+        self.assertEqual(self._eval_words(NEG_ZERO_BITS, POS_ZERO_BITS, NEG_ZERO_BITS), POS_ZERO_BITS)
+        self.assertEqual(self._eval_words(NEG_ZERO_BITS, NEG_ZERO_BITS, POS_ZERO_BITS), POS_ZERO_BITS)
+        self.assertEqual(self._eval_words(NEG_ZERO_BITS, NEG_ZERO_BITS, NEG_ZERO_BITS), NEG_ZERO_BITS)
+        self.assertEqual(self._eval_words(POS_ZERO_BITS, POS_ZERO_BITS, POS_ZERO_BITS), POS_ZERO_BITS)
+
+    def test_infinity_extremes(self):
+        self.assertEqual(self._eval_words(POS_INF_BITS, 0x7F7FFFFF, NEG_INF_BITS), POS_INF_BITS)
+        self.assertEqual(self._eval_words(NEG_INF_BITS, 0x7F7FFFFF, 0x00000000), 0x7F7FFFFF)
+        self.assertEqual(self._eval_words(NEG_INF_BITS, NEG_INF_BITS, NEG_INF_BITS), NEG_INF_BITS)
+        self.assertEqual(self._eval_words(POS_INF_BITS, POS_INF_BITS, 0x00000000), POS_INF_BITS)
+
+    def test_subnormal_extremes(self):
+        self.assertEqual(self._eval_words(SUBNORM_MIN_BITS, POS_ZERO_BITS, NEG_ZERO_BITS), SUBNORM_MIN_BITS)
+        self.assertEqual(self._eval_words(SUBNORM_MAX_BITS, SUBNORM_MIN_BITS, POS_ZERO_BITS), SUBNORM_MAX_BITS)
+
 if __name__ == "__main__":
     unittest.main()
