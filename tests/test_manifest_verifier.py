@@ -27,6 +27,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import tools.manifest_verifier as mv
+import manifest
 
 SYNTHETIC_SIZES = {
     "alpha.bin": 256 * 1024,
@@ -110,12 +111,13 @@ class TestManifestVerifier(unittest.TestCase):
 
         # Simulate POSIX directory entries even on Windows, where a filename cannot contain a literal backslash.
         target = "/target"
-        posix_os = Mock(sep="/", path=Mock(wraps=posixpath))
+        posix_os = Mock(sep="/", altsep=None, path=Mock(wraps=posixpath))
         posix_os.path.isdir.return_value = True
         posix_os.path.isfile.side_effect = os.path.isfile
         posix_os.path.getsize.return_value = len(payload)
         posix_os.walk.return_value = [(target, [], [literal_name])]
         with (patch.object(mv, "os", posix_os),
+              patch.object(manifest, "os", posix_os),
               patch.object(mv, "sha256_file", return_value=hashlib.sha256(payload).hexdigest()) as hash_file):
             report = mv.verify_manifest(target, self.manifest_path)
         self.assertFalse(report.passed)
@@ -540,6 +542,22 @@ class TestManifestVerifier(unittest.TestCase):
         res = self.run_cli(*args)
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertEqual(json.loads(res.stdout)["untracked"], ["manifest.json"])
+
+    def test_cli_strict_excludes_in_tree_manifest_with_case_alias(self) -> None:
+        self.write_manifest(os.path.join(self.game_dir, "nested", "Manifest.json"), self.payloads)
+        alias = os.path.join(self.game_dir, "NESTED", "manifest.json")
+        if not os.path.isfile(alias):
+            self.skipTest("temporary volume is case-sensitive")
+
+        args = (self.game_dir, "--manifest", alias, "--strict", "--json")
+        result = self.run_cli(*args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["untracked"], [])
+
+        self.write_manifest(os.path.join(self.game_dir, "nested", "backup.json"), self.payloads)
+        result = self.run_cli(*args)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["untracked"], ["nested/backup.json"])
 
     def test_cli_missing_manifest_returns_exit_code_2(self) -> None:
         res = self.run_cli(self.game_dir, "--manifest", os.path.join(self.root, "none.json"))

@@ -152,6 +152,33 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         with open(target, "rb") as f:
             self.assertEqual(f.read(), before)
 
+    def test_verify_excludes_in_tree_manifest_with_case_alias(self):
+        out = os.path.join(self.pkg, "Manifest.json")
+        alias = os.path.join(self.pkg, "manifest.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, out, jobs=1)
+        if not os.path.isfile(alias):
+            self.skipTest("temporary volume is case-sensitive")
+
+        with contextlib.redirect_stdout(io.StringIO()) as report:
+            self.assertEqual(manifest.verify(self.pkg, alias), 0)
+        self.assertEqual(report.getvalue(), "OK\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(manifest.create(self.pkg, alias, jobs=1), 0)
+        self.assertEqual(set(manifest.load_manifest(alias)), set(self.files))
+
+    def test_create_cannot_overwrite_an_input_through_a_case_alias(self):
+        target = os.path.join(self.pkg, "content", "asset1.dat")
+        alias = os.path.join(self.pkg, "CONTENT", "ASSET1.dat")
+        if not os.path.isfile(alias):
+            self.skipTest("temporary volume is case-sensitive")
+
+        with self.assertRaises(manifest.ManifestError):
+            manifest.create(self.pkg, alias, jobs=1)
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), self.files["content/asset1.dat"])
+
     def test_create_cannot_overwrite_a_hard_link_to_a_hashed_file(self):
         alias = os.path.join(self.tmp.name, "alias.json")
         try:

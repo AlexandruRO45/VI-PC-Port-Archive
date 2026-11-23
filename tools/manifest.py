@@ -17,6 +17,9 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import case_insensitive_volume, path_key  # noqa: E402
+
 CHUNK = 8 * 1024 * 1024
 DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
 
@@ -91,22 +94,35 @@ def same_output_path(first: str, second: str) -> bool:
 
 
 def walk(game_dir: str, *, exclude=None):
+    """Yield relative paths with forward slashes, omitting the selected manifest entry."""
     def scan_failed(error: OSError) -> None:
         raise error
 
     excluded_dir = excluded_name = None
+    fold_case = False
     if exclude is not None:
         directory, name = os.path.split(os.path.abspath(exclude))
         excluded_dir = os.path.normcase(os.path.realpath(directory))
         excluded_name = os.path.normcase(name)
+        fold_case = case_insensitive_volume(excluded_dir)
 
     # os.walk otherwise treats missing or unreadable directories as empty.
     for root, _, files in os.walk(game_dir, onerror=scan_failed):
-        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
+        contains_manifest = False
+        if excluded_dir is not None:
+            root_dir = os.path.normcase(os.path.realpath(root))
+            contains_manifest = root_dir == excluded_dir or (
+                fold_case and root_dir.casefold() == excluded_dir.casefold()
+                and same_output_path(root_dir, excluded_dir)
+            )
+        # Prefer the exact entry so a differently named hard link stays in the inventory.
+        check_alias = contains_manifest and fold_case and excluded_name not in files
         for name in sorted(files):
-            if contains_manifest and os.path.normcase(name) == excluded_name:
-                continue
             p = os.path.join(root, name)
+            if contains_manifest and (os.path.normcase(name) == excluded_name or (
+                check_alias and name.casefold() == excluded_name.casefold() and same_output_path(p, exclude)
+            )):
+                continue
             rel = os.path.relpath(p, game_dir)
             if os.sep != "/":
                 rel = rel.replace(os.sep, "/")
@@ -124,8 +140,8 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
         raise ManifestError(f"--out is a folder, not a manifest file: {out}")
     if os.path.isfile(out):
         try:
-            inside = os.path.normcase(os.path.commonpath(
-                [os.path.realpath(game_dir), os.path.realpath(out)])) == os.path.normcase(os.path.realpath(game_dir))
+            root = path_key(game_dir)
+            inside = os.path.commonpath([root, path_key(out)]) == root
         except ValueError:
             inside = False
         if inside:

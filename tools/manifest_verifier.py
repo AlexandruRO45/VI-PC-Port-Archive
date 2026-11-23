@@ -22,6 +22,9 @@ import sys
 import time
 from typing import Callable, Optional, TextIO
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from manifest import walk as walk_manifest  # noqa: E402
+
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
 
@@ -85,24 +88,7 @@ def sha256_file(path: str, chunk_size: int = CHUNK, *, expected_size: int | None
 
 def walk(target_dir: str, *, exclude: str | None = None):
     """Yields (relative_path, absolute_path) using forward slashes, excluding the selected manifest."""
-    def scan_failed(error: OSError) -> None:
-        raise error
-
-    excluded_dir = excluded_name = None
-    if exclude is not None:
-        directory, name = os.path.split(os.path.abspath(exclude))
-        excluded_dir = os.path.normcase(os.path.realpath(directory))
-        excluded_name = os.path.normcase(name)
-
-    # os.walk otherwise treats missing or unreadable directories as empty.
-    for root, _, files in os.walk(target_dir, onerror=scan_failed):
-        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
-        for name in sorted(files):
-            if contains_manifest and os.path.normcase(name) == excluded_name:
-                continue
-            abs_p = os.path.join(root, name)
-            rel_p = os.path.relpath(abs_p, target_dir).replace(os.sep, "/")
-            yield rel_p, abs_p
+    yield from walk_manifest(target_dir, exclude=exclude)
 
 
 def load_manifest(path: str) -> dict[str, dict]:
