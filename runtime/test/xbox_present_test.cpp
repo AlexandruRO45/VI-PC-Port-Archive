@@ -678,13 +678,14 @@ int main() {
                         p.tex.px[std::size_t(y) * p.tex.w + x] = {R / 1023.0, G / 1023.0, B / 1023.0, A / 3.0};
                 return true;
             };
-            // One PresentX of `count` planes, a fresh token for all; the swapchain frame is read back into `frame`.
-            const auto present_planes = [&](rt::d3d12::XboxPresentPlaneParameters* planes_, UINT count_, HRESULT want = S_OK) {
+            const auto submit_planes = [&](rt::d3d12::XboxPresentPlaneParameters* planes_, UINT count_, HRESULT want) {
                 clock.advance_us(4 * period);
                 if (!next_token(token)) return false;
                 for (UINT i = 0; i < count_; ++i) planes_[i].Token = token;
-                if (xbox.PresentX(count_, planes_, nullptr) != want) return false;
-                return want != S_OK || grab(frame);
+                return xbox.PresentX(count_, planes_, nullptr) == want;
+            };
+            const auto present_planes = [&](rt::d3d12::XboxPresentPlaneParameters* planes_, UINT count_, HRESULT want = S_OK) {
+                return submit_planes(planes_, count_, want) && (want != S_OK || grab(frame));
             };
             const auto parameters = [&](Source& s, const XboxViewRect* place, int filter, int color_space = 0,
                                         UINT flags = 0, const D3D12_RECT* rect = nullptr) {
@@ -1099,9 +1100,14 @@ int main() {
                 want_w = want_h = 0;  // the first present after a resize may still be at the old size (suboptimal swapchain)
                 for (int round = 0; round < 3; ++round) {
                     one = parameters(quad.source, &middle_half, xbox_scale_filter_point);
-                    // (A present the driver reports out of date right after the resize is not counted as shown, so the counter
-                    // is not checked here; the frame is still composed and read back.)
-                    EXPECT(present_planes(&one, 1));
+                    const auto before = xbox.presenter().presented();
+                    EXPECT(submit_planes(&one, 1, S_OK));
+                    // A resize can reject the old swapchain image. The final attempt must produce a frame.
+                    if (xbox.presenter().presented() == before) {
+                        EXPECT(round < 2);
+                        continue;
+                    }
+                    EXPECT(grab(frame));
                     // Whatever size the frame has, it must be the composition at that size (no stale or mis-sized target).
                     Ref_plane resized = model(quad, &middle_half, true);
                     resized.dest[0] = middle_half.left * double(frame.extent.width);
