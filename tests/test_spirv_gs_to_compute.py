@@ -34,7 +34,7 @@ def test_layout(gs_tri):
     _, spvasm = gs_tri
     _, lay = gsc.rewrite(spvasm)
     assert lay == {"verts_in": 3, "max_verts": 3, "topology": "triangle_strip",
-                   "inputs": ["position", "location 1"], "outputs": ["position", "location 1"], "local_size": 64}
+                   "inputs": ["position", "location 0"], "outputs": ["position", "location 0"], "local_size": 64}
 
 
 @requires_tools

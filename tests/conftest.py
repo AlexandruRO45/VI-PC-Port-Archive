@@ -133,12 +133,14 @@ def mesh_psv0_chunk(threads=(128, 1, 1), max_vertices=64, max_primitives=64, top
 # DXBC the hand-written gs_tri / ms_tri samples in runtime/test/shaders need (their header comments say which).
 GS_TRI_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),      # SV_Position reg 0, TEXCOORD0 reg 1
                          signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)])])
+GS_W64_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF), (2, 0, 0xF)]),  # + TEXCOORD1 reg 2
+                         signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)])])      # build.py gs_container
 MS_TRI_DXBC = make_dxbc([mesh_psv0_chunk()])                                          # 128 threads, 64/64, triangles
 MS_CLIP_DXBC = make_dxbc([mesh_psv0_chunk(),
                           signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x1)])])      # SV_Position + SV_ClipDistance.x
 SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC, "ms_wave_info_s3": MS_TRI_DXBC,
                "ms_w64x_ballot": MS_TRI_DXBC, "ms_f16_pack": MS_TRI_DXBC,      # scripts/run_gpu_tests.py, ms_tri's PSV0
-               "gs_w64_a_ring": GS_TRI_DXBC, "gs_w64_c_lane_id": GS_TRI_DXBC,  # build.py gives every gs_* gs_tri's
+               "gs_w64_a_ring": GS_W64_DXBC, "gs_w64_c_lane_id": GS_W64_DXBC,  # build.py gs_container
                "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
                                                            max_primitives=1, group_shared=128)])}
 

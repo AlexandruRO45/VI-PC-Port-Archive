@@ -338,10 +338,30 @@ def test_gs_packed_input_register_emits_one_variable(make_shader):
     shader = make_shader(asm, "gs_tri_packed", dxbc=dxbc)
     spvasm = shader.translate()
     assert spvasm.count("%gs_in1 = OpVariable") == 1
-    assert spvasm.count("OpDecorate %gs_in1 Location 1") == 1
+    assert spvasm.count("OpDecorate %gs_in1 Location 0") == 1
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
     assert meta["gs_inputs"] == [0, 1]
-    assert meta["gs_input_locations"] == [1]
+    assert meta["gs_input_locations"] == [0]
+    shader.validate(spvasm)
+
+
+def test_gs_locations_are_ranks_past_the_position(make_shader):
+    """A GS varying's Location is its rank among the non-position signature registers, as the VS's param exports and
+    the PS's attribute reads number them: with SV_Position in register 0 and varyings in registers 1-2 (in) and 1, 3
+    (out), the GS reads locations 0-1 and writes 0-1, not the register numbers."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8") as f:
+        asm = f.read()
+    dxbc = make_dxbc([
+        signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF), (2, 0, 0xF)]),
+        signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF), (3, 0, 0xF)]),
+    ])
+    shader = make_shader(asm, "gs_tri_ranks", dxbc=dxbc)
+    spvasm = shader.translate()
+    for var, loc in (("gs_in1", 0), ("gs_in2", 1), ("gs_out1", 0), ("gs_out3", 1)):
+        assert re.search(rf"OpDecorate %{var} Location {loc}$", spvasm, re.M)
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert meta["gs_inputs"] == [0, 1, 2] and meta["gs_outputs"] == [0, 1, 3]
+    assert meta["gs_input_locations"] == [0, 1] and meta["gs_output_locations"] == [0, 1]
     shader.validate(spvasm)
 
 

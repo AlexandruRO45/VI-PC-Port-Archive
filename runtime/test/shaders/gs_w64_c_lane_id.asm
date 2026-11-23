@@ -1,11 +1,12 @@
 ; TEST-251 (SHADER-10 tier C, geometry stage): the raw lane number (v_mbcnt_lo/hi of -1) used as data, in a legacy
 ; (LDS-ring) wave64 geometry shader with gs_tri's EXEC prologue. Drawn with vs_ids, whose param1 is the integer
-; 0x101 + vertex index: the GS reads it from its first input vertex (signature register 1, TEXCOORD0.x, dword 4),
+; 0x101 + vertex index: the GS reads it from its first input vertex (signature register 2, TEXCOORD1.x, dword 8),
 ; so triangle p = (that - 0x101) / 3. Each GS invocation stores (lane id, lane id & 31, p, 0) to its record at heap
 ; 0x1000 + 16 * p through the V# in s[4:7] (the translator sets s3 for the prologue), then emits one vertex, which
 ; makes no primitive. In a wave64 GS some invocations get lanes 32..63, in a wave32 one none do, so r0 and r1 depend on
 ; the wave size and r2 does not. w64_graphics.py uses it as the probe of the GS wave size.
-; Needs a DXBC with ISG1/OSG1 = {SV_Position reg 0, TEXCOORD0 reg 1} (build.py makes it for gs_*).
+; Needs a DXBC with ISG1 = {SV_Position reg 0, TEXCOORD0 reg 1, TEXCOORD1 reg 2}, OSG1 = {SV_Position reg 0,
+; TEXCOORD0 reg 1} (build.py makes it for gs_*); TEXCOORD1 (Location 1) meets vs_ids's param1.
 ; Run: VKH_GS=gs_w64_c_lane_id.spv VKH_VERTICES=960 VKH_SGPRS=0,0,0,0,0,0,65536,0x30000000 VKH_HEAP=0=0
 ; VKH_HEAP_DUMP=heap.raw vk_harness vs_ids.spv <any fragment shader> out.raw, with and without RADV_PERFTEST=gewave32.
 ; mattr: +wavefrontsize64,-wavefrontsize32
@@ -15,7 +16,7 @@ s_cmp_eq_u32 s0, 64
 s_cselect_b64 exec, -1, exec
 v_lshlrev_b32_e32 v3, 2, v0
 v_and_b32_e32 v10, 0x3fffc, v3
-ds_read_b32 v20, v10 offset:16
+ds_read_b32 v20, v10 offset:32
 s_waitcnt lgkmcnt(0)
 v_subrev_nc_u32_e32 v20, 0x101, v20
 v_mul_hi_u32 v21, v20, 0xaaaaaaab

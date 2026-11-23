@@ -3,9 +3,10 @@
 ; hardware GS has. The translator maps an LDS write to an output slot from its offset alone and drops the VGPR address
 ; (rdna2spirv.py, gs_ds), so the lane id reaches no output and the program is partition invariant: after spirv-opt -O
 ; its SPIR-V is the same as without the base. Drawn with vs_ids (param1 = 0x101 + vertex index): triangle
-; p = (TEXCOORD0.x of input vertex 0 - 0x101) / 3. Each invocation stores (p, 3 * p + 1, 77, 0) to its record at heap
+; p = (TEXCOORD1.x of input vertex 0 - 0x101) / 3. Each invocation stores (p, 3 * p + 1, 77, 0) to its record at heap
 ; 0x1000 + 16 * p through the V# in s[4:7], and emits one vertex (no primitive) through the lane-based ring address.
-; Needs a DXBC with ISG1/OSG1 = {SV_Position reg 0, TEXCOORD0 reg 1} (build.py makes it for gs_*).
+; Needs a DXBC with ISG1 = {SV_Position reg 0, TEXCOORD0 reg 1, TEXCOORD1 reg 2}, OSG1 = {SV_Position reg 0,
+; TEXCOORD0 reg 1} (build.py makes it for gs_*); TEXCOORD1 (Location 1) meets vs_ids's param1.
 ; Run: VKH_GS=gs_w64_a_ring.spv VKH_VERTICES=960 VKH_SGPRS=0,0,0,0,0,0,65536,0x30000000 VKH_HEAP=0=0
 ; VKH_HEAP_DUMP=heap.raw vk_harness vs_ids.spv <any fragment shader> out.raw, with and without RADV_PERFTEST=gewave32:
 ; equal records, and equal to the expected words.
@@ -16,7 +17,7 @@ s_cmp_eq_u32 s0, 64
 s_cselect_b64 exec, -1, exec
 v_lshlrev_b32_e32 v3, 2, v0
 v_and_b32_e32 v10, 0x3fffc, v3
-ds_read_b32 v20, v10 offset:16
+ds_read_b32 v20, v10 offset:32
 s_waitcnt lgkmcnt(0)
 v_subrev_nc_u32_e32 v20, 0x101, v20
 v_mul_hi_u32 v21, v20, 0xaaaaaaab

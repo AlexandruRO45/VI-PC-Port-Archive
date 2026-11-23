@@ -115,13 +115,17 @@ def clip_container():
 
 
 def gs_container():
-    # ISG1 and OSG1 of the gs_* fixtures, as scripts/run_gpu_tests.py makes them for gs_tri: SV_Position (system value
-    # 1) in register 0 and TEXCOORD0 in register 1, float4 (component type 3), no names.
-    sig = struct.pack("<II", 2, 8) + b"".join(struct.pack("<6I2B6x", 0, 0, 0, sv, 3, reg, 0xF, 0xF)
-                                              for sv, reg in ((1, 0), (0, 1)))
-    chunk = struct.pack("<I", len(sig)) + sig
-    return (b"DXBC" + bytes(16) + struct.pack("<5I", 1, 40 + 2 * (4 + len(chunk)), 2, 40, 44 + len(chunk))
-            + b"ISG1" + chunk + b"OSG1" + chunk)
+    # ISG1 and OSG1 of the gs_* fixtures, float4 (component type 3), no names. OSG1 is gs_tri's (scripts/
+    # run_gpu_tests.py): SV_Position (system value 1) in register 0 and TEXCOORD0 in register 1. ISG1 adds TEXCOORD1 in
+    # register 2: a GS input's Location is its rank past SV_Position, so registers 1 and 2 meet the partner VS's param0
+    # and param1 (vs_ids: (u, v, 0, 1) and 0x101 + vertex index), which the gs_w64_* fixtures read.
+    def chunk(regs):
+        sig = struct.pack("<II", len(regs), 8) + b"".join(struct.pack("<6I2B6x", 0, 0, 0, sv, 3, reg, 0xF, 0xF)
+                                                          for sv, reg in regs)
+        return struct.pack("<I", len(sig)) + sig
+    isg, osg = chunk(((1, 0), (0, 1), (0, 2))), chunk(((1, 0), (0, 1)))
+    return (b"DXBC" + bytes(16) + struct.pack("<5I", 1, 40 + 8 + len(isg) + len(osg), 2, 40, 44 + len(isg))
+            + b"ISG1" + isg + b"OSG1" + osg)
 
 
 def translate_tests(work, names):

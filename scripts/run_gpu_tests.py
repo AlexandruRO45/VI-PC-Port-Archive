@@ -801,10 +801,8 @@ def run_suite(a, work: str) -> int:
     # 3. Build helper SPIR-V shaders
     vs_tri = os.path.join(spirv_dir, "vs_tri.spv")
     fs_passthru = os.path.join(spirv_dir, "fs_passthru.spv")
-    fs_loc1 = os.path.join(spirv_dir, "fs_loc1.spv")
     spirv_as(VS_TRI_SPVASM, vs_tri)
     spirv_as(make_fs_passthru(0), fs_passthru)
-    spirv_as(make_fs_passthru(1), fs_loc1)
 
     index = {}
     idx_path = os.path.join(spirv_dir, "index.json")
@@ -1324,7 +1322,7 @@ def run_suite(a, work: str) -> int:
         elif name == "gs_tri":
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_GS=spv)
-            rc, msg = run_readback(raw, run_cmd, [vk_harness, vs_tri, fs_loc1, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, vs_tri, fs_passthru, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:

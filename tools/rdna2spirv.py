@@ -12887,9 +12887,11 @@ def assemble(gen):
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %local_id BuiltIn LocalInvocationId"]
     if gsx:
         for r, sv in gen.gs["in"]:
-            dec.append("OpDecorate %gs_in_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_in{r} Location {r}")
+            dec.append("OpDecorate %gs_in_pos BuiltIn Position" if sv == 1
+                       else f"OpDecorate %gs_in{r} Location {gen.gs['in_loc'][r]}")
         for r, sv in gen.gs["out"]:
-            dec.append("OpDecorate %gs_out_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_out{r} Location {r}")
+            dec.append("OpDecorate %gs_out_pos BuiltIn Position" if sv == 1
+                       else f"OpDecorate %gs_out{r} Location {gen.gs['out_loc'][r]}")
     ms_clip_member = ms_cull_member = None
     if ms:
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %num_wg BuiltIn NumWorkgroups",
@@ -14501,7 +14503,13 @@ def translate(path):
                      any("GS_OP_EMIT" in x.get("t", "") for x in i["args"]))
         if not (1 <= n_emit <= 64):
             raise Unsupported("gs emit count")
-        g.gs = {"in": ins_sig, "out": outs, "nreg": max(r for r, _ in outs) + 1, "maxv": n_emit}
+        # A varying's Location is its rank among the signature's non-position registers, the same numbering the
+        # VS's param exports and the PS's attribute reads use (the register itself counts SV_Position at 0).
+        def ranks(sig):
+            return {r: i for i, r in enumerate(sorted(r for r, sv in sig if sv != 1))}
+
+        g.gs = {"in": ins_sig, "out": outs, "nreg": max(r for r, _ in outs) + 1, "maxv": n_emit,
+                "in_loc": ranks(ins_sig), "out_loc": ranks(outs)}
         for i in (0, 1, 3, 8, 64, 128, 0x4000, g.gs["nreg"], 64 << 16):          # used by assemble
             g.cu(i)
         for i in range(n_emit * g.gs["nreg"] + 1):
@@ -15572,8 +15580,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["max_vertices"] = g.gs["maxv"]
         m["gs_inputs"] = [r for r, _ in g.gs["in"]]
         m["gs_outputs"] = [r for r, _ in g.gs["out"]]
-        m["gs_input_locations"] = sorted(r for r, sv in g.gs["in"] if sv != 1)
-        m["gs_output_locations"] = sorted(r for r, sv in g.gs["out"] if sv != 1)
+        m["gs_input_locations"] = sorted(g.gs["in_loc"].values())
+        m["gs_output_locations"] = sorted(g.gs["out_loc"].values())
     # Every Workgroup byte of a compute shader (LDS + %x_buf of the emulation or the barrier rounds; SHADER-309): the
     # runtime compares it with the device's maxComputeSharedMemorySize. A mesh shader also has its 4-byte %ms_counts.
     lds = (4 * g.lds_dwords if g.uses_lds else 0) + (g.x_buf_bytes() if g.cs or g.emulate else 0) + (4 if g.ms else 0)
