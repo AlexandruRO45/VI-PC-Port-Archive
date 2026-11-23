@@ -50,8 +50,8 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
 - [ffmpeg](https://ffmpeg.org/download.html) w `PATH` *(opcjonalnie: dekoduje strumienie XMA2 i jest wymagany przy
   `--wav`)*.
 
-**Mało miejsca na dysku:** około 350 GB dotyczy pełnego builda. Do *uruchomienia* portu etapy
-`--stages check,shaders,runtime` potrzebują około 30 GB; etap `assets` (~300 GB) służy tylko narzędziom do zasobów,
+**Mało miejsca na dysku:** około 400 GB dotyczy pełnego builda. Do *uruchomienia* portu etapy
+`--stages check,shaders,runtime` potrzebują około 30 GB; etap `assets` (~370 GB) służy tylko narzędziom do zasobów,
 a `--wav` dodaje kilkakrotność rozmiaru Ogg Opus. `--work` i `--out` mogą leżeć na innym dysku; paczka na dysku
 tylko do odczytu wymaga `--overlay` (opcja `gta6rt`) na dysku zapisywalnym. Nie usuwaj plików `.s` z
 `work/shaders/dxbc/disasm`: skasowanie ich z pozostawieniem folderu sprawia, że etap wygląda na ukończony z zerem
