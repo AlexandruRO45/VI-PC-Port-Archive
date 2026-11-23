@@ -458,5 +458,44 @@ class TestVMax3F16IEEE754(unittest.TestCase):
         self.assertEqual(hw_res, 0xAAAA3C00)
 
 
+class TestVMax3F16NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_max3_f16."""
+
+    def test_rejection_of_invalid_syntax(self):
+        lines_missing = [
+            "v_mov_b32 v1, 1",
+            "v_max3_f16 v0, v1, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_max3_err", lines_missing)
+
+    def test_rejection_of_out_of_bounds_register(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 106)
+
+    def test_mutation_detection_min_instead_of_max(self):
+        # Mutated oracle computing min instead of max
+        def bad_oracle_min(a, b, c):
+            vals = [f16_to_float(h) for h in (a, b, c)]
+            non_nan = [v for v in vals if not math.isnan(v)]
+            chosen = min(non_nan)
+            return float_to_f16_bits(chosen)
+
+        self.assertNotEqual(ref_max3_f16(0x3C00, 0x4000, 0x3800), bad_oracle_min(0x3C00, 0x4000, 0x3800))
+
+    def test_mutation_detection_signed_zero_tie(self):
+        # Mutated oracle where -0.0 beats +0.0
+        def bad_oracle_neg_zero(a, b, c):
+            return 0x8000
+
+        self.assertNotEqual(ref_max3_f16(0x8000, 0x0000, 0xBC00), bad_oracle_neg_zero(0x8000, 0x0000, 0xBC00))
+
+
 if __name__ == "__main__":
     unittest.main()
