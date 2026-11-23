@@ -137,6 +137,15 @@ VKAPI_ATTR VkResult VKAPI_CALL wait_for_fences(VkDevice, std::uint32_t, const Vk
 }
 VKAPI_ATTR VkResult VKAPI_CALL reset_fences(VkDevice, std::uint32_t, const VkFence*) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL device_wait_idle(VkDevice) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL queue_wait_idle(VkQueue) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL create_semaphore(VkDevice, const VkSemaphoreCreateInfo*,
+                                                const VkAllocationCallbacks*, VkSemaphore* out) {
+    static constexpr std::uintptr_t kSemaphore = 9;
+    if (!out) return VK_ERROR_INITIALIZATION_FAILED;
+    *out = reinterpret_cast<VkSemaphore>(kSemaphore);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice, VkSemaphore, const VkAllocationCallbacks*) {}
 VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*,
                                             VkImage* out) {
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
@@ -209,6 +218,9 @@ const Entry kEntries[] = {
     {"vkWaitForFences", as_function(wait_for_fences)},
     {"vkResetFences", as_function(reset_fences)},
     {"vkDeviceWaitIdle", as_function(device_wait_idle)},
+    {"vkQueueWaitIdle", as_function(queue_wait_idle)},
+    {"vkCreateSemaphore", as_function(create_semaphore)},
+    {"vkDestroySemaphore", as_function(destroy_semaphore)},
     {"vkCreateImage", as_function(create_image)},
     {"vkDestroyImage", as_function(destroy_image)},
     {"vkGetImageMemoryRequirements", as_function(image_mem_req)},
@@ -249,7 +261,8 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     std::mutex mutex;
     leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
                                       reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
-                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex);
+                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex,
+                                      /*maintenance1=*/false);
     if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
                           VK_FORMAT_B8G8R8A8_UNORM, requested))
         return fail("VulkanSwapchain::create");
