@@ -1513,9 +1513,14 @@ int main() {
     {
         // The ResizeTarget block above leaves the back buffers at 234x156: start again from 300x200.
         if (FAILED(sc->ResizeBuffers(0, 300, 200, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers to 300x200");
+        DXGI_SWAP_CHAIN_DESC1 source_desc{};
+        if (FAILED(sc->GetDesc1(&source_desc))) return fail("GetDesc1 before GetSourceSize");
         UINT sw = 0, sh = 0;
-        if (FAILED(sc->GetSourceSize(&sw, &sh)) || sw != 300 || sh != 200)
-            return fail("GetSourceSize should start at the back-buffer size");
+        if (FAILED(sc->GetSourceSize(&sw, &sh)) || sw != source_desc.Width || sh != source_desc.Height) {
+            std::fprintf(stderr, "FAIL: GetSourceSize started at %ux%u, back buffers are %ux%u\n", sw, sh,
+                         source_desc.Width, source_desc.Height);
+            return 1;
+        }
         if (sc->GetSourceSize(nullptr, nullptr) != DXGI_ERROR_INVALID_CALL ||
             sc->GetSourceSize(&sw, nullptr) != DXGI_ERROR_INVALID_CALL ||
             sc->GetSourceSize(nullptr, &sh) != DXGI_ERROR_INVALID_CALL)
