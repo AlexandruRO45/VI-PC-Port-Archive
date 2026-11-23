@@ -134,7 +134,12 @@ def load_banks(source: str) -> dict:
         for bank in banks:
             if not isinstance(bank, dict):
                 raise ValueError(f"expected each bank to be an object, got {type(bank).__name__}")
-            out[bank["Path"]] = [_stream_id(s) for s in bank.get("Streams") or []]
+            rows = bank.get("Streams")
+            if rows is None:
+                rows = []
+            elif not isinstance(rows, list):
+                raise ValueError(f"expected Streams to be a list, got {type(rows).__name__}")
+            out[bank["Path"]] = [_stream_id(s) for s in rows]
         return out
     if os.path.isfile(source):
         return {os.path.splitext(os.path.basename(source))[0]: bank_ids(source)}

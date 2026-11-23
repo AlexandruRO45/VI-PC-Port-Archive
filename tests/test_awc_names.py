@@ -327,8 +327,11 @@ class TestCli(unittest.TestCase):
     def test_malformed_banks_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
-            # a bank whose Streams entry is not an object, and an rpf9dump manifest whose streams row is not one
+            # a bank whose Streams entry is not an object or not a list, and an rpf9dump manifest whose streams row is not one
             for doc in ([1], [["Path"]], {"Banks": [{"Path": "p/a.awc", "Streams": ["not an object"]}]},
+                        {"Banks": [{"Path": "p/a.awc", "Streams": 1}]},
+                        {"Banks": [{"Path": "p/a.awc", "Streams": False}]},
+                        {"Banks": [{"Path": "p/a.awc", "Streams": {}}]},
                         {"bank_count": 1, "streams": ["not a row"]}):
                 banks = write(os.path.join(tmp, "banks.json"), json.dumps(doc))
                 err = io.StringIO()
@@ -336,6 +339,15 @@ class TestCli(unittest.TestCase):
                     self.assertEqual(A.main(["--words", words, banks]), 2)
                 self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
                 self.assertIn("awc_names: error:", err.getvalue())
+
+    def test_missing_or_empty_streams_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
+            for doc in ({"Banks": [{"Path": "p/a.awc"}]}, {"Banks": [{"Path": "p/a.awc", "Streams": []}]}):
+                banks = write(os.path.join(tmp, "banks.json"), json.dumps(doc))
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(A.main(["--words", words, banks]), 0, err.getvalue())
 
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
