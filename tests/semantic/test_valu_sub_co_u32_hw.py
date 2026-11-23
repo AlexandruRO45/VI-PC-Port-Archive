@@ -488,5 +488,39 @@ class TestValuSubCoU32ConditionCodes(unittest.TestCase):
         expected64 = (((a_hi << 32) | a_lo) - ((b_hi << 32) | b_lo)) & MASK64
         self.assertEqual(res64, expected64)
 
+# ---------------------------------------------------------------------------
+# Stage 7: IEEE 754 boundary extremes, integer boundaries, and bitwise limits
+# ---------------------------------------------------------------------------
+
+class TestValuSubCoU32IEEE754EdgeCases(unittest.TestCase):
+    """Stage 7: Boundary extremes, integer limits, and bit-pattern invariance for v_sub_co_u32."""
+
+    def test_integer_boundary_extremes(self) -> None:
+        # Max unsigned boundary
+        self.assertEqual(oracle_sub_co_u32(MASK32, MASK32), (0, 0))
+        self.assertEqual(oracle_sub_co_u32(MASK32, 0), (MASK32, 0))
+        self.assertEqual(oracle_sub_co_u32(0, MASK32), (1, 1))
+
+        # Sign bit boundaries
+        self.assertEqual(oracle_sub_co_u32(0x8000_0000, 1), (0x7FFF_FFFF, 0))
+        self.assertEqual(oracle_sub_co_u32(0x7FFF_FFFF, 0x8000_0000), (MASK32, 1))
+
+    def test_float_bitpatterns_treated_as_integers(self) -> None:
+        pos_inf = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
+        neg_inf = struct.unpack(">I", struct.pack(">f", float("-inf")))[0]
+        qnan = struct.unpack(">I", struct.pack(">f", float("nan")))[0]
+
+        res = oracle_sub_co_u32(pos_inf, neg_inf)
+        expected = ((pos_inf - neg_inf) & MASK32, 1 if pos_inf < neg_inf else 0)
+        self.assertEqual(res, expected)
+
+        res_trans = run_translated_sub_co_u32(pos_inf, neg_inf)
+        self.assertEqual(res_trans, expected)
+
+        # qnan and 0
+        res_nan = oracle_sub_co_u32(qnan, 0)
+        self.assertEqual(res_nan, (qnan, 0))
+        self.assertEqual(run_translated_sub_co_u32(qnan, 0), (qnan, 0))
+
 if __name__ == "__main__":
     unittest.main()
