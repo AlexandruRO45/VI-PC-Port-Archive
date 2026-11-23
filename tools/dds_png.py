@@ -22,6 +22,7 @@ import argparse
 from bisect import bisect_right
 from functools import cache
 import math
+import mmap
 import os
 import struct
 import sys
@@ -1059,7 +1060,7 @@ def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
     return bytes(out)
 
 
-def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
+def _decode_dds(data: bytes | bytearray | memoryview) -> tuple[int, int, bytes, bool]:
     info, masks, alpha_mode = _parse_header_internal(data)
     srgb = info["dxgi_format"] in _SRGB_DXGI_FORMATS
     width = int(info["width"])  # type: ignore[arg-type]
@@ -1070,12 +1071,14 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
     if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+        with memoryview(data) as view, view[offset:] as payload:
+            rgba = _decode_uncompressed_32(payload, width, height, fmt, masks, pitch)
     elif fmt in _RGB24_LAYOUTS.values():
         assert masks is not None
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_uncompressed_24(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+        with memoryview(data) as view, view[offset:] as payload:
+            rgba = _decode_uncompressed_24(payload, width, height, fmt, masks, pitch)
     elif fmt == "BC1":
         rgba = _decode_bc1(data, offset, width, height)
     elif fmt == "BC2":
@@ -1093,11 +1096,13 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
     elif fmt == "R11G11B10_FLOAT":
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_r11g11b10(memoryview(data)[offset:], width, height, pitch)
+        with memoryview(data) as view, view[offset:] as payload:
+            rgba = _decode_r11g11b10(payload, width, height, pitch)
     elif fmt in ("R16_UNORM", "A8_UNORM"):
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_single_channel(memoryview(data)[offset:], width, height, pitch, fmt)
+        with memoryview(data) as view, view[offset:] as payload:
+            rgba = _decode_single_channel(payload, width, height, pitch, fmt)
     elif fmt == "BC7":
         rgba = _decode_bc7(data, offset, width, height)
     else:
@@ -1113,7 +1118,7 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
     return width, height, rgba, srgb
 
 
-def decode_dds(data: bytes) -> tuple[int, int, bytes]:
+def decode_dds(data: bytes | bytearray | memoryview) -> tuple[int, int, bytes]:
     """Decode mip 0 into top-down row-major RGBA8 with straight alpha."""
     width, height, rgba, _ = _decode_dds(data)
     return width, height, rgba
@@ -1244,7 +1249,7 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
     return PNG_SIGNATURE + ihdr + idat + iend
 
 
-def dds_to_png_bytes(data: bytes, max_size: int = 0) -> bytes:
+def dds_to_png_bytes(data: bytes | bytearray | memoryview, max_size: int = 0) -> bytes:
     """Decode a DDS buffer (optionally downscaling) and encode as PNG bytes."""
     if max_size < 0:
         raise DdsError(f"Invalid max_size: {max_size}")
@@ -1255,10 +1260,16 @@ def dds_to_png_bytes(data: bytes, max_size: int = 0) -> bytes:
 
 
 def dds_file_to_png_bytes(path: str, max_size: int = 0) -> bytes:
-    """Read a DDS file from disk and convert it to PNG bytes."""
+    """Preview mip 0 of slice 0 without copying the file's other mips and slices.
+
+    The decoder scopes its payload views so tracebacks cannot keep the mapping open.
+    """
     with open(path, "rb") as f:
-        data = f.read()
-    return dds_to_png_bytes(data, max_size=max_size)
+        if os.fstat(f.fileno()).st_size == 0:
+            return dds_to_png_bytes(b"", max_size=max_size)
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            with memoryview(mapped) as data:
+                return dds_to_png_bytes(data, max_size=max_size)
 
 
 def main(argv: list[str] | None = None) -> int:
