@@ -735,7 +735,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         op, args[0], args, const_int_val, int_const_by_val,
                         int_type_info, const_true_id, const_false_id,
                     )
-                    if folded is not None:
+                    # Aliases must preserve the result type, including vector shape and integer signedness.
+                    if folded is not None and id_type.get(folded) == args[0]:
                         alias[res] = folded
                         dead_idx.add(idx)
                         deleted_ids.add(res)
