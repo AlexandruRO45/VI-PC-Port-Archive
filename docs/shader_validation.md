@@ -447,6 +447,21 @@ For the translator oracle, `lds_fuzz.py` and `valu_fuzz.py` create and retain a 
 `--work DIR`, that folder is a new child of `DIR` (the printed work directory), rather than `DIR` itself; files from
 older runs and other contents of `DIR` are left alone. Without `--work`, it is created in the system temporary folder.
 
+**Batch mode.** `lds_fuzz.py`, `valu_fuzz.py` and `crosslane_fuzz.py` hand their translated programs to
+`vk_compute_test --batch` through `tools/vk_compute_batch.py`: `--batch-size` programs (default 1024) share one process
+and one Vulkan device, each with its own pipeline, buffers and settings, instead of one process per program. Opening
+the device is what a fuzzed program used to cost: 1.7 to 2.5 s on an idle RTX 5080 (driver 580.65.06) and up to 25 s
+while a fuzzing campaign opens it from dozens of processes at once (the driver serialises it), against about 2 ms of
+pipeline creation, buffers and dispatch per program once it is open. Measured there with fixed seeds, the GPU part of a
+run went from 0.1 to 0.4 programs per second to 7 to 490 (the spread is other processes opening the device), and whole
+runs from 0.12 to 0.42 programs per second to 5 to 22; assembling and translating now take most of a run. The output and the dumps are the same, bit
+for bit, as one process per program. A program that crashes `vk_compute_test`, keeps the GPU busy past 60 s (a fence
+wait) or loses the device is reported for that program (`crosslane_fuzz.py`: as a harness error; the others: as an
+`ERROR` line with exit 124 or the crash's exit code), and the programs after it run in a new process. `--batch-size 1`,
+or a `vk_compute_test` built before `--batch`, runs one process per program as before (and with no time limit in
+`lds_fuzz.py` and `valu_fuzz.py`). The batch file format is in `runtime/test/vk_compute_test.cpp`; ctest
+`vk_compute_batch` checks it on the device.
+
 - **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`, `u8_d16[_hi]`, `i8_d16[_hi]`), the
   byte and short writes (also `d16_hi`), `read2`/`write2` with and without `st64`, the add, sub,
   min, max, and, or and xor atomics with and without return, `wrxchg`, `cmpst`, `ds_swizzle_b32`

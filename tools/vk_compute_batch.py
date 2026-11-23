@@ -21,10 +21,12 @@ from dataclasses import dataclass, field
 # The settings a single run reads from its environment and a batch job gives on its line (vk_compute_test.cpp).
 SETTINGS = ("VKC_OUT_WORDS", "VKC_DUMP", "VKC_HEAP_INIT", "VKC_SUBGROUP_SIZE", "VKC_SGPRS", "VKC_BENCH",
             "LEONIDA_PC_TAIL_UBO")
-# Programs per process. Measured on an RTX 5080 (valu_fuzz, crosslane_fuzz, lds_fuzz): past ~100 programs the
-# device open is a small part of a batch; a bigger batch only delays the first results and loses more work to a
-# process crash before the rerun. See docs/testing.md ("Batch mode").
-DEFAULT_BATCH_SIZE = 256
+# Programs per process. Measured on an RTX 5080 (valu_fuzz --family mem --emulate, 600 programs, while a fuzzing
+# campaign kept opening the device): the GPU phase took 21.5 s in batches of 16, 3.6 s in batches of 64 and 1.2 s in
+# one batch of 1024. A program costs about 2 ms once the device is open; what varies is each device open (2 s idle, up
+# to 25 s under contention), so fewer opens is better, and a crash only reruns the programs after it. With 1024 a
+# usual fuzzer run (50 to 1000 programs) opens the device once. See docs/shader_validation.md ("Batch mode").
+DEFAULT_BATCH_SIZE = 1024
 JOB_TIMEOUT = 60        # seconds one dispatch may run (vk_compute_test --job-timeout)
 STARTUP_GRACE = 300     # seconds for the device open before the first job starts (18 s measured under load)
 JOB_GRACE = 120         # seconds a job may take beyond its dispatch limit (shader compile, a busy machine)

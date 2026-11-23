@@ -309,7 +309,7 @@ class Runner(unittest.TestCase):
             return {p.name: {} for p in progs}
 
         with tempfile.TemporaryDirectory() as tmp:
-            argv = ["lds_fuzz.py", "--programs", "2", "--wave", "64", "--work", tmp, *extra]
+            argv = ["lds_fuzz.py", "--programs", "2", "--wave", "64", "--work", tmp, "--batch-size", "1", *extra]
             out = io.StringIO()
             with (patch.object(sys, "argv", argv), patch.object(f, "translate", side_effect=translate),
                   patch.object(f, "run_gpu", side_effect=gpu), contextlib.redirect_stdout(out)):

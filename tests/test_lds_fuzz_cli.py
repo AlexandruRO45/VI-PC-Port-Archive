@@ -132,7 +132,8 @@ class CLIValidation(unittest.TestCase):
                         seen_g.append(pc_tail)
                         return 77, "unsupported: test"
 
-                    argv = ["lds_fuzz.py", "--programs", "1", "--wave", "32", "--work", str(tmp), *extra]
+                    argv = ["lds_fuzz.py", "--programs", "1", "--wave", "32", "--work", str(tmp), "--batch-size", "1",
+                            *extra]
                     with patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": env_val}), \
                             patch.object(sys, "argv", argv), \
                             patch.object(f, "translate", side_effect=fake_translate), \

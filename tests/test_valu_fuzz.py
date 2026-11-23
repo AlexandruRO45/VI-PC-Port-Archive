@@ -485,7 +485,7 @@ def _run_main(monkeypatch, capsys, tmp_path, msg, extra):
     monkeypatch.setattr(vf, "translate", translate)
     monkeypatch.setattr(vf, "run_gpu", run_gpu)
     monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--programs", "2", "--work", str(tmp_path),
-                                      *extra])
+                                      "--batch-size", "1", *extra])
     status = vf.main()
     return status, capsys.readouterr().out
 
@@ -562,6 +562,6 @@ def test_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):
         monkeypatch.setattr(vf, "translate", fake_translate)
         monkeypatch.setattr(vf, "run_gpu", fake_run_gpu)
         monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--programs", "1",
-                                          "--wave", "32", "--work", str(tmp_path), *extra])
+                                          "--wave", "32", "--work", str(tmp_path), "--batch-size", "1", *extra])
         vf.main()
         assert seen_t == [want] and seen_g == [want], (extra, env_val)

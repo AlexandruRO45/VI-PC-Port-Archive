@@ -51,7 +51,8 @@ class FuzzerWorkIsolation(unittest.TestCase):
                 outputs = []
                 for _ in range(2):
                     output = io.StringIO()
-                    argv = [module.__name__ + ".py", "--programs", "1", "--wave", "32", "--work", str(root), *extra]
+                    argv = [module.__name__ + ".py", "--programs", "1", "--wave", "32", "--work", str(root),
+                            "--batch-size", "1", *extra]
                     with (patch.object(sys, "argv", argv),
                           patch.object(module.mc_command, "run", side_effect=assemble),
                           patch.object(module.subprocess, "run", side_effect=translate),

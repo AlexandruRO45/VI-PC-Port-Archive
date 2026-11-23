@@ -4,8 +4,8 @@ Three jobs of SHADER (below, assembled with the SDK's spirv-as) in one process: 
 mirror64 (exit 1) with its own dump size, and one with no settings, which must pass again (nothing leaks from the
 job before). Each job's exit code, stdout and stderr must equal a single run of the same program with the same
 settings, and its dump the single run's dump. Then a job that keeps the GPU busy for seconds runs under
---job-timeout 0.25: it must be reported as timed out (exit 124), the batch must stop there (exit 3, no record for the
-next job) and the process must end promptly. Exit 0 when all hold, 1 when one fails, 77 without a Vulkan device.
+--job-timeout 0.25: it must be reported as timed out (exit 124) and the batch must stop there (exit 3, no record
+for the next job). Exit 0 when all hold, 1 when one fails, 77 without a Vulkan device.
 
 Usage: check_vk_compute_batch.py VK_COMPUTE_TEST SPIRV_AS WORK_DIR [--runner CMD]
 """
@@ -128,7 +128,9 @@ def records(stdout):
     """[(index, exit, status, out, err)] and whether the batch reached its end line."""
     found, at, ended = [], 0, False
     while at < len(stdout):
-        nl = stdout.index(b"\n", at)
+        nl = stdout.find(b"\n", at)
+        if nl < 0:
+            break          # a process that died mid-line: the records before it count
         words = stdout[at:nl].decode("ascii", "replace").split()
         at = nl + 1
         if words[:1] == ["@vkc-job-end"]:
