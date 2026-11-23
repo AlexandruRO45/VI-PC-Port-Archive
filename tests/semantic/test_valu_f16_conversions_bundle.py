@@ -289,6 +289,17 @@ class TestVCvtF16I16SIMD(unittest.TestCase):
         # Max i16 is 32767 -> 0x77FF
         self.assertEqual(ref_v_cvt_f16_i16(32767), float_to_f16_bits(32767.0))
 
+class TestVCvtF16I16Translator(unittest.TestCase):
+    def test_translator_cvt_f16_i16_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0xffd6",  # -42
+            "v_cvt_f16_i16_e32 v2, v1",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_cvt_f16_i16")
+        for l in range(32):
+            self.assertEqual(results[l] & 0xFFFF, 0xD140)
+
 
 if __name__ == "__main__":
     unittest.main()
