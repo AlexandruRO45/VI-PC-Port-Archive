@@ -81,8 +81,13 @@ int main(int argc, char** argv) {
             auto run = [&](HMODULE module, const char* label) {
                 HANDLE thread = CreateThread(nullptr, 0, worker, module, 0, nullptr);
                 DWORD code = 0;
-                bool ok = thread && WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0 &&
-                          GetExitCodeThread(thread, &code) && code == 73;
+                const DWORD wait = thread ? WaitForSingleObject(thread, 10000) : WAIT_FAILED;
+                if (thread && wait != WAIT_OBJECT_0) {
+                    check(false, label);
+                    std::fflush(nullptr);
+                    ExitProcess(1);  // Do not destroy the loader while its worker may still run.
+                }
+                bool ok = thread && GetExitCodeThread(thread, &code) && code == 73;
                 check(ok, label);
                 if (thread) CloseHandle(thread);
             };
@@ -93,7 +98,9 @@ int main(int argc, char** argv) {
             check(host && second == host, "host fixture has two references");
             if (host && second) {
                 run(host, "host module worker exits with code 73");
-                FreeLibrary(second);
+                check(GetModuleHandleW(dll.filename().c_str()) == host,
+                      "host fixture remains loaded after the worker exits");
+                check(FreeLibrary(second) != FALSE, "final host FreeLibrary succeeds");
                 check(GetModuleHandleW(dll.filename().c_str()) == nullptr,
                       "worker released exactly one host module reference");
             }
