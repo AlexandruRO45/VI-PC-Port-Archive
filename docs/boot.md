@@ -145,3 +145,34 @@ are tested on synthetic fixtures and on `tiny_game` (which has no D3D12 calls). 
 Xbox device parameters (Q1) remain the first things the executable itself has to name. The D3D12 trace needs the
 Vulkan backend; a build without it runs the game's calls through the PC device and records nothing. The runbook
 does not make the game boot; it makes the first real trace readable.
+
+## 7. What the corpus already says
+
+The package's `shaders.rpf` holds 26,503 shader containers (SM 6.6 DXIL, each with an embedded FSSM program).
+Carve and disassemble them with `tools/shader_carve.py`, `tools/fssm_unpack.py` and `tools/shader_disasm.py`; the
+wave size is the FSSM header flag read by `fssm_header.wave_size()`. The 1.0.2.1 package splits as:
+
+| Stage | Shaders | wave64 | wave32 |
+|---|---:|---:|---:|
+| Pixel | 12,101 | 10,974 | 1,127 |
+| Mesh | 9,282 | 9,282 | 0 |
+| Compute | 2,689 | 1,154 | 1,535 |
+| Vertex | 2,236 | 2,236 | 0 |
+| Geometry | 195 | 195 | 0 |
+| **Total** | **26,503** | **23,841 (90.0%)** | **2,662** |
+
+`docs/design.md`'s Coverage row records a full-corpus translation of all 26,503; the table above adds the stage and
+wave split, measured on the package. What remains before a frame is runtime support, not translation:
+
+* **Mesh.** All 9,282 are wave64, 128x1x1 with 128/128 outputs. On `main` (`3faac557b`) the layer answers
+  `MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED` and has no `DispatchMesh` replay path, so any mesh
+  content needs the mesh-PSO work (D3D-29) first. A device without `VK_EXT_mesh_shader` additionally needs the
+  `--mesh-compute` fallback wired through the same layer.
+* **Wave64 graphics.** A wave64 VS/PS/GS on a 32-wide subgroup is exact when its observable results are
+  partition-invariant (tiers A and B of the *Wave64 graphics* row); tier C depends on cross-half values and is a
+  fidelity gap, not a refusal, under the default `--wave64-graphics warn`.
+* **Present.** Both `PresentX` and the DXGI swapchain paths exist and have GPU tests; which one the game uses is
+  question 6 above.
+
+The first trace's job is therefore to name the first unimplemented call, not to find out whether the shaders can
+be translated.
