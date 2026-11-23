@@ -15,6 +15,7 @@ only: ids, inheritance and method names in order. No text is copied.
   IXUserGamertagImpl); each interface lists its own chain, so each starts at slot 3.
 
 tools/gdk_runtime_calls.py reads the output. Standard library only.
+An `--out` that aliases a docs input or names a folder is refused; read/write failures are one `ERROR:` line with exit 2.
 """
 from __future__ import annotations
 
