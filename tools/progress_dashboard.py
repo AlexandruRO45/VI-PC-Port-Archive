@@ -277,7 +277,8 @@ def run_one_test(rel, timeout):
         return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s"}
 
 
-CODE_DIRS = ("tools", "scripts", "runtime/test/shaders")
+SHADER_TEST_DIR = "runtime/test/shaders"
+CODE_DIRS = ("tools", "scripts", SHADER_TEST_DIR)
 
 
 def file_digest(rel):
@@ -289,13 +290,15 @@ def file_digest(rel):
 
 
 def code_digest():
-    """Hash make_game.py and the Python files in CODE_DIRS by content, including uncommitted edits."""
+    """Hash the Python code and shader assembly fixtures used by unit tests, including uncommitted edits."""
     h = hashlib.sha256()
     rels = ["make_game.py"]
     for d in CODE_DIRS:
+        suffixes = (".py", ".asm") if d == SHADER_TEST_DIR else (".py",)
         for base, dirs, files in os.walk(os.path.join(ROOT, d), onerror=_walk_error):
             dirs[:] = sorted(x for x in dirs if x not in ("__pycache__", "bin", "obj", "target", "build") and not x.startswith("."))
-            rels += [os.path.relpath(os.path.join(base, f), ROOT).replace("\\", "/") for f in sorted(files) if f.endswith(".py")]
+            rels += [os.path.relpath(os.path.join(base, f), ROOT).replace("\\", "/")
+                     for f in sorted(files) if f.endswith(suffixes)]
     for rel in rels:
         h.update(rel.encode("utf-8") + b"\0" + (file_digest(rel) or "-").encode("ascii"))
     return h.hexdigest()[:16]
@@ -354,7 +357,8 @@ def collect_unit(col, out_dir, args):
     col.metric("tests.passed", "tests", "Unit-test files passing (last run)", passed, n, "files whose last run exited 0 / files run")
     col.metric("tests.current", "tests", "Unit-test files passing on the current code", current, n,
                "files that passed with no change since to themselves, make_game.py or Python files under "
-               + ", ".join(d + "/" for d in CODE_DIRS) + " / files run")
+               + ", ".join(d + "/" for d in CODE_DIRS)
+               + f", or assembly fixtures under {SHADER_TEST_DIR}/ / files run")
 
 
 def group_of_test(name):

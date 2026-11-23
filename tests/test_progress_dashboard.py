@@ -205,6 +205,20 @@ class Freshness(unittest.TestCase):
             helper.write_bytes(b"shift = 1\n")
             self.assertEqual(self.collect(cached)["test_progress_dashboard.py"], ("partial", "revalidation_required"))
 
+    def test_changed_assembly_fixture_needs_revalidation(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(pd, "ROOT", root):
+            for directory in ("tools", "scripts", "runtime/test/shaders", "tests"):
+                Path(root, directory).mkdir(parents=True)
+            test = "tests/test_progress_dashboard.py"
+            Path(root, test).touch()
+            fixture = Path(root, "runtime/test/shaders/sample.asm")
+            fixture.write_bytes(b"; original fixture\n")
+            cached = self.base(pd.file_digest(test), pd.code_digest())
+            self.assertEqual(self.collect(cached)["test_progress_dashboard.py"], ("verified", "current"))
+
+            fixture.write_bytes(b"; revised fixture\n")
+            self.assertEqual(self.collect(cached)["test_progress_dashboard.py"], ("partial", "revalidation_required"))
+
     def test_code_edited_during_the_run_is_never_current(self):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), None))
         self.assertEqual(got["test_progress_dashboard.py"], ("verified", "unknown"))
