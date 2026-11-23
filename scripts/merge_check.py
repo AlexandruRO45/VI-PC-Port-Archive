@@ -38,7 +38,10 @@ class GitError(Exception):
 
 
 def git(repo, *args, check=True):
-    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    # Decode without universal-newline translation: a bare CR inside a Git line is content.
+    r.stdout = r.stdout.decode("utf-8", "replace")
+    r.stderr = r.stderr.decode("utf-8", "replace")
     if check and r.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {r.stderr.strip() or r.returncode}")
     return r
@@ -101,7 +104,7 @@ def duplicates(repo, main, tree, min_length, block=3):
                 added.append(text)
     def windows(rev, path):
         r = git(repo, "show", f"{rev}:{path}", check=False)
-        lines = [l.strip() for l in r.stdout.splitlines() if l.strip()] if r.returncode == 0 else []
+        lines = [l.strip() for l in r.stdout.split("\n") if l.strip()] if r.returncode == 0 else []
         return r.returncode == 0, Counter(tuple(lines[i:i + block]) for i in range(len(lines) - block + 1))
 
     for path, groups in hunks.items():
