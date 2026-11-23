@@ -802,6 +802,113 @@ class Gen:
         self.emit(f"{su} = OpSelect %uint {step} {dec} {u}")
         return self.tof(su)
 
+    def _f32_step_toward_zero(self, r, step):
+        """r, or r one ulp toward zero when ``step``: the magnitude bits minus one (inf - 1 = FLT_MAX)."""
+        rb, nb, sb, out = (self.tmp() for _ in range(4))
+        self.emit(f"{rb} = OpBitcast %uint {r}")
+        self.emit(f"{nb} = OpISub %uint {rb} {self.cu(1)}")
+        self.emit(f"{sb} = OpSelect %uint {step} {nb} {rb}")
+        self.emit(f"{out} = OpBitcast %float {sb}")
+        return out
+
+    def _f32_finite(self, x):
+        i, n, o, f = (self.tmp() for _ in range(4))
+        self.emit(f"{i} = OpIsInf %bool {x}")
+        self.emit(f"{n} = OpIsNan %bool {x}")
+        self.emit(f"{o} = OpLogicalOr %bool {i} {n}")
+        self.emit(f"{f} = OpLogicalNot %bool {o}")
+        return f
+
+    def _f32_overflowed(self, r, x, y):
+        """r is +-inf while both operands are finite: toward zero, that result is +-FLT_MAX."""
+        ri, both, of = (self.tmp() for _ in range(3))
+        self.emit(f"{ri} = OpIsInf %bool {r}")
+        fx, fy = self._f32_finite(x), self._f32_finite(y)
+        self.emit(f"{both} = OpLogicalAnd %bool {fx} {fy}")
+        self.emit(f"{of} = OpLogicalAnd %bool {ri} {both}")
+        return of
+
+    def _f32_away(self, r, e):
+        """The nearest result r was rounded away from zero: the exact error e has the opposite sign."""
+        rp, rn, ep, en, a1, a2, away = (self.tmp() for _ in range(7))
+        self.emit(f"{rp} = OpFOrdGreaterThan %bool {r} %f0")
+        self.emit(f"{rn} = OpFOrdLessThan %bool {r} %f0")
+        self.emit(f"{ep} = OpFOrdGreaterThan %bool {e} %f0")
+        self.emit(f"{en} = OpFOrdLessThan %bool {e} %f0")
+        self.emit(f"{a1} = OpLogicalAnd %bool {rp} {en}")
+        self.emit(f"{a2} = OpLogicalAnd %bool {rn} {ep}")
+        self.emit(f"{away} = OpLogicalOr %bool {a1} {a2}")
+        return away
+
+    def f32_sub_rtz(self, x, y):
+        """x - y rounded toward zero, from nearest-even f32 operations (the module is NoContraction throughout):
+        TwoSum gives the exact error of r = x - y, and r steps one ulp toward zero when it was rounded away (or
+        overflowed). Exact for every input whose result is not an f32 subnormal (TwoSum relies on gradual
+        underflow, which a driver may flush). From PR #3567's head (35f19f43), where the slab distances of the box
+        test were measured to round toward zero on an RX 6900 XT."""
+        r, bb, t1, t2, t3, e = (self.tmp() for _ in range(6))
+        self.emit(f"{r} = OpFSub %float {x} {y}")
+        self.emit(f"{bb} = OpFSub %float {r} {x}")
+        self.emit(f"{t1} = OpFSub %float {r} {bb}")
+        self.emit(f"{t2} = OpFSub %float {x} {t1}")
+        self.emit(f"{t3} = OpFAdd %float {y} {bb}")
+        self.emit(f"{e} = OpFSub %float {t2} {t3}")
+        step = self.tmp()
+        self.emit(f"{step} = OpLogicalOr %bool {self._f32_away(r, e)} {self._f32_overflowed(r, x, y)}")
+        return self._f32_step_toward_zero(r, step)
+
+    def f32_mul_rtz(self, x, y):
+        """x * y rounded toward zero. The nearest product m steps one ulp toward zero when the product of the two
+        significands (exponents set to 0, so nothing overflows) was rounded up: its exact error comes from Dekker's
+        product (split by 4098 = 2 (2^11 + 1), partial products exact). Exact when both operands are normal and m
+        is normal, +-inf from finite operands (-> +-FLT_MAX), or special; a subnormal operand or an f32 subnormal
+        product keeps the nearest result. From PR #3567's head (35f19f43)."""
+        m = self.tmp()
+        self.emit(f"{m} = OpFMul %float {x} {y}")
+
+        def mant(v):
+            b, k, s_, f, ex, nz, nm, ok = (self.tmp() for _ in range(8))
+            self.emit(f"{b} = OpBitcast %uint {v}")
+            self.emit(f"{k} = OpBitwiseAnd %uint {b} {self.cu(0x007FFFFF)}")
+            self.emit(f"{s_} = OpBitwiseOr %uint {k} {self.cu(0x3F800000)}")
+            self.emit(f"{f} = OpBitcast %float {s_}")
+            self.emit(f"{ex} = OpBitFieldUExtract %uint {b} {self.cu(23)} {self.cu(8)}")
+            self.emit(f"{nz} = OpINotEqual %bool {ex} {self.cu(0)}")
+            self.emit(f"{nm} = OpINotEqual %bool {ex} {self.cu(0xFF)}")
+            self.emit(f"{ok} = OpLogicalAnd %bool {nz} {nm}")
+            return f, ok
+
+        def split(v):
+            c, d, hi_, lo_ = (self.tmp() for _ in range(4))
+            self.emit(f"{c} = OpFMul %float {self.tof(self.cu(0x45801000))} {v}")
+            self.emit(f"{d} = OpFSub %float {c} {v}")
+            self.emit(f"{hi_} = OpFSub %float {c} {d}")
+            self.emit(f"{lo_} = OpFSub %float {v} {hi_}")
+            return hi_, lo_
+
+        xm, xok = mant(x)
+        ym, yok = mant(y)
+        p = self.tmp()
+        self.emit(f"{p} = OpFMul %float {xm} {ym}")
+        (xh, xl), (yh, yl) = split(xm), split(ym)
+        hh, hl, lh, ll, e1, e2, e3, e = (self.tmp() for _ in range(8))
+        self.emit(f"{hh} = OpFMul %float {xh} {yh}")
+        self.emit(f"{hl} = OpFMul %float {xh} {yl}")
+        self.emit(f"{lh} = OpFMul %float {xl} {yh}")
+        self.emit(f"{ll} = OpFMul %float {xl} {yl}")
+        self.emit(f"{e1} = OpFSub %float {hh} {p}")
+        self.emit(f"{e2} = OpFAdd %float {e1} {hl}")
+        self.emit(f"{e3} = OpFAdd %float {e2} {lh}")
+        self.emit(f"{e} = OpFAdd %float {e3} {ll}")
+        over, normals, mfin, valid, step = (self.tmp() for _ in range(5))
+        self.emit(f"{over} = OpFOrdLessThan %bool {e} %f0")
+        self.emit(f"{normals} = OpLogicalAnd %bool {xok} {yok}")
+        mf = self._f32_finite(m)
+        self.emit(f"{mfin} = OpLogicalAnd %bool {normals} {mf}")
+        self.emit(f"{valid} = OpLogicalAnd %bool {mfin} {over}")
+        self.emit(f"{step} = OpLogicalOr %bool {valid} {self._f32_overflowed(m, x, y)}")
+        return self._f32_step_toward_zero(m, step)
+
     def sum_toward_zero2(self, x, y, r):
         """sum_toward_zero on each half of v2float operands; returns a v2float."""
         if not self.round_mode:
@@ -12280,8 +12387,11 @@ class Gen:
                     e(f"{x} = OpCompositeExtract %float {v2} {c}")
                     m16.append(x)
             mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
-            b0 = [fop("OpFMul", fop("OpFSub", mm[c], org[c]), inv[c]) for c in range(3)]
-            b1 = [fop("OpFMul", fop("OpFSub", mm[3 + c], org[c]), inv[c]) for c in range(3)]
+            # Slab distance (plane - origin) * inverse direction, the subtract and the multiply each rounded toward
+            # zero: measured on RDNA2 (an RX 6900 XT in PR #3567's head; an RX 6800 in docs/design.md's Ray tracing
+            # row, 38 rows whose inputs round, BOX32 and BOX16, where round-to-nearest fits 1 of 24 BOX32 rows).
+            b0 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[c], org[c]), inv[c]) for c in range(3)]
+            b1 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[3 + c], org[c]), inv[c]) for c in range(3)]
             near, far, nnan, fnan = [], [], [], []
             for c in range(3):
                 pos = bop("OpFOrdGreaterThanEqual", inv[c], "%f0")
