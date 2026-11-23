@@ -1,0 +1,12 @@
+GPU:        Intel(R) Arc(TM) A770 Graphics (Alchemist / ACM-G10, Xe-HPG), subgroup 8..32
+Driver:     Intel Graphics Driver 32.0.101.9150 (2026-10-08)
+Subgroup:   8..32 (minSubgroupSize 8, maxSubgroupSize 32)
+OS:         Microsoft Windows 11 Pro (Build 26200)
+Commit:     dde82f27e (main, 2026-11-24; runtime-windows artifact from 4eb6155d3)
+Tools:      Python 3.13.14, prebuilt runtime-windows artifact, pre-disassembled fixtures (--disasm-dir tests/semantic/fixtures/disasm --assembler python, no spirv-val)
+run_gpu_tests.py: 78/96 passed, 18 skipped, 0 failed
+Failed:     None
+Skipped:    18 skips (15 wave64 compute shaders: no 64-wide compute subgroup on this device; ps_bary: no VK_KHR_fragment_shader_barycentric; ps_f64_mods: no shaderFloat64; ps_vcmpx_forms: fragment subgroup may run narrower than 32 on 8..32 device)
+Notes:
+- Ran prebuilt CI runtime-windows artifact (commit 4eb6155d3) against main at dde82f27e using --disasm-dir tests/semantic/fixtures/disasm --assembler python.
+- All 33 active compute tests (cs_*) and 45 active pixel tests (ps_*) passed with 0 failures (4096/4096 pixels exact on all executed pixel shaders).
