@@ -89,6 +89,29 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertIn("4 tests, 0 ", out)
 
+    def test_empty_targets_do_not_fail_a_nonempty_suite(self):
+        for empty in ("pkg/__init__.py", "test_empty.py"):
+            with self.subTest(empty=empty), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, empty: ""})
+                code, out = run(tmp, "-j", "2")
+                self.assertEqual(code, 0, out)
+                self.assertIn("2 tests, 0 ", out)
+
+    def test_suite_with_only_empty_targets_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"pkg/__init__.py": "", "test_empty.py": ""})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 1, out)
+            self.assertIn("no tests discovered", out)
+
+    def test_package_with_only_explicit_skips_succeeds(self):
+        module_skip = "\ndef setUpModule():\n    raise unittest.SkipTest('optional runtime unavailable')\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"pkg/__init__.py": FAIL + module_skip})
+            code, out = run(tmp, "-j", "2", "-v")
+            self.assertEqual(code, 0, out)
+            self.assertIn("OK (skipped=1)", out)
+
     def test_one_job_runs_discover_and_keeps_its_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "test_f.py": FAIL})

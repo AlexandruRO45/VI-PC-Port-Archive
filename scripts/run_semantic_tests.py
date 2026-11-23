@@ -28,14 +28,18 @@ def test_modules(directory):
 
 
 def run_module(directory, module, verbose):
-    """Run one test file or discover a package, returning (exit code, tests run, output)."""
+    """Return (exit code, tests run, output). A code of None marks empty discovery."""
     path = os.path.join(directory, module)
     selection = ["discover", "-s", path, "-t", directory] if os.path.isdir(path) else [module.removesuffix(".py")]
     cmd = [sys.executable, "-m", "unittest", *selection, *(["-v"] if verbose else [])]
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
+    code = p.returncode
+    # Older unittest versions report empty discovery as OK. Explicit skips have a different summary.
+    if code in (0, 5) and re.search(r"^Ran 0 tests in [^\n]*\n\n(?:NO TESTS RAN|OK)$", p.stdout, re.M):
+        code = None
+    return code, int(ran.group(1)) if ran else 0, p.stdout
 
 
 def main(argv=None):
@@ -56,11 +60,14 @@ def main(argv=None):
     # Start packages before standalone files because a package can contain several test files.
     modules.sort(key=lambda m: (m.endswith(".py"), -os.path.getsize(os.path.join(directory, m))))
     start, total, failed = time.monotonic(), 0, []
+    empty = 0
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
         jobs = {pool.submit(run_module, directory, m, a.verbose): m.removesuffix(".py") for m in modules}
         for job in concurrent.futures.as_completed(jobs):
             code, ran, out = job.result()
             total += ran
+            if code is None:
+                empty += 1
             if code:
                 failed.append(jobs[job])
                 print(f"==== FAILED: {jobs[job]}\n{out}", flush=True)
@@ -70,6 +77,9 @@ def main(argv=None):
     kind = "test targets" if any(not m.endswith(".py") for m in modules) else "files"
     summary = f"{len(modules)} {kind}, {total} tests, {len(failed)} {kind} failed in {took:.0f} s with {a.jobs} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
+    if empty == len(modules):
+        print(f"no tests discovered in {directory}")
+        return 1
     return 1 if failed else 0
 
 
