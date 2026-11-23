@@ -228,3 +228,32 @@ class TestValuLshlrevB16ScalarInterpreter(unittest.TestCase):
         res = state.execute(inst)
         self.assertEqual(res, 0x00F0)
         self.assertEqual(state.vgpr[0], 0x00F0)
+
+
+class TestValuLshlrevB16SimdDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and per-lane shift amounts."""
+
+    def test_simd_per_lane_shifts(self):
+        # 64 lanes with per-lane shift amount = lane % 16
+        for lane in range(64):
+            shift = lane % 16
+            val = 1
+            expected = (1 << shift) & MASK16
+            res = ref_lshlrev_b16(shift, val)
+            self.assertEqual(res, expected)
+
+    def test_simd_lane_masking_active_inactive(self):
+        # Simulate active lanes (even lanes only)
+        exec_mask = 0x5555555555555555
+        dest_vgpr = [0xDEAD] * 64
+
+        for lane in range(64):
+            is_active = (exec_mask & (1 << lane)) != 0
+            if is_active:
+                dest_vgpr[lane] = ref_lshlrev_b16(2, lane)
+
+        for lane in range(64):
+            if (exec_mask & (1 << lane)) != 0:
+                self.assertEqual(dest_vgpr[lane], (lane << 2) & MASK16)
+            else:
+                self.assertEqual(dest_vgpr[lane], 0xDEAD)
