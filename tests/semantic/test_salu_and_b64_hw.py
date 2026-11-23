@@ -253,5 +253,148 @@ class SaluAndB64AstTests(unittest.TestCase):
         self.assertEqual(out[2], ref_scc_b64(expected))
 
 
+class ScalarMachineState:
+    """Models RDNA2 scalar execution state: 106 SGPRs, EXEC, VCC, SCC, and NULL."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs = [0] * num_sgprs
+        self.exec: int = MASK64
+        self.vcc: int = 0
+        self.scc: int = 0
+
+    def read_sgpr64(self, idx: int) -> int:
+        if idx < 0 or idx + 1 >= len(self.sgprs):
+            raise IndexError(f"SGPR index out of bounds: {idx}")
+        lo = self.sgprs[idx] & MASK32
+        hi = self.sgprs[idx + 1] & MASK32
+        return (hi << 32) | lo
+
+    def write_sgpr64(self, idx: int, val: int) -> None:
+        if idx < 0 or idx + 1 >= len(self.sgprs):
+            raise IndexError(f"SGPR index out of bounds: {idx}")
+        self.sgprs[idx] = val & MASK32
+        self.sgprs[idx + 1] = (val >> 32) & MASK32
+
+    def resolve_src64(self, src: int | str) -> int:
+        if isinstance(src, int):
+            return src & MASK64
+        src = src.strip()
+        if src.lower() == "exec":
+            return self.exec & MASK64
+        if src.lower() == "vcc":
+            return self.vcc & MASK64
+        if src.lower() == "null":
+            return 0
+        if src.startswith("s[") and ":" in src and src.endswith("]"):
+            base = int(src[2:-1].split(":")[0])
+            return self.read_sgpr64(base)
+        if src.startswith("0x") or src.startswith("-0x") or src.isdigit() or (src.startswith("-") and src[1:].isdigit()):
+            return int(src, 0) & MASK64
+        raise ValueError(f"Unknown 64-bit source operand: {src}")
+
+    def write_dst64(self, dst: str, val: int) -> None:
+        val = val & MASK64
+        dst = dst.strip()
+        if dst.lower() == "exec":
+            self.exec = val
+        elif dst.lower() == "vcc":
+            self.vcc = val
+        elif dst.lower() == "null":
+            pass
+        elif dst.startswith("s[") and ":" in dst and dst.endswith("]"):
+            base = int(dst[2:-1].split(":")[0])
+            self.write_sgpr64(base, val)
+        else:
+            raise ValueError(f"Unknown 64-bit destination operand: {dst}")
+
+    def execute_and_b64(self, dst: str, src0: int | str, src1: int | str) -> int:
+        s0 = self.resolve_src64(src0)
+        s1 = self.resolve_src64(src1)
+        res = ref_s_and_b64(s0, s1)
+        self.write_dst64(dst, res)
+        self.scc = ref_scc_b64(res)
+        return res
+
+    def step(self, line: str) -> None:
+        clean = line.split(";")[0].strip()
+        if not clean:
+            return
+        parts = clean.split(None, 1)
+        opcode = parts[0].lower()
+        if len(parts) < 2:
+            raise ValueError(f"Missing operands for {opcode}")
+        args = [arg.strip() for arg in parts[1].split(",")]
+        if opcode == "s_and_b64":
+            if len(args) != 3:
+                raise ValueError(f"s_and_b64 requires 3 operands, got {len(args)}")
+            self.execute_and_b64(args[0], args[1], args[2])
+        elif opcode == "s_mov_b32":
+            if len(args) != 2:
+                raise ValueError("s_mov_b32 requires 2 operands")
+            dst_idx = int(args[0][1:])
+            self.sgprs[dst_idx] = int(args[1], 0) & MASK32
+        else:
+            raise ValueError(f"Unsupported opcode: {opcode}")
+
+
+class SaluAndB64InterpreterTests(unittest.TestCase):
+    """Deterministic scalar instruction interpreter tests for s_and_b64."""
+
+    def test_scalar_register_pairs(self):
+        state = ScalarMachineState()
+        val = 0x12345678_9ABCDEF0
+        state.write_sgpr64(10, val)
+        self.assertEqual(state.read_sgpr64(10), val)
+        self.assertEqual(state.sgprs[10], 0x9ABCDEF0)
+        self.assertEqual(state.sgprs[11], 0x12345678)
+
+    def test_interpreter_step_execution(self):
+        state = ScalarMachineState()
+        state.step("s_mov_b32 s0, 0x55555555")
+        state.step("s_mov_b32 s1, 0x55555555")
+        state.step("s_mov_b32 s2, 0x33333333")
+        state.step("s_mov_b32 s3, 0x33333333")
+        state.step("s_and_b64 s[4:5], s[0:1], s[2:3]")
+        self.assertEqual(state.read_sgpr64(4), 0x11111111_11111111)
+        self.assertEqual(state.scc, 1)
+
+    def test_special_registers_and_null(self):
+        state = ScalarMachineState()
+        state.exec = 0xAAAAAAAAAAAAAAAA
+        state.vcc = 0x5555555555555555
+        state.execute_and_b64("null", "exec", "vcc")
+        self.assertEqual(state.scc, 0)
+        self.assertEqual(state.exec, 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(state.vcc, 0x5555555555555555)
+
+    def test_interpreter_hardware_conformance(self):
+        state = ScalarMachineState()
+        v0 = 0xABCD0123_456789EF
+        v1 = 0x00FF00FF_00FF00FF
+        state.write_sgpr64(0, v0)
+        state.write_sgpr64(2, v1)
+        res_interp = state.execute_and_b64("s[4:5]", "s[0:1]", "s[2:3]")
+
+        lines = [
+            f"s_mov_b32 s0, {lo32(v0):#x}",
+            f"s_mov_b32 s1, {hi32(v0):#x}",
+            f"s_mov_b32 s2, {lo32(v1):#x}",
+            f"s_mov_b32 s3, {hi32(v1):#x}",
+            "s_and_b64 s[4:5], s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_and_b64_interp", lines)
+        out = mrt0_words(spv)
+        res_hw = join64(out[0], out[1])
+        self.assertEqual(res_interp, res_hw)
+        self.assertEqual(state.scc, out[2])
+
+
 if __name__ == "__main__":
     unittest.main()
