@@ -41,6 +41,7 @@ import tempfile
 
 SIG = re.compile(rb"KB2[a-z]")
 HDR = 0x2C
+RPF9_TAGS = (b"9FPR", b"RPF9")
 MAX_FRAMES = 1_000_000
 MAX_WIDTH = 7680
 MAX_HEIGHT = 4800
@@ -144,6 +145,10 @@ def _gap(data, start, end):
     return end - start, 0
 
 
+def _is_rpf_magic(tag):
+    return tag in RPF9_TAGS or tag[1:4] == b"FPR"
+
+
 def scan_file(path, source):
     """Index every Bink 2 stream in one file. Returns (rows, stats)."""
     rows = []
@@ -154,13 +159,14 @@ def scan_file(path, source):
     with open(path, "rb") as fh:
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
             start = trailer_size = 0
-            if size >= 16 and bytes(data[1:4]) == b"FPR":
+            magic = data[:4]
+            if size >= 16 and _is_rpf_magic(magic):
                 hint, trailer_size = struct.unpack_from("<I4xI", data, 4)
                 if HDR <= hint < size:
                     start = hint
                 # +12 as the trailer size is measured on RPF9 only, where it is always a multiple of 16
                 # (docs/rpf.md, "The trailer at EOF"); any other value leaves the tail to the zero/unread split.
-                if bytes(data[0:1]) != b"9" or trailer_size % 16:
+                if magic not in RPF9_TAGS or trailer_size % 16:
                     trailer_size = 0
             pos = start
             last = start
@@ -314,13 +320,13 @@ def write_json(path, target, rows, summary, probe):
 
 
 def is_rpf_archive(path):
-    """True when *path* starts with an RPF header (``?FPR``)."""
+    """True when *path* starts with a supported RPF header."""
     try:
         with open(path, "rb") as fh:
             header = fh.read(16)
     except OSError:
         return False
-    return len(header) >= 16 and header[1:4] == b"FPR"
+    return len(header) >= 16 and _is_rpf_magic(header[:4])
 
 
 def same_output_path(first, second):
@@ -343,7 +349,7 @@ def target_problem(path):
         head = fh.read(4)
     if not head:
         return "empty file"
-    if head[1:4] != b"FPR" and not SIG.match(head):
+    if not _is_rpf_magic(head) and not SIG.match(head):
         return "not a Bink 2 stream (KB2) or an RPF archive"
     return None
 

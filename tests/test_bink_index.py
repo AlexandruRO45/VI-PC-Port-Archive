@@ -154,6 +154,18 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (100, 48, 0))
 
+    def test_cli_accepts_forward_rpf9_magic(self):
+        path = self.rpf(48, bytes(range(1, 49)), magic=b"RPF9")
+        self.assertTrue(bink.is_rpf_archive(path))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()) as err:
+            code = bink.main([path, "--format", "json"])
+        self.assertEqual(code, 0, err.getvalue())
+        report = json.loads(out.getvalue())
+        self.assertEqual(len(report["streams"]), 1)
+        summary = report["summary"]
+        self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (100, 48, 0))
+
     def test_rpf_trailer_longer_than_the_gap_is_not_split_off(self):
         rows, summary = bink.scan_target(self.rpf(4096, bytes(range(1, 49))))
         self.assertEqual(len(rows), 1)
