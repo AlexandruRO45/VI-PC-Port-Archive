@@ -49,24 +49,24 @@ def run_with_timeout(call, seconds=10):
 
 
 class EmptyGroupTest(unittest.TestCase):
-    def test_empty_group_is_not_a_mesh_page(self):
-        self.assertFalse(mp.is_mesh_page(EMPTY_GROUP))
-
-    def test_parse_group_rejects_an_empty_group(self):
-        with self.assertRaises(mp.PageError) as caught:
-            mp.parse_group(EMPTY_GROUP, 0)
-        self.assertIn("no meshlets", str(caught.exception))
+    def test_an_empty_group_is_a_record_with_no_counts(self):
+        """It validates: the counts are what the group declares, and it ends 12 bytes in."""
+        record, end = mp.parse_group(EMPTY_GROUP, 0)
+        self.assertEqual((record["meshlets"], record["triangles"], record["vertex_refs"]), (0, 0, 0))
+        self.assertEqual(end, 12)
 
     def test_a_header_without_meshlets_keeps_its_sums_message(self):
-        """Counts that no meshlet accounts for are still the running-sum error, not the new one."""
+        """Counts that no meshlet accounts for are still the running-sum error, not a walk error."""
         page = struct.pack("<3I", 0x80000000, 1, 3) + bytes(10)   # 0 meshlets but 1 triangle, 3 refs
         with self.assertRaises(mp.PageError) as caught:
             mp.parse_group(page, 0)
         self.assertIn("meshlet sums", str(caught.exception))
 
-    def test_parse_page_returns_an_error(self):
-        with self.assertRaises(mp.PageError):
+    def test_parse_page_refuses_the_chunk_it_already_read(self):
+        """The empty group ends 12 bytes in, so the alignment lands on its own start: one error, not a spin."""
+        with self.assertRaises(mp.PageError) as caught:
             run_with_timeout(lambda: mp.parse_page(EMPTY_GROUP))
+        self.assertIn("does not advance", str(caught.exception))
 
     def test_cli_reports_the_page_and_exits_1(self):
         with tempfile.TemporaryDirectory() as scratch:

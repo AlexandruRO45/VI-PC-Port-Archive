@@ -509,10 +509,6 @@ def parse_group(data, at):
         tbase += tcount
     if vbase != refs or tbase != triangles:
         raise PageError(f"group at +0x{at:x}: meshlet sums do not match the header")
-    if not meshlets:
-        # An empty group ends 12 bytes in and parse_page's 16-byte alignment rounds that back to the group's own
-        # start, so the walker parses the same bytes forever (#5600). It carries no chunk either way.
-        raise PageError(f"group at +0x{at:x}: no meshlets")
     vref = struct.unpack_from(f"<{refs}H", data, ref_at) if refs else ()
     span = (max(vref) + 1) if vref else 0
     record = {"kind": "group", "offset": at, "meshlets": meshlets, "triangles": triangles,
@@ -551,11 +547,16 @@ def _other_data(data, pos, chunks):
 
 
 def parse_page(data):
-    """Walk a whole page. Returns a list of chunk records; raises PageError on anything unexpected."""
+    """Walk a whole page. Returns a list of chunk records; raises PageError on anything unexpected.
+
+    A chunk can end fewer than 16 bytes past its start -- an empty group ends 12 bytes in -- and the alignment
+    below then rounds back to that start; the walk refuses that second visit instead of reading the same bytes
+    forever (#5600). An empty group between padded chunks still parses as a 0-meshlet record."""
     if len(data) < 4 or not is_mesh_page(data):
         raise PageError("page starts with neither a vertex block nor a meshlet group")
     chunks = []
     pos = 0
+    started = -1                        # the chunk parsed last: a walk that returns to it would never end (#5600)
     while True:
         while pos < len(data) and data[pos] == 0:
             pos += 1
@@ -566,6 +567,9 @@ def parse_page(data):
             pos += 4
         if pos % 16:
             raise PageError(f"chunk at +0x{pos:x} is not 16-byte aligned")
+        if pos <= started:
+            raise PageError(f"chunk at +0x{pos:x} does not advance past the chunk at +0x{started:x}")
+        started = pos
         word = _u32(data, pos)
         if word == BLOCK_MAGIC:
             record, pos = parse_block(data, pos)
