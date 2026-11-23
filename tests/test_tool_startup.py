@@ -72,12 +72,12 @@ class ToolStartupTests(unittest.TestCase):
             tools = Path(directory)
             package = tools / "sample_package"
             package.mkdir()
-            (package / "__init__.py").write_text("TOKEN = 1\n", encoding="utf-8")
-            (tools / "sample_module.py").write_text("TOKEN = 1\n", encoding="utf-8")
+            (package / "__init__.py").write_text("TOKEN = 1\n", encoding="utf-8", newline="\n")
+            (tools / "sample_module.py").write_text("TOKEN = 1\n", encoding="utf-8", newline="\n")
             for dependency in ("sample_module", "sample_package"):
                 (tools / f"use_{dependency}.py").write_text(
                     f"from {dependency} import TOKEN\nimport argparse\nargparse.ArgumentParser().parse_args()\n",
-                    encoding="utf-8",
+                    encoding="utf-8", newline="\n",
                 )
             found = {Path(path).name for path in sibling_importers(directory)}
 
