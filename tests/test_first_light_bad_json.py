@@ -80,6 +80,10 @@ class CliBadJsonTests(unittest.TestCase):
         path = self.bad_index('[{"name": "x", ')
         self.assert_one_clean_line(self.list_cli(), path)
 
+    def test_list_reports_a_deeply_nested_index(self):
+        path = self.bad_index("[" * 50_000 + "]" * 50_000)
+        self.assert_one_clean_line(self.list_cli(), path)
+
     def test_list_reports_a_non_utf8_index(self):
         path = self.bad_index(b'[{"name": \xff}]')
         self.assert_one_clean_line(self.list_cli(), path)
