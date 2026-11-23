@@ -72,9 +72,9 @@ class F64OutputModifiersTest(unittest.TestCase):
         for index, register in ((0, "%c4"), (1, "%c5")):
             word = result(rf"OpCompositeExtract %uint {pair} {index}")
             dest = result(rf"OpAccessChain %_ptr_Function_uint %vgpr {register}")
-            old_word = result(rf"OpLoad %uint {dest}")
-            masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+            # No instruction here writes EXEC, so every lane is active: each word of the result is stored as
+            # computed (rdna2spirv's exec_static_true path, #4473) instead of through a masked OpSelect.
+            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {word}$")
         # Every f64 add and scale keeps its own rounding (no_contraction decorates all float arithmetic).
         for op in re.findall(r"(?m)^ *(%\w+) = Op(?:FAdd|FMul) %double ", spv):
             self.assertRegex(spv, rf"(?m)^ *OpDecorate {op} NoContraction$")
