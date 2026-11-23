@@ -105,6 +105,18 @@ jobs:
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         run: python -I tests/test_rpf9dump_exit_codes.py
+      # The standard-library loop above also runs these tests, before the optional library is built (Python only).
+      - name: Build the native XDXR BVH traversal and check Python parity
+        shell: bash
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          export CARGO_HOME="$(mktemp -d)"
+          cargo build --release --locked --offline --manifest-path tools/xdxr_bvh_native/Cargo.toml
+          cargo test --release --locked --offline --manifest-path tools/xdxr_bvh_native/Cargo.toml
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import xdxr_bvh; assert xdxr_bvh._native() is not None"
+          python -I tests/test_xdxr_bvh_native.py
+          python -I tests/test_xdxr_bvh.py
       - name: Build the calibrated BCPack reader and test the texture pipeline
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll

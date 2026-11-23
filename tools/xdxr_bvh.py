@@ -436,6 +436,30 @@ def build_tlas(instances, box16=False):
 
 
 # ---- memory and one traversal step ----
+def _native():
+    """The optional Rust traversal (tools/xdxr_bvh_native, built with cargo), or None: it is not built, ctypes is
+    unavailable, or LEONIDA_XDXR_BVH_NATIVE=0. It returns the same results as the Python code below, which runs
+    whenever it declines an input."""
+    global _NATIVE
+    if _NATIVE is False:
+        import importlib.util
+        import os
+        _NATIVE = None
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xdxr_bvh_native", "__init__.py")
+        try:
+            spec = importlib.util.spec_from_file_location("xdxr_bvh_native", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if module._load() is not None:
+                _NATIVE = module
+        except (ImportError, OSError, AttributeError):
+            pass
+    return _NATIVE
+
+
+_NATIVE = False
+
+
 class Memory:
     """A sparse GPU address space: buffers placed at virtual addresses."""
 
@@ -596,6 +620,11 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0, stats=None):
     primitive, bary and front, or None. ``bias`` is added to the BLAS addresses instance records hold (application
     address to the address in ``mem``). With ``stats`` (a dict), its "steps" counts the traversal steps: one per node
     or triangle tested, the work of one image_bvh_intersect_ray."""
+    native = _native()
+    if native is not None:
+        done, hit = native.try_trace(mem, bvh_va, org, d, tmax, mask, bias, stats, Memory)
+        if done:
+            return hit
     flags = mem.u32(bvh_va)[0]
     if flags & FLAG_BOTTOM_LEVEL:
         return _trace_blas(mem, bvh_va, org, d, tmax, None, None, stats)
@@ -633,6 +662,12 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0, stats=None):
 def brute_force(scene, org, d, tmax=INF, mask=0xFF):
     """Closest hit over every triangle of every instance, with the same triangle test: what a BVH must reproduce.
     ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance."""
+    native = _native()
+    if native is not None:
+        done, best = native.try_brute_force(scene, org, d, tmax, mask, invert_affine, _transform_point,
+                                            _transform_dir)
+        if done:
+            return best
     best = None
     for idx, (m, imask, tris) in enumerate(scene):
         if m is not None and not imask & mask:
