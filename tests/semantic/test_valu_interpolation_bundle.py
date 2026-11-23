@@ -753,5 +753,67 @@ class TestInterpP2F16Oracle(unittest.TestCase):
         self.assertEqual(res, f16_to_bits(1.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p2_f16 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VInterpP2F16Instruction:
+    dst: RegisterOperand
+    src0: RegisterOperand
+    attr: AttrOperand
+    accum: RegisterOperand
+    clamp: bool = False
+    high: bool = False
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+class ScalarMachineInterpP2F16:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.attrs_lo: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * 32
+        self.attrs_hi: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * 32
+
+    def step(self, insn: VInterpP2F16Instruction):
+        j_coord = bits_to_f32(self.vgprs[insn.src0.index])
+        accum = bits_to_f32(self.vgprs[insn.accum.index])
+        p0, p1, p2 = self.attrs_hi[insn.attr.index] if insn.high else self.attrs_lo[insn.attr.index]
+        res16 = ref_interp_p2_f16(j_coord, p0, p2, accum, clamp=insn.clamp)
+        # Writes to low 16 bits, preserving high 16 bits
+        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res16
+
+
+class TestInterpP2F16ASTAndScalar(unittest.TestCase):
+    def test_ast(self):
+        insn = VInterpP2F16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            attr=AttrOperand(0, "x"),
+            accum=RegisterOperand(OperandType.VGPR, 2),
+            clamp=True,
+            high=True,
+        )
+        self.assertTrue(insn.high)
+        self.assertTrue(insn.clamp)
+
+    def test_scalar_execution(self):
+        machine = ScalarMachineInterpP2F16()
+        machine.vgprs[1] = f32_to_bits(0.5)
+        machine.vgprs[2] = f32_to_bits(1.0)
+        machine.vgprs[4] = 0xDEAD_0000
+        machine.attrs_lo[0] = (0.0, 2.0, 4.0)  # P0=0, P2=4 -> 0.5*4 = 2 -> 1+2=3.0
+        insn = VInterpP2F16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 4),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            attr=AttrOperand(0, "x"),
+            accum=RegisterOperand(OperandType.VGPR, 2),
+        )
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[4], 0xDEAD_0000 | f16_to_bits(3.0))
+
+
 if __name__ == '__main__':
     unittest.main()
