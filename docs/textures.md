@@ -940,10 +940,10 @@ default BC1/BC3/BC4/BC5 rank/history tables (extendable or replaceable via `--hi
 
 | Format | History source | Strict vs. provisional status | Notes |
 |---|---|---|---|
-| BC1 | `tools/bcpack_tables.py` (+ optional `--history`) | 248 confirmed / 7 provisional | Entry 0 unreferenced; provisional entries (6, 9, 67, 68, 71, 74, 122) uncertain by ≤1 green step |
+| BC1 | `tools/bcpack_tables.py` (+ optional `--history`) | 252 confirmed / 3 provisional | Entry 0 unreferenced; all 255 reachable slots populated; entries 6, 71 and 122 lack exact confirmation |
 | BC3 | `tools/bcpack_tables.py` (+ optional `--history`) | 0 confirmed / 35 provisional | All 256 colour-quadrant and 64 alpha-pair rank entries populated |
-| BC4 | `tools/bcpack_tables.py` (+ optional `--history`) | 0 confirmed / 55 provisional | 64 pair entries populated; UI pool chunks reference additional unfitted entries unless supplied via `--history` |
-| BC5 | `tools/bcpack_tables.py` (+ optional `--history`) | 3 confirmed / 211 provisional | 64 pair entries populated |
+| BC4 | `tools/bcpack_tables.py` (+ optional `--history`) | 2 confirmed / 170 provisional | 64 pair entries populated; 84 history slots still unfitted, so UI pool chunks can need `--history` |
+| BC5 | `tools/bcpack_tables.py` (+ optional `--history`) | 5 confirmed / 209 provisional | 64 pair entries populated; 42 history slots still unfitted |
 | BC6H | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; external JSON supplies class 1/2/3 entries |
 | BC7 | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; 286 signature ranks (10 inferred-only refused in strict mode); partial-depth endpoints (`>= 4` bits) mid-range filled in provisional mode |
 
