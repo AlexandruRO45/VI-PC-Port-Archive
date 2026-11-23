@@ -317,7 +317,7 @@ class CompareCommand(unittest.TestCase):
     def write_sample_and_results(self, out, *folders):
         sample = [{"name": "synthetic", "stratum": [False, "none", "structured"]}]
         (out / "sample.json").write_text(json.dumps(sample), encoding="utf-8", newline="\n")
-        receipt = {"i": 0, "code": 0, "reason": "", "targets": 1}
+        receipt = {"i": 0, "code": 0, "reason": "", "targets": 1, "samples_passed": 1}
         for folder in folders:
             run = out / folder
             run.mkdir()
@@ -340,6 +340,39 @@ class CompareCommand(unittest.TestCase):
                                 with self.assertRaisesRegex(SystemExit, "same result directory"):
                                     ps_sweep.main(args)
                             self.assertFalse((out / report).exists())
+
+    def test_classification_rejects_overlapping_report_fields(self):
+        cases = [
+            ("amd", "class", "class"),
+            ("samples_passed", "amd", "samples_passed"),
+            ("amd", "amd_reason", "amd_reason"),
+            ("amd_reason", "amd", "amd_reason"),
+        ]
+        for left, right, field in cases:
+            with self.subTest(left=left, right=right), tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                self.write_sample_and_results(out, f"{left}_z", f"{right}_z")
+                report = out / "classes_z.json"
+                report.write_text("[]", encoding="utf-8", newline="\n")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(SystemExit, f"report field {field!r}"):
+                        ps_sweep.main(["compare", "--out", tmp, "--tags", left, right])
+                self.assertEqual(report.read_text(encoding="utf-8"), "[]")
+
+    def test_report_fields_are_preserved_for_valid_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self.write_sample_and_results(out, "amd_z", "intel_z", "class_z")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ps_sweep.main(["compare", "--out", tmp, "--tags", "amd", "intel"])
+                ps_sweep.main(["compare", "--out", tmp, "--tags", "amd", "class", "--exact"])
+            self.assertEqual(json.loads((out / "classes_z.json").read_text(encoding="utf-8")), [{
+                "i": 0, "class": "OK on both", "sub": "", "stratum": [False, "none", "structured"],
+                "samples_passed": [1, 1], "amd": 0, "intel": 0, "amd_reason": "", "intel_reason": "",
+            }])
+            exact = json.loads((out / "exact_z.json").read_text(encoding="utf-8"))
+            self.assertEqual(exact["tags"], ["amd", "class"])
+            self.assertEqual(exact["rows"][0]["class"], "non-clear exact")
 
     def test_incomplete_depth_measurements(self):
         with tempfile.TemporaryDirectory() as tmp:

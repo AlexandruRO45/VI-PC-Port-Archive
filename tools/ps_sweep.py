@@ -497,6 +497,11 @@ def cmd_compare(a):
     ra, rb = load_results(left_folders), load_results(right_folders)
     if a.exact:
         return compare_exact(a, sample, ra, rb)
+    left_reason, right_reason = f"{ta}_reason", f"{tb}_reason"
+    conflicts = {ta, tb} & {left_reason, right_reason}
+    if conflicts:
+        raise SystemExit(f"compare tags would overwrite report field {min(conflicts)!r}")
+    tag_fields = {ta, tb, left_reason, right_reason}
     counts, sub, rows = {}, {}, []
     for i, s in enumerate(sample):
         if i not in ra or i not in rb:
@@ -507,9 +512,13 @@ def cmd_compare(a):
             c, sc = "depth " + depth["depth_class"], ""
         counts[c] = counts.get(c, 0) + 1
         sub[(c, sc)] = sub.get((c, sc), 0) + 1
-        rows.append({"i": i, "class": c, "sub": sc, "stratum": s["stratum"], **depth, **draw_measurements(ra[i], rb[i]),
-                     ta: ra[i]["code"], tb: rb[i]["code"],
-                     ta + "_reason": ra[i]["reason"], tb + "_reason": rb[i]["reason"]})
+        row = {"i": i, "class": c, "sub": sc, "stratum": s["stratum"], **depth, **draw_measurements(ra[i], rb[i])}
+        conflicts = tag_fields & row.keys()
+        if conflicts:
+            raise SystemExit(f"compare tags would overwrite report field {min(conflicts)!r}")
+        row.update({ta: ra[i]["code"], tb: rb[i]["code"],
+                    left_reason: ra[i]["reason"], right_reason: rb[i]["reason"]})
+        rows.append(row)
     with open(os.path.join(a.out, f"classes_{a.variant}.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(rows, f)
     print("variant", a.variant, "total", len(sample))
