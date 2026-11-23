@@ -271,6 +271,20 @@ class ToolchainFallbacks(unittest.TestCase):
         self.assertIn("-mcode-object-version=5", args)
         self.assertIn("-mwavefrontsize64", args)
 
+    def test_the_hip_linker_uses_amdgpu_elf_emulation(self):
+        o = self.oracle()
+        o.clang, o.lld = "clang", "ld.lld"
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner.subprocess, "run", return_value=ok) as run:
+            o.workdir = tmp
+            code, error = o._assemble("")
+        self.assertEqual(error, "")
+        run.assert_called_with(
+            [o.lld, "-m", "elf64_amdgpu", "-shared", os.path.join(tmp, "k.o"), "-o", code],
+            capture_output=True, text=True,
+        )
+
     def test_true16_is_used_only_where_the_assembler_needs_it(self):
         bare_only = lambda text, wave=32: (None, "error") if ".l" in text else ("k.co", "")
         half_only = lambda text, wave=32: ("k.co", "") if ".l" in text else (None, "error")
@@ -777,7 +791,7 @@ class OnHardware(unittest.TestCase):
         # image_fuzz's 64x64 cases (16,384) and this one need.
         lines = ["v_lshlrev_b32 v2, 5, v0", "v_mov_b32 v1, 0xabcd0001"]
         lines += [f"global_store_b32 v2, v1, s[2:3] offset:{4 * j}" for j in range(8)]
-        lines += ["s_waitcnt vmcnt(0)"]
+        lines += ["s_waitcnt vmcnt(0)", "s_endpgm"]
         kernel = asm.Kernel(lines, wave=32, threads=1024, words=8192, raw=True)
         self.assertEqual(self.oracle.run([kernel]), [[0xABCD0001] * 8192])
 
