@@ -18,8 +18,10 @@ against `--main` (default `origin/main`), using one history scan for the whole b
 
 Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
 tree matches main, as after a multi-commit squash merge), `duplicates`, `conflict` or `clean`.
-Exit 0 when every PR is clean, 1 when any is not, 2 on a usage or git error. Read-only: `merge-tree --write-tree`
-writes only objects, no refs. Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`.
+Exit 0 when every PR is clean, 1 when any is not, 2 on a usage or git error. `--depth` and `--min-length` take at
+least 1: no history searched tells every PR `clean`, and no length floor counts every short line as a duplicate.
+Read-only: `merge-tree --write-tree` writes only objects, no refs. Standard library only; needs git 2.38 or newer
+for `merge-tree --write-tree`.
 """
 import argparse
 import codecs
