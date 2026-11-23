@@ -1,8 +1,9 @@
 // Host-parity validation and GPU execution sanity test for ID3D12GraphicsCommandList::ExecuteIndirect.
 // Compares Close() verdicts between the Vulkan layer, live Windows WARP, and live hardware D3D12 (0 disagreements),
 // then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. No game data.
-// The expected verdicts are Windows 11's; Windows 10's in-box D3D12 refuses five of them (Case::older_runtime_refuses),
-// which the host may do there, while the layer is still held to Windows 11.
+// The expected verdicts are the newer runtime's (Windows 11 26xxx); an older D3D12 runtime (Windows 10 19045, Windows 11
+// 22631) refuses five of them (Case::older_runtime_refuses), which the host may do, while the layer is still held to
+// the newer verdicts.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
@@ -129,18 +130,17 @@ struct Case {
     const char* name;
     bool expected_ok;  // Measured on Windows 11 WARP and RTX 5090 HW D3D12
     std::function<void(Env&)> record;
-    // Windows 10's in-box D3D12 (WARP and hardware alike) refuses this case: it needs
-    // offset + stride * max_count <= width, also when max_count is 0, where Windows 11 skips max_count == 0 and
-    // counts the last command's argument size instead of a whole stride. See older_runtime_rule().
+    // An older D3D12 runtime (WARP and hardware alike) refuses this case: it needs
+    // offset + stride * max_count <= width, also when max_count is 0, where the newer runtime skips max_count == 0 and
+    // counts the last command's argument size instead of a whole stride. Measured on Windows 10 19045's in-box
+    // runtime and on Windows 11 22631. See older_runtime_rule().
     bool older_runtime_refuses = false;
 };
 
 // Whether a live host device follows the older bounds rule above: it refuses every case flagged
-// older_runtime_refuses, and it is a runtime without ID3D12Device10 (Windows 10's d3d12.dll). Only then is the host
-// compared with the older verdicts on those cases; everything else, and the layer always, keeps the Windows 11 table.
-bool older_runtime_rule(ID3D12Device* device, const std::vector<Case>& table, const std::vector<HRESULT>& hr) {
-    Ref<ID3D12Device10> device10;
-    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p)))) return false;
+// older_runtime_refuses. Only then is that host compared with the older verdicts on those cases; everything else,
+// and the layer always, keeps the newer runtime's table. All five or none: a host that refuses only some fails.
+bool older_runtime_rule(const std::vector<Case>& table, const std::vector<HRESULT>& hr) {
     bool any = false;
     for (std::size_t i = 0; i < table.size(); ++i) {
         if (!table[i].older_runtime_refuses) continue;
@@ -410,7 +410,7 @@ int main() {
 
     bool warp_ran = false;
     bool hw_ran = false;
-    bool warp_older = false;   // the host follows Windows 10's bounds rule (Case::older_runtime_refuses)
+    bool warp_older = false;   // the host follows the older bounds rule (Case::older_runtime_refuses)
     bool hw_older = false;
     std::string hw_name;
     if (!hostwine::host_is_wine()) {
@@ -425,7 +425,7 @@ int main() {
                 for (std::size_t i = 0; i < table.size(); ++i) REQUIRE(run_case(env, table[i], warp_hr[i]));
                 REQUIRE(warp_dev->GetDeviceRemovedReason() == S_OK);
                 warp_ran = true;
-                warp_older = older_runtime_rule(warp_dev.p, table, warp_hr);
+                warp_older = older_runtime_rule(table, warp_hr);
             }
             for (UINT i = 0;; ++i) {
                 Ref<IDXGIAdapter1> adapter;
@@ -443,7 +443,7 @@ int main() {
                     std::snprintf(name_buf, sizeof(name_buf), "%ls", desc.Description);
                     hw_name = name_buf;
                     hw_ran = true;
-                    hw_older = older_runtime_rule(hw_dev.p, table, hw_hr);
+                    hw_older = older_runtime_rule(table, hw_hr);
                     break;
                 }
             }
@@ -477,9 +477,9 @@ int main() {
     }
 
     if (older_cases)
-        std::printf("Windows 10's bounds rule on the host (%s%s%s, no ID3D12Device10): it refuses %u cases the "
-                    "Windows 11 runtime accepts (offset + stride * max_count <= width, also for max_count 0); the "
-                    "layer is held to the Windows 11 verdicts\n",
+        std::printf("older D3D12 bounds rule on the host (%s%s%s): it refuses %u cases the newer runtime "
+                    "accepts (offset + stride * max_count <= width, also for max_count 0); the layer is held to the "
+                    "newer verdicts\n",
                     warp_older ? "WARP" : "", warp_older && hw_older ? ", " : "", hw_older ? hw_name.c_str() : "",
                     older_cases);
 
