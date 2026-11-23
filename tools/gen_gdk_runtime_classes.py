@@ -135,9 +135,14 @@ def main(argv: list[str] | None = None) -> int:
     problems = check(table["classes"], table["interfaces"])
     for p in problems:
         print(f"warning: {p}", file=sys.stderr)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(table, f, indent=1, sort_keys=True)
-        f.write("\n")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(table, f, indent=1, sort_keys=True)
+            f.write("\n")
+    except OSError as e:   # a folder it cannot create, a read-only file, a full disk
+        print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print(f"{len(table['classes'])} classes, {len(table['interfaces'])} interfaces -> {a.out}")
     return 0
 
