@@ -148,6 +148,12 @@ class ShaderStemsTests(unittest.TestCase):
             shader_stems(path, "file", ".dxbc")
         self.assertIn(path, str(ctx.exception))
 
+    def test_deeply_nested_json_raises_value_error_with_path(self):
+        path = self.write_bytes("nested.json", b"[" * 1500 + b"]" * 1500)
+        with self.assertRaises(ValueError) as ctx:
+            shader_stems(path, "file", ".dxbc")
+        self.assertIn(path, str(ctx.exception))
+
 
 class CallerIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -174,6 +180,15 @@ class CallerIntegrationTests(unittest.TestCase):
 
         with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8") as f:
             f.write("{truncated")
+        self.assertIsNone(make_game.unpacked_shader_stems(dxbc))
+
+    def test_make_game_unpacked_shader_stems_rejects_deeply_nested_json(self):
+        dxbc = os.path.join(self.dir, "dxbc")
+        os.makedirs(dxbc)
+        with open(os.path.join(dxbc, "fssm_index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"name": "cs_bloom_0"}], f)
+        with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8") as f:
+            f.write("[" * 1500 + "]" * 1500)
         self.assertIsNone(make_game.unpacked_shader_stems(dxbc))
 
     def test_fssm_unpack_carve_index_rejects_traversal_and_malformed_json(self):

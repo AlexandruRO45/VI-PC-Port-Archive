@@ -11,7 +11,7 @@ def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
             rows = json.load(f)
     except UnicodeDecodeError as exc:
         raise ValueError(f"{path}: invalid UTF-8: {exc}") from exc
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f"{path}: invalid JSON: {exc}") from exc
     if not isinstance(rows, list):
         raise ValueError(f"{path}: expected an array of shader entries")
