@@ -74,9 +74,11 @@ public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
                     bool swapchain_maintenance1 = false,
-                    std::function<VkExtent2D()> extent_fn = nullptr)
+                    std::function<VkExtent2D()> extent_fn = nullptr,
+                    const VkPhysicalDeviceMemoryProperties* memory = nullptr)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
           maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)) {
+        if (memory) memory_ = *memory, have_memory_ = true;
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -557,8 +559,9 @@ private:
         if (vk.vkCreateBuffer(device, &info, nullptr, &capture_buffer_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device, capture_buffer_, &requirements);
-        VkPhysicalDeviceMemoryProperties memory{};
-        vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
+        // The device's own copy when given (RT-398: the instance-level re-query died with "Invalid physicalDevice").
+        VkPhysicalDeviceMemoryProperties memory = memory_;
+        if (!have_memory_) vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
         constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         std::uint32_t type = UINT32_MAX;
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i)
@@ -817,6 +820,8 @@ private:
     VulkanContext& context_;
     VkInstance instance_;
     VkPhysicalDevice physical_;
+    VkPhysicalDeviceMemoryProperties memory_{};
+    bool have_memory_ = false;
     VkQueue queue_;
     VkSurfaceKHR surface_;
     bool maintenance1_ = false;  // VK_KHR/EXT_swapchain_maintenance1 (and the surface extension) are enabled

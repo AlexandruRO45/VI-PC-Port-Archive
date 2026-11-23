@@ -6921,7 +6921,8 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
                                                                                 static_cast<uint32_t>(r.bottom - r.top)};
                                                                     }
                                                                     return {0, 0};
-                                                                });
+                                                                },
+                                                                &d->state().memory);
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
