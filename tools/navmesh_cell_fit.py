@@ -187,12 +187,17 @@ def main():
     if a.out and same_report_path(a.out, a.archive):
         ap.error("--out would overwrite the archive")
     hashes, docs = None, None
-    if a.common:
-        cells, names = vehicle_documents(a.common)
-        hashes = name_hashes(names)
-        docs = {"documents": sum(cells.values()), "models": len(names),
-                "cell_sizes": {("absent" if k is None else str(k)): v for k, v in sorted(cells.items(), key=str)}}
-    summary, scanned, hits, control = measure(a.archive, hashes, a.min_fraction, a.static_every)
+    try:
+        if a.common:
+            cells, names = vehicle_documents(a.common)
+            hashes = name_hashes(names)
+            docs = {"documents": sum(cells.values()), "models": len(names),
+                    "cell_sizes": {("absent" if k is None else str(k)): v
+                                   for k, v in sorted(cells.items(), key=str)}}
+        summary, scanned, hits, control = measure(a.archive, hashes, a.min_fraction, a.static_every)
+    except (OSError, ValueError) as exc:  # a 0-byte or non-RPF archive, or a path that is not there
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     report = {"local_space_meshes": summary, "non_grid_scanned": scanned}
     if control is not None:
         report["static_control"] = control
