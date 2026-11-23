@@ -12,6 +12,7 @@ import os
 import struct
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -215,6 +216,65 @@ class TestChains(unittest.TestCase):
         rows = [{"off": 0, "size": 100}, {"off": 1, "size": 50}]
         data = {0: b"a" * 100, 1: b"b" * 50}
         self.assertEqual([o for o, _d in T._chains(rows, lambda r: data[r["off"]])], [0, 1])
+
+    def test_csv_reports_preserve_carve_inputs(self):
+        for name in ("index.json", "000000001000.bin"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                self.carve(tmp, [make_resource(EN)])
+                report = Path(tmp, "dialogue.csv")
+                report.write_bytes(b"previous report")
+                target = Path(tmp, name)
+                original = target.read_bytes()
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(T.main([tmp, "--dialogue", str(report), "--strings", str(target)]), 2)
+                self.assertIn("overwrite", err.getvalue())
+                self.assertEqual(target.read_bytes(), original)
+                self.assertEqual(report.read_bytes(), b"previous report")
+
+    def test_index_only_carve_reserves_only_listed_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp, "index.json")
+            manifest.write_text(json.dumps({"files": [{"off": 16, "type": "bink2"}]}), encoding="utf-8")
+            reserved = Path(tmp, "000000000010.bk2")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([tmp, "--tables", str(reserved)]), 2)
+            self.assertFalse(reserved.exists())
+            available = Path(tmp, "000000000010.bin")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([tmp, "--tables", str(available)]), 0)
+            self.assertTrue(available.read_text(encoding="utf-8").startswith("source,offset,"))
+
+    def test_report_hard_link_to_carved_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = Path(tmp, "carve")
+            carve.mkdir()
+            self.carve(carve, [make_resource(EN)])
+            target = carve / "000000001000.bin"
+            alias = Path(tmp, "report.csv")
+            try:
+                os.link(target, alias)
+            except OSError:
+                self.skipTest("hard links unavailable")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([str(carve), "--strings", str(alias)]), 2)
+            self.assertTrue(target.samefile(alias))
+
+    def test_carved_symlink_to_an_external_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = Path(tmp, "carve")
+            carve.mkdir()
+            self.carve(carve, [make_resource(EN)])
+            stream = carve / "000000001000.bin"
+            report = Path(tmp, "report.csv")
+            stream.rename(report)
+            original = report.read_bytes()
+            try:
+                stream.symlink_to(report)
+            except OSError:
+                self.skipTest("symbolic links unavailable")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([str(carve), "--tables", str(report)]), 2)
+            self.assertEqual(stream.read_bytes(), original)
 
     def test_new_resource_ends_the_chain(self):
         rows = [{"off": 0, "size": T.BLOCK}, {"off": 1, "size": 10}]

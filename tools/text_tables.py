@@ -230,11 +230,48 @@ def _chains(rows, read):
         yield cur_off, b"".join(parts)
 
 
-def blobs(source: str):
+def _protect_carve_inputs(src, outputs):
+    if not outputs:
+        return
+    from gamedata_index import same_report_path
+
+    manifest = os.path.join(src.directory, "index.json")
+    candidates = set()
+    check_all = False
+    for output in outputs:
+        if same_report_path(output, manifest):
+            raise ValueError(f"report would overwrite carve manifest: {output}")
+        candidates.add(os.path.basename(os.path.realpath(output)).lower())
+        try:
+            if os.stat(output).st_nlink > 1:
+                check_all = True
+        except FileNotFoundError:
+            pass
+
+    # A payload may link to a differently named report outside the carve. Most
+    # runs only need directory entry names, not a stat for every indexed payload.
+    if not check_all:
+        try:
+            with os.scandir(src.directory) as entries:
+                candidates.update(e.name.lower() for e in entries if e.is_symlink())
+        except PermissionError:
+            check_all = True  # Known paths can still be readable without a directory listing.
+    if not check_all and not any(n.endswith((".bin", ".bk2")) for n in candidates):
+        return
+    for row in src.rows:
+        name = src.filename(row)
+        if check_all or name in candidates:
+            path = os.path.join(src.directory, name)
+            if any(same_report_path(path, output) for output in outputs):
+                raise ValueError(f"report would overwrite carved stream: {path}")
+
+
+def blobs(source: str, outputs=()):
     """(label, offset, bytes) for every logical blob of a source."""
     if os.path.isdir(source) and os.path.isfile(os.path.join(source, "index.json")):
         import gamedata_index
         src = gamedata_index.DirectorySource(source)
+        _protect_carve_inputs(src, outputs)
         rows = [r for r in src.rows if r.get("type") != "bink2"]
         for off, data in _chains(rows, src.read):
             yield source, off, data
@@ -459,7 +496,7 @@ def main(argv=None) -> int:
     try:
         for source in a.sources:
             starts = archive_starts(source)
-            for label, offset, data in blobs(source):
+            for label, offset, data in blobs(source, outs):
                 nested = archive_of(starts, offset) if starts else None
                 scan.add(label, offset, data, None if nested is None else (source, nested))
         names = {}

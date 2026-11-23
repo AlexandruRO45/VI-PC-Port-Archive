@@ -155,9 +155,13 @@ class DirectorySource:
             self.index = json.load(f)
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
 
-    def read(self, row: dict) -> bytes:
+    @staticmethod
+    def filename(row: dict) -> str:
         ext = ".bk2" if row.get("type") == "bink2" else ".bin"
-        path = os.path.join(self.directory, f'{row["off"]:012x}{ext}')
+        return f'{row["off"]:012x}{ext}'
+
+    def read(self, row: dict) -> bytes:
+        path = os.path.join(self.directory, self.filename(row))
         try:
             with open(path, "rb") as f:
                 return f.read()
