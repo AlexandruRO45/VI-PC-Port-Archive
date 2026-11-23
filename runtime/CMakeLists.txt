@@ -2026,6 +2026,33 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_geometry_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_geometry COMMAND d3d12_geometry_test)
       set_tests_properties(d3d12_geometry PROPERTIES SKIP_RETURN_CODE 77)
+      # Stream output on VK_EXT_transform_feedback (SOSetTargets, D3D12_STREAM_OUTPUT_DESC, BufferFilledSizeLocation).
+      set(LEONIDA_TEST_VS_SO ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_so.spv)
+      set(LEONIDA_TEST_VS_SO_MULTI ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_so_multi.spv)
+      set(LEONIDA_TEST_PS_SO ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_so.spv)
+      foreach(pair "vs_so.vert;${LEONIDA_TEST_VS_SO}" "vs_so_multi.vert;${LEONIDA_TEST_VS_SO_MULTI}"
+                   "ps_so.frag;${LEONIDA_TEST_PS_SO}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the stream-output test shader ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_stream_output_test test/d3d12_stream_output_test.cpp
+                     ${LEONIDA_TEST_VS_SO} ${LEONIDA_TEST_VS_SO_MULTI} ${LEONIDA_TEST_PS_SO})
+      target_link_libraries(d3d12_stream_output_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_stream_output_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SO_SPV="${LEONIDA_TEST_VS_SO}"
+                                 LEONIDA_TEST_VS_SO_MULTI_SPV="${LEONIDA_TEST_VS_SO_MULTI}"
+                                 LEONIDA_TEST_PS_SO_SPV="${LEONIDA_TEST_PS_SO}")
+      target_compile_options(d3d12_stream_output_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_stream_output COMMAND d3d12_stream_output_test)
+      set_tests_properties(d3d12_stream_output PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # D3D-309: D24 depth bias and 24-bit depth in draws, with and without a pixel shader and with a geometry shader
       # (src/depth24_fragment.h).
       set(LEONIDA_TEST_VS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth.spv)

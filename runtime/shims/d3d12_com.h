@@ -174,6 +174,17 @@ struct VulkanDeviceInfo {
     // colours fall back to transparent black.
     bool custom_border_color = false;
     bool custom_border_color_without_format = false;
+    // VK_EXT_transform_feedback and its features/properties enabled on `device`: SOSetTargets and
+    // D3D12_STREAM_OUTPUT_DESC graphics PSOs use VK_EXT_transform_feedback, and buffers are created with
+    // VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT.
+    // Without it, CreateGraphicsPipelineState refuses stream-output PSOs with E_NOTIMPL.
+    bool transform_feedback = false;
+    bool geometry_streams = false;
+    bool transform_feedback_queries = false;
+    bool transform_feedback_rasterization_stream_select = false;
+    std::uint32_t max_transform_feedback_buffers = 0;
+    std::uint32_t max_transform_feedback_streams = 0;
+    std::uint64_t max_transform_feedback_buffer_size = 0;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

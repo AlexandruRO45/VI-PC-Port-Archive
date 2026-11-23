@@ -10,7 +10,8 @@ hand-written RDNA2 run through the translator in `d3d12_translated_draw_test`, a
 set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
 PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
 and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
-pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
+pipeline-state streams (`CreatePipelineState`), and tessellation are not implemented, stream-output PSOs and
+`SOSetTargets` replay via `VK_EXT_transform_feedback`, and
 mesh shaders are reported as not supported (stream PSOs and mesh shaders: D3D-29, #1712). The device reports
 `RaytracingTier` as `NOT_SUPPORTED`, yet `BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the
 GPU (section 4.8).** This is the plan for
@@ -749,23 +750,35 @@ The compute path, end to end:
     standalone device enables where the GPU has it and reports in `VulkanDeviceInfo::features`; without it such a
     PSO is `E_NOTIMPL`. The PSO's topology type must be `TRIANGLE`, the GS's input (`E_INVALIDARG` otherwise). The
     push-constant range names the geometry stage only on such a device (`d3d12_geometry_test`).
-  - **Refused with a log:** hull and domain stages, stream output, MSAA, set-0 bindings, and two stages
+  - **Stream output (`D3D12_STREAM_OUTPUT_DESC`):** validated and accepted when `VK_EXT_transform_feedback` is enabled
+    on the device (otherwise `E_NOTIMPL`). `D3D12_SO_NO_RASTERIZED_STREAM` sets `rasterizerDiscardEnable = VK_TRUE` and
+    non-zero `RasterizedStream` chains `VkPipelineRasterizationStateStreamCreateInfoEXT` when `geometryStreams` and
+    `transformFeedbackRasterizationStreamSelect` are available.
+  - **Refused with a log:** hull and domain stages, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
     stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
     `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
     limit in the log, until the uniform-buffer tail exists.
 
-  The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
+  The command list keeps the input-assembler, stream-output (`SOSetTargets`: direct command lists only; rejected on
+  bundles, compute, and copy lists; cleared on `ClearState`/`Reset`), viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
   `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. A draw with no viewport (never set, or
   unbound with `RSSetViewports(0, …)`) or an empty one rasterizes nothing in D3D12. Such a draw is not recorded,
-  since Vulkan forbids a 0×0 viewport.
+  since Vulkan forbids a 0×0 viewport, unless stream-output targets are bound (in which case a 0×0 scissor keeps
+  rasterization discarded while transform feedback runs).
 
   At replay:
-  - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
+  - **Buffers:** vertex, index, and stream-output buffer/counter views resolve to buffers by VA (arena or upload),
+    with 4-byte offset alignment enforced for transform-feedback buffers and counters. A view that runs past its
     buffer is cut at the buffer's end. An unbound vertex slot, or an indexed draw with no index buffer, reads the
     arena's reserved first 64 KiB, which is kept zero (stride 0), so it gets the zeros D3D12 gives.
+  - **Stream output (`VK_EXT_transform_feedback`):** when a draw's PSO declares stream output and at least one
+    `SOSetTargets` slot is bound, replay binds the active slots via `vkCmdBindTransformFeedbackBuffersEXT` and brackets
+    the draw with `vkCmdBeginTransformFeedbackEXT` / `vkCmdEndTransformFeedbackEXT`. `BufferFilledSizeLocation` maps
+    to Vulkan's 32-bit transform-feedback counter buffer for append offset read and post-draw writeback; zero-filled
+    8-byte counter storage matches D3D12's `UINT64` layout on little-endian hosts up to 4 GiB. (`d3d12_stream_output_test`)
   - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
@@ -2644,15 +2657,10 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
-- **Stream-output statistics** (D3D-302). The layer has no stream output: a graphics PSO with `StreamOutput`
-  entries is refused and `SOSetTargets` is not implemented, so no primitive reaches a stream and every
-  `SO_STATISTICS_STREAM0..3` query counts 0 written and 0 needed. An `SO_STATISTICS` heap is therefore made without
-  a `VkQueryPool`: `BeginQuery`/`EndQuery` record nothing in Vulkan (D3D12's call rules are still kept, and the
-  heap's queries track ended or not as the others do), they overlap no other query, and `ResolveQueryData` writes
-  zeros (`vkCmdFillBuffer`, 16 bytes per query: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), with no
-  statistics split since nothing is dispatched. When stream output lands, the heap becomes a
-  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun with `vkCmdBeginQueryIndexedEXT` on the stream, whose two
-  results are in the same order.
+- **Stream-output statistics** (D3D-302). Stream-output graphics PSOs and `SOSetTargets` replay via
+  `VK_EXT_transform_feedback`, while `SO_STATISTICS` query heaps still return zeros here (`BeginQuery`/`EndQuery`
+  track ended state and `ResolveQueryData` fills 16 zero bytes per query) until hardware
+  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` queries are wired in the follow-up change.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and

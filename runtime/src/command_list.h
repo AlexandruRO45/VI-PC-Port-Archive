@@ -404,12 +404,20 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
+// D3D12_STREAM_OUTPUT_BUFFER_VIEW: console VAs, resolved to buffers at replay.
+struct StreamOutputBufferView {
+    std::uint64_t va = 0;
+    std::uint64_t size = 0;
+    std::uint64_t filled_size_va = 0;
+};
+
 // The views a draw captured, at the D3D12 maxima. Kept by value because the CPU descriptor slots and the bound
 // views can change after the draw is recorded, and out of line because the command variant is sized by its largest
 // member: inline they made every recorded command, barriers included, 976 bytes.
 struct DrawViews {
     std::array<TargetView, 8> render_targets{};
     std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
+    std::array<StreamOutputBufferView, 4> stream_output_buffers{};  // by SO slot
     std::uint32_t render_target_count = 8;
 };
 

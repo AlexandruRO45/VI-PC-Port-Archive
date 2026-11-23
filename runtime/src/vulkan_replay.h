@@ -249,7 +249,7 @@ inline VkAccessFlags2 vulkan_barrier_access(std::uint32_t access) {
          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT},
         {a::depth_stencil_read, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT},
         {a::shader_resource, VK_ACCESS_2_SHADER_READ_BIT},
-        {a::stream_output, VK_ACCESS_2_MEMORY_WRITE_BIT},
+        {a::stream_output, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT},
         {a::indirect_argument, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
         {a::copy_dest, VK_ACCESS_2_TRANSFER_WRITE_BIT},
         {a::copy_source, VK_ACCESS_2_TRANSFER_READ_BIT},
@@ -761,6 +761,9 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    bool has_stream_output = false;
+    bool rasterizer_discard = false;  // D3D12_SO_NO_RASTERIZED_STREAM
+    std::uint32_t stream_output_slots = 0;  // bit per SO output slot 0..3 declared by the PSO
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -792,6 +795,15 @@ struct ReplayFunctions {
     // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
     PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
     PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
+    // VK_EXT_transform_feedback: SOSetTargets and StreamOutput graphics PSOs. Buffers must have
+    // VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT and counter buffers
+    // VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT.
+    bool transform_feedback = false;
+    PFN_vkCmdBindTransformFeedbackBuffersEXT bind_transform_feedback_buffers = nullptr;
+    PFN_vkCmdBeginTransformFeedbackEXT begin_transform_feedback = nullptr;
+    PFN_vkCmdEndTransformFeedbackEXT end_transform_feedback = nullptr;
+    PFN_vkCmdBeginQueryIndexedEXT begin_query_indexed = nullptr;
+    PFN_vkCmdEndQueryIndexedEXT end_query_indexed = nullptr;
     PFN_vkCmdResetQueryPool reset_query_pool = nullptr;  // queries, with fill_buffer for unavailable results
     PFN_vkCmdBeginQuery begin_query = nullptr;
     PFN_vkCmdEndQuery end_query = nullptr;
@@ -1004,6 +1016,14 @@ struct PreparedDraw {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+    std::uint32_t so_first = 0;
+    std::uint32_t so_count = 0;
+    std::array<VkBuffer, 4> so_buffers{};
+    std::array<VkDeviceSize, 4> so_offsets{};
+    std::array<VkDeviceSize, 4> so_sizes{};
+    std::array<VkBuffer, 4> so_counter_buffers{};
+    std::array<VkDeviceSize, 4> so_counter_offsets{};
+    bool so_has_counters = false;
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
@@ -1020,6 +1040,14 @@ struct PreparedDraw {
         index_type = VK_INDEX_TYPE_UINT16;
         area = {};
         layers = 1;
+        so_first = 0;
+        so_count = 0;
+        so_buffers = {};
+        so_offsets = {};
+        so_sizes = {};
+        so_counter_buffers = {};
+        so_counter_offsets = {};
+        so_has_counters = false;
     }
 };
 
@@ -2004,6 +2032,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
         p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
                   std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+        if ((pipeline->has_stream_output || pipeline->rasterizer_discard) && (p.area.width == 0 || p.area.height == 0))
+            p.area = {std::max(1u, p.area.width), std::max(1u, p.area.height)};
     }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
@@ -2055,6 +2085,41 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             std::uint64_t size = draw.index.size;
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
                 return ReplayResult::unresolved_resource;
+        }
+    }
+    if (pipeline->has_stream_output && draw.views) {
+        std::uint32_t first_so = UINT32_MAX, last_so = 0;
+        for (std::uint32_t slot = 0; slot < 4; ++slot) {
+            const StreamOutputBufferView& view = draw.views->stream_output_buffers[slot];
+            if (!view.va || !view.size) continue;
+            if (!vk.transform_feedback || !vk.bind_transform_feedback_buffers ||
+                !vk.begin_transform_feedback || !vk.end_transform_feedback)
+                return ReplayResult::unsupported;
+            std::uint64_t size = view.size;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (!vk.buffer_at(view.va, size, buffer, offset)) return ReplayResult::unresolved_resource;
+            if ((offset % 4) != 0 || size == 0) return ReplayResult::invalid_subresource;
+            p.so_buffers[slot] = buffer;
+            p.so_offsets[slot] = offset;
+            p.so_sizes[slot] = size;
+            if (view.filled_size_va) {
+                std::uint64_t counter_size = 4;
+                VkBuffer counter = VK_NULL_HANDLE;
+                VkDeviceSize counter_offset = 0;
+                if (!vk.buffer_at(view.filled_size_va, counter_size, counter, counter_offset))
+                    return ReplayResult::unresolved_resource;
+                if ((counter_offset % 4) != 0 || counter_size < 4) return ReplayResult::invalid_subresource;
+                p.so_counter_buffers[slot] = counter;
+                p.so_counter_offsets[slot] = counter_offset;
+                p.so_has_counters = true;
+            }
+            first_so = std::min(first_so, slot);
+            last_so = std::max(last_so, slot);
+        }
+        if (first_so != UINT32_MAX) {
+            p.so_first = first_so;
+            p.so_count = last_so - first_so + 1;
         }
     }
     return ReplayResult::success;
@@ -3783,27 +3848,53 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
-            const Viewport& v = draw->viewport;
-            const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            vk.set_viewport(command_buffer, 0, 1, &viewport);
-            const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
+            if (!graphics.rasterizer_discard) {
+                const Viewport& v = draw->viewport;
+                const bool has_viewport = (v.width > 0) && (v.height > 0);
+                const VkViewport viewport =
+                    has_viewport ? VkViewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth}
+                                 : VkViewport{0.0f, 1.0f, 1.0f, -1.0f, 0.0f, 1.0f};
+                vk.set_viewport(command_buffer, 0, 1, &viewport);
+                const Rect& s = draw->scissor;
+                const VkRect2D scissor =
+                    has_viewport ? VkRect2D{{std::max(0, s.left), std::max(0, s.top)},
+                                            {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
+                                             std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}}
+                                 : VkRect2D{{0, 0}, {0, 0}};
+                vk.set_scissor(command_buffer, 0, 1, &scissor);
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
+                vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            }
             const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
             vk.set_primitive_topology(command_buffer, topology);
             const bool restart = draw->indexed && detail::strip_topology(topology) &&
                                  ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
                                   (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
             vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
-            vk.set_blend_constants(command_buffer, draw->blend_factor.data());
             for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
                 if (!d.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
+            }
+            if (d.so_count > 0) {
+                std::uint32_t pos = 0;
+                while (pos < d.so_count) {
+                    if (!d.so_buffers[d.so_first + pos]) {
+                        ++pos;
+                        continue;
+                    }
+                    std::uint32_t end = pos + 1;
+                    while (end < d.so_count && d.so_buffers[d.so_first + end]) ++end;
+                    vk.bind_transform_feedback_buffers(command_buffer, d.so_first + pos, end - pos,
+                                                       &d.so_buffers[d.so_first + pos],
+                                                       &d.so_offsets[d.so_first + pos],
+                                                       &d.so_sizes[d.so_first + pos]);
+                    pos = end;
+                }
+                vk.begin_transform_feedback(command_buffer, d.so_first, d.so_count,
+                                            d.so_has_counters ? &d.so_counter_buffers[d.so_first] : nullptr,
+                                            d.so_has_counters ? &d.so_counter_offsets[d.so_first] : nullptr);
             }
             if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
@@ -3811,6 +3902,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                 draw->first_instance);
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
+            }
+            if (d.so_count > 0) {
+                vk.end_transform_feedback(command_buffer, d.so_first, d.so_count,
+                                          d.so_has_counters ? &d.so_counter_buffers[d.so_first] : nullptr,
+                                          d.so_has_counters ? &d.so_counter_offsets[d.so_first] : nullptr);
             }
             vk.end_rendering(command_buffer);
         }

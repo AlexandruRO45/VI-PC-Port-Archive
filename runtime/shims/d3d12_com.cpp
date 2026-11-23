@@ -341,6 +341,22 @@ public:
         set_index_buffer(view);
     }
 
+    void STDMETHODCALLTYPE SOSetTargets(UINT start, UINT count,
+                                        const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views) override {
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || list_.closed()) return check(false);
+        if (std::uint64_t(start) + count > stream_output_buffers_.size()) return check(false);
+        if (!count) return;
+        draw_views_stale_ = true;
+        for (UINT i = 0; i < count; ++i) {
+            if (!views || !views[i].BufferLocation || !views[i].SizeInBytes) {
+                stream_output_buffers_[start + i] = {};
+            } else {
+                stream_output_buffers_[start + i] = {views[i].BufferLocation, views[i].SizeInBytes,
+                                                      views[i].BufferFilledSizeLocation};
+            }
+        }
+    }
+
     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
@@ -986,6 +1002,7 @@ private:
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
+    std::array<leonida::StreamOutputBufferView, D3D12_SO_BUFFER_SLOT_COUNT> stream_output_buffers_{};
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
@@ -1054,6 +1071,7 @@ private:
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
+        stream_output_buffers_ = {};
         viewport_ = {};
         scissor_ = {};
         render_targets_.fill({});
@@ -1088,6 +1106,7 @@ private:
             auto views = std::make_shared<leonida::DrawViews>();
             views->render_targets = render_targets_;
             views->vertex_buffers = vertex_buffers_;
+            views->stream_output_buffers = stream_output_buffers_;
             views->render_target_count = render_target_count_;
             draw_views_ = std::move(views);
             draw_views_stale_ = false;
@@ -1099,8 +1118,10 @@ private:
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
-        // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        // and Vulkan forbids a 0x0 viewport, so the draw is not recorded unless stream-output targets are bound.
+        const bool has_so = std::any_of(stream_output_buffers_.begin(), stream_output_buffers_.end(),
+                                        [](const auto& v) { return v.va != 0 && v.size != 0; });
+        if ((!(viewport_.width > 0) || !(viewport_.height > 0)) && !has_so) return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};

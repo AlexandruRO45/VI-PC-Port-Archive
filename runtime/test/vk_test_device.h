@@ -121,6 +121,13 @@ public:
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
+    bool transform_feedback = false;  // VK_EXT_transform_feedback and transformFeedback enabled
+    bool geometry_streams = false;
+    bool transform_feedback_queries = false;
+    bool transform_feedback_rasterization_stream_select = false;
+    std::uint32_t max_transform_feedback_buffers = 0;
+    std::uint32_t max_transform_feedback_streams = 0;
+    std::uint64_t max_transform_feedback_buffer_size = 0;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -531,6 +538,31 @@ public:
             custom_border.pNext = *v13_.next();   // where later feature structs go since #1706
             *v13_.next() = &custom_border;
         }
+        // VK_EXT_transform_feedback where the device has it (SOSetTargets / StreamOutput).
+        VkPhysicalDeviceTransformFeedbackFeaturesEXT tf_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &tf_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            transform_feedback = tf_features.transformFeedback == VK_TRUE;
+            geometry_streams = transform_feedback && tf_features.geometryStreams == VK_TRUE;
+            if (transform_feedback) {
+                VkPhysicalDeviceTransformFeedbackPropertiesEXT tf_props{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
+                VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &tf_props};
+                instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &props2);
+                transform_feedback_queries = tf_props.transformFeedbackQueries == VK_TRUE;
+                transform_feedback_rasterization_stream_select =
+                    tf_props.transformFeedbackRasterizationStreamSelect == VK_TRUE;
+                max_transform_feedback_buffers = tf_props.maxTransformFeedbackBuffers;
+                max_transform_feedback_streams = tf_props.maxTransformFeedbackStreams;
+                max_transform_feedback_buffer_size = tf_props.maxTransformFeedbackBufferSize;
+                tf_features.pNext = *v13_.next();
+                *v13_.next() = &tf_features;
+            }
+            break;
+        }
 
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
@@ -576,6 +608,7 @@ public:
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
+        if (transform_feedback) device_extensions.push_back(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

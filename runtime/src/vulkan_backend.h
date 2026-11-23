@@ -87,7 +87,9 @@ struct VulkanDeviceFunctions {
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)                                      \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
-    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)                       \
+    X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT)                                  \
+    X(vkCmdEndTransformFeedbackEXT) X(vkCmdBeginQueryIndexedEXT) X(vkCmdEndQueryIndexedEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -809,7 +811,8 @@ public:
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
-                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false)
+                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false,
+                  bool transform_feedback = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
@@ -834,6 +837,14 @@ public:
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
+        }
+        replay_.transform_feedback = transform_feedback;
+        if (transform_feedback) {  // a driver may hand out these pointers even when the extension is off
+            replay_.bind_transform_feedback_buffers = vk.vkCmdBindTransformFeedbackBuffersEXT;
+            replay_.begin_transform_feedback = vk.vkCmdBeginTransformFeedbackEXT;
+            replay_.end_transform_feedback = vk.vkCmdEndTransformFeedbackEXT;
+            replay_.begin_query_indexed = vk.vkCmdBeginQueryIndexedEXT;
+            replay_.end_query_indexed = vk.vkCmdEndQueryIndexedEXT;
         }
         replay_.reset_query_pool = vk.vkCmdResetQueryPool;
         replay_.begin_query = vk.vkCmdBeginQuery;

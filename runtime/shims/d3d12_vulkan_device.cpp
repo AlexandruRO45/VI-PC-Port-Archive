@@ -578,6 +578,9 @@ struct DeviceState {
                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (info.conditional_rendering) result.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (info.transform_feedback)
+            result.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                            VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         // D3D12 reserved buffers are visible to DIRECT, COPY and COMPUTE queues without exposing Vulkan
         // queue-family ownership. Their tile bindings and accesses may use distinct families, so match the
         // CONCURRENT sharing policy used for ordinary buffers and the GPU address arena.
@@ -1669,6 +1672,9 @@ public:
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (device_.info.transform_feedback)
+            info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                          VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         if (addressable || need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (device_.info.ray_tracing) {
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
@@ -2682,11 +2688,11 @@ public:
 
     // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
     // VS's input signature by semantic name and index: location = the element's register, the translator's rule
-    // (docs/design.md, "Vertex fetch"). Refused with a log: hull and domain stages, stream output, the centre
-    // multisample pattern, two stages that both read their code base, and state that needs a Vulkan feature the
-    // device lacks (including the geometryShader feature a GS needs). A GS takes triangles; the sample count may
-    // be above one. Viewport, scissor, topology, vertex strides, stencil reference and blend factor are dynamic,
-    // set from the list's state at each draw.
+    // (docs/design.md, "Vertex fetch"). Stream output uses VK_EXT_transform_feedback when enabled. Refused with a
+    // log: hull and domain stages, the centre multisample pattern, two stages that both read their code base, and
+    // state that needs a Vulkan feature the device lacks (including geometryShader and transformFeedback). A GS takes
+    // triangles; the sample count may be above one. Viewport, scissor, topology, vertex strides, stencil reference
+    // and blend factor are dynamic, set from the list's state at each draw.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
@@ -2701,8 +2707,8 @@ public:
             return E_NOTIMPL;
         }
         if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
-        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.StreamOutput.NumEntries) {
-            log_once("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
+        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength) {
+            log_once("graphics pipeline stage not supported yet (hull/domain):", 0);
             return E_NOTIMPL;
         }
         // A geometry shader is the translator's Vulkan geometry stage (docs/design.md, "Geometry shaders"): it takes
@@ -2717,6 +2723,62 @@ public:
             log_once("a translated geometry shader takes triangles; topology type", desc.PrimitiveTopologyType);
             return E_INVALIDARG;
         }
+        const D3D12_STREAM_OUTPUT_DESC& so = desc.StreamOutput;
+        if (so.NumEntries > 0 && !so.pSODeclaration) return E_INVALIDARG;
+        if (so.NumStrides > D3D12_SO_BUFFER_SLOT_COUNT || (so.NumStrides > 0 && !so.pBufferStrides)) return E_INVALIDARG;
+        if (so.NumEntries > D3D12_SO_STREAM_COUNT * D3D12_SO_OUTPUT_COMPONENT_COUNT) return E_INVALIDARG;
+        if (so.RasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM && so.RasterizedStream >= D3D12_SO_STREAM_COUNT)
+            return E_INVALIDARG;
+        if (!geometry && so.NumEntries > 0 && so.RasterizedStream != 0 &&
+            so.RasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM)
+            return E_INVALIDARG;
+        for (UINT i = 0; i < so.NumStrides; ++i) {
+            if (so.pBufferStrides[i] > D3D12_SO_BUFFER_MAX_STRIDE_IN_BYTES || (so.pBufferStrides[i] % 4) != 0)
+                return E_INVALIDARG;
+        }
+        for (UINT i = 0; i < so.NumEntries; ++i) {
+            const D3D12_SO_DECLARATION_ENTRY& e = so.pSODeclaration[i];
+            if (e.Stream >= D3D12_SO_STREAM_COUNT || e.OutputSlot >= D3D12_SO_BUFFER_SLOT_COUNT) return E_INVALIDARG;
+            if (!geometry && e.Stream > 0) return E_INVALIDARG;
+            if (e.ComponentCount == 0 || e.ComponentCount > 4) return E_INVALIDARG;
+            if (!e.SemanticName) {
+                if (e.StartComponent != 0 || e.SemanticIndex != 0) return E_INVALIDARG;
+            } else if (std::uint32_t(e.StartComponent) + e.ComponentCount > 4) {
+                return E_INVALIDARG;
+            }
+            graphics_.stream_output_slots |= 1u << e.OutputSlot;
+        }
+        const bool has_stream_output = so.NumEntries > 0;
+        const bool no_rasterized_stream = so.RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM;
+        if (has_stream_output) {
+            if (!device_.info.transform_feedback) {
+                log_once("stream output needs VK_EXT_transform_feedback; entries", int(so.NumEntries));
+                return E_NOTIMPL;
+            }
+            for (UINT slot = 0; slot < D3D12_SO_BUFFER_SLOT_COUNT; ++slot) {
+                if ((graphics_.stream_output_slots & (1u << slot)) &&
+                    device_.info.max_transform_feedback_buffers &&
+                    slot >= device_.info.max_transform_feedback_buffers) {
+                    log_once("stream output slot exceeds maxTransformFeedbackBuffers; slot", int(slot));
+                    return E_NOTIMPL;
+                }
+            }
+            if (!no_rasterized_stream && so.RasterizedStream > 0) {
+                if (!device_.info.geometry_streams || !device_.info.transform_feedback_rasterization_stream_select) {
+                    log_once("non-zero RasterizedStream needs geometryStreams and rasterization stream select; stream",
+                             int(so.RasterizedStream));
+                    return E_NOTIMPL;
+                }
+                if (device_.info.max_transform_feedback_streams &&
+                    so.RasterizedStream >= device_.info.max_transform_feedback_streams) {
+                    log_once("RasterizedStream exceeds maxTransformFeedbackStreams; stream",
+                             int(so.RasterizedStream));
+                    return E_NOTIMPL;
+                }
+            }
+        }
+        graphics_.has_stream_output = has_stream_output;
+        graphics_.rasterizer_discard = no_rasterized_stream;
         const UINT samples = desc.SampleDesc.Count;
         if (!samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || (samples & (samples - 1))) {
             log_once("invalid graphics pipeline sample count:", int(samples));
@@ -2764,7 +2826,7 @@ public:
         const bool d24_as_float = desc.DSVFormat != DXGI_FORMAT_UNKNOWN &&
                                   vulkan_format(desc.DSVFormat, true).format == VK_FORMAT_D24_UNORM_S8_UINT &&
                                   !device_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT);
-        bool depth24_fragment = d24_as_float && desc.DepthStencilState.DepthEnable;
+        bool depth24_fragment = d24_as_float && desc.DepthStencilState.DepthEnable && !no_rasterized_stream;
         if (depth24_fragment && samples > 1) {
             log_once("D24 depth stored as D32 keeps float depth bias and precision on multisampled targets; samples",
                      int(samples));
@@ -2960,6 +3022,7 @@ public:
             if (r.ForcedSampleCount) return E_NOTIMPL;
         }
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.rasterizerDiscardEnable = no_rasterized_stream ? VK_TRUE : VK_FALSE;
         raster.polygonMode = r.FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
                           : r.CullMode == D3D12_CULL_MODE_BACK ? VK_CULL_MODE_BACK_BIT
@@ -3155,6 +3218,8 @@ public:
         recipe_.divisors = std::move(divisors);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
+        recipe_.rasterization_stream =
+            (has_stream_output && !no_rasterized_stream) ? so.RasterizedStream : 0u;
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
@@ -3302,6 +3367,7 @@ private:
         std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
+        std::uint32_t rasterization_stream = 0;
         bool conservative = false;
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
@@ -3312,14 +3378,6 @@ private:
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
-        // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
-        // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
-        // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
@@ -3350,6 +3408,13 @@ private:
         viewport.scissorCount = 1;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
         VkPipelineRasterizationStateCreateInfo raster = r.raster;
+        VkPipelineRasterizationStateStreamCreateInfoEXT stream{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT};
+        if (r.rasterization_stream > 0) {
+            stream.rasterizationStream = r.rasterization_stream;
+            stream.pNext = raster.pNext;
+            raster.pNext = &stream;
+        }
         VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{
             VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
         if (r.conservative) {
@@ -3362,9 +3427,19 @@ private:
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
+        std::vector<VkDynamicState> enabled_dynamic{
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+        if (raster.rasterizerDiscardEnable == VK_FALSE) {
+            enabled_dynamic.push_back(VK_DYNAMIC_STATE_VIEWPORT);
+            enabled_dynamic.push_back(VK_DYNAMIC_STATE_SCISSOR);
+            enabled_dynamic.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+            enabled_dynamic.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
+        }
+        // Only pipelines with vertex bindings set dynamic strides (VUID-vkCmdDraw-pStrides-04913).
+        if (!r.bindings.empty()) enabled_dynamic.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-        dynamic.pDynamicStates = dynamic_states;
+        dynamic.dynamicStateCount = std::uint32_t(enabled_dynamic.size());
+        dynamic.pDynamicStates = enabled_dynamic.data();
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
         info.stageCount = std::uint32_t(r.stages.size());
@@ -4279,7 +4354,17 @@ public:
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
                 VkPhysicalDeviceConservativeRasterizationPropertiesEXT conservative{
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
-                if (info.conservative_rasterization) resolve.pNext = &conservative;
+                VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback_props{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
+                void** tail = &resolve.pNext;
+                if (info.conservative_rasterization) {
+                    *tail = &conservative;
+                    tail = &conservative.pNext;
+                }
+                if (info.transform_feedback && state_.info.max_transform_feedback_buffers == 0) {
+                    *tail = &transform_feedback_props;
+                    tail = &transform_feedback_props.pNext;
+                }
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
                 state_.conservative_raster_tier1 = leonida::conservative_raster::tier1(
@@ -4287,6 +4372,16 @@ public:
                     conservative.primitiveOverestimationSize);
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
+                if (info.transform_feedback && state_.info.max_transform_feedback_buffers == 0) {
+                    state_.info.transform_feedback_queries =
+                        transform_feedback_props.transformFeedbackQueries == VK_TRUE;
+                    state_.info.transform_feedback_rasterization_stream_select =
+                        transform_feedback_props.transformFeedbackRasterizationStreamSelect == VK_TRUE;
+                    state_.info.max_transform_feedback_buffers = transform_feedback_props.maxTransformFeedbackBuffers;
+                    state_.info.max_transform_feedback_streams = transform_feedback_props.maxTransformFeedbackStreams;
+                    state_.info.max_transform_feedback_buffer_size =
+                        transform_feedback_props.maxTransformFeedbackBufferSize;
+                }
             }
         }
 
@@ -4294,7 +4389,8 @@ public:
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
-                                                                      info.buffer_device_address);
+                                                                      info.buffer_device_address,
+                                                                  info.transform_feedback);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -4531,6 +4627,9 @@ public:
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         // Default-heap buffers live here, and any of them can be a SetPredication buffer.
         if (state_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (state_.info.transform_feedback)
+            info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                          VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         // With ray tracing, AS result, scratch and build-input buffers are default-heap ranges of the arena.
         if (state_.info.ray_tracing)
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
@@ -8493,6 +8592,32 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // Optional: VK_EXT_transform_feedback enables SOSetTargets and D3D12_STREAM_OUTPUT_DESC graphics PSOs.
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT tf_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    if (has_device_extension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &tf_features};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.transform_feedback = tf_features.transformFeedback == VK_TRUE;
+        info.geometry_streams = info.transform_feedback && tf_features.geometryStreams == VK_TRUE;
+        if (info.transform_feedback) {
+            VkPhysicalDeviceTransformFeedbackPropertiesEXT tf_props{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &tf_props};
+            vkGetPhysicalDeviceProperties2(info.physical, &props2);
+            info.transform_feedback_queries = tf_props.transformFeedbackQueries == VK_TRUE;
+            info.transform_feedback_rasterization_stream_select =
+                tf_props.transformFeedbackRasterizationStreamSelect == VK_TRUE;
+            info.max_transform_feedback_buffers = tf_props.maxTransformFeedbackBuffers;
+            info.max_transform_feedback_streams = tf_props.maxTransformFeedbackStreams;
+            info.max_transform_feedback_buffer_size = tf_props.maxTransformFeedbackBufferSize;
+            tf_features.transformFeedback = VK_TRUE;
+            tf_features.geometryStreams = info.geometry_streams ? VK_TRUE : VK_FALSE;
+            tf_features.pNext = *v13.next();
+            *v13.next() = &tf_features;
+        }
+    }
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -8527,6 +8652,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.presentation = has_swapchain && instance_has_surface;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
+    if (info.transform_feedback) device_extensions.push_back(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
