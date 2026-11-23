@@ -10,6 +10,14 @@ This page collects the setup steps and the problems testers have run into so far
 
 [claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
+## Tested Configurations
+
+*Note: For detailed logs, crash reports, and ongoing discussions, please refer to [Issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).*
+
+| GPU | Driver | OS | Results & Notes |
+| --- | --- | --- | --- |
+| **AMD Radeon RX 6600** (RDNA2, Device ID: 0x73ff) | AMD Proprietary 26.10.1 | Windows 10 (Build 19045) | ✅ **97% passed** (155/169). Native wave64 support confirmed (subgroup sizes 32..64, default 64).<br>⚠️ `d3d12_sparse_queue_family_contract` crashes with access violation (exit code `0xC0000005`).<br>⚠️ `d3d12_conservative_raster` fails (driver lacks `VK_EXT_conservative_rasterization`). |
+
 ## What you need
 
 - **Python 3.11+.** `scripts/run_gpu_tests.py` needs at least 3.10.
