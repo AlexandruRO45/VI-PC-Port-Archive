@@ -383,6 +383,19 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(data["summary"]["models"], 1)
         self.assertEqual(data["models"][0]["name"], "synthetic_static")
 
+    def test_report_write_failure_is_a_clean_error(self):
+        parent = self.root / "not-a-directory"
+        parent.write_text("keep", encoding="utf-8", newline="\n")
+        for flag in ("--csv", "--json"):
+            with self.subTest(flag=flag):
+                report = parent / "report"
+                result = self.run_tool(self.root, flag, report)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                self.assertIn(f"ERROR: cannot write {flag} report {report}", result.stderr)
+                self.assertNotIn("wrote", result.stdout)
+                self.assertEqual(parent.read_text(encoding="utf-8"), "keep")
+
     def test_missing_target_is_a_clean_error(self):
         result = self.run_tool(pathlib.Path(self.temp.name) / "absent")
         self.assertEqual(result.returncode, 2)
