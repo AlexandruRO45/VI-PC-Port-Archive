@@ -598,6 +598,33 @@ int main() {
               "WinHttpCrackUrl parses a URL");
     }
 
+    // WinHttpSetStatusCallback refuses a callback with no notifications, and a non-zero reserved, before it looks at
+    // the handle, as the host's winhttp.dll does (Windows 10 22H2).
+    {
+        static std::atomic<int> calls{0};  // the two bodies differ, so the linker cannot fold them into one address
+        const WINHTTP_STATUS_CALLBACK first = [](HINTERNET, DWORD_PTR, DWORD, LPVOID, DWORD) { ++calls; };
+        const WINHTTP_STATUS_CALLBACK second = [](HINTERNET, DWORD_PTR, DWORD, LPVOID, DWORD) { --calls; };
+        const auto refused = [&](HINTERNET handle, WINHTTP_STATUS_CALLBACK callback, DWORD notifications,
+                                 DWORD_PTR reserved) {
+            SetLastError(0);
+            return set_callback(handle, callback, notifications, reserved) == WINHTTP_INVALID_STATUS_CALLBACK &&
+                   GetLastError() == ERROR_INVALID_PARAMETER;
+        };
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        const HINTERNET closed = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        close(closed);
+        constexpr DWORD kHandles = WINHTTP_CALLBACK_FLAG_HANDLES;
+        check(set_callback(session, first, kHandles, 0) == nullptr && refused(session, second, 0, 0) &&
+                  set_callback(session, first, kHandles, 0) == first,
+              "a callback with no notification flags is refused with ERROR_INVALID_PARAMETER and the old one stays");
+        check(refused(session, second, kHandles, 1) && refused(session, nullptr, 0, 1) &&
+                  set_callback(session, nullptr, 0, 0) == first,
+              "so is a non-zero reserved, even to clear the callback, which no flags still does");
+        check(refused(nullptr, second, 0, 0) && refused(closed, second, kHandles, 1),
+              "both are refused before the handle is checked");
+        close(session);
+    }
+
     // Sending a request from inside HANDLE_CREATED must see the connection's server and port already initialized.
     {
         CreatedRequestProbe probe{open_request, send, close};

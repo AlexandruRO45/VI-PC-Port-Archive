@@ -386,7 +386,11 @@ BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD 
 }
 
 WINHTTP_STATUS_CALLBACK WINAPI set_status_callback(HINTERNET handle, WINHTTP_STATUS_CALLBACK callback,
-                                                   DWORD notifications, DWORD_PTR) {
+                                                   DWORD notifications, DWORD_PTR reserved) {
+    if (reserved || (callback && !notifications)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return WINHTTP_INVALID_STATUS_CALLBACK;
+    }
     if (!handle) {
         SetLastError(ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
         return WINHTTP_INVALID_STATUS_CALLBACK;
