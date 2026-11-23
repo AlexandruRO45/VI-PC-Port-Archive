@@ -13509,6 +13509,34 @@ def ds_const_extent(op, key, value):
     return (start + size - 1) // 4 + 1
 
 
+MIX_LITERAL_OPS = ("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16")
+
+
+def mix_literal_high_half(raw, printed, op):
+    """The literal dword the blob holds for a v_fma_mix* whose printed encoding differs from the blob only in the
+    literal's high half, else None. A VOP3P literal is a whole dword: llvm-mc prints it as an f16 (its low half)
+    and re-encodes the high half as 0, but op_sel can select that high half. Everything else must match: the eight
+    instruction bytes exactly, the literal's low half, and the printed high half must be the zero extension."""
+    if base_op(op) not in MIX_LITERAL_OPS or len(raw) != 12 or len(printed) != 12:
+        return None
+    if raw[:8] != printed[:8] or raw[8:10] != printed[8:10] or printed[10:] != b"\0\0" or raw[10:] == b"\0\0":
+        return None
+    if not any(((int.from_bytes(raw[4:8], "little") >> shift) & 0x1FF) == 0xFF for shift in (0, 9, 18)):
+        return None
+    return int.from_bytes(raw[8:], "little")
+
+
+def apply_mix_literal(ins, raw):
+    """Give each source encoded as the literal (SRC field 0xff) the whole dword; other immediates, inline
+    constants that happen to equal the literal's low half, stay as they are."""
+    lit = int.from_bytes(raw[8:], "little")
+    fields = int.from_bytes(raw[4:8], "little")
+    for i, shift in enumerate((0, 9, 18)):
+        if (fields >> shift) & 0x1FF == 0xFF and i + 1 < len(ins["args"]) and ins["args"][i + 1]["k"] == "imm":
+            ins["args"][i + 1]["v"] = lit
+    ins["enc"] = raw.hex()
+
+
 def check_printed_encodings(path, info):
     """A listing without undecodable words is translated from LLVM's text, which shows the instruction LLVM decoded,
     not the bytes it read. Where those bytes sit next to the listing (fssm/ or fspx/), each instruction's printed
@@ -13533,16 +13561,8 @@ def check_printed_encodings(path, info):
             continue
         enc = bytes.fromhex(ins["enc"])
         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
-        if (base_op(ins["op"]).startswith("v_fma_mix") and len(enc) == 12 and len(raw) == 12
-                and same_encoding(raw[:8], enc[:8], ins["op"], len(ins["args"])) and raw[8:10] == enc[8:10]):
-            # A VOP3P literal is a whole dword. llvm-mc prints it as an f16 (its low half) and re-encodes the
-            # high half as 0, but op_sel can select that high half of a mixed-precision operand: read the
-            # dword the blob holds. Only the high half may differ, so the printed operand is its low half.
-            lit = int.from_bytes(raw[8:], "little")
-            for x in ins["args"]:
-                if x["k"] == "imm" and x["v"] & 0xFFFF == lit & 0xFFFF:
-                    x["v"] = lit
-            ins["enc"] = raw.hex()
+        if mix_literal_high_half(raw, enc, ins["op"]) is not None:
+            apply_mix_literal(ins, raw)
             continue
         if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
@@ -13581,7 +13601,8 @@ def translate(path):
             enc = bytes.fromhex(ins["enc"])
             op, operand_count = ins["op"], len(ins["args"])
             skipped, at = 0, pos
-            while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
+            while not (same_encoding(blob[at:at + len(enc)], enc, op, operand_count)
+                       or mix_literal_high_half(blob[at:at + len(enc)], enc, op) is not None):
                 at += 4
                 skipped += 4
                 if skipped > 4096 or at >= len(blob):
@@ -13597,6 +13618,8 @@ def translate(path):
                 at = pos
                 ins["normalized"] = True
             ins["pc"] = at
+            if mix_literal_high_half(blob[at:at + len(enc)], enc, op) is not None:
+                apply_mix_literal(ins, blob[at:at + len(enc)])
             pos = at + len(enc)
         insns = fold_far_branches(insns)
         insns = reachable_code(insns)
