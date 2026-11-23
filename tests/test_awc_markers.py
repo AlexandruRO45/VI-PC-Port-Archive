@@ -193,6 +193,26 @@ class ScanTest(unittest.TestCase):
         self.assertEqual((report["banks"], report["streamed_music"]["events"], report["other"]["chunks"]), (1, 1, 0))
         self.assertIsNone(report["other"]["events_per_chunk"])
 
+    def test_out_in_a_missing_folder_is_created(self):
+        # --out reports/audio/markers.json used to end in a FileNotFoundError after the whole scan.
+        bank = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
+        out = os.path.join(self.tmp.name, "reports", "audio", "markers.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(awc_markers.main([bank, "--out", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["banks"], 1)
+
+    def test_an_out_it_cannot_write_is_one_line(self):
+        # A path under a file cannot be a folder: one error line and exit 2, not a traceback.
+        bank = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                awc_markers.main([bank, "--out", os.path.join(bank, "sub", "report.json")])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("cannot be written to", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_runs_under_python_dash_i(self):
         path = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
         proc = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True, timeout=120)
