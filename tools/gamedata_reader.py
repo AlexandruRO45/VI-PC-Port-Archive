@@ -308,7 +308,8 @@ def main(argv=None):
     try:
         s = run(a.targets, a.root, a.out)
     except FileNotFoundError as e:
-        print(f"ERROR: {e} does not exist", file=sys.stderr)
+        import gamedata_index as gi
+        print(f"ERROR: {gi.missing_file_line(e)}", file=sys.stderr)
         return 2
     except (OSError, ValueError, KeyError, TypeError) as e:
         # an unreadable file, or a carve folder whose index.json is not JSON or not the rpf9_carve.py shape

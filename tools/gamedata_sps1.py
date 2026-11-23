@@ -168,7 +168,7 @@ def _load_from_source(rows: list[dict], read_row) -> list[dict]:
     while i < len(rows):
         row = rows[i]
         head_hex = row.get("head", "")
-        if len(head_hex) >= 8 and not head_hex.lower().startswith("53505331"):
+        if gm.is_bink(row) or len(head_hex) >= 8 and not head_hex.lower().startswith("53505331"):
             i += 1
             continue
         data = read_row(row)
@@ -187,6 +187,7 @@ def _load_from_source(rows: list[dict], read_row) -> list[dict]:
                     "truncated" not in str(err)
                     or not (len(parts[-1]) > 0 and len(parts[-1]) % 65536 == 0)
                     or j + 1 >= len(rows)
+                    or gm.is_bink(rows[j + 1])
                 ):
                     raise
                 nxt = read_row(rows[j + 1])

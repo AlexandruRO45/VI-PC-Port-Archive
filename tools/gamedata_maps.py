@@ -297,13 +297,16 @@ def parse_payload(blob: bytes) -> dict:
     raise ValueError(f"unsupported payload magic {blob[:4]!r}")
 
 
+def is_bink(row: dict) -> bool:
+    """rpf9_carve.py saves a Bink 2 row as <off>.bk2, not .bin; it is a video, never a map or a continuation."""
+    return row.get("type") == "bink2"
+
+
 def _read_row(directory: str, row: dict) -> bytes:
-    path = os.path.join(directory, f'{row["off"]:012x}.bin')
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return bytes.fromhex(row.get("head", ""))
+    # A missing .bin raises FileNotFoundError naming it; the index head is 16 bytes, not the stream.
+    # Callers skip Bink rows (is_bink): they have no .bin to read.
+    with open(os.path.join(directory, f'{row["off"]:012x}.bin'), "rb") as f:
+        return f.read()
 
 
 def _join(row: dict, data: bytes) -> dict:
@@ -339,6 +342,9 @@ def read_payloads(directory: str, rows: list[dict] | None = None) -> list[dict]:
     out = []
     i = 0
     while i < len(rows):
+        if is_bink(rows[i]):
+            i += 1
+            continue
         data = _read_row(directory, rows[i])
         if data[:4] not in MAGIC:
             i += 1
@@ -351,6 +357,8 @@ def read_payloads(directory: str, rows: list[dict] | None = None) -> list[dict]:
         j = i
         # The header's size bounds the join, so any whole number of 64 KiB blocks may continue (as in gamedata_index).
         while size < target_size and rows[j].get("size", 0) and rows[j]["size"] % 65536 == 0 and j + 1 < len(rows):
+            if is_bink(rows[j + 1]):
+                break
             nxt = _read_row(directory, rows[j + 1])
             if nxt[:4] in MAGIC or nxt.startswith((b"<?xml", b"\xef\xbb\xbf<")):
                 break

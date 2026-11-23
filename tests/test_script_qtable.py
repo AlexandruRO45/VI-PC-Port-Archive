@@ -199,6 +199,26 @@ class ScriptQtableTests(unittest.TestCase):
             self.assertEqual(lines[0], f"ERROR: {missing}: does not exist")
             self.assertEqual(p.stdout, "")
 
+    def test_missing_carved_stream_names_the_stream_not_the_carve(self):
+        # An --index-only carve has index.json rows but no .bin; the error used to blame the carve folder itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "script.rpf")
+            os.mkdir(carve)
+            rows = [{"off": 0x1000, "stored": 64, "size": 128, "head": (b"PSIN" + bytes(12)).hex()}]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"archive": "synthetic", "files": 1}, "files": rows}, f)
+            p = subprocess.run(
+                [sys.executable, "-I", TOOL, carve],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            lines = [line for line in p.stderr.splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1, p.stderr)
+            stream = os.path.join(carve, "000000001000.bin")
+            self.assertEqual(lines[0], f"ERROR: {stream} is missing (an --index-only carve?). "
+                                       "Pass script.rpf instead, or carve without --index-only.")
+            self.assertEqual(p.stdout, "")
+
     def test_json_it_cannot_write_is_one_error_line_and_exit_2(self):
         # The scan succeeds and then the report cannot be written; that is not a payload verdict (exit 1).
         with tempfile.TemporaryDirectory() as tmp:

@@ -172,6 +172,29 @@ class GamedataSps1Test(unittest.TestCase):
             self.assertEqual(loaded[0]["size"], len(blob))
         self.assertEqual(gamedata_sps1.read_payloads(self.carve)[0]["chunks"], 2)
 
+    def add_bink(self):
+        # rpf9_carve.py saves a Bink 2 row as <off>.bk2 with type "bink2"; there is no .bin for it.
+        off = self.next_off
+        self.next_off += 0x1000
+        video = b"KB2j" + bytes(60)
+        with open(os.path.join(self.carve, f"{off:012x}.bk2"), "wb") as f:
+            f.write(video)
+        self.rows.append({"off": off, "stored": len(video), "size": len(video), "type": "bink2",
+                          "head": video[:16].hex(), "pre": ""})
+
+    def test_bink_rows_are_never_read_as_bin(self):
+        long_preset = "p_" + ("x" * 180) + ".sps"
+        entries = [(f"{long_preset[:-4]}_{i}.sps", f"fx_{i % 5}", i % 7) for i in range(400)]
+        blob = sps1_payload(entries)
+        self.assertGreater(len(blob), 65536)
+        self.add_bink()
+        self.add(blob[:65536])       # its continuation is missing: the next row is a video
+        self.add_bink()
+        self.finish()
+        with self.assertRaisesRegex(ValueError, "truncated") as cm:
+            gamedata_sps1.read_payloads(self.carve)
+        self.assertNotIsInstance(cm.exception, OSError)
+
     def test_exact_64k_sps1_does_not_absorb_following_opaque_row(self):
         # 8B header + 327 * 200B + 128B == 65,536B exact, followed by an opaque binary row.
         entries_64k = [(f"p{i:03d}_" + ("x" * 180) + ".sps", "fx_std", i % 7) for i in range(327)]

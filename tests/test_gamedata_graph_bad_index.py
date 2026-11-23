@@ -57,6 +57,17 @@ class BadGamedataGraphIndexTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             self.assert_one_error(self.run_tool(self.make_carve(td, {"files": [{"size": 4}]})))
 
+    def test_missing_stream_is_one_error_line(self):
+        # An --index-only carve has rows but no .bin: one ERROR line naming the stream, not "not found: [Errno 2] ...".
+        with tempfile.TemporaryDirectory() as td:
+            doc = {"files": [{"off": 0, "stored": len(XML), "size": len(XML), "head": XML[:16].hex()}]}
+            carve = self.make_carve(td, doc)
+            result = self.run_tool(carve)
+            self.assertNotIn("Traceback", result.stderr, result.stderr)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stderr.strip(), f"ERROR: {carve / '000000000000.bin'} is missing "
+                                                    "(an --index-only carve?). Carve without --index-only.")
+
     def test_valid_carve_still_reports(self):
         with tempfile.TemporaryDirectory() as td:
             doc = {"files": [{"off": 0, "stored": len(XML), "size": len(XML), "head": XML[:16].hex()}]}

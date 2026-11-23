@@ -138,6 +138,94 @@ class GamedataIndexTest(unittest.TestCase):
                 self.assertEqual(p.stdout, "")
         self.assertFalse(os.path.exists(os.path.join(self.root, "out.json")))
 
+    def test_missing_stream_is_an_error(self):
+        # An index-only carve, or one with a deleted stream, has rows but no .bin. Its 16 head bytes are not the
+        # stream: read as one, a complete document indexed as a header-less fragment and the run exited 0.
+        self.add(b'<?xml version="1.0"?>\n<Foo a="1"><Bar/></Foo>\n')
+        self.finish()
+        os.remove(os.path.join(self.carve, "000000001000.bin"))
+        source = T.DirectorySource(self.carve)
+        with self.assertRaises(OSError):
+            source.read(source.rows[0])
+        out = os.path.join(self.root, "out.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("000000001000.bin", p.stderr)
+        # The folder is a carve, so the hint is the archive route, not "give a carve folder".
+        self.assertIn("--index-only", p.stderr)
+        self.assertIn("--carve-dir", p.stderr)
+        self.assertNotIn("Give a carve folder", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_archive_stream_that_does_not_inflate_is_an_error(self):
+        # A --carve-dir index that does not match the archive points at bytes that are not a zlib stream.
+        rpf = os.path.join(self.root, "mismatch.rpf")
+        with open(rpf, "wb") as f:
+            f.write(bytes(0x1000) + b"\xff" * 64)
+        self.rows.append({"off": 0x1000, "stored": 64, "size": 50,
+                          "head": b'<?xml version="1.0"?><Foo/>'[:16].hex(), "pre": ""})
+        self.finish()
+        source = T.ArchiveSource(rpf, self.carve)
+        try:
+            with self.assertRaises(ValueError):
+                source.read(source.rows[0])
+        finally:
+            source.close()
+        p = self.run_tool(rpf, "--carve-dir", self.carve)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("0x1000", p.stderr)
+        self.assertIn(os.path.join(self.carve, "index.json"), p.stderr)
+        self.assertNotIn("ValueError(", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def mismatched_archive(self, body: bytes, row: dict) -> str:
+        rpf = os.path.join(self.root, "mismatch.rpf")
+        with open(rpf, "wb") as f:
+            f.write(bytes(0x1000) + body)
+        self.rows.append(row)
+        self.finish()
+        return rpf
+
+    def assert_mismatch(self, rpf, message):
+        source = T.ArchiveSource(rpf, self.carve)
+        try:
+            with self.assertRaisesRegex(ValueError, message):
+                source.read(source.rows[0])
+        finally:
+            source.close()
+        p = self.run_tool(rpf, "--carve-dir", self.carve)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+        self.assertRegex(p.stderr, "^ERROR: .*" + message)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_archive_row_past_the_end_is_an_error(self):
+        # Past the end the slice is b"", which inflates to b"" without a zlib error: it used to index as binary.
+        stream = zlib.compress(b'<?xml version="1.0"?><Foo/>')
+        rpf = self.mismatched_archive(stream, {"off": 0x9000, "stored": len(stream), "size": 27, "pre": "",
+                                               "head": stream[:16].hex()})
+        self.assert_mismatch(rpf, "runs past the archive end")
+
+    def test_archive_stream_cut_short_is_an_error(self):
+        # A cut-short stream inflates partway without a zlib error: it used to index as an incomplete document.
+        doc = b'<?xml version="1.0"?>\n<Foo>' + b"<Bar/>" * 200 + b"</Foo>\n"
+        stream = zlib.compress(doc)
+        rpf = self.mismatched_archive(stream, {"off": 0x1000, "stored": len(stream) // 2, "size": len(doc),
+                                               "pre": "", "head": doc[:16].hex()})
+        self.assert_mismatch(rpf, "is cut short")
+
+    def test_archive_reads_a_matching_stream(self):
+        doc = b'<?xml version="1.0"?>\n<Foo a="1"><Bar/></Foo>\n'
+        stream = zlib.compress(doc)
+        rpf = self.mismatched_archive(stream, {"off": 0x1000, "stored": len(stream), "size": len(doc),
+                                               "pre": "", "head": doc[:16].hex()})
+        source = T.ArchiveSource(rpf, self.carve)
+        try:
+            self.assertEqual(source.read(source.rows[0]), doc)
+        finally:
+            source.close()
+
     def test_directory_groups_chunks_and_roots(self):
         self.add(b'<?xml version="1.0"?>\n<RootA><!-- synthetic fixture, longer than 64 bytes --><Item value="1"/></RootA>')
         second = b'<?xml version="1.0"?>\n<RootB>' + b"x" * (65536 - len(b'<?xml version="1.0"?>\n<RootB>'))

@@ -178,6 +178,20 @@ def magic_name(data: bytes) -> str:
 CARVED_STREAM = re.compile(r"[0-9a-f]{12}\.(?:bin|bk2)")
 
 
+def missing_file_line(exc: FileNotFoundError, remedy: str = "Carve without --index-only.",
+                      absent: str = "{} does not exist") -> str:
+    """The one-line message (without "ERROR: ") for a FileNotFoundError from a strict carve read.
+
+    A missing `<offset>.bin`/`.bk2` beside an index.json is a carve whose streams were not written (--index-only) or
+    were deleted, not a missing input: it is named with `remedy`. Anything else is `absent` formatted with the path.
+    """
+    name = exc.filename
+    missing = os.fsdecode(name) if isinstance(name, (str, bytes)) else str(exc)
+    if CARVED_STREAM.fullmatch(os.path.basename(missing)):
+        return f"{missing} is missing (an --index-only carve?). {remedy}"
+    return absent.format(missing)
+
+
 def carved_stream(address: str, directory: str):
     """The carved stream a report at `address` would overwrite in `directory`, or None.
 
@@ -200,17 +214,19 @@ class DirectorySource:
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
 
     def read(self, row: dict) -> bytes:
+        # A missing or unreadable stream (an --index-only carve, a deleted .bin) raises OSError naming the file.
+        # Its 16 index head bytes are not the stream: read as one, XML indexed as fragments and resources as binary.
         ext = ".bk2" if row.get("type") == "bink2" else ".bin"
-        path = os.path.join(self.directory, f'{row["off"]:012x}{ext}')
-        try:
-            with open(path, "rb") as f:
-                return f.read()
-        except OSError:
-            return bytes.fromhex(row.get("head", ""))
+        with open(os.path.join(self.directory, f'{row["off"]:012x}{ext}'), "rb") as f:
+            return f.read()
 
     @property
     def summary(self) -> dict:
         return self.index.get("summary", {})
+
+
+class IndexMismatch(ValueError):
+    """An index.json row that does not describe a whole stream of the archive it is read against."""
 
 
 class ArchiveSource:
@@ -219,6 +235,8 @@ class ArchiveSource:
     def __init__(self, archive: str, index_dir: str | None = None):
         self.archive = archive
         self._tmp = None
+        # Names the index in a mismatch error; one rpf9_carve.py has just made from this archive has no path to give.
+        self.index_name = os.path.join(index_dir, "index.json") if index_dir else "the index rpf9_carve.py made"
         if index_dir is None:
             self._tmp = tempfile.TemporaryDirectory(prefix="gamedata-index-")
             index_dir = self._tmp.name
@@ -233,14 +251,22 @@ class ArchiveSource:
         self._map = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
 
     def read(self, row: dict) -> bytes:
+        # A row that does not match the archive raises IndexMismatch. Slicing past the end gives b"" and a cut-short
+        # stream inflates partway without a zlib error, so both used to index as a silent stand-in.
+        off, stored = row["off"], row["stored"]
+        mismatch = f"{self.index_name} does not match {self.archive}: the stream at {off:#x}"
+        if off + stored > len(self._map):
+            raise IndexMismatch(f"{mismatch} ({stored} bytes) runs past the archive end at {len(self._map):#x}")
         if row.get("type") == "bink2":
-            return self._map[row["off"]:row["off"] + min(row["stored"], 64)]
+            return self._map[off:off + min(stored, 64)]
+        d = zlib.decompressobj()
         try:
-            d = zlib.decompressobj()
-            out = d.decompress(self._map[row["off"]:row["off"] + row["stored"]])
-            return out + d.flush()
-        except zlib.error:
-            return bytes.fromhex(row.get("head", ""))
+            out = d.decompress(self._map[off:off + stored]) + d.flush()
+        except zlib.error as e:
+            raise IndexMismatch(f"{mismatch} does not inflate ({e})") from e
+        if not d.eof:   # rpf9_carve.py indexes only streams that inflate to their end
+            raise IndexMismatch(f"{mismatch} is cut short: its {stored} bytes do not inflate to the stream end")
+        return out
 
     @property
     def summary(self) -> dict:
@@ -453,8 +479,13 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     except FileNotFoundError as e:
-        print(f"ERROR: {e.filename} is missing. Give a carve folder from rpf9_carve.py or an .rpf archive.",
-              file=sys.stderr)
+        # A missing stream: the folder has an index.json, so it is a carve whose streams were not written or deleted.
+        line = missing_file_line(e, f"Pass the .rpf with --carve-dir {a.target}, or carve without --index-only.",
+                                 "{} is missing. Give a carve folder from rpf9_carve.py or an .rpf archive.")
+        print(f"ERROR: {line}", file=sys.stderr)
+        return 2
+    except IndexMismatch as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 2
     except (OSError, ValueError, KeyError, TypeError) as e:
         where = getattr(e, "filename", None) or a.target

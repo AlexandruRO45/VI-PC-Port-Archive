@@ -47,6 +47,7 @@ from collections import Counter, defaultdict, deque
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+import gamedata_index as gi  # noqa: E402
 import gamedata_xml as gx  # noqa: E402
 
 MANIFEST_ROOTS = ("CDataFileMgr__ContentChangeSetDef", "CDataFileMgr__ContentDef")
@@ -612,7 +613,7 @@ def main() -> int:
 
         documents = list(gx.load_documents(args.targets))
     except FileNotFoundError as exc:
-        print(f"not found: {exc}", file=sys.stderr)
+        print(f"ERROR: {gi.missing_file_line(exc)}", file=sys.stderr)
         return 2
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

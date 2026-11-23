@@ -702,7 +702,7 @@ def main() -> int:
         for doc in load_documents(args.targets):
             rows.append(file_row(doc, scan_xml(doc["data"])))
     except FileNotFoundError as exc:
-        print(f"not found: {exc}", file=sys.stderr)
+        print(f"ERROR: {gi.missing_file_line(exc)}", file=sys.stderr)
         return 2
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

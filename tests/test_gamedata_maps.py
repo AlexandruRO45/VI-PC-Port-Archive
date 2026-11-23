@@ -261,6 +261,56 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(mhiu["chunks"], 2)
         self.assertEqual(mhiu["grid"]["width"], 300)
 
+    def test_missing_stream_is_named_not_read_as_its_head(self):
+        # An index-only carve has rows but no .bin. The 16 head bytes used to stand in for the stream, so a map
+        # failed as "truncated MHIU header", blaming the payload instead of the missing file.
+        self.add(mhiu_payload(4, 3, [(0, 0, []), (0, 0, []), (0, 0, [])], pixels=b""))
+        self.finish()
+        os.remove(os.path.join(self.carve, "000000001000.bin"))
+        with self.assertRaises(FileNotFoundError) as cm:
+            gamedata_maps.read_payloads(self.carve)
+        self.assertIn("000000001000.bin", cm.exception.filename)
+        result = subprocess.run([sys.executable, "-I", TOOL, self.carve],
+                                capture_output=True, text=True, errors="replace")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("000000001000.bin", result.stderr)
+        self.assertNotIn("truncated", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def add_bink(self):
+        # rpf9_carve.py saves a Bink 2 row as <off>.bk2 with type "bink2"; there is no .bin for it.
+        off = self.next_off
+        self.next_off += 0x1000
+        video = b"KB2j" + bytes(60)
+        with open(os.path.join(self.carve, f"{off:012x}.bk2"), "wb") as f:
+            f.write(video)
+        self.rows.append({"off": off, "stored": len(video), "size": len(video), "type": "bink2", "w": 64, "h": 64,
+                          "head": video[:16].hex(), "pre": ""})
+
+    def test_bink_rows_are_skipped_not_read_as_bin(self):
+        # A full carve of an archive with Bink 2 videos has .bk2 rows; reading <off>.bin for them failed the run.
+        self.add_bink()
+        self.add(mhiu_payload(4, 3, [(0, 0, []), (0, 0, []), (0, 0, [])], pixels=b""))
+        self.add_bink()
+        self.finish()
+        p, data = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual([x["offset"] for x in data["payloads"]], [0x2000])
+
+    def test_continuation_stops_at_a_bink_row(self):
+        # A 64 KiB first stream whose next row is a video has lost its continuation; the map is truncated.
+        payload = mhiu_payload(300, 1, [(0, 300, [i % 256 for i in range(300)])], pixels=b"\x07" * 90000)
+        self.add(payload, [payload[:65536]])
+        self.add_bink()
+        self.finish()
+        with self.assertRaises(ValueError) as cm:
+            gamedata_maps.read_payloads(self.carve)
+        self.assertNotIsInstance(cm.exception, OSError)
+        p, _ = self.run_tool()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn(".bin", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
     def test_reports_an_unwritable_json_destination(self):
         self.finish()
         blocker = os.path.join(self.root, "blocker")

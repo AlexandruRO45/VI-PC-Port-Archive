@@ -161,7 +161,7 @@ def carve_documents(directory):
     """Yield (offset, stored size, document) for XML payloads in an existing carve.
 
     Existing grouping determines spans; it does not recover encrypted TOC names.
-    Strict reads prevent missing .bin files falling back to index header bytes.
+    A missing .bin raises OSError; a .bk2 is read only as far as grouping needs.
     Non-content XML yields None; malformed content raises ContentError.
     """
     tools_dir = os.path.dirname(os.path.abspath(__file__))

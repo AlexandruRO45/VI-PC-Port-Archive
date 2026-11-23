@@ -594,8 +594,10 @@ def main(argv=None) -> int:
     except UsageError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
-    except FileNotFoundError:
-        print(f"ERROR: {a.target}: does not exist", file=sys.stderr)
+    except FileNotFoundError as e:
+        # A row's missing .bin is named, not the carve folder that holds it; script.rpf itself carves to a temp folder.
+        line = gi.missing_file_line(e, "Pass script.rpf instead, or carve without --index-only.", "{}: does not exist")
+        print(f"ERROR: {line}", file=sys.stderr)
         return 2
     except OSError as e:
         print(f"ERROR: cannot read {a.target}: {e.strerror or e}", file=sys.stderr)
