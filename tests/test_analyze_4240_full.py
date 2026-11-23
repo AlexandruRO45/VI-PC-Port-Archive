@@ -252,5 +252,19 @@ class Analyze4240Test(unittest.TestCase):
                 self.assertEqual(stats["blocks_6330"], n)
 
 
+class WriteJsonReportPreserveTest(unittest.TestCase):
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '[{"previous": true}]'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(A, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    A.write_json_report(path, [{"new": True}])
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -11,13 +11,17 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import zlib
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # Constants from meshlet_page.py
 BLOCK_MAGIC = 0x3063       # 63 30 00 00
@@ -324,16 +328,48 @@ def main() -> int:
             s_copy["strides_from_slot0"] = {str(k): v for k, v in s["strides_from_slot0"].items()}
             s_copy["slot_tag_counts"] = {str(k): v for k, v in s["slot_tag_counts"].items()}
             output.append(s_copy)
-        parent = os.path.dirname(os.path.abspath(args.json))
         try:
-            if parent:      # every archive has been read by now; a missing folder used to lose the run
-                os.makedirs(parent, exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(output, f, indent=2)
+            write_json_report(args.json, output)
         except OSError as e:
             print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
             return 2
     return status
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:  # every archive has been read by now; a missing folder used to lose the run
+        os.makedirs(parent, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".analyze_4240_full-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=2)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
