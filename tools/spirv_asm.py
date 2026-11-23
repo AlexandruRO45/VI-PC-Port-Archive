@@ -123,6 +123,8 @@ def _unquote_string(tok: str, lineno: int) -> str:
     if len(tok) < 2 or tok[0] != '"' or tok[-1] != '"':
         raise SpirvAsmError(f"line {lineno}: expected string literal, got {tok!r}")
     raw = tok[1:-1]
+    if "\0" in raw:
+        raise SpirvAsmError(f"line {lineno}: string literal contains a NUL character")
     if "\\" not in raw:
         return raw
     # SPIRV-Tools decodes \<ch> as the literal character <ch> (e.g. \n -> 'n', \" -> '"', \\ -> '\').

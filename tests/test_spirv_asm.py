@@ -75,6 +75,35 @@ class SpirvAsmUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 10: type ID %node_ptr is already defined"):
             spirv_asm.assemble(asm.replace(declaration, declaration * 2))
 
+    def test_literal_strings_cannot_contain_a_nul_character(self):
+        for separator in ("\0", "\\" + "\0"):
+            with self.subTest(separator=separator):
+                asm = f'; test string\n%s = OpString "a{separator}b"\n'
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"^line 2: string literal contains a NUL"):
+                    spirv_asm.assemble(asm)
+
+        # Backslash plus the digit zero is an escaped ordinary character.
+        words = _literal_words(spirv_asm.assemble(r'%s = OpString "a\0b"'), 7, 1)
+        self.assertEqual(words, [int.from_bytes(b"a0b\0", "little")])
+
+    def test_cli_preserves_output_when_assembly_contains_a_nul_literal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "source.spvasm")
+            output = os.path.join(directory, "output.spv")
+            previous = spirv_asm.assemble("OpNop\n")
+            with open(source, "wb") as f:
+                f.write(b'%s = OpString "a\0b"\n')
+            with open(output, "wb") as f:
+                f.write(previous)
+            result = subprocess.run(
+                [sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), source, "-o", output],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("line 1: string literal contains a NUL", result.stderr)
+            with open(output, "rb") as f:
+                self.assertEqual(f.read(), previous)
+
     def test_assembler_leaves_non_type_redefinitions_to_validator(self):
         for body in (
             "%t = OpTypeBool\n%t = OpUndef %uint\n",
