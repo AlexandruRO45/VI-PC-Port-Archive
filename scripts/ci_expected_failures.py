@@ -4,7 +4,8 @@
 
 FAILED_LIST is a file with one failed test name per line, EXIT_STATUS the test runner's exit status, and each
 EXPECTED argument one or more whitespace-separated test names (so a workflow can pass one quoted list). Exits 1 when a
-test outside EXPECTED failed, or when the runner failed without naming a test (a crash, a build error). An expected
+test outside EXPECTED failed, or when the runner failed without naming a test (a crash, a build error); 2 on a usage
+error, including a non-integer EXIT_STATUS or a FAILED_LIST that cannot be read, reported as one line. An expected
 failure that passed gets a GitHub Actions notice, so the list in the workflow can shrink.
 """
 
@@ -29,10 +30,19 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__.strip(), file=sys.stderr)
         return 2
-    with open(argv[0], encoding="utf-8") as f:
-        failed = [line.strip() for line in f if line.strip()]
+    try:
+        status = int(argv[1])
+    except ValueError:
+        print(f"ci_expected_failures: EXIT_STATUS {argv[1]!r} is not an integer", file=sys.stderr)
+        return 2
+    try:
+        with open(argv[0], encoding="utf-8") as f:
+            failed = [line.strip() for line in f if line.strip()]
+    except OSError as e:
+        print(f"ci_expected_failures: {argv[0]}: {e.strerror or e}", file=sys.stderr)
+        return 2
     expected = [name for arg in argv[2:] for name in arg.split()]
-    code, lines = judge(failed, int(argv[1]), expected)
+    code, lines = judge(failed, status, expected)
     print("\n".join(lines))
     return code
 
