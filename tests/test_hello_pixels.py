@@ -61,6 +61,16 @@ class TestCheckImage(unittest.TestCase):
         with self.assertRaises(AssertionError):
             hp.check_image(bytes(px), W, H)
 
+    def test_rejects_nonfinite_channels(self):
+        x, y = 3, 3
+        for channel in range(4):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(channel=channel, value=value):
+                    pixels = bytearray(make_image())
+                    struct.pack_into("<f", pixels, ((y * W + x) * 4 + channel) * 4, value)
+                    with self.assertRaisesRegex(AssertionError, rf"pixel \(3,3\).*channel {channel}"):
+                        hp.check_image(pixels, W, H)
+
     def test_expected_pixel_corners(self):
         # u rises left->right, v rises bottom->top (row 0 is the top of the image).
         bottom_left = hp.expected_pixel(0, H - 1, W, H)

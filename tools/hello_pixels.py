@@ -13,6 +13,7 @@ Everything it writes is synthetic and safe to keep; no game data is touched or p
 """
 
 import json
+import math
 import os
 import shutil
 import struct
@@ -215,7 +216,7 @@ def check_image(data: bytes, width: int, height: int):
             got = pixels[i : i + 4]
             want_px = expected_pixel(x, y, width, height)
             for c in range(4):
-                if abs(got[c] - want_px[c]) > 0.04:
+                if not math.isfinite(got[c]) or abs(got[c] - want_px[c]) > 0.04:
                     raise AssertionError(
                         f"pixel ({x},{y}) is {[round(g, 4) for g in got]}, "
                         f"expected {[round(w, 4) for w in want_px]} channel {c}"
