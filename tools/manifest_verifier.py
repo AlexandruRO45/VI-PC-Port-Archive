@@ -65,6 +65,66 @@ def _file_stamp(st: os.stat_result) -> tuple[int, int, int]:
     return st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
 
+# A verify cache remembers which files matched, so a second run does not re-hash 200 GB of unchanged package.
+# It is only ever a shortcut for a file whose identity and content the cache can still vouch for.
+CACHE_VERSION = 1
+RACY_NS = 3 * 1_000_000_000     # a file written this recently may change again within one timestamp tick
+
+
+def cache_stamp(st: os.stat_result) -> list[int]:
+    """Identity of a file for the cache: size, both timestamps, and the device/inode it lived on.
+
+    `st_ino` catches a file replaced by a same-size copy with both timestamps restored; `st_dev` keeps that
+    meaningful across mount points."""
+    return [st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            getattr(st, "st_dev", 0), getattr(st, "st_ino", 0)]
+
+
+def load_cache(path: str) -> dict[str, dict]:
+    """The cache's entries, or {} when it is absent, foreign, or unreadable — never a hard failure."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as err:
+        print(f"warning: ignoring unreadable cache {path}: {err}", file=sys.stderr)
+        return {}
+    if not isinstance(raw, dict) or raw.get("version") != CACHE_VERSION:
+        print(f"warning: ignoring cache {path}: version {raw.get('version') if isinstance(raw, dict) else '?'}"
+              f" is not {CACHE_VERSION}", file=sys.stderr)
+        return {}
+    entries = raw.get("entries")
+    if not isinstance(entries, dict):
+        print(f"warning: ignoring cache {path}: no entries object", file=sys.stderr)
+        return {}
+    return {k: v for k, v in entries.items() if isinstance(v, dict)}
+
+
+def save_cache(path: str, entries: dict[str, dict]) -> None:
+    """Write atomically: a killed run must not leave a half cache that the next run trusts."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"version": CACHE_VERSION, "entries": entries}, f, indent=0, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def cache_hit(entry: Optional[dict], abs_path: str, expected_sha256: str) -> bool:
+    """A hit needs the same expected hash *and* the same stamp: a changed manifest must not be laundered."""
+    if not entry:
+        return False
+    if str(entry.get("sha256", "")).lower() != expected_sha256.lower():
+        return False
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        return False
+    return entry.get("stamp") == cache_stamp(st)
+
+
 def sha256_file(path: str, chunk_size: int = CHUNK, *, expected_size: int | None = None) -> str:
     """Hash a stable open file, refusing a resize, rewrite or path replacement during the read."""
     h = hashlib.sha256()
@@ -203,6 +263,8 @@ class ManifestReport:
     bytes_verified: int = 0
     elapsed_seconds: float = 0.0
     strict: bool = False
+    cached_count: int = 0
+    bytes_cached: int = 0
 
     def count_problems(self, *, strict: Optional[bool] = None) -> int:
         count = len(self.missing) + len(self.size_mismatch) + len(self.hash_mismatch) + len(self.unreadable)
@@ -229,6 +291,8 @@ class ManifestReport:
             "untracked": self.untracked,
             "problems": self.problems,
             "bytes_verified": self.bytes_verified,
+            "cached_count": self.cached_count,
+            "bytes_cached": self.bytes_cached,
             "elapsed_seconds": round(self.elapsed_seconds, 4),
         }
 
@@ -240,6 +304,7 @@ def verify_manifest(
     progress_callback: Optional[Callable[[ProgressInfo], None]] = None,
     progress_stream: Optional[TextIO] = None,
     strict: bool = False,
+    cache: Optional[str] = None,
 ) -> ManifestReport:
     """Verifies target_dir against manifest_path, optionally in parallel."""
     try:
@@ -253,6 +318,12 @@ def verify_manifest(
 
     want = load_manifest(manifest_path)
     have = dict(walk(target_dir, exclude=manifest_path))
+    cache_entries: dict[str, dict] = {}
+    cache_real = os.path.realpath(cache) if cache else None
+    if cache:
+        cache_entries = load_cache(cache)
+        # A cache inside the tree must not be verified as if it were part of the package.
+        have = {rel: p for rel, p in have.items() if os.path.realpath(p) != cache_real}
     if not want and have:
         # A cut-short create or a mistyped --manifest would otherwise print OK without checking a file.
         raise ManifestError(f"{manifest_path} lists no files, but {target_dir} holds {len(have)}")
@@ -262,6 +333,8 @@ def verify_manifest(
     unreadable_map: dict[str, str] = {}
     pending: list[tuple[str, str, int, str]] = []
     total_manifest_bytes = 0
+    cached_count = 0
+    bytes_cached = 0
 
     for rel in sorted(want.keys()):
         info = want[rel]
@@ -280,6 +353,11 @@ def verify_manifest(
             problems[rel] = "SIZE"
             continue
         expected_sha256 = info["sha256"]
+        if cache and cache_hit(cache_entries.get(os.path.realpath(abs_p)), abs_p, expected_sha256):
+            cached_count += 1
+            bytes_cached += actual_size
+            total_manifest_bytes += actual_size
+            continue        # matched by the cache: not hashed, so it is not pending
         pending.append((rel, abs_p, actual_size, expected_sha256))
         total_manifest_bytes += actual_size
 
@@ -287,6 +365,7 @@ def verify_manifest(
     completed_files = 0
     completed_bytes = 0
     bytes_verified = 0
+    cache_dirty = False
     t0 = time.time()
 
     def hash_worker(rel: str, abs_p: str, size: int, expected_hash: str) -> tuple[str, int, str, Optional[str]]:
@@ -308,6 +387,22 @@ def verify_manifest(
             problems[rel] = status
             if status == "UNREADABLE" and err_msg:
                 unreadable_map[rel] = err_msg
+            if cache:
+                # A mismatch drops any stale entry: the cache records passes, never failures.
+                cache_entries.pop(os.path.realpath(have.get(rel, rel)), None)
+        elif cache:
+            nonlocal cache_dirty
+            abs_p = have.get(rel)
+            try:
+                st = os.stat(abs_p) if abs_p else None
+            except OSError:
+                st = None
+            if st is not None and time.time_ns() - st.st_mtime_ns >= RACY_NS:
+                key = os.path.realpath(abs_p)
+                entry = {"stamp": cache_stamp(st), "sha256": want[rel]["sha256"]}
+                if cache_entries.get(key) != entry:
+                    cache_entries[key] = entry
+                    cache_dirty = True
 
         elapsed = max(time.time() - t0, 1e-6)
         rate_mib = (completed_bytes / elapsed) / (1024 * 1024)
@@ -365,6 +460,12 @@ def verify_manifest(
         else:
             matched.append(rel)
 
+    if cache and cache_dirty:
+        try:
+            save_cache(cache, cache_entries)
+        except OSError as err:
+            print(f"warning: cannot write cache {cache}: {err}", file=sys.stderr)
+
     problem_count = len(missing) + len(size_mismatch) + len(hash_mismatch) + len(unreadable)
     passed = (problem_count == 0) and (not strict or len(untracked) == 0)
     elapsed_total = time.time() - t0
@@ -382,6 +483,8 @@ def verify_manifest(
         bytes_verified=bytes_verified,
         elapsed_seconds=elapsed_total,
         strict=strict,
+        cached_count=cached_count,
+        bytes_cached=bytes_cached,
     )
 
 
@@ -407,7 +510,10 @@ def print_report(
     if bad == 0:
         if verbose:
             gib = report.bytes_verified / (1024**3)
-            out.write(f"OK ({len(report.matched)} files, {gib:.2f} GiB in {report.elapsed_seconds:.2f}s)\n")
+            spared = (f", {report.cached_count} from cache ({report.bytes_cached / (1024**3):.2f} GiB hashed less)"
+                      if report.cached_count else "")
+            out.write(f"OK ({len(report.matched)} files, {gib:.2f} GiB in {report.elapsed_seconds:.2f}s"
+                      f"{spared})\n")
         else:
             out.write("OK\n")
     else:
@@ -434,6 +540,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--verbose", "-v", action="store_true", help="Print verbose summary statistics")
     ap.add_argument("--json", action="store_true", help="Output verification report as JSON")
     ap.add_argument("--strict", action="store_true", help="Fail if untracked (NEW) files exist")
+    ap.add_argument("--cache", metavar="PATH", default=None,
+                    help="Remember files that matched here and skip re-hashing them next run "
+                         "(a hit needs the same manifest SHA-256 and an unchanged size/mtime/ctime/inode; "
+                         "only passes are recorded)")
     return ap
 
 
@@ -463,6 +573,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             jobs=args.jobs,
             progress_stream=progress_stream,
             strict=args.strict,
+            cache=args.cache,
         )
     except ManifestError as err:
         print(f"ERROR: {err}", file=sys.stderr)

@@ -804,5 +804,166 @@ class TestStableHashing(unittest.TestCase):
             mv.sha256_file(path)
 
 
+class TestVerifyCache(unittest.TestCase):
+    """The --cache path (BUILD-1328). Its whole promise is "a second run skips files that provably did not
+    change", so every test here is about what must NOT be skipped."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.game_dir = os.path.join(self.root, "game")
+        os.makedirs(self.game_dir, exist_ok=True)
+        self.files = {"one.bin": 4096, "two.bin": 8192, "sub/three.bin": 2048}
+        self.payloads = {}
+        for rel, size in self.files.items():
+            abs_p = os.path.join(self.game_dir, *rel.split("/"))
+            os.makedirs(os.path.dirname(abs_p), exist_ok=True)
+            data = make_payload(size, rel)
+            with open(abs_p, "wb") as f:
+                f.write(data)
+            self.payloads[rel] = data
+        self.backdate()          # outside the racy window, or nothing may be cached at all
+        self.manifest_path = os.path.join(self.root, "manifest.json")
+        self.write_manifest({rel: data for rel, data in self.payloads.items()})
+        self.cache = os.path.join(self.root, "verify-cache.json")
+
+    def write_manifest(self, files_map, path=None) -> str:
+        path = path or self.manifest_path
+        entries = {rel: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                   for rel, data in files_map.items()}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"created": "2026-11-22 00:00:00", "files": entries}, f)
+        return path
+
+    def backdate(self, rel=None) -> None:
+        when = 1_600_000_000  # far in the past: mtime and atime
+        paths = [os.path.join(self.game_dir, *rel.split("/"))] if rel else \
+                [os.path.join(self.game_dir, *r.split("/")) for r in self.files]
+        for p in paths:
+            os.utime(p, (when, when))
+
+    def verify(self, **kw):
+        return mv.verify_manifest(target_dir=self.game_dir, manifest_path=self.manifest_path,
+                                  cache=self.cache, **kw)
+
+    # ---- what the cache is for
+    def test_second_run_hashes_nothing_and_still_passes(self):
+        first = self.verify()
+        self.assertTrue(first.passed, first.problems)
+        self.assertEqual(first.cached_count, 0)
+        self.assertGreater(first.bytes_verified, 0)
+
+        second = self.verify()
+        self.assertTrue(second.passed, second.problems)
+        self.assertEqual(second.cached_count, len(self.files))
+        self.assertEqual(second.bytes_verified, 0, "a cache hit must not hash the file")
+        self.assertGreater(second.bytes_cached, 0)
+
+    def test_without_the_flag_behaviour_is_unchanged(self):
+        r1 = mv.verify_manifest(target_dir=self.game_dir, manifest_path=self.manifest_path)
+        r2 = mv.verify_manifest(target_dir=self.game_dir, manifest_path=self.manifest_path)
+        for r in (r1, r2):
+            self.assertTrue(r.passed)
+            self.assertEqual(r.cached_count, 0)
+            self.assertGreater(r.bytes_verified, 0, "no --cache means every file is hashed every time")
+
+    # ---- what must never be skipped
+    def test_same_size_rewrite_is_still_changed(self):
+        self.verify()
+        rel = "two.bin"
+        abs_p = os.path.join(self.game_dir, rel)
+        st = os.stat(abs_p)
+        with open(abs_p, "wb") as f:
+            f.write(make_payload(self.files[rel], "different seed"))
+        os.utime(abs_p, ns=(st.st_atime_ns, st.st_mtime_ns))    # the classic cache trap: mtime restored
+        after = self.verify()
+        self.assertFalse(after.passed)
+        self.assertIn(rel, after.hash_mismatch, "a same-size rewrite with the old mtime must still be CHANGED")
+
+    def test_a_changed_manifest_hash_invalidates_the_entry(self):
+        self.verify()
+        rel = "one.bin"
+        bumped = dict(self.payloads)
+        bumped[rel] = make_payload(self.files[rel], "the manifest now expects something else")
+        self.write_manifest(bumped)
+        after = self.verify()
+        self.assertEqual(after.cached_count, len(self.files) - 1)
+        self.assertIn(rel, after.hash_mismatch)
+
+    def test_only_passes_are_recorded(self):
+        rel = "sub/three.bin"
+        abs_p = os.path.join(self.game_dir, *rel.split("/"))
+        with open(abs_p, "wb") as f:
+            f.write(make_payload(self.files[rel], "corrupted"))     # same size: it must be hashed, not size-failed
+        self.backdate(rel)
+        bad = self.verify()
+        self.assertIn(rel, bad.hash_mismatch)
+        with open(self.cache, encoding="utf-8") as f:
+            entries = json.load(f)["entries"]
+        self.assertNotIn(os.path.realpath(abs_p), entries, "a failing file must not be cached")
+
+    def test_a_file_in_the_racy_window_is_not_cached(self):
+        rel = "one.bin"
+        abs_p = os.path.join(self.game_dir, rel)
+        os.utime(abs_p, None)              # written "just now"
+        self.verify()
+        with open(self.cache, encoding="utf-8") as f:
+            entries = json.load(f)["entries"]
+        self.assertNotIn(os.path.realpath(abs_p), entries)
+        self.assertGreater(self.verify().bytes_verified, 0, "an uncacheable file is hashed again")
+
+    # ---- robustness
+    def test_cache_inside_the_tree_is_not_verified_as_a_file(self):
+        self.cache = os.path.join(self.game_dir, "verify-cache.json")
+        self.verify()
+        report = self.verify(strict=True)
+        self.assertTrue(report.passed, f"the cache file showed up as a problem: {report.problems} {report.untracked}")
+        self.assertEqual(report.untracked, [])
+
+    def test_corrupt_cache_is_ignored_with_a_warning(self):
+        with open(self.cache, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            report = self.verify()
+        self.assertTrue(report.passed)
+        self.assertEqual(report.cached_count, 0)
+        self.assertIn("cache", err.getvalue().lower())
+
+    def test_foreign_cache_version_is_ignored(self):
+        with open(self.cache, "w", encoding="utf-8") as f:
+            json.dump({"version": 999, "entries": {}}, f)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            report = self.verify()
+        self.assertTrue(report.passed)
+        self.assertEqual(report.cached_count, 0)
+        self.assertIn("version", err.getvalue())
+
+    def test_parallel_and_serial_agree(self):
+        serial = self.verify(jobs=1)
+        shutil_path = self.cache + ".parallel"
+        try:
+            par = mv.verify_manifest(target_dir=self.game_dir, manifest_path=self.manifest_path,
+                                     jobs=4, cache=shutil_path)
+        finally:
+            self.cache = shutil_path
+        self.assertEqual(par.passed, serial.passed)
+        self.assertEqual(par.cached_count, serial.cached_count)
+        again = self.verify(jobs=4)
+        self.assertEqual(again.cached_count, len(self.files))
+
+    def test_json_output_reports_the_cache(self):
+        self.verify()
+        proc = subprocess.run([sys.executable, "-I", TOOL, "--json", "--manifest", self.manifest_path,
+                               "--cache", self.cache, self.game_dir],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["cached_count"], len(self.files))
+        self.assertEqual(doc["bytes_verified"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
