@@ -98,8 +98,9 @@ A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file 
 `GetFileAttributesExA/W` and `DeleteFileA/W` (`runtime/shims/file_system.cpp`), under `kernel32.dll`, `kernelbase.dll`
 and the `api-ms-win-core-file-*` sets a GDK title links against.
 
-- A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. A path without the prefix is a host path and is
-  passed to the host unchanged. `--game-dir` defaults to the image's folder. `gta6rt` makes it and `--overlay`
+- A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. Other paths keep their host interpretation unless
+  they are relative to a logical console current directory, as described below. `--game-dir` defaults to the image's folder.
+  `gta6rt` makes it and `--overlay`
   absolute at startup, so a bare image name (`gta6rt --run game.exe` from the game folder) and a relative folder
   both keep naming the same place after the title changes its current directory (CTest `run_tiny_game_dir`).
   `G:\` is the same folder as `GAME:`, and `T:\` is a scratch folder, `<overlay>\.gta6rt-temp`, that `GAME:` does
@@ -108,6 +109,19 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
   `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
   is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
+- `SetCurrentDirectoryA/W` selects an existing directory in the merged package/overlay view. `GetCurrentDirectoryA/W`
+  then reports its normalized logical path, using `GAME:\` for both `GAME:` and `G:\`, or `T:\` for scratch. Relative
+  file names and directory changes use this directory, and a single leading separator starts at its console drive's
+  root. The file operations below continue to read the merged view and write only the overlay. An unsuccessful directory
+  change preserves the previous directory. A successful absolute host directory change returns to host path handling.
+  The runtime's own host current directory stays independent while a console directory is selected.
+- The current-directory shims are registered under `kernel32.dll`, `kernelbase.dll` and
+  `api-ms-win-core-processenvironment-l1-1-0.dll`. Getters return the required size including the NUL for a short buffer,
+  without changing its contents, and the length excluding the NUL when it fits. A retained directory handle and checks
+  on virtual directory operations prevent removal or movement of the current directory until it changes. Configuring
+  new package/overlay roots resets this state. Drive-qualified names such as `C:relative`, `G:relative` and `T:relative`,
+  and UNC/device paths, retain their existing host interpretation. The bare `G:`/`T:` root aliases and absolute
+  `G:\`/`T:\` forms select console drives.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
   write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes. The copy is
   written under `<overlay>\.gta6rt-copy` and renamed into place, one copy-up at a time, so a process killed mid-copy
@@ -156,6 +170,11 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   move of one.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
+`run_tiny_current_directory` runs an original fixture natively and mapped against synthetic build-directory folders,
+compares current-directory behavior, and verifies that relative mutations preserve the package. Path expansion through
+`GetFullPathName` is separate work in [#4621](https://github.com/ItsNotRexed/Leonida/pull/4621); combining that change with
+logical current directories also requires resolving relative names before its `GAME:` classification. Calls made inside
+host CRT DLLs still need the separate host-import routing work.
 
 ## When an unimplemented import is called
 

@@ -1340,6 +1340,66 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
     }
+
+    // A logical console directory also serves relative paths through every file shim. The host's own directory
+    // stays independent, and configure() releases the previous title's directory and its retained handle.
+    {
+        using SetDirectoryW = BOOL(WINAPI*)(LPCWSTR);
+        using GetDirectoryW = DWORD(WINAPI*)(DWORD, LPWSTR);
+        const auto set_directory = resolve<SetDirectoryW>("kernel32.dll", "SetCurrentDirectoryW");
+        const auto get_directory = resolve<GetDirectoryW>("kernelbase.dll", "GetCurrentDirectoryW");
+        check(set_directory && get_directory &&
+                  resolve<SetDirectoryW>("api-ms-win-core-processenvironment-l1-1-0.dll", "SetCurrentDirectoryW") == set_directory &&
+                  resolve<GetDirectoryW>("api-ms-win-core-processenvironment-l1-1-0.dll", "GetCurrentDirectoryW") == get_directory &&
+                  rt::shims::find("kernel32.dll", "SetCurrentDirectoryA") &&
+                  rt::shims::find("api-ms-win-core-processenvironment-l1-1-0.dll", "GetCurrentDirectoryA"),
+              "current-directory APIs resolve through kernel32/kernelbase and processenvironment");
+        if (set_directory && get_directory) {
+            wchar_t host_before[32768]{}, host_after[32768]{}, logical[32768]{};
+            ::GetCurrentDirectoryW(32768, host_before);
+            write_path(package / "current" / "file.txt", "current");
+            check(set_directory(L"G:\\current") && get_directory(32768, logical) &&
+                      std::wstring(logical) == L"GAME:\\current", "G: directory reports the logical GAME: path");
+            ::GetCurrentDirectoryW(32768, host_after);
+            check(std::wstring(host_before) == host_after, "a console directory does not change the runtime's host directory");
+            HANDLE h = create_w(L"file.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(h != INVALID_HANDLE_VALUE && read_handle(h) == "current", "G: current directory resolves relative reads");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            SetLastError(0);
+            h = create_w(L"file.txt:stream", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+                  "relative stream names cannot bypass console path validation");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            check(set_directory(L"T:\\cache") && get_directory(32768, logical) &&
+                      std::wstring(logical) == L"T:\\cache", "scratch current directory keeps the T: prefix");
+            h = create_w(L"scratch.bin", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(h != INVALID_HANDLE_VALUE && read_handle(h) == "scratch", "relative reads use the scratch directory");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            check(set_directory(L"..") && get_directory(32768, logical) && std::wstring(logical) == L"T:\\",
+                  "scratch root keeps its trailing separator");
+            SetLastError(0);
+            check(!rmdir_w(L".") && GetLastError() == ERROR_ACCESS_DENIED,
+                  "a relative name cannot remove the selected scratch root");
+            SetLastError(0);
+            check(!move_w(L".", L"T:\\moved-root") && GetLastError() == ERROR_ACCESS_DENIED,
+                  "a relative name cannot move the selected scratch root");
+            SetLastError(0);
+            check(!move_w(L"T:\\cache", L".") && GetLastError() == ERROR_ACCESS_DENIED,
+                  "a relative destination still identifies the scratch root");
+            SetLastError(0);
+            check(!set_directory(L"..") && GetLastError() == ERROR_INVALID_NAME,
+                  "relative parent cannot leave the current console drive");
+            check(set_directory(L"GAME:\\") && get_directory(32768, logical) && std::wstring(logical) == L"GAME:\\",
+                  "GAME: root keeps its trailing separator");
+            std::filesystem::create_directories(overlay / "current-empty");
+            check(set_directory(L"GAME:\\current-empty"), "retain an overlay directory before reconfiguration");
+            rt::fs::configure(package, overlay);
+            check(get_directory(32768, logical) && std::wstring(logical) == host_before,
+                  "configure resets the previous logical current directory");
+            check(::RemoveDirectoryW((overlay / "current-empty").c_str()), "configure releases the retained directory handle");
+        }
+    }
+
 }
 
 }  // namespace

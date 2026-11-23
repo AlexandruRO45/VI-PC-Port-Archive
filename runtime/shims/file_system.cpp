@@ -6,7 +6,8 @@
 // here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
-//     the overlay (RT-218); any other path is a host path and goes to the host;
+//     the overlay (RT-218); relative paths use a logical console current directory when one is set, and other paths
+//     go to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
 //     package stays exactly as installed. A write-open of a package file copies it into the overlay first, so
 //     OPEN_EXISTING keeps its bytes; a delete of a package file leaves an empty marker under
@@ -63,6 +64,18 @@ std::mutex g_mutex;
 std::filesystem::path g_game_dir;
 std::filesystem::path g_overlay_dir;
 
+// The host keeps its own working directory. A mapped title's console directory must continue to see both the
+// package and the overlay, so retaining only a physical directory would route relative writes into the package.
+// Serialize directory changes with virtual removes/moves, which can otherwise hide a locked package directory.
+std::mutex g_directory_mutex;
+struct CurrentDirectory {
+    std::wstring path;
+    std::vector<std::wstring> parts;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    ~CurrentDirectory() { if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle); }
+};
+std::unique_ptr<CurrentDirectory> g_current_directory;
+
 struct Roots {
     std::filesystem::path game, overlay;
 };
@@ -106,6 +119,22 @@ enum class Parsed { Host, Console, Refused };
 // and a ".." that would leave the root are refused: the package and the overlay are the only folders a title may name.
 bool is_separator(wchar_t c) { return c == L'\\' || c == L'/'; }
 
+std::wstring current_console_directory() {
+    std::lock_guard lock(g_mutex);
+    return g_current_directory ? g_current_directory->path : std::wstring();
+}
+
+std::wstring resolve_console_relative(const std::wstring& path) {
+    // Empty names, drive-qualified names, UNC paths and device paths keep their existing interpretation.
+    if (path.empty() || (path.size() >= 2 && path[1] == L':') ||
+        (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) ||
+        (path.size() >= 2 && is_separator(path[0]) && is_separator(path[1]))) return path;
+    const std::wstring current = current_console_directory();
+    if (current.empty()) return path;
+    if (is_separator(path[0])) return current.substr(0, current.find(L':') + 1) + path;
+    return current + L'\\' + path;
+}
+
 // True when `path` is `root` or lies below it, compared by name (case-insensitive, either separator).
 bool lies_under(const std::wstring& path, const std::filesystem::path& root) {
     std::wstring base = lower(root.native());
@@ -139,9 +168,11 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
-Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
+Parsed parse_console(const std::wstring& name, std::vector<std::wstring>& parts, Drive* parsed_drive = nullptr) {
+    const std::wstring path = resolve_console_relative(name);
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
+    if (parsed_drive) *parsed_drive = drive;
     if (drive == Drive::None) return Parsed::Host;
     parts.clear();
     if (drive == Drive::Scratch) {
@@ -194,7 +225,8 @@ std::filesystem::path join(const std::filesystem::path& root, const std::vector<
 
 bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
-    return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
+    return parts.empty() ||
+           (parts.size() == 1 && console_drive(resolve_console_relative(path), prefix_length) == Drive::Scratch);
 }
 
 struct Target {
@@ -614,7 +646,9 @@ void to_ansi(const WIN32_FIND_DATAW& wide, WIN32_FIND_DATAA* ansi) {
 }  // namespace
 
 void configure(const std::filesystem::path& game_dir, const std::filesystem::path& overlay_dir) {
+    std::lock_guard directory_lock(g_directory_mutex);
     std::lock_guard lock(g_mutex);
+    g_current_directory.reset();
     g_game_dir = game_dir;
     g_overlay_dir = overlay_dir;
 }
@@ -628,6 +662,114 @@ std::filesystem::path overlay_dir() {
     std::lock_guard lock(g_mutex);
     return g_overlay_dir;
 }
+
+BOOL WINAPI set_current_directory_w(LPCWSTR name) {
+    const DWORD previous_error = GetLastError();
+    std::lock_guard directory_lock(g_directory_mutex);
+    if (!name) return ::SetCurrentDirectoryW(name);
+    std::vector<std::wstring> parts;
+    Drive drive = Drive::None;
+    const Parsed parsed = parse_console(name, parts, &drive);
+    if (parsed == Parsed::Host) {
+        SetLastError(previous_error);
+        const BOOL ok = ::SetCurrentDirectoryW(name);
+        const DWORD error = GetLastError();
+        if (ok) {
+            std::lock_guard lock(g_mutex);
+            g_current_directory.reset();
+        }
+        SetLastError(error);
+        return ok;
+    }
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+
+    const Roots r = roots();
+    if (r.game.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
+    // A removed directory or a file hiding a package directory must also block traversal of its children.
+    std::vector<std::wstring> parent;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        parent.push_back(parts[i]);
+        const Kind kind = view(r, parent).kind;
+        if (kind == Kind::None) return fail_bool(i + 1 == parts.size() ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND);
+        if (kind != Kind::Directory) return fail_bool(i + 1 == parts.size() ? ERROR_DIRECTORY : ERROR_PATH_NOT_FOUND);
+    }
+    const View directory = view(r, parts);
+    const std::filesystem::path physical = join(directory.in_overlay ? r.overlay : r.game, parts);
+    auto next = std::make_unique<CurrentDirectory>();
+    // Like a native current directory, retain a directory handle without delete sharing until the next change.
+    next->handle = ::CreateFileW(physical.c_str(), FILE_TRAVERSE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (next->handle == INVALID_HANDLE_VALUE) return FALSE;
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!::GetFileInformationByHandle(next->handle, &info)) return FALSE;
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return fail_bool(ERROR_DIRECTORY);
+    next->parts = parts;
+    next->path = drive == Drive::Scratch ? L"T:" : L"GAME:";
+    const size_t first = drive == Drive::Scratch ? 1 : 0;
+    for (size_t i = first; i < parts.size(); ++i) next->path += L'\\' + parts[i];
+    if (parts.size() == first) next->path += L'\\';
+    {
+        std::lock_guard lock(g_mutex);
+        g_current_directory = std::move(next);
+    }
+    SetLastError(previous_error);
+    return TRUE;
+}
+
+BOOL WINAPI set_current_directory_a(LPCSTR name) {
+    if (!name) return ::SetCurrentDirectoryA(name);
+    const DWORD previous_error = GetLastError();
+    const std::wstring wide = widen_ansi(name);
+    SetLastError(previous_error);
+    return set_current_directory_w(wide.c_str());
+}
+
+DWORD WINAPI get_current_directory_w(DWORD capacity, LPWSTR buffer) {
+    const DWORD previous_error = GetLastError();
+    const std::wstring path = current_console_directory();
+    if (path.empty()) {
+        SetLastError(previous_error);
+        return ::GetCurrentDirectoryW(capacity, buffer);
+    }
+    const DWORD needed = static_cast<DWORD>(path.size() + 1);
+    if (capacity < needed) {
+        SetLastError(previous_error);
+        return needed;
+    }
+    if (!buffer) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    std::memcpy(buffer, path.c_str(), needed * sizeof(wchar_t));
+    SetLastError(previous_error);
+    return needed - 1;
+}
+
+DWORD WINAPI get_current_directory_a(DWORD capacity, LPSTR buffer) {
+    const DWORD previous_error = GetLastError();
+    const std::wstring path = current_console_directory();
+    if (path.empty()) {
+        SetLastError(previous_error);
+        return ::GetCurrentDirectoryA(capacity, buffer);
+    }
+    const int needed = WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (!needed) return 0;
+    if (capacity < static_cast<DWORD>(needed)) {
+        SetLastError(previous_error);
+        return static_cast<DWORD>(needed);
+    }
+    if (!buffer) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    if (!WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, buffer, needed, nullptr, nullptr)) return 0;
+    SetLastError(previous_error);
+    return static_cast<DWORD>(needed - 1);
+}
+
+namespace {
+DWORD current_directory_conflict(const std::vector<std::wstring>& parts) {
+    std::lock_guard lock(g_mutex);
+    if (!g_current_directory || parts.size() > g_current_directory->parts.size()) return 0;
+    for (size_t i = 0; i < parts.size(); ++i)
+        if (!same_name(parts[i].c_str(), g_current_directory->parts[i].c_str())) return 0;
+    return parts.size() == g_current_directory->parts.size() ? ERROR_SHARING_VIOLATION : ERROR_ACCESS_DENIED;
+}
+}  // namespace
 
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
@@ -975,6 +1117,7 @@ BOOL WINAPI create_directory_ex_a(LPCSTR template_name, LPCSTR name, LPSECURITY_
 }
 
 BOOL WINAPI remove_directory_w(LPCWSTR name) {
+    std::lock_guard directory_lock(g_directory_mutex);
     if (!name) return fail_bool(ERROR_INVALID_PARAMETER);
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(name, parts);
@@ -987,6 +1130,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
+    if (current_directory_conflict(parts) == ERROR_SHARING_VIOLATION) return fail_bool(ERROR_SHARING_VIOLATION);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
     if (v.in_overlay && !::RemoveDirectoryW(join(r.overlay, parts).c_str())) return FALSE;  // its error
@@ -1007,6 +1151,7 @@ BOOL WINAPI remove_directory_a(LPCSTR name) {
 // ---- Move, copy and attributes: the result lands in the overlay, a moved package name is deleted by a marker
 
 BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
+    std::lock_guard directory_lock(g_directory_mutex);
     if (!from) return fail_bool(ERROR_INVALID_PARAMETER);
     std::vector<std::wstring> src, dst;
     const Parsed from_kind = parse_console(from, src);
@@ -1023,6 +1168,8 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (from_view.kind == Kind::Directory)
+        if (const DWORD error = current_directory_conflict(src)) return fail_bool(error);
     const std::filesystem::path overlay_from = join(r.overlay, src), overlay_to = join(r.overlay, dst);
     if (same_entry(src, dst)) {
         // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
@@ -1339,9 +1486,17 @@ using namespace rt::fs;
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
         {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+#define DIRECTORY_API(dll)                                                                         \
+    {dll, "SetCurrentDirectoryA", reinterpret_cast<void*>(&set_current_directory_a)},              \
+        {dll, "SetCurrentDirectoryW", reinterpret_cast<void*>(&set_current_directory_w)},          \
+        {dll, "GetCurrentDirectoryA", reinterpret_cast<void*>(&get_current_directory_a)},          \
+        {dll, "GetCurrentDirectoryW", reinterpret_cast<void*>(&get_current_directory_w)}
 }  // namespace
 
 SHIM_TABLE(file_system,
+    DIRECTORY_API("kernel32.dll"),
+    DIRECTORY_API("kernelbase.dll"),
+    DIRECTORY_API("api-ms-win-core-processenvironment-l1-1-0.dll"),
     FILE_API("kernel32.dll"),
     FILE_API("kernelbase.dll"),
     FILE_API("api-ms-win-core-file-l1-1-0.dll"),
