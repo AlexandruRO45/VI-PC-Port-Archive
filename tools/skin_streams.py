@@ -40,10 +40,16 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import time
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 PAGE = 4096
 MAX_SYS = 32 * 1024 * 1024
@@ -497,15 +503,47 @@ def main(argv=None):
             print(f"  {layout:26s} {row['meshes']:8d} meshes {row['vertices']:12d} vertices")
     if a.json:
         try:
-            parent = os.path.dirname(os.path.abspath(a.json))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-                json.dump(report, fh, indent=1)
+            write_json_report(a.json, report)
         except OSError as exc:
             print(f"error: cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(payload, fh, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".skin_streams-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

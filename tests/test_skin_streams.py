@@ -605,6 +605,18 @@ class TestCli(unittest.TestCase):
             self.assertIn("not a file", r2.stderr)
             self.assertNotIn("Traceback", r2.stderr)
 
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(ss, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    ss.write_json_report(path, {"new": True})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
