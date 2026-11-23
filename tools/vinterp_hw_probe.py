@@ -495,6 +495,9 @@ def run_hw(arch=None, waves=(32, 64)):
     from hw_oracle import asm, runner  # noqa: E402
     oracle = runner.open_oracle(arch=arch)
     try:
+        why = asm.modes_skip_reason([c.mode for c in CASES], oracle.arch)
+        if why:                         # every case sets IEEE and DX10_CLAMP, which gfx1170+ fixes: nothing to run
+            raise runner.Unavailable(why)
         device = oracle.device
         hw_arch = oracle.arch
         per_wave = {}

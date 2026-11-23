@@ -143,6 +143,24 @@ def mode_skip_reason(mode, arch):
             "is unsupported on gfx1170+ (the behaviour is fixed there)")
 
 
+def modes_skip_reason(modes, arch):
+    """Why a tool whose kernels all start in one of `modes` has nothing to run on this architecture, or None. When
+    every MODE names a field gfx1170+ cannot set, Oracle.run gives a str for each of the tool's kernels, so there is
+    no hardware word to compare. Such a tool prints "hardware oracle unavailable: <this>" and exits 77, as it does
+    for a missing compiler, instead of failing its MODE probe or listing the reason as a mismatch."""
+    reasons = [mode_skip_reason(m, arch) for m in modes]
+    return reasons[0] if reasons and all(reasons) else None
+
+
+def family_skip_reason(arch, families, what):
+    """Why a tool whose kernel text is written for `families` (e.g. ("gfx10",)) cannot run on this architecture, or
+    None. `what` names the instructions or descriptor it depends on, for the message."""
+    fam = family(arch)
+    if fam in families:
+        return None
+    return f"{what} is written for {' and '.join(families)}; {arch} is {fam}"
+
+
 # The global memory instructions GFX11 renamed, under their GFX10 names. A raw kernel body is written with the
 # GFX11 ones (crosslane_fuzz stores with global_store_b32); a GFX10 assembler only takes the old spelling.
 _GFX10_NAMES = {f"global_{kind}_b{bits}": f"global_{kind}_dword{suffix}"

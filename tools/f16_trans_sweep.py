@@ -457,6 +457,12 @@ def main(argv=None):
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
+    from hw_oracle import asm
+    why = asm.modes_skip_reason([MODES[m] for m in modes], oracle.arch)
+    if why:                             # every mode here sets IEEE and DX10_CLAMP, which gfx1170+ fixes
+        oracle.close()
+        print(f"hardware oracle unavailable: {why}")
+        return 77
     print(f"hardware oracle: {oracle.device}")
     report = {"device": str(oracle.device), "arch": oracle.arch, "modes": {m: MODES[m] for m in modes}, "ops": {}}
     rc = 0

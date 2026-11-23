@@ -499,6 +499,11 @@ def run_hw(cases, arch=None, waves=(32, 64)):
     from hw_oracle import asm, runner  # noqa: E402
     oracle = runner.open_oracle(arch=arch)
     try:
+        # GFX12 has no MUBUF/MTBUF forms: its assembler answers the buffer_* lines here with "operands are not valid
+        # for this GPU or mode" (gfx1150 still takes them), so every kernel of a chunk would be rejected.
+        why = asm.family_skip_reason(oracle.arch, ("gfx10", "gfx11"), "the MUBUF/MTBUF kernel text of this probe")
+        if why:
+            raise runner.Unavailable(why)
         device = oracle.device
         per_wave = {}
         for wave in waves:

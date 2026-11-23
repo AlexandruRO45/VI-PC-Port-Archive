@@ -199,6 +199,11 @@ def main():
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
+    why = asm.family_skip_reason(oracle.arch, ("gfx10",), "the T# mip layout of this probe (image_words)")
+    if why:
+        oracle.close()
+        print(f"hardware oracle unavailable: {why}")
+        return 77
     print(f"device: {oracle.device}")
     got = {}
     for wave in (32, 64):

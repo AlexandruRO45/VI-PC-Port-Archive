@@ -114,6 +114,13 @@ def main(argv=None):
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
+    # GFX12 has no MUBUF forms and no s_waitcnt_vscnt: its assembler rejects the buffer_store_* lines that seed and
+    # read back the rows ("operands are not valid for this GPU or mode"; gfx1150 still takes them).
+    why = asm.family_skip_reason(oracle.arch, ("gfx10", "gfx11"), "the MUBUF kernel text of this probe")
+    if why:
+        oracle.close()
+        print(f"hardware oracle unavailable: {why}")
+        return 77
     try:
         lines, order = kernel_lines()
         n = len(order)

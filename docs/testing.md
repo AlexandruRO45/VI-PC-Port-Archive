@@ -485,6 +485,20 @@ exits 77, so CI skips it. `image_fuzz.py --oracle hw` loads a linear texture thr
 its CPU model; add `--negative-control` to check that wrong models are caught. A gfx1150 (RDNA3.5) is not RDNA2: a
 match supports the model and does not prove RDNA2. Run these one at a time: a second job on the same GPU can hang it.
 
+On RDNA4 (gfx12xx) only part of this runs, and a tool that cannot run there exits 77 with the reason
+(`tests/test_hw_oracle_gfx12_unavailable.py`; measured on an RX 9060 XT, gfx1200, AMD 26.11.2):
+
+- **Run:** `salu_diff.py`, `vint_diff.py`, `wint_diff.py`, `pk16_diff.py`, `fmisc_diff.py`, `crosslane_fuzz.py` and
+  `int_hw_probe.py` (opcodes GFX12 removed are skipped or rejected one by one and counted).
+- **Exit 77, fixed MODE:** `f32_fuzz.py`, `f16_trans_sweep.py`, `pknorm_probe.py`, `fma_mix_probe.py` and
+  `vinterp_hw_probe.py`. Every kernel of theirs sets IEEE and DX10_CLAMP, which gfx1170+ fixes,
+  so the game's MODE cannot be set there.
+- **Exit 77, kernel text of an older family:** `buffer_swizzle_probe.py` and `smem_neg_probe.py` (GFX12 has no
+  MUBUF/MTBUF forms; gfx1150 still assembles them), `vcmp16_opsel_probe.py` (raw GFX10 compare opcodes, which GFX11
+  renumbered) and `sampler_lod_probe.py` (GFX10 mip fields); `sdwa_diff.py` (no SDWA after GFX10) and
+  `mad_denorm_probe.py` (`v_mad_f32` is GFX10.1 only).
+- **Exit 77, no GFX12 T#:** `image_fuzz.py` and `texoff_probe.py`.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example

@@ -154,6 +154,14 @@ def main():
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
+    # The compares are raw words with GFX10's VOP3 opcodes (OPCODES). GFX11 and GFX12 renumbered them (llvm-mc gives
+    # v_cmp_lt_f16_e64 opcode 0xC9 for gfx1036 and 0x01 for gfx1150 and gfx1200), so the same words are other
+    # instructions there, while the control's v_add_nc_u16 kept its opcode and would still pass.
+    why = asm.family_skip_reason(oracle.arch, ("gfx10",), "the raw v_cmp_*16_e64 encoding of this probe")
+    if why:
+        oracle.close()
+        print(f"hardware oracle unavailable: {why}")
+        return 77
     print(f"device: {oracle.device}")
     got = {}
     controls = control_rows()
@@ -162,6 +170,9 @@ def main():
                                      raw=True, vgprs=16, sgprs=24)])[0]
         if isinstance(res, str):
             print(f"wave{wave}: kernel rejected: {res}")
+            return 2
+        if runner.SENTINEL in res:      # a word the kernel never stored: it stopped early, nothing is measured
+            print(f"wave{wave}: the kernel left word {res.index(runner.SENTINEL)} unwritten (0x{runner.SENTINEL:08x})")
             return 2
         got[wave] = res
     # The control must show the hand-set bits working on a VOP3 op that takes op_sel; otherwise nothing is measured.
