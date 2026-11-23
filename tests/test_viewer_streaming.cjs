@@ -823,7 +823,17 @@ test('camera hash round-trips and malformed hashes are ignored', () => {
     const cam = camHelpers.parseCamHash(hash);
     assert.deepEqual(JSON.parse(JSON.stringify(cam)), { pos: [12.3, -5, 600], yaw: 1.5, pitch: -0.25 });
     for (const bad of ['', '#', '#cam=', '#cam=1,2,3', '#cam=1,2,3,4,x', '#cam=1,2,3,4,Infinity',
-                       '#cam=1,2,,4,5', '#cam=1,2,3,4,5,6', '#other=1,2,3,4,5', undefined, null]) {
+                       '#cam=1,2,,4,5', '#cam=1,2,3,4,5,6', '#other=1,2,3,4,5',
+                       '#cam=0x10,0,0,0,0', '#cam=0b10,0,0,0,0', '#cam=0o10,0,0,0,0',
+                       '#cam=1e309,0,0,0,0', '#notcam=1,2,3,4,5', undefined, null]) {
         assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
     }
+    // cam= may follow another &-delimited hash parameter, and -0.0 normalizes to +0.
+    const multi = camHelpers.parseCamHash('#foo=1&cam=1,2,3,4,5&bar=2');
+    assert.deepEqual(JSON.parse(JSON.stringify(multi)), { pos: [1, 2, 3], yaw: 4, pitch: 5 });
+    const negZero = camHelpers.formatCamHash([-0.01, 0, 0], -0.0001, 0);
+    assert.equal(negZero, '#cam=0.0,0.0,0.0,0.000,0.000');
+    assert.ok(Object.is(camHelpers.parseCamHash('#cam=-0.0,0,0,0,0').pos[0], 0));
+    assert.equal(camHelpers.formatCamHash([NaN, 0, 0], 0, 0), '');
+    assert.equal(camHelpers.formatCamHash([0, Infinity, 0], 0, 0), '');
 });

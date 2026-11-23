@@ -78,18 +78,26 @@ function manifestError(world) {
   return null;
 }
 
-// Camera in the URL hash: #cam=x,y,z,yaw,pitch. Returns null for anything that is not five finite numbers,
+// Camera in the URL hash: #cam=x,y,z,yaw,pitch. Returns null for anything that is not five finite decimal numbers,
 // so a hand-edited or stale link falls back to the spawn point instead of putting the camera at NaN.
+const DECIMAL_NUM = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 function parseCamHash(hash) {
-  const m = /^#?cam=([^&]*)/.exec(typeof hash === "string" ? hash : "");
+  const m = /(?:^#?|[&])cam=([^&]*)/.exec(typeof hash === "string" ? hash : "");
   if (!m) return null;
   const parts = m[1].split(",");
-  if (parts.length !== 5 || parts.some(t => t.trim() === "")) return null;
-  const v = parts.map(Number);
+  if (parts.length !== 5) return null;
+  const trimmed = parts.map(t => t.trim());
+  if (trimmed.some(t => !DECIMAL_NUM.test(t))) return null;
+  const v = trimmed.map(t => Number(t) || 0);
   return v.every(Number.isFinite) ? { pos: v.slice(0, 3), yaw: v[3], pitch: v[4] } : null;
 }
 function formatCamHash(pos, yaw, pitch) {
-  return "#cam=" + [...pos, yaw, pitch].map((n, i) => n.toFixed(i < 3 ? 1 : 3)).join(",");
+  const vals = [...pos, yaw, pitch];
+  if (vals.length !== 5 || !vals.every(Number.isFinite)) return "";
+  return "#cam=" + vals.map((n, i) => {
+    const s = n.toFixed(i < 3 ? 1 : 3);
+    return Number(s) === 0 ? (0).toFixed(i < 3 ? 1 : 3) : s;
+  }).join(",");
 }
 
 async function loadWorld() {
@@ -228,7 +236,8 @@ addEventListener("keydown", e => {
   if (e.code === "KeyG" && !e.repeat) toggleBounds();
   if (e.code === "KeyR") camera.position.fromArray(world.spawn);
   if (e.code === "KeyP" && !e.repeat) {
-    history.replaceState(null, "", formatCamHash(camera.position.toArray(), yaw, pitch));
+    const nextHash = formatCamHash(camera.position.toArray(), yaw, pitch);
+    if (nextHash) history.replaceState(null, "", nextHash);
     navigator.clipboard?.writeText(location.href).catch(() => {});
   }
 });
