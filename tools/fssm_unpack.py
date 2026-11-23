@@ -165,9 +165,9 @@ def main(argv=None) -> int:
         return 2
     rows, problems = [], Counter()
     for shader in shaders:
-        with open(shader, "rb") as f:
-            d = f.read()
         try:
+            with open(shader, "rb") as f:
+                d = f.read()
             fssm, ents = unpack(d, payload=a.payload)
         except Exception as e:  # noqa: BLE001
             problems[type(e).__name__] += 1

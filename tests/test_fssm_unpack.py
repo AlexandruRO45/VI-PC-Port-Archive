@@ -669,5 +669,32 @@ class TestMainDirectoryProcessing(unittest.TestCase):
                          ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
 
 
+    def test_main_records_read_oserror_and_continues(self):
+        fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
+        good_path = os.path.join(self.src, "good.dxbc")
+        bad_path = os.path.join(self.src, "bad.dxbc")
+        with open(good_path, "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1)}))]))
+        with open(bad_path, "wb") as f:
+            f.write(b"unreadable")
+
+        real_open = open
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(bad_path) and "r" in mode:
+                raise PermissionError(errno.EACCES, "Permission denied", path)
+            return real_open(path, mode, *args, **kwargs)
+
+        buf = io.StringIO()
+        with mock.patch("builtins.open", side_effect=failing_open):
+            with mock.patch("sys.stdout", buf):
+                rc = fssm_unpack.main([self.src])
+        self.assertEqual(rc, 0)
+        self.assertIn("1 FSSM blobs", buf.getvalue())
+        self.assertIn("PermissionError", buf.getvalue())
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["good"])
+
+
 if __name__ == "__main__":
     unittest.main()
