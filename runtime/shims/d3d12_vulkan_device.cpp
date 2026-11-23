@@ -3281,7 +3281,9 @@ public:
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
         // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
-        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
+        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one. Hull and
+        // domain shaders and stream output are refused above, so here the PS is the only reader of the VS's outputs,
+        // which lets the link demote raw VS outputs the PS does not read when it needs their locations.
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
