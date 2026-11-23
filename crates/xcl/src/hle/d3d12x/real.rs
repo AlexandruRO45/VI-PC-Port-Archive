@@ -419,10 +419,22 @@ pub fn init() -> Result<String, String> {
     }
 }
 
-/// A debug layer message: errors and warnings into the log (the first 200).
+/// A debug layer message into the log: the first 200 warnings, the first 20 errors of each
+/// message id – the error before a device removal came after hundreds of others and was dropped.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 || N.fetch_add(1, Ordering::Relaxed) >= 200 {
+    static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
+    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+        return;
+    }
+    if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+        let mut g = PER_ID.lock().unwrap();
+        let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
+        *n += 1;
+        if *n > 20 {
+            return;
+        }
+    } else if N.fetch_add(1, Ordering::Relaxed) >= 200 {
         return;
     }
     let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
