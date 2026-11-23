@@ -26,9 +26,11 @@ import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
+from contextlib import suppress
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
+from file_mode import published_mode  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -17706,14 +17708,30 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
 
 
 def write_index(path, index):
-    """Write an index under another name and rename it into place, so a run stopped part-way never leaves half of
-    one: make_game.py takes these files as proof that a shard, or the whole translation, finished."""
-    tmp = path + ".tmp"     # must not end in .json: --merge globs index.part*.json
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        _json.dump(index, f, indent=0, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
-    replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
+    """Write an index under a unique staging name and rename it into place, so a run stopped part-way never leaves
+    half of one: make_game.py takes these files as proof that a shard, or the whole translation, finished."""
+    abs_path = os.path.abspath(path)
+    directory = os.path.dirname(abs_path)
+    tmp = None
+    try:
+        # Must not end in .json: --merge globs index.part*.json.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         prefix=".index-", suffix=".tmp",
+                                         dir=directory, delete=False) as f:
+            tmp = f.name
+            _json.dump(index, f, indent=0, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
+        os.chmod(tmp, published_mode(abs_path))
+        replace_retry(tmp, abs_path)    # a scanner or sync client on Windows may hold the new file open for a moment
+        tmp = None
+    finally:
+        if tmp is not None:
+            with suppress(OSError):
+                # The staging file may have inherited a read-only destination's mode; make it
+                # deletable first, or Windows strands it beside the index when replace fails.
+                os.chmod(tmp, 0o600)
+                os.unlink(tmp)
 
 
 class ShardSetError(Exception):

@@ -3,6 +3,7 @@
     python -I tests/test_rdna2spirv_merge.py
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -328,6 +329,68 @@ class ShardRoundTripTest(unittest.TestCase):
         self.assertEqual(full.returncode, 2, full.stdout + full.stderr)
         self.assertIn("holds no shaders", full.stderr)
         self.assertFalse((self.out / "index.json").exists())
+
+
+class WriteIndexStagingTest(unittest.TestCase):
+    """write_index stages through a unique temp file, applies file_mode, and cleans up on failure."""
+
+    def test_stale_dot_tmp_folder_or_file_does_not_block_or_get_clobbered(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "index.json"
+            blocker_dir = Path(d) / "index.json.tmp"
+            blocker_dir.mkdir()
+            R.write_index(str(dest), {"a": {"stage": "cs"}})
+            self.assertEqual(json.loads(dest.read_text(encoding="utf-8")), {"a": {"stage": "cs"}})
+            self.assertTrue(blocker_dir.is_dir())
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["index.json", "index.json.tmp"])
+
+    def test_applies_published_mode_without_flipping_umask(self):
+        import file_mode
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "index.json"
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def record_chmod(p, mode):
+                chmod_calls.append((Path(p), mode))
+                return real_chmod(p, mode)
+
+            with mock.patch.object(R, "published_mode", wraps=R.published_mode) as pub, \
+                    mock.patch.object(R.os, "chmod", side_effect=record_chmod), \
+                    mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+                R.write_index(str(dest), {"a": 1})
+            self.assertEqual(pub.call_count, 1)
+            self.assertEqual(len(chmod_calls), 1)
+            staged_path, staged_mode = chmod_calls[0]
+            self.assertNotEqual(staged_path, dest)
+            self.assertFalse(staged_path.name.endswith(".json"))
+            self.assertEqual(staged_mode, file_mode.published_mode(str(dest)))
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["index.json"])
+
+    def test_failed_replace_cleans_read_only_staging_file(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "index.json"
+            dest.write_text("{}\n", encoding="utf-8", newline="\n")
+            os.chmod(dest, 0o444)
+            self.addCleanup(lambda: dest.exists() and os.chmod(dest, 0o600))
+            with mock.patch.object(R, "replace_retry", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    R.write_index(str(dest), {"a": 1})
+            self.assertEqual(dest.read_text(encoding="utf-8"), "{}\n")
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["index.json"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_new_and_replaced_index_preserve_posix_bits(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "index.json"
+            R.write_index(str(dest), {"a": 1})
+            self.assertEqual(os.stat(dest).st_mode & 0o777, file_mode.new_file_mode(d))
+            os.chmod(dest, 0o640)
+            R.write_index(str(dest), {"b": 2})
+            self.assertEqual(os.stat(dest).st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":
