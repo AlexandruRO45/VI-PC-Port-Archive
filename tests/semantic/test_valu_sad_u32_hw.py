@@ -229,5 +229,35 @@ class TestSadSimdInteraction(unittest.TestCase):
         self.assertEqual(words[1], 130)
 
 
+class TestSadRegisterPreservation(unittest.TestCase):
+    """Commit 5: register aliasing and in-place operand preservation for v_sad_u32."""
+
+    def test_in_place_aliasing_destination_equals_source(self):
+        lines = [
+            "v_mov_b32 v0, 60",
+            "v_mov_b32 v1, 20",
+            "v_mov_b32 v2, 10",
+            "v_sad_u32 v0, v0, v1, v2",  # |60-20|+10 = 50
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_sad_ps(lines, "ps_sad_alias")
+        self.assertEqual(words[0], 50)
+        self.assertEqual(words[1], 20)
+        self.assertEqual(words[2], 10)
+
+    def test_preservation_of_unrelated_registers(self):
+        lines = [
+            "v_mov_b32 v0, 0x1111",
+            "v_mov_b32 v1, 0x2222",
+            "v_mov_b32 v2, 0x3333",
+            "v_mov_b32 v3, 0x4444",
+            "v_sad_u32 v0, v1, v2, v3",
+        ]
+        words = run_sad_ps(lines, "ps_sad_preserve")
+        self.assertEqual(words[1], 0x2222)
+        self.assertEqual(words[2], 0x3333)
+        self.assertEqual(words[3], 0x4444)
+
+
 if __name__ == '__main__':
     unittest.main()
