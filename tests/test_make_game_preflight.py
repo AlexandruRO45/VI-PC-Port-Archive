@@ -250,6 +250,15 @@ class GameCheckTest(PreflightTestBase):
                 self.assert_fails(make_game.check, game_dir, full=False,
                                   match="test_game.exe is 256 bytes, the manifest has 512.")
 
+    def test_full_check_rejects_a_wrong_size_before_the_hash_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(tmp, expected_exe_size=512)
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch.object(make_game, "py") as verify:
+                    self.assert_fails(make_game.check, game_dir, full=True,
+                                      match="test_game.exe is 256 bytes, the manifest has 512.")
+                    verify.assert_not_called()
+
     def test_full_check_reports_a_matching_executable_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             exe_bytes = b"x" * 256

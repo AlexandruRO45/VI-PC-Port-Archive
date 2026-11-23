@@ -1089,9 +1089,15 @@ def check(game: str, full: bool) -> dict:
             print(f"  wrong size  {rel}"); bad += 1
     if bad:
         fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
+    exe = os.path.join(game, v["expected_exe"])
+    if os.path.isfile(exe):
+        # The size is one stat, so check it before --full hashes every file: a truncated executable is
+        # already unusable and should not wait for a 108-file pass to be reported.
+        why = exe_mismatch(v, exe, False)
+        if why:
+            fail(f"{why} Use an unmodified {v['expected_exe']} from version {v['version']}.")
     if full:
         py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
-    exe = os.path.join(game, v["expected_exe"])
     present = "all files present" + (" and hashes match" if full else "")
     if not os.path.isfile(exe):
         log(f"check: {present}. "
