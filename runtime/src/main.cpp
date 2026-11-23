@@ -177,9 +177,13 @@ int wmain(int argc, wchar_t** argv) {
                         reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
         }
         std::fflush(stdout);
+        loader.enable_process_exit();
         RunStartup startup{loader, main_module};
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva,
-                                                8u << 20, initialise_for_run, &startup);
+                                                8u << 20, initialise_for_run, &startup,
+                                                [](void* context) {
+                                                    static_cast<RunStartup*>(context)->loader.prepare_process_exit();
+                                                });
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();
@@ -188,9 +192,9 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stderr);
         // Not `return`: a normal host exit runs the CRT's atexit table, which the game shares with gta6rt (its
         // handlers would run against a game that has stopped) and whose last word decides the exit status.
-        // ExitProcess also skips atexit, so the TLS clone cleanup registered there is run here instead.
-        rt::cleanup_tls_clones();
-        ExitProcess(static_cast<UINT>(code));
+        // TLS helpers must remain mapped until native process detach has delivered all guest callbacks. Clone
+        // files are reclaimed by the existing stale-clone sweep on the next load, as after a forced termination.
+        rt::process::finish_run(code);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rt::startup_trace::event("error", "\"what\":" + rt::startup_trace::quote(e.what()));

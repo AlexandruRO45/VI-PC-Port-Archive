@@ -4,8 +4,9 @@
 // arguments and finally calls exit(); both go through the EXE's own import table, so they can be answered here:
 //   - argv/argc and the command line are the game's (set by run_entry), not gta6rt's;
 //   - exit(), _exit(), quick_exit(), ExitProcess() and abort() from the game end the game's run, not the host:
-//     the exit code is recorded, the run is signalled as finished and the calling thread waits for the host to
-//     exit. atexit handlers and static destructors of the game are not run (its CRT shares the host's, whose
+//     the exit code is recorded, the run is signalled as finished and the calling thread waits for the host's
+//     finish_run handoff before invoking native ExitProcess with its TLS intact. atexit handlers and static
+//     destructors of the game are not run (its CRT shares the host's, whose
 //     process-wide atexit table also holds gta6rt's own).
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
@@ -44,6 +45,12 @@ std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
 std::atomic<int> g_exit_code{0};
 HANDLE g_done = nullptr;
+HANDLE g_release_exit = nullptr;
+HANDLE g_exit_thread = nullptr;
+std::atomic<bool> g_native_exit{false};
+std::atomic<DWORD> g_exit_tid{0};
+void (*g_prepare_exit)(void*) = nullptr;
+void* g_exit_context = nullptr;
 
 std::wstring quote(const std::wstring& a) {
     if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
@@ -72,13 +79,27 @@ std::string narrow(const std::wstring& w) {
 }
 
 [[noreturn]] void end_run(int code) {
+    // A detach callback may call exit again. Preserve the first exit status and let Windows handle reentry.
+    if (g_native_exit && g_exit_tid == GetCurrentThreadId()) ExitProcess(static_cast<UINT>(g_exit_code.load()));
     bool expected = false;
     if (g_exited.compare_exchange_strong(expected, true)) {
         g_exit_code = code;
+        if (g_prepare_exit) g_prepare_exit(g_exit_context);
+        // Keep a real handle even when a worker, rather than the entry thread, requested process exit.
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_exit_thread,
+                        SYNCHRONIZE, FALSE, 0);
+        g_exit_tid = GetCurrentThreadId();
         if (g_done) SetEvent(g_done);
+        if (g_release_exit) {
+            WaitForSingleObject(g_release_exit, INFINITE);
+            g_native_exit = true;
+            // Native ExitProcess kills the other threads before issuing DLL_PROCESS_DETACH on this thread.
+            // Neither the host nor an explicit unload can supply that ordering and this thread's TLS together.
+            ExitProcess(static_cast<UINT>(g_exit_code.load()));
+        }
     }
     // Park until the host's ExitProcess, not ExitThread: Wine < 11.2 can exit 0 if the two race (4a9bc42a).
-    if (g_running) for (;;) Sleep(INFINITE);
+    if (g_running || g_release_exit) for (;;) Sleep(INFINITE);
     // The run is already over: this is game code running during host shutdown (an atexit handler the game
     // registered with the shared CRT calling exit again). Finish the process with the game's exit code; ending
     // just this thread here would make the host's last thread, and so the process, exit with `code` instead.
@@ -213,11 +234,23 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
     g_wargv_ptr = g_wargv.data();
 }
 
-int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* startup_context) {
+int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* startup_context,
+              void (*prepare_exit)(void*)) {
     g_exited = false;
     g_exit_code = 0;
+    g_native_exit = false;
+    g_exit_tid = 0;
+    g_exit_thread = nullptr;
+    g_prepare_exit = prepare_exit;
+    g_exit_context = startup_context;
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_done) return -1;
+    g_release_exit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_release_exit) {
+        CloseHandle(g_done);
+        g_done = nullptr;
+        return -1;
+    }
     g_running = true;
     EntryCall call{entry, startup, startup_context};
     HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
@@ -225,6 +258,8 @@ int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* sta
         g_running = false;
         CloseHandle(g_done);
         g_done = nullptr;
+        CloseHandle(g_release_exit);
+        g_release_exit = nullptr;
         return -1;
     }
     // The run ends when any game thread exits the process (exit/ExitProcess/abort) or the entry point returns.
@@ -246,6 +281,16 @@ int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* sta
     g_done = nullptr;
     g_running = false;
     return g_exit_code.load();
+}
+
+[[noreturn]] void finish_run(int code) {
+    if (g_exit_tid) {
+        SetEvent(g_release_exit);
+        // Normally ExitProcess kills this host thread. If the caller died unexpectedly, retain the exit code.
+        if (g_exit_thread) WaitForSingleObject(g_exit_thread, INFINITE);
+        else for (;;) Sleep(INFINITE);  // handle duplication failed; retain the live caller's TLS, never race it
+    }
+    ExitProcess(static_cast<UINT>(code));
 }
 
 }  // namespace rt::process

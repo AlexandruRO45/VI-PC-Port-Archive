@@ -433,6 +433,26 @@ if(BUILD_TESTING)
     set_target_properties(tiny_bundled_load PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    add_library(process_detach_dep SHARED test/fixtures/process_detach_dll.cpp)
+    add_executable(process_detach_guest test/fixtures/process_detach_exe.cpp)
+    target_link_libraries(process_detach_guest PRIVATE process_detach_dep)
+    add_executable(process_detach_driver test/process_detach_driver.cpp
+      src/pe_loader.cpp shims/registry.cpp shims/process.cpp)
+    target_link_options(process_detach_driver PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
+    target_link_libraries(process_detach_driver PRIVATE psapi)
+    add_dependencies(process_detach_driver gta6rt_tls_host process_detach_guest)
+    foreach(target process_detach_dep process_detach_guest process_detach_driver)
+      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    endforeach()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+      add_test(NAME process_detach COMMAND "${Python3_EXECUTABLE}" -I
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/check_process_detach.py"
+        --driver "$<TARGET_FILE:process_detach_driver>" --guest "$<TARGET_FILE:process_detach_guest>")
+      set_tests_properties(process_detach PROPERTIES TIMEOUT 180)
+    endif()
+
     add_library(startup_rollback_a SHARED test/fixtures/startup_rollback_dll.cpp)
     target_compile_definitions(startup_rollback_a PRIVATE ROLLBACK_DEPENDENCY_A)
     add_library(startup_rollback_b SHARED test/fixtures/startup_rollback_dll.cpp)

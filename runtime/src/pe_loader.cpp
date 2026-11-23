@@ -27,6 +27,12 @@ std::string lower(std::string s) {
 
 namespace {
 
+std::atomic<Loader*> g_process_exit_loader{nullptr};
+
+void __cdecl on_host_process_detach(void* reserved) {
+    if (Loader* loader = g_process_exit_loader.load()) loader->detach_initialised_modules(reserved);
+}
+
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + p.string());
@@ -126,8 +132,8 @@ std::atomic<uint64_t> g_next_tls_generation{1};
 std::vector<TlsCloneRecord> g_tls_clones;
 
 // Frees every TLS helper clone this process loaded and deletes its files. load() registers the wrapper with atexit;
-// the --run path in main() must also call this directly before ExitProcess, which skips the atexit table. Call it
-// only when no mapped code can run again: it unmaps the helper images.
+// ExitProcess skips the atexit table. The --run path keeps helpers mapped through process detach and lets the
+// next process sweep their stale clone files. Explicit cleanup is only safe when no mapped code can run again.
 void cleanup_tls_clones_internal() {
     for (const auto& rec : g_tls_clones) {
         if (rec.module) FreeLibrary(rec.module);
@@ -570,6 +576,8 @@ Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) 
 }
 
 Loader::~Loader() {
+    Loader* armed = this;
+    g_process_exit_loader.compare_exchange_strong(armed, nullptr);
     detach_initialised_modules();
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
@@ -594,19 +602,43 @@ Loader::~Loader() {
     }
 }
 
-void Loader::detach_initialised_modules() {
+void Loader::enable_process_exit() {
+    std::lock_guard alloc_lock(g_tls_alloc_mutex);
+    const auto host = ensure_tls_host(0);
+    using SetProcessDetach = void(__cdecl*)(void(__cdecl*)(void*));
+    const auto set = host.module ? reinterpret_cast<SetProcessDetach>(
+        GetProcAddress(host.module, "gta6rt_tls_host_set_process_detach")) : nullptr;
+    if (!set) throw std::runtime_error("process detach requires the matching gta6rt_tls_host.dll");
+    Loader* expected = nullptr;
+    if (!g_process_exit_loader.compare_exchange_strong(expected, this) && expected != this)
+        throw std::runtime_error("a process exit Loader is already registered");
+    set(&on_host_process_detach);
+}
+
+void Loader::prepare_process_exit() {
+    // Drain in-progress module loads/initialisation while the other threads are alive; prevent further mutation
+    // before native ExitProcess kills them. Do not take this mutex from DLL_PROCESS_DETACH.
+    std::lock_guard lock(mutex_);
+    detaching_ = true;
+}
+
+void Loader::detach_initialised_modules(void* process_termination) {
     // Publish before invoking guest code: LoadLibrary/forwarders can reenter this loader during detach.
     // This is terminal, including after a failed startup. Repeated or recursive rollback is a no-op.
-    if (detaching_.exchange(true)) return;
+    if (detach_started_.exchange(true)) return;
+    detaching_ = true;
     // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
     // block alive throughout the notifications: a detach handler can still call an imported function or free an
     // FLS slot whose destructor lives in another mapped image.
-    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
-        Module& m = **it;
-        if (!m.initialised) continue;  // a map-only load never opts in to running image code
-        set_initialised(m, false);  // under the TLS lock: thread events stop running its callbacks
+    const auto detach = [&](Module& m) {
+        if (!m.initialised) return;  // a map-only load never opts in to running image code
+        // Process termination runs under the Windows loader lock, after all other threads are gone. A lock
+        // owned by a killed worker cannot be acquired here. Explicit unload still synchronises thread events.
+        if (process_termination) m.initialised = false;
+        else set_initialised(m, false);
         try {
-            run_tls_callbacks(m, DLL_PROCESS_DETACH);
+            // Trace output takes host locks too; it must be completed before native termination starts.
+            run_callbacks(m, DLL_PROCESS_DETACH, !process_termination);
         } catch (const std::exception& e) {
             // A module may have changed its callback table since attach. A destructor cannot propagate the validation
             // error; report it and still let DllMain release resources before the image is freed.
@@ -616,18 +648,31 @@ void Loader::detach_initialised_modules() {
         if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
             auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
             try {
-                entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
+                entry(m.base, DLL_PROCESS_DETACH, process_termination);
             } catch (const std::exception& error) {
                 // Continue releasing dependencies, and retain a diagnostic for the cleanup failure.
                 std::fprintf(stderr, "[rt] DllMain process detach failed for %s: %s\n", m.name.c_str(), error.what());
             }
         }
+    };
+    if (process_termination) {
+        // Windows detaches loaded DLLs before issuing the executable's TLS process-detach callbacks.
+        for (bool dll_pass : {true, false}) {
+            for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
+                Module& m = **it;
+                const auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+                const bool is_dll = (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
+                if (is_dll == dll_pass) detach(m);
+            }
+        }
+    } else {
+        for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) detach(**it);
     }
 }
 
 Module& Loader::load(const std::filesystem::path& image) {
-    if (detaching_) throw std::runtime_error("loader is detaching");
     std::lock_guard lock(mutex_);
+    if (detaching_) throw std::runtime_error("loader is detaching");
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
     Module* mapped = nullptr;
@@ -789,6 +834,7 @@ void Loader::register_unwind(Module& m) {
 }
 
 void Loader::initialise() {
+    std::lock_guard lock(mutex_);
     if (detaching_) throw std::runtime_error("loader is detaching");
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.

@@ -19,6 +19,8 @@ using ThreadEventFn = void(__cdecl*)(DWORD reason);
 
 // A plain global, not TLS (see above). Written once by the loader, read on every thread event.
 void* volatile g_thread_event = nullptr;
+using ProcessDetachFn = void(__cdecl*)(void* reserved);
+void* volatile g_process_detach = nullptr;
 
 }  // namespace
 
@@ -32,10 +34,19 @@ extern "C" __declspec(dllexport) void gta6rt_tls_host_set_thread_event(ThreadEve
     InterlockedExchangePointer(&g_thread_event, reinterpret_cast<void*>(fn));
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+// Separate from thread notifications: only the primary helper registers this callback. Explicit FreeLibrary
+// must not deliver process termination for mapped modules; their Loader owns explicit unload/rollback.
+extern "C" __declspec(dllexport) void gta6rt_tls_host_set_process_detach(ProcessDetachFn fn) {
+    InterlockedExchangePointer(&g_process_detach, reinterpret_cast<void*>(fn));
+}
+
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {
     if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
         void* fn = InterlockedCompareExchangePointer(&g_thread_event, nullptr, nullptr);
         if (fn) reinterpret_cast<ThreadEventFn>(fn)(reason);
+    } else if (reason == DLL_PROCESS_DETACH && reserved) {
+        void* fn = InterlockedCompareExchangePointer(&g_process_detach, nullptr, nullptr);
+        if (fn) reinterpret_cast<ProcessDetachFn>(fn)(reserved);
     }
     return TRUE;
 }

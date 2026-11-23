@@ -90,10 +90,17 @@ public:
     // TLS was already installed by load(), so this is safe to call on the loading thread without a second install.
     void initialise();
 
-    // Delivers process detach in reverse initialization order, once, while all mappings and TLS remain live.
+    // Delivers process detach once while all mappings and TLS remain live. A null argument means explicit unload
+    // (reverse initialization order). The native process-termination hook supplies its non-null reserved pointer,
+    // detaches DLLs before EXE TLS, and avoids locks/tracing after Windows has stopped the other threads.
     // Call on the initialization thread to roll back failed startup. Terminal: further load/initialise is refused.
     // Standard exceptions from cleanup callbacks are reported, and remaining dependencies are still detached.
-    void detach_initialised_modules();
+    void detach_initialised_modules(void* process_termination = nullptr);
+
+    // Opt in the process's run Loader to native DLL_PROCESS_DETACH, while its mappings/TLS are still live.
+    // Arm before starting guest code; prepare on the winning exit caller before signalling run completion.
+    void enable_process_exit();
+    void prepare_process_exit();
 
     // Calls the image's IMAGE_TLS_DIRECTORY64 callbacks in order with (base, reason, nullptr). This is opt-in:
     // load() never runs image code; initialise() and ~Loader() use it for process attach/detach. No-op for
@@ -133,6 +140,7 @@ private:
     mutable std::recursive_mutex mutex_;
     // Terminal once rollback/destruction starts. Never run process attach or map new images after this point.
     std::atomic<bool> detaching_{false};
+    std::atomic<bool> detach_started_{false};
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules
@@ -140,8 +148,9 @@ private:
 };
 
 // Frees the TLS helper clones load() created and deletes their files (Module::tls_index background). load()
-// registers this with atexit; a caller that ends with ExitProcess must invoke it directly, because ExitProcess
-// skips the atexit table. Call it when no mapped code can run again: it unmaps the helper images.
+// registers this with atexit. Call only after explicit detach when no mapped code can run again: it unmaps helpers.
+// The --run process-exit handoff keeps helpers alive through native DLL_PROCESS_DETACH instead; their stale files
+// are reclaimed by the existing clone sweep on a later multi-module load.
 void cleanup_tls_clones();
 
 std::string lower(std::string s);
