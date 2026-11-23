@@ -2701,16 +2701,22 @@ const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEn
 
 // Whether the input layout has an element for every ordinary (non-system-value) input of the vertex shader.
 bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC& layout) {
+    const UINT count = layout.pInputElementDescs ? layout.NumElements : 0;
     for (const auto& input : vs.input_signature) {
         if (input.system_value) continue;
         bool fed = false;
-        for (UINT i = 0; i < layout.NumElements && !fed; ++i)
+        for (UINT i = 0; i < count && !fed; ++i)
             fed = layout.pInputElementDescs[i].SemanticIndex == input.semantic_index &&
                   equal_semantic(input.semantic, layout.pInputElementDescs[i].SemanticName);
         if (!fed) return false;
     }
     return true;
 }
+
+// Known D3D12_PIPELINE_STATE_FLAGS bits: TOOL_DEBUG (0x1, kept for cached-PSO parity), bit 0x2,
+// DYNAMIC_DEPTH_BIAS (0x4), and DYNAMIC_INDEX_BUFFER_STRIP_CUT (0x8). Higher bits fail with E_INVALIDARG
+// on both Windows hardware D3D12 and WARP.
+constexpr UINT kKnownPipelineStateFlags = 0xFu;
 
 class RootSignature final
     : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
@@ -2823,8 +2829,10 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
     for (const D3D12_DEPTH_STENCILOP_DESC& face : {d.FrontFace, d.BackFace})
         key.u32(face.StencilFailOp).u32(face.StencilDepthFailOp).u32(face.StencilPassOp).u32(face.StencilFunc);
     const D3D12_INPUT_LAYOUT_DESC& input = desc.InputLayout;
-    key.u32(input.pInputElementDescs ? input.NumElements : 0);
-    for (UINT i = 0; input.pInputElementDescs && i < input.NumElements; ++i) {
+    const UINT input_count =
+        input.pInputElementDescs ? std::min<UINT>(input.NumElements, D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) : 0;
+    key.u32(input_count);
+    for (UINT i = 0; i < input_count; ++i) {
         const D3D12_INPUT_ELEMENT_DESC& e = input.pInputElementDescs[i];
         key.text(e.SemanticName).u32(e.SemanticIndex).u32(e.Format).u32(e.InputSlot).u32(e.AlignedByteOffset);
         key.u32(e.InputSlotClass).u32(e.InstanceDataStepRate);
@@ -3171,6 +3179,8 @@ public:
             log_once("mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
             return E_NOTIMPL;
         }
+        if (desc.NodeMask & ~1u) return E_INVALIDARG;
+        if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
         if (!device_.arena.mapped) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
             return E_NOTIMPL;
@@ -3181,6 +3191,37 @@ public:
             return E_NOTIMPL;
         }
         if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
+        for (UINT i = desc.NumRenderTargets; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+            if (desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN) return E_INVALIDARG;
+        if (desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+            const Format dsv_fmt = vulkan_format(desc.DSVFormat, true);
+            if (dsv_fmt.format == VK_FORMAT_UNDEFINED || dsv_fmt.typeless ||
+                !(dsv_fmt.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
+                log_once("depth-stencil format not supported:", desc.DSVFormat);
+                return E_INVALIDARG;
+            }
+        }
+        if (desc.InputLayout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return E_INVALIDARG;
+        if (desc.InputLayout.NumElements > 0 && !desc.InputLayout.pInputElementDescs) return E_INVALIDARG;
+        for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+            const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
+            if (!element.SemanticName) return E_INVALIDARG;
+            if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
+            if (element.InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA &&
+                element.InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA)
+                return E_INVALIDARG;
+            if (element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA &&
+                element.InstanceDataStepRate != 0)
+                return E_INVALIDARG;
+        }
+        if (desc.BlendState.IndependentBlendEnable) {
+            for (const D3D12_RENDER_TARGET_BLEND_DESC& rt : desc.BlendState.RenderTarget)
+                if (rt.LogicOpEnable) return E_INVALIDARG;
+        } else {
+            const D3D12_RENDER_TARGET_BLEND_DESC& rt0 = desc.BlendState.RenderTarget[0];
+            if (rt0.BlendEnable && rt0.LogicOpEnable) return E_INVALIDARG;
+            if (rt0.LogicOpEnable && unsigned(rt0.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
+        }
         if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.StreamOutput.NumEntries) {
             log_once("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
             return E_NOTIMPL;
@@ -3714,6 +3755,8 @@ public:
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
+        if (desc.NodeMask & ~1u) return E_INVALIDARG;
+        if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
         if (!device_.arena.mapped) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 0);
             return E_NOTIMPL;
@@ -7101,20 +7144,31 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
             *opts = {};
-            opts->DoublePrecisionFloatShaderOps = TRUE;
-            opts->OutputMergerLogicOp = TRUE;
+            // Answer what the layer will actually honour, not what the GPU offers: docs/d3d12_vulkan.md 4.1 says a
+            // false "supported" is worse than a false "unsupported" at boot, and the PSO paths refuse these same
+            // features when they are missing (logic ops, per the mapping vkd3d-proton's
+            // d3d12_device_caps_init_feature_options uses).
+            opts->DoublePrecisionFloatShaderOps = state_.info.features.shaderFloat64;
+            opts->OutputMergerLogicOp = state_.info.features.logicOp;
             opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
             opts->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
             opts->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
-            opts->PSSpecifiedStencilRefSupported = TRUE;
+            // No VK_EXT_shader_stencil_export is enabled and the translator emits no stencil-ref write, so a pixel
+            // shader that writes the stencil ref would be refused: answer unsupported, the direction 4.1 prefers.
+            opts->PSSpecifiedStencilRefSupported = FALSE;
             opts->TypedUAVLoadAdditionalFormats = TRUE;
-            opts->ROVsSupported = TRUE;
+            // POPS: the translator only declares PixelInterlockOrderedEXT, enabled exactly when the GPU offers
+            // VK_EXT_fragment_shader_interlock and its fragmentShaderPixelInterlock feature.
+            opts->ROVsSupported = state_.info.fragment_shader_interlock;
             opts->ConservativeRasterizationTier = state_.conservative_raster_tier;
             opts->MaxGPUVirtualAddressBitsPerResource = 40;
             opts->StandardSwizzle64KBSupported = FALSE;
             opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
             opts->CrossAdapterRowMajorTextureSupported = FALSE;
-            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
+            // A translated vertex shader writing a layer or viewport index needs both Vulkan 1.2 features enabled
+            // (vkCreateShaderModule refuses the module without them, VUID-...-pCode-08740).
+            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
+                state_.info.shader_output_layer && state_.info.shader_output_viewport_index;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
             return d3d12_trace::result(method, S_OK);
         }
