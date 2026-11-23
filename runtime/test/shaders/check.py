@@ -462,7 +462,7 @@ VM_MASK_CLEAR = (0xbf800000,) * 4
 VM_MASK_KEPT = (0x3f800000,) * 4
 VM_MASK_TESTS = {"ps_vm_mask_late": "odd",     # on at the vm export, off at the end: these survive
                  "ps_vm_mask_null": "even",    # the NULL export's mask is the last one: the even ones survive
-                 "ps_vm_mask_end": "even"}     # no vm export at all: EXEC at the end keeps the even ones
+                 "ps_vm_mask_end": "even"}     # no vm export: the color export's own EXEC keeps the even ones
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
 # a required subgroup size onto the fragment stage ("fragment subgroup size: N", the whole line; a device that could
 # not take the size gets "fragment subgroup size: N not available" or no line). A device that cannot

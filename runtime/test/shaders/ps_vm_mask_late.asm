@@ -12,6 +12,10 @@
 ; latched valid mask would return the frame inverted (odd pixels cleared, even ones 1.0), and one that dropped the
 ; mask altogether would return all 4096 pixels as 1.0.
 ;
+; The s_waitcnt matters on hardware (docs/design.md, EXEC): an export is asynchronous, and without it the
+; hardware takes the EXEC of a later moment, so the very rule these fixtures measure would read as
+; "EXEC at the end decides" (ps_exp_color_mask.asm learned the same thing on RDNA2).
+;
 ; Run: vk_harness vs_ids.spv ps_vm_mask_late.spv out.raw
 ;   -> mrt0 = (1.0, 1.0, 1.0, 1.0) on every odd column, the clear value (-1.0) on every even one
 v_interp_p1_f32_e32 v2, v0, attr0.x
@@ -22,5 +26,6 @@ v_and_b32_e32 v3, 1, v2
 v_mov_b32_e32 v4, 1.0
 v_cmpx_ne_u32_e32 0, v3
 exp mrt0 v4, v4, v4, v4 done vm
+s_waitcnt expcnt(0)
 v_cmpx_eq_u32_e32 0, v3
 s_endpgm

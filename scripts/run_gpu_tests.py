@@ -488,7 +488,7 @@ VM_MASK_CLEAR = (0xBF800000,) * 4     # -1.0 in all four components: what vk_har
 VM_MASK_KEPT = (0x3F800000,) * 4      # the 1.0 the fixtures export
 VM_MASK_TESTS = {"ps_vm_mask_late": "odd",     # on at the vm export, off at the end: these survive
                  "ps_vm_mask_null": "even",    # the NULL export's mask is the last one: the even ones survive
-                 "ps_vm_mask_end": "even"}     # no vm export at all: EXEC at the end keeps the even ones
+                 "ps_vm_mask_end": "even"}     # no vm export: the color export's own EXEC keeps the even ones
 
 
 def check_vm_mask(raw_path: str, kept: str) -> tuple[bool, str]:

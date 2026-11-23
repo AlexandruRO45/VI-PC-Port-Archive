@@ -11,6 +11,10 @@
 ; would come back as 1.0: both are the same claim (the last vm export is the mask, whatever its target), so this
 ; fixture separates it from "the first one wins" and not from each of them on its own.
 ;
+; The s_waitcnt matters on hardware (docs/design.md, EXEC): an export is asynchronous, and without it the
+; hardware takes the EXEC of a later moment, so the very rule these fixtures measure would read as
+; "EXEC at the end decides" (ps_exp_color_mask.asm learned the same thing on RDNA2).
+;
 ; Run: vk_harness vs_ids.spv ps_vm_mask_null.spv out.raw
 ;   -> mrt0 = (1.0, 1.0, 1.0, 1.0) on every even column, the clear value (-1.0) on every odd one
 v_interp_p1_f32_e32 v2, v0, attr0.x
@@ -20,7 +24,9 @@ v_cvt_u32_f32_e32 v2, v2
 v_and_b32_e32 v3, 1, v2
 v_mov_b32_e32 v4, 1.0
 exp mrt0 v4, v4, v4, v4 done vm
+s_waitcnt expcnt(0)
 v_cmpx_eq_u32_e32 0, v3
 exp null off, off, off, off done vm
+s_waitcnt expcnt(0)
 s_mov_b64 exec, -1
 s_endpgm
