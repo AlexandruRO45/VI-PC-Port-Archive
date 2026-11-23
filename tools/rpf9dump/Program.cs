@@ -64,7 +64,13 @@ long? effectiveScanLength = scanLength is long reqSpan ? Math.Min(reqSpan, lengt
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
-string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
+string outDir = Path.Combine(outRoot, baseName);
+try { Directory.CreateDirectory(outDir); }
+catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+{
+    Console.Error.WriteLine($"cannot create output directory '{outDir}': {e.Message}");
+    return 1;
+}
 int ok = 0, fail = 0, skip = 0, writeFail = 0;
 // Every mode below works on all cores by default. Core's readers open their own read handle per call, entry and
 // file names come from offsets and indexes, and results are put back in source order, so outputs match a

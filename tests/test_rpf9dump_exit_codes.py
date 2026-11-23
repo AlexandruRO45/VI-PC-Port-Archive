@@ -79,6 +79,26 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
                     self.assertNotIn("Unhandled exception", done.stderr)
                     self.assertFalse(out.exists(), f"{label} source left {out} behind")
 
+    def test_blocked_output_directory_reports_an_error_and_preserves_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            src = root / "textures.rpf"
+            texture_dictionary_rpf(src)
+            root_file = root / "blocked-root"
+            leaf_root = root / "output"
+            leaf_root.mkdir()
+            for out, blocker in ((root_file, root_file), (leaf_root, leaf_root / src.stem)):
+                with self.subTest(blocker=blocker):
+                    blocker.write_bytes(b"keep")
+                    result = run("textures", src, out)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    errors = result.stderr.splitlines()
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertTrue(errors[0].startswith("cannot create output directory "), errors)
+                    self.assertIn(str(out / src.stem), errors[0])
+                    self.assertEqual(blocker.read_bytes(), b"keep")
+
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
