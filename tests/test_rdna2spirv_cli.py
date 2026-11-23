@@ -196,6 +196,76 @@ class CommandLine(unittest.TestCase):
                     self.assertFalse(os.path.exists(out))     # 9/8 used to write an empty index.part9.json
 
 
+class NothingTranslated(unittest.TestCase):
+    """A run whose inputs all fail publishes no index and exits 1; a slice with no inputs is still a success."""
+
+    BAD = "\tv_no_such_op_e32 v0, v1\n\ts_endpgm\n"   # an unknown instruction: Unsupported, never translated
+    OK = "\ts_endpgm\n"
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.src = self.root / "disasm"
+        self.src.mkdir()
+        self.out = self.root / "spirv"
+
+    def shader(self, name, text):
+        (self.src / f"{name}.s").write_text(text, encoding="utf-8")
+        (self.root / f"{name}.dxbc").write_bytes(b"DXBC" + bytes(28))
+
+    def run_tool(self, *extra):
+        return subprocess.run([sys.executable, "-I", TOOL, str(self.src), "--out", str(self.out), *extra],
+                              capture_output=True, text=True)
+
+    def test_all_inputs_failing_exits_1_without_an_index(self):
+        self.shader("ps_bad", self.BAD)
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("none of the 1 shaders translated; index.json not written", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("v_no_such_op", p.stdout)            # the reasons are still listed
+        self.assertFalse((self.out / "index.json").exists())
+
+    def test_one_translated_shader_is_still_a_success(self):
+        self.shader("ps_bad", self.BAD)
+        self.shader("ps_ok", self.OK)
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(list(json.loads((self.out / "index.json").read_text(encoding="utf-8"))), ["ps_ok"])
+
+    def test_a_shard_slice_with_no_inputs_is_a_success(self):
+        self.shader("ps_ok", self.OK)
+        p = self.run_tool("--shard", "1/2")                 # one shader, two shards: slice 1 is empty
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads((self.out / "index.part1.json").read_text(encoding="utf-8")), {})
+        self.assertTrue((self.out / "shard1.json").is_file())
+
+    def test_a_shard_slice_whose_inputs_all_fail_leaves_no_part(self):
+        self.shader("ps_bad", self.BAD)
+        p = self.run_tool("--shard", "0/1")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("index.part0.json not written", p.stderr)
+        self.assertFalse((self.out / "index.part0.json").exists())
+        self.assertFalse((self.out / "shard0.json").exists())   # --merge then reports an incomplete set
+
+    def test_a_rerun_that_translates_nothing_keeps_the_index_it_found(self):
+        self.shader("ps_ok", self.OK)
+        self.assertEqual(self.run_tool().returncode, 0)
+        (self.src / "ps_ok.s").unlink()
+        self.shader("ps_bad", self.BAD)
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(list(json.loads((self.out / "index.json").read_text(encoding="utf-8"))), ["ps_ok"])
+
+    def test_a_rerun_where_the_indexed_shader_now_fails_drops_the_index(self):
+        self.shader("ps_ok", self.OK)
+        self.assertEqual(self.run_tool().returncode, 0)
+        (self.src / "ps_ok.s").write_text(self.BAD, encoding="utf-8")
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertFalse((self.out / "index.json").exists())  # its only entry's module is gone with it
+        self.assertFalse((self.out / "ps_ok.spv").exists())
+
+
 class OutputFolderValidation(unittest.TestCase):
     """--out must be a folder path: a file there is a usage error, never a traceback."""
 
@@ -347,7 +417,8 @@ class ValidatedOutput(unittest.TestCase):
 
         output = io.StringIO()
         with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
-                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output), \
+                redirect_stderr(io.StringIO()):
             self.exit_code = rdna2spirv.main()
         return output.getvalue()
 
@@ -495,7 +566,7 @@ class ValidatedOutput(unittest.TestCase):
     def test_validator_rejection_does_not_publish_binary(self):
         self.assertIn("INVALID: synthetic rejection", self.translate(reject_at="spirv-val"))
         self.assertFalse(self.module.exists())
-        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+        self.assertFalse(self.index.exists())      # the only shader failed: no index says it was translated
         self.assertTrue((self.out / "ps_fixture.spvasm").is_file())
         self.assertEqual(list(self.out.glob("*.tmp")), [])
 
@@ -534,11 +605,12 @@ class ValidatedOutput(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(rdna2spirv, "translate", side_effect=ValueError("synthetic translator error")), \
                 mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
-                redirect_stdout(output):
-            rdna2spirv.main()
+                redirect_stdout(output), redirect_stderr(io.StringIO()):
+            code = rdna2spirv.main()
         self.assertIn("translator error ValueError", output.getvalue())
         self.assertFalse(self.module.exists())
-        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+        self.assertEqual(code, 1)
+        self.assertFalse(self.index.exists())      # its only entry is the shader that just failed
 
     def test_validation_success_publishes_binary_and_metadata(self):
         self.assertIn("1 pass spirv-val", self.translate())
@@ -563,10 +635,12 @@ class EmptyShader(unittest.TestCase):
                 f.write(b"DXBC" + bytes(28))
             out = os.path.join(tmp, "spirv")
             p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True, errors="replace")
-            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.returncode, 1, p.stderr)    # the run's only shader did not translate
             self.assertIn("0 translated", p.stdout, p.stdout)
             self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)
+            self.assertIn("index.json not written", p.stderr)
             self.assertFalse(os.path.exists(os.path.join(out, "ps_empty.spv")))
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
 
 
 class PopsInvocationInterlock(unittest.TestCase):

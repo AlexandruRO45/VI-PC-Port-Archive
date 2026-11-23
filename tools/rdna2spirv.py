@@ -18168,18 +18168,6 @@ def main():
                 eta = ""
             print(f"  {label}: {i}/{total} ({pct}%){eta}", flush=True)
     import json as _js
-    old = {}
-    if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
-        with open(idx_path, encoding="utf-8") as f:
-            old = _js.load(f)  # partial runs merge into an existing index
-        for name in invalid:
-            old.pop(name, None)
-    old.update(meta)
-    if shard is None or not missing_inputs:
-        write_index(idx_path, old)
-    if shard is None:
-        import spirv_stubs
-        spirv_stubs.generate_for_index(a.out, old)
     status_label = "assembled (spirv-val skipped)" if a.no_validate else "pass spirv-val"
     print(f"{len(files)} shaders: {ok} translated, {valid} {status_label}")
     if W64G_COUNTS:
@@ -18187,6 +18175,36 @@ def main():
               + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
     for k, v in why.most_common(25):
         print(f"  {v:6}  {k}")
+    old, loaded_old = {}, False
+    if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
+        with open(idx_path, encoding="utf-8") as f:
+            old = _js.load(f)  # partial runs merge into an existing index
+        loaded_old = True
+        for name in invalid:
+            old.pop(name, None)
+    old.update(meta)
+    if files and not meta:
+        # Every input failed to translate or to validate. index.json (a shard's part) is the marker that says the
+        # slice was translated, so none is published and the run exits 1, which make_game.py stops on; --merge
+        # then sees an incomplete shard set. A slice with no .s files stays a success below. An index from an
+        # earlier run keeps the shaders that still translate, or goes when none does.
+        if shard is not None:
+            Path(idx_path).unlink(missing_ok=True)
+            Path(os.path.join(a.out, SHARD_MARKER.format(index=shard))).unlink(missing_ok=True)
+        elif old:
+            write_index(idx_path, old)
+        elif loaded_old:
+            Path(idx_path).unlink(missing_ok=True)
+        print(f"ERROR: none of the {len(files)} shaders translated; {os.path.basename(idx_path)} not written",
+              file=sys.stderr)
+        return 1
+    if shard is not None:   # a marker beside the part, so --merge can tell a complete set from a partial one
+        write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
+    if shard is None or not missing_inputs:
+        write_index(idx_path, old)
+    if shard is None:
+        import spirv_stubs
+        spirv_stubs.generate_for_index(a.out, old)
     if missing_inputs:
         print(f"{missing_inputs} of {len(files)} selected shaders missing required inputs", file=sys.stderr)
         return 1
