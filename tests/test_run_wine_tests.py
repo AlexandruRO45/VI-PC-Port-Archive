@@ -275,6 +275,17 @@ class RunTestTest(unittest.TestCase):
                 self.assertEqual(status, "pass", detail)
                 self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
 
+    def test_invalid_ctest_skip_return_code_fails_without_launching(self):
+        exe = self.exiting(0)
+        for bad in ("abc", "", [], True, 1.5):
+            with self.subTest(skip_code=bad):
+                entry = ctest_entry("bad_skip", self.command_for(exe), {"SKIP_RETURN_CODE": bad})
+                with mock.patch.object(rwt.subprocess, "run") as run:
+                    status, detail = self.run_entry(entry)
+                self.assertEqual(status, "fail", detail)
+                self.assertIn("invalid CTest SKIP_RETURN_CODE", detail)
+                run.assert_not_called()
+
     def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
         status, detail = rwt.run_test(ctest_entry("ok", self.command_for(self.exiting(0))), self.args,
                                       ["definitely-not-a-real-wine-xyz"])
