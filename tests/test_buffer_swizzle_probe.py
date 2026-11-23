@@ -137,6 +137,28 @@ class BufferSwizzleProbeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("WAVE_DIFF", out.getvalue())
 
+    def test_short_or_none_hw_oracle_results_exit_2_and_close_oracle(self):
+        cases = [c for c in probe.build_cases() if c.group == "oob_mode3_soffset"]
+        self.assertEqual(len(cases), 2)
+        for responses, match in (
+            ([[]], "wave32: the oracle returned 0 results for 2 kernels"),
+            ([[[0] * probe.OUT_WORDS]], "wave32: the oracle returned 1 results for 2 kernels"),
+            ([[None, [0] * probe.OUT_WORDS]], f"wave32 {cases[0].name}: expected {cases[0].words} words, got None"),
+            ([[[0] * (cases[0].words - 1), [0] * probe.OUT_WORDS]],
+             f"wave32 {cases[0].name}: expected {cases[0].words} words"),
+        ):
+            with self.subTest(match=match):
+                ora = unittest.mock.MagicMock(device="fake", arch="gfx1036")
+                ora.run.side_effect = responses
+                out, err = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=ora), \
+                     redirect_stdout(out), redirect_stderr(err):
+                    rc = probe.main(["--oracle", "hw", "--group", "oob_mode3_soffset", "--wave", "32"])
+                self.assertEqual(rc, 2)
+                self.assertIn("harness error:", err.getvalue())
+                self.assertIn(match, err.getvalue())
+                ora.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
