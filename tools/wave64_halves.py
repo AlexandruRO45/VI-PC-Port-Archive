@@ -98,6 +98,10 @@ MOVREL_OPS = (
 )
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
+VALU_MASK_OPS = (
+    "v_cndmask_b32", "v_cndmask_b16", "v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
+    "v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32", "v_addc_u32", "v_subb_u32",
+)
 DPP_BAD = ("row_bcast", "wave_")
 UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none in the wave and in each half (see vote)
 
@@ -184,6 +188,13 @@ def _half(a):
 
 def _zero(a):
     return a.get("k") == "imm" and a.get("v") == 0
+
+
+def _uniform_mask_const(a):
+    """True when a 64-bit mask constant is identical in both 32-lane halves (0, all-ones, or null)."""
+    if a.get("k") == "imm":
+        return a["v"] in (0, -1, 0xFFFFFFFFFFFFFFFF)
+    return a.get("k") == "special" and a.get("t") == "null"
 
 
 def _mask64(a):
@@ -698,12 +709,15 @@ class Analysis:
         # hardware it is the 64 lane bits, here the bits of the lanes of the half
         md = 0
         if not op.startswith(("v_cmp", "s_cmp", "s_bitcmp")) and op not in (
-                "v_cndmask_b32", "v_cndmask_b16", "s_bcnt1_i32_b64", "s_ff1_i32_b64", "v_mbcnt_lo_u32_b32",
+                "s_bcnt1_i32_b64", "s_ff1_i32_b64", "v_mbcnt_lo_u32_b32",
                 "v_mbcnt_hi_u32_b32") and not op.startswith(MASK_BITWISE + SAVEEXEC) and "exec" not in defs:
-            for x in srcs:
+            for idx, x in enumerate(srcs):
                 if _half(x):
                     violation("mask-half")
                     md |= X
+                elif op in VALU_MASK_OPS and idx == 2:
+                    # srcs[2] is the per-lane condition/carry-in mask operand, not integer data.
+                    continue
                 elif self.is_mask(ins, x) and x.get("k") != "special" or (
                         x.get("k") == "special" and x.get("t") in ("vcc", "exec") and self.is_mask(ins, x)):
                     md |= MASKD | X
@@ -1021,12 +1035,16 @@ class Analysis:
                     return cnt_toks[0]
             return None
 
-        if op in ("v_cndmask_b32", "v_cndmask_b16") or op.startswith("v_"):
+        if op in VALU_MASK_OPS or op.startswith("v_"):
             tj = t_src
+            if op in VALU_MASK_OPS and len(srcs) >= 3:
+                mask_op = srcs[2]
+                if not self.is_mask(ins, mask_op) and not _uniform_mask_const(mask_op):
+                    tj |= LANE
             uniform = False
             uniform_active = False
-            if op.startswith("v_") and not op.startswith(("v_interp", "v_mbcnt", "v_readlane", "v_writelane", "v_permlane",
-                                                          "v_cndmask")) and dests:
+            if op.startswith("v_") and op not in VALU_MASK_OPS and not op.startswith((
+                    "v_interp", "v_mbcnt", "v_readlane", "v_writelane", "v_permlane")) and dests:
                 uniform = st["f"] and all(
                     x.get("k") in ("imm", "fimm") or (x.get("k") == "sgpr" and not self.is_mask(ins, x)) or
                     (x.get("k") == "vgpr" and all(r[1] in st["u"] for r in _regs(x))) for x in srcs) and not uses
