@@ -128,6 +128,22 @@ class PkInt16ClampProbeTests(unittest.TestCase):
                 rc_err = probe.main(["--ops", "v_pk_mul_lo_u16", "--waves", "32"])
         self.assertEqual(rc_err, 2)
 
+    def test_repeated_selections_measure_each_combination_once(self):
+        op = "v_pk_max_i16"
+        expected = _expected_results_for([op], [32])
+        oracle = _mock_oracle([])
+        oracle.run.side_effect = lambda kernels: [
+            expected[i % len(expected)] for i in range(len(kernels))
+        ]
+
+        out = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle):
+            with redirect_stdout(out):
+                rc = probe.main(["--waves", "32,32", "--ops", f"{op},{op}"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("52 evaluations across 1 wave(s) x 1 op(s)", out.getvalue())
+
     def test_unavailable_non_gfx10_and_cli_errors(self):
         with unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=hw_runner.Unavailable("no gpu")):
             with redirect_stdout(io.StringIO()):

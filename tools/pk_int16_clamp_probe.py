@@ -349,7 +349,8 @@ def main(argv=None) -> int:
     bad_waves = [w for w in wave_tokens if w not in ("32", "64")]
     if bad_ops or bad_waves or not ops or not wave_tokens:
         ap.error("unknown or empty: " + ", ".join(bad_ops + bad_waves or ["--ops/--waves"]))
-    waves = [int(w) for w in wave_tokens]
+    ops = list(dict.fromkeys(ops))
+    waves = list(dict.fromkeys(map(int, wave_tokens)))
     if a.json and os.path.isdir(a.json):
         ap.error(f"--json {a.json} is a folder, not a file")
 
