@@ -434,6 +434,38 @@ void test_physical_pages(const PhysicalApi& api) {
     api.map(window, 1, nullptr);
     api.free_pages(kPages, again);
 
+    // Runs: consecutive pages backed by one section map with one view, and splitting one page out of the run keeps
+    // the neighbours mapped with their contents.
+    constexpr uint64_t kRunPages = 8;
+    auto* const run_window = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kRunPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    check(run_window != nullptr, "run test reserves its own window");
+    if (!run_window) return;
+    uint64_t run_count = kRunPages;
+    uint64_t run_pages[kRunPages]{};
+    check(api.allocate(0x280, &run_count, run_pages) == TRUE && run_count == kRunPages,
+          "run test allocates consecutive pages");
+    check(api.map(run_window, kRunPages, run_pages) == run_window, "a consecutive run maps in one call");
+    for (uint64_t i = 0; i < kRunPages; ++i) fill_page(run_window + i * kPage64k, 0x5000u + static_cast<uint32_t>(i));
+    bool run_kept = true;
+    for (uint64_t i = 0; i < kRunPages; ++i) run_kept &= page_holds(run_window + i * kPage64k, 0x5000u + (uint32_t)i);
+    check(run_kept, "every page of the run shows its own contents");
+    const uint64_t hole[1] = {0};
+    check(api.map(run_window + 3 * kPage64k, 1, hole) == reinterpret_cast<void*>(run_window + 3 * kPage64k),
+          "unmapping one page of a run succeeds");
+    bool split_kept = true;
+    for (uint64_t i = 0; i < kRunPages; ++i) {
+        if (i == 3) continue;
+        split_kept &= page_holds(run_window + i * kPage64k, 0x5000u + (uint32_t)i);
+    }
+    check(split_kept && reserved_only(run_window + 3 * kPage64k),
+          "the neighbours of the unmapped page keep their contents and the hole is reserved again");
+    check(api.map(run_window + 3 * kPage64k, 1, &run_pages[3]) == reinterpret_cast<void*>(run_window + 3 * kPage64k),
+          "remapping the hole restores the page");
+    check(page_holds(run_window + 3 * kPage64k, 0x5000u + 3), "the restored page shows its contents");
+    check(api.map(run_window, kRunPages, nullptr) == run_window, "bulk unmap drops the whole run");
+    check(api.free_pages(kRunPages, run_pages) == TRUE, "run pages are freed again");
+
     uint64_t zero_count = 0;
     check(api.allocate(0x280, &zero_count, nullptr) == TRUE, "allocating zero pages succeeds");
     check(api.allocate(0x280, nullptr, pages) == FALSE, "a null count fails");

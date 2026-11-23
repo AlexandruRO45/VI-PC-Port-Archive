@@ -425,15 +425,39 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     return VirtualAlloc(address, size, host_type, host_prot);
 }
 
+// Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
+// GPU memory, which the D3D12 layer reads on the CPU.
+DWORD view_protect(const Window& window) {
+    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+}
+
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
-bool unmap_page(uintptr_t address) {
-    const auto it = g_mapped.find(address);
-    if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
+bool unmap_page(uintptr_t address);  // defined after map_run (it re-maps the surviving siblings)
+
+// View extents for the run-mapped regions below: view base -> size in bytes. g_mapped still records every page, so
+// unmapping one page of a run splits the view around it.
+std::map<uintptr_t, SIZE_T> g_views;  // mapped view base -> size
+
+// With g_phys_mutex held: the view containing `address`, or g_views.end().
+std::map<uintptr_t, SIZE_T>::iterator find_view(uintptr_t address) {
+    auto it = g_views.upper_bound(address);
+    if (it == g_views.begin()) return g_views.end();
+    --it;
+    return (address - it->first < it->second) ? it : g_views.end();
+}
+
+// With g_phys_mutex held. Unmaps the whole view at `base` and forgets its pages, without re-mapping anything.
+// The caller re-maps what must survive (unmap_page below) or nothing at all (bulk unmaps).
+bool unmap_view_whole(uintptr_t base) {
+    const auto it = g_views.find(base);
+    if (it == g_views.end()) return true;
+    const SIZE_T size = it->second;
+    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(base),
                                        MEM_PRESERVE_PLACEHOLDER)) {
         return false;
     }
-    g_mapped.erase(it);
+    for (SIZE_T off = 0; off < size; off += kPhysicalPageSize) g_mapped.erase(base + off);
+    g_views.erase(it);
     return true;
 }
 
@@ -454,13 +478,114 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
                                                    protect, nullptr, 0);
     if (!view) return false;
     g_mapped[address] = page;
+    g_views[address] = kPhysicalPageSize;
     return true;
 }
 
-// Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
-// GPU memory, which the D3D12 layer reads on the CPU.
-DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+// With g_phys_mutex held. Maps `count` consecutive guest pages `pages[0..count)` at [start, start + count * 64 KiB)
+// with one placeholder replacement instead of one view per page. The run must already hold: consecutive VAs (the
+// caller steps by 64 KiB), one section, and consecutive section offsets. Every page is still recorded in g_mapped,
+// so unmap_page keeps working. When the range cannot go through as a whole, falls back to per-page mapping, which
+// reports the same failures as before.
+bool map_run(uintptr_t start, const uint64_t* pages, uint64_t count, DWORD protect) {
+    if (count == 0) return true;
+    {
+        // Already mapped exactly this way: nothing to do (remapping the same range is a no-op).
+        const auto have = g_views.find(start);
+        if (have != g_views.end() && have->second == count * kPhysicalPageSize) {
+            uint64_t i = 0;
+            for (; i < count; ++i) {
+                const auto it = g_mapped.find(start + i * kPhysicalPageSize);
+                if (it == g_mapped.end() || it->second != pages[i]) break;
+            }
+            if (i == count) return true;
+        }
+    }
+    const Section* section = nullptr;
+    uint64_t offset = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        const auto it = g_pages.find(pages[i]);
+        if (it == g_pages.end()) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        if (i == 0) {
+            section = it->second.section.get();
+            offset = it->second.offset;
+        } else if (it->second.section.get() != section || it->second.offset != offset + i * kPhysicalPageSize) {
+            for (uint64_t j = 0; j < count; ++j) {
+                if (!map_page(start + j * kPhysicalPageSize, pages[j], protect)) return false;
+            }
+            return true;
+        }
+    }
+    for (uint64_t i = 0; i < count; ++i) {
+        if (!unmap_page(start + i * kPhysicalPageSize)) return false;
+    }
+    void* const target = reinterpret_cast<void*>(start);
+    const SIZE_T size = count * kPhysicalPageSize;
+    void* const view = placeholder_api().map_view3(section->handle, GetCurrentProcess(), target, offset, size,
+                                                   MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
+    if (!view) {
+        for (uint64_t i = 0; i < count; ++i) {
+            if (!map_page(start + i * kPhysicalPageSize, pages[i], protect)) return false;
+        }
+        return true;
+    }
+    for (uint64_t i = 0; i < count; ++i) {
+        g_mapped[start + i * kPhysicalPageSize] = pages[i];
+    }
+    g_views[start] = size;
+    return true;
+}
+
+// With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder
+// again. A page inside a run-mapped view splits the view: the whole view is dropped and the surviving siblings are
+// re-mapped around the hole (unmap_page callers touch one page at a time and stay rare; bulk unmaps go through whole
+// views in XMemMapPhysicalPages below).
+bool unmap_page(uintptr_t address) {
+    if (g_mapped.find(address) == g_mapped.end()) return true;
+    const auto view = find_view(address);
+    if (view == g_views.end() || view->second == kPhysicalPageSize) {
+        if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
+                                           MEM_PRESERVE_PLACEHOLDER)) {
+            return false;
+        }
+        g_mapped.erase(address);
+        g_views.erase(address);
+        return true;
+    }
+    const uintptr_t base = view->first;
+    const SIZE_T size = view->second;
+    const uint64_t n = size / kPhysicalPageSize;
+    std::vector<uint64_t> kept;
+    kept.reserve(n);
+    for (uint64_t k = 0; k < n; ++k) {
+        const auto it = g_mapped.find(base + k * kPhysicalPageSize);
+        kept.push_back(it == g_mapped.end() ? 0 : it->second);
+    }
+    kept[(address - base) / kPhysicalPageSize] = 0;
+    if (!unmap_view_whole(base)) return false;
+    // Re-map the surviving runs with the window's protection. The range was one window's before the split.
+    uint64_t i = 0;
+    while (i < n) {
+        if (kept[i] == 0) {
+            ++i;
+            continue;
+        }
+        uint64_t j = i + 1;
+        while (j < n && kept[j] != 0) ++j;
+        const Window* const window = find_window(base + i * kPhysicalPageSize, (j - i) * kPhysicalPageSize);
+        if (!window) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+        for (uint64_t k = i; k < j; ++k) {
+            if (!map_page(base + k * kPhysicalPageSize, kept[k], view_protect(*window))) return false;
+        }
+        i = j;
+    }
+    return true;
 }
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
@@ -556,8 +681,10 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // or null to unmap that many (four calls at shutdown). Callers test the 64-bit result for zero, so it is the address on
 // success. A page number of 0 in the array unmaps that one page.
 //
-// Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
-// without touching its neighbours. A failure part-way leaves the pages before it mapped.
+// Each maximal run of consecutive pages backed by one section at consecutive offsets goes through as one view
+// (MapViewOfFile3 over the whole run), so mapping N pages costs one placeholder replacement instead of N; every
+// page is still recorded on its own, so any page can be remapped or unmapped later without touching its neighbours.
+// A failure part-way leaves the pages before it mapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
@@ -571,8 +698,20 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     }
     const std::lock_guard lock(g_phys_mutex);
     if (!page_array) {
-        for (uint64_t i = 0; i < page_count; ++i) {
-            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+        // Unmap whole views where the range covers them, single pages at the edges.
+        uint64_t i = 0;
+        while (i < page_count) {
+            const uintptr_t addr = start + i * kPhysicalPageSize;
+            const auto view = find_view(addr);
+            if (view != g_views.end() && addr == view->first &&
+                view->first + view->second <= start + page_count * kPhysicalPageSize) {
+                const uint64_t view_pages = view->second / kPhysicalPageSize;
+                if (!unmap_view_whole(view->first)) return nullptr;
+                i += view_pages;
+                continue;
+            }
+            if (!unmap_page(addr)) return nullptr;
+            ++i;
         }
         return address;
     }
@@ -582,8 +721,30 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const DWORD protect = view_protect(*window);
-    for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+    // Accumulate maximal runs: consecutive indices, nonzero pages, one section, consecutive section offsets.
+    // A zero page unmaps that one page and ends the run; an unknown page ends the run with the invalid page in it,
+    // so map_run reports it with the earlier runs already mapped, exactly like the per-page loop did.
+    uint64_t i = 0;
+    while (i < page_count) {
+        if (page_array[i] == 0) {
+            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+            ++i;
+            continue;
+        }
+        uint64_t j = i + 1;
+        const auto first = g_pages.find(page_array[i]);
+        if (first != g_pages.end()) {
+            while (j < page_count && page_array[j] != 0) {
+                const auto it = g_pages.find(page_array[j]);
+                if (it == g_pages.end() || it->second.section != first->second.section ||
+                    it->second.offset != first->second.offset + (j - i) * kPhysicalPageSize) {
+                    break;
+                }
+                ++j;
+            }
+        }
+        if (!map_run(start + i * kPhysicalPageSize, page_array + i, j - i, protect)) return nullptr;
+        i = j;
     }
     return address;
 }
