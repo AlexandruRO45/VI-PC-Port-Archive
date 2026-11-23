@@ -118,7 +118,8 @@ archive with no majority, keeps its own guess. The tool finds the archive in an 
 `story000_restofworld.rpf` has 18 nested archives, but the descriptor search finds no string table in it: none of its
 101 `0DRP` resources matches the table descriptor.
 
-Measured with the per-table guess (counts only):
+Measured with the per-table guess (counts only). The `data.rpf` and `story000.rpf` columns are from the run in #2324,
+before later reader changes (below the table):
 
 | | `data.rpf` | `story000.rpf` | `shared_minigame000.rpf` | `story000_restofworld.rpf` |
 |---|---:|---:|---:|---:|
@@ -131,6 +132,21 @@ Measured with the per-table guess (counts only):
 | `xx` before / after | 869 / 0 | 188 / 0 | 2 / 0 | 0 / 0 |
 | Plain `es` before / after | 659 / 0 | 553 / 0 | 2 / 0 | 0 / 0 |
 | Plain `zh` before / after | 203 / 0 | 47 / 0 | 0 / 0 | 0 / 0 |
+
+That run read 14,440 `data.rpf` and 15,831 `story000.rpf` tables. Three later changes are not in those two columns:
+
+- **`data.rpf` count.** #2129 lets a resource's first stream be any whole number of 64 KiB blocks, which raised
+  `data.rpf` to 14,482 tables. #3449 wrote that census into the `Tables in them` row. The rows below it still count
+  the 14,440 tables: 13 archives of at most 1,113 tables hold 14,469.
+- **`story000.rpf` count.** #2129 did not re-measure `story000.rpf`. #3575 counted 15,951 of its tables, 120 more than
+  this column covers (13 × 1,220 is 15,860). Between the two runs `main` gained #2129, its `gamedata_index.py`
+  counterpart #2193, and #2210, which keeps entries whose string is empty. Which of them adds the 120 tables, and
+  which nested archive and language those tables have, is not measured; that needs the package.
+- **Blob chunks.** #3575 reads 23 `data.rpf` tables differently ([Blob chunks](#blob-chunks)), which reaches their
+  per-table guess. The `story000.rpf` tables read the same.
+
+The `shared_minigame000.rpf` and `story000_restofworld.rpf` columns (#3449) are current: #2129 and #3575 left the
+78 `shared_minigame000.rpf` tables unchanged, and #3575 found no string table in `story000_restofworld.rpf`.
 
 The three archives that hold tables share the 13 languages in the same order: `en`, `pt`, `zh-Hans`, `zh-Hant`, `fr`,
 `de`, `it`, `ja`, `ko`, `es-419`, `pl`, `ru`, `es-ES`. The lowest agreement is in the Spanish archives: in `data.rpf` and
