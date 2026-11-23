@@ -89,6 +89,13 @@ def check_output(code, output):
     return problems
 
 
+def run_process(label, command, **kwargs):
+    try:
+        return subprocess.run(command, **kwargs)
+    except OSError as error:
+        raise SystemExit(f"FAIL: cannot start {label} ({command[0]}): {error}") from error
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("loader")
@@ -100,15 +107,19 @@ def main():
     timeout = 180 if options.runner else 90  # a first start of Wine in a fresh prefix can take tens of seconds
 
     if options.probe:
-        probe = subprocess.run([*options.runner, options.probe], capture_output=True, timeout=timeout)
+        probe = run_process("Vulkan device probe", [*options.runner, options.probe],
+                            capture_output=True, timeout=timeout)
         if probe.returncode == SKIP:
             print("SKIP: no usable Vulkan device (the probe test skipped)")
             return SKIP
 
     environment = dict(os.environ, LEONIDA_D3D12="vulkan")
-    run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
-                         cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    run = run_process(
+        "tiny-frame loader",
+        [*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
+        cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
+        text=True, encoding="utf-8", errors="replace", timeout=timeout,
+    )
     output = run.stdout + run.stderr
     problems = check_output(run.returncode, output)
     if problems:
