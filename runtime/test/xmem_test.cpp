@@ -28,6 +28,11 @@ using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD
 using XMemGetWriteWatchFn = UINT(WINAPI*)(DWORD, void*, SIZE_T, void**, ULONG_PTR*, ULONG*);
 using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
 using XMemSetAllocationHooksFn = void(__stdcall*)(XMemAllocFn, XMemFreeFn);
+using XMemMakeTagFn = ULONGLONG(__stdcall*)(uint32_t);
+using BoolFn = BOOL(__stdcall*)();
+using TitleHeapFn = HANDLE(__stdcall*)();
+using PreallocateFn = BOOL(__stdcall*)(DWORD, BOOL);
+using SetOptionFn = void(__stdcall*)(uint64_t);
 constexpr uint32_t kMeasuredKind = 0x20000001;
 
 int g_checks = 0;
@@ -332,6 +337,25 @@ void test_allocation_hooks(XMemAllocFn alloc, XMemFreeFn free_mem) {
     check(g_hook_allocs == 1 && g_hook_frees == 1, "two null routines restore the defaults");
 }
 
+void test_documented_queries() {
+    const auto make_tag = reinterpret_cast<XMemMakeTagFn>(rt::shims::find("xmem.dll", "XMemMakeTag"));
+    const auto tools = reinterpret_cast<BoolFn>(rt::shims::find("xmem.dll", "XMemIsToolsMemAvailable"));
+    const auto title_heap = reinterpret_cast<TitleHeapFn>(rt::shims::find("xmem.dll", "XMemGetTitleHeap"));
+    const auto preallocate =
+        reinterpret_cast<PreallocateFn>(rt::shims::find("xmem.dll", "XMemPreallocateFreeSpace"));
+    const auto set_option = reinterpret_cast<SetOptionFn>(rt::shims::find("xmem.dll", "XMemSetOption"));
+    check(make_tag && tools && title_heap && preallocate && set_option, "registry exposes the documented queries");
+    if (!make_tag || !tools || !title_heap || !preallocate || !set_option) return;
+
+    const uint64_t tag = make_tag('A' | 'b' << 8 | '0' << 16 | '$' << 24);
+    check(tag != 0 && (tag & ((uint64_t{1} << 40) - 1)) == 0, "XMemMakeTag fills only the top 24 bits");
+    check(tag != make_tag('A' | 'b' << 8 | '1' << 16 | '$' << 24), "XMemMakeTag tells different codes apart");
+    check(!tools(), "XMemIsToolsMemAvailable is FALSE outside a profiling dev kit");
+    check(title_heap() == nullptr, "XMemGetTitleHeap reports no title-partition heap");
+    check(preallocate(0, FALSE) == TRUE, "XMemPreallocateFreeSpace succeeds");
+    set_option(1);  // must return without reading the argument: 1 is not a readable address
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -381,6 +405,7 @@ int main() {
 
     test_title_virtual_alloc();
     test_allocation_hooks(alloc, free_mem);
+    test_documented_queries();
 
     print_result();
     return g_failures ? 1 : 0;
