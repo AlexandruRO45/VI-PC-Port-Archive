@@ -168,10 +168,9 @@ int main() {
             DWORD wait = WaitForSingleObject(event, 5000);
             check(wait == WAIT_OBJECT_0, "offline UI callback runs");
             if (wait != WAIT_OBJECT_0) {
-                XAsyncCancel(&block);
-                while (XAsyncGetStatus(&block, false) == E_PENDING)
-                    XTaskQueueDispatch(uiQueue, XTaskQueuePort::Work, INFINITE);
-                WaitForSingleObject(event, INFINITE);
+                // The callback may still use the stack block and event; exit without unwinding them.
+                std::fflush(stdout);
+                std::_Exit(1);
             }
             check(XAsyncGetStatus(&block, false) == E_ABORT, "offline UI completes dismissed");
             if (i == 3) {
