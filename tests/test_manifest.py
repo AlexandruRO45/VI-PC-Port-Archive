@@ -530,18 +530,18 @@ class ManifestAtomicCreateTest(unittest.TestCase):
         def open_with_edit(path, mode, **kwargs):
             stream = open(path, mode, **kwargs)
             if path == source and mode == "rb":
-                original_read = stream.read
+                original_readinto = stream.readinto
 
-                def read_then_edit(size):
-                    chunk = original_read(size)
-                    stream.read = original_read
+                def readinto_then_edit(buffer):
+                    count = original_readinto(buffer)
+                    stream.readinto = original_readinto
                     stamp = os.stat(source)
                     with open(source, "r+b") as f:
                         f.write(b"X")
                     os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
-                    return chunk
+                    return count
 
-                stream.read = read_then_edit
+                stream.readinto = readinto_then_edit
             return stream
 
         with patch.object(manifest, "open", side_effect=open_with_edit, create=True):

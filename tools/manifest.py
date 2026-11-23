@@ -65,9 +65,13 @@ def _hash_file(path: str, *, expected_size: int | None = None) -> tuple[int, str
         if expected_size is not None and size != expected_size:
             raise ManifestError(f"{path}: file size changed before hashing")
         remaining = size
-        while remaining and (chunk := f.read(min(CHUNK, remaining))):
-            h.update(chunk)
-            remaining -= len(chunk)
+        with memoryview(bytearray(min(CHUNK, remaining))) as buffer:
+            while remaining:
+                count = f.readinto(buffer[:min(len(buffer), remaining)])
+                if not count:
+                    break
+                h.update(buffer[:count])
+                remaining -= count
         # Compare timestamps from the same handle. Windows can report different times by path.
         # Compare the path by identity so a replacement of the open file is detected too.
         if (remaining or _file_stamp(os.fstat(f.fileno())) != _file_stamp(before)
