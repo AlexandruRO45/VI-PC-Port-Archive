@@ -1414,7 +1414,13 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
                                            {1, xbox_desc->kind1, xbox_desc->kind1_size},
                                            {6, xbox_desc->kind6, xbox_desc->kind6_size},
                                            {7, xbox_desc->kind7, xbox_desc->kind7_size}};
-        payload = leonida::fspx_payload_from_parts(parts);
+        // The payload is built in vectors. A refused allocation must not leave this thunk as an exception into the
+        // title's code: it is E_OUTOFMEMORY, like the proxy's own allocations, and nothing reaches the device.
+        try {
+            payload = leonida::fspx_payload_from_parts(parts);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
         if (payload.empty()) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true, std::memory_order_relaxed))

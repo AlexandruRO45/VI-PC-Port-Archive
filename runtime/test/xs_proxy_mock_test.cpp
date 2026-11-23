@@ -589,6 +589,39 @@ int check_alloc_failures() {
     EXPECT(mock->array[34][0] == word(xs::queue_proxy_real_queue(queue)) &&
            mock->array[34][1] == word(xs::fence_proxy_real_fence(fence)));
 
+    // Device slot 67 builds an FSPX payload from the description's pointer/size pairs, which allocates
+    // (leonida::fspx_payload_from_parts). A refused allocation is E_OUTOFMEMORY like the others here, not an
+    // exception thrown through the thunk into the title's code, and no pipeline is asked of the device.
+    {
+        const std::uint8_t kind0[28] = {}, kind6[36] = {1};
+        const struct {
+            std::uint64_t root_signature;
+            const void* kind0;
+            std::uint64_t kind0_size;
+            const void* kind1;
+            std::uint64_t kind1_size;
+            const void* kind6;
+            std::uint64_t kind6_size;
+            const void* kind7;
+            std::uint64_t kind7_size;
+        } native{0, kind0, sizeof(kind0), nullptr, 0, kind6, sizeof(kind6), nullptr, 0};
+        const unsigned calls11 = mock->calls[11];
+        bool threw = false;
+        HRESULT refused = S_OK;
+        out = reinterpret_cast<void*>(1);
+        try {
+            refused = failing([&] { return hr_of(raw(device, 67, word(&native), word(&kQueueIid), word(&out))); });
+        } catch (const std::bad_alloc&) {
+            threw = true;
+            g_fail_news = 0;
+        }
+        EXPECT(!threw);
+        EXPECT(refused == E_OUTOFMEMORY && !out && mock->calls[11] == calls11);
+        // And without the failure the description goes on to CreateComputePipelineState (PC slot 11).
+        EXPECT(hr_of(raw(device, 67, word(&native), word(&kQueueIid), word(&out))) == S_OK &&
+               mock->calls[11] == calls11 + 1);
+    }
+
     // The device proxy itself: on failure the caller keeps its reference.
     Mock* other = new_mock(Kind::device);
     other->refs = 1;
