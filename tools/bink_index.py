@@ -322,12 +322,19 @@ def main(argv=None):
         if os.path.isfile(manifest) and same_output_path(a.out, manifest):
             ap.error(f"--out would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
-            for root, _dirs, names in os.walk(a.target):
-                for name in names:
-                    if name.lower().endswith((".json", ".csv")):
-                        continue
-                    if same_output_path(os.path.join(root, name), a.out):
-                        ap.error(f"--out would overwrite an input file: {a.out}")
+            # This walk has to fail closed too: a folder it cannot list may hold the very input the
+            # guard exists to protect. An unlistable folder stops the run with one error line, exit 2.
+            try:
+                for root, _dirs, names in os.walk(a.target, onerror=_walk_error):
+                    for name in names:
+                        if name.lower().endswith((".json", ".csv")):
+                            continue
+                        if same_output_path(os.path.join(root, name), a.out):
+                            ap.error(f"--out would overwrite an input file: {a.out}")
+            except OSError as error:
+                path = error.filename or a.target
+                print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+                return 2
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
