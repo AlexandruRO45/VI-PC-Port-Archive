@@ -17982,10 +17982,35 @@ def build_vs_compute(path, name, a, m):
         Path(sv).unlink(missing_ok=True)
         m["vs_compute_error"] = "INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:150]
         return
+    m["vs_compute"] = vs_compute_entry(g, asm, name)
+
+
+# What a runtime needs to build the --vs-compute module's pipeline, taken from the module's own metadata: the VS's
+# entry describes the VS (subgroup_size 64, no workgroup memory, its own capabilities), not the compute variant.
+VS_COMPUTE_META_KEYS = ("capabilities", "extensions", "features", "float_controls", "needs_maintenance8",
+                        "lds_bytes", "wave64_exchange", "subgroup_size", "bindings", "descriptor_strides",
+                        "uses_code_base", "control_flow")
+
+
+def vs_compute_entry(g, asm, name):
+    """The VS index entry's "vs_compute" object for the compute variant just translated (generator `g`, its SPIR-V
+    assembly `asm`): the slot layout (vs_compute_layout), the module's file name, and its own pipeline facts."""
     lay = dict(g.vsc_layout)
     lay["params"] = {str(k): v for k, v in lay["params"].items()}
     lay["module"] = name + ".vs_compute.spv"
-    m["vs_compute"] = lay
+    lay["stage"] = "cs"
+    lay["local_size"] = [64, 1, 1]
+    try:
+        meta = shader_meta(g, asm)
+    except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
+        lay["meta_error"] = f"{type(e).__name__}: {e}"[:200]
+        return lay
+    for k in VS_COMPUTE_META_KEYS:
+        if k in meta:
+            lay[k] = meta[k]
+    lay["subgroup_size"] = None        # exact on any size: the workgroup exchange, no subgroup operation
+    lay["wave64_exchange"] = "workgroup"
+    return lay
 
 
 def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True):
