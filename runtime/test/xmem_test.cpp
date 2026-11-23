@@ -715,12 +715,21 @@ void test_read_file_into_untouched_pages(const PhysicalApi& api) {
     check(wrote, "a 128 KiB file to read from");
     if (wrote) {
         HANDLE in = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-        // The control: the host's ReadFile into an untouched page fails, and the page stays uncommitted.
+        // The control: the host's ReadFile into an untouched page fails, and the page stays uncommitted. Windows
+        // only: Wine's ReadFile writes the buffer from user mode, so the first-touch handler runs and the read
+        // succeeds; the kernel write this guards against doesn't happen there. Skipped under Wine, which also
+        // leaves the page untouched for the shim's read below.
         DWORD bytes = 0;
-        const BOOL plain = ::ReadFile(in, window, static_cast<DWORD>(kPage64k), &bytes, nullptr);
-        const DWORD plain_error = plain ? 0 : GetLastError();
-        check(!plain && plain_error == ERROR_NOACCESS && !committed(window),
-              "control: the host's ReadFile into an untouched physical page fails with ERROR_NOACCESS");
+        const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        if (wine) {
+            std::printf("SKIP control: the host's ReadFile into an untouched physical page fails with "
+                        "ERROR_NOACCESS (Wine's ReadFile writes from user mode, not from the kernel)\n");
+        } else {
+            const BOOL plain = ::ReadFile(in, window, static_cast<DWORD>(kPage64k), &bytes, nullptr);
+            const DWORD plain_error = plain ? 0 : GetLastError();
+            check(!plain && plain_error == ERROR_NOACCESS && !committed(window),
+                  "control: the host's ReadFile into an untouched physical page fails with ERROR_NOACCESS");
+        }
 
         // Through the kernel32 shim, into the same page.
         SetFilePointer(in, 0, nullptr, FILE_BEGIN);
