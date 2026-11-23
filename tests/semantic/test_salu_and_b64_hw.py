@@ -396,5 +396,80 @@ class SaluAndB64InterpreterTests(unittest.TestCase):
         self.assertEqual(state.scc, out[2])
 
 
+class SimdWavefrontState:
+    """Models Wave64 execution with lane masking governed by EXEC."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        self.wave_size = wave_size
+        self.exec_mask: int = MASK64 if wave_size == 64 else MASK32
+        self.vgprs: list[list[int]] = [[0] * wave_size for _ in range(32)]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        if 0 <= lane_id < self.wave_size:
+            return bool((self.exec_mask >> lane_id) & 1)
+        return False
+
+    def active_lane_count(self) -> int:
+        return bin(self.exec_mask & ((1 << self.wave_size) - 1)).count("1")
+
+    def apply_s_and_b64_exec(self, condition_mask: int) -> None:
+        """Emulates s_and_b64 exec, exec, <mask_src> for lane divergence control."""
+        self.exec_mask = ref_s_and_b64(self.exec_mask, condition_mask)
+
+    def vector_add_divergent(self, dst_v: int, src_v: int, imm: int) -> None:
+        """Only active lanes commit side effects."""
+        for lane in range(self.wave_size):
+            if self.is_lane_active(lane):
+                self.vgprs[dst_v][lane] = (self.vgprs[src_v][lane] + imm) & MASK32
+
+
+class SaluAndB64SimdExecMaskTests(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking for s_and_b64."""
+
+    def test_exec_masking_subsets(self):
+        simd = SimdWavefrontState(64)
+        self.assertEqual(simd.active_lane_count(), 64)
+
+        # Restrict to even lanes
+        even_mask = 0x55555555_55555555
+        simd.apply_s_and_b64_exec(even_mask)
+        self.assertEqual(simd.active_lane_count(), 32)
+        for lane in range(64):
+            self.assertEqual(simd.is_lane_active(lane), (lane % 2 == 0))
+
+        # Further restrict to lower half
+        lower_mask = 0x00000000_FFFFFFFF
+        simd.apply_s_and_b64_exec(lower_mask)
+        self.assertEqual(simd.active_lane_count(), 16)
+        for lane in range(64):
+            expected = (lane % 2 == 0) and (lane < 32)
+            self.assertEqual(simd.is_lane_active(lane), expected)
+
+    def test_divergent_vector_commit(self):
+        simd = SimdWavefrontState(64)
+        simd.apply_s_and_b64_exec(0x00000000_0000000F)  # Lanes 0..3 active only
+        simd.vector_add_divergent(1, 0, 42)
+
+        for lane in range(64):
+            if lane < 4:
+                self.assertEqual(simd.vgprs[1][lane], 42)
+            else:
+                self.assertEqual(simd.vgprs[1][lane], 0)
+
+    def test_spirv_exec_mask_translation(self):
+        """Verify translator lowers s_and_b64 on exec/vcc masks via OpBitwiseAnd."""
+        lines = [
+            "s_and_b64 exec, exec, vcc",
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_and_b64_exec", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
