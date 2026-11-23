@@ -279,6 +279,53 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
             self.assertEqual(ps_sweep.depth_measurements(0, {"code": 0}, rec), {"depth_class": "missing"})
 
+    @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
+    def test_integer_texture_fetch(self):
+        from pathlib import Path
+        import subprocess
+
+        worker = os.environ["PS_SWEEP_TEST_EXE"]
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            vs = ps_sweep.make_vs("glslangValidator", {}, tmp)
+            src = folder / "fetch.frag"
+            fs = folder / "fetch.spv"
+            raw = folder / "draw.raw"
+            draw = [worker, vs, str(fs), str(raw), "32", "32", "1"]
+            def compile_shader(text):
+                src.write_text(text, encoding="utf-8", newline="\n")
+                subprocess.run(["glslangValidator", "-V", str(src), "-o", str(fs)], check=True)
+
+            for mode, prefix, expected in (("sint", "i", (-126, 34, -8, 77)), ("uint", "u", (130, 34, 248, 77))):
+                source = ("#version 450\n#extension GL_EXT_samplerless_texture_functions : require\n"
+                          f"layout(set=0,binding=0) uniform {prefix}texture2D tex[1];\n"
+                          "layout(location=0) out vec4 color;\n"
+                          "void main() {color = vec4(texelFetch(tex[0], ivec2(2,3), 0));}\n")
+                compile_shader(source)
+                env = ps_sweep.job_env(os.environ, 20, mode, {}, None)
+                subprocess.run(draw, env=env, check=True)
+                self.assertEqual(raw.read_bytes(), struct.pack("<4f", *expected) * 1024)
+                raw.unlink()
+                env["VKS_TEX"] = "uint" if mode == "sint" else "sint"
+                self.assertEqual(subprocess.run(draw, env=env).returncode, 77)
+                self.assertFalse(raw.exists())
+                for other in (source.replace("tex[1];", "tex[2];").replace("tex[0],", "tex[1],"),
+                              source.replace("2,3", "8,3"), source.replace("), 0)", "), 1)"),
+                              source.replace("binding=0", "binding=3"),
+                              source.replace("ivec2(2,3)", "ivec2(gl_FragCoord.xy)"),
+                              source.replace("layout(location=0)", "layout(set=0,binding=0) uniform texture2D other;\n"
+                                             "layout(location=0)").replace(";}"," + texelFetch(other, ivec2(0), 0);}")):
+                    compile_shader(other)
+                    self.assertEqual(subprocess.run([worker, "--screen-integer", str(fs)]).returncode, 77)
+
+            compile_shader(source.replace("utexture2D", "texture2D"))
+            env = ps_sweep.job_env(os.environ, 20, "t", {}, None)
+            subprocess.run(draw, env=env, check=True)
+            for rgba in struct.iter_unpack("<4f", raw.read_bytes()):
+                for component, byte in zip(rgba, (64, 96, 64, 255)):
+                    self.assertAlmostEqual(component, byte / 255, places=6)
+            self.assertEqual(raw.stat().st_size, 1024 * 16)
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a precise-query Vulkan worker")
     def test_clear_draws_with_opposite_coverage(self):
         from pathlib import Path

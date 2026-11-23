@@ -12,6 +12,8 @@
 //               b = 0.25 + 0.15 * z or layer, a = 1) in every sampled dimension (2D, 2D array of 6, 1D, 3D of
 //               depth 4) and a linear clamping sampler, so a shader whose T# and S# miss the table (a zeroed heap)
 //               samples texels; the storage bindings keep their 1x1 fallbacks
+//   VKS_TEX=sint|uint selects an RGBA8 integer view at 2D element zero for bounded constant texelFetch.
+//               --screen-integer <ps.spv> checks applicability without initializing Vulkan.
 //   VKS_GS=<gs.spv>
 //               a geometry shader between the two (tools/bary_fallback_gs.py's pass-through GS for a pixel shader
 //               translated with --bary-fallback: it writes the barycentric input that shader reads); needs the
@@ -28,6 +30,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "ps_sweep_integer_fetch.h"
 #include "vk_shader_fma.h"
 #include "../src/vulkan_bindless.h"
 
@@ -60,6 +63,7 @@ static PFN_vkGetInstanceProcAddr gipa;
 static std::vector<uint32_t> read_spv(const char* path) {
     std::ifstream f(path, std::ios::binary);
     std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
+    if (b.empty() || b.size() % 4) return {};
     std::vector<uint32_t> w(b.size() / 4);
     std::memcpy(w.data(), b.data(), w.size() * 4);
     return w;
@@ -119,6 +123,11 @@ int main(int argc, char** argv) {
     const double t_start = now_s();
     bool depth = false, occlusion = false;
     float depth_clear = 1.0f;
+    if (argc == 3 && std::strcmp(argv[1], "--screen-integer") == 0) {
+        const char* kind = integer_fetch_type(read_spv(argv[2]));
+        std::puts(kind ? kind : "unsupported");
+        return kind ? 0 : 77;
+    }
     if (argc < 7) {
         std::fprintf(stderr, "usage: vk_ps_sweep vs.spv ps.spv out.raw width height render-targets [--occlusion] [--depth | --depth-zero]\n");
         return 2;
@@ -155,6 +164,16 @@ int main(int argc, char** argv) {
     const char* timeout_env = std::getenv("VKS_TIMEOUT_S");
     const uint64_t timeout_ns = (timeout_env && std::atoi(timeout_env) > 0 ? uint64_t(std::atoi(timeout_env)) : 20u) * 1000000000ull;
 
+    auto fs_code = read_spv(argv[2]);
+    const char* tex_mode = std::getenv("VKS_TEX");
+    const bool integer_tex = tex_mode && (!std::strcmp(tex_mode, "sint") || !std::strcmp(tex_mode, "uint"));
+    if (integer_tex) {
+        const char* kind = integer_fetch_type(fs_code);
+        if (!kind || std::strcmp(kind, tex_mode) || std::getenv("VKS_GS") || std::getenv("VKS_TEX_CONST")) {
+            std::puts("unsupported: integer texture needs a matching bounded 2D fetch and fixed fixture inputs");
+            return 77;
+        }
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
     VkInstance inst = VK_NULL_HANDLE;
@@ -210,7 +229,6 @@ int main(int argc, char** argv) {
     };
 
     // What the pixel shader declares, against what the device has.
-    std::vector<uint32_t> fs_code = read_spv(argv[2]);
     const bool max_reconv = std::getenv("VKS_MAX_RECONV") != nullptr;
     if (max_reconv && fs_code.size() >= 6) add_maximal_reconvergence(fs_code);
     if (fs_code.size() < 6) {
@@ -438,6 +456,7 @@ int main(int argc, char** argv) {
                 {VK_NULL_HANDLE, VK_NULL_HANDLE, 8, 8, 1, 6, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 3},
                 {VK_NULL_HANDLE, VK_NULL_HANDLE, 8, 1, 1, 1, VK_IMAGE_TYPE_1D, VK_IMAGE_VIEW_TYPE_1D, 5},
                 {VK_NULL_HANDLE, VK_NULL_HANDLE, 8, 8, 4, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D, 6}};
+        if (integer_tex) texs.resize(1);
         std::vector<uint32_t> texels;
         std::vector<VkDeviceSize> offsets;
         for (auto& t : texs) {
@@ -445,7 +464,8 @@ int main(int argc, char** argv) {
             for (uint32_t z = 0; z < t.d * t.layers; ++z)
                 for (uint32_t y = 0; y < t.h; ++y)
                     for (uint32_t x = 0; x < t.w; ++x)
-                        texels.push_back(tex_const ? tex_const_value
+                        texels.push_back(integer_tex ? (128u + x) | ((31u + y) << 8) | ((250u - x) << 16) | ((80u - y) << 24)
+                                                   : tex_const ? tex_const_value
                                                    : (x * 32u) | ((y * 32u) << 8) | ((64u + z * 40u) << 16) | (255u << 24));
         }
         void* sp = nullptr;
@@ -465,7 +485,8 @@ int main(int argc, char** argv) {
         for (std::size_t k = 0; k < texs.size(); ++k) {
             Tex& t = texs[k];
             VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            ii.imageType = t.type; ii.format = VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {t.w, t.h, t.d};
+            ii.imageType = t.type; ii.format = integer_tex ? (!std::strcmp(tex_mode, "sint") ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UINT)
+                                                         : VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {t.w, t.h, t.d};
             ii.mipLevels = 1; ii.arrayLayers = t.layers; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             CHECK(vkCreateImage(dev, &ii, nullptr, &t.img));
@@ -483,7 +504,7 @@ int main(int argc, char** argv) {
             CHECK(vkCreateImageView(dev, &vi, nullptr, &t.view));
         }
         VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sci.magFilter = sci.minFilter = std::getenv("VKS_TEX_NEAREST") ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+        sci.magFilter = sci.minFilter = integer_tex || std::getenv("VKS_TEX_NEAREST") ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
         sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         CHECK(vkCreateSampler(dev, &sci, nullptr, &tex_sampler));

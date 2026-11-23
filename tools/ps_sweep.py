@@ -33,7 +33,8 @@ shader (`VKS_GS`), so it runs on a device without `fragmentShaderBarycentric`; t
 normal translation (`sample` keeps its own strata), and the folder only has to contain the sampled shaders.
 
 `--variant z` (default) leaves every texture lookup on the zero fallback; `--variant t` replaces the fallback images
-with a gradient (VKS_TEX=1), so sampled values are not all zero. `--lo/--hi` split the sample over parallel workers
+with a UNORM gradient. The sint and uint variants require a matching 2D integer image at binding 0,
+element zero, and constant in-bounds texel fetches at mip zero; other modules report unsupported. `--lo/--hi` split the sample over parallel workers
 and `--only 3,7` re-runs single shaders (into `<tag>_<variant>_re`, which `compare` prefers), for example the ones that
 timed out while another process was starting.
 
@@ -142,6 +143,8 @@ def job_env(base, timeout, variant, meta, gs):
     env.update(VKS_TIMEOUT_S=str(timeout), VKS_HEAP_KB="1024")
     if variant == "t":
         env["VKS_TEX"] = "1"
+    if variant in ("sint", "uint"):
+        env["VKS_TEX"] = variant
     if gs:
         env["VKS_GS"] = gs
     if meta.get("needs_maintenance8"):
@@ -523,7 +526,7 @@ def main(argv=None):
     ap.add_argument("--depth", action="store_true", help="capture D32 depth and precise samples passed (run)")
     ap.add_argument("--occlusion", action="store_true", help="measure precise samples passed per draw (run)")
     ap.add_argument("--exact", action="store_true", help="compare target bytes and count clear-only pairs separately")
-    ap.add_argument("--variant", choices=["z", "t"], default="z")
+    ap.add_argument("--variant", choices=["z", "t", "sint", "uint"], default="z")
     ap.add_argument("--exe", help="vk_ps_sweep")
     ap.add_argument("--glslang", default="glslangValidator")
     ap.add_argument("--timeout", type=int, default=20, help="seconds the GPU may take for one draw")
