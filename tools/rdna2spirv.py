@@ -6889,9 +6889,13 @@ class Gen:
                 self.scc_nonzero(r)
         elif op == "v_cvt_f16_f32":
             # Low 16 bits get the f16; on GFX10 the high half is kept (partial write: Mesa ACO instr_is_16bit lists
-            # v_cvt_f16_f32 as 16-bit for gfx_level >= GFX10).
+            # v_cvt_f16_f32 as 16-bit for gfx_level >= GFX10). Under op_sel:[0,1], the high half gets the f16 and the
+            # low half is kept; src0 is 32-bit f32, so op_sel[0] is rejected.
             # VOP3 omod and clamp apply to the f16 (ACO: dst(F16)), in the order an RX 6800 applies them: round, omod
             # (f16_omod), then clamp. They were dropped until 2026-11-22.
+            sel, dhi = self.opsel_bits(mods, 1)
+            if sel[0]:
+                raise Unsupported(op + " op_sel")
             x = self.src_f(a[1])
             h = self.f16_omod(self.f16_res(x), mods)
             if "clamp" in mods:
@@ -6899,7 +6903,7 @@ class Gen:
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {h}")
                 self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
                 h = self.f16_bits(self.clamp_mods(f, ["clamp"]))     # exact: the clamped value is an f16
-            self.write_lo16(a[0], h)
+            self.write_half16(a[0], h, dhi)
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
             k = v - 0x10000 if v & 0x8000 else v
@@ -8304,8 +8308,8 @@ class Gen:
             self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
         elif op == "v_fmac_f16":
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
-            sel, dhi = self.opsel_bits(mods, 3)
-            vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], sel[2])]
+            sel, dhi = self.opsel_bits(mods, 2)
+            vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], dhi)]
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_f16(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
@@ -10120,11 +10124,13 @@ class Gen:
                 lo = clamped_lo
             self.write_half16(a[0], lo, dhi)
         elif op == "v_cvt_f32_f16":
-            u = self.src_h(a[1])
-            v2, f = self.tmp(), self.tmp()
-            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-            self.dst(a[0], self.tou(self.clamp_mods(self.modify_f(f, a[1]), mods)))
+            # Widen f16 (low half, or high half under op_sel:[1,0]) to f32 via f16_in so subnormals produced by
+            # SDWA BYTE_1 use the integer widening path (see f16_in). dst is 32-bit f32, so op_sel's dst bit is rejected.
+            sel, dhi = self.opsel_bits(mods, 1)
+            if dhi:
+                raise Unsupported(op + " op_sel")
+            f = self.f16_in(a[1], sel[0])
+            self.dst(a[0], self.tou(self.clamp_mods(f, mods)))
         elif op in ("v_interp_p1_f32", "v_interp_p2_f32", "v_interp_mov_f32"):
             # Single-lane model: the barycentric p1/p2 pair yields the interpolated attribute, and the mov of P0
             # the provoking vertex's value. An input only ever read through the mov is declared Flat: such
