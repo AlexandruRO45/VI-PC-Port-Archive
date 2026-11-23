@@ -1275,6 +1275,7 @@ def run_suite(a, work: str) -> int:
                 continue
             const_wants = {
                 "ps_clip_color": (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000),
+                "ps_pk_fma_literal": (0x40008c00, 0x42008c00, 0x4200bc00, 0x4400bc00),
                 "ps_ops": (0x48804300, 5, 7, 0xBFFFFFFC),
                 "ps_ops2": (0xABCD4400, 0x46001234, 0xBFFFFFFA, 7),
                 "ps_ops3": (0xBFFFFFFA, 0x44660066, 0x44AABBCC, 16),
