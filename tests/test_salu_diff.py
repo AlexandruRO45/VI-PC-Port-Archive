@@ -121,6 +121,19 @@ class Translated(unittest.TestCase):
             d.translated = real
 
 
+class Generator(unittest.TestCase):
+    def test_two_source_forms_share_one_literal_word(self) -> None:
+        for op in ("s_add_u32", "s_bfm_b64", "s_cmp_eq_u32"):
+            for operands in (("0x12345", "0x23456"), ("0x12345", "0x12345")):
+                with self.subTest(op=op, operands=operands):
+                    with unittest.mock.patch.object(d, "_src32", side_effect=operands):
+                        line = d.emit(d.random.Random(2), op)
+                    sources = line.split(" ", 1)[1].split(", ")[-2:]
+                    literals = [source for source in sources if source.startswith("0x")]
+                    self.assertEqual(len(set(literals)), 1, line)
+                    self.assertEqual(len(literals), 2 if operands[0] == operands[1] else 1, line)
+
+
 class Branches(unittest.TestCase):
     """--branches: SCC consumer chains and s_cbranch_scc0/1 forward over 1..3 instructions."""
 
@@ -209,6 +222,21 @@ class CliOps(unittest.TestCase):
             self.assertIn(message, proc.stderr)
             self.assertEqual(proc.stdout, "")
             self.assertNotIn("Traceback", proc.stderr)
+
+
+class EverythingSkipped(unittest.TestCase):
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        def refuse(lines, *args):
+            raise d.Skip("unsupported form")
+        out = io.StringIO()
+        with mock.patch.object(d, "translated", refuse), contextlib.redirect_stdout(out):
+            rc = d.main(["--programs", "3", "--seed", "1"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
 
 
 if __name__ == "__main__":

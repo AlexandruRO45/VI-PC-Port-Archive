@@ -38,8 +38,19 @@ EITHER = "either"       # a constant 0 or -1: no lanes or all lanes, and the sam
 COPIES = ("s_mov_b", "s_not_b", "s_wqm_b")
 BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b",
            "s_cselect_b")
-NO_DESTINATION = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe")      # their first operand is a source
-VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_xor_b32", "v_xor3_b32", "v_not_b32")
+NO_DESTINATION = (                      # their first operand (if any) is a source, not a written register
+    "s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe",
+    "s_store_", "s_buffer_store_", "s_dcache_", "s_icache_",
+    "s_sendmsg", "s_branch", "s_cbranch", "s_waitcnt", "s_nop", "s_sleep", "s_barrier", "s_endpgm",
+    "exp",
+    "buffer_store", "tbuffer_store", "global_store", "flat_store", "image_store", "ds_write",
+)
+DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute",
+              "ds_append", "ds_consume", "ds_ordered_count", "ds_nop")
+VGPR_REL_DST = ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32")
+SGPR_REL_DST = ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32")
+VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_and_or_b32",
+                  "v_xor_b32", "v_xor3_b32", "v_xnor_b32", "v_bfi_b32", "v_not_b32")
 
 
 def base_op(op):
@@ -112,6 +123,12 @@ def put(state, a, k):
             state[r] = k
 
 
+def _maskable_b32(x):
+    return x["k"] in ("sgpr", "imm") or (
+        x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") == "null")
+    )
+
+
 def lane_slot(vgpr, lane):
     """State key for a mask parked in one lane of a VGPR, or None unless both operands are plain."""
     if vgpr["k"] != "vgpr" or lane["k"] != "imm":
@@ -124,10 +141,19 @@ def step(state, ins):
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
+    mods = ins.get("mods", ())
+    if op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods:
+        return
+    if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic",
+                      "s_atomic", "s_buffer_atomic")) and "glc" not in mods:
+        return
+    if op.startswith("ds_") and not op.startswith(DS_HAS_DST) and "_rtn" not in op:
+        return
     if op == "v_readfirstlane_b32" and len(a) == 2:                             # sD = vS, the same in every lane
         put(state, a[0], kind(state, a[1]))
         return
     if op == "v_writelane_b32" and len(a) == 3 and lane_slot(a[0], a[2]):       # vD[lane] = sS
+        state.pop(("v", a[0]["r"]), None)
         k = kind(state, a[1])
         if k is None:
             state.pop(lane_slot(a[0], a[2]), None)
@@ -141,10 +167,36 @@ def step(state, ins):
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
         put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK)
         return
+    if op == "v_swap_b32":
+        written = set()
+        for x in a[:2]:
+            if x["k"] == "vgpr":
+                written.update(range(x["r"], x["r"] + x.get("n", 1)))
+        for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
+            del state[key]
+        return
+    if op in VGPR_REL_DST:
+        bases = [x["r"] for x in (a[:2] if op == "v_swaprel_b32" else a[:1]) if x["k"] == "vgpr"]
+        if bases:
+            lo = min(bases)
+            for key in [k for k in state if isinstance(k, tuple) and k[1] >= lo]:
+                del state[key]
+        return
+    if op in SGPR_REL_DST:
+        if a[0]["k"] == "sgpr":
+            lo = a[0]["r"]
+            for key in [k for k in state if isinstance(k, int) and k >= lo]:
+                del state[key]
+        return
     if a[0]["k"] == "vgpr":                             # any other write to a VGPR ends what was parked in it
         # A mask only when every source is one (or a constant 0 / -1) on every path: no EITHER for VGPRs, whose
         # plain writes skip inactive lanes. The sources are looked at first: the destination can be one of them.
-        kinds = [kind(state, x) for x in a[1:]] if op in VECTOR_BITWISE and a[0].get("n", 1) == 1 else [None]
+        # SDWA/DPP or modified forms alter sub-dwords or read other lanes, so they are never plain mask ops.
+        plain_valu = (op in VECTOR_BITWISE and a[0].get("n", 1) == 1
+                      and not ins["op"].endswith(("_sdwa", "_dpp", "_dpp8"))
+                      and not mods
+                      and not any(x.get("neg") or x.get("abs") or x.get("sext") for x in a[1:]))
+        kinds = [kind(state, x) for x in a[1:]] if plain_valu else [None]
         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
             del state[key]
@@ -155,28 +207,44 @@ def step(state, ins):
             # VGPR (SHADER-21 part 2). Only per-lane mask computations take the all-lanes store,
             # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
             return op != "v_mov_b32"
-    if "_saveexec_b" in op or "_wrexec_b" in op or op == "s_bfm_b64":
+    if "_saveexec_b" in op or "_wrexec_b" in op:
+        put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
+    elif op == "s_bfm_b64":
         put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1])
-        if k is None and op.endswith("b64") and a[0]["k"] == "special" and a[0].get("t") in ("vcc", "vcc_lo") and \
-                a[1]["k"] == "imm":
+        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
+        if k in (None, EITHER) and op.endswith("b64") and dst_t in ("vcc", "vcc_lo") and a[1]["k"] == "imm":
             k = MASK
+        elif op == "s_not_b32" and dst_t in ("vcc", "vcc_lo") and _maskable_b32(a[1]):
+            k = MASK
+        elif op == "s_not_b32" and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
+            return
         put(state, a[0], k)
     elif op.startswith(BITWISE):
         kinds = [kind(state, x) for x in a[1:]]
         ms = {k for k in kinds if k in MASK_KINDS}
+        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
         if None not in kinds:
-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else EITHER)
-        elif op.endswith("b64") and (ms or (a[0]["k"] == "special" and a[0].get("t") in ("vcc", "vcc_lo"))) and \
+            if op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS:
+                return
+            fallback = MASK if op.endswith("b64") and dst_t in ("vcc", "vcc_lo") else EITHER
+            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else fallback)
+        elif op.endswith("b64") and (ms or dst_t in ("vcc", "vcc_lo")) and \
                 all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
             put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK)
+        elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
+            put(state, a[0], MASK)
+        elif op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and \
+                all(_maskable_b32(x) for x in a[1:]):
+            return
         else:
             put(state, a[0], None)
     else:
         put(state, a[0], None)
-        if ((op.startswith("v_") and "_co_" in op) or op in ("v_mad_u64_u32", "v_mad_i64_i32")) and len(a) > 1:
-            put(state, a[1], MASK)                      # carry/sign lane mask of v_add_co_u32, v_mad_u64_u32, etc.
+        if ((op.startswith("v_") and "_co_" in op)
+                or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) and len(a) > 1:
+            put(state, a[1], MASK)                      # carry/sign/scale lane mask of VOP3b ops
 
 
 def parked(blocks, masks):

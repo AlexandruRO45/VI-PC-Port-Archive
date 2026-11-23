@@ -10,8 +10,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace {
 
@@ -80,9 +85,25 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
     const BOOL ok = get_stats(kMeasuredKind, stats);
     check(ok != FALSE, "XMemGetWorkingSetStatistics(kind, 64-byte out) returns TRUE");
 
+    uint64_t total_memory = 0;
+    std::memcpy(&total_memory, stats + 0, sizeof(total_memory));
+    check(ok != FALSE && total_memory != 0, "XMemGetWorkingSetStatistics writes a non-zero total memory at +0");
+
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
+        check(ok != FALSE && total_memory == ms.ullTotalPhys,
+              "XMemGetWorkingSetStatistics total memory (+0) matches GlobalMemoryStatusEx ullTotalPhys");
+    } else {
+        check(ok != FALSE && total_memory == 12ULL * 1024 * 1024 * 1024,
+              "XMemGetWorkingSetStatistics total memory (+0) falls back to 12 GiB title limit");
+    }
+
     uint64_t working_set = 0;
     std::memcpy(&working_set, stats + 8, sizeof(working_set));
     check(ok != FALSE && working_set != 0, "XMemGetWorkingSetStatistics writes a non-zero size at +8");
+
+    check(ok != FALSE && total_memory >= working_set,
+          "XMemGetWorkingSetStatistics total memory (+0) >= working set (+8)");
 
     bool tail_untouched = true;
     for (size_t i = 16; i < sizeof(stats); ++i) {
@@ -233,20 +254,14 @@ void test_console_virtual_alloc(XMemVirtualAllocFn xmem_alloc) {
     const auto base_alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find("kernelbase.dll", "VirtualAlloc"));
     check(alloc && base_alloc == alloc, "kernel32 and kernelbase bind to the same VirtualAlloc shim");
     for (const char* dll : {"api-ms-win-core-memory-l1-1-0.dll", "api-ms-win-core-memory-l1-1-1.dll",
-                            "api-ms-win-core-memory-l1-1-2.dll", "api-ms-win-core-memory-l1-1-3.dll"}) {
+                            "api-ms-win-core-memory-l1-1-2.dll", "api-ms-win-core-memory-l1-1-3.dll",
+                            "api-ms-win-core-memory-l1-1-4.dll", "api-ms-win-core-memory-l1-1-5.dll",
+                            "api-ms-win-core-memory-l1-1-6.dll"}) {
         const auto api_alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find(dll, "VirtualAlloc"));
         check(api_alloc && api_alloc == alloc, "memory API-set import binds to the VirtualAlloc shim");
-        if (api_alloc) {
-            check_console_allocation(api_alloc(nullptr, 0x1000, type | graphics, PAGE_READWRITE), 0x1000,
-                                     "tagged allocation through the memory API-set import");
-        }
     }
 
     if (alloc) {
-        check_console_allocation(alloc(nullptr, 0x1000, type | graphics, PAGE_READWRITE), 0x1000,
-                                 "graphics allocations are host-backed");
-        check_console_allocation(alloc(nullptr, 0x1000, type | title, PAGE_READWRITE), 0x1000,
-                                 "title allocations are host-backed");
         check_console_allocation(alloc(nullptr, 0x1000, type, PAGE_READWRITE | console_protect), 0x1000,
                                  "the console protection annotation is accepted without allocation tags");
         check_console_allocation(alloc(nullptr, 1, type | graphics | console_64k, PAGE_READWRITE), 0x10000,
@@ -273,6 +288,76 @@ void test_console_virtual_alloc(XMemVirtualAllocFn xmem_alloc) {
         check_console_allocation(xmem_alloc(nullptr, 1, type | graphics | title | console_64k, 0,
                                             PAGE_READWRITE | console_protect),
                                  0x10000, "XMemVirtualAlloc also accepts the console allocation and protection tags");
+    }
+}
+
+// gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
+void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring path =
+        std::wstring(temp) + L"xmem_trace_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
+    DeleteFileW(path.c_str());
+
+    void* untraced = alloc(64, 0x1111);  // trace not open yet: nothing to write, nothing to crash
+    check(untraced != nullptr, "XMemAlloc with the trace off still allocates");
+    free_mem(untraced, 0x1111);
+
+    check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
+    void* a = alloc(4096, 0x5e50000);
+    void* b = alloc(8192, 0x5e50000);  // same word again: no second event
+    void* c = alloc(16, 0x99);
+    free_mem(a, 0x5e50000);
+    free_mem(b, 0x5e50000);  // same word again: no second event
+    free_mem(c, 0x99);
+    free_mem(nullptr, 0x77);  // a free-only word is recorded too
+    rt::startup_trace::close();
+
+    std::ifstream in(std::filesystem::path{path});
+    std::stringstream text;
+    text << in.rdbuf();
+    const std::string log = text.str();
+    auto count = [&](const std::string& needle) {
+        int n = 0;
+        for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
+        return n;
+    };
+    check(count("\"kind\":\"xmem_attributes\"") == 5, "five events: two XMemAlloc words and three XMemFree words");
+    check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
+          "XMemAlloc 0x5e50000 is recorded once, with the size of the first call");
+    check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x99\",\"size\":16") == 1, "XMemAlloc 0x99 is recorded once");
+    check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
+    check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
+    check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
+    check(count("\"caller\":\"") == 5, "every event names its caller");
+    DeleteFileW(path.c_str());
+}
+
+using HostVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
+
+// RT-217: a title's kernel32!VirtualAlloc carries the console's MEM_GRAPHICS / MEM_TITLE type bits, which the host
+// rejects. The registered shim has to drop them and still allocate.
+void test_title_virtual_alloc() {
+    constexpr DWORD kMemGraphics = 0x10000000;
+    constexpr DWORD kMemTitle = 0x40000000;
+    const char* const dlls[] = {"kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll"};
+    for (const char* dll : dlls) {
+        const auto alloc = reinterpret_cast<HostVirtualAllocFn>(rt::shims::find(dll, "VirtualAlloc"));
+        char what[160];
+        std::snprintf(what, sizeof what, "registry exposes %s!VirtualAlloc", dll);
+        check(alloc != nullptr, what);
+        if (!alloc) continue;
+
+        for (const DWORD bits : {kMemGraphics, kMemTitle, kMemGraphics | kMemTitle, DWORD{0}}) {
+            void* const p = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | bits, PAGE_READWRITE);
+            std::snprintf(what, sizeof what, "%s!VirtualAlloc with type bits %#lx returns memory", dll,
+                          static_cast<unsigned long>(bits));
+            check(p != nullptr, what);
+            if (!p) continue;
+            static_cast<volatile uint8_t*>(p)[0] = 0x5a;
+            check(static_cast<volatile uint8_t*>(p)[0] == 0x5a, "the allocation is committed and writable");
+            check(VirtualFree(p, 0, MEM_RELEASE), "release the allocation");
+        }
     }
 }
 
@@ -321,6 +406,9 @@ int main() {
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
+    test_attribute_trace(alloc, free_mem);
+
+    test_title_virtual_alloc();
     test_console_virtual_alloc(virtual_alloc);
 
     print_result();

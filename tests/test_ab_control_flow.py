@@ -299,6 +299,15 @@ class CandidateSelectionTest(unittest.TestCase):
         picked = AB.select_candidates(index, self.disasm, self.spirv, count=10)
         self.assertEqual(picked, ["a_valid", "z_valid"])
 
+    def test_automatic_selection_excludes_buffer_atomics_but_keeps_loads(self) -> None:
+        index = {name: self.shader(features=["bufferDeviceAddress", "shaderInt64"])
+                 for name in ("atomic", "read_only")}
+        prefix = "\ts_cbranch_scc0 2\n"
+        suffix = "\ts_branch 0\n\ts_endpgm\n"
+        self.add_shader("atomic", prefix + "\tbuffer_atomic_add v0, off, s[0:3], 0\n" + suffix)
+        self.add_shader("read_only", prefix + "\tbuffer_load_dword v0, off, s[0:3], 0\n" + suffix)
+        self.assertEqual(AB.select_candidates(index, self.disasm, self.spirv), ["read_only"])
+
     def test_metadata_filters_reject_shaders_that_pass_every_file_check(self):
         # Each rejected entry has a valid disassembly and SPIR-V, so only its metadata can drop it.
         index = {
@@ -370,6 +379,94 @@ class CountArgumentTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertIn(flag, err.getvalue())
             self.assertFalse(os.path.exists(out))
+
+
+    def test_cli_rejects_empty_selection_before_preparing_the_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = os.path.join(tmp, "spirv")
+            os.mkdir(spirv)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            out = os.path.join(tmp, "out")
+            with patch.object(AB, "test_vertex_shader") as harness, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(AB.main([tmp, tmp, out]), 1)
+            harness.assert_not_called()
+            self.assertIn("no shader candidates", err.getvalue())
+            self.assertFalse(os.path.exists(out))
+
+
+class CliBadInputTest(unittest.TestCase):
+    """Bad paths end in one stderr line and exit 2, and a mistyped input leaves no output tree behind."""
+
+    def run_cli(self, *args, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "ab_control_flow.py"), *args],
+                              capture_output=True, text=True, env=env)
+
+    def check_one_line(self, res, needle):
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn(needle, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_bad_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as f:
+                f.write("x")
+            out = os.path.join(tmp, "out")
+            # No shaders folder at all.
+            self.check_one_line(self.run_cli(tmp, os.path.join(tmp, "nope"), out), "index.json")
+            self.assertFalse(os.path.exists(out))
+            # An index that is not JSON.
+            with open(os.path.join(shaders, "spirv", "index.json"), "wb") as f:
+                f.write(b"\xff\xfe not json")
+            self.check_one_line(self.run_cli(tmp, shaders, out), "index.json")
+            self.assertFalse(os.path.exists(out))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            # A names file that does not exist.
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", os.path.join(tmp, "nope.txt")), "--names")
+            self.assertFalse(os.path.exists(out))
+            # Past the selection (an explicit names file selects without reading the disassembly):
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8") as f:
+                f.write("one\n")
+            disasm = os.path.join(shaders, "dxbc", "disasm")
+            os.makedirs(disasm)
+            with open(os.path.join(disasm, "one.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("s_endpgm\n")
+            # an output path under a regular file,
+            self.check_one_line(self.run_cli(tmp, shaders, os.path.join(blocker, "out"), "--names", names),
+                                "cannot create")
+            # and no SPIR-V tools on PATH.
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
+                                             path=os.path.join(tmp, "empty-path")), "spirv-as")
+
+
+    def test_bad_index_shape_and_stale_names_leave_no_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            index = os.path.join(shaders, "spirv", "index.json")
+            out = os.path.join(tmp, "out")
+            for payload in ("[]", '{"one": []}'):
+                with open(index, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(payload)
+                self.check_one_line(self.run_cli(tmp, shaders, out), "metadata")
+                self.assertFalse(os.path.exists(out))
+            with open(index, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            names = os.path.join(tmp, "names.txt")
+            for payload in (b"missing\n", b"\xff"):
+                with open(names, "wb") as f:
+                    f.write(payload)
+                self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names), "cannot read selected")
+                self.assertFalse(os.path.exists(out))
 
 
 class ResultClassificationTest(unittest.TestCase):
@@ -496,7 +593,7 @@ class BackwardBranchAndDisasmTest(unittest.TestCase):
         self.assertEqual(AB.SUPPORTED_BINDINGS, {0, 1, 2})
         self.assertEqual(
             AB.HOSTED_FEATURES,
-            {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"},
+            {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64", "shaderSampledImageArrayDynamicIndexing"},
         )
 
 

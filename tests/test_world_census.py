@@ -629,20 +629,21 @@ class ClassifyGapsTest(unittest.TestCase):
         self.assertEqual(r["accounted"], r["span"])
 
     def test_straddling_raw_segment_is_not_skipped(self):
-        # A raw_graphics segment that starts before cursor and extends past it (even when a shorter
-        # nested segment sits between its start and cursor) must still account for [cursor, s1).
+        # A raw_graphics segment that straddles scan_start (or overlaps an earlier raw segment in the
+        # same gap) must account for [pos, s1), whereas a raw_pages candidate whose start was covered
+        # by a compressed stream [0x200..0x240) must not spill its uncompressed tail into [0x240..0x300).
         self.write(b"\x22" * 0x300)
         r = WC.classify_gaps(
             self.arc,
-            [[0x100, 0x180]],
-            [[0x080, 0x180], [0x0A0, 0x040]],  # [0x80..0x200) straddles cursor=0x180; [0xA0..0xE0) ends earlier
+            [[0x200, 0x240]],
+            [[0x080, 0x100], [0x0A0, 0x040], [0x200, 0x0C0]],
             [],
             0x100,
             0x300,
         )
-        self.assertEqual(r["covered"], 0x80)
+        self.assertEqual(r["covered"], 0x40)
         self.assertEqual(r["raw_graphics"], 0x80)
-        self.assertEqual(r["unread"], 0x100)
+        self.assertEqual(r["unread"], 0x140)
         self.assertEqual(r["accounted"], r["span"])
 
     def test_duplicates_handles_rows_without_map_name(self):
@@ -737,6 +738,20 @@ class MainTest(unittest.TestCase):
                 code, _, err = self.run_main(bad, "--out", self.out)
                 self.assertEqual(code, 2)
                 self.assertIn("not an RPF9 archive", err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_magic_without_the_data_start_is_not_an_rpf9_archive(self):
+        # The data start is the u32 at +4: a file with the magic but under 8 bytes used to end in a
+        # struct.error traceback with exit 1, the code for an incomplete census.
+        bad = os.path.join(self.dir, "short.rpf")
+        for content in (b"9FPR", b"9FPR\x40", b"9FPR\x40\x00\x00"):
+            with self.subTest(size=len(content)):
+                with open(bad, "wb") as f:
+                    f.write(content)
+                code, out, err = self.run_main(bad, "--out", self.out)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertEqual(err.strip(), "not an RPF9 archive")
         self.assertFalse(os.path.exists(self.out))
 
     def test_missing_or_folder_archive_is_one_line(self):
