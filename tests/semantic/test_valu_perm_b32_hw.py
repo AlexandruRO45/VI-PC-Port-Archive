@@ -437,5 +437,48 @@ class TestVPermB32RegisterAliasing(unittest.TestCase):
         self.assertEqual(support.mrt0_words(spv)[0], 0x00010203)
 
 
+@dataclasses.dataclass(frozen=True)
+class PermStatusFlags:
+    is_zero: bool
+    is_negative: bool
+    all_from_src1: bool
+    all_from_src0: bool
+    has_constants: bool
+
+
+def compute_status_flags(res: int, sel: int) -> PermStatusFlags:
+    bytes_sel = [(sel >> (8 * i)) & 0xFF for i in range(4)]
+    return PermStatusFlags(
+        is_zero=(res == 0),
+        is_negative=((res & 0x80000000) != 0),
+        all_from_src1=all(b < 4 for b in bytes_sel),
+        all_from_src0=all(4 <= b < 8 for b in bytes_sel),
+        has_constants=any(b >= 12 for b in bytes_sel),
+    )
+
+
+class TestVPermB32ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and classification."""
+
+    def test_zero_result_flags(self):
+        flags = compute_status_flags(0, sel=0x0C0C0C0C)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertTrue(flags.has_constants)
+
+    def test_negative_result_flags(self):
+        flags = compute_status_flags(0x80000000, sel=0x07060504)
+        self.assertFalse(flags.is_zero)
+        self.assertTrue(flags.is_negative)
+        self.assertTrue(flags.all_from_src0)
+        self.assertFalse(flags.has_constants)
+
+    def test_pure_src1_flags(self):
+        flags = compute_status_flags(0x12345678, sel=0x03020100)
+        self.assertTrue(flags.all_from_src1)
+        self.assertFalse(flags.all_from_src0)
+        self.assertFalse(flags.has_constants)
+
+
 if __name__ == "__main__":
     unittest.main()
