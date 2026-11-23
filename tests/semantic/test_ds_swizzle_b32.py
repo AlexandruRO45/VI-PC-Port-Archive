@@ -876,15 +876,18 @@ class NegativeControls(unittest.TestCase):
             r"(%\w+) = OpGroupNonUniformShuffle %uint %c3 (%\w+) %\w+",
             r"\1 = OpCopyObject %uint \2",
             spv,
+            count=1,   # the data shuffle; the write gate's own-lane shuffle of EXEC comes after it (#4233)
         )
         self.assertEqual(n2, 1)
         self.assertNotEqual(self._run(bad_shuf, 32, 32), want)
 
-        # 3. Making the destination EXEC mask all ones (the write after the shuffle) overwrites inactive quads.
+        # 3. Making the destination EXEC mask all ones (the write after the shuffle) overwrites inactive quads. The
+        # mask's condition is the lane's EXEC bit read back after the shuffle (#4233's write gate: an own-lane shuffle
+        # compared with its constant), not the %active load before it.
         at = spv.index("OpGroupNonUniformShuffle %uint %c3")
         tail, n3 = re.subn(
-            r"(%\w+) = OpLoad %bool %active\n(\s*)(%\w+) = OpSelect %uint \1 %cffffffff %c0\b",
-            r"\1 = OpLoad %bool %active\n\2\3 = OpCopyObject %uint %cffffffff",
+            r"(%\w+) = OpIEqual %bool (%\w+ %\w+)\n(\s*)(%\w+) = OpSelect %uint \1 %cffffffff %c0\b",
+            r"\1 = OpIEqual %bool \2\n\3\4 = OpCopyObject %uint %cffffffff",
             spv[at:],
             count=1,
         )

@@ -16,7 +16,9 @@ from test_valu_permlane16 import translate_cs  # noqa: E402
 
 
 class SubgroupWritebackGateTests(unittest.TestCase):
-    def assert_post_shuffle_gate(self, spv, swizzle):
+    def assert_post_shuffle_gate(self, spv, swizzle, source_activity=False):
+        """source_activity: a v_permlane16 with FI=0, whose value is select(source lane active, shuffle, old) and whose
+        source lane's EXEC bit comes through a shuffle of its own, between the data shuffle and the gate's."""
         rows = [line.split() for line in spv.splitlines()]
         defs = {row[0]: (number, row[2:]) for number, row in enumerate(rows)
                 if len(row) >= 3 and row[1] == "="}
@@ -29,7 +31,8 @@ class SubgroupWritebackGateTests(unittest.TestCase):
 
         shuffles = [(name, number) for name, (number, args) in defs.items()
                     if args[0] == "OpGroupNonUniformShuffle"]
-        self.assertEqual(len(shuffles), 2, "the data shuffle and the gate's")   # in program order
+        # In program order: the data shuffle, the FI=0 source-activity shuffle, the gate's.
+        self.assertEqual(len(shuffles), 3 if source_activity else 2)
         shuffle, shuffle_order = shuffles[0]
 
         # Follow the stored value of v2, ignoring swizzle's separate pre-shuffle source-presence ballot.
@@ -46,10 +49,13 @@ class SubgroupWritebackGateTests(unittest.TestCase):
             select_order, (_, gate, _, _) = find(mask, "OpSelect")
         else:
             select_order, (_, gate, fetched, _) = find(stored, "OpSelect")
+        if source_activity:
+            _, (_, _, fetched, _) = find(fetched, "OpSelect")
         self.assertEqual(fetched, shuffle)
 
         compare_order, (_, got, salt) = find(gate, "OpIEqual")
-        _, (_, _, flag, lane) = find(got, "OpGroupNonUniformShuffle")
+        gate_shuffle_order, (_, _, flag, lane) = find(got, "OpGroupNonUniformShuffle")
+        self.assertEqual(gate_shuffle_order, shuffles[-1][1], "the gate's shuffle comes after every other")
         _, lane_source = find(lane, "OpLoad")
         self.assertEqual(lane_source, ["%uint", "%sg_lane"])
         flag_order, (_, active_value, flag_salt, _) = find(flag, "OpSelect")
@@ -72,7 +78,8 @@ class SubgroupWritebackGateTests(unittest.TestCase):
 
     def test_native_writeback_reads_exec_after_its_shuffle(self):
         cases = (
-            ("permlane", "v_permlane16_b32 v2, v1, 0, 0"),
+            ("permlane", "v_permlane16_b32 v2, v1, 0, 0"),   # FI=0: the source lane's EXEC bit is shuffled too
+            ("permlane_fi", "v_permlane16_b32 v2, v1, 0, 0 op_sel:[1,0]"),
             ("swizzle", "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM, 1, 0, 3, 2)"),
         )
         for name, instruction in cases:
@@ -83,7 +90,7 @@ class SubgroupWritebackGateTests(unittest.TestCase):
                     "s_mov_b32 exec_lo, 0x0000ffff",
                     instruction,
                 ], 32, emulate=False)
-                self.assert_post_shuffle_gate(spv, swizzle=name == "swizzle")
+                self.assert_post_shuffle_gate(spv, swizzle=name == "swizzle", source_activity=name == "permlane")
 
     def test_two_gates_in_a_module_read_different_values(self):
         # Two identical EXEC reads are merged by the NVIDIA compiler, which moves the second before the
