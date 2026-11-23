@@ -61,6 +61,18 @@ class EverythingSkipped(unittest.TestCase):
         self.assertEqual(rc, 2, out.getvalue())
         self.assertIn("no program ran: every one was skipped", out.getvalue())
 
+    def test_a_run_exits_by_what_was_compared(self):
+        import contextlib
+        import io
+        from unittest import mock
+        for status, code in (("mismatch", 1), ("match", 0)):
+            out = io.StringIO()
+            with self.subTest(status=status), \
+                    mock.patch.object(md, "run_one", lambda *args, status=status: (status, "detail")), \
+                    contextlib.redirect_stdout(out):
+                self.assertEqual(md.main(["--programs", "2", "--seed", "1"]), code, out.getvalue())
+                self.assertNotIn("no program ran", out.getvalue())
+
 
 class Reference(unittest.TestCase):
     """The reference model on hand-made cases (the expected words are worked out by hand)."""

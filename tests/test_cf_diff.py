@@ -53,6 +53,16 @@ def test_a_run_where_every_program_was_skipped_is_not_a_success(capsys, monkeypa
     assert "no program ran: every one was skipped" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("status, code", [
+    ("mismatch", 1),                  # every program mismatched: a mismatch is not "nothing ran"
+    ("match", 0),                     # every program matched
+])
+def test_a_suite_run_exits_by_what_was_compared(status, code, capsys, monkeypatch):
+    monkeypatch.setattr(cf_diff, "run_case", lambda *args, **kwargs: (status, "detail"))
+    assert cf_diff.main(["--programs", "2", "--seed", "1"]) == code
+    assert "no program ran" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("statuses, code", [
     (["skip", "skip"], 2),            # nothing was compared
     (["skip", "mismatch"], 1),        # a mismatch outranks "nothing else ran"

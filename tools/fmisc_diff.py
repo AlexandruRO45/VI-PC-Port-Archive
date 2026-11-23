@@ -59,7 +59,8 @@ Usage:
     python -I tools/fmisc_diff.py --self-test
 
 Exit 0 when every program matches, 1 on a mismatch (the shortest failing program is printed after removing
-instructions that do not matter), 2 on a harness error or when every program was skipped (nothing was compared), 77 when the requested hardware oracle is unavailable.
+instructions that do not matter), 2 on a harness error or when every program was skipped (nothing was
+compared), 77 when the requested hardware oracle is unavailable.
 Skips are counted with their reasons.
 """
 import argparse
