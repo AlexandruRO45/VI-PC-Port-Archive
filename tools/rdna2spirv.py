@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """RDNA2 (gfx10) shader -> SPIR-V assembly.
 
 Model: one SPIR-V invocation runs one lane. VGPRs and SGPRs are Function-scope uint arrays; float ops bitcast,
