@@ -124,6 +124,12 @@ descriptor:
 | Distinct types | 17 | 153 |
 | Events with non-zero flags | 0 | 418,184 |
 
+The 419,222 non-music length comparisons cover Opus streams (codec 11, `0x0B`).
+[An independent check](https://github.com/ItsNotRexed/Leonida/pull/3916#issuecomment-7087546815) identified
+the remaining one of the 419,223 marker chunks as belonging to a mono XMA2 stream (codec 5).
+`awc_markers.py` derives standalone stream lengths only for Opus, so that chunk is counted in the totals but
+excluded from the length comparison. The Opus timing measurement above does not establish XMA2 marker time units.
+
 - 928 of the 2,958 one-channel music banks have a chunk, and 10 of the 50 multi-channel banks (17 chunks; in the
   four banks with more than one, every channel holds the same events).
 - 923 of the 945 music chunks sit on a stream whose id is one of the 1,589 config records.
