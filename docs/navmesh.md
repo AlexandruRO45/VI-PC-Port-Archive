@@ -327,14 +327,16 @@ shares the identical 20-byte prefix `+0x00..+0x13` (`3,123,445 / 3,123,445`):
 
 `tools/navmesh_nodes.py` puts the lane graph of `levels.rpf` ([world_lights_paths.md](world_lights_paths.md)) on
 the navmesh: for each node it takes the polygon of the node's tile that contains the node in plan view and is
-closest in height, and counts that polygon's flag bits. A polygon's height is the mean of its vertex heights, not
-the surface height under the node, so on a slope the two differ (the 3 m cutoff below absorbs that). For comparison
-it sums the plan area of the polygons that carry each bit over the same tiles; surfaces above one another, such as a
+closest in height, and counts that polygon's flag bits. On a planar slope the tool evaluates the surface
+at the node's XY position. For a nonplanar ring it uses the mean vertex height, since the boundary alone
+does not specify how the interior is triangulated. For comparison it sums the plan area of the polygons
+that carry each bit over the same tiles; surfaces above one another, such as a
 bridge over a road or the stacked tiles that share one sector id, each add their own area. A bit that most road
 nodes stand on while it covers little of the area marks where the roads are.
 
 A vertex is `tile minimum + u16 / 65535 * tile extent` (the minimum is the quadtree root's, the extent `+0x60`).
-The node heights confirm it: of the 63,806 nodes with a finite position (63,808 read),
+The following census used the earlier vertex-mean method (available at `867d922f0`).
+Of the 63,806 nodes with a finite position (63,808 read),
 63,802 lie over a polygon and 63,793 have one within 3 m above or below; the height
 difference is 0.032 m at the median, 0.095 m at the 90th percentile and 0.28 m at the 99th.
 

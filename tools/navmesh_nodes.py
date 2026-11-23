@@ -4,7 +4,7 @@ The lane graph (tools/world_lights_paths.py, levels.rpf) gives every road node a
 (tools/navmesh_decode.py, navmeshes.rpf) gives polygons with two flag words whose bits are mostly unnamed. This
 tool puts the two together: for each node it finds the polygon of the node's 128 m tile that contains the node in
 plan view and is closest in height, and counts the bits of that polygon's `+0x18` and `+0x28` words. A polygon's
-height is the mean of its vertex heights, not the surface height under the node, so on a slope the two differ. Next
+height is evaluated at the node's (x, y) on a planar polygon; other polygons use the mean vertex height. Next
 to it, it sums the plan area of the polygons that carry each bit, over the tiles that hold at least one node;
 surfaces that lie above one another (a bridge over a road, stacked tiles of one sector) each add their area. A bit that
 most nodes sit on while it covers a small share of the area is tied to the roads. Two bits of `+0x18` do that,
@@ -117,13 +117,34 @@ def contains(points, x, y):
     return inside
 
 
+def _height_at(points, x, y):
+    """Evaluate a planar ring at (x, y), falling back to the vertex mean when it has no single height plane."""
+    ox, oy, oz = points[0]
+    if all(p[2] == oz for p in points):
+        return oz
+
+    # Sum signed triangle normals about a local origin, including for concave rings.
+    offsets = [(px - ox, py - oy, pz - oz) for px, py, pz in points[1:]]
+    nx = ny = nz = 0.0
+    for (ax, ay, az), (bx, by, bz) in zip(offsets, offsets[1:]):
+        nx += ay * bz - az * by
+        ny += az * bx - ax * bz
+        nz += ax * by - ay * bx
+    if nz:
+        sx, sy = -nx / nz, -ny / nz
+        # Allow sub-micrometre roundoff in decoded coordinates, without choosing a diagonal for a warped face.
+        if len(points) == 3 or all(abs(sx * dx + sy * dy - dz) <= 1e-7 for dx, dy, dz in offsets):
+            return oz + (x - ox) * sx + (y - oy) * sy
+    return sum(p[2] for p in points) / len(points)
+
+
 def polygon_under(polygons, grid, x, y, z):
-    """The polygon containing (x, y) whose mean height is closest to z -> (height difference, polygon) or None."""
+    """The polygon containing (x, y) closest to the node at that position -> (height difference, polygon) or None."""
     best = None
     for i in grid.get((int(math.floor(x / CELL)), int(math.floor(y / CELL))), ()):
         points = polygons[i][0]
         if len(points) >= 3 and contains(points, x, y):
-            dz = abs(sum(p[2] for p in points) / len(points) - z)
+            dz = abs(_height_at(points, x, y) - z)
             if best is None or dz < best[0]:
                 best = (dz, polygons[i])
     return best

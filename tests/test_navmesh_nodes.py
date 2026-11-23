@@ -31,7 +31,8 @@ MARK = 1 << 17                          # +0x28 word of the first polygon
 def build_tile(squares, sector=(256 << 9) | 256, flags=1):
     """One navmesh tile whose polygons are axis-aligned squares.
 
-    squares: [(x0, y0, x1, y1, z, flags18, flags28)] in metres from the tile's minimum corner (height 0..16).
+    squares: [(x0, y0, x1, y1, z, flags18, flags28)] in metres from the tile's minimum corner.
+    z is one height or a tuple of four corner heights (0..16).
     """
     tile = bytearray(build_navmesh(flags=flags, sector=sector, n_verts=4 * len(squares),
                                    poly_sizes=(4,) * len(squares), n_links=0, n_link_idx=0, n_volumes=0)[0])
@@ -43,7 +44,8 @@ def build_tile(squares, sector=(256 << 9) | 256, flags=1):
 
     for i, (x0, y0, x1, y1, z, flags18, flags28) in enumerate(squares):
         for k, (x, y) in enumerate(((x0, y0), (x1, y0), (x1, y1), (x0, y1))):
-            struct.pack_into("<3H", tile, vertex_at + 6 * (4 * i + k), q(x, 128.0), q(y, 128.0), q(z, 16.0))
+            height = z[k] if isinstance(z, tuple) else z
+            struct.pack_into("<3H", tile, vertex_at + 6 * (4 * i + k), q(x, 128.0), q(y, 128.0), q(height, 16.0))
         struct.pack_into("<I", tile, polygon_at + 44 * i + 0x18, flags18)
         struct.pack_into("<I", tile, polygon_at + 44 * i + 0x28, flags28)
     return bytes(tile)
@@ -133,6 +135,26 @@ class TallyTest(unittest.TestCase):
             "neither": {"nodes": 1, "polygons": 2, "area_m2": 1088},
         })
         self.assertAlmostEqual(s["height_difference_m"]["p10"], 0.5, delta=0.01)
+
+    def test_nodes_on_a_ramp_and_an_overlapping_deck(self):
+        tile = build_tile([(0, 0, 32, 16, (0, 16, 16, 0), ROAD, MARK),
+                           (0, 0, 32, 16, 2, OTHER, 0)])
+        nodes = [(2, 3, 1), (2, 3, 2), (30, 4, 15)]
+        tally = nn.new_tally()
+        nn.tally_tile(tally, tile, {(256, 256): range(3)}, nodes)
+        summary = nn.summarize(tally, 3, 1, 0.001)
+        self.assertEqual(summary["nodes_within_max_dz"], 3)
+        self.assertEqual(summary["flags28"]["17"]["nodes"], 2)
+        self.assertEqual(summary["flags18"]["12"]["nodes"], 1)
+
+    def test_sloped_triangle_and_nonplanar_ring_in_either_winding(self):
+        triangle = [(0, 0, 0), (8, 0, 16), (0, 8, -8)]  # z = 2x - y
+        warped = [(0, 0, 0), (8, 0, 8), (8, 8, 0), (0, 8, 0)]  # mean height 2
+        for points, z in ((triangle, 1), (warped, 2)):
+            for ring in (points, points[::-1]):
+                with self.subTest(ring=ring):
+                    dz, _ = nn.polygon_under([(ring, ROAD, MARK)], {(0, 0): [0]}, 2, 3, z)
+                    self.assertAlmostEqual(dz, 0)
 
     def test_the_two_road_bits_are_counted_in_combination(self):
         self.assertEqual([nn.pair_key(w) for w in (0x2100, 0x100, 0x2000, 0x1000, 0, 0xFFFFFFFF)],
