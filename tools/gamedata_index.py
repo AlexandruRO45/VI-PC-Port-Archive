@@ -32,6 +32,7 @@ import sys
 import tempfile
 import zlib
 from collections import defaultdict
+from pathlib import Path
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -415,6 +416,18 @@ def write_csv(path: str, rows: list) -> None:
         w.writerows(rows)
 
 
+def report_is_parent(report: str, other: str) -> bool:
+    parent = Path(os.path.abspath(other)).parent
+    resolved_parent = Path(os.path.realpath(parent))
+    # Check the named directory chain as well as the target of any link or junction.
+    directories = (parent,) if parent == resolved_parent else (parent, resolved_parent)
+    return any(
+        same_report_path(report, ancestor)
+        for directory in directories
+        for ancestor in (directory, *directory.parents)
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carve directory or .rpf archive")
@@ -422,8 +435,11 @@ def main() -> int:
     ap.add_argument("--csv", help="write one row per payload to this CSV")
     ap.add_argument("--json", help="write the summary and rows to this JSON")
     a = ap.parse_args()
-    if a.csv and a.json and same_report_path(a.csv, a.json):
-        ap.error("--csv and --json must use different paths")
+    if a.csv and a.json:
+        if same_report_path(a.csv, a.json):
+            ap.error("--csv and --json must use different paths")
+        if report_is_parent(a.csv, a.json) or report_is_parent(a.json, a.csv):
+            ap.error("--csv and --json cannot place one output under the other")
 
     if not os.path.exists(a.target):
         print(f"ERROR: {a.target} does not exist", file=sys.stderr)
