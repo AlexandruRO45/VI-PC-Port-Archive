@@ -1,14 +1,13 @@
-r"""Run the translator regression suite (tests/semantic) one process per test file, several files at a time.
+r"""Run independent test files and packages from the translator regression suite in parallel.
 
-    python -I scripts/run_semantic_tests.py tests/semantic          # one file per core
+    python -I scripts/run_semantic_tests.py tests/semantic          # one job per core
     python -I scripts/run_semantic_tests.py tests/semantic -j 4     # four at a time
-    python -I scripts/run_semantic_tests.py tests/semantic -v       # also print the output of the files that pass
+    python -I scripts/run_semantic_tests.py tests/semantic -v       # also print passing jobs' output
 
-It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
-`python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
-run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
-or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
-line, and exits 1 if a file fails or none is found. Standard library only.
+Each top-level `test*.py` file runs as `python -m unittest <module>` from the suite folder. Each top-level package
+runs with `unittest discover` from the same folder so package tests, imports, and `load_tests` hooks are honored.
+Tests can run side by side because each writes only into its own temporary folder. With -j 1, the runner uses
+`unittest discover` for the whole suite. Standard library only.
 """
 import argparse
 import concurrent.futures
@@ -21,20 +20,18 @@ import time
 
 
 def test_modules(directory):
-    """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only)."""
-    names = []
-    for base, dirs, files in os.walk(directory):
-        dirs[:] = sorted(d for d in dirs if os.path.isfile(os.path.join(base, d, "__init__.py")))
-        prefix = os.path.relpath(base, directory).replace(os.sep, ".")
-        for name in sorted(files):
-            if fnmatch.fnmatchcase(name, "test*.py"):
-                names.append(name[:-3] if prefix == "." else f"{prefix}.{name[:-3]}")
-    return names
+    """Names of the top-level test files and package directories to schedule."""
+    for _, dirs, files in os.walk(directory):
+        packages = [name for name in dirs if os.path.isfile(os.path.join(directory, name, "__init__.py"))]
+        return sorted(packages + [name for name in files if fnmatch.fnmatchcase(name, "test*.py")])
+    return []
 
 
 def run_module(directory, module, verbose):
-    """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
+    """Run one test file or discover a package, returning (exit code, tests run, output)."""
+    path = os.path.join(directory, module)
+    selection = ["discover", "-s", path, "-t", directory] if os.path.isdir(path) else [module.removesuffix(".py")]
+    cmd = [sys.executable, "-m", "unittest", *selection, *(["-v"] if verbose else [])]
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
@@ -56,10 +53,11 @@ def main(argv=None):
         print(f"no test*.py files in {directory}")
         return 1
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
-    modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
+    # Start packages before standalone files because a package can contain several test files.
+    modules.sort(key=lambda m: (m.endswith(".py"), -os.path.getsize(os.path.join(directory, m))))
     start, total, failed = time.monotonic(), 0, []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        jobs = {pool.submit(run_module, directory, m, a.verbose): m for m in modules}
+        jobs = {pool.submit(run_module, directory, m, a.verbose): m.removesuffix(".py") for m in modules}
         for job in concurrent.futures.as_completed(jobs):
             code, ran, out = job.result()
             total += ran
@@ -69,7 +67,8 @@ def main(argv=None):
             elif a.verbose:
                 print(f"==== {jobs[job]}\n{out}", flush=True)
     took = time.monotonic() - start
-    summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
+    kind = "test targets" if any(not m.endswith(".py") for m in modules) else "files"
+    summary = f"{len(modules)} {kind}, {total} tests, {len(failed)} {kind} failed in {took:.0f} s with {a.jobs} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
     return 1 if failed else 0
 

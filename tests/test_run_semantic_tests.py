@@ -38,12 +38,11 @@ def run(*argv):
 
 
 class RunnerTest(unittest.TestCase):
-    def test_finds_what_discover_finds(self):
+    def test_finds_top_level_test_files_and_packages(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"test_one.py": "", "helper.py": "", "pkg/__init__.py": "", "pkg/test_two.py": "",
                         "plain_dir/test_three.py": "", "testx.py": ""})
-            # discover enters packages only, and its pattern is test*.py
-            self.assertEqual(r.test_modules(tmp), ["test_one", "testx", "pkg.test_two"])
+            self.assertEqual(r.test_modules(tmp), ["pkg", "test_one.py", "testx.py"])
 
     def test_all_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -62,6 +61,33 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("==== FAILED: test_b", out)
             self.assertIn("2 files failed", out)
             self.assertTrue(out.rstrip().endswith("test_b, test_f"), out)
+
+    def test_package_initialization_failures_fail_the_run(self):
+        for package_init, diagnosis in ((FAIL, "boom-msg"), (BROKEN, "no_such_module_anywhere")):
+            with self.subTest(diagnosis=diagnosis), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "pkg/__init__.py": package_init})
+                code, out = run(tmp, "-j", "2")
+                self.assertEqual(code, 1, out)
+                self.assertIn("==== FAILED: pkg", out)
+                self.assertIn(diagnosis, out)
+
+    def test_package_load_tests_hook_controls_which_tests_run(self):
+        hook = ("def load_tests(loader, tests, pattern):\n"
+                "    return loader.loadTestsFromName('pkg.selected')\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "pkg/__init__.py": hook,
+                        "pkg/selected.py": PASS, "pkg/test_excluded.py": FAIL})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("4 tests, 0 ", out)
+
+    def test_plain_package_still_discovers_nested_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "pkg/__init__.py": "",
+                        "pkg/nested/__init__.py": "", "pkg/nested/test_p.py": PASS})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("4 tests, 0 ", out)
 
     def test_one_job_runs_discover_and_keeps_its_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
