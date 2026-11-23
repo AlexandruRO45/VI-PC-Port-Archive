@@ -63,6 +63,12 @@ bool host_has_clzero();
 // True when the host CPU implements SSE4a (CPUID 8000_0001h ECX bit 6).
 bool host_has_sse4a();
 
+// True when the host CPU implements CLWB (CPUID 7.0 EBX bit 24).
+bool host_has_clwb();
+
+// True when the host CPU implements MONITORX/MWAITX (CPUID 8000_0001h ECX bit 29).
+bool host_has_monitorx();
+
 // Installs the vectored handler, first in line, once per process. Without `force` it does so only when the host CPU
 // lacks an instruction the table emulates, since a CPU that has them executes them natively. Returns whether the
 // handler is installed.

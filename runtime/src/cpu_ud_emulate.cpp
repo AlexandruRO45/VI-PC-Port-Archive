@@ -118,9 +118,55 @@ size_t emulate_insertq(CONTEXT& ctx, const uint8_t* code, size_t available) {
     return at;
 }
 
+// The length of the ModRM byte at code[at], with its SIB byte and displacement, or 0 when `available` cuts it off.
+// mod 00 with rm 101 is RIP-relative (disp32); rm 100 adds a SIB byte, and mod 00 with SIB base 101 has a disp32 and
+// no base. REX bits do not change the length.
+size_t modrm_length(const uint8_t* code, size_t available, size_t at) {
+    if (at >= available) return 0;
+    const unsigned mod = code[at] >> 6, rm = code[at] & 7;
+    size_t length = 1;
+    unsigned disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (at + 1 >= available) return 0;
+        ++length;
+        if (mod == 0 && (code[at + 1] & 7) == 5) disp = 4;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;
+    }
+    length += disp;
+    return at + length <= available ? length : 0;
+}
+
+// CLWB, 66 [REX] 0F AE /6 with a memory operand: write the cache line back without evicting it. That changes no
+// architectural state, so the emulation is a no-op that skips the instruction; the work is its length (prefix, ModRM,
+// SIB, displacement). 0F AE /6 without the 66 is XSAVEOPT and 66 0F AE /7 is CLFLUSHOPT: neither is taken.
+size_t emulate_clwb(CONTEXT&, const uint8_t* code, size_t available) {
+    size_t at = 0;
+    if (available < 4 || code[at++] != 0x66) return 0;
+    if ((code[at] & 0xF0) == 0x40) ++at;  // REX
+    if (at + 3 > available || code[at] != 0x0F || code[at + 1] != 0xAE) return 0;
+    at += 2;
+    const unsigned modrm = code[at];
+    if ((modrm >> 6) == 3 || ((modrm >> 3) & 7) != 6) return 0;
+    const size_t tail = modrm_length(code, available, at);
+    return tail ? at + tail : 0;
+}
+
+// MONITORX (0F 01 FA) and MWAITX (0F 01 FB), AMD's user-mode MONITOR/MWAIT. MONITORX only arms an address monitor and
+// has no visible effect, so it does nothing. MWAITX waits until the monitored line is written, an interrupt arrives
+// or its timer runs out; it is allowed to return early, and callers re-check their condition in a loop, so it yields
+// the thread and returns at once. Neither touches a register or memory.
+size_t emulate_monitorx_mwaitx(CONTEXT&, const uint8_t* code, size_t available) {
+    if (available < 3 || code[0] != 0x0F || code[1] != 0x01 || (code[2] != 0xFA && code[2] != 0xFB)) return 0;
+    if (code[2] == 0xFB) SwitchToThread();
+    return 3;
+}
+
 const Emulator kTable[] = {
     {"clzero", &emulate_clzero},
     {"insertq", &emulate_insertq},
+    {"clwb", &emulate_clwb},
+    {"monitorx_mwaitx", &emulate_monitorx_mwaitx},
 };
 
 // Copies up to kMaxInstructionLength bytes of the code at `ip`, fewer when it runs into unreadable memory, and
@@ -188,9 +234,25 @@ bool host_has_sse4a() {
     return (regs[2] & (1 << 6)) != 0;
 }
 
+bool host_has_clwb() {
+    int regs[4];
+    __cpuid(regs, 0);
+    if (regs[0] < 7) return false;
+    __cpuidex(regs, 7, 0);
+    return (regs[1] & (1 << 24)) != 0;
+}
+
+bool host_has_monitorx() {
+    int regs[4];
+    __cpuid(regs, static_cast<int>(0x80000000));
+    if (static_cast<unsigned>(regs[0]) < 0x80000001u) return false;
+    __cpuid(regs, static_cast<int>(0x80000001));
+    return (regs[2] & (1 << 29)) != 0;
+}
+
 bool install(bool force) {
     if (g_handler) return true;
-    if (!force && host_has_clzero() && host_has_sse4a()) return false;
+    if (!force && host_has_clzero() && host_has_monitorx() && host_has_clwb() && host_has_sse4a()) return false;
     g_handler = AddVectoredExceptionHandler(1, &handler);
     return g_handler != nullptr;
 }
