@@ -19,6 +19,12 @@ class ShaderIRParseTests(unittest.TestCase):
         self.assertEqual(shader_ir.split_args("[v0, v1], s[4:7], neg(|v2|)"),
                          ["[v0, v1]", " s[4:7]", " neg(|v2|)"])
 
+    def test_hwreg_comma_spacing_preserves_operands(self):
+        for reg in ("hwreg(HW_REG_MODE,2, 2)", "hwreg(HW_REG_MODE, 2,2)"):
+            with self.subTest(reg=reg):
+                ins = shader_ir.parse_line(f"s_setreg_imm32_b32 {reg}, 3")
+                self.assertEqual(ins["args"], [{"k": "special", "t": reg}, {"k": "imm", "v": 3}])
+
     def test_operand_fast_paths_and_modifiers(self):
         self.assertEqual(shader_ir.operand("v3"), {"k": "vgpr", "r": 3, "n": 1, "neg": False, "abs": False})
         self.assertEqual(shader_ir.operand("-|s12|"), {"k": "sgpr", "r": 12, "n": 1, "neg": True, "abs": True})
