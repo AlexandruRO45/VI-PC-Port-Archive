@@ -17,7 +17,13 @@ namespace {
 template<class T>
 struct Ref {
     T* p = nullptr;
-    ~Ref() { if (p) p->Release(); }
+    ~Ref() { reset(); }
+    void reset() {
+        if (p) {
+            p->Release();
+            p = nullptr;
+        }
+    }
     T* operator->() const { return p; }
 };
 
@@ -133,11 +139,33 @@ bool verify_valid_on(ID3D12Device* device, ID3D12InfoQueue* iq, const char* labe
     return true;
 }
 
+bool create_host_warp(Ref<ID3D12Device>& host, Ref<ID3D12InfoQueue>& iq) {
+    iq.reset();
+    host.reset();
+    if (hostwine::host_is_wine()) return false;
+    Ref<IDXGIFactory4> factory;
+    Ref<IDXGIAdapter> warp;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+        FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        host.reset();
+        return false;
+    }
+    host->QueryInterface(IID_PPV_ARGS(&iq.p));
+    return true;
+}
+
+bool ensure_host_warp(Ref<ID3D12Device>& host, Ref<ID3D12InfoQueue>& iq) {
+    if (host.p && host->GetDeviceRemovedReason() == S_OK) return true;
+    return create_host_warp(host, iq);
+}
+
 // Verify an invalid RTV produces a null TargetView on ours (overwriting a valid seed RTV, failing
 // ClearRenderTargetView/Close with E_INVALIDARG and 0 Vulkan validation errors), and on host WARP
-// (when debug layer is enabled) produces at least one D3D12 validation error.
-bool verify_invalid(ID3D12Device* ours, ID3D12Device* host, ID3D12InfoQueue* iq, const char* label,
-                    const D3D12_RESOURCE_DESC& rd, D3D12_RESOURCE_STATES initial_state,
+// (when available) either removes the WARP device or produces at least one D3D12 debug-layer error.
+// If WARP removes the device, recreate it cleanly before the next case.
+bool verify_invalid(ID3D12Device* ours, Ref<ID3D12Device>& host, Ref<ID3D12InfoQueue>& iq, bool host_available,
+                    const char* label, const D3D12_RESOURCE_DESC& rd, D3D12_RESOURCE_STATES initial_state,
                     const D3D12_RENDER_TARGET_VIEW_DESC* desc, bool check_host_debug = true) {
     // 1. Vulkan backend check: seed slot with a valid RTV first so we verify overwrite with null TargetView.
     {
@@ -170,22 +198,37 @@ bool verify_invalid(ID3D12Device* ours, ID3D12Device* host, ID3D12InfoQueue* iq,
             return false;
         }
     }
-    // 2. Host WARP parity check when debug layer is available.
-    if (host && iq && check_host_debug) {
-        iq->ClearStoredMessages();
-        Ref<ID3D12Resource> host_res;
-        if (!create_resource(host, rd, initial_state, host_res)) {
-            std::fprintf(stderr, "invalid [%s]: host resource creation failed\n", label);
+    // 2. Host WARP parity check.
+    if (host_available && check_host_debug) {
+        if (!ensure_host_warp(host, iq)) {
+            std::fprintf(stderr, "invalid [%s]: failed to recreate host WARP device\n", label);
             return false;
         }
-        Ref<ID3D12DescriptorHeap> heap;
-        const D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-        CHECK(SUCCEEDED(host->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap.p))));
-        const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
-        iq->ClearStoredMessages();
-        host->CreateRenderTargetView(host_res.p, desc, handle);
-        const UINT errs = count_and_clear_errors(iq);
-        if (errs == 0) {
+        HRESULT removed = S_OK;
+        UINT errs = 0;
+        {
+            if (iq.p) iq->ClearStoredMessages();
+            Ref<ID3D12Resource> host_res;
+            if (!create_resource(host.p, rd, initial_state, host_res)) {
+                std::fprintf(stderr, "invalid [%s]: host resource creation failed\n", label);
+                return false;
+            }
+            Ref<ID3D12DescriptorHeap> heap;
+            const D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            CHECK(SUCCEEDED(host->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap.p))));
+            const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
+            if (iq.p) iq->ClearStoredMessages();
+            host->CreateRenderTargetView(host_res.p, desc, handle);
+            errs = count_and_clear_errors(iq.p);
+            removed = host->GetDeviceRemovedReason();
+        }
+        if (removed != S_OK) {
+            if (!create_host_warp(host, iq)) {
+                std::fprintf(stderr, "invalid [%s]: failed to recreate host WARP device after removal (0x%08lx)\n",
+                             label, static_cast<unsigned long>(removed));
+                return false;
+            }
+        } else if (iq.p && errs == 0) {
             std::fprintf(stderr, "invalid [%s]: host WARP debug layer accepted view that ours rejected\n", label);
             return false;
         }
@@ -216,20 +259,15 @@ int main() {
         info.queue_family = vk.family;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
 
-        if (!hostwine::host_is_wine()) {
-            Ref<IDXGIFactory4> factory;
-            Ref<IDXGIAdapter> warp;
-            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
-                SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) &&
-                SUCCEEDED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
-                host->QueryInterface(IID_PPV_ARGS(&iq.p));
-            }
-        }
+        const bool host_available = create_host_warp(host, iq);
 
         const auto run_valid = [&](const char* label, const D3D12_RESOURCE_DESC& rd,
                                    const D3D12_RENDER_TARGET_VIEW_DESC* desc) -> bool {
             if (!verify_valid_on(ours.p, nullptr, label, rd, desc)) return false;
-            if (host.p && !verify_valid_on(host.p, iq.p, label, rd, desc)) return false;
+            if (host_available) {
+                if (!ensure_host_warp(host, iq)) return false;
+                if (!verify_valid_on(host.p, iq.p, label, rd, desc)) return false;
+            }
             ++valid_cases;
             return true;
         };
@@ -237,7 +275,7 @@ int main() {
         const auto run_invalid = [&](const char* label, const D3D12_RESOURCE_DESC& rd,
                                      D3D12_RESOURCE_STATES state, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                      bool check_host_debug = true) -> bool {
-            if (!verify_invalid(ours.p, host.p, iq.p, label, rd, state, desc, check_host_debug)) return false;
+            if (!verify_invalid(ours.p, host, iq, host_available, label, rd, state, desc, check_host_debug)) return false;
             ++invalid_cases;
             return true;
         };
