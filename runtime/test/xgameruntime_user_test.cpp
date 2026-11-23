@@ -185,6 +185,46 @@ int main(int argc, char** argv) {
     rt::shims::xgameruntime_user_raise_change_for_test(0);
     while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
     check(result.calls == 1, "unregistered user callback stays silent");
+    for (bool wait : {false, true}) {
+        XTaskQueueRegistrationToken queued{};
+        check(at<Register>(user, 33)(user, manual, &result, record_change, &queued) == S_OK,
+              "register callback for queued cancellation");
+        rt::shims::xgameruntime_user_raise_change_for_test(0);
+        check(at<Unregister>(user, 34)(user, queued, wait), "unregister before queued dispatch");
+        while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+        check(result.calls == 1, "queued callback suppressed after unregister");
+    }
+    XTaskQueueHandle saved_process = nullptr;
+    check(XTaskQueueGetCurrentProcessTaskQueue(&saved_process), "save process queue");
+    XTaskQueueSetCurrentProcessTaskQueue(nullptr);
+    XTaskQueueRegistrationToken failed_token{12345};
+    check(at<Register>(user, 33)(user, nullptr, nullptr, on_change, &failed_token) ==
+              HRESULT_FROM_WIN32(ERROR_NO_TASK_QUEUE) && failed_token.token == 12345,
+          "disabled process queue fails without issuing a token");
+    XTaskQueueSetCurrentProcessTaskQueue(saved_process);
+    XTaskQueueCloseHandle(saved_process);
+
+    XTaskQueueHandle nested_queue = nullptr;
+    check(SUCCEEDED(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &nested_queue)),
+          "create nested dispatch queue");
+    struct Nested { void* user; Unregister unregister; XTaskQueueRegistrationToken outer; XTaskQueueHandle queue; bool returned; } nested{user, at<Unregister>(user, 34), {}, nested_queue, false};
+    auto outer = [](void* ctx, XUserLocalId, uint32_t) {
+        auto* n = static_cast<Nested*>(ctx);
+        XTaskQueueDispatch(n->queue, XTaskQueuePort::Completion, 0);
+    };
+    auto inner = [](void* ctx, XUserLocalId, uint32_t) {
+        auto* n = static_cast<Nested*>(ctx);
+        n->returned = !n->unregister(n->user, n->outer, true);
+    };
+    XTaskQueueRegistrationToken inner_token{};
+    check(at<Register>(user, 33)(user, manual, &nested, outer, &nested.outer) == S_OK &&
+              at<Register>(user, 33)(user, nested_queue, &nested, inner, &inner_token) == S_OK,
+          "register nested callbacks");
+    rt::shims::xgameruntime_user_raise_change_for_test(0);
+    XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0);
+    check(nested.returned, "nested callback unregisters outer without deadlock");
+    at<Unregister>(user, 34)(user, inner_token, true);
+    XTaskQueueCloseHandle(nested_queue);
     XTaskQueueCloseHandle(manual);
     void* deferral = reinterpret_cast<void*>(1);
     check(at<Deferral>(user, 35)(user, &deferral) == E_GAMEUSER_DEFERRAL_NOT_AVAILABLE && deferral == nullptr,

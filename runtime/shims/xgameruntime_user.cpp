@@ -339,7 +339,17 @@ std::mutex g_tokens_mutex;
 std::condition_variable g_tokens_cv;
 std::unordered_map<uint64_t, std::shared_ptr<UserRegistration>> g_tokens;
 uint64_t g_next_token = 1;
-thread_local UserRegistration* g_current_user_callback = nullptr;
+struct UserDispatchFrame {
+    UserRegistration* registration;
+    UserDispatchFrame* previous;
+};
+thread_local UserDispatchFrame* g_user_dispatch = nullptr;
+
+bool inside_user_dispatch(UserRegistration* registration) {
+    for (auto* frame = g_user_dispatch; frame; frame = frame->previous)
+        if (frame->registration == registration) return true;
+    return false;
+}
 
 HRESULT STDMETHODCALLTYPE user_register_change(void*, XTaskQueueHandle queue, void* context, XUserChangeEventCallback callback,
                                                XTaskQueueRegistrationToken* token) {
@@ -347,8 +357,12 @@ HRESULT STDMETHODCALLTYPE user_register_change(void*, XTaskQueueHandle queue, vo
     auto registration = std::make_shared<UserRegistration>();
     registration->context = context;
     registration->callback = callback;
-    if (queue) XTaskQueueDuplicateHandle(queue, &registration->queue);
-    else XTaskQueueGetCurrentProcessTaskQueue(&registration->queue);
+    if (queue) {
+        const HRESULT hr = XTaskQueueDuplicateHandle(queue, &registration->queue);
+        if (FAILED(hr)) return hr;
+    } else if (!XTaskQueueGetCurrentProcessTaskQueue(&registration->queue)) {
+        return HRESULT_FROM_WIN32(ERROR_NO_TASK_QUEUE);
+    }
     std::lock_guard<std::mutex> lock(g_tokens_mutex);
     token->token = g_next_token++;
     g_tokens.emplace(token->token, registration);
@@ -361,7 +375,7 @@ bool STDMETHODCALLTYPE user_unregister_change(void*, XTaskQueueRegistrationToken
     if (it == g_tokens.end()) return true;
     auto registration = it->second;
     registration->active = false;
-    if (wait && g_current_user_callback != registration.get())
+    if (wait && !inside_user_dispatch(registration.get()))
         g_tokens_cv.wait(lock, [&] { return registration->running == 0; });
     const bool done = registration->running == 0;
     if (done) g_tokens.erase(token.token);
@@ -379,10 +393,10 @@ struct UserNotification {
             if (canceled || !registration->active) return;
             ++registration->running;
         }
-        auto* previous = g_current_user_callback;
-        g_current_user_callback = registration.get();
+        UserDispatchFrame frame{registration.get(), g_user_dispatch};
+        g_user_dispatch = &frame;
         registration->callback(registration->context, XUserLocalId{kOfflineLocalId}, notification->event);
-        g_current_user_callback = previous;
+        g_user_dispatch = frame.previous;
         {
             std::lock_guard<std::mutex> lock(g_tokens_mutex);
             --registration->running;
