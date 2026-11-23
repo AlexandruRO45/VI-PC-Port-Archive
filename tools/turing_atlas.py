@@ -222,14 +222,22 @@ def validate_cases():
             spv = os.path.join(d, name + ".spv")
             with open(src, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
-            ra = run(["spirv-as", src, "-o", spv, "--target-env", "vulkan1.4"])
-            if ra is None or ra.returncode != 0:
-                out[name] = {"assemble": False, "stderr": (ra.stderr if ra else "missing")[:300]}
-                continue
-            rv = run(["spirv-val", "--target-env", "vulkan1.4", spv])
-            out[name] = {"assemble": True,
-                         "valid": bool(rv and rv.returncode == 0),
-                         "stderr": ((rv.stderr if rv else "") or "")[:300]}
+            tool = "spirv-as"
+            result = run([tool, src, "-o", spv, "--target-env", "vulkan1.4"])
+            if result is None or result.returncode != 0:
+                case = {"assemble": False, "stderr": (result.stderr if result else "missing")[:300]}
+            else:
+                tool = "spirv-val"
+                result = run([tool, "--target-env", "vulkan1.4", spv])
+                case = {"assemble": True, "valid": bool(result and result.returncode == 0),
+                        "stderr": ((result.stderr if result else "") or "")[:300]}
+            if result is None:
+                case["tool_failure"] = f"{tool} could not be started"
+            # POSIX signals are negative. Windows reports fatal NTSTATUS codes separately from
+            # ordinary exits such as the assembler's unsigned SPV_ERROR_INVALID_TEXT (0xFFFFFFFB).
+            elif result.returncode < 0 or 0xC0000000 <= result.returncode <= 0xCFFFFFFF:
+                case["tool_failure"] = f"{tool} terminated abnormally (exit code {result.returncode})"
+            out[name] = case
     # A broken toolchain can reject everything and still reject the malformed control.
     compute = out["compute32"]
     compute["control_ok"] = compute.get("valid") is True
@@ -240,9 +248,12 @@ def validate_cases():
     # other results say anything about the toolchain gate and the atlas must not be read as a pass.
     control = out.get("broken_negative")
     if isinstance(control, dict):
-        rejected = control.get("assemble") is False or control.get("valid") is False
+        failure = control.get("tool_failure")
+        rejected = not failure and (control.get("assemble") is False or control.get("valid") is False)
         control["control_ok"] = rejected
-        if not rejected:
+        if failure:
+            control["error"] = f"broken_negative could not be checked: {failure}"
+        elif not rejected:
             control["error"] = ("broken_negative was accepted: the spirv-as/spirv-val gate is not rejecting "
                                 "malformed modules, so the other case results are not trustworthy")
     return out

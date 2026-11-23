@@ -209,6 +209,44 @@ class ValidationGateTests(unittest.TestCase):
         self.assertIn("turing_atlas: error:", err)
         self.assertIn("broken_negative", err)
 
+    def test_tool_failure_does_not_pass_the_negative_control(self):
+        for tool in ("spirv-as", "spirv-val"):
+            for returncode in (None, -11, 0xC0000005):
+                with self.subTest(tool=tool, returncode=returncode):
+                    fallback = self.fake_run()
+
+                    def run(cmd, **kw):
+                        if cmd[0] == tool and any("broken_negative" in str(arg) for arg in cmd):
+                            if returncode is None:
+                                return None
+                            return subprocess.CompletedProcess(cmd, returncode, "", "")
+                        return fallback(cmd, **kw)
+
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with patch.object(sys, "argv", ["turing_atlas.py"]), \
+                            patch.object(turing_atlas.shutil, "which", return_value="tool"), \
+                            patch.object(turing_atlas, "run", run), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        code = turing_atlas.main()
+                    self.assertEqual(code, 2)
+                    control = json.loads(stdout.getvalue())["cases"]["broken_negative"]
+                    self.assertFalse(control["control_ok"])
+                    self.assertIn(tool, control["error"])
+                    self.assertIn(control["error"], stderr.getvalue())
+
+    def test_windows_assembler_rejection_is_not_a_crash(self):
+        def run(cmd, **kw):
+            broken = any("broken_negative" in str(arg) for arg in cmd)
+            # spirv-as can return SPV_ERROR_INVALID_TEXT (-5) as an unsigned Windows result.
+            return subprocess.CompletedProcess(cmd, 0xFFFFFFFB if broken else 0, "", "")
+
+        with patch.object(turing_atlas.shutil, "which", return_value="tool"), \
+                patch.object(turing_atlas, "run", run):
+            control = turing_atlas.validate_cases()["broken_negative"]
+        self.assertFalse(control["assemble"])
+        self.assertTrue(control["control_ok"])
+        self.assertNotIn("error", control)
+
     def test_main_fails_when_the_validator_rejects_the_known_good_control(self) -> None:
         code, err = self.main_with(fail_validation=True)
         self.assertEqual(code, 2)
