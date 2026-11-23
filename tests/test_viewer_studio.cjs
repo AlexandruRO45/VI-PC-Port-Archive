@@ -32,14 +32,15 @@ class Vector3 { set() { return this; } sub() { return this; } }
 class Disposable { disposed = false; dispose() { this.disposed = true; } }
 
 function loadStudio() {
-    const elements = new Map(), loads = [], alerts = [];
+    const elements = new Map(), loads = [], alerts = [], timers = [];
     const document = {
         getElementById: id => elements.get(id) ?? elements.set(id, fakeElement()).get(id),
         createElement: fakeElement,
         querySelectorAll: () => [],
     };
     const context = vm.createContext({
-        document, URLSearchParams, localStorage: { getItem: () => null, setItem() {} }, window: {}, setTimeout() {},
+        document, URLSearchParams, localStorage: { getItem: () => null, setItem() {} }, window: {},
+        setTimeout(callback) { timers.push(callback); },
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
             MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
@@ -52,7 +53,7 @@ function loadStudio() {
         scene = { objects: new Set(), add(o) { this.objects.add(o); }, remove(o) { this.objects.delete(o); } };
         camera = { position: new THREE.Vector3() };
         controls = { target: new THREE.Vector3(), update() {} };`, context);
-    return { context, elements, loads, alerts, run: code => vm.runInContext(code, context) };
+    return { context, elements, loads, alerts, timers, run: code => vm.runInContext(code, context) };
 }
 
 function fakeModel() {
@@ -112,6 +113,23 @@ test('a download that finishes or fails after a later click does not replace the
     assert.deepEqual([...studio.run('scene.objects')], [modelC]);
     assert.equal(studio.elements.get('stat-name').innerText, 'c.glb');
     assert.deepEqual(studio.alerts, []);
+});
+
+test('a completed model cannot hide the next model\'s loading bar', () => {
+    const studio = loadStudio();
+    studio.run(`loadModel('/models/a.glb', 'a.glb', '', 1);`);
+    studio.loads[0].onLoad({ scene: fakeModel() });
+    const bar = studio.elements.get('loading-bar');
+    assert.equal(bar.style.transform, 'scaleX(1)');
+
+    studio.run(`loadModel('/models/b.glb', 'b.glb', '', 1);`);
+    studio.timers[0]();
+    assert.equal(bar.style.transform, 'scaleX(0.4)');
+
+    studio.loads[1].onLoad({ scene: fakeModel() });
+    assert.equal(bar.style.transform, 'scaleX(1)');
+    studio.timers[1]();
+    assert.equal(bar.style.transform, 'scaleX(0)');
 });
 
 test('switching models in clay mode disposes the old model\'s geometry, material and texture, not the clay', () => {
