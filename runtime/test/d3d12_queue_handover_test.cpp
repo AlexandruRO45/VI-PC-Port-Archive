@@ -18,6 +18,7 @@
 // producer ran reads a zero-filled texture and fails here (and with LEONIDA_VK_VALIDATION=1 under sync validation).
 // No game data.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "../shims/d3d12_com.h"
 
 #include <dxgi1_4.h>
@@ -708,9 +709,39 @@ bool run_all(ID3D12Device* device, bool layer) {
     return ok;
 }
 
-ComPtr<ID3D12Device> native_device(std::wstring& name) {
+// The host device the cases are repeated on. LEONIDA_HOST_ADAPTER picks it by name, as host_adapter.h reads it ("warp":
+// no hardware host, so the comparison is skipped); otherwise it is the adapter with the layer's LUID, so on a PC with
+// two GPUs the host run is on the same GPU as the layer. Without that adapter, the first hardware adapter, as before.
+ComPtr<ID3D12Device> native_device(LUID layer_luid, std::wstring& name) {
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
+    const std::string needle = hostadapter::wanted();
+    if (needle == "warp") return {};
+    if (!needle.empty()) {
+        ComPtr<IDXGIAdapter1> found;
+        found.Attach(hostadapter::named(factory.Get(), needle));
+        ComPtr<ID3D12Device> device;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (found && SUCCEEDED(found->GetDesc1(&desc)) &&
+            SUCCEEDED(D3D12CreateDevice(found.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+            name = desc.Description;
+            return device;
+        }
+        std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter, or no D3D12 device on it\n", needle.c_str());
+        std::exit(1);
+    }
+    {
+        ComPtr<IDXGIAdapter1> adapter;
+        ComPtr<ID3D12Device> device;
+        DXGI_ADAPTER_DESC1 desc{};
+        if ((layer_luid.LowPart || layer_luid.HighPart) &&
+            SUCCEEDED(factory->EnumAdapterByLuid(layer_luid, IID_PPV_ARGS(&adapter))) &&
+            SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+            name = desc.Description;
+            return device;
+        }
+    }
     for (UINT i = 0;; ++i) {
         ComPtr<IDXGIAdapter1> adapter;
         if (factory->EnumAdapters1(i, &adapter) != S_OK) return {};
@@ -780,6 +811,7 @@ int main(int argc, char** argv) {
     if (!run_all(layer.Get(), true)) return 1;
     const int layer_cases = cases_run;
     std::printf("Vulkan layer: %d cases passed, every one exact\n", layer_cases);
+    const LUID layer_luid = layer->GetAdapterLuid();
     layer.Reset();
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
@@ -788,7 +820,7 @@ int main(int argc, char** argv) {
     // Every mode ends with the same cases on the host runtime: the expected data is the CPU's pattern in all of
     // them, so the host run shows the cases are valid D3D12 and the layer's modes are held to the same bar.
     std::wstring name;
-    if (auto host = native_device(name)) {
+    if (auto host = native_device(layer_luid, name)) {
         arm("host runtime", 300000);
         cases_run = 0;
         if (!run_all(host.Get(), false)) return 1;

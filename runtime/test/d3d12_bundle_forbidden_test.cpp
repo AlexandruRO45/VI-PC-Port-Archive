@@ -1,5 +1,5 @@
 // Calls a bundle may not make: what Close of the bundle and of the parent that executes it return for each, on the
-// layer and on Windows' own D3D12 (no debug layer; the default adapter and WARP). One call is recorded per bundle,
+// layer and on Windows' own D3D12 (no debug layer; the layer's adapter and WARP). One call is recorded per bundle,
 // with valid arguments, on a bundle of its own; the parent direct list executes it, is closed and submitted, and the
 // device's removed reason is read after the fence. A host device is created per call, so a call that removes the
 // device does not touch the next one. Microsoft documents RSSetViewports, RSSetScissorRects, OMSetRenderTargets,
@@ -7,11 +7,13 @@
 // layer (every one of them fails the bundle's Close with E_FAIL, on both adapters, and executing such a bundle
 // crashes the PC runtime, so the parent is only closed for bundles that closed). The layer is held to the same
 // verdict for every call where both host adapters agree; its code for a refused bundle is E_INVALIDARG.
-// Both host adapters always run (LEONIDA_HOST_ADAPTER is not read), except under Wine, where the host is skipped.
+// The hardware host is the adapter host_adapter.h picks (LEONIDA_HOST_ADAPTER, else the one behind the layer's Vulkan
+// device); WARP always runs. Under Wine the host is skipped.
 // No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
+#include "host_adapter.h"
 #include "../shims/d3d12_com.h"
 
 #include <dxgi1_4.h>
@@ -204,20 +206,23 @@ int main() {
         layer.ran = true;
     }
 
+    // The hardware host is the adapter behind the layer's Vulkan device (host_adapter.h), not D3D12's default adapter,
+    // which on a PC with two GPUs can be the other one.
     Run hosts[2];
-    hosts[0].name = "default adapter";
-    hosts[1].name = "WARP";
+    std::string host_names[2] = {"hardware adapter", "WARP"};
+    hosts[0].name = host_names[0].c_str();
+    hosts[1].name = host_names[1].c_str();
     if (hostwine::host_is_wine()) {
         // Wine's vkd3d answers differently; the host is not compared.
     } else {
         Ref<IDXGIFactory4> factory;
         REQUIRE(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))));
         for (int i = 0; i < 2; ++i) {
-            bool usable = true;
+            Ref<IDXGIAdapter> adapter;
+            bool usable = hostadapter::reference(factory.p, vk, i == 1, &adapter.p, host_names[i]);
+            hosts[i].name = host_names[i].c_str();
             for (const Call& call : list) {
-                Ref<IDXGIAdapter> adapter;
                 Ref<ID3D12Device> host;
-                if (i == 1 && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) usable = false;
                 if (!usable || FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
                     usable = false;
                     break;
@@ -264,7 +269,7 @@ int main() {
         const Run& first = hosts[0].ran ? hosts[0] : hosts[1];
         const HRESULT a = first.outcomes[i].bundle_close;
         if (hosts[0].ran && hosts[1].ran && a != hosts[1].outcomes[i].bundle_close) {
-            std::printf("  the default adapter and WARP disagree on %s: not compared\n", list[i].name);
+            std::printf("  %s and WARP disagree on %s: not compared\n", hosts[0].name, list[i].name);
             ++disagreed;
             continue;
         }
@@ -282,7 +287,7 @@ int main() {
         ++failures;
     }
     if (!hosts[0].ran && !hosts[1].ran && !hostwine::host_is_wine())
-        std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
+        std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
     std::printf("bundle forbidden calls: %zu on the layer, %u compared with the host, %u hosts disagree, %u failures\n",
                 list.size(), compared, disagreed, failures);
     return failures ? 1 : 0;

@@ -1,6 +1,6 @@
 // ExecuteBundle: what a bundle's draws inherit from the list that executes it, and what the bundle hands back.
 // The same scenarios run on the layer (a Vulkan device, shaders written to the translator's contract, the ones
-// d3d12_draw_test uses) and on Windows' own D3D12 (HLSL from D3DCompile, the default adapter and WARP), and each
+// d3d12_draw_test uses) and on Windows' own D3D12 (HLSL from D3DCompile, the layer's adapter and WARP), and each
 // is read back as an 8x8 grid of letters: B blue (the clear), R, G, Y the draw's colour, C a green-only write over
 // the clear, K black. The expected grids are what the host produced when they were measured (docs/d3d12_vulkan.md
 // section 3.2); the default adapter and WARP gave the same grid in every scenario, so the layer is held to the PC
@@ -10,12 +10,14 @@
 // (the default adapter inherits the parent's topology when it does not, WARP removes the device, so that is not
 // asserted). The layer alone is also checked for the order of a bundle's commands in its parent, for the trace
 // (one line per call the application made, however often the bundle runs) and for object lifetimes.
-// Both host adapters always run (LEONIDA_HOST_ADAPTER is not read), except under Wine, where the host is skipped.
+// The hardware host is the adapter host_adapter.h picks (LEONIDA_HOST_ADAPTER, else the one behind the layer's Vulkan
+// device); WARP always runs. Under Wine the host is skipped.
 // No game data.
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
+#include "host_adapter.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_trace.h"
 #include "../src/shader_library.h"
@@ -800,7 +802,8 @@ int main() {
         REQUIRE(layer_checks(ours.p, vs_container, ps_container, library));
     }
 
-    // The host: Windows' D3D12 on the default adapter and on WARP.
+    // The host: Windows' D3D12 on the adapter behind the layer's Vulkan device (host_adapter.h; on a PC with two GPUs
+    // D3D12's default adapter can be the other one) and on WARP.
     std::vector<std::uint8_t> host_vs, host_ps;
     const bool wine = hostwine::host_is_wine();
     const bool host_shaders = !wine && compile_hlsl(hlsl, "vs", "vs_5_0", host_vs) &&
@@ -811,15 +814,17 @@ int main() {
         std::vector<std::string> grids;
         std::vector<HRESULT> closes;
     } hosts[2];
-    hosts[0].name = "the default adapter";
-    hosts[1].name = "WARP";
+    std::string host_names[2] = {"the hardware adapter", "WARP"};
+    hosts[0].name = host_names[0].c_str();
+    hosts[1].name = host_names[1].c_str();
     if (host_shaders) {
         Ref<IDXGIFactory4> factory;
         REQUIRE(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))));
         for (int i = 0; i < 2; ++i) {
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
-            if (i == 1 && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+            if (!hostadapter::reference(factory.p, vk, i == 1, &adapter.p, host_names[i])) continue;
+            hosts[i].name = host_names[i].c_str();
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
             REQUIRE(run_all(nullptr, true, adapter.p, host_vs, host_ps, list, hosts[i].grids, hosts[i].closes));
             hosts[i].ran = true;
@@ -871,7 +876,7 @@ int main() {
         ++failures;
     }
     if (!hosts[0].ran && !hosts[1].ran && !hostwine::host_is_wine())
-        std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
+        std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
     std::printf("bundles: %zu scenarios on the layer, %u host comparisons, %u failures\n", list.size(), compared,
                 failures);
     return failures ? 1 : 0;
