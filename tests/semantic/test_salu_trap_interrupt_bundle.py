@@ -411,5 +411,37 @@ class TestSSendMsgChaining(unittest.TestCase):
         self.assertEqual(words, [0x222, 0x222, 0x222, 0x222])
 
 
+class TestSSendMsgRejection(unittest.TestCase):
+    def test_unsupported_sendmsg_message_rejection(self):
+        bad_lines = [
+            "s_sendmsg sendmsg(MSG_SAVE_WAVE)",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_sendmsg_save", bad_lines)
+        self.assertIn("s_sendmsg", str(cm.exception))
+
+    def test_malformed_sendmsg_syntax_rejection(self):
+        bad_lines = [
+            "s_sendmsg",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_sendmsg_syntax", bad_lines)
+        self.assertIn("s_sendmsg", str(cm.exception))
+
+    def test_sendmsg_numeric_id_rejection(self):
+        bad_lines = [
+            "s_sendmsg 0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_sendmsg_num", bad_lines)
+        self.assertIn("s_sendmsg", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
