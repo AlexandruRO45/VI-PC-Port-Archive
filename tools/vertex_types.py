@@ -38,6 +38,8 @@ import json
 import math
 import mmap
 import os
+import stat
+import tempfile
 import random
 import re
 import struct
@@ -45,7 +47,9 @@ import sys
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from meshlet_page import PageError, parse_group  # noqa: E402  (same group validation as the 63 30 pages)
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import path_key  # noqa: E402
 
 MAGIC = 0x4042
@@ -694,6 +698,45 @@ def _walk_error(exc: OSError):
     raise exc
 
 
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination.
+
+    Parent folders are created when missing (same as the previous direct writer).
+    """
+    folder = os.path.dirname(os.path.abspath(path))
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(report, fh, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".vertex_types-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", help=".rpf archives or folders; overlapping paths are counted once")
@@ -754,9 +797,7 @@ def main(argv=None):
     print(json.dumps(out, indent=1))
     if args.json:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
-                json.dump(out, fh, indent=1)
+            write_json_report(args.json, out)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2
