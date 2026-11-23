@@ -572,9 +572,69 @@ class TestMed3I32BoundaryExtremes(unittest.TestCase):
             with self.subTest(perm=[hex(x) for x in perm]):
                 expected = ref_med3_i32(*perm)
                 self.assertEqual(hw_clamp_med3_i32(*perm), expected)
-                if perm[0] != perm[1] and perm[1] != perm[2]:
-                    res = run_shader_med3_i32(*perm)
-                    self.assertEqual(res, expected)
+
+        key_cases = [
+            (0, 1, 0x7FFFFFFF),
+            (0, 0x80000000, 0x7FFFFFFF),
+            (0xFFFFFFFF, 0, 1),
+            (0x7FFFFFFF, 0x80000000, 0xFFFFFFFF),
+            (0x80000000, 0x80000001, 0x7FFFFFFE),
+            (1, 0xFFFFFFFE, 0xFFFFFFFF),
+        ]
+        for c in key_cases:
+            with self.subTest(case=[hex(x) for x in c]):
+                res = run_shader_med3_i32(*c)
+                self.assertEqual(res, ref_med3_i32(*c))
+
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection (Commit 8)
+# ==============================================================================
+
+class TestMed3I32NegativeControls(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_insufficient_operands(self):
+        lines = [
+            "v_mov_b32_e32 v1, 10",
+            "v_mov_b32_e32 v2, 20",
+            "v_med3_i32 v0, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_med3_bad_operands", lines)
+
+    def test_syntax_rejection_sgpr_destination(self):
+        with self.assertRaises(ValueError):
+            parse_med3_i32_asm("v_med3_i32 s0, v1, v2, v3")
+
+    def test_syntax_rejection_invalid_operand_count(self):
+        with self.assertRaises(ValueError):
+            parse_med3_i32_asm("v_med3_i32 v0, v1, v2")
+
+    def test_mutation_detection_unsigned_median_mutation(self):
+        def mutant_u32_med3(s0: int, s1: int, s2: int) -> int:
+            return sorted([u32(s0), u32(s1), u32(s2)])[1]
+
+        trip = (0x7FFFFFFF, 0x80000000, 0xFFFFFFFF)
+        correct = ref_med3_i32(*trip)
+        mutant = mutant_u32_med3(*trip)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_min3_mutation(self):
+        def mutant_min3(s0: int, s1: int, s2: int) -> int:
+            return sorted([s32(s0), s32(s1), s32(s2)])[0] & MASK32
+
+        trip = (10, 20, 30)
+        self.assertNotEqual(ref_med3_i32(*trip), mutant_min3(*trip))
+
+    def test_mutation_detection_max3_mutation(self):
+        def mutant_max3(s0: int, s1: int, s2: int) -> int:
+            return sorted([s32(s0), s32(s1), s32(s2)])[2] & MASK32
+
+        trip = (10, 20, 30)
+        self.assertNotEqual(ref_med3_i32(*trip), mutant_max3(*trip))
 
 
 if __name__ == "__main__":
