@@ -565,5 +565,46 @@ class TestVPkLshrrevB16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x40004000)
 
+def ref_v_pk_mad_i16(s0: int, s1: int, s2: int) -> int:
+    """Signed 16-bit integer multiply-add on packed values.
+    Each half: (src0 * src1 + src2) wrapping to 16 bits.
+    """
+    a_lo, a_hi = i16(s0 & MASK16), i16((s0 >> 16) & MASK16)
+    b_lo, b_hi = i16(s1 & MASK16), i16((s1 >> 16) & MASK16)
+    c_lo, c_hi = i16(s2 & MASK16), i16((s2 >> 16) & MASK16)
+    res_lo = (a_lo * b_lo + c_lo) & MASK16
+    res_hi = (a_hi * b_hi + c_hi) & MASK16
+    return pack16(res_lo, res_hi)
+
+
+class TestVPkMadI16Oracle(unittest.TestCase):
+    def test_oracle_basic_mad(self) -> None:
+        s0 = pack16(2, 3)
+        s1 = pack16(4, 5)
+        s2 = pack16(6, 7)
+        # 2*4 + 6 = 14; 3*5 + 7 = 22
+        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(14, 22))
+
+    def test_oracle_negative_signed_mad(self) -> None:
+        s0 = pack16(u16(-2), u16(-3))
+        s1 = pack16(3, u16(-4))
+        s2 = pack16(10, u16(-5))
+        # -2*3 + 10 = 4; -3*(-4) + (-5) = 7
+        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(4, 7))
+
+    def test_oracle_wrap_16bit(self) -> None:
+        s0 = pack16(200, 300)
+        s1 = pack16(200, 300)
+        s2 = pack16(10, 20)
+        # 200*200 + 10 = 40010 & 0xFFFF = 0x9C4A
+        # 300*300 + 20 = 90020 & 0xFFFF = 0x5FA4
+        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(40010 & MASK16, 90020 & MASK16))
+
+    def test_oracle_extremes(self) -> None:
+        s0 = pack16(u16(-32768), 32767)
+        s1 = pack16(1, 1)
+        s2 = pack16(0, 0)
+        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(0x8000, 0x7FFF))
+
 if __name__ == "__main__":
     unittest.main()
