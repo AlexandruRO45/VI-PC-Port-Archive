@@ -612,8 +612,12 @@ def check(lines, backends=("translator",), hw=None):
             skips.append(e)
     if "hw" in backends:
         got = hw(lines) if callable(hw) else hw
+        if got is None:
+            raise RuntimeError("no result from the hardware runner")
         if isinstance(got, str):
             skips.append(Skip(f"hardware: {got}"))
+        elif len(got) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(got)} words (expected 4)")
         else:
             problems.append(_diff(lines, want, got, "hardware"))
     if skips and len(skips) == len(backends):
@@ -665,7 +669,11 @@ def hw_prepare(oracle, programs, wave=32):
         from hw_oracle import asm
         programs = [asm.Kernel([vk_fuzz_run.wave64_text(ln) for ln in p], wave=64, threads=1, words=4)
                     for p in programs]
-    return oracle.run(programs)
+    raw = oracle.run(programs)
+    if raw is None or len(raw) != len(programs):
+        count = 0 if raw is None else len(raw)
+        raise RuntimeError(f"the hardware runner returned {count} results for {len(programs)} programs")
+    return raw
 
 
 def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, wave=32, build=None, work=None,
@@ -799,7 +807,12 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(lines):
-            return check(lines, backends, (lambda l: hw_prepare(oracle, [l], a.wave)[0]) if oracle else None)
+            def run_hw_one(l):
+                res = hw_prepare(oracle, [l], a.wave)
+                if not res:
+                    raise RuntimeError("the hardware runner returned no result for shrunk program")
+                return res[0]
+            return check(lines, backends, run_hw_one if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
