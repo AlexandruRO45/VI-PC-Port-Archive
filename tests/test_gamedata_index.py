@@ -332,9 +332,43 @@ class XmlClassificationTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertFalse(self.tool.standalone_xml(bad))
 
+    def test_tail_root_ignores_xml_epilogue(self):
+        for epilogue in (b"<!-- </Other> -->", b"<?note literal <? and </Other>?>",
+                         b"\n <!--a-->\t<?note b?>\r\n<!--c--> ",
+                         b"<!--" + b" " * 470 + b"-->"):
+            with self.subTest(epilogue=epilogue):
+                data = b"<Root><Child/></Root>" + epilogue
+                self.assertEqual(self.tool.tail_root(data), "Root")
+                self.assertTrue(self.tool.standalone_xml(data))
+
+        self.assertEqual(self.tool.tail_root(b"<Child/></Root><!-- note -->"), "Root")
+        for data in (b"<Root><!-- </Other> -->", b"<Root><?note </Other>?>",
+                     b"<Root><![CDATA[</Other>]]><!-- note -->",
+                     b"<Root><![CDATA[</Other><!-- note -->",
+                     b"<Root></Root>invalid<!-- note -->",
+                     b"<Root></Root><!--" + b" " * 512 + b" </Other> -->",
+                     b"<Root></Root>" + b" " * 512 + b"<!-- note -->"):
+            with self.subTest(data=data):
+                self.assertEqual(self.tool.tail_root(data), "")
+
 
 class XmlGroupingRegressionTest(GamedataIndexTest):
     """The classification bugs must also show up in the index the tool writes."""
+
+    def test_64k_declarationless_xml_with_epilogue_does_not_absorb_next_stream(self):
+        epilogue = b"</Root><!-- note -->"
+        doc = b"<Root>" + b"x" * (65536 - len(b"<Root>") - len(epilogue)) + epilogue
+        self.add(doc)
+        self.add(b"separate text stream\n" * 4)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        process = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual([(r["type"], r["root"], r["chunks"]) for r in rows],
+                         [("xml", "Root", 1), ("text", "", 1)])
+        self.assertTrue(rows[0]["complete"])
 
     def test_bom_with_whitespace_is_grouped_as_an_xml_document(self):
         doc = b"\xef\xbb\xbf\n" + b'<?xml version="1.0"?>' + b"\n<RootBom><Item/></RootBom>"

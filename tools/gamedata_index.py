@@ -50,6 +50,8 @@ MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1": "SPS1", b"RBF0": "RBF0", b"P
 # Its first 4 KiB can be over 95% printable, so without this check such a stream reads as text, and as XML when it
 # holds a "<": data.rpf has 337 of them and no XML at all (docs/gamedata.md, "Relationship to data.rpf").
 PAGE_MARKER, PAGE_MARKER_AT = b"0DRP", 16
+XML_MARKUP_START = re.compile(rb"<!--|<!\[CDATA\[|<\?")
+XML_MARKUP_END = {b"<!--": b"-->", b"<![CDATA[": b"]]>", b"<?": b"?>"}
 
 
 def printable(data: bytes) -> float:
@@ -111,7 +113,23 @@ def xml_root(data: bytes) -> str:
 
 
 def tail_root(data: bytes) -> str:
-    m = XML_CLOSE_TAIL.search(data[-512:])
+    tail = data[-512:]
+    m = XML_CLOSE_TAIL.search(tail)
+    if m is None and tail.rstrip(b" \t\r\n").endswith((b"-->", b"?>")):
+        # Walk complete markup tokens so a fake closing tag or opener in a comment or PI cannot end the root.
+        end, epilogue = 0, None
+        while start := XML_MARKUP_START.search(tail, end):
+            terminator = XML_MARKUP_END[start[0]]
+            close = tail.find(terminator, start.end())
+            if close < 0:
+                return ""
+            if terminator == b"]]>":
+                epilogue = None
+            elif epilogue is None or tail[end:start.start()].strip(b" \t\r\n"):
+                epilogue = start.start()
+            end = close + len(terminator)
+        if epilogue is not None and not tail[end:].strip(b" \t\r\n"):
+            m = XML_CLOSE_TAIL.search(tail[:epilogue])
     return m.group(1).decode("ascii", "replace") if m else ""
 
 
