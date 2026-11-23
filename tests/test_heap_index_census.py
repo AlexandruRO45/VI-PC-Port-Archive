@@ -16,6 +16,20 @@ SFI0_RES = 1 << 25
 SFI0_SMP = 1 << 26
 
 
+class ScalarCarryTests(unittest.TestCase):
+    def test_unsigned_arithmetic_matches_integer_reference(self):
+        limit = 1 << 32
+        words = (0, 1, (limit >> 1) - 1, limit >> 1, limit - 2, limit - 1)
+        for op in ("s_addc_u32", "s_subb_u32"):
+            for x in words:
+                for y in words:
+                    for carry in (0, 1):
+                        with self.subTest(op=op, x=x, y=y, carry=carry):
+                            total = x + y + carry if op == "s_addc_u32" else x - y - carry
+                            expected = (total % limit, int(not 0 <= total < limit))
+                            self.assertEqual(hic.unsigned_add_sub(op, x, y, carry), expected)
+
+
 def enc(n):
     """A placeholder `; encoding:` of n bytes: the census only needs the length (for code offsets)."""
     return "; encoding: [" + ",".join(["0x00"] * n) + "]"
@@ -146,6 +160,53 @@ class HeapIndexCensus(unittest.TestCase):
         ])
         g = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
         self.assertEqual([(r["base"], r["ptr"]) for r in g["loads"]], [("user s8", "ptr32")])
+
+    def test_carry_and_borrow_control_descriptor_address_width(self):
+        cases = (
+            ("s_add_u32 s10, 0xffffffff, 1", "s_addc_u32", "ptr64_lo_only"),
+            ("s_add_u32 s10, s8, 0", "s_addc_u32", "ptr32"),
+            ("s_sub_u32 s10, 0, 1", "s_subb_u32", "ptr64_lo_only"),
+            ("s_sub_u32 s10, s8, 0", "s_subb_u32", "ptr32"),
+            ("s_add_u32 s10, s8, 1", "s_addc_u32", "ptr64_lo_only"),
+            ("s_cmp_eq_u32 s8, 0", "s_subb_u32", "ptr64_lo_only"),
+        )
+        for producer, consumer, expected in cases:
+            with self.subTest(producer=producer, consumer=consumer):
+                self.work.add("ps_carry_width", "ps", SFI0_RES, [
+                    (producer, 4),
+                    ("s_mov_b32 s11, 0", 4),  # Leaves SCC intact.
+                    (f"{consumer} s9, s11, 0", 4),
+                    ("s_load_dwordx4 s[20:23], s[8:9], 0", 8),
+                    ("s_endpgm", 4),
+                ])
+                g = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+                self.assertEqual([(r["base"], r["ptr"]) for r in g["loads"]], [("user s8", expected)])
+
+    def test_carry_at_control_flow_join_requires_agreement(self):
+        for rhs, expected in ((0, "ptr32"), (1, "ptr64_lo_only")):
+            with self.subTest(rhs=rhs):
+                self.work.add("ps_carry_join", "ps", SFI0_RES, [
+                    ("s_cbranch_vccz 2", 4),
+                    ("s_add_u32 s10, 0, 0", 4),
+                    ("s_branch 1", 4),
+                    (f"s_add_u32 s10, 0xffffffff, {rhs}", 4),
+                    ("s_addc_u32 s9, 0, 0", 4),
+                    ("s_load_dwordx4 s[20:23], s[8:9], 0", 8),
+                    ("s_endpgm", 4),
+                ])
+                g = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+                self.assertEqual([(r["base"], r["ptr"]) for r in g["loads"]], [("user s8", expected)])
+
+    def test_unmodelled_scc_writer_discards_stale_carry(self):
+        self.work.add("ps_carry_clobbered", "ps", SFI0_RES, [
+            ("s_add_u32 s10, 0, 0", 4),
+            ("s_cmp_eq_u32 s8, 0", 4),
+            ("s_addc_u32 s9, 0, 0", 4),
+            ("s_load_dwordx4 s[20:23], s[8:9], 0", 8),
+            ("s_endpgm", 4),
+        ])
+        g = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+        self.assertEqual(g["loads"][0]["ptr"], "ptr64_lo_only")
 
     def test_branch_past_the_last_instruction_is_skipped(self):
         # 0x104 s_cbranch_scc0 0 targets 0x108 = the end of the code: counted, not a KeyError.
