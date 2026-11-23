@@ -150,10 +150,12 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     vktest::Device d;
-    if (!d.create(false)) {
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
         std::printf("SKIP: no suitable Vulkan 1.3 device\n");
         return 77;
     }
+    if (status != vktest::DeviceStatus::ready) return 1;
     driver::install(d.device_proc, d.device);
     EXPECT(driver::real_wait_semaphores != nullptr && driver::real_destroy_semaphore != nullptr);
 
@@ -274,24 +276,38 @@ int main() {
         const std::uint64_t t1 = context.submitted_retire_ticket();
         {
             std::lock_guard lock(driver::mu);
-            driver::wait_override = [](const VkSemaphoreWaitInfo*, std::uint64_t) {
+            driver::wait_calls = 0;
+            // On AMD Windows drivers (e.g. 32.0.32029.2010), vkQueueWaitIdle can return before
+            // vkGetSemaphoreCounterValue visibly reflects the timeline signal. Synchronize the
+            // real timeline wait first so completed_retire_ticket() sees t1 after the simulated OOM.
+            driver::wait_override = [&](const VkSemaphoreWaitInfo* info, std::uint64_t) {
+                if (info) (void)driver::real_wait_semaphores(d.device, info, UINT64_MAX);
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
             };
         }
         const std::uint64_t done1 = context.wait_retire_ticket(t1);
         EXPECT(!context.is_device_lost());
         EXPECT(done1 >= t1);
+        {
+            std::lock_guard lock(driver::mu);
+            EXPECT(driver::wait_calls == 1);
+        }
 
         EXPECT(q.execute({&p_empty, 1}) == ReplayResult::success);
         EXPECT(q.idle());
         const std::uint64_t t2 = context.submitted_retire_ticket();
         {
             std::lock_guard lock(driver::mu);
+            driver::wait_calls = 0;
             driver::wait_override = [](const VkSemaphoreWaitInfo*, std::uint64_t) { return VK_ERROR_DEVICE_LOST; };
         }
         const std::uint64_t done2 = context.wait_retire_ticket(t2);
         EXPECT(done2 == 0);
         EXPECT(context.is_device_lost());
+        {
+            std::lock_guard lock(driver::mu);
+            EXPECT(driver::wait_calls == 1);
+        }
         std::printf("case 3 (OOM nonfatal vs VK_ERROR_DEVICE_LOST marks context lost): ok\n");
     }
 
