@@ -47,8 +47,8 @@ matrix M: the transpose of M, row by row. Measured: the other order draws nothin
   `meshlet_page.positions_4240`) with the same matrix in double precision and rasterises them with #4809's
   `mesh_pass_coverage.rasterize`: vertices snapped to the device's subpixel grid (`--subpixel-bits`, default 8),
   top-left rule at pixel centres.
-- **Pass:** IoU of at least 0.99, no wrong colour, and **no mismatching pixel more than about one pixel from a
-  silhouette edge** (an edge only one triangle has). IoU alone is not enough: a camera 3 degrees off still gives
+- **Pass:** IoU of at least 0.99, no wrong colour, and **no mismatching pixel whose centre is more than one pixel
+  from a silhouette edge segment** (an edge only one triangle has; the distance is to the segment, not to its line). IoU alone is not enough: a camera 3 degrees off still gives
   0.98 on this drawable. An edge two triangles share is not in the edge band, because one of them covers the pixel
   either way; a mismatch there is a crack or an overlap.
 - **Subgroup mode.** The mesh shader is wave64. `--wave64-emulate auto` (the default) translates it natively only

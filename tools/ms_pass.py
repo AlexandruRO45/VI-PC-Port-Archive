@@ -274,31 +274,34 @@ def _edge_key(p, q):
     return tuple(sorted((tuple(round(v, 6) for v in p), tuple(round(v, 6) for v in q))))
 
 
+def segment_distance(p, a, b) -> float:
+    """Distance from point p to the segment a-b (not to the infinite line through it)."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length2 = dx * dx + dy * dy
+    t = 0.0 if not length2 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2))
+    return math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy))
+
+
 def silhouette_band(tris2d, width: int, height: int) -> set:
-    """The pixels within about one pixel of a silhouette edge (an edge only one triangle has), where the GPU and the
-    CPU projection may disagree by a pixel. An edge two triangles share is not in that band: one of them covers the
-    pixel either way, so a mismatch there is a crack or an overlap. Returns a set of y * width + x."""
+    """The pixels whose centre lies within one pixel of a silhouette edge segment (an edge only one triangle has),
+    where the GPU and the CPU projection may disagree by a pixel. The distance is to the segment, so a pixel near the
+    line's extension past a vertex is not in the band. An edge two triangles share is not in it either: one of them
+    covers the pixel either way, so a mismatch there is a crack or an overlap. Returns a set of y * width + x."""
+    tris2d = [(a, b, c) for a, b, c in tris2d                       # a triangle with no area covers nothing
+              if abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) >= 1e-12]
     uses = {}
     for a, b, c in tris2d:
         for p, q in ((a, b), (b, c), (c, a)):
             uses[_edge_key(p, q)] = uses.get(_edge_key(p, q), 0) + 1
     band = set()
-    for a, b, c in tris2d:
-        area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-        if abs(area) < 1e-12:
-            continue
-        lens = [math.dist(p, q) if uses[_edge_key(p, q)] == 1 else 0.0 for p, q in ((a, b), (b, c), (c, a))]
-        x0 = max(0, int(math.floor(min(a[0], b[0], c[0]))) - 1)
-        x1 = min(width - 1, int(math.ceil(max(a[0], b[0], c[0]))) + 1)
-        y0 = max(0, int(math.floor(min(a[1], b[1], c[1]))) - 1)
-        y1 = min(height - 1, int(math.ceil(max(a[1], b[1], c[1]))) + 1)
+    for p, q in ((p, q) for a, b, c in tris2d for p, q in ((a, b), (b, c), (c, a)) if uses[_edge_key(p, q)] == 1):
+        x0 = max(0, int(math.floor(min(p[0], q[0]) - 1.5)))
+        x1 = min(width - 1, int(math.ceil(max(p[0], q[0]) + 1.5)))
+        y0 = max(0, int(math.floor(min(p[1], q[1]) - 1.5)))
+        y1 = min(height - 1, int(math.ceil(max(p[1], q[1]) + 1.5)))
         for y in range(y0, y1 + 1):
             for x in range(x0, x1 + 1):
-                px, py = x + 0.5, y + 0.5
-                e = [((q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])) / area
-                     for p, q in ((a, b), (b, c), (c, a))]
-                dist = min(abs(e[i] * area) / lens[i] if lens[i] else math.inf for i in range(3))
-                if dist < 1.0 and min(e) > -1.0:
+                if segment_distance((x + 0.5, y + 0.5), p, q) < 1.0:
                     band.add(y * width + x)
     return band
 

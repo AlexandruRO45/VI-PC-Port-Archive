@@ -124,6 +124,27 @@ class Raster(unittest.TestCase):
             self.assertNotIn(6 * 16 + 6, band)               # on the shared diagonal: not excused
             self.assertNotIn(4 * 16 + 8, band)               # interior
 
+    def test_band_follows_the_segment_not_its_extension(self):
+        # a thin sliver: its long edge's line runs on past the tip at (30, 3); the pixel at (40, 3), about 10 px
+        # beyond the tip on that line, is near the line but not near the segment
+        tris = [((2.0, 2.0), (30.0, 3.0), (2.0, 4.0))]
+        _, band = mp.rasterize(tris, 48, 8)
+        self.assertNotIn(3 * 48 + 40, band)
+        self.assertGreater(mp.segment_distance((40.5, 3.5), (2.0, 2.0), (30.0, 3.0)), 9.0)
+        self.assertIn(3 * 48 + 29, band)                 # next to the tip itself
+        self.assertAlmostEqual(mp.segment_distance((5.0, 0.0), (0.0, 0.0), (10.0, 0.0)), 0.0)
+        self.assertAlmostEqual(mp.segment_distance((13.0, 4.0), (0.0, 0.0), (10.0, 0.0)), 5.0)
+        self.assertAlmostEqual(mp.segment_distance((3.0, 4.0), (0.0, 0.0), (0.0, 0.0)), 5.0)
+
+    def test_an_extra_pixel_beyond_a_vertex_fails(self):
+        tris = [((2.0, 2.0), (30.0, 3.0), (2.0, 4.0))]
+        cpu, band = mp.rasterize(tris, 48, 8)
+        far = 3 * 48 + 40
+        gpu = set(cpu) | {far}
+        r = mp.compare(gpu, frame(gpu, 48, 8), cpu, band)
+        self.assertEqual((r["extra"], r["off_edge"]), (1, 1))
+        self.assertFalse(mp.passed(r))
+
     def test_degenerate_and_offscreen(self):
         self.assertEqual(mp.rasterize([((1, 1), (5, 5), (9, 9))], 16, 16), (set(), set()))
         covered, _ = mp.rasterize([((-50, -50), (-40, -50), (-50, -40))], 16, 16)
