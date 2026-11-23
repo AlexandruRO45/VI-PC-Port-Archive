@@ -1706,6 +1706,17 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_get_resource_allocation_info(self, a1, a2, a3, a4);
     } else if constexpr (Slot == 26) {
         return proxy_get_custom_heap_properties(self, a1, a2, a3);
+    } else if constexpr (Slot == 61) {
+        note_slot(61);
+        static std::atomic<bool> logged61{false};
+        if (first_call(logged61)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 61 (Xbox bring-up stand-in) args: a1=0x%llx a2=0x%llx a3=0x%llx "
+                         "a4=0x%llx\n",
+                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+        }
+        return hr_to_u64(S_OK);
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
