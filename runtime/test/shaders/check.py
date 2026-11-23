@@ -191,6 +191,11 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 # The SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm header): one thread too.
 # Never run cs_smem_sload_neg with a translator that zero-extends the s_load immediate: it reads 4 GiB past the heap.
+# cs_dot4_neg.asm: VOP3P neg_lo / neg_hi on v_dot4_i32_i8 (the FSPX programs' instruction, enabled for gfx1013 with
+# `; mattr: ... +dot1-insts`). The rule is measured on gfx1036 and pinned on the CPU by
+# tests/semantic/test_dot4_i8_neg.py; these words are the same program on a GPU, derived in the .asm header.
+DOT4_NEG_WORDS = [0x00000040, 0xFFFFFF40, 0x00000240, 0xFFFFFD40,
+                  0x00000440, 0x80000040, 0x7FFFFFFF, 0x80000000]
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           ("cs_smem_bounds", [0, 0x5eed0010, 0x5eed000c, 0, 0x5eed000c, 0x5eed0010, 0, 0]),
           ("cs_smem_stride_align", [0x5eed0010, 0, 0, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0004]),
@@ -204,7 +209,9 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           # the end of an access decides (a start check, Mesa's GFX10 column, reads more); x4 loads and stores per dword, typed all or nothing
           ("cs_oob_tail", [0, 0, 0x5eed0010, 0, 0xbeef0000, 0xeeeeeeee, 0, 0x5eed0010]),
           # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
-          ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed000c, 0, 0xbeef0000, 0xbeef0001])]
+          ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed000c, 0, 0xbeef0000, 0xbeef0001]),
+          # cs_dot4_neg.asm: VOP3P neg_lo/neg_hi on v_dot4_i32_i8, one thread, no wave64 requirement
+          ("cs_dot4_neg", DOT4_NEG_WORDS)]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
