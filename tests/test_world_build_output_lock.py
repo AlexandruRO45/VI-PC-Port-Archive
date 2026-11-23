@@ -123,7 +123,10 @@ class WorldBuildOutputLockTests(unittest.TestCase):
             link = os.path.join(tmp, "link")
             if os.name == "nt":
                 import _winapi
-                _winapi.CreateJunction(parent, link)
+                try:
+                    _winapi.CreateJunction(parent, link)
+                except PermissionError as exc:
+                    self.skipTest(f"cannot create a Windows junction here: {exc}")
             else:
                 try:
                     os.symlink(parent, link, target_is_directory=True)
