@@ -716,7 +716,13 @@ DWORD WINAPI get_file_attributes_w(LPCWSTR name) {
         SetLastError(t.error);
         return INVALID_FILE_ATTRIBUTES;
     }
-    return ::GetFileAttributesW(t.path.c_str());
+    const DWORD attr = ::GetFileAttributesW(t.path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        const DWORD err = GetLastError();
+        note_open_failure("GetFileAttributesW", name, err, _ReturnAddress());
+        SetLastError(err);
+    }
+    return attr;
 }
 
 DWORD WINAPI get_file_attributes_a(LPCSTR name) {
@@ -738,7 +744,13 @@ BOOL WINAPI get_file_attributes_ex_w(LPCWSTR name, GET_FILEEX_INFO_LEVELS level,
         SetLastError(t.error);
         return FALSE;
     }
-    return ::GetFileAttributesExW(t.path.c_str(), level, info);
+    const BOOL ok = ::GetFileAttributesExW(t.path.c_str(), level, info);
+    if (!ok) {
+        const DWORD err = GetLastError();
+        note_open_failure("GetFileAttributesExW", name, err, _ReturnAddress());
+        SetLastError(err);
+    }
+    return ok;
 }
 
 BOOL WINAPI get_file_attributes_ex_a(LPCSTR name, GET_FILEEX_INFO_LEVELS level, LPVOID info) {

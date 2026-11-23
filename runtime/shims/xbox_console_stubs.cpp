@@ -7,12 +7,19 @@
 //
 // All entry points log on first call so bring-up traces record call order cleanly.
 #include <windows.h>
+#include <unknwn.h>
 #include <malloc.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <vector>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -23,13 +30,296 @@ void log_once(std::atomic<bool>& flag, const char* dll, const char* fn) {
     }
 }
 
-// ---- xcrdapi.dll (DirectStorage) --------------------------------------------------------------------------------
+void log_iid(const char* tag, REFIID riid) {
+    std::fprintf(stderr,
+                 "[rt] xcrdapi: %s IID={%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
+                 tag, static_cast<unsigned long>(riid.Data1), riid.Data2, riid.Data3, riid.Data4[0], riid.Data4[1],
+                 riid.Data4[2], riid.Data4[3], riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7]);
+}
 
-HRESULT WINAPI DStorageGetFactory_stub(REFIID /*riid*/, void** out) {
+// ---- xcrdapi.dll (DirectStorage COM bring-up shim) --------------------------------------------------------------
+
+class DStorageFileShim : public IUnknown {
+public:
+    explicit DStorageFileShim(HANDLE h) : handle_(h) {}
+    ~DStorageFileShim() { close_handle(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = this;
+        AddRef();
+        (void)riid;
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (left == 0) delete this;
+        return left;
+    }
+
+    // IDStorageFileX vtable: slot 3 = Close, slot 4 = GetFileInformation
+    virtual void STDMETHODCALLTYPE Close() {
+        std::fprintf(stderr, "[rt] xcrdapi: File::Close()\n");
+        close_handle();
+    }
+    virtual HRESULT STDMETHODCALLTYPE GetFileInformation(BY_HANDLE_FILE_INFORMATION* info) {
+        if (!info) return E_POINTER;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (handle_ == INVALID_HANDLE_VALUE) return E_HANDLE;
+        const BOOL ok = GetFileInformationByHandle(handle_, info);
+        const HRESULT hr = ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+        std::fprintf(stderr, "[rt] xcrdapi: File::GetFileInformation -> hr=0x%08lx size=%llu\n",
+                     static_cast<unsigned long>(hr),
+                     (static_cast<unsigned long long>(info->nFileSizeHigh) << 32) | info->nFileSizeLow);
+        return hr;
+    }
+
+    HANDLE native_handle() const { return handle_; }
+
+private:
+    void close_handle() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    std::atomic<ULONG> refs_{1};
+    std::mutex mutex_;
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+
+class DStorageStatusArrayShim : public IUnknown {
+public:
+    explicit DStorageStatusArrayShim(UINT32 capacity) : results_(capacity ? capacity : 1, S_OK) {}
+    ~DStorageStatusArrayShim() = default;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = this;
+        AddRef();
+        (void)riid;
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (left == 0) delete this;
+        return left;
+    }
+
+    // IDStorageStatusArrayX vtable: slot 3 = IsComplete, slot 4 = GetHResult
+    virtual BOOL STDMETHODCALLTYPE IsComplete(UINT32 /*index*/) { return TRUE; }
+    virtual HRESULT STDMETHODCALLTYPE GetHResult(UINT32 index) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index >= results_.size()) return E_INVALIDARG;
+        return results_[index];
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    std::mutex mutex_;
+    std::vector<HRESULT> results_;
+};
+
+class DStorageQueueShim : public IUnknown {
+public:
+    DStorageQueueShim() { error_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
+    ~DStorageQueueShim() {
+        if (error_event_) CloseHandle(error_event_);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = this;
+        AddRef();
+        (void)riid;
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (left == 0) delete this;
+        return left;
+    }
+
+    // IDStorageQueueX / X1 / X2 vtable
+    virtual void STDMETHODCALLTYPE EnqueueRequest(const void* /*request*/) {
+        static std::atomic<bool> logged{false};
+        log_once(logged, "xcrdapi", "IDStorageQueueX::EnqueueRequest");
+    }
+    virtual void STDMETHODCALLTYPE EnqueueStatus(IUnknown* /*statusArray*/, UINT32 /*index*/) {
+        static std::atomic<bool> logged{false};
+        log_once(logged, "xcrdapi", "IDStorageQueueX::EnqueueStatus");
+    }
+    virtual void STDMETHODCALLTYPE EnqueueSignal(IUnknown* /*fence*/, UINT64 /*value*/) {
+        static std::atomic<bool> logged{false};
+        log_once(logged, "xcrdapi", "IDStorageQueueX::EnqueueSignal");
+    }
+    virtual void STDMETHODCALLTYPE Submit() {
+        static std::atomic<bool> logged{false};
+        log_once(logged, "xcrdapi", "IDStorageQueueX::Submit");
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (HANDLE ev : pending_events_) {
+            if (ev && ev != INVALID_HANDLE_VALUE) SetEvent(ev);
+        }
+        pending_events_.clear();
+    }
+    virtual void STDMETHODCALLTYPE CancelRequestsWithTag(UINT64 /*mask*/, UINT64 /*value*/) {}
+    virtual void STDMETHODCALLTYPE Close() {}
+    virtual HANDLE STDMETHODCALLTYPE GetErrorEvent() { return error_event_; }
+    virtual void STDMETHODCALLTYPE RetrieveErrorRecord(void* record) {
+        if (record) std::memset(record, 0, 128);
+    }
+    virtual void STDMETHODCALLTYPE Query(void* info) {
+        if (info) std::memset(info, 0, 48);
+    }
+    // IDStorageQueueX1
+    virtual void STDMETHODCALLTYPE EnqueueSetEvent(HANDLE handle) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_events_.push_back(handle);
+    }
+    // IDStorageQueueX2
+    virtual void STDMETHODCALLTYPE Query1(void* info) {
+        if (info) std::memset(info, 0, 64);
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    std::mutex mutex_;
+    HANDLE error_event_ = nullptr;
+    std::vector<HANDLE> pending_events_;
+};
+
+std::wstring resolve_dstorage_path(const wchar_t* path) {
+    if (!path) return {};
+    std::wstring s(path);
+    auto strip_seps = [](std::wstring rest) {
+        while (!rest.empty() && (rest.front() == L'\\' || rest.front() == L'/')) rest.erase(rest.begin());
+        return rest;
+    };
+    if (s.size() >= 5 && _wcsnicmp(s.c_str(), L"GAME:", 5) == 0) {
+        const auto game = rt::fs::game_dir();
+        if (!game.empty()) return (game / strip_seps(s.substr(5))).wstring();
+    } else if (s.size() >= 2 && (s[0] == L'G' || s[0] == L'g') && s[1] == L':') {
+        const auto game = rt::fs::game_dir();
+        if (!game.empty()) return (game / strip_seps(s.substr(2))).wstring();
+    } else if (s.size() >= 2 && (s[0] == L'T' || s[0] == L't') && s[1] == L':') {
+        const auto ov = rt::fs::overlay_dir();
+        if (!ov.empty()) return (ov / L".gta6rt-temp" / strip_seps(s.substr(2))).wstring();
+    }
+    return s;
+}
+
+class DStorageFactoryShim : public IUnknown {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        log_iid("Factory::QueryInterface", riid);
+        *ppv = this;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        return left;  // singleton factory
+    }
+
+    // IDStorageFactoryX / X1 / X2 vtable
+    virtual HRESULT STDMETHODCALLTYPE CreateQueue(const void* /*desc*/, REFIID riid, void** ppv) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            log_iid("Factory::CreateQueue", riid);
+        }
+        if (!ppv) return E_POINTER;
+        *ppv = new DStorageQueueShim();
+        return S_OK;
+    }
+    virtual HRESULT STDMETHODCALLTYPE OpenFile(const WCHAR* path, REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (!path) return E_INVALIDARG;
+        (void)riid;
+        const std::wstring resolved = resolve_dstorage_path(path);
+        HANDLE h = CreateFileW(resolved.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            const DWORD err = GetLastError();
+            std::fprintf(stderr, "[rt] xcrdapi: OpenFile failed (err=%lu) for '%ls'\n",
+                         static_cast<unsigned long>(err), resolved.c_str());
+            return HRESULT_FROM_WIN32(err);
+        }
+        static std::atomic<int> open_log_count{0};
+        if (open_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr, "[rt] xcrdapi: OpenFile OK '%ls'\n", resolved.c_str());
+        }
+        *ppv = new DStorageFileShim(h);
+        return S_OK;
+    }
+    virtual HRESULT STDMETHODCALLTYPE CreateStatusArray(UINT32 capacity, PCSTR /*name*/, REFIID /*riid*/, void** ppv) {
+        static std::atomic<bool> logged{false};
+        log_once(logged, "xcrdapi", "Factory::CreateStatusArray");
+        if (!ppv) return E_POINTER;
+        *ppv = new DStorageStatusArrayShim(capacity);
+        return S_OK;
+    }
+    virtual void STDMETHODCALLTYPE SetDebugFlags(UINT32 flags) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] xcrdapi: Factory::SetDebugFlags(0x%x)\n", flags);
+        }
+    }
+    virtual HRESULT STDMETHODCALLTYPE SetCpuAffinity(UINT64 affinity) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] xcrdapi: Factory::SetCpuAffinity(0x%llx)\n",
+                         static_cast<unsigned long long>(affinity));
+        }
+        return S_OK;
+    }
+    virtual HRESULT STDMETHODCALLTYPE SetStagingBufferSize(UINT32 size) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] xcrdapi: Factory::SetStagingBufferSize(%u)\n", size);
+        }
+        return S_OK;
+    }
+    // IDStorageFactoryX1
+    virtual void STDMETHODCALLTYPE GetStats(void* stats) {
+        static std::atomic<bool> logged{false};
+        log_once(logged, "xcrdapi", "Factory::GetStats");
+        if (stats) std::memset(stats, 0, 64);
+    }
+    // IDStorageFactoryX2
+    virtual HRESULT STDMETHODCALLTYPE CreateQueue1(const void* desc, REFIID riid, void** ppv) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            log_iid("Factory::CreateQueue1", riid);
+        }
+        (void)desc;
+        if (!ppv) return E_POINTER;
+        *ppv = new DStorageQueueShim();
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+};
+
+DStorageFactoryShim g_dstorage_factory;
+
+HRESULT WINAPI DStorageGetFactory_stub(REFIID riid, void** out) {
     static std::atomic<bool> logged{false};
-    log_once(logged, "xcrdapi", "DStorageGetFactory -> E_NOTIMPL");
-    if (out) *out = nullptr;
-    return E_NOTIMPL;
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        log_iid("DStorageGetFactory -> S_OK", riid);
+    }
+    if (!out) return E_POINTER;
+    g_dstorage_factory.AddRef();
+    *out = &g_dstorage_factory;
+    return S_OK;
 }
 
 // ---- xg_xs.dll (Xbox Graphics texture tiling) -------------------------------------------------------------------
