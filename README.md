@@ -244,8 +244,7 @@ The biggest open pieces:
 - **Xbox D3D12 → Vulkan**: the `d3d12_xs` command list and descriptor heap model.
 - **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
-pull requests.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Credits
 
