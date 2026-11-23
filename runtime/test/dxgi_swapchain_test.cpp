@@ -1172,10 +1172,16 @@ int main() {
             return fail("SetVideoMemoryReservation(LOCAL) did not reflect across second IDXGIAdapter3 handle");
 
         DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info{};
-        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 32u * 1024u * 1024u)) ||
+        if (FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)))
+            return fail("QueryVideoMemoryInfo(NON_LOCAL) before reservation failed");
+        constexpr UINT64 request = 32u * 1024u * 1024u;
+        const HRESULT nonlocal_hr = adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, request);
+        const bool refused = nonlocal_hr == E_INVALIDARG && nonlocal_info.AvailableForReservation < request;
+        const UINT64 expected = refused ? nonlocal_info.CurrentReservation : request;
+        if ((FAILED(nonlocal_hr) && !refused) ||
             FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)) ||
-            nonlocal_info.CurrentReservation != 32u * 1024u * 1024u)
-            return fail("SetVideoMemoryReservation(NON_LOCAL) did not reflect across second IDXGIAdapter3 handle");
+            nonlocal_info.CurrentReservation != expected)
+            return fail("SetVideoMemoryReservation(NON_LOCAL) returned an unexpected result");
         // Restore reservations to 0 and verify both handles see 0.
         if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, 0)) ||
             FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 0)) ||

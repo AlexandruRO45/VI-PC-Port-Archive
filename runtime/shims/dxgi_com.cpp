@@ -1082,6 +1082,87 @@ LARGE_INTEGER umd_driver_version(LUID luid) {
     return version;
 }
 
+// A Windows adapter's WDDM budget is process state, not a property that can be reconstructed from Vulkan heaps.
+// In particular, a UMA adapter can expose only DEVICE_LOCAL Vulkan memory and no DXGI NON_LOCAL segment at all.
+class WddmVideoMemory {
+public:
+    WddmVideoMemory() = default;
+    WddmVideoMemory(const WddmVideoMemory&) = delete;
+    WddmVideoMemory& operator=(const WddmVideoMemory&) = delete;
+    ~WddmVideoMemory() {
+        if (adapter_) {
+            D3DKMT_CLOSEADAPTER args{adapter_};
+            close_(&args);
+        }
+    }
+
+    void initialize(LUID luid) {
+        if (!luid.LowPart && !luid.HighPart) return;
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll || GetProcAddress(ntdll, "wine_get_version")) return;
+        const HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+        if (!gdi) return;
+        const auto open = reinterpret_cast<decltype(&D3DKMTOpenAdapterFromLuid)>(
+            GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"));
+        close_ = reinterpret_cast<decltype(close_)>(GetProcAddress(gdi, "D3DKMTCloseAdapter"));
+        query_ = reinterpret_cast<decltype(query_)>(GetProcAddress(gdi, "D3DKMTQueryVideoMemoryInfo"));
+        change_ = reinterpret_cast<decltype(change_)>(GetProcAddress(gdi, "D3DKMTChangeVideoMemoryReservation"));
+        status_to_error_ = reinterpret_cast<decltype(status_to_error_)>(GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+        if (!open || !close_ || !query_ || !change_ || !status_to_error_) return;
+
+        D3DKMT_OPENADAPTERFROMLUID args{};
+        args.AdapterLuid = luid;
+        if (open(&args) != 0) return;
+        D3DKMT_QUERYVIDEOMEMORYINFO probe{};
+        probe.hAdapter = args.hAdapter;
+        probe.MemorySegmentGroup = D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
+        if (query_(&probe) == 0) {
+            adapter_ = args.hAdapter;
+        } else {
+            D3DKMT_CLOSEADAPTER closing{args.hAdapter};
+            close_(&closing);
+        }
+    }
+
+    explicit operator bool() const { return adapter_ != 0; }
+
+    HRESULT query(DXGI_MEMORY_SEGMENT_GROUP group, DXGI_QUERY_VIDEO_MEMORY_INFO* info) const {
+        D3DKMT_QUERYVIDEOMEMORYINFO args{};
+        args.hAdapter = adapter_;
+        args.MemorySegmentGroup = segment(group);
+        const NTSTATUS status = query_(&args);
+        if (status != 0) return error(status);
+        *info = {args.Budget, args.CurrentUsage, args.AvailableForReservation, args.CurrentReservation};
+        return S_OK;
+    }
+
+    HRESULT reserve(DXGI_MEMORY_SEGMENT_GROUP group, UINT64 bytes) const {
+        D3DKMT_CHANGEVIDEOMEMORYRESERVATION args{};
+        args.hAdapter = adapter_;
+        args.MemorySegmentGroup = segment(group);
+        args.Reservation = bytes;
+        const NTSTATUS status = change_(&args);
+        return status == 0 ? S_OK : error(status);
+    }
+
+private:
+    static D3DKMT_MEMORY_SEGMENT_GROUP segment(DXGI_MEMORY_SEGMENT_GROUP group) {
+        return group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL ? D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL
+                                                        : D3DKMT_MEMORY_SEGMENT_GROUP_NON_LOCAL;
+    }
+    HRESULT error(NTSTATUS status) const {
+        const ULONG code = status_to_error_(status);
+        return code != ERROR_SUCCESS && code != ERROR_MR_MID_NOT_FOUND ? HRESULT_FROM_WIN32(code)
+                                                                       : HRESULT_FROM_NT(status);
+    }
+
+    D3DKMT_HANDLE adapter_ = 0;
+    decltype(&D3DKMTCloseAdapter) close_ = nullptr;
+    decltype(&D3DKMTQueryVideoMemoryInfo) query_ = nullptr;
+    decltype(&D3DKMTChangeVideoMemoryReservation) change_ = nullptr;
+    decltype(&RtlNtStatusToDosError) status_to_error_ = nullptr;
+};
+
 class Adapter final : public IDXGIAdapter3 {
 public:
     Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
@@ -1089,7 +1170,8 @@ public:
         if (parent_) parent_->AddRef();
         populate_desc();
         umd_version_ = umd_driver_version(desc_.AdapterLuid);
-        reservations_ = adapter_reservation_state(desc_.AdapterLuid, physical_);
+        if (!(desc_.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) wddm_.initialize(desc_.AdapterLuid);
+        if (!wddm_) reservations_ = adapter_reservation_state(desc_.AdapterLuid, physical_);
     }
 
     ~Adapter() {
@@ -1198,6 +1280,7 @@ public:
         if (node_index != 0 || !info) return E_INVALIDARG;
         if (group != DXGI_MEMORY_SEGMENT_GROUP_LOCAL && group != DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
             return E_INVALIDARG;
+        if (wddm_) return wddm_.query(group, info);
         std::memset(info, 0, sizeof(*info));
         const bool want_local = (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
         if (has_memory_budget_ && gipa_ && instance_ && physical_) {
@@ -1235,6 +1318,9 @@ public:
     HRESULT STDMETHODCALLTYPE SetVideoMemoryReservation(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP group,
                                                         UINT64 reservation) override {
         if (node_index != 0) return E_INVALIDARG;
+        if (group != DXGI_MEMORY_SEGMENT_GROUP_LOCAL && group != DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
+            return E_INVALIDARG;
+        if (wddm_) return wddm_.reserve(group, reservation);
         if (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL) {
             reservations_->local.store(reservation, std::memory_order_relaxed);
             return S_OK;
@@ -1330,6 +1416,7 @@ private:
     DXGI_ADAPTER_DESC2 desc_{};
     LARGE_INTEGER umd_version_{};  // CheckInterfaceSupport(IDXGIDevice): the adapter's user-mode driver version
     bool has_memory_budget_ = false;
+    WddmVideoMemory wddm_;
     std::shared_ptr<ReservationState> reservations_;
 };
 
