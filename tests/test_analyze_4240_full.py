@@ -21,6 +21,7 @@ TOOL = os.path.join(ROOT, "tools", "analyze_4240_full.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import analyze_4240_full as A  # noqa: E402
+import report_paths  # noqa: E402
 
 BLOCK_6330 = struct.pack("<I", 0x3063) + bytes(0x60 - 4)
 
@@ -174,6 +175,24 @@ class Analyze4240Test(unittest.TestCase):
                 self.assertNotIn("Processing", p.stdout, "refused before the scan")
                 with open(path, "rb") as f:
                     self.assertEqual(f.read(), before)
+
+    def test_json_with_an_equivalent_unicode_archive_name_is_refused(self):
+        source = os.path.join(self.root, "caf\u00e9.rpf")
+        output = os.path.join(self.root, "cafe\u0301.rpf")
+        make_archive(source, BLOCK_6330)
+        with open(source, "rb") as f:
+            original = f.read()
+        stderr = io.StringIO()
+        with (mock.patch.object(report_paths, "case_insensitive_volume", return_value=True),
+              mock.patch.object(A, "process_archive", wraps=A.process_archive) as scan,
+              mock.patch.object(sys, "argv", [TOOL, source, "--json", output]),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(stderr)):
+            self.assertEqual(A.main(), 2)
+        scan.assert_not_called()
+        self.assertIn("would overwrite the input archive", stderr.getvalue())
+        with open(source, "rb") as f:
+            self.assertEqual(f.read(), original)
 
     def test_json_naming_a_later_input_is_refused(self):
         first, second = self.truncated_archive(), os.path.join(self.root, "second.rpf")
