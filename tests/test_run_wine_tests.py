@@ -535,7 +535,7 @@ class MainTest(unittest.TestCase):
             program = self.artifact / f"{name}.py"
             program.write_text(
                 "from pathlib import Path\nPath(__file__).with_suffix('.launched').touch()\n",
-                encoding="utf-8",
+                encoding="utf-8", newline="\n",
             )
             entries.append(ctest_entry(name, self.command(program.name), {"TIMEOUT": timeout}))
 
