@@ -596,5 +596,27 @@ class TestVMsadU8HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_msad_u8(0x04030201, 0x01010101, 10), 16)
 
 
+def ref_mqsad_u32_u8(s0_64: int, s1: int, s2_quad: list[int]) -> list[int]:
+    """Reference mathematical oracle for RDNA2 v_mqsad_u32_u8."""
+    res = []
+    for k in range(4):
+        win = (s0_64 >> (8 * k)) & MASK32
+        diffs = [
+            abs(((win >> (8 * i)) & 0xFF) - ((s1 >> (8 * i)) & 0xFF))
+            if ((s1 >> (8 * i)) & 0xFF) != 0 else 0
+            for i in range(4)
+        ]
+        res.append(((s2_quad[k] & MASK32) + sum(diffs)) & MASK32)
+    return res
+
+
+class TestVMqsadU32U8Reference(unittest.TestCase):
+    """Reference oracle unit tests for v_mqsad_u32_u8."""
+
+    def test_reference_sliding_window(self):
+        outs = ref_mqsad_u32_u8(0x0807060504030201, 0x01010101, [0, 0, 0, 0])
+        self.assertEqual(outs, [6, 10, 14, 18])
+
+
 if __name__ == "__main__":
     unittest.main()
