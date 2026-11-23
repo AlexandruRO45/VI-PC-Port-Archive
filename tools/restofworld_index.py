@@ -377,7 +377,8 @@ def _carve_index(path):
         stored = {f"{int(e['off']):012x}.bin": int(e["stored"]) for e in index.get("files", [])}
         summary = index.get("summary", {})
         return stored, summary if isinstance(summary, dict) else {}
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    # OverflowError: json decodes a number such as 1e400 as infinity, and int() refuses it.
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return {}, {}
 
 

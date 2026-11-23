@@ -503,6 +503,23 @@ class FolderModeStoredBytesTest(unittest.TestCase):
             rows, summary = restofworld_index.scan_dir(tmp)
         self.assertEqual((rows[0]["stored"], summary["compressed_bytes"]), (1000, 1000))
 
+    def test_an_infinite_offset_or_size_in_the_index_is_a_damaged_index(self):
+        # json reads 1e400 as infinity and int() raises OverflowError on it: such an index is ignored like any other
+        # damaged one, and the folder is indexed from the lengths on disk (BUILD-1582).
+        for entry in ('{"off": 4096, "stored": 1e400}', '{"off": 1e400, "stored": 300}',
+                      '{"off": -1e400, "stored": 300}'):
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as tmp:
+                self.make(tmp, with_index=False)
+                with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                    f.write('{"summary": {"span": 2000}, "files": [%s]}' % entry)
+                self.assertEqual(restofworld_index._carve_index(tmp), ({}, {}))
+                rows, summary = restofworld_index.scan_dir(tmp)
+                self.assertEqual((rows[0]["stored"], summary["compressed_bytes"]), (1000, 1000))
+                out = os.path.join(tmp, "out.json")
+                proc = subprocess.run([sys.executable, "-I", TOOL, tmp, out, "--quiet"], capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+
 
 def _synth_tex_descriptor(gpu_off, w, h, dxgi_fmt, flags_lo=5, mips=1, dtype=0x980, depth=1):
     """Build one synthetic 8-qword RAGE9 texture descriptor (q[k-2]..q[k+5])."""
