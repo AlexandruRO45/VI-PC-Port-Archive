@@ -68,8 +68,32 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
         r.ExceptionCode != 0xC0000409 && r.ExceptionCode != 0xC00000FD)
         return EXCEPTION_CONTINUE_SEARCH;
     const void* access = r.NumberParameters >= 2 ? reinterpret_cast<void*>(r.ExceptionInformation[1]) : nullptr;
-    std::fprintf(stderr, "[rt] crash-veh: code=0x%08lx addr=%p access=%p tid=%lu\n", r.ExceptionCode,
-                 r.ExceptionAddress, access, GetCurrentThreadId());
+    char module[MAX_PATH] = {};
+    HMODULE host = nullptr;
+    const auto address = reinterpret_cast<LPCSTR>(r.ExceptionAddress);
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           address, &host) &&
+        host)
+        GetModuleFileNameA(host, module, MAX_PATH);
+    std::fprintf(stderr, "[rt] crash-veh: code=0x%08lx addr=%p module=%s+0x%llx access=%p tid=%lu\n", r.ExceptionCode,
+                 r.ExceptionAddress, module[0] ? module : "?", host ? static_cast<unsigned long long>(
+                     reinterpret_cast<uintptr_t>(r.ExceptionAddress) - reinterpret_cast<uintptr_t>(host)) : 0ull,
+                 access, GetCurrentThreadId());
+    void* frames[32] = {};
+    const USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        HMODULE frame_host = nullptr;
+        char frame_module[MAX_PATH] = {};
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(frames[i]), &frame_host) &&
+            frame_host)
+            GetModuleFileNameA(frame_host, frame_module, MAX_PATH);
+        const char* slash = std::strrchr(frame_module, '\\');
+        std::fprintf(stderr, "[rt] crash-stack %u: %s+0x%llx\n", i, slash ? slash + 1 : frame_module,
+                     frame_host ? static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(frames[i]) -
+                                                                  reinterpret_cast<uintptr_t>(frame_host))
+                                : 0ull);
+    }
     std::fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }

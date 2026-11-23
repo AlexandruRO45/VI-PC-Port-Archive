@@ -662,7 +662,14 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 // CreateCommandList and Reset and only the Vulkan layer's lists resolve a proxy there (CommandAllocator::from);
 // a PC runtime allocator is handed out unchanged until a command-list proxy unwraps it at Reset.
 
-enum class ChildKind { queue, fence, allocator };
+enum class ChildKind { queue, fence, allocator, list };
+
+// The retail exe asks for this console command-list interface; the PC runtime does not know it. The base
+// ID3D12GraphicsCommandList vtable is the same prefix, and the list proxy answers it.
+constexpr IID kXboxGraphicsCommandListIid = {
+    0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+constexpr IID kXboxCommandSignatureIid = {
+    0xc36a797c, 0xec80, 0x4f0a, {0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1}};
 
 constexpr unsigned kQueueSlots = 128;        // the table: 19 public slots plus a refused tail
 constexpr unsigned kFenceSlots = 64;         // the table: 12 public slots plus a refused tail
@@ -671,12 +678,14 @@ constexpr unsigned kFencePublicSlots = 11;   // ID3D12Fence
 constexpr unsigned kFence1PublicSlots = 12;  // ID3D12Fence1
 constexpr unsigned kAllocatorSlots = 64;     // the table: 9 public slots plus a refused tail
 constexpr unsigned kAllocatorPublicSlots = 9;  // ID3D12CommandAllocator: the base chain and Reset (slot 8)
+constexpr unsigned kListSlots = 160;         // the table: the PC list prefix plus the observed Xbox tail
+constexpr unsigned kListPublicSlots = 80;    // PC ID3D12GraphicsCommandList7 prefix
 constexpr SIZE_T kTableRegion = 64 * 1024;   // one allocation granule: the table page plus 15 never-committed pages
 static_assert(kQueueSlots > kQueuePublicSlots && kFenceSlots > kFence1PublicSlots &&
-                  kAllocatorSlots > kAllocatorPublicSlots,
+                  kAllocatorSlots > kAllocatorPublicSlots && kListSlots > kListPublicSlots,
               "the tables need a tail");
 static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*) <= 4096 &&
-                  kAllocatorSlots * sizeof(void*) <= 4096,
+                  kAllocatorSlots * sizeof(void*) <= 4096 && kListSlots * sizeof(void*) <= 4096,
               "a table must fit in the first page of its reservation");
 
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
@@ -694,6 +703,7 @@ template <ChildKind K>
 struct ChildStats {
     static constexpr unsigned kSlots = K == ChildKind::queue   ? kQueueSlots
                                        : K == ChildKind::fence ? kFenceSlots
+                                       : K == ChildKind::list  ? kListSlots
                                                                : kAllocatorSlots;
     static inline std::atomic<std::uint64_t> hits[kSlots];
     static inline std::atomic<bool> first[kSlots];
@@ -705,7 +715,10 @@ struct ChildStats {
 
 template <ChildKind K>
 constexpr const char* child_kind_name() {
-    return K == ChildKind::queue ? "queue" : K == ChildKind::fence ? "fence" : "allocator";
+    return K == ChildKind::queue   ? "queue"
+           : K == ChildKind::fence ? "fence"
+           : K == ChildKind::list  ? "list"
+                                   : "allocator";
 }
 
 template <ChildKind K>
@@ -722,6 +735,32 @@ const char* child_public_name(unsigned slot) {
         if (slot < kQueuePublicSlots) return queue[slot - 8];
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
+    } else if constexpr (K == ChildKind::list) {
+        static constexpr const char* list[] = {"Close", "Reset", "ClearState", "DrawInstanced", "DrawIndexedInstanced",
+                                               "Dispatch", "CopyBufferRegion", "CopyTextureRegion", "CopyResource",
+                                               "CopyTiles", "ResolveSubresource", "IASetPrimitiveTopology",
+                                               "RSSetViewports", "RSSetScissorRects", "OMSetBlendFactor",
+                                               "OMSetStencilRef", "SetPipelineState", "ResourceBarrier",
+                                               "ExecuteBundle", "SetDescriptorHeaps", "SetComputeRootSignature",
+                                               "SetGraphicsRootSignature", "SetComputeRootDescriptorTable",
+                                               "SetGraphicsRootDescriptorTable", "SetComputeRoot32BitConstant",
+                                               "SetGraphicsRoot32BitConstant", "SetComputeRoot32BitConstants",
+                                               "SetGraphicsRoot32BitConstants", "SetComputeRootConstantBufferView",
+                                               "SetGraphicsRootConstantBufferView", "SetComputeRootShaderResourceView",
+                                               "SetGraphicsRootShaderResourceView", "SetComputeRootUnorderedAccessView",
+                                               "SetGraphicsRootUnorderedAccessView", "IASetIndexBuffer",
+                                               "IASetVertexBuffers", "SOSetTargets", "OMSetRenderTargets",
+                                               "ClearDepthStencilView", "ClearRenderTargetView", "DiscardResource",
+                                               "BeginQuery", "EndQuery", "ResolveQueryData", "SetPredication",
+                                               "ExecuteIndirect", "AtomicCopyBufferUINT", "AtomicCopyBufferUINT64",
+                                               "OMSetDepthBounds", "SetSamplePositions", "ResolveSubresourceRegion",
+                                               "SetViewInstanceMask", "WriteBufferImmediate", "SetProtectedResourceSession",
+                                               "BeginRenderPass", "EndRenderPass", "InitializeMetaCommand",
+                                               "ExecuteMetaCommand", "BuildRaytracingAccelerationStructure",
+                                               "EmitRaytracingAccelerationStructurePostbuildInfo",
+                                               "CopyRaytracingAccelerationStructure", "SetPipelineState1",
+                                               "DispatchRays", "RSSetShadingRate", "RSSetShadingRateImage"};
+        if (slot >= 8 && slot - 8 < std::size(list)) return list[slot - 8];
     } else {
         if (slot == 8) return "Reset";
     }
@@ -737,6 +776,7 @@ const char* child_trace_name(unsigned slot) {
         static char storage[ChildStats<K>::kSlots][64];
         const char* iface = K == ChildKind::queue   ? "XboxID3D12CommandQueue"
                             : K == ChildKind::fence ? "XboxID3D12Fence"
+                            : K == ChildKind::list  ? "XboxID3D12GraphicsCommandList"
                                                     : "XboxID3D12CommandAllocator";
         for (unsigned s = 0; s < ChildStats<K>::kSlots; ++s) {
             const char* method = child_public_name<K>(s);
@@ -812,6 +852,8 @@ bool is_child_iid(const IID& iid) {
         return IsEqualIID(iid, __uuidof(ID3D12CommandQueue));
     } else if constexpr (K == ChildKind::fence) {
         return IsEqualIID(iid, __uuidof(ID3D12Fence)) || IsEqualIID(iid, __uuidof(ID3D12Fence1));
+    } else if constexpr (K == ChildKind::list) {
+        return IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)) || IsEqualIID(iid, kXboxGraphicsCommandListIid);
     } else {
         return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator));
     }
@@ -852,6 +894,14 @@ HRESULT child_query_interface(ChildProxy* self, const IID* riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
+    // The Xbox command-list IID is a console extension our proxy models; the PC list does not answer it.
+    if constexpr (K == ChildKind::list) {
+        if (IsEqualIID(*riid, kXboxGraphicsCommandListIid)) {
+            *out = self;
+            child_add_ref<K>(self);
+            return S_OK;
+        }
+    }
     // Only what the proxy models, and of that only what the real object implements (ID3D12Fence1 is optional).
     if (!is_child_iid<K>(*riid)) {
         if (supports_iid(self->real, *riid)) log_refused_iid(child_kind_name<K>(), *riid);
@@ -893,6 +943,7 @@ IUnknown* proxy_real_object(const void* object) {
     if (vtable == reinterpret_cast<void*>(get_heap_vtable())) return static_cast<const HeapProxy*>(object)->real;
     if (vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::queue>()) ||
         vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::fence>()) ||
+        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::list>()) ||
         vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::allocator>()))
         return static_cast<const ChildProxy*>(object)->real;
     return nullptr;
@@ -971,6 +1022,7 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
         report_table_overrun<ChildKind::queue>(address);
         report_table_overrun<ChildKind::fence>(address);
         report_table_overrun<ChildKind::allocator>(address);
+        report_table_overrun<ChildKind::list>(address);
     }
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
@@ -993,6 +1045,39 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
                                              reinterpret_cast<void**>(a2)));
     } else {
+        // The retail list calls two slots past the PC chain (131 and 132) with packed console arguments. They are
+        // presentation/clear-adjacent setup; a no-op S_OK keeps the boot moving and never touches a caller pointer.
+        if constexpr (K == ChildKind::list && (Slot == 131 || Slot == 132)) {
+            note_child_slot<K>(Slot);
+            static std::atomic<bool> logged{false};
+            bool expected = false;
+            if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: command-list slot %u no-op S_OK (args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                             Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return hr_to_u64(S_OK);
+        }
+        // A list's Reset takes the allocator and the initial pipeline state. The console's sentinel and allocator
+        // shape differ from the PC Reset, and forwarding it faults in the PC list; accept the reset for the
+        // first-frame bring-up (the list is still usable; no command has been recorded yet).
+        if constexpr (K == ChildKind::list && Slot == 9) {
+            static std::atomic<bool> reset_logged{false};
+            bool expected = false;
+            if (reset_logged.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: list Reset accepted without forwarding (allocator=%p state=0x%llx)\n",
+                             reinterpret_cast<void*>(a1), static_cast<unsigned long long>(a2));
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return hr_to_u64(S_OK);
+        }
+        // ExecuteCommandLists takes an array of lists; unwrap any list proxy before the PC queue sees it.
+        if constexpr (K == ChildKind::queue && Slot == 10) {
+            UnwrappedArray array;
+            if (!array.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
+            if (array.data()) a2 = array.data();
+        }
         note_child_slot<K>(Slot);
         if constexpr (K == ChildKind::queue && Slot >= kQueuePublicSlots) {
             // Opt-in: only the slots named by the environment (or, under LEONIDA_CAPTURE, the public HLE's 30/32) are
@@ -1145,6 +1230,8 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
         proxy->slot_count = kQueuePublicSlots;
     } else if constexpr (K == ChildKind::fence) {
         proxy->slot_count = supports_iid(created, __uuidof(ID3D12Fence1)) ? kFence1PublicSlots : kFencePublicSlots;
+    } else if constexpr (K == ChildKind::list) {
+        proxy->slot_count = kListPublicSlots;
     } else {
         proxy->slot_count = kAllocatorPublicSlots;
     }
@@ -1195,6 +1282,36 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     note_slot(8);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
+    if (!desc) return E_INVALIDARG;
+    // The retail exe's slot-48 descriptor carries console values in the PC fields (observed type 2 with a
+    // non-PC priority/flags/node mask). Keep the type and translate the rest to the PC runtime's accepted range;
+    // the queue's behaviour is the same for the first frame. A valid PC description is passed through untouched
+    // (the tests rely on the pointer identity).
+    D3D12_COMMAND_QUEUE_DESC normalized = *desc;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: queue desc type=%d priority=%d flags=0x%x node=%u; translating console "
+                     "priority/flags/node to PC values\n",
+                     static_cast<int>(normalized.Type), static_cast<int>(normalized.Priority), normalized.Flags,
+                     normalized.NodeMask);
+    }
+    bool changed = false;
+    if (normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+        normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
+        normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+        normalized.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        changed = true;
+    }
+    if (normalized.Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) {
+        normalized.Flags &= D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+        changed = true;
+    }
+    if (normalized.NodeMask != 1) {
+        normalized.NodeMask = 1;
+        changed = true;
+    }
+    if (changed) desc = &normalized;
     // The caller's null output goes to the real device on purpose: its answer (S_FALSE, E_UNEXPECTED, ...) is the
     // one to give, although the SDK annotates the parameter as required.
 #pragma warning(suppress : 6387)
@@ -1203,6 +1320,29 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
+}
+
+// Device slot 41: CreateCommandSignature. The retail exe asks for the console signature IID
+// {c36a797c-ec80-4f0a-8985-a7b2475082d1}; the PC runtime does not know it. The signature object is a marker for
+// ExecuteIndirect, so create the PC object with the PC IID for the base-compatible pointer.
+HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                       ID3D12RootSignature* root, const IID* riid, void** out) {
+    note_slot(41);
+    if (out) *out = nullptr;
+    if (!riid) return E_POINTER;
+    if (!out) return E_POINTER;
+    const IID& create_iid =
+        IsEqualIID(*riid, kXboxCommandSignatureIid) ? __uuidof(ID3D12CommandSignature) : *riid;
+    const HRESULT hr = self->real->CreateCommandSignature(desc, root, create_iid, out);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot 41 CreateCommandSignature desc=%p root=%p console_iid=%d -> "
+                     "0x%08lx\n",
+                     reinterpret_cast<const void*>(desc), reinterpret_cast<void*>(root),
+                     IsEqualIID(*riid, kXboxCommandSignatureIid) ? 1 : 0, static_cast<unsigned long>(hr));
+    }
+    return hr;
 }
 
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
@@ -1271,7 +1411,16 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+    // The retail exe asks for the console command-list interface {c3827890-4024-474c-98cf-645b51dc4874}. The PC
+    // runtime does not know it; the base ID3D12GraphicsCommandList vtable is the same prefix, so create the PC list
+    // and wrap it in the list proxy, which answers the Xbox IID and forwards the PC slots. Other IIDs keep the
+    // caller's choice.
+    const IID& create_iid =
+        IsEqualIID(*riid, kXboxGraphicsCommandListIid) ? __uuidof(ID3D12GraphicsCommandList) : *riid;
+    void* created = nullptr;
+    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, create_iid, &created);
+    if (FAILED(hr)) return hr;
+    return wrap_child<ChildKind::list>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -1649,6 +1798,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
+        if constexpr (Slot == 41) {
+            return hr_to_u64(proxy_create_command_signature(
+                self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1),
+                reinterpret_cast<ID3D12RootSignature*>(a2), reinterpret_cast<const IID*>(a3),
+                reinterpret_cast<void**>(a4)));
+        }
         const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
         if (Slot == routes.frame_interval) {
             log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
