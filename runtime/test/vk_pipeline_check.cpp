@@ -1392,6 +1392,14 @@ int main(int argc, char** argv) {
             }
             std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
             const std::streamoff file_size = f.tellg();
+            if (!f || file_size < 5 * std::streamoff(sizeof(uint32_t)) ||
+                file_size % std::streamoff(sizeof(uint32_t))) {
+                std::lock_guard<std::mutex> g(mu);
+                modules_bad[stage]++;
+                std::printf("MODULE FAIL %s (missing, unreadable or invalid module size)\n", name.c_str());
+                ++done;
+                continue;
+            }
             if (max_bytes && std::cmp_greater(file_size, max_bytes)) {   // multi-MB ray-tracing shaders (#108)
                 {
                     std::lock_guard<std::mutex> g(mu);

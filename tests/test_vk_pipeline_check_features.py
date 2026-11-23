@@ -29,7 +29,7 @@ OpFunctionEnd
 
 
 class FeatureGateTest(unittest.TestCase):
-    def test_unsupported_entry_never_creates_a_module(self):
+    def setUp(self):
         configured = os.environ.get("LEONIDA_VK_PIPELINE_CHECK")
         build = ROOT / "runtime" / "build"
         candidates = [Path(configured)] if configured else [
@@ -40,6 +40,25 @@ class FeatureGateTest(unittest.TestCase):
         binary = next((path for path in candidates if path.is_file()), None)
         if binary is None:
             self.skipTest("set LEONIDA_VK_PIPELINE_CHECK to a built checker")
+        self.binary = binary
+
+    def test_missing_or_invalid_size_is_failed_before_feature_skip(self):
+        for payload in (None, b"", b"short", bytes(21)):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                if payload is not None:
+                    (root / "cs_absent.spv").write_bytes(payload)
+                with (root / "index.json").open("w", encoding="utf-8", newline="\n") as output:
+                    json.dump({"cs_absent": {"stage": "cs", "push_constant_bytes": 512}}, output)
+                result = subprocess.run(
+                    [str(self.binary), str(root), str(root / "cache.bin"), "--jobs", "1"],
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("MODULE FAIL cs_absent", result.stdout)
+                self.assertIn("cs: 0 modules ok, 1 failed", result.stdout)
+                self.assertNotIn("SKIPPED cs_absent", result.stdout)
+
+    def test_unsupported_entry_never_creates_a_module(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             code = assemble(ASM)
@@ -48,7 +67,7 @@ class FeatureGateTest(unittest.TestCase):
             with (root / "index.json").open("w", encoding="utf-8", newline="\n") as output:
                 json.dump({"supported": {"stage": "cs"},
                            "unsupported": {"stage": "cs", "float_controls": ["syntheticUnavailable"]}}, output)
-            result = subprocess.run([str(binary), str(root), str(root / "cache.bin")],
+            result = subprocess.run([str(self.binary), str(root), str(root / "cache.bin")],
                                     capture_output=True, text=True, timeout=60)
         if "no usable Vulkan" in result.stderr or "no Vulkan" in result.stderr:
             self.skipTest(result.stderr)
