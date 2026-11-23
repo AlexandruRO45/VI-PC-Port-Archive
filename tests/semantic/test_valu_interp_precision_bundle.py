@@ -102,6 +102,19 @@ class TestInterpP1F32Translator(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP2F32Reference(unittest.TestCase):
+    def test_p2_f32_reference_translation(self):
+        code = [
+            "v_interp_p1_f32 v2, v0, attr0.x",
+            "v_interp_p2_f32 v2, v1, attr0.x",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p2_f32_ref", code)
+        self.assertIn("OpCapability Shader", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
