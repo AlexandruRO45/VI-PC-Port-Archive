@@ -458,5 +458,24 @@ class VFrexpExpI32F64AstInterpreterTests(unittest.TestCase):
         res = oracle_frexp_exp_i32_f64(0x4020000000000000)
         self.assertEqual(res, 4)
 
+class VFrexpExpI32F64SimdDivergenceTests(unittest.TestCase):
+    def test_frexp_exp_f64_simd_exec_masking(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0x00FF00FF
+        for i in range(32):
+            wave.set_vgpr(i, 2, 0x77777777)
+            if (wave.exec_mask >> i) & 1:
+                val = d2u(math.pow(2.0, i))
+                wave.set_vgpr(i, 2, oracle_frexp_exp_i32_f64(val))
+        for i in range(32):
+            if (0x00FF00FF >> i) & 1:
+                self.assertEqual(wave.get_vgpr(i, 2), i + 1)
+            else:
+                self.assertEqual(wave.get_vgpr(i, 2), 0x77777777)
+
+    def test_frexp_exp_f64_subnormal_normalization(self):
+        # Smallest subnormal 0x0000000000000001 (2^-1074) -> exp = -1073 (0xFFFFFBCF in u32)
+        self.assertEqual(oracle_frexp_exp_i32_f64(1), 0xFFFFFBCF)
+
 if __name__ == "__main__":
     unittest.main()
