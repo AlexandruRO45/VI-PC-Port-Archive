@@ -536,3 +536,49 @@ class TestXorB32ASTAndScalar(unittest.TestCase):
             "v_xor_b32 v0, v0, v1",
         ])
         self.assertEqual(val_inplace, 0xFFFFFFFF)
+
+
+# ------------------------------------------------------------------------------
+# v_xor_b32 SIMD Divergence & Multi-Lane Properties
+# ------------------------------------------------------------------------------
+
+def step_xor_simd(wave: SIMDWaveLogic, insn: VXorB32Instruction):
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.vgprs[insn.src0.index][lane]
+            s1 = wave.vgprs[insn.src1.index][lane]
+            wave.vgprs[insn.dst.index][lane] = ref_xor_b32(s0, s1)
+
+
+class TestXorB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveLogic(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = 1 << i
+            wave.vgprs[2][i] = 1 << i
+            wave.vgprs[0][i] = 0xFFFFFFFF
+
+        insn = VXorB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        step_xor_simd(wave, insn)
+
+        val_hw, _ = run_shader("ps_xor_lane_match", [
+            "v_mov_b32 v1, 0x4000",
+            "v_mov_b32 v2, 0x4000",
+            "v_xor_b32 v0, v1, v2",
+        ])
+        self.assertEqual(wave.vgprs[0][14], val_hw)
+        self.assertEqual(val_hw, 0)
+
+    def test_algebraic_properties_hardware(self):
+        # Self-inverse property: (a ^ b) ^ b == a
+        val_roundtrip, _ = run_shader("ps_xor_self_inv", [
+            "v_mov_b32 v1, 0x13579BDF",
+            "v_mov_b32 v2, 0x2468ACE0",
+            "v_xor_b32 v0, v1, v2",
+            "v_xor_b32 v0, v0, v2",
+        ])
+        self.assertEqual(val_roundtrip, 0x13579BDF)
