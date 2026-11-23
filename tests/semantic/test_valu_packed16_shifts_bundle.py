@@ -62,6 +62,96 @@ def pack16(lo: int, hi: int) -> int:
 def unpack16(val: int) -> tuple[int, int]:
     return (val & MASK16, (val >> 16) & MASK16)
 
+class Opcode(Enum):
+    V_PK_ASHRREV_I16 = "v_pk_ashrrev_i16"
+    V_PK_LSHLREV_B16 = "v_pk_lshlrev_b16"
+    V_PK_LSHRREV_B16 = "v_pk_lshrrev_b16"
+    V_PK_MAD_I16 = "v_pk_mad_i16"
+    V_PK_MAD_U16 = "v_pk_mad_u16"
+    V_PK_SUB_U16 = "v_pk_sub_u16"
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    value: int = 0
+
+    @classmethod
+    def vgpr(cls, idx: int) -> ASTOperand:
+        return cls(kind=OperandKind.VGPR, index=idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> ASTOperand:
+        return cls(kind=OperandKind.SGPR, index=idx)
+
+    @classmethod
+    def imm(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.IMM, value=val & MASK32)
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: Optional[ASTOperand] = None
+
+    def disasm(self) -> str:
+        def fmt(op: ASTOperand) -> str:
+            if op.kind == OperandKind.VGPR:
+                return f"v{op.index}"
+            if op.kind == OperandKind.SGPR:
+                return f"s{op.index}"
+            return hex(op.value)
+
+        if self.src2 is not None:
+            return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}, {fmt(self.src2)}"
+        return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}"
+
+
+class ScalarMachineState:
+    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
+        self.vgprs: list[int] = [0] * num_vgprs
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.scc: int = 0
+        self.vcc: int = 0
+
+    def read_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.kind == OperandKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        return op.value & MASK32
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+
+GLOBAL_ORACLE_MAP: dict[Opcode, Callable[..., int]] = {}
+
+
+class ScalarInterpreter:
+    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> int:
+        s0 = state.read_operand(instr.src0)
+        s1 = state.read_operand(instr.src1)
+        if instr.src2 is not None:
+            s2 = state.read_operand(instr.src2)
+            res = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1, s2)
+        else:
+            res = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1)
+
+        if instr.dst.kind == OperandKind.VGPR:
+            state.write_vgpr(instr.dst.index, res)
+        return res
+
 def ref_v_pk_ashrrev_i16(s0: int, s1: int) -> int:
     """Arithmetic right shift reversed on packed 16-bit integers.
     s0: shift count (each half masked to 15).
@@ -98,6 +188,45 @@ class TestVPkAshrrevI16Oracle(unittest.TestCase):
         s1 = pack16(0x7FFF, 0x8000)
         # 0x7FFF >> 1 == 0x3FFF, -32768 >> 15 == -1 (0xFFFF)
         self.assertEqual(ref_v_pk_ashrrev_i16(s0, s1), pack16(0x3FFF, 0xFFFF))
+
+GLOBAL_ORACLE_MAP[Opcode.V_PK_ASHRREV_I16] = ref_v_pk_ashrrev_i16
+
+
+class TestVPkAshrrevI16ASTAndInterpreter(unittest.TestCase):
+    def test_ast_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.V_PK_ASHRREV_I16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+        )
+        self.assertEqual(inst.disasm(), "v_pk_ashrrev_i16 v0, v1, v2")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(1, pack16(2, 1))
+        state.write_vgpr(2, pack16(u16(-8), 100))
+        inst = ASTInstruction(
+            Opcode.V_PK_ASHRREV_I16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, pack16(u16(-2), 50))
+        self.assertEqual(state.vgprs[0], pack16(u16(-2), 50))
+
+    def test_imm_and_sgpr_operands(self) -> None:
+        state = ScalarMachineState()
+        state.sgprs[5] = pack16(1, 2)
+        inst = ASTInstruction(
+            Opcode.V_PK_ASHRREV_I16,
+            ASTOperand.vgpr(3),
+            ASTOperand.sgpr(5),
+            ASTOperand.imm(pack16(u16(-10), 40)),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, pack16(u16(-5), 10))
 
 if __name__ == "__main__":
     unittest.main()
