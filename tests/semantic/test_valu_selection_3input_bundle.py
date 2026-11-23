@@ -411,5 +411,27 @@ class VMin3I32TranslatorIntegrationTests(unittest.TestCase):
         self.assertEqual(unsigned_min, 10)
         self.assertNotEqual(signed_min, unsigned_min)
 
+def ref_max3_i32(a: int, b: int, c: int) -> int:
+    """RDNA2 v_max3_i32: signed 32-bit integer maximum of 3 values."""
+    return u32(max(i32(a), i32(b), i32(c)))
+
+
+class VMax3I32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_max3_i32."""
+
+    def test_basic_ordering(self):
+        self.assertEqual(ref_max3_i32(10, 50, 30), 50)
+        self.assertEqual(ref_max3_i32(50, 10, 30), 50)
+        self.assertEqual(ref_max3_i32(30, 50, 10), 50)
+
+    def test_signed_negative_values(self):
+        self.assertEqual(i32(ref_max3_i32(u32(-50), u32(-10), u32(-30))), -10)
+        self.assertEqual(i32(ref_max3_i32(u32(-100), 0, u32(-5))), 0)
+
+    def test_boundary_extrema(self):
+        int_min = 0x80000000
+        int_max = 0x7FFFFFFF
+        self.assertEqual(ref_max3_i32(int_min, 0, int_max), int_max)
+
 if __name__ == "__main__":
     unittest.main()
