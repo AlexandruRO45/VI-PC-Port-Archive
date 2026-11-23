@@ -165,7 +165,13 @@ int main(int argc, char** argv) {
         ici.enabledExtensionCount = 1;
         ici.ppEnabledExtensionNames = &debug_utils;
     }
-    CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    const VkResult instance_result = vkCreateInstance(&ici, nullptr, &inst);
+    if (instance_result == VK_ERROR_INCOMPATIBLE_DRIVER) {
+        // The loader is present but there is no ICD (a GPU-less runner, a server, a remote session): ctest skips.
+        std::printf("SKIP: no Vulkan driver (vkCreateInstance returned VK_ERROR_INCOMPATIBLE_DRIVER)\n");
+        return 77;
+    }
+    CHECK(instance_result);
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     if (validation) {
         LI(vkCreateDebugUtilsMessengerEXT);

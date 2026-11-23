@@ -778,7 +778,8 @@ if(BUILD_TESTING)
 
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
-    # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll). No game files.
+    # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll, or when the host's own
+    # GameInputCreate fails for the test itself). No game files.
     find_library(GAMEINPUT_LIBRARY NAMES gameinput HINTS ${_sdk_lib_hints})
     if(GAMEINPUT_LIBRARY)
       add_library(gameinput_host SHARED test/fixtures/gameinput_host.cpp)
@@ -801,7 +802,7 @@ if(BUILD_TESTING)
       target_compile_options(gameinput_host_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
       add_dependencies(gameinput_host_test gameinput_host)
       add_test(NAME gameinput_host COMMAND gameinput_host_test "$<TARGET_FILE:gameinput_host>")
-      set_tests_properties(gameinput_host PROPERTIES SKIP_RETURN_CODE 77)  # Windows cannot load GameInput.dll
+      set_tests_properties(gameinput_host PROPERTIES SKIP_RETURN_CODE 77)  # no working GameInput.dll on the host
     endif()
 
     # LEONIDA_UNIMPLEMENTED=log|fail|stop: builds its own image with two imports that bind to nothing, calls them in

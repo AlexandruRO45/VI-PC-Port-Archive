@@ -12,7 +12,9 @@ features. That path is tested without the game: `gameinput_host_test` (ctest `ga
 built against the SDK's `gameinput.lib` and checks that its `GameInput.dll` import binds to the host's copy, that
 `GameInputCreate` and `GetCurrentTimestamp` work from mapped code, and that `GetCurrentReading` answers; with a pad
 attached, `GetGamepadState` must succeed on the reading. It passes on Windows 11 build 26300 (GameInput 0.2309) without
-a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that binds to nothing fails it. The game executable is not available yet,
+a pad attached. The test skips only where Windows cannot load `GameInput.dll`, or where the host's own
+`GameInputCreate` fails when the test calls it directly, before anything is mapped (Windows Server 2025 in a remote
+session: `0xD0000034`); with a working DLL present, an import that binds to nothing fails it. The game executable is not available yet,
 so whether it imports GameInput this way, and under which
 module, is unverified (see [VERIFY](#verify)).
 

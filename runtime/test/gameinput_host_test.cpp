@@ -6,9 +6,11 @@
 //   - GameInputCreate succeeds from mapped code, and the library answers GetCurrentTimestamp;
 //   - GetCurrentReading says either "reading" or "no reading found": no crash, no other error. With a gamepad attached
 //     GetGamepadState must succeed on the reading; the test passes with or without one.
-// Skips (exit 77) only where Windows itself cannot load GameInput.dll (asked before mapping, with LoadLibraryExW).
-// When the DLL is there, an import that binds to nothing is a failure, not a skip. No game files.
+// Skips (exit 77) only where Windows itself cannot load GameInput.dll (asked before mapping, with LoadLibraryExW) or
+// where the host's own GameInputCreate fails for this test too (seen on Windows Server 2025 in a remote session).
+// When the DLL is there and works, an import that binds to nothing is a failure, not a skip. No game files.
 #include <windows.h>
+#include <unknwn.h>
 
 #include <cstdio>
 #include <filesystem>
@@ -49,6 +51,27 @@ int main(int argc, char** argv) {
         }
         std::printf("FAIL GameInput.dll is present but does not load (error %lu)\n", static_cast<unsigned long>(error));
         return 1;
+    }
+    // The same for a GameInput.dll that loads but cannot start. Seen on Windows Server 2025 (GameInput.dll
+    // 0.2309.26100, GameInputSvc running, a remote session without a GPU): GameInputCreate returns 0xD0000034 to
+    // this test and to mapped code alike. Asked here, by the test's own call into the host's copy and before
+    // anything is mapped, so a create that fails only from mapped code still fails the test.
+    {
+        using CreateFn = HRESULT(WINAPI*)(IUnknown**);
+        auto create = reinterpret_cast<CreateFn>(GetProcAddress(host_gameinput, "GameInputCreate"));
+        if (!create) create = reinterpret_cast<CreateFn>(GetProcAddress(host_gameinput, MAKEINTRESOURCEA(1)));
+        if (!create) {
+            std::printf("FAIL the host's GameInput.dll exports no GameInputCreate\n");
+            return 1;
+        }
+        IUnknown* host_input = nullptr;
+        const HRESULT host_hr = create(&host_input);
+        if (host_input) host_input->Release();
+        if (FAILED(host_hr)) {
+            std::printf("SKIP: the host's own GameInputCreate fails on this machine (hr=0x%08lX)\n",
+                        static_cast<unsigned long>(host_hr));
+            return 77;
+        }
     }
 
     try {

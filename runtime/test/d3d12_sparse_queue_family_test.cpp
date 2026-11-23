@@ -148,8 +148,12 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         ComPtr<ID3D12Device> device;
-        ok(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device)),
-           "Leonida create_vulkan_device_standalone");
+        const HRESULT created = rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device));
+        if (FAILED(created) || !device) {
+            // As the other layer tests do: a machine with no Vulkan driver has nothing to check here.
+            std::printf("SKIP: no Vulkan device (hr=0x%08lx)\n", static_cast<unsigned long>(created));
+            return 77;
+        }
         if (!rt::d3d12::device_sparse_buffer_tiles(device.Get())) {
             std::puts("SKIP Leonida sparse_buffer_tiles not supported");
             return 77;
