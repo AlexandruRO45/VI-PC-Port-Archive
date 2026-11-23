@@ -686,5 +686,46 @@ class SaluAndB64Ieee754BitwiseTests(unittest.TestCase):
         self.assertEqual(res_float, abs(neg_val))
 
 
+class SaluAndB64NegativeRejectionTests(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for s_and_b64."""
+
+    def test_syntax_rejection_in_interpreter(self):
+        state = ScalarMachineState()
+        with self.assertRaises(ValueError):
+            state.step("s_unknown_b64 s[0:1], s[2:3], s[4:5]")
+        with self.assertRaises(ValueError):
+            state.step("s_and_b64")
+        with self.assertRaises(ValueError):
+            state.step("s_and_b64 s[0:1], s[2:3]")
+        with self.assertRaises(ValueError):
+            state.resolve_src64("invalid_src")
+        with self.assertRaises(ValueError):
+            state.write_dst64("invalid_dst", 123)
+
+    def test_mutation_detection_bitwise_and_vs_other_ops(self):
+        """Ensure mutated logic (OR, XOR, ANDN2, NAND, NOR) fails assertions."""
+        a = 0xF0F0F0F0_0F0F0F0F
+        b = 0x33333333_CCCCCCCC
+        and_res = ref_s_and_b64(a, b)
+        self.assertNotEqual(and_res, (a | b) & MASK64)
+        self.assertNotEqual(and_res, (a ^ b) & MASK64)
+        self.assertNotEqual(and_res, (a & (~b)) & MASK64)
+        self.assertNotEqual(and_res, (~(a & b)) & MASK64)
+        self.assertNotEqual(and_res, (~(a | b)) & MASK64)
+
+    def test_mutation_detection_32bit_truncation(self):
+        """Mutated logic truncating to 32 bits fails detection."""
+        a = 0x12345678_00000000
+        b = 0x12345678_00000000
+        full_res = ref_s_and_b64(a, b)
+        truncated_res = (a & b) & MASK32
+        self.assertNotEqual(full_res, truncated_res)
+
+    def test_mutation_detection_scc_inversion(self):
+        """Inverted SCC condition code fails validation."""
+        self.assertNotEqual(ref_scc_b64(0), 1)
+        self.assertNotEqual(ref_scc_b64(1), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
