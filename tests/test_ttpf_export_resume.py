@@ -20,8 +20,8 @@ def write_pool(pool):
     write_rds5_pool(pool, records, [b"a" * 4096, b"b" * 4096])
 
 
-def export(pool, out):
-    return subprocess.run(["dotnet", os.environ["RPF9DUMP_DLL"], "ttpf", pool, out],
+def export(pool, out, *args):
+    return subprocess.run(["dotnet", os.environ["RPF9DUMP_DLL"], "ttpf", pool, out, *args],
                           capture_output=True, text=True)
 
 
@@ -31,6 +31,41 @@ def textures(folder):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class TtpfExportResumeTest(unittest.TestCase):
+    def test_parallel_export_and_partial_resume_match_serial_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool.ttpf"
+            count = 64
+            records = [pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 2, i * 4096) for i in range(count)]
+            # The first entry is unmapped. The remaining entries have distinct synthetic payloads.
+            write_rds5_pool(pool, records, [bytes([i]) * 4096 for i in range(1, count)])
+
+            def export_with_jobs(name, jobs):
+                result = export(pool, root / name, "--jobs", str(jobs))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return root / name / pool.stem
+
+            def snapshot(folder):
+                return {p.name: p.read_bytes() for p in folder.iterdir()}
+
+            serial = export_with_jobs("serial", 1)
+            expected = snapshot(serial)
+            self.assertEqual(len(expected), count)  # one manifest and count - 1 DDS files
+            self.assertIsNone(textures(serial)[0]["File"])
+            parallel = export_with_jobs("parallel", 8)
+            self.assertEqual(snapshot(parallel), expected)
+
+            files = sorted(parallel.glob("*.dds"))
+            for path in files[16::3]:
+                path.unlink()
+            prefix = files[:16]
+            for path in prefix:
+                os.utime(path, (1_000_000_000, 1_000_000_000))
+            old_times = [path.stat().st_mtime_ns for path in prefix]
+            export_with_jobs("parallel", 8)
+            self.assertEqual(snapshot(parallel), expected)
+            self.assertEqual([path.stat().st_mtime_ns for path in prefix], old_times)
+
     def test_manifest_preserves_volume_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

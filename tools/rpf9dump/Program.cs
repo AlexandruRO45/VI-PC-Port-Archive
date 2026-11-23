@@ -76,9 +76,10 @@ if (mode == "ttpf")
     var info = TtpfReader.Inspect(src);
     var rows = new object[info.Textures.Count];
     int done = 0;
-    Parallel.For(0, info.Textures.Count, par, i =>
+    bool ExportTexture(int i)
     {
         var t = info.Textures[i];
+        bool attemptedDecode = false;
         string name = $"{t.Index:D6}_{Util.Safe(Path.GetFileNameWithoutExtension(t.Name))}.dds";
         string path = Path.Combine(outDir, name);
         string? file = t.CanExtract ? name : null, limitation = t.Limitation;
@@ -86,6 +87,7 @@ if (mode == "ttpf")
         else if (File.Exists(path)) Interlocked.Increment(ref ok);
         else
         {
+            attemptedDecode = true;
             try
             {
                 // Content the decoder cannot handle is a skip like !CanExtract. Pool read errors, DDS write errors,
@@ -102,7 +104,17 @@ if (mode == "ttpf")
         }
         rows[i] = new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height,
             t.Depth, t.Dimension, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file };
-    });
+        return attemptedDecode;
+    }
+
+    // The upstream cache can parse on each concurrent cold miss. Process the first pending
+    // decode on this thread, then let workers reuse the cached index with separate read handles.
+    int next = 0;
+    while (next < info.Textures.Count)
+    {
+        if (ExportTexture(next++)) break;
+    }
+    Parallel.For(next, info.Textures.Count, par, i => { ExportTexture(i); });
     // The manifest is the build's completion marker. Keep successful DDS for retry, but withdraw a stale marker.
     string manifest = Path.Combine(outDir, "manifest.json");
     if (fail == 0)
