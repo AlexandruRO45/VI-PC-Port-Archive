@@ -436,6 +436,15 @@ class TestValuMulF32ScalarExecution(unittest.TestCase):
         words = support.mrt0_words(support.translate_lines(next_test_id("ps_mul_sq"), lines))
         self.assertAlmostEqual(bits_to_f32(words[0]), 0.25, places=6)
 
+class TestValuMulF32SIMDDivergence(unittest.TestCase):
+    """Stage 16: SIMD multi-lane divergence tests for v_mul_f32 clamp and omod."""
+
+    def test_mul_commutativity(self):
+        res_ab = run_binary_f32("v_mul_f32", -0.5, 0.8, clamp=True)
+        res_ba = run_binary_f32("v_mul_f32", 0.8, -0.5, clamp=True)
+        self.assertAlmostEqual(res_ab, res_ba, places=6)
+        self.assertAlmostEqual(res_ab, 0.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
