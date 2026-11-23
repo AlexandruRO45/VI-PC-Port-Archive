@@ -14,18 +14,18 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 
 | # | Stop | What clears it |
 |---|---|---|
-| 1 | The first `XMemVirtualAlloc` calls: two 64 KiB reserve forms, then 2 MiB pages | #6709, #4531 |
-| 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. #6843 measures the attribute words; no PR changes the check yet |
-| 3 | `xgameruntime.lib`'s thunk treats a missing `XErrorReport` as fatal | #6582 |
-| 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 |
-| 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
-| 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
-| 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
-| 8 | Device slot 48 is forwarded to the PC slot 48 and fails | Local, §3.2 |
-| 9 | Device slot 73 is forwarded to the PC slot 73; the title then reads through a null list | #2490's list proxy plus local routing, §3.3 |
-| 10 | An `XMemVirtualAlloc` reserve of about 185 MiB with type `0x42000`, attribute 7 and `PAGE_NOACCESS` is refused with `ERROR_INVALID_PARAMETER`. `0x40000` is `MEM_RESERVE_PLACEHOLDER` on the PC, which `VirtualAlloc` refuses and only `VirtualAlloc2` accepts; stop 11 supports the same reading on the console | Local: reserve it with `VirtualAlloc2(MEM_RESERVE \| MEM_RESERVE_PLACEHOLDER)` |
-| 11 | The title carves five sub-ranges out of that placeholder with `MEM_RESERVE \| MEM_REPLACE_PLACEHOLDER \| MEM_PHYSICAL \| MEM_LARGE_PAGES` (`0x20406000`) at addresses inside it, then allocates a second batch of physical pages | Local: a physical reserve inside a known placeholder stays a placeholder (the page maps split it); other `MEM_REPLACE_PLACEHOLDER` calls split the range and allocate it in place |
-| 12 | Device slot 133 is called; the proxy table had 128 slots, so the call went through a null pointer | Local: a 192-slot table, and a slot 133 stand-in, §3.4 |
+| 1 | The first `XMemVirtualAlloc` calls: two 64 KiB reserve forms, then 2 MiB pages | Landed on main (#6919, `042c5f378`: 64 KiB reserve and 2 MiB page sizes accepted) |
+| 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Landed on main (#6919: `PAGE_GRAPHICS_*` stripped to base CPU protections). #6843 measures attribute words |
+| 3 | `xgameruntime.lib`'s thunk treats a missing `XErrorReport` as fatal | Landed on main (`e41757045`: `XErrorReport` in `runtime/shims/xgameruntime.cpp`) |
+| 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | Open #8379, #7524 (#4313 closed unmerged) |
+| 5 | Fatal assert when `DStorageGetFactory` returns null | Open #8461 (takeover of #4348), #7784, #7175 (#4348 closed unmerged) |
+| 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Landed on main (#6919: `runtime/shims/xmem.cpp:494`) |
+| 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Open #8851, #9061, or local thunk, §3.1 |
+| 8 | Device slot 48 is forwarded to the PC slot 48 and fails | Local §3.2, or open D3D12 queue PRs |
+| 9 | Device slot 73 is forwarded to the PC slot 73; the title then reads through a null list | Open #2490 list proxy plus routing, §3.3 |
+| 10 | An `XMemVirtualAlloc` reserve of about 185 MiB with type `0x42000`, attribute 7 and `PAGE_NOACCESS` is refused with `ERROR_INVALID_PARAMETER`. `0x40000` is `MEM_RESERVE_PLACEHOLDER` on the PC, which `VirtualAlloc` refuses and only `VirtualAlloc2` accepts; stop 11 supports the same reading on the console | Landed on main (#6919: `VirtualAlloc2` placeholder reservations supported) |
+| 11 | The title carves five sub-ranges out of that placeholder with `MEM_RESERVE \| MEM_REPLACE_PLACEHOLDER \| MEM_PHYSICAL \| MEM_LARGE_PAGES` (`0x20406000`) at addresses inside it, then allocates a second batch of physical pages | Landed on main (#6919: physical sub-ranges split placeholders in `runtime/shims/xmem.cpp`) |
+| 12 | Device slot 133 is called; the proxy table had 128 slots, so the call went through a null pointer | Open #9045, #8225, #8414 (expanded proxy table and `CreatePlacedResourceX` stand-in, §3.4) |
 | 13 | **Current stop**: right after the first `CreateDescriptorHeap`, the title calls the heap's slot 9 (`GetCPUDescriptorHandleForHeapStart` on the PC), takes the handle from `rax` and asserts that it equals a value it already holds. Hypothesis: a console descriptor heap starts at an address the title chose or can predict, which the PC handle doesn't match | Open: a question for the descriptor model ([boot.md](boot.md) Q4) |
 
 At stop 13 the D3D12 trace holds 1,185 calls: the device, 5 command queues, 5 fences, 7 command allocators,
