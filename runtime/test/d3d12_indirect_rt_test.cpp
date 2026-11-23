@@ -290,6 +290,7 @@ int main() {
     DF(vkCreateComputePipelines);
     DF(vkDestroyPipeline);
     DF(vkCreateDescriptorSetLayout);
+    DF(vkGetAccelerationStructureDeviceAddressKHR);
     DF(vkDestroyDescriptorSetLayout);
     DF(vkCreateDescriptorPool);
     DF(vkDestroyDescriptorPool);
@@ -773,6 +774,27 @@ int main() {
         VkAccelerationStructureKHR tlas_ptr_vk =
             rt::d3d12::vulkan_acceleration_structure(dev, tlas_ptr_buf->GetGPUVirtualAddress());
         if (!tlas_vk || !tlas_ptr_vk) return fail("vulkan_acceleration_structure(TLAS)");
+
+        // The instance above holds the BLAS's GetGPUVirtualAddress(). Vulkan wants a value obtained from
+        // vkGetAccelerationStructureDeviceAddressKHR there (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281),
+        // so every AS resource's GPU VA must be what the driver reports for the structure behind it. GPU-assisted
+        // validation only accepts addresses it has seen that call return.
+        if (!vkGetAccelerationStructureDeviceAddressKHR) return fail("vkGetAccelerationStructureDeviceAddressKHR");
+        for (ID3D12Resource* as_buf : {blas_buf, tlas_buf, tlas_ptr_buf}) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = as_buf->GetGPUVirtualAddress();
+            VkAccelerationStructureDeviceAddressInfoKHR dai{
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+            dai.accelerationStructure = rt::d3d12::vulkan_acceleration_structure(dev, va);
+            if (!dai.accelerationStructure) return fail("vulkan_acceleration_structure(AS resource)");
+            const VkDeviceAddress driver_va = vkGetAccelerationStructureDeviceAddressKHR(vk_dev, &dai);
+            if (driver_va != va) {
+                std::fprintf(stderr,
+                             "FAIL: AS resource GPU VA 0x%llx, vkGetAccelerationStructureDeviceAddressKHR 0x%llx\n",
+                             static_cast<unsigned long long>(va), static_cast<unsigned long long>(driver_va));
+                return 1;
+            }
+        }
+        std::printf("  [PASS] AS resource GPU VAs are the driver's acceleration structure addresses\n");
 
 #if defined(LEONIDA_TEST_CS_RAYQUERY_SPV)
         std::vector<std::uint32_t> rq_words;

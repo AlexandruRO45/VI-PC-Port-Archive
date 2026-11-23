@@ -1784,8 +1784,8 @@ public:
             // No host pointer: this is DEFAULT-heap arena memory the GPU may write, so its mapped bytes can be
             // stale. host_at() must not treat it as a CPU-written instance pointer list.
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
-            // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
-            // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
+            // it sits. It is named by its device address (heap base + offset, as the driver reports it), as instance
+            // descriptors and BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
             if (device_.info.ray_tracing &&
                 initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
                 vk.vkCreateAccelerationStructureKHR) {
@@ -1796,7 +1796,27 @@ public:
                 asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
                 if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
                     gpu_va_ = device_.arena.address + va_;
+                    // An instance names its BLAS by a value obtained from vkGetAccelerationStructureDeviceAddressKHR
+                    // (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281), so ask for it, as the committed path
+                    // below does. For GENERIC the spec only promises that these addresses keep the offsets between
+                    // the structures of one buffer; drivers return buffer address + offset (vkd3d-proton checks the
+                    // same). If one ever does not, the driver's address is the one instances must hold.
+                    if (vk.vkGetAccelerationStructureDeviceAddressKHR) {
+                        VkAccelerationStructureDeviceAddressInfoKHR dai{
+                            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+                        dai.accelerationStructure = accel_;
+                        const std::uint64_t as_va =
+                            vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
+                        if (as_va && as_va != gpu_va_) {
+                            log_once("GENERIC acceleration structure address is not its buffer address + offset; "
+                                     "arena offset in KiB:", int(arena_offset_ / 1024));
+                            buffer_va_ = gpu_va_;
+                            gpu_va_ = as_va;
+                        }
+                    }
                     device_.context->register_acceleration_structure(gpu_va_, accel_);
+                    if (buffer_va_ && buffer_va_ != gpu_va_)
+                        device_.context->register_acceleration_structure(buffer_va_, accel_);
                 }
             }
             device_.context->add_resource(id(), binding);
