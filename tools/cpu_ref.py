@@ -794,6 +794,13 @@ def main(argv=None):
                 ap.exit(2, f"error: --{kind} expects {syntax}, got {item!r}\n")
             inputs.setdefault(kind, {})[index] = value
 
+    if not os.path.exists(args.listing):
+        print(f"error: {args.listing}: does not exist", file=sys.stderr)
+        return 2
+    if not os.path.isfile(args.listing):
+        print(f"error: {args.listing}: is not a file", file=sys.stderr)
+        return 2
+
     if args.parse_only:
         try:
             return _print_parse_report(args.listing)

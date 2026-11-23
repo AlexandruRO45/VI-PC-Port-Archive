@@ -39,6 +39,12 @@ class TileProbeInputTest(unittest.TestCase):
         self.assertIn("missing.bin", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_directory_input_exits_two(self):
+        p = self.run_tool(self.tmp.name)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is not a file", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
     def test_offset_outside_the_file_is_an_error(self):
         # Before: -5 quietly probed the last five bytes, the file size and more printed nothing, and both exited 0.
         for offset in ("-5", "16384", "99999"):

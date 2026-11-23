@@ -204,10 +204,10 @@ def main() -> int:
         counts["included_sets"] += len(doc.included_sets)
         counts["groups"] += len(doc.change_set_groups)
 
-    for path in args.inputs:
-        if not os.path.exists(path):
+    if not any(os.path.exists(path) for path in args.inputs):
+        for path in args.inputs:
             print(f"ERROR: {path} does not exist", file=sys.stderr)
-            return 2
+        return 2
 
     for path in args.inputs:
         try:

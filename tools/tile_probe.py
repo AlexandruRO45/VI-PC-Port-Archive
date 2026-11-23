@@ -166,11 +166,13 @@ def main():
     a = ap.parse_args()
     if a.out:
         check_preview_path(a.out, a.blob)
+    if not os.path.exists(a.blob):
+        ap.exit(2, f"{a.blob}: does not exist\n")
+    if not os.path.isfile(a.blob):
+        ap.exit(2, f"{a.blob}: is not a file\n")
     try:
         with open(a.blob, "rb") as f:
             data = f.read()
-    except FileNotFoundError as e:
-        ap.exit(2, f"{a.blob}: {e.strerror or e}\n")
     except OSError as e:
         raise SystemExit(f"{a.blob}: {e.strerror or e}")
     if not 0 <= a.offset < len(data):  # a negative offset used to probe the file's tail, one past the end nothing

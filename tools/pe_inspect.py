@@ -480,6 +480,9 @@ def main(argv: list[str] | None = None) -> int:
         if not os.path.exists(img):
             print(f"{img}: does not exist", file=sys.stderr)
             return 2
+        if not os.path.isfile(img):
+            print(f"{img}: is not a file", file=sys.stderr)
+            return 2
         search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
         key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
         if key in seen_paths:

@@ -465,6 +465,19 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual((row["size"], row["chunks"]), (65536, 1))
         self.assertEqual(row["grid"]["width"], 255)
 
+    def test_missing_and_file_inputs_exit_two(self):
+        missing = os.path.join(self.tmp.name, "missing")
+        not_dir = os.path.join(self.tmp.name, "not_a_dir.bin")
+        with open(not_dir, "wb") as f:
+            f.write(b"x")
+        for target, needle in ((missing, "does not exist"), (not_dir, "not a directory")):
+            with self.subTest(target=target):
+                p = subprocess.run([sys.executable, "-I", TOOL, target],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertIn(needle, p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

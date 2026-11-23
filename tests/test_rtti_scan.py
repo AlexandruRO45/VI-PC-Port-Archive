@@ -567,6 +567,18 @@ class RttiScanCoreTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("ERROR:", p.stderr)
 
+    def test_missing_and_directory_inputs_exit_two(self):
+        missing = os.path.join(self.tmp.name, "missing.exe")
+        for target, needle in (
+            (missing, "does not exist"),
+            (self.tmp.name, "is not a file"),
+        ):
+            with self.subTest(target=target):
+                p = self.run_tool(target)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertIn(needle, p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

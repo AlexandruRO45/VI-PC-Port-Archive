@@ -240,6 +240,9 @@ def main():
     if not os.path.exists(a.image):
         print(f"ERROR: {a.image} does not exist", file=sys.stderr)
         return 2
+    if not os.path.isfile(a.image):
+        print(f"ERROR: {a.image} is not a file", file=sys.stderr)
+        return 2
     try:
         with open(a.image, "rb") as f:
             data = f.read()

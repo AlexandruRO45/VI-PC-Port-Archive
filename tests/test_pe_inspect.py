@@ -798,6 +798,21 @@ class ShortHeaderTest(unittest.TestCase):
         data[0x40:0x44] = b"XX\0\0"
         self.check_rejected("bad_sig.bin", bytes(data), "no PE signature")
 
+    def test_missing_and_directory_inputs_exit_two(self):
+        missing = os.path.join(self.dir, "missing.exe")
+        out_dir = os.path.join(self.dir, "reports")
+        for target, needle in (
+            (missing, "does not exist"),
+            (self.dir, "is not a file"),
+        ):
+            with self.subTest(target=target):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = pe_inspect.main([target, "--out", out_dir])
+                self.assertEqual(rc, 2, err.getvalue())
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn(needle, err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

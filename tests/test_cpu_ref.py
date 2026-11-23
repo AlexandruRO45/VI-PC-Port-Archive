@@ -508,6 +508,21 @@ class CpuRefTest(unittest.TestCase):
                 self.assertIn(option, result.stderr)
                 self.assertIn("N=VALUE", result.stderr)
 
+    def test_missing_and_directory_inputs_exit_two(self):
+        missing = os.path.join(self.tmp.name, "missing.asm")
+        for target, needle, flags in (
+            (missing, "does not exist", []),
+            (missing, "does not exist", ["--parse-only"]),
+            (self.tmp.name, "is not a file", []),
+            (self.tmp.name, "is not a file", ["--parse-only"]),
+        ):
+            with self.subTest(target=target, flags=flags):
+                result = subprocess.run([sys.executable, "-I", cpu_ref.__file__, target, *flags],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(needle, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
