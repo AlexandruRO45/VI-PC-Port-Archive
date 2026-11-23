@@ -39,6 +39,16 @@ CAUGHT = [
     ("resource.dat", b"RSC8" + bytes(12), "RAGE resource"),
     ("page.dat", b"0DRP" + bytes(12), "RAGE page directory"),
     ("tree.dat", b"RBF0" + bytes(12), "RBF0 tree"),
+    # The package's resource containers, as tools/gamedata_*.py, sgd5_effects.py, ttpf_mips.py and
+    # restofworld_index.py read them.
+    ("metadata.bin", b"PSIN" + bytes(12), "PSIN metadata container"),
+    ("grid.dat", b"PAMH" + bytes(12), "PAMH heightmap"),
+    ("grid_be.dat", b"MHIU" + bytes(12), "MHIU heightmap"),
+    ("presets.dat", b"SPS1" + bytes(12), "SPS1 shader-preset table"),
+    ("effects.bin", b"SGD5" + bytes(12), "SGD5 effects database"),
+    ("texture.txt", b"RDS5" + bytes(252), "RDS5 texture container"),
+    ("bank.csv", b"AWC\0" + bytes(12), "AWC audio bank"),
+    ("script.dat", b"YSC\0" + bytes(60), "YSC compiled script"),
     ("shader.txt", b"XBCH" + (3).to_bytes(4, "little") + bytes(8), "XBCH shader container"),
     ("shader2.txt", b"FSSM" + bytes(12), "FSSM shader"),
     ("container.txt", b"DXBC" + bytes(12), "DXBC container"),
