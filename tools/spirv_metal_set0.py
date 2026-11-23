@@ -17,6 +17,7 @@ buffer then holds binding b's element i at ID `metal_id(b) + i` (`--print-layout
 Usage: spirv_metal_set0.py in.spv out.spv     |     spirv_metal_set0.py --print-layout
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 """
+import locale
 import os
 import re
 import subprocess
@@ -62,7 +63,8 @@ def _fresh_id(base, used):
 def rewrite(text, counts):
     """Rewrite the disassembly (spirv-dis --raw-id is not needed; names are kept) of one module."""
     ids = metal_ids(counts)
-    lines = text.splitlines()
+    # Literals can contain Unicode separators such as U+2028.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n").split("\n")
     sets, binds = {}, {}
     for ln in lines:
         m = re.match(r"\s*OpDecorate (%\S+) DescriptorSet (\d+)$", ln)
@@ -169,12 +171,11 @@ def main(argv):
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 2
     dis, asm = _tools()
-    # errors="replace": on Windows text=True decodes with the ANSI code page, and a program that answers in UTF-8
-    # (a path with non-ASCII letters in its error message) would otherwise kill the reader thread and lose stderr.
-    text = _run([dis, argv[1]], capture_output=True, text=True, errors="replace").stdout
+    # SPIR-V literal strings use UTF-8 on every host.
+    text = _run([dis, argv[1]], capture_output=True).stdout.decode("utf-8", errors="replace")
     env = re.search(r"; Version: (\d+)\.(\d+)", text)
     target = f"spv{env.group(1)}.{env.group(2)}" if env else "vulkan1.2"
-    _run([asm, "--target-env", target, "-", "-o", argv[2]], input=rewrite(text, counts), text=True)
+    _run([asm, "--target-env", target, "-", "-o", argv[2]], input=rewrite(text, counts).encode("utf-8"))
     return 0
 
 
@@ -199,7 +200,10 @@ def cli(argv):
         return main(argv)
     except subprocess.CalledProcessError as e:
         program = e.cmd[0] if isinstance(e.cmd, (list, tuple)) else e.cmd
-        said = next((line.strip() for line in (e.stderr or "").splitlines() if line.strip()), "")
+        stderr = e.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(locale.getpreferredencoding(False), errors="replace")
+        said = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
         print(f"ERROR: {program} failed with exit status {e.returncode}" + (f": {said}" if said else ""),
               file=sys.stderr)
     except OSError as e:

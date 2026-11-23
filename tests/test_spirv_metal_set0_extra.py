@@ -356,13 +356,13 @@ def _make_fake_spirv_tools(dis_name="spirv-dis", asm_name="spirv-as"):
                 if check:
                     raise subprocess.CalledProcessError(1, cmd, output="", stderr=str(exc)) from exc
                 return subprocess.CompletedProcess(cmd, 1, "", str(exc))
-            return subprocess.CompletedProcess(cmd, 0, disasm, "")
+            return subprocess.CompletedProcess(cmd, 0, disasm.encode("utf-8"), b"")
         if exe == asm_name:
             # Expect: [asm, "--target-env", target, "-", "-o", out_path]
             target_env = cmd[cmd.index("--target-env") + 1]
             out_path = cmd[cmd.index("-o") + 1]
             try:
-                out_bytes = _synthetic_disasm_to_spv(input, target_env)
+                out_bytes = _synthetic_disasm_to_spv(input.decode("utf-8"), target_env)
                 with open(out_path, "wb") as f:
                     f.write(out_bytes)
             except (OSError, ValueError) as exc:
@@ -780,7 +780,7 @@ class TestMainAndCli(unittest.TestCase):
             m.subprocess,
             "run",
             side_effect=[
-                subprocess.CompletedProcess([], 0, "OpCapability Shader\n", ""),
+                subprocess.CompletedProcess([], 0, b"OpCapability Shader\n", b""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ],
         ) as run_mock:
@@ -891,6 +891,28 @@ class TestMainAndCli(unittest.TestCase):
             with open(inplace_path, "rb") as f:
                 self.assertEqual(f.read(), out_bytes)
 
+    def test_utf8_operands_survive_the_rewrite_on_a_gbk_host(self):
+        run = subprocess.run
+        for literal in ("name \u96ea", "line\u2028separator"):
+            with self.subTest(literal=literal), tempfile.TemporaryDirectory() as directory:
+                assembly = f'; Version: 1.5\nOpName %entry "{literal}"\n'.encode("utf-8")
+                out = os.path.join(directory, "assembler-input")
+
+                def run_stand_in(cmd, **kwargs):
+                    if kwargs.get("text"):
+                        kwargs.setdefault("encoding", "cp936")
+                    if cmd[0] == "dis":
+                        program = f"import sys\nsys.stdout.buffer.write({assembly!r})"
+                        return run([sys.executable, "-I", "-c", program], **kwargs)
+                    program = "import sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+                    return run([sys.executable, "-I", "-c", program, cmd[-1]], **kwargs)
+
+                with mock.patch.object(m, "_tools", return_value=("dis", "as")), \
+                        mock.patch.object(m.subprocess, "run", side_effect=run_stand_in):
+                    self.assertEqual(m.main(["spirv_metal_set0.py", "in.spv", out]), 0)
+                with open(out, "rb") as file:
+                    self.assertEqual(file.read(), assembly)
+
     def test_target_env_extraction_and_env_var_overrides(self):
         cases = [
             ("; Version: 1.0\n", "spv1.0"),
@@ -906,7 +928,7 @@ class TestMainAndCli(unittest.TestCase):
                 def run_stub(cmd, check=False, capture_output=False, text=False, input=None, errors=None):
                     seen_cmds.append((list(cmd), check, capture_output, text, input))
                     if len(seen_cmds) == 1:
-                        return subprocess.CompletedProcess(cmd, 0, disasm, "")
+                        return subprocess.CompletedProcess(cmd, 0, disasm.encode("utf-8"), b"")
                     return subprocess.CompletedProcess(cmd, 0, "", "")
 
                 with mock.patch.dict(os.environ, {"SPIRV_DIS": "/opt/bin/dis", "SPIRV_AS": "/opt/bin/as"}), \
@@ -917,11 +939,11 @@ class TestMainAndCli(unittest.TestCase):
                 self.assertEqual(seen_cmds[0][0], ["/opt/bin/dis", "in.spv"])
                 self.assertTrue(seen_cmds[0][1])
                 self.assertTrue(seen_cmds[0][2])
-                self.assertTrue(seen_cmds[0][3])
+                self.assertFalse(seen_cmds[0][3])
                 self.assertEqual(seen_cmds[1][0], ["/opt/bin/as", "--target-env", expected_target, "-", "-o", "out.spv"])
                 self.assertTrue(seen_cmds[1][1])
-                self.assertTrue(seen_cmds[1][3])
-                self.assertEqual(seen_cmds[1][4], disasm)
+                self.assertFalse(seen_cmds[1][3])
+                self.assertEqual(seen_cmds[1][4], disasm.encode("utf-8"))
 
     def test_invalid_spirv_binary_words_and_missing_or_directory_paths(self):
         fake_run, calls = _make_fake_spirv_tools()
@@ -996,7 +1018,7 @@ class TestMainAndCli(unittest.TestCase):
             self.assertFalse(os.path.exists(out_path))
 
             # 3. spirv-as failure raises CalledProcessError.
-            dis_ok = subprocess.CompletedProcess(["spirv-dis", in_path], 0, "; Version: 1.5\nOpCapability Shader\n", "")
+            dis_ok = subprocess.CompletedProcess(["spirv-dis", in_path], 0, b"; Version: 1.5\nOpCapability Shader\n", b"")
             asm_fail = subprocess.CalledProcessError(1, ["spirv-as"], stderr="bad asm")
             with mock.patch.object(m.subprocess, "run", side_effect=[dis_ok, asm_fail]) as run_mock:
                 with self.assertRaises(subprocess.CalledProcessError):
