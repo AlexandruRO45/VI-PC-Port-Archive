@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -152,6 +153,25 @@ class Api(unittest.TestCase):
         os.environ[pc.SKIP_ENV] = "1"
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
+
+
+class HeadlessGui(unittest.TestCase):
+    def test_installed_tkinter_without_display_falls_back_to_cli(self):
+        class NoDisplayTk:
+            TclError = RuntimeError
+
+            @staticmethod
+            def Tk():
+                raise RuntimeError("no display name and no $DISPLAY environment variable")
+
+        # tkinter may import successfully on a machine with no display.
+        with (mock.patch.object(pc, "tk", NoDisplayTk),
+              mock.patch.object(sys, "argv", ["pc_checker.py"]),
+              mock.patch.object(pc, "run_cli") as cli,
+              mock.patch("builtins.print") as printed):
+            pc.main()
+        cli.assert_called_once()
+        printed.assert_called_once_with("No graphical display available; using text mode.\\n")
 
 
 if __name__ == "__main__":
