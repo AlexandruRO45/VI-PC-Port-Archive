@@ -15,6 +15,7 @@ import sys
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -954,6 +955,30 @@ class SectionBoundaryReadTest(unittest.TestCase):
                 image2[0x3FE:0x400] = straddle[:2]
                 image2[b_raw2:b_raw2 + width - 2] = straddle[2:]
                 self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(pe_inspect, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    pe_inspect.write_json_report(path, {"file": "x.exe"})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
+    def test_markdown_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = "# previous\n"
+            path = os.path.join(tmp, "keep.md")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(pe_inspect, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    pe_inspect.write_text_report(path, "# new\n")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

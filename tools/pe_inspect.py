@@ -22,9 +22,15 @@ import json
 import math
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 
@@ -474,6 +480,47 @@ def to_markdown(r: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def _publish_text(path: str, text: str, *, prefix: str) -> None:
+    """Publish a complete regular file via a temp sibling, or write a non-regular destination directly."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=prefix, suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
+def write_json_report(path: str, report: dict) -> None:
+    _publish_text(path, json.dumps(report, indent=1), prefix=".pe_inspect-")
+
+
+def write_text_report(path: str, text: str) -> None:
+    _publish_text(path, text, prefix=".pe_inspect-")
+
+
 def same_output_path(first: str, second: str) -> bool:
     """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
     if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
@@ -546,10 +593,8 @@ def main(argv: list[str] | None = None) -> int:
             rc = 1
             continue
         try:
-            with open(json_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(r, f, indent=1)
-            with open(md_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(to_markdown(r))
+            write_json_report(json_path, r)
+            write_text_report(md_path, to_markdown(r))
         except OSError as e:
             print(f"{img}: cannot write report ({e.strerror or e})", file=sys.stderr)
             rc = 1
