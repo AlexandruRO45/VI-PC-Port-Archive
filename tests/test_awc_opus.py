@@ -26,6 +26,7 @@ def load_awc_opus():
 
 
 awc = load_awc_opus()
+import audio_wav  # noqa: E402
 
 
 def read_wav(path):
@@ -320,6 +321,55 @@ class ExportBankTest(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(bank)
         return path, pcm16, floats
+
+    def test_directory_decode_skips_a_generated_ogg_after_a_bad_rerun(self):
+        bank, _, _ = self.make_bank()
+        awc.export_bank(bank, self.out)
+        directory = Path(self.out) / "synthetic"
+        generated = directory / "00000003.ogg"
+        original = generated.read_bytes()
+        unrelated = directory / "user-track.ogg"
+        unrelated.write_bytes(original)
+        self.assertEqual({Path(path).name for path, _ in audio_wav.collect(self.out)[0]},
+                         {generated.name, unrelated.name})
+
+        Path(bank).write_bytes(b"malformed bank")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(awc.main([bank, self.out, "--jobs", "1"]), 0)
+        self.assertIn("skip synthetic.awc", stdout.getvalue())
+
+        self.assertEqual({Path(path).name for path, _ in audio_wav.collect(self.out)[0]}, {unrelated.name})
+        self.assertEqual(generated.read_bytes(), original)
+        self.assertEqual(unrelated.read_bytes(), original)
+
+        self.make_bank()
+        subprocess.run([sys.executable, "-IB", awc.__file__, bank, self.out, "--jobs", "2"],
+                       check=True, capture_output=True)
+        self.assertEqual({Path(path).name for path, _ in audio_wav.collect(self.out)[0]},
+                         {generated.name, unrelated.name})
+
+    def test_partial_reexport_keeps_only_successful_oggs_current(self):
+        bank = Path(self.tmp.name) / "partial.awc"
+        fmt = format_block(960, 48000, 0x0B, 1)
+        block = struct.pack("<H", 1) + b"\x98" + bytes(2045)
+        bank.write_bytes(build_bank([(1, fmt, block), (2, fmt, block)]))
+        awc.export_bank(str(bank), self.out)
+        previous = Path(self.out) / "partial" / "00000002.ogg"
+        previous_bytes = previous.read_bytes()
+        write_ogg = awc.write_ogg_opus
+
+        def fail_second_output(path, *args, **kwargs):
+            if Path(path).name == previous.name:
+                raise PermissionError("synthetic Ogg write failure")
+            return write_ogg(path, *args, **kwargs)
+
+        with mock.patch.object(awc, "write_ogg_opus", side_effect=fail_second_output), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(awc.main([str(bank), self.out, "--jobs", "1"]), 1)
+
+        self.assertEqual({Path(path).name for path, _ in audio_wav.collect(self.out)[0]}, {"00000001.ogg"})
+        self.assertEqual(previous.read_bytes(), previous_bytes)
 
     def test_recursive_cli_preserves_bank_paths(self):
         src = Path(self.tmp.name) / "banks"

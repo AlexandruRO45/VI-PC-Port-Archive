@@ -37,6 +37,7 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from awc_ogg_inventory import INVENTORY_NAME, inventory_bytes, read_inventory  # noqa: E402
 from file_mode import new_file_mode, published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 from report_paths import path_key  # noqa: E402
@@ -345,18 +346,33 @@ def bank_output_dir(path, out_dir):
 
 
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
+    od = bank_output_dir(path, out_dir)
+    known, previous = read_inventory(od)
+    inventory_path = os.path.join(od, INVENTORY_NAME)
+    current = set()
+    if previous:
+        # Invalidate the previous run before reading the bank, which may now be unreadable or malformed.
+        write_file(inventory_path, inventory_bytes(known, current))
+    try:
+        return _export_bank_audio(path, od, pre_skip, current)
+    finally:
+        if current:
+            write_file(inventory_path, inventory_bytes(known | current, current))
+
+
+def _export_bank_audio(path: str, od: str, pre_skip: int, current: set[str]):
     with open(path, "rb") as f:
         d = f.read()
     streams, music = parse_awc(d)
-    od = bank_output_dir(path, out_dir)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     for mus, data in music:
         for cid, samples, rate, codec, pk, packet_channels in music_channels(d, mus, data):
             if pk:
                 n48 = samples * 48000 // rate if rate else 0
-                write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
-                               pre_skip=pre_skip)
+                name = f"{cid:08X}.ogg"
+                write_ogg_opus(os.path.join(od, name), pk, packet_channels, cid, n48, pre_skip=pre_skip)
+                current.add(name)
                 counts["music"] += 1
     for s, stem in zip(streams, export_stems([s["id"] for s in streams])):
         at, size = s["data"]
@@ -370,8 +386,9 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
                 frames = s["frames"]
                 if not frames or frames * s["channels"] != s["samples"]:
                     frames = s["samples"] // max(1, s["channels"])
-                write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
-                               pre_skip=pre_skip)
+                name = stem + ".ogg"
+                write_ogg_opus(os.path.join(od, name), pk, s["channels"], s["id"], frames, pre_skip=pre_skip)
+                current.add(name)
                 counts["opus"] += 1
                 continue
         if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:

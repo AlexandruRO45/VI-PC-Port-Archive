@@ -17,6 +17,7 @@ end. For chained streams, ffmpeg handles each link's timing. ffmpeg must be on P
 
 For PCM copies of the AWC banks' Opus streams, first repackage the banks with awc_opus.py, then run this tool on
 its output (make_game.py does both, the second only with --wav).
+Directory scans skip stale files recorded by awc_opus.py. An explicit input file can still be decoded.
 Usage: `python -I tools/audio_wav.py --help` lists the options.
 """
 import argparse
@@ -34,6 +35,9 @@ import tempfile
 import time
 from typing import BinaryIO
 import unicodedata
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from awc_ogg_inventory import INVENTORY_NAME, read_inventory  # noqa: E402
 
 EXTS = (".ogg", ".opus")
 
@@ -135,8 +139,12 @@ def collect(src: str):
     files, not_opus = [], 0
     for root, dirs, names in os.walk(src, onerror=scan_failed):
         dirs.sort()
+        stale = set()
+        if INVENTORY_NAME in names:
+            known, current = read_inventory(root)
+            stale = {os.path.normcase(name) for name in known - current}
         for name in sorted(names):
-            if not name.lower().endswith(EXTS):
+            if not name.lower().endswith(EXTS) or os.path.normcase(name) in stale:
                 continue
             path = os.path.join(root, name)
             rel = os.path.relpath(path, src)
