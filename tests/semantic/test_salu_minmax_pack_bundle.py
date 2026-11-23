@@ -387,5 +387,25 @@ class SMaxU32TranslatorTests(unittest.TestCase):
         self.assertEqual(words[0], 0xFFFFFFFF)
         self.assertEqual(words[1], 1)
 
+# -----------------------------------------------------------------------------
+# Opcode 5: s_pack_ll_b32_b16
+# -----------------------------------------------------------------------------
+def oracle_pack_ll_b32_b16(s0: int, s1: int) -> int:
+    """Reference mathematical oracle for s_pack_ll_b32_b16: D = {S1[15:0], S0[15:0]}."""
+    lo = s0 & 0xFFFF
+    hi = (s1 & 0xFFFF) << 16
+    return (hi | lo) & MASK32
+
+
+class SPackLlB32B16OracleTests(unittest.TestCase):
+    def test_pack_ll_basic(self):
+        # s0 = 0x12345678, s1 = 0xABCDEF01 -> {0xef01, 0x5678} = 0xEF015678
+        res = oracle_pack_ll_b32_b16(0x12345678, 0xABCDEF01)
+        self.assertEqual(res, 0xEF015678)
+
+    def test_pack_ll_zeros_and_ones(self):
+        self.assertEqual(oracle_pack_ll_b32_b16(0, 0), 0)
+        self.assertEqual(oracle_pack_ll_b32_b16(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
