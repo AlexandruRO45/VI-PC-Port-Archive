@@ -130,7 +130,16 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   ucrtbase's wide function with the host path, so the `FILE*` or descriptor belongs to the CRT the caller reads it
   with. A refused path fails with `EINVAL` and a missing one with `ENOENT` in that CRT's `errno`. Host paths go to
   ucrtbase unchanged. Not covered: the host's `msvcp140.dll` (every `std::fstream`), which `gta6rt` loads itself
-  and binds to the host CRT, and the CRT's other path calls (`remove`, `rename`, `_stat`, `_access`, `_mkdir`).
+  and binds to the host CRT.
+- The CRT's other path calls follow the same rules (RT-359): `remove`/`_wremove`, `_unlink`/`_wunlink`,
+  `rename`/`_wrename`, `_mkdir`/`_wmkdir`, `_rmdir`/`_wrmdir`, `_access`/`_waccess`, `_access_s`/`_waccess_s` and
+  `_stat32`, `_stat32i64`, `_stat64`, `_stat64i32` with their `_wstat` forms, under
+  `api-ms-win-crt-filesystem-l1-1-0.dll` (which exports all of them) and `ucrtbase.dll`. A console path that changes
+  a name goes to the shim of the Win32 call the CRT function wraps (`DeleteFileW`, `MoveFileExW` with
+  `MOVEFILE_COPY_ALLOWED`, `CreateDirectoryW`, `RemoveDirectoryW`), so deleting a package file leaves a marker and a
+  move from `GAME:` to a host path fails with `EXDEV`. `_stat*` and `_access*` look at the copy a read would open,
+  through ucrtbase's wide function. Errors land in the caller's CRT `errno` as that CRT maps them. Host paths go to
+  ucrtbase unchanged.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
