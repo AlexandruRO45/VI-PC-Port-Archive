@@ -249,16 +249,21 @@ def run_all(args, events):
     known = list(xcl.order)
 
     # 2. gta6rt, restarted with a hung check skipped, up to --max-restarts times.
-    def leonida_cmd(attempt):
-        if (work / "leonida").exists():
-            shutil.rmtree(work / "leonida")
-        game = work / "leonida" / "game"
-        prepare_game(xcl_dir, bins, game)
-        trace = work / "leonida" / ("trace_%d.jsonl" % attempt)
-        return [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
-                "--overlay", str(work / "leonida" / "overlay"), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
+    leonida = work / "leonida"
+    if leonida.exists():
+        shutil.rmtree(leonida)
+    scratch = leonida / "run"  # discard title state between attempts, not the startup traces beside it
 
-    run_with_restarts(leonida_cmd, dict(os.environ), str(work / "leonida"), leo, known, args.timeout, cdb, events,
+    def leonida_cmd(attempt):
+        if scratch.exists():
+            shutil.rmtree(scratch)
+        game = scratch / "game"
+        prepare_game(xcl_dir, bins, game)
+        trace = leonida / ("trace_%d.jsonl" % attempt)
+        return [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
+                "--overlay", str(scratch / "overlay"), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
+
+    run_with_restarts(leonida_cmd, dict(os.environ), str(scratch), leo, known, args.timeout, cdb, events,
                       list(args.skip), args.max_restarts, transcripts["leonida"])
     for name in known:
         if name not in leo.checks:

@@ -9,6 +9,9 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import xcl_compare as xc  # noqa: E402
@@ -140,6 +143,35 @@ class Restart(unittest.TestCase):
             skip = xc.run_with_restarts(cmd_for, env, tmp, run, ["a", "b", "c"], 2, None, Sink(), [], 3,
                                         os.path.join(tmp, "out.txt"))
         return run, skip, attempts
+
+    def test_restarts_preserve_traces_but_not_title_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests/data/testgame").mkdir(parents=True)
+            release = root / "target/release"
+            release.mkdir(parents=True)
+            for name in ("xcl.exe", "xcl_testtitle.exe", "testgame_mw.dll"):
+                (release / name).touch()
+            work = root / "work"
+            (work / "leonida").mkdir(parents=True)
+            (work / "leonida/trace_8.jsonl").touch()  # left by an earlier comparison
+            args = SimpleNamespace(xcl=root, gta6rt=release / "xcl.exe", work=work, cdb=None, timeout=1,
+                                   skip=[], max_restarts=1, out=None)
+
+            def title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript):
+                if run.label == "XCL":
+                    return None
+                scratch_file = Path(cwd) / "previous-attempt"
+                self.assertFalse(scratch_file.exists())
+                scratch_file.touch()
+                trace = Path(cmd[cmd.index("--trace") + 1])
+                trace.write_bytes(b"second" if skip else b"first")
+                return None if skip else "hung check"
+
+            with mock.patch.object(xc, "run_title", side_effect=title):
+                xc.run_all(args, Sink())
+            self.assertEqual({p.name: p.read_bytes() for p in (work / "leonida").glob("trace_*.jsonl")},
+                             {"trace_0.jsonl": b"first", "trace_1.jsonl": b"second"})
 
     def test_hang_then_restart_with_the_check_skipped(self):
         run, skip, attempts = self.run_fake(honour=True)

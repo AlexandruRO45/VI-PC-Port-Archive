@@ -37,6 +37,8 @@ to the game folder, so a real `D:\` path is not reachable inside XCL and the tit
 `report.json` in the work folder (`--out` to change it). Everything each title printed is in `xcl_output.txt` and
 `leonida_output.txt` beside it. A check counts as a difference when its status or its reason differs between the
 two runs, so a check that fails in both for different reasons is still listed.
+Leonida's startup traces are `leonida/trace_0.jsonl`, `leonida/trace_1.jsonl`, and so on under the work folder.
+A restart resets the title's working files but keeps its earlier traces; starting a new comparison clears them.
 
 A check that prints nothing for `--timeout` seconds (15 by default) is a hang. The tool records the stacks of the
 title's threads with `cdb.exe` from the Windows SDK debugging tools (when installed), stops the title, and starts it
