@@ -236,6 +236,7 @@ class Module:
         self.entry_points = []
         self.decorations = defaultdict(dict)
         self.member_decorations = defaultdict(dict)
+        self.decorated_members = defaultdict(set)
         self.groups = set()
         self.group_uses = []
         self.definition_ids = set()
@@ -278,6 +279,8 @@ class Module:
             self.require_operands(operands, at, 3, 4)
             pointer, identifier, storage = operands[:3]
             self.require_id(pointer)
+            if len(operands) == 4:
+                self.require_id(operands[3])
             self.define(identifier)
             self.variables[identifier] = (pointer, storage)
         elif opcode == OP_ENTRY_POINT:
@@ -308,6 +311,8 @@ class Module:
             target = (self.decorations[identifier] if split == 1
                       else self.member_decorations[(identifier, operands[1])])
             self.add_decoration(target, decoration, extra[0] if extra else True)
+            if split == 2:
+                self.decorated_members[identifier].add(operands[1])
         elif opcode == OP_DECORATION_GROUP:
             self.require_operands(operands, at, 1, 1)
             self.define(operands[0])
@@ -342,6 +347,8 @@ class Module:
                           else self.member_decorations[(identifier, member)])
                 for decoration, value in source.items():
                     self.add_decoration(target, decoration, value)
+                if member is not None and source:
+                    self.decorated_members[identifier].add(member)
 
     def type_declaration(self, identifier):
         try:
@@ -439,6 +446,7 @@ class Module:
             opcode, args = self.type_declaration(pointee)
             if opcode != OP_TYPE_ARRAY:
                 raise InterfaceError(f"{stage} requires an outer per-vertex or per-primitive array")
+            self.array_count(args[1])
             pointee = args[0]
         return pointee, indexed
 
@@ -454,16 +462,27 @@ class Module:
         return Address(location, component, index)
 
     @staticmethod
-    def check_modes(decorations):
+    def check_modes(decorations, stage=None, storage=None, *, per_vertex=False):
         if DEC_PASSTHROUGH_NV in decorations:
             raise InterfaceError("geometry passthrough interfaces require different matching rules")
         if DEC_PATCH in decorations:
             raise InterfaceError("tessellation patch interfaces are unsupported")
+        if stage is not None:
+            if DEC_PER_PRIMITIVE in decorations:
+                if (stage, storage) not in (("ms", STORAGE_OUTPUT), ("ps", STORAGE_INPUT)):
+                    raise InterfaceError("PerPrimitiveEXT is only supported on mesh outputs and fragment inputs")
+                if per_vertex:
+                    raise InterfaceError("PerVertexKHR and PerPrimitiveEXT cannot both decorate a varying")
+            if DEC_INDEX in decorations and (stage, storage) != ("ps", STORAGE_OUTPUT):
+                raise InterfaceError("Index is only supported on fragment outputs")
 
     def declaration(self, symbol, pointer, storage, stage):
         decorations = self.decorations.get(symbol, {})
-        self.check_modes(decorations)
+        per_vertex = DEC_PER_VERTEX in decorations
+        self.check_modes(decorations, stage, storage, per_vertex=per_vertex)
         if DEC_BUILTIN in decorations:
+            if any(dec in decorations for dec in (DEC_LOCATION, DEC_COMPONENT, DEC_INDEX)):
+                raise InterfaceError("BuiltIn cannot be combined with Location, Component, or Index")
             return None
         type_id, indexed = self.varying_type(pointer, storage, stage, decorations)
         opcode, args = self.type_declaration(type_id)
@@ -472,8 +491,15 @@ class Module:
             varying = Varying(self.address(decorations), self.shape(type_id), per_primitive)
             return Declaration((varying,), symbol, indexed_by_vertex_or_primitive=indexed)
 
+        for member_index in sorted(self.decorated_members.get(type_id, ())):
+            if member_index >= len(args):
+                raise InterfaceError(f"member index {member_index} is out of range for structure %{type_id}")
         member_decs = [self.member_decorations.get((type_id, i), {}) for i in range(len(args))]
         if member_decs and all(DEC_BUILTIN in member for member in member_decs):
+            if (any(dec in decorations for dec in (DEC_LOCATION, DEC_COMPONENT, DEC_INDEX))
+                    or any(dec in member for member in member_decs
+                           for dec in (DEC_LOCATION, DEC_COMPONENT, DEC_INDEX))):
+                raise InterfaceError("BuiltIn cannot be combined with Location, Component, or Index")
             return None
         if any(DEC_BUILTIN in member for member in member_decs):
             raise InterfaceError("mixed built-in and user-defined structure members")
@@ -490,7 +516,9 @@ class Module:
         members = []
         next_location = base_location
         for child, member in zip(args, member_decs):
-            self.check_modes(member)
+            self.check_modes(member, stage, storage, per_vertex=per_vertex)
+            if not is_block and (DEC_COMPONENT in member or DEC_INDEX in member):
+                raise InterfaceError("Component or Index on a non-block structure member is unsupported")
             address = self.address(member, next_location)
             shape = self.shape(child, (type_id,))
             members.append(Varying(address, shape, per_primitive or DEC_PER_PRIMITIVE in member))
