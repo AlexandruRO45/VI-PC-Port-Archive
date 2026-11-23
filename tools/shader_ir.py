@@ -111,7 +111,8 @@ def operand(tok):
         m = _REG_RANGE.fullmatch(core)
         if m:
             lo, hi = int(m.group(2)), int(m.group(3))
-            return {"k": m.group(1) + "gpr", "r": lo, "n": hi - lo + 1, "neg": neg, "abs": absm}
+            if lo <= hi:
+                return {"k": m.group(1) + "gpr", "r": lo, "n": hi - lo + 1, "neg": neg, "abs": absm}
         m = _VLIST.fullmatch(core)
         if m:  # NSA image address: non-contiguous VGPR list
             return {"k": "vlist", "r": [int(x.strip()[1:]) for x in m.group(1).split(",")]}
@@ -200,7 +201,10 @@ def parse_line(line):
     if comment and "encoding" in comment:
         m = ENC.search(line)
         if m:
-            enc = bytes(int(x, 16) for x in m.group(1).split(",") if x.strip())
+            try:
+                enc = bytes(int(x, 16) for x in m.group(1).split(",") if x.strip())
+            except ValueError:
+                enc = None
     code = code.strip()
     if not code:
         return None

@@ -396,6 +396,20 @@ class CliInputTest(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertTrue(p.stdout.startswith("1 shaders,"), p.stdout)  # --limit 1 of the two files
 
+    def test_malformed_encoding_comment_does_not_crash_parse_line(self):
+        for bad in ("[0xzz]", "[0x1ff]", "[-1]", "[0x00, junk]"):
+            with self.subTest(bad=bad):
+                ins = shader_ir.parse_line(f"\ts_nop 0 ; encoding: {bad}")
+                self.assertIsNotNone(ins)
+                self.assertEqual(ins["op"], "s_nop")
+                self.assertIsNone(ins["enc"])
+
+    def test_reversed_register_range_falls_back_to_raw(self):
+        for tok in ("v[5:2]", "s[7:4]", "-v[3:1]", "|s[9:8]|"):
+            with self.subTest(tok=tok):
+                self.assertEqual(shader_ir.operand(tok), {"k": "raw", "t": tok})
+        self.assertEqual(shader_ir.operand("v[2:2]"), {"k": "vgpr", "r": 2, "n": 1, "neg": False, "abs": False})
+
 
 if __name__ == "__main__":
     unittest.main()
