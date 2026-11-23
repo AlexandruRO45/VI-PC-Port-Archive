@@ -241,7 +241,7 @@ class GamedataBlobsTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, self.carve, *extra, "--json", bad_out],
                                cwd=self.root, capture_output=True, text=True, encoding="utf-8", errors="replace")
             self.assertEqual(r.returncode, 1)
-            self.assertIn("error:", r.stderr)
+            self.assertIn("ERROR:", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
 
@@ -253,11 +253,13 @@ class BadCarveIndexTest(unittest.TestCase):
                               cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     def assert_one_error(self, result, *needles):
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        # BUILD-1046: a missing input is a usage error (exit 2); a present-but-bad input is a failed run (exit 1).
+        # Both answer one ERROR: line naming what is wrong.
+        self.assertIn(result.returncode, (1, 2), result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         lines = result.stderr.strip().splitlines()
         self.assertEqual(len(lines), 1, result.stderr)
-        self.assertTrue(lines[0].startswith("error:"), lines[0])
+        self.assertTrue(lines[0].startswith("ERROR:"), lines[0])
         for needle in needles:
             self.assertIn(needle, lines[0])
 

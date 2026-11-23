@@ -207,7 +207,7 @@ class Cli(unittest.TestCase):
                 rc, stdout, stderr = self.run_main(["mesh_compute_vs.py", missing])
             build.assert_not_called()
             self.assertEqual(os.listdir(tmp), [])
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 2)  # BUILD-1046: a missing input is a usage error
         self.assertEqual(stdout, "")
         self.assertEqual(len(stderr.splitlines()), 1)
         self.assertIn("not a directory", stderr)
