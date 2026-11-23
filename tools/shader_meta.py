@@ -57,11 +57,20 @@ KIND_PRIORITY = {
 }
 
 
+_BASE_OP_CACHE = {}
+
+
 def base_op(op):
+    res = _BASE_OP_CACHE.get(op)
+    if res is not None:
+        return res
+    res = op
     for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
         if op.endswith(suffix):
-            return op[:-len(suffix)]
-    return op
+            res = op[:-len(suffix)]
+            break
+    _BASE_OP_CACHE[op] = res
+    return res
 
 
 def _imm_u32(a):
@@ -144,9 +153,10 @@ def _const_of(sym, a):
     return None
 
 
-def _split_operands(ins):
+def _split_operands(ins, op=None):
     """Return (read_sgprs, write_sgprs) for one parsed instruction."""
-    op = base_op(ins["op"])
+    if op is None:
+        op = base_op(ins["op"])
     a = ins["args"]
     if not a:
         return [], []
@@ -226,12 +236,13 @@ def _valid_stride(n):
     return isinstance(n, int) and 4 <= n <= 4096 and n % 4 == 0
 
 
-def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
+def _step_state(sym, scale, ptr_stride, vscale, ins, events=None, op=None, writes=None):
     """Advance symbolic SGPR origin/constants and descriptor-stride state by one instruction."""
-    op = base_op(ins["op"])
     a = ins["args"]
     if not a:
         return
+    if op is None:
+        op = base_op(ins["op"])
 
     # Record pointer, descriptor, stride and literal-sampler observations BEFORE writes clobber operands.
     if events is not None:
@@ -318,7 +329,8 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 vscale.pop(r, None)
 
     # Update SGPR symbolic state for writes.
-    _, writes = _split_operands(ins)
+    if writes is None:
+        _, writes = _split_operands(ins, op)
     if not writes:
         return
 
@@ -509,7 +521,20 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     entry_scale[0] = {}
     entry_pstride[0] = {}
     entry_vscale[0] = {}
-    work = [0]
+    decoded = [None] * nblk
+
+    def block_ops(b):
+        ops = decoded[b]
+        if ops is None:
+            ops = []
+            for ins in blocks[b]:
+                op = base_op(ins["op"])
+                if op == "s_endpgm":
+                    break
+                reads, writes = _split_operands(ins, op)
+                ops.append((ins, op, reads, writes))
+            decoded[b] = ops
+        return ops
 
     def merge_sets(dst, src):
         out = dict(dst)
@@ -517,41 +542,41 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
             out[k] = out[k] | v if k in out else v
         return out
 
-    while work:
-        b = work.pop()
-        written = set(entry_written[b])
-        sym = dict(entry_sym[b])
-        scale = dict(entry_scale[b])
-        pstride = dict(entry_pstride[b])
-        vscale = dict(entry_vscale[b])
-        for ins in blocks[b]:
-            if base_op(ins["op"]) == "s_endpgm":
-                break
-            _, writes = _split_operands(ins)
-            _step_state(sym, scale, pstride, vscale, ins, events=None)
-            written.update(writes)
-        out_w = frozenset(written)
-        for s in succ[b]:
-            if entry_written[s] is None:
-                mw = out_w
-                ms = dict(sym)
-                msc = dict(scale)
-                mps = dict(pstride)
-                mvs = dict(vscale)
-            else:
-                mw = entry_written[s] & out_w
-                ms = {k: v for k, v in entry_sym[s].items() if sym.get(k) == v}
-                msc = merge_sets(entry_scale[s], scale)
-                mps = merge_sets(entry_pstride[s], pstride)
-                mvs = merge_sets(entry_vscale[s], vscale)
-            if (mw != entry_written[s] or ms != entry_sym[s] or msc != entry_scale[s] or
-                    mps != entry_pstride[s] or mvs != entry_vscale[s]):
-                entry_written[s] = mw
-                entry_sym[s] = ms
-                entry_scale[s] = msc
-                entry_pstride[s] = mps
-                entry_vscale[s] = mvs
-                work.append(s)
+    if nblk > 1 or succ[0]:
+        work = [0]
+        while work:
+            b = work.pop()
+            written = set(entry_written[b])
+            sym = dict(entry_sym[b])
+            scale = dict(entry_scale[b])
+            pstride = dict(entry_pstride[b])
+            vscale = dict(entry_vscale[b])
+            for ins, op, _, writes in block_ops(b):
+                _step_state(sym, scale, pstride, vscale, ins, events=None, op=op, writes=writes)
+                if writes:
+                    written.update(writes)
+            out_w = frozenset(written)
+            for s in succ[b]:
+                if entry_written[s] is None:
+                    mw = out_w
+                    ms = dict(sym)
+                    msc = dict(scale)
+                    mps = dict(pstride)
+                    mvs = dict(vscale)
+                else:
+                    mw = entry_written[s] & out_w
+                    ms = {k: v for k, v in entry_sym[s].items() if sym.get(k) == v}
+                    msc = merge_sets(entry_scale[s], scale)
+                    mps = merge_sets(entry_pstride[s], pstride)
+                    mvs = merge_sets(entry_vscale[s], vscale)
+                if (mw != entry_written[s] or ms != entry_sym[s] or msc != entry_scale[s] or
+                        mps != entry_pstride[s] or mvs != entry_vscale[s]):
+                    entry_written[s] = mw
+                    entry_sym[s] = ms
+                    entry_scale[s] = msc
+                    entry_pstride[s] = mps
+                    entry_vscale[s] = mvs
+                    work.append(s)
 
     # Final pass over all reachable blocks to collect read-before-write user SGPRs and events.
     rbw = set()
@@ -575,15 +600,13 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
         scale = dict(entry_scale[b])
         pstride = dict(entry_pstride[b])
         vscale = dict(entry_vscale[b])
-        for ins in blocks[b]:
-            if base_op(ins["op"]) == "s_endpgm":
-                break
-            reads, writes = _split_operands(ins)
+        for ins, op, reads, writes in block_ops(b):
             for r in reads:
                 if r in user_range and r not in written:
                     rbw.add(r)
-            _step_state(sym, scale, pstride, vscale, ins, events=events)
-            written.update(writes)
+            _step_state(sym, scale, pstride, vscale, ins, events=events, op=op, writes=writes)
+            if writes:
+                written.update(writes)
 
     # Assign the strongest observed kind to each read-before-write user SGPR.
     kinds = {r: "const32" for r in rbw}

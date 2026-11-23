@@ -376,6 +376,48 @@ class ShaderMetaIntegrationTests(unittest.TestCase):
         self.assertEqual(M._imm_u32(shader_ir.operand("-|0|")), 0x80000000)
         self.assertEqual(M._imm_u32(shader_ir.operand("neg(1)")), 0x80000001)
 
+    def test_analyse_instructions_splits_each_reachable_instruction_once(self):
+        import shader_ir
+        from unittest.mock import patch
+
+        straight = [[shader_ir.parse_line(ln) for ln in (
+            "s_load_dwordx4 s[8:11], s[0:1], 0x0",
+            "s_add_u32 s12, s2, 4",
+            "s_endpgm",
+        )]]
+        split_calls = 0
+        step_calls = 0
+        real_split = M._split_operands
+        real_step = M._step_state
+
+        def count_split(*args, **kwargs):
+            nonlocal split_calls
+            split_calls += 1
+            return real_split(*args, **kwargs)
+
+        def count_step(*args, **kwargs):
+            nonlocal step_calls
+            step_calls += 1
+            return real_step(*args, **kwargs)
+
+        with patch.object(M, "_split_operands", count_split), patch.object(M, "_step_state", count_step):
+            res_straight = M.analyse_instructions(straight, [[]])
+        self.assertEqual(split_calls, 2)
+        self.assertEqual(step_calls, 2)
+        self.assertTrue(res_straight["table_loads"])
+
+        # Branching/looping CFG: each reachable instruction is still split once across fixpoint + reporting.
+        loop_blocks = [
+            [shader_ir.parse_line("s_mov_b32 s10, s0")],
+            [shader_ir.parse_line("s_add_u32 s10, s10, s1"), shader_ir.parse_line("s_cbranch_scc1 -1")],
+            [shader_ir.parse_line("s_endpgm")],
+        ]
+        split_calls = 0
+        with patch.object(M, "_split_operands", count_split):
+            res_loop = M.analyse_instructions(loop_blocks, [[1], [1, 2], []])
+        self.assertEqual(split_calls, 3)
+        self.assertEqual([r["sgpr"] for r in res_loop["user_sgpr_reads"]], [0, 1])
+
 
 class OperandClassificationTests(unittest.TestCase):
     @staticmethod
