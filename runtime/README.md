@@ -137,10 +137,11 @@ once and a further one is rejected with an error instead of sharing a slot. Imag
 directory (or with an all-zero one) load normally.
 
 `load()` also records the image's `OptionalHeader.SizeOfStackReserve` and `SizeOfStackCommit`. With `--run`, the
-entry-point thread and size-0 calls through the `CreateThread` and `_beginthreadex` shims use the mapped image's
-reserve. A nonzero commit without `STACK_SIZE_PARAM_IS_A_RESERVATION` gets the larger of the image reserve and the
-commit rounded up to 1 MiB. The shims set that reserve with the flag and use the host's default commit. A nonzero
-size with the flag remains the caller's explicit reservation (RT-119).
+entry-point thread and size-0 calls through the `CreateThread` and `_beginthreadex` shims use the larger of the
+mapped image's reserve and gta6rt's own 8 MB `/STACK` (BUILD-1457): an image that names less than 8 MB, including
+Windows' 1 MB default, keeps the loader's guarantee. A nonzero commit without `STACK_SIZE_PARAM_IS_A_RESERVATION`
+gets the larger of that reserve and the commit rounded up to 1 MiB. The shims set that reserve with the flag and
+use the host's default commit. A nonzero size with the flag remains the caller's explicit reservation (RT-119).
 
 `_beginthread` uses the native CRT stack policy and does not inherit the mapped image's reserve. It takes a commit
 size and exposes no reservation flag. Passing the image reserve would commit that much per thread, and replacing it

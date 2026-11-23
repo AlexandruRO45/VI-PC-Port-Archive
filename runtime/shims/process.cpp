@@ -59,7 +59,10 @@ wchar_t** g_wargv_ptr = nullptr;
 
 std::size_t g_stack_reserve = 0;  // the mapped image's reserve; 0 until set_thread_stack is called
 
-std::size_t game_stack_reserve() { return g_stack_reserve ? g_stack_reserve : kDefaultStackReserve; }
+// RT-119 + BUILD-1457 (PR #5468): use the mapped image's reserve when it is larger than the loader's own 8 MB, and
+// never less. #5468 gives every thread that asks for no size at least 8 MB through gta6rt.exe's PE header; a game
+// image that names a smaller reserve (Windows' 1 MB default, for one) must not take that guarantee away.
+std::size_t game_stack_reserve() { return std::max(g_stack_reserve, kDefaultStackReserve); }
 
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};

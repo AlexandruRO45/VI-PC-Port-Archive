@@ -613,7 +613,8 @@ asynchronous paths with `.invalid` names; it opens no connection.
 `CreateThread` is registered for `kernel32.dll`, `kernelbase.dll` and `api-ms-win-core-processthreads-l1-1-{0,1,2,3}.dll`;
 `_beginthreadex` is registered for `api-ms-win-crt-runtime-l1-1-0.dll`, `ucrtbase.dll`, `ucrtbased.dll` and
 `msvcrt.dll` (`runtime/shims/process.cpp`). Both shims set the reserve for a size of 0 or a nonzero commit without
-`STACK_SIZE_PARAM_IS_A_RESERVATION`. A nonzero size with the flag remains the caller's explicit reservation.
+`STACK_SIZE_PARAM_IS_A_RESERVATION`, to the larger of the mapped image's reserve and gta6rt's own 8 MB `/STACK`
+(BUILD-1457). A nonzero size with the flag remains the caller's explicit reservation.
 `_beginthread`, `CreateRemoteThread(Ex)`, imports under other names and threads started inside host DLLs use the
 host's stack policy.
 
