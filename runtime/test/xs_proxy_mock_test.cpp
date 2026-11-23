@@ -188,12 +188,18 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
         switch (slot) {
-            case 8:  // CreateCommandQueue: snapshot the desc, the shim passes its own masked copy
-                if (a1) {
-                    std::memcpy(&m->last_queue_desc, reinterpret_cast<const void*>(a1), sizeof(D3D12_COMMAND_QUEUE_DESC));
+            case 8: {  // CreateCommandQueue: validate flags as the PC backend does, then snapshot the desc
+                const auto* desc = reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
+                // d3d12_vulkan_device.cpp refuses undefined queue flag bits with E_INVALIDARG; mirroring it here
+                // makes the slot-8 route a real negative test instead of a silent accept (tupacfan04, #8258).
+                if (desc && (desc->Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT))
+                    return static_cast<std::uint32_t>(E_INVALIDARG);
+                if (desc) {
+                    std::memcpy(&m->last_queue_desc, desc, sizeof(D3D12_COMMAND_QUEUE_DESC));
                     m->has_last_queue_desc = true;
                 }
                 return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
+            }
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
@@ -749,10 +755,15 @@ int check_xbox_slots() {
     EXPECT(release(flagged_queue) == 0);
 
     // PC slot 8 keeps the PC semantics: an undefined flag bit is the caller's bug and reaches the real device
-    // unchanged (the PC backend's E_INVALIDARG is the answer to preserve), unlike the console slot 48 route.
+    // unchanged, so the PC backend's E_INVALIDARG is the answer the caller sees (the console slot 48 route masks
+    // the same bit instead). The mock validates flags like d3d12_vulkan_device.cpp, so this is a negative test.
     xbox_flags_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x2);
+    EXPECT(hr_of(raw(device, 8, word(&xbox_flags_desc), word(&kQueueIid), word(&flagged_queue))) == E_INVALIDARG);
+    EXPECT(mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);  // the desc never arrived
+    // A PC-valid flag bit goes through slot 8 unmasked, as the PC backend accepts it.
+    xbox_flags_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
     EXPECT(hr_of(raw(device, 8, word(&xbox_flags_desc), word(&kQueueIid), word(&flagged_queue))) == S_OK);
-    EXPECT(mock->last_queue_desc.Flags == static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x2));
+    EXPECT(mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
     EXPECT(release(flagged_queue) == 0);
 
     // A null desc goes through to the real device on both routes (the PC runtime refuses it with E_INVALIDARG,
