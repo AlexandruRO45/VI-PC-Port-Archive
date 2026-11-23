@@ -5,6 +5,7 @@ Usage:
 """
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -41,6 +43,130 @@ def _create_minimal_bc1_dds(color: int = 0xF800) -> bytes:
 
 
 class TestBatchGlb(unittest.TestCase):
+    def test_cache_evicts_least_recent_payload_and_keeps_errors(self) -> None:
+        loader_results = {"a": b"aa", "b": b"bb", "c": b"ccc", "big": b"123456", "bad": None}
+        loads = []
+
+        def load(path, max_size=0):
+            loads.append(path)
+            data = loader_results[path]
+            return data, "unreadable" if data is None else ""
+
+        with mock.patch.object(batch_glb, "_PNG_CACHE_BUDGET", 5), \
+                mock.patch.object(batch_glb, "_load_png_bytes", load):
+            cache = batch_glb.TextureCache()
+            for path in ("bad", "a", "b", "a", "c", "big", "big", "a", "b", "bad"):
+                self.assertEqual(cache.get_or_load(path)[0], loader_results[path])
+        self.assertEqual(loads, ["bad", "a", "b", "c", "big", "big", "b"])
+
+    def test_cache_separates_dds_decode_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "red.dds"
+            path.write_bytes(_create_minimal_bc1_dds())
+            cache = batch_glb.TextureCache()
+            for limit, size in ((1, 1), (0, 2), (1, 1)):
+                data, reason = cache.get_or_load(str(path), max_size=limit)
+                self.assertEqual(reason, "")
+                self.assertEqual(struct.unpack_from(">II", data, 16), (size, size))
+
+    def test_waiters_keep_their_result_after_eviction_or_failure(self) -> None:
+        for case in ("evicted", "oversize", "exception"):
+            with self.subTest(case=case):
+                started = threading.Event()
+                joined = threading.Event()
+                release = threading.Event()
+                calls = []
+
+                class ObservedFuture(Future):
+                    def result(self, timeout=None):
+                        joined.set()
+                        if not release.wait(timeout=5):
+                            raise TimeoutError("waiter was not released")
+                        return super().result(timeout=5)
+
+                def load(path, max_size=0):
+                    calls.append(path)
+                    if len(calls) == 1:
+                        started.set()
+                        self.assertTrue(joined.wait(timeout=5), "no worker joined the pending load")
+                        if case == "exception":
+                            raise RuntimeError("decoder stopped")
+                    return path.encode(), ""
+
+                def check_result(future):
+                    if case == "exception":
+                        with self.assertRaisesRegex(RuntimeError, "decoder stopped"):
+                            future.result(timeout=8)
+                    else:
+                        self.assertEqual(future.result(timeout=8), (b"shared", ""))
+
+                budget = 2 if case == "oversize" else len(b"shared")
+                with mock.patch.object(batch_glb, "_PNG_CACHE_BUDGET", budget), \
+                        mock.patch.object(batch_glb.concurrent.futures, "Future", ObservedFuture), \
+                        mock.patch.object(batch_glb, "_load_png_bytes", load):
+                    cache = batch_glb.TextureCache()
+                    with ThreadPoolExecutor(2) as pool:
+                        owner = pool.submit(cache.get_or_load, "shared")
+                        self.assertTrue(started.wait(timeout=5))
+                        waiter = pool.submit(cache.get_or_load, "shared")
+                        try:
+                            check_result(owner)
+                            if case == "evicted":
+                                cache.get_or_load("other")
+                        finally:
+                            release.set()
+                        check_result(waiter)
+                    self.assertEqual(calls.count("shared"), 1)
+                    self.assertEqual(cache.get_or_load("shared"), (b"shared", ""))
+                    self.assertEqual(calls.count("shared"), 2)
+
+    def test_parallel_texture_loads_match_serial_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src, tex = root / "models", root / "textures"
+            src.mkdir()
+            tex.mkdir()
+            red_dds = _create_minimal_bc1_dds()
+            blue_png = dds_png.dds_to_png_bytes(_create_minimal_bc1_dds(0x001F))
+            (tex / "red.dds").write_bytes(red_dds)
+            (tex / "blue.png").write_bytes(blue_png)
+            (tex / "bad.dds").write_bytes(b"invalid DDS")
+            models = {"one": "red", "two": "red", "three": "blue", "four": "bad"}
+            for name, material in models.items():
+                (src / (name + ".obj")).write_text(
+                    "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n"
+                    f"usemtl {material}\nf 1/1 2/2 3/3\n", encoding="utf-8", newline="\n")
+            serial = batch_glb.batch_convert(str(src), str(root / "serial"), jobs=1, texture_dir=str(tex))
+            rendezvous = threading.Barrier(2, timeout=5)
+            load = batch_glb._load_png_bytes
+            calls = []
+
+            def concurrent_load(path, max_size=0):
+                name = Path(path).stem
+                calls.append(name)
+                if name in ("red", "blue"):
+                    rendezvous.wait()
+                return load(path, max_size)
+
+            with mock.patch.object(batch_glb, "_load_png_bytes", concurrent_load):
+                parallel = batch_glb.batch_convert(str(src), str(root / "parallel"), jobs=4, texture_dir=str(tex))
+            self.assertEqual(parallel, serial)
+            self.assertEqual(parallel["succeeded"], 4)
+            self.assertEqual(len(parallel["dropped_textures"]), 1)
+            self.assertCountEqual(calls, ["red", "blue", "bad"])
+            textures = {"red": dds_png.dds_to_png_bytes(red_dds), "blue": blue_png}
+            for name, material in models.items():
+                glb = (root / "parallel" / (name + ".glb")).read_bytes()
+                self.assertEqual(glb, (root / "serial" / (name + ".glb")).read_bytes())
+                json_size, = struct.unpack_from("<I", glb, 12)
+                gltf = json.loads(glb[20:20 + json_size])
+                if material == "bad":
+                    self.assertFalse(gltf.get("images"))
+                else:
+                    view = gltf["bufferViews"][gltf["images"][0]["bufferView"]]
+                    start = 28 + json_size + view.get("byteOffset", 0)
+                    self.assertEqual(glb[start:start + view["byteLength"]], textures[material])
+
     def test_cli_reports_directory_setup_errors(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             missing = os.path.join(root, "missing")

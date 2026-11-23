@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from collections import OrderedDict
 import os
 import sys
 import threading
@@ -66,19 +67,59 @@ def _load_png_bytes(tex_path: str, max_size: int = 0) -> tuple[bytes | None, str
     return None, "not a .png or .dds"
 
 
+_PNG_CACHE_BUDGET = 256 * 1024 * 1024
+
+
 class TextureCache:
-    """Thread-safe (bytes, reason) per texture path, so the batch decodes a broken DDS once even when two
-    worker threads reach the same file at the same time (the pool runs one model per thread)."""
+    """Retain at most 256 MiB of completed PNG payloads per batch, evicting the least recently used.
+
+    Workers reading the same texture at the same size share one load. In-flight work and textures held
+    by models being written are outside the cache budget. Keep read errors for the batch so an
+    unreadable texture is reported for each model without repeatedly decoding it.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[str, tuple[bytes | None, str]] = {}
+        self._images: OrderedDict[tuple[str, int], bytes] = OrderedDict()
+        self._cached_bytes = 0
+        self._errors: dict[tuple[str, int], str] = {}
+        self._pending: dict[tuple[str, int], concurrent.futures.Future[tuple[bytes | None, str]]] = {}
 
     def get_or_load(self, path: str, max_size: int = 0) -> tuple[bytes | None, str]:
+        key = (path, max_size)
         with self._lock:
-            if path not in self._entries:
-                self._entries[path] = _load_png_bytes(path, max_size=max_size)
-            return self._entries[path]
+            if key in self._images:
+                self._images.move_to_end(key)
+                return self._images[key], ""
+            if key in self._errors:
+                return None, self._errors[key]
+            start_load = key not in self._pending
+            if start_load:
+                self._pending[key] = concurrent.futures.Future()
+            pending = self._pending[key]
+
+        if not start_load:
+            return pending.result()
+
+        try:
+            data, reason = _load_png_bytes(path, max_size=max_size)
+            with self._lock:
+                if data is None:
+                    self._errors[key] = reason
+                elif len(data) <= _PNG_CACHE_BUDGET:
+                    while self._cached_bytes + len(data) > _PNG_CACHE_BUDGET:
+                        self._cached_bytes -= len(self._images.popitem(last=False)[1])
+                    self._images[key] = data
+                    self._cached_bytes += len(data)
+        except BaseException as exc:
+            pending.set_exception(exc)
+            raise
+        else:
+            pending.set_result((data, reason))
+            return data, reason
+        finally:
+            with self._lock:
+                del self._pending[key]
 
 
 def convert_single(
