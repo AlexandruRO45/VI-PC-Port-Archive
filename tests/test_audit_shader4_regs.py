@@ -405,14 +405,6 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(rep["gs"]["rbw_vgpr_counts"], {"v0": 1, "v1": 1})
             self.assertEqual(rep["gs"]["s3_rbw_op_patterns"], {"s_bfe_u32 D, s3, 0x80008": 1})
 
-
-def setUpModule():
-    # The tools' main() prints its report; keep it out of the test log (tests that check it redirect again).
-    quiet = contextlib.redirect_stdout(io.StringIO())
-    quiet.__enter__()
-    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
-
-
     def test_buffer_load_lds_reads_vaddr_and_writes_no_vgpr(self):
         # The lds modifier sends the load straight to LDS: args[0] is vaddr (a source), not a destination.
         insns = [audit_mod.shader_ir.parse_line(line) for line in (
@@ -429,6 +421,14 @@ def setUpModule():
         )]
         _s_rbw, v_rbw, _patterns = audit_mod.rbw_registers(insns)
         self.assertEqual(v_rbw, [2, 3, 4, 5])
+
+
+def setUpModule():
+
+    # The tools' main() prints its report; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":
