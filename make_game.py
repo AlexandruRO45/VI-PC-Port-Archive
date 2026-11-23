@@ -2117,7 +2117,8 @@ def linux_build_configured() -> bool:
 def build_pipeline_check(jobs: int) -> None:
     build = os.path.join(ROOT, "runtime", "build", "linux")
     log("pipelines: building vk_pipeline_check")
-    cmake_configure(build)
+    if not os.path.isfile(os.path.join(build, "CMakeCache.txt")):
+        cmake_configure(build)  # a configured tree re-runs CMake from the build itself when CMakeLists.txt changed
     cmake_build(build, ["vk_pipeline_check"], jobs,
                 "It needs a C++20 compiler and the Vulkan headers (your distribution's Vulkan headers package, "
                 "or VULKAN_SDK); the CMake output above says which is missing.")

@@ -51,6 +51,7 @@ class FirstLightHarnessPathsTests(unittest.TestCase):
         self.assertEqual(first_light.find_harness(None), str(configured))
 
     def configure_linux_build(self) -> Path:
+        self.executable = "vk_harness"  # these tests patch os.name to "posix", so find_harness looks for no .exe
         linux = self.root / "runtime" / "build" / "linux"
         linux.mkdir(parents=True, exist_ok=True)
         (linux / "CMakeCache.txt").touch()
@@ -86,6 +87,7 @@ class FirstLightHarnessPathsTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_no_build_without_a_configured_tree(self) -> None:
+        self.executable = "vk_harness"
         harness = self.put_harness("runtime", "build", "linux")
         with patch.object(first_light.os, "name", "posix"), \
                 patch.object(first_light.shutil, "which", return_value="/usr/bin/cmake"), \
