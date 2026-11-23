@@ -1845,3 +1845,46 @@ This change adds the design, the CPU prototype and its unit tests. It does not m
 `tools/rdna2spirv.py`, does not add a GPU runner, and does not use game data. The prototype is useful
 now because it pins the semantics of the first instruction families and gives the future harness a
 reference that fails loudly on anything it does not understand.
+
+### Real mesh shaders, native and as compute (`tools/ms_sweep.py`, `runtime/test/vk_ms_sweep.cpp`)
+
+The mesh-shader sibling of the pixel-shader sweep above, for the 9,282 mesh shaders (a third of the corpus), which had
+been translated, validated and pipeline-checked but never executed. `ms_sweep.py sample` takes a fixed-seed stratified
+sample (strata: module size tercile, no / 1-6 / 7+ params, reads buffers, writes clip distances; at least 6 per
+stratum, the rest in proportion; 400 of 9,282 in 30 strata, seed 20261123). `translate` translates the sampled
+listings twice with the current translator, plain and with `--mesh-compute` (both `--wave64-emulate`), and builds the
+fallback's vertex shaders. `vk_ms_sweep` runs one shader on the runtime's bindless set 0 with a zero 1 MiB heap, zero
+user SGPRs and four workgroups, with a generated pixel shader summing the varyings: `native` as a `VK_EXT_mesh_shader`
+mesh shader (`vkCmdDrawMeshTasksEXT`, counting `VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT`), `compute` as the
+`--mesh-compute` fallback (dispatch, barrier, `tools/mesh_compute_vs.py` draw). `ms_sweep.py compare` classifies each
+shader: both ran and agree (the native primitive count equals the fallback slots' count, with or without the culled
+ones, and the two 64x64 images differ in at most 2 pixels), or primitive count differs, image differs, fails in one or
+both modes, timeout, device lost. From the fallback's slots it also counts vertices and primitives emitted, NaN or
+infinite positions and indices past the vertex count.
+
+Limit of the input: the heap holds the shaders' own descriptors (V# bases, table pointers), so any data in it is read as
+a wild address and resets the device. Floats, small integers, and pointing the descriptor base SGPRs at a filled heap
+were each tried and reset the device on every shader tried; the sweep therefore runs on a zero heap, where a shader
+finds zero counts and emits nothing or one primitive per workgroup. It checks that every sampled shader creates and
+runs in both modes and that the fallback reproduces what the native path rasterises, not the geometry of real meshes
+(`tools/ms_pass.py` draws one real drawable).
+
+RTX 4080 SUPER, Windows 11, 400 of 9,282 mesh shaders (seed 20261123), zero heap, 4 workgroups:
+
+| class | shaders |
+|---|---|
+| both modes run, native primitive count equals the fallback's, images agree | 399 |
+| primitive count differs / image differs | 0 / 0 |
+| fails in one mode (missing feature, pipeline creation) | 0 |
+| device lost (both modes) | 1 |
+
+- The fallback's slots hold 2,358 vertices and 2,358 primitives over the 399 (1 to 2 per workgroup, never past the
+  maxima, no index past the vertex count). 10 shaders emit a NaN or infinite position (40 vertices); the native image of
+  each agrees with the fallback's. The positions come from zero input (a normalise or reciprocal of zero data), so this
+  is an artefact of the synthetic heap, not a translation difference.
+- The device loss is the same shader in both modes, one that reads buffers: with the zero heap a loaded pointer is
+  null. Like the pixel-shader sweep's zeroed-heap loops, an artefact of the input.
+- Creating the pipeline is the slow part: native median 3.4 s, 90th percentile 16 s, 15 shaders over 30 s (up to
+  about 60 s alone); the fallback's compute pipeline median 2.1 s, 5 over 30 s (one about 70 s). With a 35 s limit,
+  18 native and 5 compute runs first timed out; re-run alone with 90 to 150 s all complete. Give the checker's
+  pipeline step a long limit on NVIDIA.
