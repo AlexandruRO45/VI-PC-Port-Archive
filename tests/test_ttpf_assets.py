@@ -342,7 +342,32 @@ class ProfileRules(unittest.TestCase):
         (self.work / "bcpack-calibration.json").write_text(text, encoding="utf-8")
 
     def test_missing_calibration_is_the_strict_profile(self):
-        self.assertEqual(ttpf_assets.load_profile(self.work), ("v1-strict", None))
+        self.assertEqual(ttpf_assets.load_profile(self.work), (ttpf_assets.strict_stamp(), None))
+
+    def test_a_decoder_source_edit_changes_both_stamps_and_the_pass_is_done_again(self):
+        # A pool stamped before a bcpack.py fix kept its limited rows for good: the strict stamp was a constant.
+        tools = self.work / "tools"
+        tools.mkdir()
+        for name in ttpf_assets.DECODER_SOURCES:
+            (tools / name).write_text(f"# {name}\n", encoding="utf-8")
+        self.write(json.dumps({"version": 1}))
+        with mock.patch.object(ttpf_assets, "__file__", str(tools / "ttpf_assets.py")), \
+                mock.patch.dict(sys.modules, {"calibrated_texture": mock.Mock()}):
+            old = ttpf_assets.strict_stamp(), ttpf_assets.load_profile(self.work)[0]
+            with open(tools / "bcpack.py", "a", encoding="utf-8") as f:
+                f.write("# fixed\n")
+            new = ttpf_assets.strict_stamp(), ttpf_assets.load_profile(self.work)[0]
+            self.assertTrue(new[0].endswith("-strict"))
+            self.assertEqual(len(f"000000_bcpack_{new[0][:19]}.dds"), 37)
+            (tools / "tex_headers.py").unlink()
+            with self.assertRaises(FileNotFoundError):
+                ttpf_assets.strict_stamp()
+        self.assertNotEqual(old[0], new[0])
+        self.assertNotEqual(old[1], new[1])
+        manifest = {"BCPackPass": old[0], "Textures": [synthetic_row(BCPackDecoder=old[0])]}
+        with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=RuntimeError("opened")):
+            with self.assertRaisesRegex(RuntimeError, "opened"):
+                ttpf_assets.complete_pool("missing.ttpf", self.work, manifest, (new[0], None))
 
     def test_another_calibration_version_is_an_error(self):
         self.write(json.dumps({"version": 2}))
