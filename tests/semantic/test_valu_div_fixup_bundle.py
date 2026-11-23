@@ -700,5 +700,24 @@ class TestVRcpIflagF32SIMD(unittest.TestCase):
                 self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
 
 
+def run_hw_rcp_iflag_f32(src: float) -> float:
+    lines = [
+        f"v_mov_b32 v0, {f32_to_bits(src):#x}",
+        "v_rcp_iflag_f32 v0, v0",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_rcp_iflag_hw", lines)
+    return bits_to_f32(support.mrt0_words(spv)[0])
+
+
+class TestVRcpIflagF32HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for v_rcp_iflag_f32."""
+
+    def test_translator_hardware_cases(self):
+        self.assertEqual(run_hw_rcp_iflag_f32(2.0), 0.5)
+        self.assertEqual(run_hw_rcp_iflag_f32(4.0), 0.25)
+
+
 if __name__ == "__main__":
     unittest.main()
