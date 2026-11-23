@@ -87,6 +87,7 @@ class SemanticRunnerTimeout(unittest.TestCase):
             "import time\nimport unittest\n\n"
             "class Slow(unittest.TestCase):\n"
             "    def test_slow(self):\n"
+            "        print('before timeout', flush=True)\n"
             "        time.sleep(30)\n",
             encoding="utf-8", newline="\n",
         )
@@ -107,8 +108,7 @@ class SemanticRunnerTimeout(unittest.TestCase):
     def test_parallel_timeout_fails_the_module_and_reports_completed_work(self):
         result = self.run_suite(2, 2)
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("==== FAILED: test_slow", result.stdout)
-        self.assertIn("timed out after 2 s", result.stdout)
+        self.assertIn("==== FAILED: test_slow\nbefore timeout\ntimed out after 2 s\n", result.stdout, result.stderr)
         self.assertIn("2 files, 1 tests, 1 files failed", result.stdout)
 
     def test_serial_discovery_respects_the_timeout(self):

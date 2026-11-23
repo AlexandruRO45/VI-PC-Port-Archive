@@ -42,8 +42,10 @@ def run_module(directory, module, verbose, timeout=None):
         p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                            errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or b"").decode(locale.getpreferredencoding(False), errors="replace").rstrip()
-        return 1, 0, "\n".join(filter(None, (output, f"timed out after {timeout} s")))
+        output = exc.stdout or ""
+        if isinstance(output, bytes):  # Windows can return already-decoded text after killing the child.
+            output = output.decode(locale.getpreferredencoding(False), errors="replace")
+        return 1, 0, "\n".join(filter(None, (output.rstrip(), f"timed out after {timeout} s")))
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
     return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
 
