@@ -830,6 +830,61 @@ class ModelJoinTests(unittest.TestCase):
             self.assertEqual(fh.read(), previous)
         self.assertEqual(os.listdir(out_dir), ["report.json"])
 
+    def test_write_output_preserves_symlinks_for_json_and_csv(self):
+        for ext in (".json", ".csv"):
+            with self.subTest(ext=ext):
+                sub = os.path.join(self.root, f"stage_symlink_{ext[1:]}")
+                target_dir = os.path.join(sub, "targets")
+                link_dir = os.path.join(sub, "links")
+                os.makedirs(target_dir)
+                os.makedirs(link_dir)
+                target = os.path.join(target_dir, f"real{ext}")
+                link = os.path.join(link_dir, f"link{ext}")
+                with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write("previous\n")
+                try:
+                    os.symlink(target, link)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+
+                joiner.write_output(link, [], {"ok": True})
+                self.assertTrue(os.path.islink(link))
+                with open(target, "r", encoding="utf-8") as fh:
+                    written = fh.read()
+                self.assertNotEqual(written, "previous\n")
+                if ext == ".json":
+                    self.assertEqual(json.loads(written), {"summary": {"ok": True}, "resources": []})
+                else:
+                    self.assertTrue(written.startswith("offset,stream_index,"))
+                self.assertEqual(os.listdir(target_dir), [f"real{ext}"])
+                self.assertEqual(os.listdir(link_dir), [f"link{ext}"])
+
+    def test_write_output_stages_and_replaces_resolved_destination(self):
+        for ext in (".json", ".csv"):
+            with self.subTest(ext=ext):
+                sub = os.path.join(self.root, f"stage_realpath_{ext[1:]}")
+                target_dir = os.path.join(sub, "targets")
+                link_dir = os.path.join(sub, "links")
+                os.makedirs(target_dir)
+                os.makedirs(link_dir)
+                target = os.path.join(target_dir, f"real{ext}")
+                link = os.path.join(link_dir, f"link{ext}")
+                with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write("previous\n")
+
+                with unittest.mock.patch.object(joiner.os.path, "realpath", return_value=target):
+                    joiner.write_output(link, [], {"ok": True})
+
+                self.assertFalse(os.path.exists(link))
+                with open(target, "r", encoding="utf-8") as fh:
+                    written = fh.read()
+                if ext == ".json":
+                    self.assertEqual(json.loads(written), {"summary": {"ok": True}, "resources": []})
+                else:
+                    self.assertTrue(written.startswith("offset,stream_index,"))
+                self.assertEqual(os.listdir(target_dir), [f"real{ext}"])
+                self.assertEqual(os.listdir(link_dir), [])
+
 
 if __name__ == "__main__":
     unittest.main()

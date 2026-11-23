@@ -1182,7 +1182,8 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
 def write_output(path, resources, summary):
     """Write JSON or CSV based on the output path extension, staged via a sibling temp file."""
     ext = os.path.splitext(path)[1].lower()
-    parent = os.path.dirname(os.path.abspath(path))
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest)
     fd, tmp = tempfile.mkstemp(prefix=".restofworld_model_join.", suffix=f"{ext}.tmp", dir=parent)
     try:
         if ext == ".json":
@@ -1220,8 +1221,8 @@ def write_output(path, resources, summary):
                         "all_lod_triangles": r["all_lod_triangles"],
                         "error": "" if r["error"] is None else r["error"],
                     })
-        os.chmod(tmp, file_mode.published_mode(path))
-        replace_retry.replace(tmp, path)
+        os.chmod(tmp, file_mode.published_mode(dest))
+        replace_retry.replace(tmp, dest)
     except BaseException:
         try:
             os.chmod(tmp, 0o600)
