@@ -3,8 +3,8 @@
 `open(path, "w")` with no `newline=` turns each "\\n" into "\\r\\n" on Windows, so the same JSON report, manifest or
 assembly listing is CRLF there and LF on Linux and macOS: the same input gives byte-different output per platform
 (checksums and diffs differ). The CSV writers were fixed in #1573; this covers the other text writers. This test reads
-the source with `ast` (standard library, no game data, no GPU) and fails for any `open`, `io.open`, `Path.open`,
-`os.fdopen` or `tempfile.NamedTemporaryFile` (and `TemporaryFile`, `SpooledTemporaryFile`) in a text write mode (`w`,
+the source with `ast` (standard library, no game data, no GPU) and fails for any `open`, `builtins.open`, `io.open`,
+`Path.open`, `os.fdopen` or `tempfile.NamedTemporaryFile` (and `TemporaryFile`, `SpooledTemporaryFile`) in a text write mode (`w`,
 `a`, `x`, `r+`), or any `Path.write_text`, under tools/, scripts/, make_game.py and runtime/test/shaders/ that has no
 `newline=` argument. `codecs.open` is left alone: it never translates line ends and takes no `newline=`. Pass `newline="\\n"` for LF output (or `newline=""` when the text carries its own line ends,
 like a csv writer).
@@ -33,9 +33,9 @@ def python_files():
 
 
 MODE_CHARS = set("rwaxbt+")
-# Where each call takes its mode: open(file, mode), io/gzip/bz2/lzma.open(file, mode), os.fdopen(fd, mode),
+# Where each call takes its mode: open(file, mode), builtins/io/gzip/bz2/lzma.open(file, mode), os.fdopen(fd, mode),
 # Path.open(mode) and tempfile.*TemporaryFile(mode) (binary unless the mode says otherwise).
-MODULE_OPENS = {"io", "gzip", "bz2", "lzma"}
+MODULE_OPENS = {"builtins", "io", "gzip", "bz2", "lzma"}
 TEMPFILES = {"NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile"}
 # open() calls that never write translated text: codecs.open writes "\n" as it is and takes no newline=; os.open
 # takes flags; tarfile, zipfile and webbrowser open archives or URLs.
@@ -92,6 +92,27 @@ def unpinned_text_writes(source: str):
 
 
 class TextWriteLineEndings(unittest.TestCase):
+    def test_detector_finds_qualified_builtin_text_writes(self):
+        src = (
+            "builtins.open('out.txt', 'w')\n"
+            "builtins.open('out.txt', 'a+')\n"
+            "builtins.open('out.txt', 'r+')\n"
+            "builtins.open('out.txt', mode='x')\n"
+        )
+        self.assertEqual(unpinned_text_writes(src), [1, 2, 3, 4])
+
+    def test_detector_ignores_qualified_builtin_reads_binary_and_pinned_writes(self):
+        # A filename that looks like a write mode must not be mistaken for the mode argument.
+        src = (
+            "builtins.open('w')\n"
+            "builtins.open('w', 'r')\n"
+            "builtins.open('w', 'rb')\n"
+            "builtins.open('w', 'wb')\n"
+            "builtins.open('out.txt', 'w', newline='\\n')\n"
+            "builtins.open('out.txt', 'w', newline='')\n"
+        )
+        self.assertEqual(unpinned_text_writes(src), [])
+
     def test_detector_finds_the_unpinned_forms(self):
         src = (
             "open('a', 'w')\n"                                     # 1
