@@ -252,6 +252,22 @@ class CliTest(unittest.TestCase):
             ihp.main(["--denorm32", "1"])
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_kernels_must_be_at_least_one(self):
+        # 0 or fewer kernels per seed generated no random case at all, yet the run printed its tally and exited 0
+        # (lds_fuzz --programs and image_fuzz --programs refuse the same).
+        for value in ("0", "-1"):
+            with self.subTest(kernels=value), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as ctx:
+                    ihp.main(["--kernels", value])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("--kernels", err.getvalue())
+
+    def test_a_positive_kernel_count_still_reaches_the_oracle(self):
+        with mock.patch.object(ihp.runner, "open_oracle",
+                               side_effect=ihp.runner.Unavailable("no AMD GPU on this box")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ihp.main(["--kernels", "1"]), 77)
+
     def test_no_oracle_is_77(self):
         # Patch the oracle open instead of hoping this machine has no AMD GPU: on a box with a
         # working gfx1036 target the unpatched call would run the real probe and return 0.

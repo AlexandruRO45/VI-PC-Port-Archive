@@ -252,6 +252,8 @@ def main(argv=None):
         seeds = [int(s) for s in args.seeds.split(",")]
     except ValueError:
         ap.error("--seeds takes integers separated by commas")
+    if args.kernels < 1:
+        ap.error("--kernels must be at least 1")
     mode = {"denorm32": args.denorm32}
     try:
         o = runner.open_oracle(arch=args.arch)
