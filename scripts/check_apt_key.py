@@ -8,14 +8,15 @@ fingerprint each project publishes. The key file must hold exactly one primary k
 FINGERPRINT (40 hex digits; spaces and case don't matter). A second primary key appended to the file fails the check
 too, since apt would trust it as well. Subkeys are allowed: they are bound to the primary key.
 
-Reads the key with `gpg --show-keys --with-colons` (GnuPG 2.2.8+), which lists a key file without importing it, so no
-keyring changes. Exits 0 when the key matches, 1 when it doesn't or gpg can't read it, 2 on a usage error. Standard
-library only.
+Reads the key with `gpg --show-keys --with-colons` (GnuPG 2.2.8+) in a temporary GnuPG home. Any files GnuPG creates
+stay in that directory and are removed after the check. Exits 0 when the key matches, 1 when it doesn't or gpg
+can't read it, 2 on a usage error. Standard library only.
 """
 import os
 import re
 import subprocess
 import sys
+import tempfile
 
 
 def normalize(fingerprint):
@@ -41,9 +42,10 @@ def primary_fingerprints(colons):
 
 
 def show_keys(path, gpg=("gpg",)):
-    """`gpg --show-keys --with-colons` output for the key file at `path` (it lists the file, importing nothing)."""
-    result = subprocess.run([*gpg, "--batch", "--show-keys", "--with-colons", path],
-                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    """List the key file at `path` in a disposable GnuPG home."""
+    with tempfile.TemporaryDirectory(prefix="leonida-apt-key-") as gpg_home:
+        result = subprocess.run([*gpg, "--homedir", gpg_home, "--batch", "--show-keys", "--with-colons", path],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise ValueError(f"gpg could not read {path}: {result.stderr.strip() or 'exit ' + str(result.returncode)}")
     return result.stdout

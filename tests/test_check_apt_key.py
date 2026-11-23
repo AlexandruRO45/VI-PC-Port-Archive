@@ -2,10 +2,10 @@
 
     python -I tests/test_check_apt_key.py
 
-GnuPG is stood in for by a small Python program that prints the `--with-colons` listing written in each test's "key
-file", so the tests run anywhere without a real key or gpg: the one key, another key, two primary keys, a primary key
-with subkeys, a file gpg can't read. The workflows are read as text: every `.key`/`.gpg`/`.asc` URL they fetch must go
-to a temporary file that `scripts/check_apt_key.py` checks before anything installs it. Standard library only.
+Most tests use a Python stand-in for GnuPG that prints the `--with-colons` listing written in each fixture.
+An optional CLI test uses GnuPG to check whether it initializes the caller's keybox. The workflow check reads each
+workflow as text and verifies that fetched keys go through `scripts/check_apt_key.py` before installation.
+Standard library only.
 """
 import os
 import re
@@ -115,6 +115,21 @@ class CommandLine(unittest.TestCase):
         result = self.run_script(os.path.join(ROOT, "no-such.key"), WINEHQ)
         self.assertEqual(result.returncode, 1)
         self.assertIn("no such key file", result.stderr)
+
+    @unittest.skipUnless(shutil.which("gpg"), "GnuPG is required to check keybox side effects")
+    def test_failed_listing_leaves_the_callers_gpg_home_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            caller_home = os.path.join(directory, "caller")
+            os.mkdir(caller_home, 0o700)
+            source = os.path.join(directory, "invalid.asc")
+            with open(source, "w", encoding="utf-8", newline="\n") as f:
+                f.write("synthetic input without OpenPGP data\n")
+            result = subprocess.run([sys.executable, "-I", SCRIPT, source, WINEHQ],
+                                    env=dict(os.environ, GNUPGHOME=caller_home),
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("gpg could not read", result.stderr)
+            self.assertEqual(os.listdir(caller_home), [])
 
 
 class Workflows(unittest.TestCase):
