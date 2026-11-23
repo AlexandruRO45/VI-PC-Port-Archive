@@ -3,11 +3,15 @@
   - Inline int/float constants and 32-bit literals with op_sel=0/1.
   - SGPR high halves, f16 abs/neg/ordered-vs-unordered NaN.
 
-Usage:
-  powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
+Needs a built `vk_compute_test`, `spirv-as` on PATH and the RDNA2 iGPU (the probe sets
+LEONIDA_VK_DEVICE=radeon). No game files:
+
+  python -I tools/probe_gfx1036_vcmp16.py [--harness runtime\\build\\vk_compute_test.exe]
 """
+import argparse
 import math
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -333,7 +337,22 @@ def test_f16_nan_and_modifiers(wave_size=32):
     print(f"[{name}] ALL NaN & MODIFIER TESTS PASSED on gfx1036 silicon!")
 
 
-def main():
+def main(argv=None):
+    global VK_COMPUTE_TEST
+    ap = argparse.ArgumentParser(
+        description="Probe gfx1036 silicon for the 16-bit vector compares: v_cmp/v_cmpx inactive lanes and EXEC, "
+                    "constants and literals with op_sel, SGPR high halves, and f16 NaN/abs/neg.")
+    ap.add_argument("--harness", default=VK_COMPUTE_TEST,
+                    help="the vk_compute_test program (default: %(default)s)")
+    a = ap.parse_args(argv)
+    VK_COMPUTE_TEST = a.harness
+    if not os.path.isfile(a.harness):
+        sys.stderr.write(f"error: no vk_compute_test at {a.harness}; build it first "
+                         "(docs/testing.md, \"Build the test programs\"), or pass --harness\n")
+        return 2
+    if shutil.which("spirv-as") is None:
+        sys.stderr.write("error: spirv-as is not on PATH; install SPIRV-Tools (docs/testing.md)\n")
+        return 2
     print("=" * 70)
     print("PROBING GFX1036 SILICON FOR V_CMP(X) 16-BIT OP_SEL & CONSTANTS")
     print("=" * 70)
@@ -361,10 +380,11 @@ def main():
     print("\n" + "=" * 70)
     print("ALL GFX1036 SILICON PROBES (WAVE32 & WAVE64) PASSED WITH ZERO DIVERGENCES!")
     print("=" * 70)
+    return 0
 
 if __name__ == "__main__":
     try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    main()
+    sys.exit(main())
