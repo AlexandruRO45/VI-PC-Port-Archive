@@ -460,6 +460,20 @@ class ComposeDeterminism(unittest.TestCase):
         # both inside the six ties that used to be chosen in hash order.
         self.assertEqual(composed.split()[2], "1")
 
+    def test_out_problem_uses_same_report_path_for_folding_alias(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            save = os.path.join(tmp, "k.json")
+            dic = os.path.join(tmp, "words.bin")
+            for p in (save, dic):
+                with open(p, "wb") as f:
+                    f.write(b"{}")
+            alias = os.path.join(tmp, "WORDS.BIN")
+            with mock.patch.object(sk, "same_report_path", side_effect=lambda a, b: a == alias and b == dic) as mocked:
+                problem = sk.out_problem(alias, [save], [dic])
+            self.assertIn("refusing to overwrite it", problem)
+            self.assertEqual(mocked.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
