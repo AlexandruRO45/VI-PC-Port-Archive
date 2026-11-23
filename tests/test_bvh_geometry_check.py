@@ -91,12 +91,14 @@ class TestChecks(unittest.TestCase):
             for p, data in zip(paths, (src, VB, IB)):
                 with open(p, "wb") as f:
                     f.write(data)
-            target = os.path.join(d, "x" * 300 + ".json")          # a name no file system accepts
-            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
-                rc = C.main([paths[0], "--geom", paths[1] + "," + paths[2], "--json", target])
-        self.assertEqual(rc, 2)
-        self.assertIn("consistent", out.getvalue())
-        self.assertIn("error: cannot write", err.getvalue())
+            for label, target in (("name too long", os.path.join(d, "x" * 300 + ".json")),   # no file system accepts it
+                                  ("missing folder", os.path.join(d, "no-such-dir", "r.json"))):
+                with self.subTest(label), contextlib.redirect_stdout(io.StringIO()) as out, \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = C.main([paths[0], "--geom", paths[1] + "," + paths[2], "--json", target])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("consistent", out.getvalue())
+                    self.assertIn("ERROR: cannot write " + target + ": ", err.getvalue())
 
 
 if __name__ == "__main__":

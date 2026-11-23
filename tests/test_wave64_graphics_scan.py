@@ -203,7 +203,7 @@ class CliTests(unittest.TestCase):
                 code = scan.main([src, "--out", target])
         self.assertEqual(code, 2)
         self.assertIn("shaders", out.getvalue())
-        self.assertIn("ERROR: cannot write", err.getvalue())
+        self.assertIn("ERROR: cannot write " + target + ": ", err.getvalue())
 
     def test_out_same_as_source_rejected(self):
         with tempfile.TemporaryDirectory() as src:

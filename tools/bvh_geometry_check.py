@@ -185,7 +185,7 @@ def main(argv=None):
             with open(a.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(report, f, indent=1)
         except OSError as e:
-            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            print("ERROR: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
             return 2
     return 0 if report["consistent"] else 1
 
