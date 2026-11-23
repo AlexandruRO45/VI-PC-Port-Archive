@@ -5,27 +5,27 @@
 	v_mov_b32_e32 v3, 0xbe553cb0
 	v_mov_b32_e32 v4, 0x3c00bc00
 	v_mov_b32_e32 v20, 0xc150a000
-	v_max_i16_e64 v20, v2, v3 op_sel:[0,0,1]
+	v_add_nc_u16_e64 v20, v2, v3 op_sel:[0,0,1]
 	v_pk_mul_f16 v10, v4, v20 op_sel:[0,0] op_sel_hi:[0,1]
 	v_mov_b32_e32 v20, 0
 	v_mov_b32_e32 v21, 0xc150a000
-	v_add_nc_u16_e64 v21, v2, v3 op_sel:[0,0,1]
+	v_sub_nc_u16_e64 v21, v3, v2 op_sel:[0,0,1]
 	v_pk_mul_f16 v11, v4, v21 op_sel:[0,0] op_sel_hi:[0,1]
 	v_mov_b32_e32 v21, 0
 	v_mov_b32_e32 v22, 0xc150a000
-	v_mul_lo_u16_e64 v22, v2, v3 op_sel:[0,0,1]
+	v_add_nc_i16 v22, v2, v3 op_sel:[0,0,1]
 	v_pk_mul_f16 v12, v4, v22 op_sel:[0,0] op_sel_hi:[0,1]
 	v_mov_b32_e32 v22, 0
 	v_mov_b32_e32 v23, 0xc150a000
-	v_max_u16_e64 v23, v2, v3 op_sel:[0,0,1]
+	v_sub_nc_i16 v23, v3, v2 op_sel:[0,0,1]
 	v_pk_mul_f16 v13, v4, v23 op_sel:[0,0] op_sel_hi:[0,1]
 	v_mov_b32_e32 v23, 0
 	v_mov_b32_e32 v24, 0xc150a000
-	v_max_i16_e64 v24, v2, v3 op_sel:[0,0,1]
+	v_add_nc_u16_e64 v24, v2, v3 op_sel:[0,0,1]
 	v_pk_add_f16 v14, v4, v24 op_sel:[0,0] op_sel_hi:[0,1]
 	v_mov_b32_e32 v24, 0
 	v_mov_b32_e32 v25, 0xc150a000
-	v_max_i16_e64 v25, v2, v3 op_sel:[0,0,1]
+	v_add_nc_u16_e64 v25, v2, v3 op_sel:[0,0,1]
 	v_pk_mul_f16 v15, v4, v25 op_sel:[0,0] op_sel_hi:[0,1]
 	v_and_b32_e32 v6, 31, v0
 	v_lshlrev_b32_e32 v6, 5, v6

@@ -1062,7 +1062,7 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],     # s_cmp mask, -1 in a partial wave
                 "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],      # the same in a 20-thread wave32
                 # v_pk_mul_f16 reading a high half a 16-bit op just wrote through op_sel (cs_w32_pk_mul_hi.asm header)
-                "cs_w32_pk_mul_hi": [0xBCB02000, 0xF8B02000, 0xC0002000, 0xBCB02000, 0x3180BC08, 0xBCB02000, 0x00003C00, 0x00000000],
+                "cs_w32_pk_mul_hi": [0xF8B02000, 0x80B02000, 0xF8B02000, 0x80B02000, 0x78B0BC08, 0xF8B02000, 0x00003C00, 0x00000000],
                 "cs_w32_andn2_exec": [1, 8, 16, 2064, 2068, 3, 20, 1544],   # s_andn2_saveexec/wrexec_b32 (.asm header)
                 "cs_w32_sincos": [1, 1, 1, 1, 1, 1],                  # SHADER-88 (cs_w32_sincos.asm): angles in turns
                 "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
