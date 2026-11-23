@@ -11,6 +11,7 @@ first look at the executable (scripts/first_look.ps1) has one list to work throu
 several). A shim note then says whether the executable calls a runtime class that file serves: "called" items are
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
 `constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
+If any input was skipped, unreadable or cut off, an unobserved class is marked "unknown".
 
 Output: Markdown, to stdout or --out (LF). Exit status 0; 1 when a --gdk-calls file can't be read. Reads files only.
 Standard library only.
@@ -114,14 +115,20 @@ def collect(root: str) -> list[dict]:
     return notes
 
 
-def called_classes(paths: list[str]) -> set[str]:
-    """The class ids the executable's gdk_runtime_calls reports list (any image in them)."""
+def read_calls(paths: list[str]) -> tuple[set[str], bool]:
+    """Collect observed class ids and whether every reported input was scanned in full."""
     ids = set()
+    complete = True
     for p in paths:
         with open(p, encoding="utf-8") as f:
             doc = json.load(f)
         if not isinstance(doc, dict):
             raise ValueError(f"{p}: expected a report object")
+        unreadable = doc.get("unreadable_images", 0)
+        if type(unreadable) is not int or unreadable < 0:
+            raise ValueError(f"{p}: expected a nonnegative unreadable_images count")
+        if unreadable:
+            complete = False
         images = doc.get("images", [doc])
         if not isinstance(images, list):
             raise ValueError(f"{p}: expected an images array")
@@ -131,14 +138,21 @@ def called_classes(paths: list[str]) -> set[str]:
             location = f"{p}: image {index + 1}"
             if not isinstance(image, dict) or not isinstance(image.get("classes"), list):
                 raise ValueError(f"{location}: expected an object with a classes array")
+            if image.get("cut_off_sections") or image.get("skipped"):
+                complete = False
             for c in image["classes"]:
                 if not isinstance(c, dict) or not isinstance(c.get("class_id"), str) or not c["class_id"]:
                     raise ValueError(f"{location}: expected each class to have a nonempty class_id string")
                 ids.add(c["class_id"].lower())
-    return ids
+    return ids, complete
 
 
-def render(notes: list[dict], called: set[str] | None) -> str:
+def called_classes(paths: list[str]) -> set[str]:
+    """The class ids observed in any image, including partially scanned images."""
+    return read_calls(paths)[0]
+
+
+def render(notes: list[dict], called: set[str] | None, *, complete: bool = True) -> str:
     def status(n):
         if called is None or not n.get("classes"):
             return None
@@ -146,10 +160,13 @@ def render(notes: list[dict], called: set[str] | None) -> str:
 
     out = ["# Checklist: what to confirm against the executable", ""]
     out.append(f"{len(notes)} notes from the runtime sources and the docs (tools/exe_checklist.py).")
-    if called is not None:
+    if called is not None and not complete:
+        out.append("The GDK scan was incomplete. Observed calls come first. Other class-linked notes are marked unknown.")
+    elif called is not None:
         out.append("Runtime notes are marked by whether the executable calls a class their file serves "
                    "(gdk_runtime_calls); the called ones come first.")
     out.append("")
+    tags = {True: " **called**", False: " (not called)" if complete else " (unknown)", None: ""}
     groups = [("Runtime", [n for n in notes if not n["file"].startswith("docs/")]),
               ("Docs", [n for n in notes if n["file"].startswith("docs/")])]
     for title, group in groups:
@@ -160,7 +177,7 @@ def render(notes: list[dict], called: set[str] | None) -> str:
         order = {True: 0, None: 1, False: 2}
         for n in sorted(group, key=lambda n: (order[status(n)], n["file"], n["line"])):
             s = status(n)
-            tag = "" if s is None else (" **called**" if s else " (not called)")
+            tag = tags[s]
             out.append(f"- [ ] `{n['file']}:{n['line']}` {n['kind']}{tag}: {n['text']}")
         out.append("")
     return "\n".join(out)
@@ -173,13 +190,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default=DEFAULT_ROOT, help="the repository (default: %(default)s)")
     a = ap.parse_args(argv)
     called = None
+    complete = True
     if a.gdk_calls:
         try:
-            called = called_classes(a.gdk_calls)
+            called, complete = read_calls(a.gdk_calls)
         except (OSError, ValueError, RecursionError) as e:
             print(f"cannot read the gdk_runtime_calls report: {e}", file=sys.stderr)
             return 1
-    text = render(collect(a.root), called)
+    text = render(collect(a.root), called, complete=complete)
     if a.out:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)

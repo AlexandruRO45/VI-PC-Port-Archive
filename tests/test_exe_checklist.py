@@ -100,12 +100,38 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def test_partial_scans_keep_observed_calls_and_label_other_classes_unknown(self):
+        report = os.path.join(self.root, "partial.json")
+        known = os.path.join(self.root, "observed.json")
+        with open(known, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"classes": [{"class_id": SAVE_CLASS}]}, f)
+        for payload in (
+            {"classes": [], "cut_off_sections": [".text"]},
+            {"images": [{"classes": [], "skipped": "unsupported machine"}, {"classes": []}]},
+            {"images": [{"classes": []}], "unreadable_images": 1},
+        ):
+            with self.subTest(payload=payload):
+                with open(report, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(payload, f)
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report]), 0)
+                self.assertIn("demo.cpp:3` ASSUMPTION (unknown)", stdout.getvalue())
+                self.assertNotIn("(not called)", stdout.getvalue())
+                self.assertIn("other.cpp:2` ASSUMPTION:", stdout.getvalue())
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report, "--gdk-calls", known]), 0)
+                self.assertIn("demo.cpp:3` ASSUMPTION **called**", stdout.getvalue())
+
     def test_malformed_reports_fail_without_publishing_a_checklist(self):
         report = os.path.join(self.root, "malformed.json")
         for case, (payload, reason) in enumerate((
             (None, "report object"),
             ({"images": None}, "images array"),
             ({"images": []}, "at least one image"),
+            ({"classes": [], "unreadable_images": -1}, "unreadable_images count"),
             ({"images": [None]}, "classes array"),
             ({"images": [{"classes": 1}]}, "classes array"),
             ({}, "classes array"),

@@ -40,6 +40,7 @@ k...Class` with its id in one of runtime/shims/xgameruntime*.cpp: xgameruntime.c
 xgameruntime_user.cpp, _gamesave.cpp, _store.cpp, _offline.cpp; the class only, not each slot); then the known ids present in the image that
 no thunk reaches. Text by default, --json for JSON. --out DIR writes both, as <image file name>.gdk_calls.txt and
 .json (x.dll-2.gdk_calls.txt for a second input named x.dll), and prints one summary line per image instead.
+When --json omits unreadable inputs, unreadable_images gives their count.
 
 Exit status 1 when an image (or the class table) can't be read, or an image is cut off before the end of its
 sections (the report of what is there is still written); 0 otherwise. Reads the files only; never runs them.
@@ -1044,7 +1045,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not a.out:
         if a.json:
-            print(json.dumps({"table": table.source, "images": reports}, indent=1))
+            doc = {"table": table.source, "images": reports}
+            if len(reports) < len(a.image):
+                doc["unreadable_images"] = len(a.image) - len(reports)
+            print(json.dumps(doc, indent=1))
         else:
             print(f"(class table: {table.source})")
             for r in reports:

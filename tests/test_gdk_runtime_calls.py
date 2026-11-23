@@ -427,6 +427,15 @@ class ImageTest(unittest.TestCase):
         self.assertIn("incomplete", stderr.getvalue())
         self.assertIn("not a readable PE image", stderr.getvalue())
 
+    def test_json_accounts_for_an_input_that_could_not_be_read(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            rc = grc.main(["--json", self.path, os.path.join(self.tmp, "missing.dll")])
+        self.assertEqual(rc, 1)
+        doc = json.loads(stdout.getvalue())
+        self.assertEqual(doc["unreadable_images"], 1)
+        self.assertEqual([image["file"] for image in doc["images"]], ["thunks.dll"])
+
 
 class DecoderTest(unittest.TestCase):
     def test_lengths(self):
