@@ -741,6 +741,8 @@ def main(argv=None):
         "--quiet", action="store_true", help="print nothing, only set the exit code"
     )
     a = ap.parse_args(argv)
+    if a.limit is not None and not (a.meta or a.entry is not None):
+        ap.error("--limit only applies to --meta")
     try:
         report = inspect(
             a.cache,
