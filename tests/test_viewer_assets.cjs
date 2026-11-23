@@ -63,11 +63,16 @@ test("catalog paths encode individual segments and retain the library status", (
   const result = parseCatalog({ version: 1, status, assets: [
     { name: "Trolley", category: "props", model: "Props/Pad #2%.glb", preview: "Pics/Pad ?2.png" },
     { name: "Rover", category: "vehicles", model: "Vehicles/Rover.GLB" },
+    { name: "Crate", category: "props", model: "props/data/Crate%20%2B%23.glb",
+      preview: "props/data/Crate%20%2B%23.shader.png" },
   ] });
   assert.equal(result.status, status);
   assert.equal(result.entries[0].modelUrl, "/catalog/Props/Pad%20%232%25.glb");
   assert.equal(result.entries[0].previewUrl, "/catalog/Pics/Pad%20%3F2.png");
   assert.equal(result.entries[1].previewUrl, undefined);
+  assert.equal(result.entries[2].modelUrl, "/catalog/props/data/Crate%20%2B%23.glb");
+  assert.equal(result.entries[2].previewUrl, "/catalog/props/data/Crate%20%2B%23.shader.png");
+  assert.equal(result.entries[2].previewName, "Crate +#.shader.png");
 });
 
 test("catalog entries reject absolute paths, unsafe segments, and unexpected types", () => {
@@ -76,7 +81,8 @@ test("catalog entries reject absolute paths, unsafe segments, and unexpected typ
     assets: [{ name: "Cart", category: "vehicles", model }],
   });
   for (const path of ["http://example.test/cart.glb", "/cart.glb", "C:/cart.glb", "../cart.glb",
-    "cars/./cart.glb", "cars//cart.glb", "cars\\cart.glb", "cars/cart.obj", "cars/a\u0000b.glb"]) {
+    "cars/./cart.glb", "cars//cart.glb", "cars\\cart.glb", "cars/cart.obj", "cars/a\u0000b.glb",
+    "%2E%2E/cart.glb", "cars%2Fcart.glb", "cars%5Ccart.glb", "cars/a%00b.glb"]) {
     assert.throws(() => parse(path), /Invalid catalog file path/);
   }
   assert.throws(() => parseCatalog({ version: 2, assets: [], status: { complete: true } }), /version 1/);

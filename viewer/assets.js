@@ -32,12 +32,18 @@ let viewerPromise;
 let catalogTimer;
 let catalogPolling = false;
 
-function catalogURL(path, extension) {
-  if (typeof path !== "string" || !path.toLowerCase().endsWith(extension) || /[\\:\x00-\x1f]/.test(path))
+function catalogFile(path, extension) {
+  if (typeof path !== "string")
     throw new Error("Invalid catalog file path.");
-  const parts = path.split("/");
-  if (parts.some(part => !part || /[. ]$/.test(part))) throw new Error("Invalid catalog file path.");
-  return "/catalog/" + parts.map(encodeURIComponent).join("/");
+  const parts = path.split("/").map(part => {
+    // The builder quotes each segment. Also accept literal segments from hand-written catalogs.
+    try { return decodeURIComponent(part); }
+    catch { return part; }
+  });
+  if (!parts.at(-1).toLowerCase().endsWith(extension) ||
+      parts.some(part => !part || /[\\/:\x00-\x1f]/.test(part) || /[. ]$/.test(part)))
+    throw new Error("Invalid catalog file path.");
+  return { path: parts.join("/"), name: parts.at(-1), url: "/catalog/" + parts.map(encodeURIComponent).join("/") };
 }
 
 function parseCatalog(manifest) {
@@ -48,12 +54,12 @@ function parseCatalog(manifest) {
     if (!entry || typeof entry.name !== "string" || !entry.name.trim() ||
         !["props", "ped-parts", "vehicles"].includes(entry.category))
       throw new Error("Invalid catalog asset.");
-    const modelUrl = catalogURL(entry.model, ".glb");
-    const previewUrl = entry.preview === undefined ? undefined : catalogURL(entry.preview, ".png");
-    const key = entry.category + ":" + modelUrl;
+    const model = catalogFile(entry.model, ".glb");
+    const preview = entry.preview === undefined ? undefined : catalogFile(entry.preview, ".png");
+    const key = entry.category + ":" + model.url;
     entries.set(key, {
-      key, name: entry.name, category: entry.category, path: entry.model, modelUrl, previewUrl,
-      previewName: entry.preview?.split("/").at(-1),
+      key, name: entry.name, category: entry.category, path: model.path, modelUrl: model.url,
+      previewUrl: preview?.url, previewName: preview?.name,
     });
   }
   return { entries: [...entries.values()], status: manifest.status };

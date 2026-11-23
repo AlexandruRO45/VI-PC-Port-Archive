@@ -12,7 +12,14 @@ other archive exports in the same layout, or self-contained GLBs anywhere below 
 looks in `<work>/assets` when it is separate from the catalog. It reads GLBs already in the catalog
 directory in place, including the `props/<archive>/<stem>.glb` layout, and imports files from other
 roots. A `<stem>.shader.png` sibling becomes the optional native preview. Paths in `catalog.json` are
-relative to its folder with forward slashes and URL-encoded segments.
+relative to its folder with forward slashes and URL-encoded segments, such as `props/data/Crate%20%2B%23.glb`.
+
+```powershell
+python -I viewer/serve.py --catalog "<work>/catalog" --world "<work>/world"
+```
+
+Open **Assets** from `http://127.0.0.1:8765/` to browse ready models as the catalog builds.
+Omit `--world` to use the test terrain.
 
 To fill in missing exports automatically, use the documented local `rpf9dump` build and add `--game`.
 Point `--rpf9dump` at the local executable or DLL if the builder cannot find it.
