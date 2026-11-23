@@ -304,6 +304,37 @@ class TestArgumentValidation(unittest.TestCase):
                 self.assertIn(diagnostic, stderr.getvalue())
                 self.assertIn(index, stderr.getvalue())
 
+    def test_probe_reports_a_missing_blob_part(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "synthetic"
+            archive.mkdir()
+            first_part = archive / "000000001000.bin"
+            missing_part = archive / "000000002000.bin"
+            first_part.write_bytes(bytes(8))
+            index = Path(directory) / "index.json"
+            index.write_text(json.dumps([{
+                "archive": archive.name, "gpu": 0x1000, "gpu_size": 16,
+                "gpu_chain": [[0x1000, 8], [0x2000, 8]],
+                "fmt_name": "BC1_UNORM", "w": 256, "h": 256,
+                "flags": 0, "data_off": 0,
+            }]), encoding="utf-8", newline="\n")
+            stderr = io.StringIO()
+            with mock.patch.object(tex_mode_probe, "load", return_value=({}, {})), \
+                    mock.patch.object(sys, "argv", ["tex_mode_probe.py", str(index), directory]), \
+                    mock.patch.object(sys, "stdout", io.StringIO()), \
+                    mock.patch.object(sys, "stderr", stderr):
+                with self.assertRaises(SystemExit) as exc:
+                    tex_mode_probe.main()
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn("cannot read texture blob", stderr.getvalue())
+                self.assertIn(missing_part.name, stderr.getvalue())
+
+                missing_part.write_bytes(bytes(8))
+                stderr.seek(0)
+                stderr.truncate()
+                self.assertIsNone(tex_mode_probe.main())
+                self.assertEqual(stderr.getvalue(), "")
+
     def test_probe_refuses_a_count_below_one_cli(self):
         for val in ["0", "-1", "x"]:
             with self.subTest(value=val):

@@ -106,7 +106,10 @@ def main():
     skipped = 0
     for t in texs:
         bpe = bc_bpe(t["fmt_name"])
-        G = gpu_blob(a.carve, t)
+        try:
+            G = gpu_blob(a.carve, t)
+        except OSError as error:
+            ap.error(f"cannot read texture blob: {error}")
         wb, hb = (t["w"] + 3) // 4, (t["h"] + 3) // 4
         mips = (t["flags"] >> 16) & 0xFF
         res = []
