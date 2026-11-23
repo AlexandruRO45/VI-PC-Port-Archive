@@ -200,6 +200,27 @@ class VCvtF32F64AstInterpreterTests(unittest.TestCase):
         wave.set_u32(0, 2, res_f32)
         self.assertEqual(wave.get_u32(0, 2), f32_to_u32(128.75))
 
+class VCvtF32F64SimdIeeeTests(unittest.TestCase):
+    def test_cvt_f32_f64_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x55555555
+        for i in range(32):
+            wave.set_u32(i, 2, 0xCAFEBABE)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_u32(i, 2, oracle_cvt_f32_f64(f64_to_u64(float(i))))
+        for i in range(32):
+            if (0x55555555 >> i) & 1:
+                self.assertEqual(wave.get_u32(i, 2), f32_to_u32(float(i)))
+            else:
+                self.assertEqual(wave.get_u32(i, 2), 0xCAFEBABE)
+
+    def test_cvt_f32_f64_overflow_and_underflow(self):
+        # Value exceeding float32 max (1e39 > 3.4028235e38) overflows to +inf
+        self.assertEqual(oracle_cvt_f32_f64(f64_to_u64(1e39)), F32_POS_INF)
+        self.assertEqual(oracle_cvt_f32_f64(f64_to_u64(-1e39)), F32_NEG_INF)
+        # Value smaller than float32 min subnormal underflows to 0.0
+        self.assertEqual(oracle_cvt_f32_f64(f64_to_u64(1e-50)), F32_POS_ZERO)
+
 
 if __name__ == "__main__":
     unittest.main()
