@@ -17,6 +17,18 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+def run_captured(args, **kwargs):
+    """Capture a child's text streams without failing on a non-UTF-8 host message.
+
+    A failed launch can emit a CP1252 diagnostic on Windows (0xdd is common in
+    system messages). Decoding the pipe as strict UTF-8 raises inside the reader
+    thread and leaves ``result.stdout`` as None, which hides the real failure.
+    """
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    return subprocess.run(args, **kwargs)
+
+
 class GuestSceneReferenceTest(unittest.TestCase):
     def test_trace_and_pixel_digest_at_scene_boundaries(self):
         # These records were read back independently on the RTX 5090 and Apple M3 Max.
@@ -78,6 +90,19 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
+    def test_captured_child_output_tolerates_non_utf8_bytes(self):
+        # The launcher's own diagnostics are not guaranteed to be UTF-8 on a
+        # Windows host. A strict decode used to raise here and leave stdout None.
+        child = (
+            "import os,sys; "
+            "os.write(1, b'prefix \\xdd suffix\\n'); "
+            "os.write(2, b'bad \\xdd\\n')"
+        )
+        result = run_captured([sys.executable, "-I", "-c", child], capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("prefix \ufffd suffix", result.stdout)
+        self.assertIn("bad \ufffd", result.stderr)
+
     def test_launch_failure_preserves_run_record_and_logs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -90,7 +115,7 @@ class GuestSceneReferenceTest(unittest.TestCase):
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader)]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            result = run_captured(cmd, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])
