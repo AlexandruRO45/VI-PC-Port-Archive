@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +79,18 @@ class MergeCheckTest(unittest.TestCase):
         with redirect_stdout(out):
             code = mc.main(["--repo", self.repo, "--main", "main", "--json", *pairs])
         return code, json.loads(out.getvalue())
+
+    def add_legacy_text(self, original_suffix, added_suffix):
+        path = Path(self.repo, "docs", "legacy.txt")
+        paragraph = PARAGRAPH.encode("ascii")
+        original = paragraph.replace(b"\n", original_suffix + b"\n")
+        separated = original + b"An unrelated line separates the two paragraphs.\n"
+        path.write_bytes(separated)
+        self.commit("Add legacy text")
+        self.git("checkout", "-q", "-b", "legacy")
+        path.write_bytes(separated + paragraph.replace(b"\n", added_suffix + b"\n"))
+        self.commit("Append text")
+        self.git("checkout", "-q", "main")
 
     def test_a_fresh_pr_is_clean(self):
         base = self.git("rev-parse", "main")
@@ -161,6 +174,40 @@ class MergeCheckTest(unittest.TestCase):
         self.git("checkout", "-q", "main")
         code, [result] = self.run_check("19=duplicate-separators")
         self.assertEqual((code, result["duplicates"]), (1, dict.fromkeys(paths, 3)))
+
+    def test_distinct_invalid_utf8_bytes_are_not_duplicates(self):
+        self.add_legacy_text(b"\xe9", b"\xe8")
+        code, [result] = self.run_check("20=legacy")
+        self.assertEqual((code, result["verdict"], result["duplicates"]), (0, "clean", {}))
+
+    def test_literal_replacement_character_is_distinct_from_invalid_utf8(self):
+        self.add_legacy_text(b"\xe9", "\ufffd".encode("utf-8"))
+        code, [result] = self.run_check("21=legacy")
+        self.assertEqual((code, result["verdict"], result["duplicates"]), (0, "clean", {}))
+
+    def test_identical_invalid_utf8_bytes_are_reported_in_json_and_text(self):
+        self.add_legacy_text(b"\xe9", b"\xe9")
+        samples = [line + "\ufffd" for line in PARAGRAPH.splitlines()]
+        code, [result] = self.run_check("22=legacy")
+        self.assertEqual((code, result["verdict"]), (1, "duplicates"))
+        self.assertEqual(result["duplicates"], {"docs/legacy.txt": 3})
+        self.assertEqual(result["duplicate_samples"], {"docs/legacy.txt": samples})
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = mc.main(["--repo", self.repo, "--main", "main", "22=legacy"])
+        self.assertEqual(code, 1)
+        self.assertIn("#22 duplicates:", out.getvalue())
+        self.assertIn("  docs/legacy.txt: 3 added line(s) already there in the same order, "
+                      f"e.g. {samples[0][:90]!r}\n", out.getvalue())
+
+    def test_minimum_length_counts_a_truncated_utf8_sequence_once(self):
+        self.add_legacy_text(b"\xe2\x82", b"\xe2\x82")
+        minimum = min(map(len, PARAGRAPH.splitlines())) + 1
+        code, [result] = self.run_check("--min-length", str(minimum), "23=legacy")
+        self.assertEqual((code, result["duplicates"]), (1, {"docs/legacy.txt": 3}))
+        code, [result] = self.run_check("--min-length", str(minimum + 1), "23=legacy")
+        self.assertEqual((code, result["duplicates"]), (0, {}))
 
     def test_a_block_the_pr_moves_is_not_a_duplicate(self):
         base = self.git("rev-parse", "main")

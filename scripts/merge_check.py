@@ -37,10 +37,10 @@ class GitError(Exception):
     pass
 
 
-def git(repo, *args, check=True):
+def git(repo, *args, check=True, stdout_errors="replace"):
     r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
     # Decode without universal-newline translation: a bare CR inside a Git line is content.
-    r.stdout = r.stdout.decode("utf-8", "replace")
+    r.stdout = r.stdout.decode("utf-8", stdout_errors)
     r.stderr = r.stderr.decode("utf-8", "replace")
     if check and r.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {r.stderr.strip() or r.returncode}")
@@ -80,6 +80,11 @@ def patch_destination(header):
     return name[2:] if name.startswith("b/") else None  # Deleted files say /dev/null.
 
 
+def report_text(line):
+    """Use the original UTF-8 replacement decoding for character counts and samples."""
+    return line.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 def duplicates(repo, main, tree, min_length, block=3):
     """{path: [line, ...]} for runs of `block` or more consecutive added lines (each at least `min_length` characters
     once stripped; blank lines skipped) that already stand in the same order in the same file on main: a paragraph,
@@ -87,9 +92,10 @@ def duplicates(repo, main, tree, min_length, block=3):
     legitimately."""
     found = {}
     hunks, path, added = {}, None, None
+    # Keep undecodable bytes distinct in both the added lines and the file contents.
     patch = git(repo, "-c", "core.quotePath=true", "diff", "--unified=0", "--no-color", "--no-renames",
                 "--src-prefix=a/", "--dst-prefix=b/", "--no-relative", "--no-ext-diff", "--no-textconv",
-                main, tree).stdout
+                main, tree, stdout_errors="surrogateescape").stdout
     for line in patch.split("\n"):
         if line.startswith("diff --git "):
             path, added = None, None
@@ -103,7 +109,7 @@ def duplicates(repo, main, tree, min_length, block=3):
             if text:
                 added.append(text)
     def windows(rev, path):
-        r = git(repo, "show", f"{rev}:{path}", check=False)
+        r = git(repo, "show", f"{rev}:{path}", check=False, stdout_errors="surrogateescape")
         lines = [l.strip() for l in r.stdout.split("\n") if l.strip()] if r.returncode == 0 else []
         return r.returncode == 0, Counter(tuple(lines[i:i + block]) for i in range(len(lines) - block + 1))
 
@@ -119,10 +125,11 @@ def duplicates(repo, main, tree, min_length, block=3):
                 run = tuple(added[i:i + block])
                 # Doubled: on main already, and more copies after the merge. A block the PR moves (deleted where
                 # it was, added elsewhere) keeps its count and is not reported.
-                if all(len(x) >= min_length for x in run) and before[run] and after[run] > before[run]:
+                if (before[run] and after[run] > before[run]
+                        and all(len(report_text(line)) >= min_length for line in run)):
                     for j in range(i, i + block):
                         marked[j] = True
-            same += [x for x, m in zip(added, marked) if m]
+            same += [report_text(x) for x, m in zip(added, marked) if m]
         if same:
             found[path] = same
     return found
