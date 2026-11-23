@@ -409,3 +409,46 @@ class TestCmpClassF32ASTAndScalar(unittest.TestCase):
     def test_scalar_sgpr_dst_hardware(self):
         val_sgpr, _ = run_cmp_shader("f32", 0xFF800000, CLASS_NEG_INF, is_cmpx=False, test_id="sgpr_dst")
         self.assertEqual(val_sgpr, 1)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f32 SIMD Divergence & 10-Bit Class Mapping
+# ------------------------------------------------------------------------------
+
+def step_cmp_class_f32_simd(wave: SIMDWaveClassLogic, insn: VCmpClassF32Instruction):
+    mask = insn.mask.value if isinstance(insn.mask, LiteralOperand) else wave.vgprs[insn.mask.index][0]
+    out_vcc = 0
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.vgprs[insn.src0.index][lane] & MASK32
+            if ref_cmp_class_f32(s0, mask):
+                out_vcc |= (1 << lane)
+    wave.vcc = out_vcc
+
+
+class TestCmpClassF32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveClassLogic(wave_size=32)
+        wave.vgprs[1][0] = 0x3F800000  # +1.0 (+normal)
+        wave.vgprs[1][1] = 0x80000000  # -0.0 (-zero)
+
+        insn = VCmpClassF32Instruction(
+            dst=RegisterOperand(OperandType.VCC),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        step_cmp_class_f32_simd(wave, insn)
+
+        val_lane0, _ = run_cmp_shader("f32", 0x3F800000, CLASS_POS_NORMAL, is_cmpx=False, test_id="simd_l0")
+        val_lane1, _ = run_cmp_shader("f32", 0x80000000, CLASS_POS_NORMAL, is_cmpx=False, test_id="simd_l1")
+        self.assertEqual(val_lane0, 1)
+        self.assertEqual(val_lane1, 0)
+        self.assertEqual(wave.vcc & 1, 1)
+        self.assertEqual((wave.vcc >> 1) & 1, 0)
+
+    def test_algebraic_complement_hardware(self):
+        # Normal floats vs Non-normal floats partition
+        val_norm, _ = run_cmp_shader("f32", 0x3F800000, CLASS_POS_NORMAL | CLASS_NEG_NORMAL, is_cmpx=False, test_id="norm_check")
+        val_inf, _ = run_cmp_shader("f32", 0x7F800000, CLASS_POS_NORMAL | CLASS_NEG_NORMAL, is_cmpx=False, test_id="inf_check")
+        self.assertEqual(val_norm, 1)
+        self.assertEqual(val_inf, 0)
