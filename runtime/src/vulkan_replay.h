@@ -1044,6 +1044,7 @@ struct PreparedDraw {
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
+    VkRect2D scissor{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
 
     // Back to a new draw's state, keeping the vectors' storage.
@@ -2155,9 +2156,22 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!a.view) return ReplayResult::unsupported;
         shrink(a.binding, draw.depth, a.range);
     }
-    if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
-        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
-                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+    // D3D rasterization implicitly scissors to the floored viewport edges (functional spec 15.7).
+    // Clip to nonnegative framebuffer coordinates before converting; floor the far edge after adding the origin.
+    const auto edge = [](float value) {
+        return static_cast<std::int32_t>(std::min(double(INT32_MAX), std::max(0.0, double(value))));
+    };
+    const Viewport& v = draw.viewport;
+    const Rect& s = draw.scissor;
+    const auto left = std::max(s.left, edge(v.x)), top = std::max(s.top, edge(v.y));
+    const auto right = std::min(s.right, edge(v.x + v.width)), bottom = std::min(s.bottom, edge(v.y + v.height));
+    p.scissor = {};
+    if (right > left && bottom > top)
+        p.scissor = {{left, top}, {std::uint32_t(right - left), std::uint32_t(bottom - top)}};
+    if (p.area.width == UINT32_MAX) {
+        // Without attachments, bound rendering by the effective scissor. Vulkan still needs a nonempty render area
+        // when no sample is covered; the empty scissor suppresses the fragments in that case.
+        p.area = p.scissor.extent.width ? VkExtent2D{std::uint32_t(right), std::uint32_t(bottom)} : VkExtent2D{1, 1};
     }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
@@ -4091,11 +4105,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const Viewport& v = draw->viewport;
             const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
             vk.set_viewport(command_buffer, 0, 1, &viewport);
-            const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
+            vk.set_scissor(command_buffer, 0, 1, &d.scissor);
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
             if (!draw->mesh) {

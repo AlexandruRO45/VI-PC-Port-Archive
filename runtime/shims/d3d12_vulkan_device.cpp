@@ -1739,7 +1739,8 @@ private:
 };
 
 class Resource final
-    : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
+    : public Child<Resource, ID3D12Resource1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource,
+                   ID3D12Resource1> {
 public:
     // {9b3e5f12-7c48-4d0e-a6b1-2f8d4c7e9a35}, shared with presentx_capture.cpp so the capture guard and this object
     // cannot drift.
@@ -2047,8 +2048,12 @@ public:
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
             create.format_list.pViewFormats = view_formats_.data();
-            create.format_list.pNext = info.pNext;
-            info.pNext = &create.format_list;
+            // The R9G9B9E5 emulation already chained format_list (TextureCreateInfo): relinking it would point it
+            // at itself, and a looped pNext chain hangs whatever walks it.
+            if (info.pNext != &create.format_list) {
+                create.format_list.pNext = info.pNext;
+                info.pNext = &create.format_list;
+            }
         }
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
@@ -2150,6 +2155,12 @@ public:
     // structure reports its real device address (instance descriptors and builds hand it to the driver); other
     // buffers report their console VA into the GPU address arena.
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+
+    // ID3D12Resource1: as for a heap, no resource belongs to a protected session (DXGI_ERROR_NOT_FOUND, null out).
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -2615,7 +2626,8 @@ bool equal_semantic(const std::string& a, const char* b) {
 // name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
 // their key, which keeps optimal-tiling images out of the arena's memory type.
 class Heap final
-    : public Child<Heap, ID3D12HeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap> {
+    : public Child<Heap, ID3D12Heap1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap,
+                   ID3D12Heap1> {
 public:
     // {5d20c7a4-8e13-4b6d-9f27-3a1c94e0b7d8}
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
@@ -2644,6 +2656,13 @@ public:
         desc.Properties.CreationNodeMask = 1;
         desc.Properties.VisibleNodeMask = 1;
         return desc;
+    }
+
+    // ID3D12Heap1: the layer has no protected resource sessions, so no heap belongs to one. The host runtime and
+    // WARP answer DXGI_ERROR_NOT_FOUND with a null interface for an unprotected heap, whatever the IID asked for.
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
     }
 
     bool reserved() const { return bool(allocation_); }
@@ -6857,6 +6876,16 @@ public:
             return E_OUTOFMEMORY;
         }
         return hand_out(heap, riid, out);
+    }
+
+    // Device4: CreateHeap with an optional protected session. The layer reports no protected-session support, so a
+    // session is refused as the committed-resource variants refuse one; without a session it is CreateHeap itself
+    // (the host runtime and WARP answer the same HRESULTs for the same arguments).
+    HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* session,
+                                          REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (session) return refuse_protected_session("CreateHeap1");
+        return CreateHeap(desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
