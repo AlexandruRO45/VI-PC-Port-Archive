@@ -149,6 +149,20 @@ class IidScan(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("ERROR", p.stderr)
 
+    def test_cli_unreadable_image_fails_cleanly(self):
+        missing = os.path.join(self.tmp.name, "no_such_image.dll")
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), missing,
+                            "--header", self.header], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn(f"ERROR: {missing}:", p.stderr)
+        # a directory is the other way to name something that is not an image
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), self.tmp.name,
+                            "--header", self.header], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn(f"ERROR: {self.tmp.name}:", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

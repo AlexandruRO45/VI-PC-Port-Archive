@@ -16,6 +16,7 @@ Usage:
     python -I tools/d3d12_iid_scan.py <image> [<image> ...] [--header PATH/d3d12.h] [--json OUT]
 
 Without --header it takes d3d12.h from the newest Windows SDK under "Windows Kits\10\Include".
+An image it cannot read (a missing path, a directory) stops the scan with `ERROR: <path>: <reason>` and exit 2.
 It also lists what each image imports from d3d12_xs.dll and warns when one of those imports could be IID data (an
 IID_* name, or an ordinal in the GUID range 23-115), because an IID taken from there would not show up here.
 """
@@ -149,7 +150,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(iids)} ID3D12 IIDs from {header}")
     results = []
     for path in args.images:
-        r = scan(path, iids)
+        try:
+            r = scan(path, iids)
+        except OSError as error:                    # a missing path, a directory, no permission
+            print(f"ERROR: {path}: {error.strerror or error}", file=sys.stderr)
+            return 2
         results.append(r)
         absent = [n for n, present in r["focus"].items() if not present]
         print(f"== {r['image']}: {len(r['found'])} found")
