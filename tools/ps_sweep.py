@@ -112,6 +112,22 @@ def run_dir(a, tag):
     return os.path.join(a.out, f"{tag}_{a.variant}{a.suffix}")
 
 
+def read_rows(path):
+    """The records of one results JSONL. A run killed mid-write leaves a partly written last line, so that line is
+    dropped instead of failing the resume; a broken line anywhere else is still an error."""
+    with open(path, encoding="utf-8") as f:
+        lines = [line for line in f if line.strip()]
+    rows = []
+    for n, line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            if n != len(lines) - 1:
+                raise
+            print(f"ignoring a partly written last line of {os.path.basename(path)}", file=sys.stderr)
+    return rows
+
+
 def cmd_run(a):
     ps = load_ps(a.spirv)
     with open(os.path.join(a.out, "sample.json"), encoding="utf-8") as f:
@@ -121,10 +137,7 @@ def cmd_run(a):
     cache = os.path.join(a.out, "vs")
     os.makedirs(cache, exist_ok=True)
     log = os.path.join(out_dir, f"results_{a.lo}.jsonl")
-    done = set()
-    if os.path.exists(log):
-        with open(log, encoding="utf-8") as f:
-            done = {json.loads(line)["i"] for line in f if line.strip()}
+    done = {r["i"] for r in read_rows(log)} if os.path.exists(log) else set()
     hi = a.hi or len(sample)
     for i, s in enumerate(sample):
         if i < a.lo or i >= hi or i in done or (a.only and i not in a.only):
@@ -221,12 +234,9 @@ def load_results(a, tag):
             continue
         for name in sorted(os.listdir(folder)):
             if name.startswith("results_") and name.endswith(".jsonl"):
-                with open(os.path.join(folder, name), encoding="utf-8") as f:
-                    for line in f:
-                        if line.strip():
-                            r = json.loads(line)
-                            r["dir"] = folder
-                            recs[r["i"]] = r
+                for r in read_rows(os.path.join(folder, name)):
+                    r["dir"] = folder
+                    recs[r["i"]] = r
     return recs
 
 
