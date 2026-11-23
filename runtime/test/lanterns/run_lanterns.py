@@ -342,8 +342,9 @@ def main(argv=None):
         return CLEANUP_EXIT
     conv = wine_path if a.wine else os.path.abspath
     env = dict(os.environ, LEONIDA_D3D12="vulkan", LEONIDA_SHADERS=conv(os.path.join(a.shaders, "spirv")))
-    cmd = (["wine"] if a.wine else []) + [a.gta6rt, "--run", conv(a.guest), "--", "--stage", str(a.stage),
-                                          "--shaders", conv(a.shaders), "--out", conv(run_dir)]
+    launcher = ["wine", a.gta6rt] if a.wine else [os.path.abspath(a.gta6rt)]
+    cmd = launcher + ["--run", conv(a.guest), "--", "--stage", str(a.stage),
+                      "--shaders", conv(a.shaders), "--out", conv(run_dir)]
     if a.wine:
         stuck = stop_wineserver(env)
         if stuck:

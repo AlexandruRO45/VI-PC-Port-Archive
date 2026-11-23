@@ -145,6 +145,21 @@ class StalledLauncher(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(out, run, "gta6rt-stage1.stdout")))
 
 
+class NativeLauncher(unittest.TestCase):
+    def test_relative_launcher_uses_the_checked_file(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
+            os.makedirs("bin")
+            fake = "bin/gta6rt.exe"  # Forward slashes, including on Windows.
+            open(fake, "wb").close()
+            os.makedirs("shaders/spirv")
+            open("shaders/spirv/index.json", "wb").close()
+            with mock.patch.object(run_lanterns, "become_subreaper", return_value=True), \
+                    mock.patch.object(run_lanterns, "run", return_value=(0, "", "", False, [])) as launch, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                run_lanterns.main(["--gta6rt", fake, "--guest", fake, "--shaders", "shaders", "--out", "out"])
+            self.assertEqual(launch.call_args.args[0][0], os.path.abspath(fake))
+
+
 class Transcript(unittest.TestCase):
     def test_only_a_complete_transcript_passes(self):
         check = run_lanterns.check_transcript
