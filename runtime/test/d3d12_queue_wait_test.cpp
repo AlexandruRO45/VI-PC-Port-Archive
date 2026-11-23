@@ -12,19 +12,29 @@ template<class T> struct Ref {
     T* operator->() const { return p; }
 };
 
-bool wait_for(ID3D12Fence* fence, UINT64 value, DWORD timeout_ms = 3000) {
+bool wait_for(ID3D12Fence* fence, UINT64 value, DWORD timeout_ms = 3000, bool expect_timeout = false) {
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event) return false;
     if (FAILED(fence->SetEventOnCompletion(value, event))) {
         CloseHandle(event);  // no wait was registered
         return false;
     }
-    if (WaitForSingleObject(event, timeout_ms) != WAIT_OBJECT_0) {
+    const DWORD result = WaitForSingleObject(event, timeout_ms);
+    if (result != WAIT_OBJECT_0) {
         // The fence dispatcher can still hold this event, and a queued GPU Wait can keep the queue destructor
-        // blocked forever. End the failed test without closing live handles or waiting for blocked queues.
-        std::fputs("cross-queue Wait-before-Signal timed out\n", stderr);
+        // blocked forever. Exit without closing live handles or waiting for blocked queues.
+        if (result == WAIT_TIMEOUT) {
+            if (expect_timeout) {
+                std::puts("unsignaled fence timed out as expected");
+                std::fflush(stdout);
+                std::_Exit(EXIT_SUCCESS);
+            }
+            std::fputs("cross-queue Wait-before-Signal timed out\n", stderr);
+        } else {
+            std::fprintf(stderr, "fence wait failed (status %lu, error %lu)\n", result, GetLastError());
+        }
         std::fflush(stderr);
-        std::_Exit(1);
+        std::_Exit(EXIT_FAILURE);
     }
     CloseHandle(event);
     return true;
@@ -36,10 +46,15 @@ int main(int argc, char** argv) {
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device.p)))) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--timeout-control") == 0) {
         Ref<ID3D12Fence> never_signaled;
-        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&never_signaled.p)))) return 1;
-        // Expected to leave the process with code 1 promptly, without destroying the pending event.
-        wait_for(never_signaled.p, 1, 20);
-        return 0;  // a completed wait here means the control did not exercise the timeout path
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&never_signaled.p)))) {
+            std::fputs("could not create the timeout control fence\n", stderr);
+            return EXIT_FAILURE;
+        }
+        // A genuine timeout exits successfully without destroying the pending event.
+        const bool completed = wait_for(never_signaled.p, 1, 20, true);
+        std::fputs(completed ? "unsignaled fence completed unexpectedly\n" :
+                             "could not register the timeout control wait\n", stderr);
+        return EXIT_FAILURE;
     }
     D3D12_COMMAND_QUEUE_DESC desc{};
     Ref<ID3D12CommandQueue> copy, compute, direct_a, direct_b;

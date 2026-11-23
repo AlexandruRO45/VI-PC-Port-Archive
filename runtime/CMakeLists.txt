@@ -1086,7 +1086,7 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_queue_wait COMMAND d3d12_queue_wait_test)
     set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
-    set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
+    set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 10)
     # Wait-before-Signal with a texture and a buffer handed over between the COPY, COMPUTE and DIRECT queues, in every
     # submission order, on the layer and on the host runtime (docs/d3d12_vulkan.md section 4.4).
     add_executable(d3d12_queue_handover_test test/d3d12_queue_handover_test.cpp)
