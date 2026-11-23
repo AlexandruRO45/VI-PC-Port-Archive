@@ -204,5 +204,50 @@ class VSubCoU32AstInterpreterTests(unittest.TestCase):
         self.assertEqual(out[1], 0)
 
 
+class VSubCoU32SimdBoundaryTests(unittest.TestCase):
+    """SIMD boundary extremes and clamp saturation for v_sub_co_u32."""
+
+    def test_boundary_extremes_translator(self):
+        cases = [
+            (0, 0, 0, 0),
+            (0, 1, 0xFFFFFFFF, 1),
+            (1, 0, 1, 0),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0, 0),
+            (0x80000000, 1, 0x7FFFFFFF, 0),
+            (0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 1),
+        ]
+        for x, y, exp_d, exp_b in cases:
+            out = run_prog([
+                f"v_mov_b32 v0, {x:#x}",
+                f"v_mov_b32 v1, {y:#x}",
+                "v_sub_co_u32 v2, vcc, v0, v1",
+                "v_mov_b32 v0, v2",
+                "v_cndmask_b32 v1, 0, 1, vcc",
+            ])
+            self.assertEqual(out[0], exp_d, f"Failed diff for {x:#x} - {y:#x}")
+            self.assertEqual(out[1], exp_b, f"Failed borrow for {x:#x} - {y:#x}")
+
+    def test_clamp_saturation_translator(self):
+        out_borrow = run_prog([
+            "v_mov_b32 v0, 10",
+            "v_mov_b32 v1, 50",
+            "v_sub_co_u32 v2, vcc, v0, v1 clamp",
+            "v_mov_b32 v0, v2",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out_borrow[0], 0)
+        self.assertEqual(out_borrow[1], 1)
+
+        out_noborrow = run_prog([
+            "v_mov_b32 v0, 50",
+            "v_mov_b32 v1, 10",
+            "v_sub_co_u32 v2, vcc, v0, v1 clamp",
+            "v_mov_b32 v0, v2",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out_noborrow[0], 40)
+        self.assertEqual(out_noborrow[1], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
