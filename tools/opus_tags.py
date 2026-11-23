@@ -47,6 +47,13 @@ STREAM_FILE = re.compile(r"^([0-9A-Fa-f]{8})(?:~\d+)?\.ogg$")   # <id>~2 ...: a 
 MAX_PACKET = 255 * 255 - 1          # lacing values of one page: 254 full segments and a final short one
 
 
+def error_text(error: Exception) -> str:
+    """`path: reason` for an OSError, without the repr() that doubles every backslash of a Windows path."""
+    if isinstance(error, OSError) and error.filename is not None and error.strerror:
+        return f"{error.filename}: {error.strerror}"
+    return str(error)
+
+
 def clean(text: str) -> str:
     return SPACES.sub(" ", MARKUP.sub(" ", text)).strip()
 
@@ -229,12 +236,12 @@ def main(argv=None) -> int:
         names, ambiguous = load_names(a.names, a.source)
         dialogue, langs = load_dialogue(a.dialogue) if a.dialogue else ({}, [])
     except (OSError, KeyError, ValueError) as e:
-        print(f"opus_tags: error: cannot read a CSV: {e}", file=sys.stderr)
+        print(f"opus_tags: error: cannot read a CSV: {error_text(e)}", file=sys.stderr)
         return 2
     try:
         stats = tag_folder(a.opus, names, dialogue, langs, a.dry_run, ambiguous)
     except OSError as e:
-        print(f"opus_tags: error: {e}", file=sys.stderr)
+        print(f"opus_tags: error: {error_text(e)}", file=sys.stderr)
         return 2
     for k, v in stats.items():
         print(f"{k:32} {v:,}")

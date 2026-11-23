@@ -58,6 +58,13 @@ DERIVED_SUFFIXES = ("_lod", "_slod")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
+def error_text(error: Exception) -> str:
+    """`path: reason` for an OSError, without the repr() that doubles every backslash of a Windows path."""
+    if isinstance(error, OSError) and error.filename is not None and error.strerror:
+        return f"{error.filename}: {error.strerror}"
+    return str(error)
+
+
 def joaat(text: str, *, case_sensitive: bool = False) -> int:
     """Jenkins one-at-a-time joaat over the engine's name bytes.
 
@@ -672,7 +679,7 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {error_text(exc)}", file=sys.stderr)
         return 1
 
 

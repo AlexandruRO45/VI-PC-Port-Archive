@@ -59,6 +59,13 @@ CONFIDENCES = ("verified", "anchored", "bracketed", "positional")
 FIELDS = ["source", "offset", "size", "path", "confidence", "width", "height", "frames"]
 REPORT_FIELDS = ["source", "offset", "size", "width", "height", "frames"]
 
+
+def error_text(error):
+    """`path: reason` for an OSError, without the repr() that doubles every backslash of a Windows path."""
+    if isinstance(error, OSError) and error.filename is not None and error.strerror:
+        return f"{error.filename}: {error.strerror}"
+    return str(error)
+
 PIN_SCORE = 50.0
 HINT_SCORE = 3.0
 SNAPMATIC_SCORE = 2.0
@@ -389,7 +396,7 @@ def main(argv=None):
     try:
         names = read_mount_lists(a.mount)
     except (OSError, ValueError) as error:
-        print(f"bink_names: error: {error}", file=sys.stderr)
+        print(f"bink_names: error: {error_text(error)}", file=sys.stderr)
         return 1
     try:
         streams = load_streams(a.source, skip_report=a.out if a.out and os.path.isfile(a.out) else None)
