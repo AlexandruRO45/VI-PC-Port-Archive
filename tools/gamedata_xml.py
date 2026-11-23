@@ -21,6 +21,7 @@ no game data.
 """
 import argparse
 import csv
+import errno
 import io
 import json
 import os
@@ -39,6 +40,8 @@ import gamedata_index as gi  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
+# The RPF9 tag as it sits on disk: "RPF9" stored little-endian (docs/rpf.md, tools/rpf9_carve.py MAGIC).
+RPF9_MAGIC = b"9FPR"
 MACRO_REF = re.compile(r"\$\(([A-Za-z_][\w.-]*)\)")
 PLATFORM_REF = re.compile(r"platform:/([A-Za-z0-9_.-]+)?")
 XI_INCLUDE = "{http://www.w3.org/2001/XInclude}include"
@@ -553,6 +556,15 @@ def document_mode(targets: list) -> str:
     return "files"
 
 
+def is_rpf9(path: str) -> bool:
+    """Whether the file starts with the RPF9 tag: never an XML document, only a carve source."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(RPF9_MAGIC)) == RPF9_MAGIC
+    except OSError:
+        return False
+
+
 def load_documents(targets: list):
     """Yield one document per XML payload. Directories with index.json use the carve path."""
     for target in targets:
@@ -564,6 +576,11 @@ def load_documents(targets: list):
                 for path in xml_files(target):
                     yield file_document(path)
         elif os.path.isfile(target):
+            if is_rpf9(target):
+                # An archive is not one big malformed document: catalogs and readers would report an
+                # empty corpus (or one uncatalogued row) instead of saying how to read it.
+                raise OSError(errno.EINVAL, "an RPF9 archive, not an XML document; carve it with "
+                              "rpf9_carve.py and pass the carve directory", target)
             yield file_document(target)
         else:
             raise FileNotFoundError(target)
