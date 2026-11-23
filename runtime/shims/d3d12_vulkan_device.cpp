@@ -7923,26 +7923,128 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
 
 namespace {
 
-// Whether the loader lists the instance layer `name` (vkEnumerateInstanceLayerProperties).
-bool instance_layer_listed(PFN_vkGetInstanceProcAddr get, const char* name) {
+// What LEONIDA_VK_VALIDATION=1 adds to the instance: the layer, when the loader lists it, and the
+// synchronization-validation request (VkValidationFeaturesEXT) only where a validation layer is there to read it.
+struct ValidationRequest {
+    bool layer = false;              // ask for VK_LAYER_KHRONOS_validation by name
+    bool features = false;           // chain VkValidationFeaturesEXT
+    bool features_extension = false; // and enable VK_EXT_validation_features, which the listed layer provides
+};
+
+// Whether the instance extension `name` is listed, by the loader (`layer` null) or by `layer`.
+bool instance_extension_listed(PFN_vkGetInstanceProcAddr get, const char* layer, const char* name) {
+    const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+        get(nullptr, "vkEnumerateInstanceExtensionProperties"));
+    std::uint32_t count = 0;
+    if (!enumerate || enumerate(layer, &count, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkExtensionProperties> extensions(count);
+    if (enumerate(layer, &count, extensions.data()) < VK_SUCCESS) return false;
+    extensions.resize(count);
+    for (const auto& e : extensions)
+        if (!std::strcmp(e.extensionName, name)) return true;
+    return false;
+}
+
+// Counts the validation errors reported to unlisted_validation_layer_active's messenger.
+VKAPI_ATTR VkBool32 VKAPI_CALL count_validation_error(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                      VkDebugUtilsMessageTypeFlagsEXT types,
+                                                      const VkDebugUtilsMessengerCallbackDataEXT*, void* errors) {
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
+        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
+        ++*static_cast<unsigned*>(errors);
+    return VK_FALSE;
+}
+
+// Whether a validation layer the loader does not list is active anyway (under Wine: the host's layer, which the host's
+// loader enables when VK_INSTANCE_LAYERS names it; Wine passes no VK_* variable into the Windows environment, so this
+// process cannot read it). On an instance of its own, a second messenger with no severity bits breaks
+// VUID-VkDebugUtilsMessengerCreateInfoEXT-messageSeverity-requiredbitmask: a validation layer reports it to the first
+// messenger, the loader alone accepts it.
+bool unlisted_validation_layer_active(PFN_vkGetInstanceProcAddr get) {
+    if (!instance_extension_listed(get, nullptr, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) return false;
+    const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "gta6rt validation probe";
+    app.apiVersion = VK_API_VERSION_1_1;
+    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    VkInstanceCreateInfo info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    info.pApplicationInfo = &app;
+    info.enabledExtensionCount = 1;
+    info.ppEnabledExtensionNames = &debug_utils;
+    VkInstance instance = VK_NULL_HANDLE;
+    if (!create_instance || create_instance(&info, nullptr, &instance) != VK_SUCCESS) return false;
+    const auto destroy_instance = reinterpret_cast<PFN_vkDestroyInstance>(get(instance, "vkDestroyInstance"));
+    const auto create_messenger =
+        reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(get(instance, "vkCreateDebugUtilsMessengerEXT"));
+    const auto destroy_messenger =
+        reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(get(instance, "vkDestroyDebugUtilsMessengerEXT"));
+    unsigned errors = 0;
+    if (create_messenger && destroy_messenger) {
+        VkDebugUtilsMessengerCreateInfoEXT listener{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        listener.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        listener.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
+        listener.pfnUserCallback = count_validation_error;
+        listener.pUserData = &errors;
+        VkDebugUtilsMessengerEXT first = VK_NULL_HANDLE, second = VK_NULL_HANDLE;
+        if (create_messenger(instance, &listener, nullptr, &first) == VK_SUCCESS) {
+            VkDebugUtilsMessengerCreateInfoEXT invalid = listener;
+            invalid.messageSeverity = 0;
+            if (create_messenger(instance, &invalid, nullptr, &second) == VK_SUCCESS && second)
+                destroy_messenger(instance, second, nullptr);
+            destroy_messenger(instance, first, nullptr);
+        }
+    }
+    destroy_instance(instance, nullptr);
+    return errors > 0;
+}
+
+// Asking for a layer the loader does not list fails vkCreateInstance (VK_ERROR_LAYER_NOT_PRESENT), and with it the
+// whole device. Wine's vulkan-1.dll lists no layers and refuses every explicit one; a Windows machine without the
+// Vulkan SDK has none to list. So the layer is asked for only when listed; otherwise the device relies on a layer
+// enabled outside this program, if unlisted_validation_layer_active finds one. VkValidationFeaturesEXT goes on the
+// instance only for a layer that is there: with VK_EXT_validation_features from the listed layer, or, for an
+// unlisted one, without it, because the loader lists no layer extension then (Wine passes the structure on to the
+// host's layer, which turns synchronization validation on).
+ValidationRequest choose_validation(PFN_vkGetInstanceProcAddr get, const char* layer) {
+    ValidationRequest request;
     const auto enumerate =
         reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(get(nullptr, "vkEnumerateInstanceLayerProperties"));
-    if (!enumerate) return false;
     std::uint32_t count = 0;
-    if (enumerate(&count, nullptr) != VK_SUCCESS) return false;
-    std::vector<VkLayerProperties> layers(count);
-    if (enumerate(&count, layers.data()) < VK_SUCCESS) return false;
-    layers.resize(count);
-    for (const auto& l : layers)
-        if (!std::strcmp(l.layerName, name)) return true;
-    return false;
+    std::vector<VkLayerProperties> layers;
+    VkResult result = enumerate ? enumerate(&count, nullptr) : VK_ERROR_INITIALIZATION_FAILED;
+    if (result == VK_SUCCESS) {
+        layers.resize(count);
+        result = enumerate(&count, layers.data());
+        layers.resize(result < VK_SUCCESS ? 0 : count);
+    }
+    if (result < VK_SUCCESS)
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: vkEnumerateInstanceLayerProperties failed (VkResult "
+                             "%d)\n", static_cast<int>(result));
+    for (const auto& l : layers) request.layer = request.layer || !std::strcmp(l.layerName, layer);
+    if (request.layer) {
+        request.features_extension = request.features =
+            instance_extension_listed(get, layer, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: %s enabled%s\n", layer,
+                     request.features ? " with synchronization validation" : "");
+    } else if (unlisted_validation_layer_active(get)) {
+        request.features = true;
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list %s, but a validation "
+                             "layer is active (enabled outside this program: under Wine, the host's), so the device "
+                             "asks it for synchronization validation\n", layer);
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list %s and no validation "
+                             "layer is active, so validation is off (under Wine: set VK_INSTANCE_LAYERS=%s before "
+                             "wine; on Windows: install the Vulkan SDK)\n", layer, layer);
+    }
+    return request;
 }
 
 }  // namespace
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
 // VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation when the
-// loader lists it; otherwise the device is made without it and a warning says why.
+// loader lists it, and otherwise says on stderr which layer it relies on or that validation is off
+// (choose_validation).
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -8008,24 +8110,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     validation_features.pEnabledValidationFeatures = &sync_validation;
     char validation[8] = {};
     size_t length = 0;
-    if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
-        // The layer reads the synchronization-validation request however it was enabled: by this instance, or by the
-        // environment (VK_INSTANCE_LAYERS), which is the only way under Wine.
-        instance_info.pNext = &validation_features;
-        if (instance_layer_listed(get, layer)) {
-            instance_info.enabledLayerCount = 1;
-            instance_info.ppEnabledLayerNames = &layer;
-            std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: VK_LAYER_KHRONOS_validation enabled\n");
-        } else {
-            // Asking for a layer the loader does not list fails vkCreateInstance (VK_ERROR_LAYER_NOT_PRESENT), and
-            // with it the whole device. Wine's vulkan-1.dll lists no layers and refuses every explicit one; a Windows
-            // machine without the Vulkan SDK has none to list.
-            std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list "
-                                 "VK_LAYER_KHRONOS_validation, so the device is created without asking for it; "
-                                 "validation runs only if the layer is enabled outside this program (under Wine: "
-                                 "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation set before wine; on Windows: install "
-                                 "the Vulkan SDK)\n");
-        }
+    const ValidationRequest validation_request =
+        getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0'
+            ? choose_validation(get, layer)
+            : ValidationRequest{};
+    if (validation_request.features) instance_info.pNext = &validation_features;
+    if (validation_request.layer) {
+        instance_info.enabledLayerCount = 1;
+        instance_info.ppEnabledLayerNames = &layer;
     }
     // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
     const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
@@ -8041,6 +8133,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
     const bool instance_has_surface = !inst_exts.empty();
     if (has_debug_utils) inst_exts.push_back(debug_utils);
+    if (validation_request.features_extension) inst_exts.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
     instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
     instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     OwnedRuntime owned{};

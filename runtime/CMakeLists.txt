@@ -2120,7 +2120,9 @@ if(TARGET Vulkan::Headers)
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" ${_trace_runner})
         set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
         # The same run with LEONIDA_VK_VALIDATION=1: under Wine the device must still be created (Wine refuses the
-        # explicit layer; the host's layer comes from VK_INSTANCE_LAYERS), and no validation error may be printed.
+        # explicit layer; the host's layer comes from VK_INSTANCE_LAYERS), the layer must show it was active, and no
+        # validation error may be printed; skipped (77) where no layer is active. A run of its own, because the layer
+        # is chosen when the process starts; tiny_frame is the cheapest guest (one clear and one readback).
         add_test(NAME run_tiny_frame_validation COMMAND "${Python3_EXECUTABLE}" -I
                  "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" --validation ${_trace_runner})

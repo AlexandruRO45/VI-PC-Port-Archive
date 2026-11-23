@@ -194,12 +194,13 @@ check against Wine's vkd3d or vkd3d-proton here, not Microsoft's runtime, so som
 
 Under Wine, `LEONIDA_VK_VALIDATION=1` cannot enable the validation layer by itself: Wine's `vulkan-1.dll` lists no
 layers and refuses every layer a program asks for (`vkCreateInstance` returns `VK_ERROR_LAYER_NOT_PRESENT`; with
-`WINEDEBUG=fixme+vulkan`, "Loading explicit layers is not supported!", Wine 11 `dlls/win32u/vulkan.c`). The Vulkan
-device then says so on stderr and is created without the layer. Load the host's Linux layer instead, through the
-host's loader, by setting `VK_INSTANCE_LAYERS` before `wine` (and `VK_LAYER_PATH` to the SDK's
-`share/vulkan/explicit_layer.d` if the layer isn't installed system-wide). The device still asks for synchronization
-validation, which reaches the host layer, and the layer prints its messages to stdout. Checked with Wine 11.0 and
-SDK 1.4.363.1 on an RTX 5080:
+`WINEDEBUG=fixme+vulkan`, "Loading explicit layers is not supported!", Wine 11 `dlls/win32u/vulkan.c`). Load the
+host's Linux layer instead, through the host's loader, by setting `VK_INSTANCE_LAYERS` before `wine` (and
+`VK_LAYER_PATH` to the SDK's `share/vulkan/explicit_layer.d` if the layer isn't installed system-wide). Wine passes
+no `VK_*` variable into the Windows environment, so the Vulkan device finds out on its own: it makes one deliberately
+invalid call on a throwaway instance and, when a layer reports it, asks that layer for synchronization validation
+(Wine passes `VkValidationFeaturesEXT` on). It says on stderr which way it went, and "validation is off" when no
+layer is active. The layer prints its messages to stdout. Checked with Wine 11.0 and SDK 1.4.363.1 on an RTX 5080:
 
 ```sh
 cd runtime/build/windows/fixtures/game/RelWithDebInfo
@@ -207,9 +208,18 @@ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation LEONIDA_VK_VALIDATION=1 LEONIDA_D
   xvfb-run -a wine ../../../gta6rt.exe --run tiny_frame.exe --trace-d3d12
 ```
 
-`ctest -R run_tiny_frame_validation` runs that and fails on any `Validation Error` line. The Windows test programs
-that count validation errors themselves (`vk_test_device.h`) still need the layer listed, so under Wine they stop with
-"LEONIDA_VK_VALIDATION is set but VK_LAYER_KHRONOS_validation is not installed".
+`ctest -R run_tiny_frame_validation` runs that with the layer's information messages on, passes only when the layer's
+`CURRENT-VALIDATION-ENABLED` report (with Synchronization) shows it was active, fails on any `Validation Error`
+line, and skips (77) where no layer is active.
+
+Start each `xvfb-run` with the prefix's Wine processes gone (`WINEPREFIX=... wineserver -k`, or `wineserver -w` to
+wait), or run everything under one `xvfb-run` as `ctest` does. `xvfb-run -a` gives every run its own X display and
+closes it when the run ends, while the prefix's `wineserver` and `explorer.exe` stay a few seconds longer, still
+on that display. A program started in that window can block in its first Vulkan call (in `wine_vk_init`,
+`winevulkan/loader.c`) and never return; it then looks like a hang at device creation, with or without validation.
+With Wine 11.0 on an RTX 5080, 20 runs of `d3d12_com_test` back to back (each under its own `xvfb-run -a`, no
+validation): the first passed and the other 19 hung; once one has hung, the next ones hang too. The same 20 runs with
+`wineserver -k` before each: all passed.
 
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
@@ -447,7 +457,8 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | Validation errors without a VUID, or messages from a layer you didn't ask for | An implicit Vulkan layer from other software (Rockstar Social Club, ReShade, MangoHud, an overlay) | Set `VK_LOADER_LAYERS_DISABLE=~implicit~`. Overlays that hook the swapchain (RivaTuner `VK_LAYER_RTSS`, OBS `VK_LAYER_OBS_HOOK`) can stay loaded: see the next row |
 | Validation errors that only your machine shows (e.g. `xbox_present`'s sRGB swapchain `STORAGE` message), with MSI Afterburner/RivaTuner or OBS installed | An overlay layer that hooks the swapchain: while RivaTuner Statistics Server is running, its `VK_LAYER_RTSS` adds `STORAGE` usage to it (OBS's `VK_LAYER_OBS_HOOK` injects `VK_IMAGE_USAGE_STORAGE_BIT` too). In an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE` (`VK_LOADER_DEBUG=all` says so), so `~implicit~` leaves the layer in | Run the tests from a normal terminal, close the overlay application, or set the layer's own switch, which works elevated too: `DISABLE_RTSS_LAYER=1`, `DISABLE_VULKAN_OBS_CAPTURE=1` (OBS). Any other layer's switch is the `disable_environment` entry in its manifest (the JSON listed under `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers` or `HKCU\...`). `VK_LOADER_DEBUG=layer` prints the layers that were actually inserted |
 | `vk_sync_validation` fails with `LEONIDA_VK_VALIDATION=1` ("the write-after-write hazard was not reported") | Synchronization validation is off although the tests ask for it: an older layer, or a layer setting such as `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=false` or a `vk_layer_settings.txt` that overrides it. Every other GPU test then reports "0 validation errors" without having been checked | Remove the override or update the Vulkan SDK, then rerun `ctest -R vk_sync_validation` until it passes |
-| With `LEONIDA_VK_VALIDATION=1`, `[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list VK_LAYER_KHRONOS_validation`, and no validation messages | The loader has no such layer to give the program: Wine's `vulkan-1.dll` (it refuses every explicit layer), or Windows without the Vulkan SDK. The device is created without validation; before, this failed `D3D12XboxCreateDevice` with `0x80004005` | Under Wine, set `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` before `wine` (see "The Windows runtime on Linux"); on Windows, install the Vulkan SDK |
+| With `LEONIDA_VK_VALIDATION=1`, `[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list VK_LAYER_KHRONOS_validation and no validation layer is active, so validation is off` | The loader has no such layer to give the program: Wine's `vulkan-1.dll` (it refuses every explicit layer), or Windows without the Vulkan SDK, and no layer was enabled from outside. The device is created without validation; before, this failed `D3D12XboxCreateDevice` with `0x80004005` | Under Wine, set `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` before `wine` (see "The Windows runtime on Linux"); on Windows, install the Vulkan SDK |
+| A program under `xvfb-run -a wine` never gets past its first Vulkan call (device creation), and `winedbg --command "bt all"` shows it in `wine_vk_init` | It started while the prefix's `wineserver`/`explorer.exe` from the previous `xvfb-run` were still alive on that run's closed X display | `WINEPREFIX=... wineserver -k` (or `-w`) before each `xvfb-run`, or one `xvfb-run` around all the runs |
 | On RADV with Mesa 25.2 (Ubuntu 24.04's default; 25.2.8 measured) or 25.3 (from the source, not run), `cs_w32_salu64` fails with word 2 = `0` (want `0xFFFFFFFF`) and `cs_signed_zero_nan` fails with word 5 = `0` (want `1`) | Two Mesa bugs, not translator bugs (#166). `cs_w32_salu64`: ACO's `combine_add_sub_b2i` reads a temporary without counting the use, so dead-code elimination removes it (`ACO ERROR: ... never defined` with `MESA_SHADER_CACHE_DISABLE=true`); `RADV_DEBUG=llvm` passes. `cs_signed_zero_nan`: NIR's range analysis (`fmul_is_a_number`) calls `0 * x` a number when `x` may be infinite, so the `x != x` check folds to false despite `SignedZeroInfNanPreserve`. The same NIR code is behind llvmpipe's word 5 (#664) | Expected with these Mesa versions. From the source, the ACO function is gone from Mesa 26.0 and the NIR code was replaced in 26.1 (neither run); RADV from Mesa 26.3.1 passes both on an 8060S (gfx1151) |
 | Every test crashes inside `libnvidia-eglcore.so` | NVIDIA's 535 server driver (Ubuntu 24.04's default) | Use driver 615 or newer |
 | `build.py`: 0 translated, reason `.text` | An old `build.py` with LLVM 19 | Update to current `main` |

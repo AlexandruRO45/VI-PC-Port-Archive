@@ -9,9 +9,11 @@ order. Exits 77 (ctest: skipped) when --probe, one of the Vulkan device tests, s
 there is no usable Vulkan device on this machine.
 
 --validation runs it with LEONIDA_VK_VALIDATION=1 and VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation (unless already
-set): the device must still be created, the runtime must say whether it enabled the layer itself or why it did not (a
-loader that lists no such layer: Wine's vulkan-1.dll, or Windows without the Vulkan SDK), and no validation error may
-be printed. Under Wine only the environment variable reaches the layer, through the host's loader.
+set; under Wine only the environment variable reaches the layer, through the host's loader), with the layer's
+information messages on. It passes only when the layer shows it was active in that process: its
+CURRENT-VALIDATION-ENABLED report, with Synchronization among the enabled checks. No validation error may be printed.
+It exits 77 when no validation layer was active (none installed, or a layer too old to report), instead of passing a
+run that nothing validated.
 """
 
 import argparse
@@ -22,9 +24,25 @@ import sys
 
 SKIP = 77
 
-# What the runtime prints when LEONIDA_VK_VALIDATION=1: it enabled the layer, or the loader does not list it.
-VALIDATION_ENABLED = "[rt] d3d12: LEONIDA_VK_VALIDATION: VK_LAYER_KHRONOS_validation enabled"
-VALIDATION_UNLISTED = "[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list VK_LAYER_KHRONOS_validation"
+# The runtime's line about LEONIDA_VK_VALIDATION=1 (choose_validation in d3d12_vulkan_device.cpp), and the layer's
+# report of the checks it runs, printed at vkCreateInstance when information messages are on.
+VALIDATION_LINE = "[rt] d3d12: LEONIDA_VK_VALIDATION: "
+VALIDATION_OFF = "so validation is off"
+LAYER_REPORT = "CURRENT-VALIDATION-ENABLED"
+
+
+def validation_checks(lines):
+    """The checks the validation layer reported as enabled, or None when it reported nothing (no layer was active)."""
+    checks = None
+    for index, line in enumerate(lines):
+        if LAYER_REPORT in line:  # the last report is the device's instance (the runtime may probe on another first)
+            checks = []
+            for following in lines[index + 1:]:
+                if following.startswith("  - "):
+                    checks.append(following[4:].strip())
+                elif checks:
+                    break
+    return checks
 
 # The first frame, in the order the fixture makes the calls, as the trace words them (`called` for a method that
 # returns nothing). Other traced calls, such as the queue and fence proxies' own entries, may sit between them.
@@ -77,9 +95,10 @@ def check_output(code, output, validation=False):
     problems = []
     lines = output.replace("\r\n", "\n").split("\n")
     if validation:
-        if not any(line.startswith((VALIDATION_ENABLED, VALIDATION_UNLISTED)) for line in lines):
-            problems.append("LEONIDA_VK_VALIDATION=1, but the runtime said neither that it enabled the layer "
-                            "nor why not")
+        if not any(line.startswith(VALIDATION_LINE) for line in lines):
+            problems.append("LEONIDA_VK_VALIDATION=1, but the runtime said nothing about the validation layer")
+        if "Synchronization" not in (validation_checks(lines) or ["Synchronization"]):
+            problems.append("the validation layer ran without synchronization validation, which the device asks for")
         errors = [line for line in lines if "Validation Error" in line]
         if errors:
             problems.append(f"{len(errors)} validation error(s), the first: {errors[0]}")
@@ -129,10 +148,18 @@ def main():
     if options.validation:
         environment["LEONIDA_VK_VALIDATION"] = "1"
         environment.setdefault("VK_INSTANCE_LAYERS", "VK_LAYER_KHRONOS_validation")
+        environment["VK_KHRONOS_VALIDATION_REPORT_FLAGS"] = "error,warn,info"
     run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
                          cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
                          text=True, encoding="utf-8", errors="replace", timeout=timeout)
     output = run.stdout + run.stderr
+    lines = output.replace("\r\n", "\n").split("\n")
+    if options.validation and validation_checks(lines) is None:
+        print(output)
+        off = any(line.startswith(VALIDATION_LINE) and VALIDATION_OFF in line for line in lines)
+        print("SKIP: no validation layer was active in the run" + (" (the runtime says validation is off)" if off else
+              " (it printed no CURRENT-VALIDATION-ENABLED report)"))
+        return SKIP
     problems = check_output(run.returncode, output, options.validation)
     if problems:
         print(output)
