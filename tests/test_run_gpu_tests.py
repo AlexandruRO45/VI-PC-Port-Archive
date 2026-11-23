@@ -555,6 +555,11 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         "ps_texture_sample_d16": "device: X\nenabled VK_KHR_maintenance8\n",
         "ps_cube_sample": "device: X\n", "ps_gather_wrap": "device: X\n",
         "ps_tex": "", "ps_imgatomic": "",
+        # The texture-offset, geometry, mesh and image-atomic rows, and the vertex-stage one (TEST-1353: ms_clip
+        # on an AMD iGPU printed only its device line, on a build whose row reported the output unchanged).
+        "ps_texoff": "device: X\nenabled VK_KHR_maintenance8\n", "gs_tri": "device: X\n",
+        "ms_clip": "device: X\n", "ms_tri": "device: X\n", "ms_f16_pack": "device: X\n",
+        "vs_base_ids": "device: X\n", "cs_imgatomic": "device: X\n", "cs_fma_fused": "device: X\n",
     }
 
     def run_one(self, name, code, printed):

@@ -893,7 +893,7 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             else:
                 problem = store_words_problem(msg, name)
                 results.append((name, not problem, problem or "all 64 words of the uint image, the sint image and "
@@ -1010,7 +1010,7 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             else:
                 khr = os.environ.get("LEONIDA_FMA") == "khr"
                 exact = os.environ.get("LEONIDA_FMA") == "exact"   # SHADER-497: as strict as khr
@@ -1245,7 +1245,7 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             else:
                 with open(raw, "rb") as f:
                     problem, covered = texoff_problem(f.read(), msg, name=name)
@@ -1271,7 +1271,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, unsupported_skip(msg)))
                 continue
             if rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
                 continue
             const_wants = {
                 "ps_clip_color": (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000),
@@ -1395,14 +1395,14 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
         elif name == "ms_v5_workgroup":
             rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
             if rc:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
                 continue
             problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
             results.append((name, None if isinstance(problem, Skip) else not problem,
@@ -1418,7 +1418,7 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             elif no64:
                 results.append((name, None, "SKIP (no 64-wide subgroup on this device)"))
             else:
@@ -1435,7 +1435,7 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             else:
                 # A missing or partial readback is an empty frame for this test, not a crash of the suite (as #3442).
                 problem = interp_f16_high_problem(read_raw_u32(raw) if os.path.isfile(raw) else [])
@@ -1447,7 +1447,7 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
@@ -1460,7 +1460,7 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
-                results.append((name, False, msg))
+                results.append((name, False, verdict_line(rc, msg)))
             else:
                 ok, detail = check_flat(raw)
                 results.append((name, ok, detail))
