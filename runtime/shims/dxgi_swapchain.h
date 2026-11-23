@@ -129,12 +129,30 @@ public:
         }
     }
 
-    ~VulkanSwapchain() {
+    ~VulkanSwapchain() { destroy(); }
+
+    // Destroys every Vulkan handle owned by the swapchain before the device or submit_mutex_ goes away.
+    // Idempotent, so ~VulkanSwapchain() is a no-op afterward and touches neither Vulkan nor submit_mutex_.
+    void destroy() {
         destroy_swapchain();
-        if (blit_pool_) fn_.destroy_cmd_pool(device_, blit_pool_, nullptr);
-        if (surface_) fn_.destroy_surface(instance_, surface_, nullptr);
-        if (acquire_fence_) fn_.destroy_fence(device_, acquire_fence_, nullptr);
-        if (blit_fence_) fn_.destroy_fence(device_, blit_fence_, nullptr);
+        if (blit_pool_) {
+            fn_.destroy_cmd_pool(device_, blit_pool_, nullptr);
+            blit_pool_ = VK_NULL_HANDLE;
+            blit_cmd_ = VK_NULL_HANDLE;
+        }
+        if (surface_) {
+            fn_.destroy_surface(instance_, surface_, nullptr);
+            surface_ = VK_NULL_HANDLE;
+        }
+        if (acquire_fence_) {
+            fn_.destroy_fence(device_, acquire_fence_, nullptr);
+            acquire_fence_ = VK_NULL_HANDLE;
+        }
+        if (blit_fence_) {
+            fn_.destroy_fence(device_, blit_fence_, nullptr);
+            blit_fence_ = VK_NULL_HANDLE;
+        }
+        loaded_ = false;
     }
 
     VulkanSwapchain(const VulkanSwapchain&) = delete;
@@ -285,7 +303,7 @@ private:
     }
 
     void destroy_swapchain() {
-        if (swapchain_ || !offscreen_images_.empty()) {
+        if (swapchain_ || !offscreen_images_.empty() || !offscreen_memory_.empty()) {
             std::lock_guard lock(submit_mutex_);
             fn_.device_wait_idle(device_);
             destroy_offscreen();
@@ -295,7 +313,11 @@ private:
             }
         }
         images_.clear();
+        image_initialized_.clear();
         exposed_count_ = 0;
+        current_index_ = 0;
+        acquired_index_ = 0;
+        next_back_buffer_ = 0;
     }
 
     bool create_offscreen_backbuffers(std::uint32_t count) {

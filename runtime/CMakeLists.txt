@@ -2369,6 +2369,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME dxgi_swapchain COMMAND dxgi_swapchain_test)
     set_tests_properties(dxgi_swapchain PROPERTIES SKIP_RETURN_CODE 77)
 
+    # D3D-818: SwapChain destructor must destroy VulkanSwapchain before releasing device_ (last device ref).
+    add_executable(dxgi_swapchain_lifetime_test test/dxgi_swapchain_lifetime_test.cpp)
+    target_link_libraries(dxgi_swapchain_lifetime_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(dxgi_swapchain_lifetime_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_swapchain_lifetime_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_swapchain_lifetime COMMAND dxgi_swapchain_lifetime_test)
+    set_tests_properties(dxgi_swapchain_lifetime PROPERTIES SKIP_RETURN_CODE 77)
+
     # Synthetic (no GPU): VulkanSwapchain's DXGI BufferCount contract when Vulkan returns more images than the
     # app asked for, or the surface minimum exceeds the request (D3D-389).
     add_executable(dxgi_swapchain_count_test test/dxgi_swapchain_count_test.cpp)

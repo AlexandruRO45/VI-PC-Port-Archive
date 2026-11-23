@@ -219,10 +219,11 @@ public:
 
     ~SwapChain() {
         unregister_buffers();
+        swapchain_.destroy();  // before releasing device_, which may destroy VulkanContext and VkDevice
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
-        if (device_) device_->Release();
         if (parent_) parent_->Release();
+        if (device_) device_->Release();
     }
 
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {

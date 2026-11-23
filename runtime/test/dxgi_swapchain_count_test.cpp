@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -36,6 +37,9 @@ struct Fake {
     VkImage blit_dst = VK_NULL_HANDLE;
     unsigned presents = 0;
     unsigned created_offscreen = 0;
+    unsigned destroy_calls = 0;
+    bool forbid_vk_calls = false;
+    bool vk_called_when_forbidden = false;
 };
 Fake g;
 
@@ -53,7 +57,10 @@ VKAPI_ATTR VkResult VKAPI_CALL create_win32_surface(VkInstance, const VkWin32Sur
     if (out) *out = reinterpret_cast<VkSurfaceKHR>(kSurface);
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_surface(VkInstance, VkSurfaceKHR, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_surface(VkInstance, VkSurfaceKHR, const VkAllocationCallbacks*) {
+    if (g.forbid_vk_calls) g.vk_called_when_forbidden = true;
+    ++g.destroy_calls;
+}
 VKAPI_ATTR VkResult VKAPI_CALL surface_support(VkPhysicalDevice, std::uint32_t, VkSurfaceKHR, VkBool32* out) {
     if (out) *out = VK_TRUE;
     return VK_SUCCESS;
@@ -103,7 +110,10 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreat
     *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain);
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*) {
+    if (g.forbid_vk_calls) g.vk_called_when_forbidden = true;
+    ++g.destroy_calls;
+}
 VKAPI_ATTR VkResult VKAPI_CALL get_images(VkDevice, VkSwapchainKHR, std::uint32_t* count, VkImage* images) {
     if (!count) return VK_ERROR_INITIALIZATION_FAILED;
     if (images) {
@@ -131,19 +141,28 @@ VKAPI_ATTR VkResult VKAPI_CALL create_fence(VkDevice, const VkFenceCreateInfo*, 
     if (out) *out = reinterpret_cast<VkFence>(kFence);
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_fence(VkDevice, VkFence, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_fence(VkDevice, VkFence, const VkAllocationCallbacks*) {
+    if (g.forbid_vk_calls) g.vk_called_when_forbidden = true;
+    ++g.destroy_calls;
+}
 VKAPI_ATTR VkResult VKAPI_CALL wait_for_fences(VkDevice, std::uint32_t, const VkFence*, VkBool32, std::uint64_t) {
     return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL reset_fences(VkDevice, std::uint32_t, const VkFence*) { return VK_SUCCESS; }
-VKAPI_ATTR VkResult VKAPI_CALL device_wait_idle(VkDevice) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL device_wait_idle(VkDevice) {
+    if (g.forbid_vk_calls) g.vk_called_when_forbidden = true;
+    return VK_SUCCESS;
+}
 VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*,
                                             VkImage* out) {
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
     *out = reinterpret_cast<VkImage>(static_cast<std::uintptr_t>(kOffscreenBase + g.created_offscreen++));
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_image(VkDevice, VkImage, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_image(VkDevice, VkImage, const VkAllocationCallbacks*) {
+    if (g.forbid_vk_calls) g.vk_called_when_forbidden = true;
+    ++g.destroy_calls;
+}
 VKAPI_ATTR void VKAPI_CALL image_mem_req(VkDevice, VkImage, VkMemoryRequirements* req) {
     std::memset(req, 0, sizeof(*req));
     req->size = 4096;
@@ -155,7 +174,10 @@ VKAPI_ATTR VkResult VKAPI_CALL alloc_mem(VkDevice, const VkMemoryAllocateInfo*, 
     if (out) *out = reinterpret_cast<VkDeviceMemory>(kOffscreenBase);
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL free_mem(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL free_mem(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+    if (g.forbid_vk_calls) g.vk_called_when_forbidden = true;
+    ++g.destroy_calls;
+}
 VKAPI_ATTR VkResult VKAPI_CALL bind_image_mem(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) {
     return VK_SUCCESS;
 }
@@ -164,7 +186,10 @@ VKAPI_ATTR VkResult VKAPI_CALL create_cmd_pool(VkDevice, const VkCommandPoolCrea
     if (out) *out = reinterpret_cast<VkCommandPool>(kPool);
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_cmd_pool(VkDevice, VkCommandPool, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_cmd_pool(VkDevice, VkCommandPool, const VkAllocationCallbacks*) {
+    if (g.forbid_vk_calls) g.vk_called_when_forbidden = true;
+    ++g.destroy_calls;
+}
 VKAPI_ATTR VkResult VKAPI_CALL alloc_cmd_bufs(VkDevice, const VkCommandBufferAllocateInfo*,
                                               VkCommandBuffer* out) {
     if (out) *out = reinterpret_cast<VkCommandBuffer>(kCmd);
@@ -326,6 +351,34 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     return 0;
 }
 
+// D3D-818: VulkanSwapchain::destroy() must release every Vulkan handle up front and remain a no-op on
+// subsequent calls (including ~VulkanSwapchain()) even after submit_mutex_ and the Vulkan device are gone.
+int check_destroy_idempotent() {
+    g = Fake{};
+    g.min_image_count = 2;
+    g.returned_images = 4;  // offscreen ring active so destroy_offscreen() + submit_mutex_ are exercised
+    auto mutex = std::make_unique<std::mutex>();
+    {
+        leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
+                                           reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
+                                           reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, *mutex);
+        if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
+                              VK_FORMAT_B8G8R8A8_UNORM, 2))
+            return fail("destroy idempotency: VulkanSwapchain::create");
+        swapchain.destroy();
+        if (g.destroy_calls == 0 || swapchain.image_count() != 0 || swapchain.is_offscreen())
+            return fail("destroy idempotency: first destroy() did not clean up");
+
+        // Simulate the owning device/VulkanContext going away before ~VulkanSwapchain() runs.
+        mutex.reset();
+        g.forbid_vk_calls = true;
+        swapchain.destroy();
+    }
+    if (g.vk_called_when_forbidden)
+        return fail("destroy idempotency: VulkanSwapchain touched Vulkan after destroy()");
+    return 0;
+}
+
 struct Case {
     const char* label;
     std::uint32_t requested;
@@ -348,7 +401,7 @@ int main() {
     for (const Case& c : cases) {
         if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen)) return result;
     }
-    std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min)\n");
+    if (const int result = check_destroy_idempotent()) return result;
+    std::printf("dxgi_swapchain_count_test: PASS (3 count cases + destroy idempotency)\n");
     return 0;
 }
