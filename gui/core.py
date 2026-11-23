@@ -88,6 +88,16 @@ def default_out_dir() -> str:
     return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
 
 
+def ensure_output_dir(out_dir: str | None = None) -> tuple[str, bool]:
+    """Ensure the output directory exists on startup without crashing on permission errors."""
+    target = os.path.abspath((out_dir or "").strip() or default_out_dir())
+    try:
+        os.makedirs(target, exist_ok=True)
+        return target, True
+    except OSError:
+        return target, False
+
+
 def resolve_repo_root() -> str:
     """Locate the Leonida root directory both from source and from a PyInstaller frozen bundle."""
     if getattr(sys, "frozen", False):

@@ -12,6 +12,7 @@ from gui.core import (  # noqa: E402
     BuildConfig,
     build_make_game_args,
     detect_system_language,
+    ensure_output_dir,
     format_validation_check_details,
     load_config,
     pending_install_plan,
@@ -107,6 +108,14 @@ class GuiCoreTest(unittest.TestCase):
         self.assertIn("50.0%", text)
         self.assertIn("data.rpf", text)
         self.assertIn("SHA-256 mismatch", text)
+
+    def test_ensure_output_dir_creates_missing_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "nested", "LeonidaOut")
+            self.assertFalse(os.path.isdir(target))
+            resolved, ok = ensure_output_dir(target)
+            self.assertTrue(ok)
+            self.assertTrue(os.path.isdir(resolved))
 
     def test_translations(self):
         self.assertEqual(tr("pt-BR", "nav_validate"), "Validação")

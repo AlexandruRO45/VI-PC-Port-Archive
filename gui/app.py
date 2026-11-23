@@ -39,6 +39,7 @@ from gui.core import (
     WAVE64_MODES,
     BuildConfig,
     build_make_game_args,
+    ensure_output_dir,
     format_free_space,
     format_validation_check_details,
     load_config,
@@ -300,6 +301,7 @@ class LeonidaWindow(QMainWindow):
         self.repo_root = repo_root
         self.font_family = font_family
         self.config = load_config()
+        ensure_output_dir(self.config.out_dir)
         self.lang = self.config.resolved_language()
         self.build_worker: SubprocessWorker | None = None
         self.val_worker: ValidationWorker | None = None
