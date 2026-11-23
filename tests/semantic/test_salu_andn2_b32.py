@@ -152,5 +152,109 @@ class TestSAndn2B32Oracle(unittest.TestCase):
         self.assertIn("OpBitwiseAnd", spv)
         self.assertIn("OpNot", spv)
 
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegisterKind(Enum):
+    SGPR = auto()
+    VGPR = auto()
+    SPECIAL = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class RegOperand:
+    kind: RegisterKind
+    index: int = 0
+    name: str = ""
+    size_bits: int = 32
+
+    def __post_init__(self):
+        if self.kind == RegisterKind.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of bounds [0, 105]: {self.index}")
+        if self.kind == RegisterKind.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index out of bounds [0, 255]: {self.index}")
+
+
+@dataclass(frozen=True)
+class ImmOperand:
+    value: int
+    size_bits: int = 32
+
+    def __post_init__(self):
+        if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF):
+            raise ValueError(f"Immediate value out of 32-bit range: {self.value}")
+
+
+Operand = Union[RegOperand, ImmOperand]
+
+
+@dataclass
+class SAndn2B32Instruction:
+    dst: RegOperand
+    src0: Operand
+    src1: Operand
+
+    def validate(self) -> None:
+        if self.dst.kind == RegisterKind.VGPR:
+            raise TypeError("SALU SOP2 instruction destination cannot be VGPR")
+        if self.dst.kind not in (RegisterKind.SGPR, RegisterKind.SPECIAL):
+            raise TypeError(f"Invalid destination kind: {self.dst.kind}")
+        if self.dst.kind == RegisterKind.SGPR and not (0 <= self.dst.index <= 105):
+            raise ValueError(f"Destination SGPR index out of range: {self.dst.index}")
+
+
+class TestSAndn2B32AST(unittest.TestCase):
+    """Unit tests for symbolic AST representation and validation."""
+
+    def test_ast_valid_sgpr_operands(self):
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        instr.validate()
+        self.assertEqual(instr.dst.index, 2)
+        self.assertEqual(instr.src0.index, 0)
+        self.assertEqual(instr.src1.index, 1)
+
+    def test_ast_valid_immediate_operands(self):
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=4),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=ImmOperand(value=0x00FF_00FF),
+        )
+        instr.validate()
+        self.assertIsInstance(instr.src1, ImmOperand)
+        self.assertEqual(instr.src1.value, 0x00FF_00FF)
+
+    def test_ast_valid_special_registers(self):
+        for name in ("exec_lo", "vcc_lo", "null"):
+            with self.subTest(special_name=name):
+                instr = SAndn2B32Instruction(
+                    dst=RegOperand(RegisterKind.SPECIAL, name=name),
+                    src0=RegOperand(RegisterKind.SPECIAL, name=name),
+                    src1=ImmOperand(value=0),
+                )
+                instr.validate()
+                self.assertEqual(instr.dst.name, name)
+
+    def test_ast_reject_invalid_sgpr_index(self):
+        for invalid_idx in (106, 128, 256):
+            with self.subTest(invalid_idx=invalid_idx):
+                with self.assertRaises(ValueError):
+                    RegOperand(RegisterKind.SGPR, index=invalid_idx)
+
+    def test_ast_reject_vgpr_destination(self):
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=0),
+            src0=RegOperand(RegisterKind.SGPR, index=1),
+            src1=RegOperand(RegisterKind.SGPR, index=2),
+        )
+        with self.assertRaises(TypeError):
+            instr.validate()
+
 if __name__ == "__main__":
     unittest.main()
