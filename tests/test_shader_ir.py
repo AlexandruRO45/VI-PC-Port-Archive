@@ -157,6 +157,13 @@ class OperandTests(unittest.TestCase):
     def test_unknown_operand_falls_back_to_raw(self):
         self.assertEqual(shader_ir.operand("weirdthing"), {"k": "raw", "t": "weirdthing"})
 
+    def test_llvm23_lit_is_the_constant(self):
+        # LLVM 23 prints lit(V) for a literal it could also show as an inline constant (v_fma_mix* sources).
+        for text, plain in (("lit(0x42200000)", "0x42200000"), ("|lit(0x3f800000)|", "|0x3f800000|"),
+                            ("neg(lit(0x3f800000))", "neg(0x3f800000)"), ("-lit(0x3f800000)", "neg(0x3f800000)")):
+            with self.subTest(text=text):
+                self.assertEqual(shader_ir.operand(text), shader_ir.operand(plain))
+
 
 class SplitArgsTests(unittest.TestCase):
     def test_commas_inside_parentheses_stay_together(self):
