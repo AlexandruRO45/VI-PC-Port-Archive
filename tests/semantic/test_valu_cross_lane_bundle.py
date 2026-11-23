@@ -194,6 +194,14 @@ class TestReadLaneAliasing(unittest.TestCase):
         self.assertIn("OpGroupNonUniformShuffle", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestReadLaneTranslator(unittest.TestCase):
+    def test_translator_mutation_guard(self):
+        prog = ["v_mov_b32_e32 v5, 111", "s_mov_b32 s5, 2", "v_readlane_b32 s6, v5, s5", "s_endpgm"]
+        spv = support.translate_lines("cs_rl_trans", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        self.assertIn("OpBitwiseAnd", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
