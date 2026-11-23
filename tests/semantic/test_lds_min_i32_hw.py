@@ -721,3 +721,65 @@ class TestLdsMinI32RegisterAliasing(unittest.TestCase):
         ]
         mem = run_compute_kernel(lines, lanes=1)
         self.assertEqual(mem.get(0), 16)
+
+
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and VCC Isolation
+# ---------------------------------------------------------------------------
+
+class TestLdsMinI32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and VCC isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(capacity_dwords=1024)
+
+    def test_zero_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 5)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+        inst = Instruction(opcode=Opcode.DS_MIN_I32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2))
+        self.interp.step(inst)
+        cc = self.interp.last_condition_codes
+        assert cc is not None
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+        self.assertTrue(cc.operand_clamped)
+
+    def test_negative_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, -50)
+        inst = Instruction(opcode=Opcode.DS_MIN_I32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2))
+        self.interp.step(inst)
+        cc = self.interp.last_condition_codes
+        assert cc is not None
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.negative)
+        self.assertFalse(cc.positive)
+
+    def test_positive_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 45)
+        inst = Instruction(opcode=Opcode.DS_MIN_I32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2))
+        self.interp.step(inst)
+        cc = self.interp.last_condition_codes
+        assert cc is not None
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertTrue(cc.positive)
+
+    def test_status_flags_metadata(self) -> None:
+        self.interp.lds.write_dword(0x28, 90)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x20)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 30)
+        inst = Instruction(opcode=Opcode.DS_MIN_I32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2), offset=DSOffset(offset=8))
+        self.interp.step(inst)
+        flags = self.interp.last_status_flags
+        assert flags is not None
+        self.assertEqual(flags.effective_byte_address, 0x28)
+        self.assertEqual(flags.dword_index, 10)
+        self.assertEqual(flags.old_value, 90)
+        self.assertEqual(flags.operand_value, 30)
+        self.assertEqual(flags.new_value, 30)
