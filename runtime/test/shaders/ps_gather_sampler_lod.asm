@@ -1,6 +1,8 @@
 ; In --two-mip mode the 128x128 base level has four colored quadrants and mip 1 is opaque cyan.
 ; Request LOD U across the draw. With max LOD 0.25 every pixel must use the base;
 ; with min LOD 0.75 every pixel must use mip 1. The misplaced half of the frame reveals a dropped bound.
+; With min LOD 0.50 the clamp pins the LOD to exactly 0.5, where the tie must round up to mip 1; rounding to
+; even would leave the left half, the half the clamp holds at 0.5, on the base.
 ; Each 2x2 gather footprint stays within its quadrant. Export the first tap of R, G, B and A.
 v_interp_p1_f32_e32 v2, v0, attr0.x
 v_interp_p2_f32_e32 v2, v1, attr0.x

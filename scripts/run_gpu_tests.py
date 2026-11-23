@@ -1177,7 +1177,8 @@ def run_suite(a, work: str) -> int:
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
-            results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
+            results.append((name, ok, problem or f"{len(MIP_TEST_PASSES[name])} passes, 4096 RGBA32F pixels each exact; "
+                                                  "wrong mip and UV rejected"))
         elif name in GRADIENT_TESTS:
             problem = texture_gradient_a16_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem

@@ -524,11 +524,11 @@ TEXTURE_MIP_TEST = "ps_texture_mip0"
 SIGNED_MIP_TEST = "ps_sample_implicit_sint"
 GATHER_LOD_TEST = "ps_gather_sampler_lod"
 TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
-# Each pair of draws expects mip 0, then mip 1. S# word 1 is minLOD[11:0], maxLOD[23:12], unsigned 4.8.
+# Per draw: the fixture, S# word 1 (minLOD[11:0], maxLOD[23:12], unsigned 4.8) and the mip every pixel must read.
 MIP_TEST_PASSES = {
-    TEXTURE_MIP_TEST: ((TEXTURE_MIP_TEST, "c00000"), ("ps_texture_sample", "c00000")),
-    GATHER_LOD_TEST: ((GATHER_LOD_TEST, "40000"), (GATHER_LOD_TEST, "1000c0")),
-    SIGNED_MIP_TEST: ((SIGNED_MIP_TEST, "0"), (SIGNED_MIP_TEST, "100000")),
+    TEXTURE_MIP_TEST: ((TEXTURE_MIP_TEST, "c00000", 0), ("ps_texture_sample", "c00000", 1)),
+    GATHER_LOD_TEST: ((GATHER_LOD_TEST, "40000", 0), (GATHER_LOD_TEST, "1000c0", 1), (GATHER_LOD_TEST, "100080", 1)),
+    SIGNED_MIP_TEST: ((SIGNED_MIP_TEST, "0", 0), (SIGNED_MIP_TEST, "100000", 1)),
 }
 
 # TEST-184: vk_store_test "words" fills the r32 uint image with 100 + i, the r32 sint image with -2i (texel
@@ -1419,12 +1419,12 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
     shaders = Path(spirv)
     vertex = shaders / "vs_ids.spv"
     with tempfile.TemporaryDirectory(prefix="leonida-mip-") as tmp:
-        for mip, (name, limits) in enumerate(MIP_TEST_PASSES[test]):
+        for i, (name, limits, mip) in enumerate(MIP_TEST_PASSES[test]):
             fragment = shaders / (name + ".spv")
             for shader in (vertex, fragment):
                 if not shader.is_file():
                     return f"missing {shader}"
-            raw = Path(tmp) / f"mip{mip}.raw"
+            raw = Path(tmp) / f"mip{i}.raw"
             mode = "--two-mip-sint" if test == SIGNED_MIP_TEST else "--two-mip"
             code, output = run(tool, vertex, fragment, raw, "0", "92", limits, "14500000", "0", mode)
             if code == UNSUPPORTED:
@@ -1434,7 +1434,7 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
             data = raw.read_bytes()
             mismatch = texture_mip_mismatch(data, mip)
             if mismatch:
-                return f"{name}: {mismatch}"
+                return f"{name}: draw {i + 1}: {mismatch}"
             if not texture_mip_mismatch(data, 1 - mip).startswith("(0,0):"):
                 return f"{name}: wrong mip control missed the expected first pixel"
             if mip == 0 and not texture_mip_mismatch(data, mip, transpose_uv=True).startswith("(32,0):"):
