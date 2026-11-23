@@ -473,5 +473,80 @@ class SaluNandB32RegisterAliasingTests(unittest.TestCase):
             self.assertEqual(interp.sgprs[0], acc)
 
 
+class SaluNandB32ConditionCodesTests(unittest.TestCase):
+    """Scalar Condition Code (SCC) behavior and bit sensitivity for s_nand_b32."""
+
+    def test_scc_zero_only_when_both_all_ones(self):
+        """Verify SCC is 0 if and only if both sources have all bits set."""
+        interp = ScalarInterpreter()
+        interp.sgprs[0] = MASK32
+        interp.sgprs[1] = MASK32
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+        self.assertEqual(interp.sgprs[2], 0)
+        self.assertEqual(interp.scc, 0)
+
+    def test_scc_nonzero_on_single_bit_zero(self):
+        """Clearing any single bit in either input makes NAND result nonzero (SCC=1)."""
+        interp = ScalarInterpreter()
+        for bit in range(32):
+            mask = (~(1 << bit)) & MASK32
+            interp.sgprs[0] = mask
+            interp.sgprs[1] = MASK32
+            interp.exec_line("s_nand_b32 s2, s0, s1")
+            self.assertEqual(interp.sgprs[2], 1 << bit)
+            self.assertEqual(interp.scc, 1)
+
+            interp.sgprs[0] = MASK32
+            interp.sgprs[1] = mask
+            interp.exec_line("s_nand_b32 s2, s0, s1")
+            self.assertEqual(interp.sgprs[2], 1 << bit)
+            self.assertEqual(interp.scc, 1)
+
+    def test_scc_nonzero_on_single_bit_one(self):
+        """Setting only one bit in both inputs produces 31 bits set (SCC=1)."""
+        interp = ScalarInterpreter()
+        for bit in range(32):
+            mask = 1 << bit
+            interp.sgprs[0] = mask
+            interp.sgprs[1] = mask
+            interp.exec_line("s_nand_b32 s2, s0, s1")
+            expected = (~mask) & MASK32
+            self.assertEqual(interp.sgprs[2], expected)
+            self.assertEqual(interp.scc, 1)
+
+    def test_scc_zero_inputs(self):
+        """NAND of 0 with 0 yields 0xFFFFFFFF, resulting in SCC=1."""
+        interp = ScalarInterpreter()
+        interp.sgprs[0] = 0
+        interp.sgprs[1] = 0
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+        self.assertEqual(interp.sgprs[2], MASK32)
+        self.assertEqual(interp.scc, 1)
+
+    def test_scc_overwrite_state_transitions(self):
+        """Verify strict overwrite of previous SCC state (0->1, 1->0, 0->0, 1->1)."""
+        interp = ScalarInterpreter()
+
+        # Step 1: Force SCC = 0
+        interp.sgprs[0] = MASK32
+        interp.sgprs[1] = MASK32
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+        self.assertEqual(interp.scc, 0)
+
+        # Step 2: 0 -> 1 transition
+        interp.sgprs[1] = 0
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+        self.assertEqual(interp.scc, 1)
+
+        # Step 3: 1 -> 1 transition
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+        self.assertEqual(interp.scc, 1)
+
+        # Step 4: 1 -> 0 transition
+        interp.sgprs[1] = MASK32
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+        self.assertEqual(interp.scc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
