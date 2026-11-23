@@ -18,10 +18,13 @@ What the comparison needs to mean anything, each learned from a run that looked 
 The single-attachment worker starts with zero user SGPRs and a zero-filled heap. Equal MRT0 readbacks can result from different execution paths. By default the harness binds only
 MRT0. The rows in <out dir>/outcomes.tsv distinguish clear-only matches and list unobserved colour targets.
 Pass --all-attachments to use vk_ps_sweep and compare each declared RGBA32F target separately.
+Private attempts.json records one translation and each attempted draw per lowering, with a one-based
+run for draws. A null failure_stage means success. Older outcomes.tsv files have no stage evidence.
 Usage: `python -I tools/ab_control_flow.py --help` lists the options.
 """
 import argparse
 import collections
+import json
 import os
 import re
 import struct
@@ -191,7 +194,21 @@ def positive_int(text):
     return value
 
 
-def render_targets(forms, name, harness, vs, out, runs, timeout, observed, declared, all_attachments):
+def worker_failure_stage(code, stderr, all_attachments):
+    """Recognize only terminal diagnostics emitted by the selected worker."""
+    lines = stderr.splitlines()
+    last = lines[-1] if lines else ""
+    if all_attachments:
+        if code == 3:
+            return "timeout"
+        if code in (4, 5) and re.fullmatch(r"PIPELINE -?\d+", last):
+            return "graphics_pipeline_creation"
+    elif code == 1 and re.fullmatch(r"FAILED vkCreateGraphicsPipelines\(.*\) -> -?\d+ \(line \d+\)", last):
+        return "graphics_pipeline_creation"
+    return "unknown"
+
+
+def render_targets(forms, name, harness, vs, out, runs, timeout, observed, declared, all_attachments, attempts):
     """Collect repeated readbacks by attachment, retaining only the mask for undeclared MRT0."""
     count = observed[-1] + 1
     size = count * READBACK_BYTES
@@ -200,31 +217,42 @@ def render_targets(forms, name, harness, vs, out, runs, timeout, observed, decla
         spirv = os.path.join(directory, name + ".spv")
         raw = os.path.join(out, f"{tag}.raw")
         args = ["64", "64", str(count)] if all_attachments else ["--zero-root"]
-        for _ in range(runs):
+        lowering = ("dispatch", "structured")[form]
+        for run in range(1, runs + 1):
             if os.path.isfile(raw):
                 os.remove(raw)
             data = None
-            failure = None
+            stage = None
             try:
                 h = subprocess.run([harness, vs, spirv, raw, *args], capture_output=True, text=True,
-                                   timeout=timeout)
-                if all_attachments and h.returncode == 3:
-                    failure = "timeout"
-                if h.returncode == 0 and os.path.isfile(raw):
-                    with open(raw, "rb") as readback:
-                        packed = readback.read(size + 1)
-                    if len(packed) == size:
-                        data = packed
+                                   errors="replace", timeout=timeout)
             except subprocess.TimeoutExpired:
-                failure = "timeout"
+                stage = "timeout"
+            except OSError:
+                stage = "worker_launch"
+            else:
+                if h.returncode:
+                    stage = worker_failure_stage(h.returncode, h.stderr, all_attachments)
+                else:
+                    try:
+                        with open(raw, "rb") as readback:
+                            packed = readback.read(size + 1)
+                    except OSError:
+                        stage = "incomplete_readback"
+                    else:
+                        if len(packed) == size:
+                            data = packed
+                        else:
+                            stage = "incomplete_readback"
+            attempts.append(dict(name=name, lowering=lowering, run=run, failure_stage=stage))
             for target in observed:
-                image = failure
+                image = "timeout" if stage == "timeout" else None
                 if data is not None:
                     image = data[target * READBACK_BYTES:(target + 1) * READBACK_BYTES]
                     if target not in declared:
                         image = bytes(image[i:i + 16] != CLEAR for i in range(0, len(image), 16))
                 images[target][form].append(image)
-            if failure == "timeout":
+            if stage == "timeout":
                 break
     return images
 
@@ -249,7 +277,6 @@ def main(argv=None):
     old = os.path.join(a.shaders, "spirv")
     # Everything the run reads is checked before anything is created: a mistyped shaders folder or names file
     # used to leave an empty output tree behind and end in a traceback.
-    import json
     index_path = os.path.join(old, "index.json")
     try:
         with open(index_path, encoding="utf-8") as f:
@@ -298,6 +325,7 @@ def main(argv=None):
     res = collections.Counter()
     differ = []
     outcomes = []
+    attempts = []
 
     def note(name, what):
         res[what] += 1
@@ -306,10 +334,18 @@ def main(argv=None):
     tool = os.path.join(a.repo, "tools", "rdna2spirv.py")
     for name in picked:
         src = os.path.join(disasm, name + ".s")
-        r1 = subprocess.run([sys.executable, "-I", tool, src, "--out", new], capture_output=True, text=True)
-        r2 = subprocess.run([sys.executable, "-I", tool, src, "--out", loopdir, "--dispatch-loop"],
-                            capture_output=True, text=True)
-        if "1 pass spirv-val" not in r1.stdout or "1 pass spirv-val" not in r2.stdout:
+        valid = True
+        for lowering, directory, flags in (("structured", new, []), ("dispatch", loopdir, ["--dispatch-loop"])):
+            try:
+                result = subprocess.run([sys.executable, "-I", tool, src, "--out", directory, *flags],
+                                        capture_output=True, text=True, errors="replace")
+                passed = result.returncode == 0 and "1 pass spirv-val" in result.stdout
+            except OSError:
+                passed = False
+            attempts.append(dict(name=name, lowering=lowering, run=None,
+                                 failure_stage=None if passed else "translation_validation"))
+            valid = valid and passed
+        if not valid:
             note(name, "a translation is invalid")
             continue
         targets = []
@@ -332,7 +368,7 @@ def main(argv=None):
                 note(name, "colour target outside MRT0..7")
                 continue
         images = render_targets((("old", loopdir), ("new", new)), name, harness, vs, a.out, a.runs,
-                                a.timeout, observed, declared, a.all_attachments)
+                                a.timeout, observed, declared, a.all_attachments, attempts)
         labels = []
         for target, (old_runs, new_runs) in images.items():
             outcome = classify_result(True, old_runs, new_runs)
@@ -362,6 +398,9 @@ def main(argv=None):
     for name in differ[:8]:
         print("   differs:", name[:70])
     write_outcomes(a.out, outcomes)
+    with open(os.path.join(a.out, "attempts.json"), "w", encoding="utf-8", newline="\n") as report:
+        json.dump(attempts, report, indent=2)
+        report.write("\n")
     return 0
 
 

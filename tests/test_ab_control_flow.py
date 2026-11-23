@@ -17,6 +17,7 @@ import collections.abc
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import re
 import struct
@@ -922,8 +923,39 @@ class PipelineExecutionTest(unittest.TestCase):
                                          "cached outputs disagree with translated colour targets",
                                          targets=(0, 1), all_attachments=True, cached=cached)
 
+    @patch("subprocess.run")
+    def test_worker_failure_receipts(self, mock_run):
+        texture = "FAILED vkCreateGraphicsPipelines(dev, 0, 1, info, 0, pipe) -> -4 (line 508)"
+        for sweep, error, stage in (
+                (False, (1, texture), "graphics_pipeline_creation"),
+                (True, (5, "PIPELINE -1"), "graphics_pipeline_creation"),
+                (True, (4, ""), "unknown"),
+                (False, (3, ""), "unknown"),
+                (True, (3, "TIMEOUT"), "timeout"),
+                (False, subprocess.TimeoutExpired("worker", 1), "timeout"),
+                (True, FileNotFoundError("worker"), "worker_launch"),
+                (False, (0, ""), "incomplete_readback")):
+            with self.subTest(sweep=sweep, stage=stage):
+                outcome = "ONLY ONE FORM TERMINATES" if stage == "timeout" else "dispatch form failed to run"
+                self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES,
+                                             ("MRT0: " if sweep else "") + outcome,
+                                             all_attachments=sweep, dispatch_error=error)
+                with open(os.path.join(self.out, "attempts.json"), encoding="utf-8") as report:
+                    attempts = json.load(report)
+                self.assertEqual([(r["lowering"], r["run"], r["failure_stage"]) for r in attempts],
+                                 [("structured", None, None), ("dispatch", None, None),
+                                  ("dispatch", 1, stage), ("structured", 1, None)])
+
+    @patch("subprocess.run")
+    def test_invalid_translation_receipt(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES, "a translation is invalid", invalid=True)
+        with open(os.path.join(self.out, "attempts.json"), encoding="utf-8") as report:
+            attempts = json.load(report)
+        self.assertEqual([(r["lowering"], r["failure_stage"]) for r in attempts],
+                         [("structured", None), ("dispatch", "translation_validation")])
+
     def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str, targets=(0,), pixel=bytes(16),
-                                all_attachments=False, divergent=False, cached=None) -> None:
+                                all_attachments=False, divergent=False, cached=None, dispatch_error=None, invalid=False) -> None:
         import json
 
         # Prepare synthetic index
@@ -970,9 +1002,14 @@ class PipelineExecutionTest(unittest.TestCase):
                         f.write(f"%out_mrt{target} = OpVariable %po Output\n")
                 with open(os.path.join(out_dir, "ps_test.spv"), "wb") as f:
                     f.write(b"fake_spv")
-                return SimpleNamespace(returncode=0, stdout="1 pass spirv-val\n")
+                return SimpleNamespace(returncode=int(invalid and "--dispatch-loop" in args), stdout="1 pass spirv-val\n")
             else:
                 # Harness call
+                if dispatch_error is not None and "dispatch" in args[2]:
+                    if isinstance(dispatch_error, Exception):
+                        raise dispatch_error
+                    code, stderr = dispatch_error
+                    return SimpleNamespace(returncode=code, stderr=stderr)
                 raw_path = args[3]
                 with open(raw_path, "wb") as f:
                     data = bytearray(pixel * (image_size // len(pixel)))
