@@ -485,5 +485,20 @@ class SPackHhB32B16SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(state.scc, 0)
         self.assertEqual(res, 0x22221111)
 
+class SPackHhB32B16TranslatorTests(unittest.TestCase):
+    def test_pack_hh_translation_and_execution(self):
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0xABCDEF01",
+            "s_pack_hh_b32_b16 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pack_hh_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, 0xABCD1234)
+
+
 if __name__ == "__main__":
     unittest.main()
