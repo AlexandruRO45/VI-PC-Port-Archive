@@ -267,6 +267,32 @@ class TestGalleryServer(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertIn(b"console.log", r.read())
 
+    def test_an_upper_case_dds_preview_is_served(self) -> None:
+        # BUILD-1896: the listing takes `.DDS` case-insensitively, so its preview must find the file too, also on a
+        # case-sensitive filesystem where `Shot.dds` would not exist.
+        with open(os.path.join(self.textures_dir, "Shot.DDS"), "wb") as f:
+            f.write(_make_1x1_rgba_dds())
+        base = f"http://127.0.0.1:{self.port}"
+        with urllib.request.urlopen(f"{base}/api/textures", timeout=3) as r:
+            textures = {t["name"]: t for t in json.loads(r.read())["textures"]}
+        self.assertEqual(textures["Shot.DDS"]["preview"], "/textures/Shot.png")
+        with urllib.request.urlopen(f"{base}/textures/Shot.png", timeout=3) as r:
+            self.assertEqual(r.status, 200)
+            self.assertEqual(r.headers.get("Content-Type"), "image/png")
+            self.assertTrue(r.read().startswith(b"\x89PNG"))
+
+    def test_the_case_insensitive_lookup_ignores_the_filesystem(self) -> None:
+        # Windows resolves `Shot.dds` to `Shot.DDS` by itself, so a case-sensitive directory is simulated here: the
+        # lowercase spelling must come back pointing at the stored name.
+        stored = os.path.join(self.textures_dir, "Shot.DDS")
+        with open(stored, "wb") as f:
+            f.write(_make_1x1_rgba_dds())
+        with mock.patch.object(gallery.os.path, "isfile", side_effect=lambda p: p == stored), \
+                mock.patch.object(gallery.os, "listdir", return_value=["Shot.DDS"]):
+            resolved = gallery.case_insensitive_file(self.textures_dir, "Shot.dds")
+        self.assertEqual(os.path.basename(resolved), "Shot.DDS")
+        self.assertEqual(gallery.case_insensitive_file(self.textures_dir, "missing.dds"), None)
+
     def test_traversal_and_sibling_prefix_escapes_are_forbidden(self) -> None:
         host = f"127.0.0.1:{self.port}"
         cases = (

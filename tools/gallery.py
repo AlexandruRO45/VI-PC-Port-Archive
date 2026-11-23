@@ -131,6 +131,27 @@ def safe_subpath(base_dir: str, rel: str) -> str | None:
     return real_target
 
 
+def case_insensitive_file(base_dir: str, rel: str) -> str | None:
+    """`rel` resolved inside base_dir, accepting a file name that differs only in case from the directory entry, or
+    None. The listing in `_serve_textures_json` takes `.DDS` and friends case-insensitively, so its preview must find
+    `Shot.DDS` even though the preview URL is `Shot.png` and the lookup spells a lowercase `.dds` (a case-sensitive
+    filesystem would otherwise answer 404). The result still goes through `safe_subpath`."""
+    direct = safe_subpath(base_dir, rel)
+    if direct is not None and os.path.isfile(direct):
+        return direct
+    folder, _, name = rel.replace("\\", "/").rpartition("/")
+    resolved = safe_subpath(base_dir, folder) if folder else None
+    directory = resolved if resolved is not None else base_dir
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.lower() == name.lower():
+            return safe_subpath(base_dir, f"{folder}/{entry}" if folder else entry)
+    return None
+
+
 class StudioHandler(http.server.BaseHTTPRequestHandler):
     models_dir: str = ""
     textures_dir: str = ""
@@ -206,13 +227,15 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if not os.path.isfile(tpath) and rel.lower().endswith(".png"):
-                # Try matching .dds file if png requested
+                # A DDS preview: the listing took `.DDS`/`.DdS` case-insensitively, so look the file up by name
+                # instead of assuming the lowercase spelling.
                 stem = os.path.splitext(rel)[0]
-                dds_cand = safe_subpath(self.textures_dir, stem + ".dds")
-                if dds_cand is None:
+                have = safe_subpath(self.textures_dir, stem + ".dds")
+                dds_cand = case_insensitive_file(self.textures_dir, stem + ".dds")
+                if have is None and dds_cand is None:
                     self.send_error(403, "Forbidden")
                     return
-                if os.path.isfile(dds_cand) and dds_png:
+                if dds_cand is not None and dds_png:
                     try:
                         png_bytes = dds_png.dds_file_to_png_bytes(dds_cand, max_size=1024)
                         self.send_response(200)
