@@ -458,5 +458,31 @@ class TestSFf1I32B64HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_ff1_i32_b64(1 << 63), 63)
 
 
+def ref_flbit_i32_b32(src0: int) -> int:
+    """Reference mathematical oracle for s_flbit_i32_b32.
+    Returns count of leading zeros before first 1 in 32-bit int (0..31, MSB down),
+    or -1 (0xFFFFFFFF) if zero.
+    """
+    val = src0 & MASK32
+    if val == 0:
+        return MASK32
+    return 32 - val.bit_length()
+
+
+class TestSFlbitI32B32Reference(unittest.TestCase):
+    """Reference oracle unit tests for s_flbit_i32_b32."""
+
+    def test_reference_zero(self):
+        self.assertEqual(ref_flbit_i32_b32(0), MASK32)
+
+    def test_reference_msb_set(self):
+        self.assertEqual(ref_flbit_i32_b32(0x80000000), 0)
+        self.assertEqual(ref_flbit_i32_b32(0x40000000), 1)
+
+    def test_reference_low_bits(self):
+        self.assertEqual(ref_flbit_i32_b32(1), 31)
+        self.assertEqual(ref_flbit_i32_b32(0x00010000), 15)
+
+
 if __name__ == "__main__":
     unittest.main()
