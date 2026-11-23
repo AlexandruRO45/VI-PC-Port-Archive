@@ -39,6 +39,31 @@ class Mov64VccDataTests(unittest.TestCase):
         self.assertNotIn("OpStore %vcc_hi", spv)
         self.assertNotIn("OpLoad %uint %vcc_hi", spv)
 
+    def test_s_mov_b64_data_pair_into_vcc_then_mask_read_extracts_lane_bit(self):
+        lines = [
+            "s_mov_b32 s2, 2",
+            "s_mov_b32 s3, 0",
+            "s_mov_b64 vcc, s[2:3]",
+            "v_mov_b32 v0, 10",
+            "v_mov_b32 v1, 20",
+            "v_cndmask_b32 v2, v0, v1, vcc",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mov64_vcc_data_then_cndmask", lines)
+        self.assertIn("OpShiftRightLogical %uint", spv)
+
+    def test_s_mov_b64_null_into_vcc_and_sgpr(self):
+        lines = [
+            "s_mov_b64 vcc, null",
+            "s_mov_b64 s[2:3], null",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mov64_null", lines)
+        self.assertIn("OpStore %vcc %c0", spv)
+
 
 if __name__ == "__main__":
     unittest.main()

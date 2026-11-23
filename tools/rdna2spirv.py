@@ -1678,7 +1678,8 @@ class Gen:
         if d["k"] == "special" and d["t"] == "exec":
             self.set_exec(self.mask_src(s))
             return
-        if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo") and (self.holds_lane_mask(s) or s["k"] == "imm"):
+        if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo") and (
+                self.holds_lane_mask(s) or s["k"] == "imm" or (s["k"] == "special" and s["t"] == "null")):
             self.emit(f"OpStore %vcc {self.mask_src(s)}")
             return
         to_vcc = d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")
@@ -1698,6 +1699,9 @@ class Gen:
             lit_lo = v & 0xFFFFFFFF
             lit_hi = (v >> 32) & 0xFFFFFFFF
             lo, hi = self.cu(lit_lo), self.cu(lit_hi)
+        elif s["k"] == "special" and s["t"] == "null":
+            lit_lo = lit_hi = 0
+            lo = hi = self.cu(0)
         elif s["k"] == "special" and s["t"] == "vcc":
             lo = self.tmp()
             self.emit(f"{lo} = OpLoad %uint %vcc")
@@ -6015,9 +6019,25 @@ class Gen:
         if a["k"] == "special" and a["t"] == "null":
             return self.cu(0)
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
-            v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint %vcc")
-            return v
+            if "vcc" in self.cur_masks:
+                v = self.tmp()
+                self.emit(f"{v} = OpLoad %uint %vcc")
+                return v
+            lane = self.wave_lane()
+            word = self.tmp()
+            self.emit(f"{word} = OpLoad %uint {'%vcc_hi' if a['t'] == 'vcc_hi' else '%vcc'}")
+            if a["t"] == "vcc" and wide and self.wave64:
+                hi, up, sel = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                self.emit(f"{sel} = OpSelect %uint {up} {hi} {word}")
+                word = sel
+            sh, shr, bit, r = (self.tmp() for _ in range(4))
+            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            return r
         if a["k"] == "special" and a["t"] in ("exec", "exec_lo", "exec_hi"):
             return self.exec_value()
         if a["k"] == "imm":
