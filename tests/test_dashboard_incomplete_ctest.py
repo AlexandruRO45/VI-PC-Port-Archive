@@ -1,10 +1,11 @@
 """CTest completeness and observed runtime results from synthetic dashboard inputs."""
+import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import progress_dashboard as dashboard  # noqa: E402
@@ -21,18 +22,25 @@ NESTED = START + "1/1 Test: inner\nTest Passed.\n" + END
 class InterruptedCTest(unittest.TestCase):
     def check_report(self, log, expected_source, verdicts):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp) / "repo"
+            tools = root / "tools"
+            tools.mkdir(parents=True)
+            for name in ("progress_dashboard.py", "progress_dashboard.html", "file_mode.py"):
+                shutil.copyfile(Path(dashboard.__file__).with_name(name), tools / name)
             saved = root / "runtime/build/Testing/Temporary/LastTest.log"
             saved.parent.mkdir(parents=True)
             saved.write_text(log, encoding="utf-8", newline="\n")
             junit = root / "independent.xml"
             junit.write_text('<testsuite><testcase name="junit_control"/></testsuite>', encoding="utf-8", newline="\n")
-            collector = dashboard.Collector()
-            with patch.object(dashboard, "ROOT", tmp), patch.object(dashboard, "last_commit_time", return_value=None):
-                dashboard.collect_ctest(collector, SimpleNamespace(junit=[str(junit)]))
+            out = Path(tmp) / "out"
+            result = subprocess.run([sys.executable, "-I", "-B", str(tools / "progress_dashboard.py"),
+                                     "--out", str(out), "--junit", str(junit)], cwd=tmp, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            snapshot_path, = (out / "snapshots").glob("*.json")
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
 
         self.assertEqual(dashboard.parse_lasttest(log), verdicts)
-        sources = {s["id"]: s for s in collector.sources}
+        sources = {s["id"]: s for s in snapshot["sources"]}
         source = sources["ctest_lasttest"]
         self.assertEqual((source["status"], source["records"]), (expected_source, len(verdicts)))
         if expected_source == "incomplete":
@@ -40,8 +48,9 @@ class InterruptedCTest(unittest.TestCase):
         self.assertEqual((sources["junit"]["status"], sources["junit"]["records"]), ("ok", 1))
         expected = {"junit_control": "verified"}
         expected.update({name: {"pass": "verified", "fail": "failed"}[result] for name, result, _ in verdicts})
-        self.assertCountEqual([(c["name"], c["status"]) for c in collector.components], expected.items())
-        metric = next(m for m in collector.metrics if m["id"] == "runtime.current")
+        observed = [(c["name"], c["status"]) for c in snapshot["components"] if c["panel"] == "runtime"]
+        self.assertCountEqual(observed, expected.items())
+        metric = next(m for m in snapshot["metrics"] if m["id"] == "runtime.current")
         self.assertEqual((metric["numerator"], metric["denominator"]),
                          (sum(value == "verified" for value in expected.values()), len(expected)))
 
