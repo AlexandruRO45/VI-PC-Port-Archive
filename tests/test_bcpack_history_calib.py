@@ -499,6 +499,52 @@ class PrefixDecoderAndCliTest(unittest.TestCase):
                     self.assertNotIn("Traceback", msg)
                     self.assertIn(field, msg)
 
+    def test_pair_int_rejects_bools_fractions_and_oversized_floats(self):
+        # int() coerces True to 1 and 1.5 to 1, and raises OverflowError on 1e400: the
+        # --ref-pairs number fields have to be real whole numbers, and each of those
+        # three shapes has to be reported as one diagnostic naming the field.
+        for value in (True, False, 1.5, 1e400, float("inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaises(calib.CliError) as ctx:
+                    calib._pair_int(value, "pairs.json", 3, "index")
+                self.assertIn("pair 3 index", str(ctx.exception))
+        for value in (7, 0, 2.0, "3"):
+            with self.subTest(accepted=value):
+                self.assertEqual(calib._pair_int(value, "pairs.json", 3, "index"), int(value))
+        for value in (None, [1], {"x": 1}, "abc", ""):
+            with self.subTest(rejected=value):
+                with self.assertRaises(calib.CliError):
+                    calib._pair_int(value, "pairs.json", 3, "out_size")
+
+    def test_cli_ref_pairs_number_fields_reject_bool_fraction_and_huge_float(self):
+        bad_pairs = [
+            ({"pool": "p.bin", "dds": "d.dds", "index": True}, "index"),
+            ({"pool": "p.bin", "dds": "d.dds", "index": 1.5}, "index"),
+            ({"pool": "p.bin", "dds": "d.dds", "index": 1e400}, "index"),
+            ({"codec": "bc1", "chunk_hex": "00" * 8, "ref_hex": "00" * 16,
+             "out_size": True}, "out_size"),
+            ({"codec": "bc1", "chunk_hex": "00" * 8, "ref_hex": "00" * 16,
+             "out_size": 1.5}, "out_size"),
+            ({"codec": "bc1", "chunk_hex": "00" * 8, "ref_hex": "00" * 16,
+             "out_size": 1e400}, "out_size"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, (pair, field) in enumerate(bad_pairs):
+                with self.subTest(field=field, pair=repr(pair)):
+                    pairs_json = os.path.join(tmp, f"num_{i}.json")
+                    with open(pairs_json, "w", encoding="utf-8") as fh:
+                        json.dump({"pairs": [pair]}, fh)
+                    err = io.StringIO()
+                    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                        rc = calib.main(["--ref-pairs", pairs_json, "--codec", "bc1",
+                                         "--out", os.path.join(tmp, f"num_out_{i}")])
+                    self.assertEqual(rc, 2, err.getvalue())
+                    msg = err.getvalue()
+                    self.assertIn("ERROR:", msg)
+                    self.assertNotIn("Traceback", msg)
+                    self.assertIn(field, msg)
+                    self.assertEqual(len(msg.strip().splitlines()), 1, msg)
+
 
 class ReferenceInversionTest(unittest.TestCase):
     def test_ref_pairs_inverts_all_six_codecs_for_strict_decode(self):

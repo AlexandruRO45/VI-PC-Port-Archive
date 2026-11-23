@@ -2157,10 +2157,20 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
 
 
 def _pair_int(value, pairs_path, idx, field):
-    """int() for one --ref-pairs field; a null, list, object or non-numeric string is a CliError."""
+    """One --ref-pairs integer field as a CliError-guarded whole number.
+
+    A null, list, object or non-numeric string is a TypeError/ValueError from int();
+    a float like 1e400 is an OverflowError; bool and 1.5 are silently coerced by int()
+    to 1 and 1. All of those name the field instead of escaping as a traceback. Plain
+    numbers and numeric strings stay accepted, which is how --ref-dds reads its index.
+    """
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise CliError(
+            f"{pairs_path}: pair {idx} {field} must be a whole number, not {type(value).__name__}"
+        )
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise CliError(f"{pairs_path}: pair {idx} {field} must be an integer") from None
 
 
