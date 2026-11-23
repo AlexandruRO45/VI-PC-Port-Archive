@@ -338,3 +338,22 @@ class TestSaluAndn2SaveexecB64RegisterAliasing(unittest.TestCase):
         self.assertEqual(new_exec, 0)
         self.assertEqual(state.exec_mask, 0)
         self.assertEqual(scc, 0)
+
+
+class TestSaluAndn2SaveexecB64ConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and SCC generation."""
+
+    def test_scc_set_when_new_exec_nonzero(self):
+        new_exec, _, scc = ref_andn2_saveexec_b64(0x1, ALL_LANES_INACTIVE)
+        self.assertEqual(new_exec, 1)
+        self.assertEqual(scc, 1)
+
+    def test_scc_cleared_when_new_exec_zero(self):
+        new_exec, _, scc = ref_andn2_saveexec_b64(ALL_LANES_ACTIVE, ALL_LANES_ACTIVE)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+
+    def test_scc_cleared_when_ssrc0_is_zero(self):
+        new_exec, _, scc = ref_andn2_saveexec_b64(0, 0x123456789ABCDEF0)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
