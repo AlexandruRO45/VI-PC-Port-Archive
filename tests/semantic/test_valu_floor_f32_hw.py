@@ -141,5 +141,86 @@ class TestVFloorF32Oracle(unittest.TestCase):
         self.assertIn("OpFunction", spv)
         self.assertIn("OpReturn", spv)
 
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegisterKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL32 = auto()
+
+
+@dataclass(frozen=True)
+class RegOperand:
+    kind: RegisterKind
+    index: int = 0
+
+    def format(self) -> str:
+        if self.kind == RegisterKind.VGPR:
+            return f"v{self.index}"
+        elif self.kind == RegisterKind.SGPR:
+            return f"s{self.index}"
+        elif self.kind == RegisterKind.LITERAL32:
+            return f"{self.index:#x}"
+        return f"reg_{self.index}"
+
+
+@dataclass
+class VFloorF32Instruction:
+    dst: RegOperand
+    src0: RegOperand
+    opcode: str = "v_floor_f32"
+
+    def validate(self) -> None:
+        if self.opcode != "v_floor_f32":
+            raise ValueError(f"Invalid opcode {self.opcode}")
+        if self.dst.kind != RegisterKind.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
+        if self.dst.index > 255:
+            raise ValueError(f"Destination VGPR index out of range: v{self.dst.index}")
+        if self.src0.kind == RegisterKind.VGPR and self.src0.index > 255:
+            raise ValueError(f"Source VGPR index out of range: v{self.src0.index}")
+        elif self.src0.kind == RegisterKind.SGPR and self.src0.index > 105:
+            raise ValueError(f"Source SGPR index out of range: s{self.src0.index}")
+
+    def emit_assembly(self) -> str:
+        self.validate()
+        return f"{self.opcode} {self.dst.format()}, {self.src0.format()}"
+
+
+class TestVFloorF32AST(unittest.TestCase):
+    """Unit tests for symbolic AST representation and validation."""
+
+    def test_ast_valid_vgpr_operands(self):
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=2),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        self.assertEqual(instr.emit_assembly(), "v_floor_f32 v2, v1")
+
+    def test_ast_valid_sgpr_source(self):
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=3),
+            src0=RegOperand(RegisterKind.SGPR, index=4)
+        )
+        self.assertEqual(instr.emit_assembly(), "v_floor_f32 v3, s4")
+
+    def test_ast_invalid_sgpr_destination(self):
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=0),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        with self.assertRaises(TypeError):
+            instr.validate()
+
+    def test_ast_out_of_bounds_vgpr(self):
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=256),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
 if __name__ == "__main__":
     unittest.main()
