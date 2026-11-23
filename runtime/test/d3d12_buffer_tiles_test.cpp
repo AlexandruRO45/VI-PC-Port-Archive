@@ -277,6 +277,18 @@ int main() {
     std::puts("A rejected update left all tile mappings intact");
     const LUID layer_luid = vulkan->GetAdapterLuid();
     if (auto device = native_device(layer_luid)) {
+        // Unset LEONIDA_HOST_ADAPTER means the layer's own GPU whenever its driver can run the cases: comparing with
+        // another GPU's driver measures that driver (an Intel tier-4 iGPU read snapshot 1 as zeros), not the layer.
+        char want[2] = {};
+        const LUID host_luid = device->GetAdapterLuid();
+        ComPtr<IDXGIFactory4> factory;
+        if (!GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want)) &&
+            SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && tiled_device(*factory.Get(), layer_luid, false) &&
+            (host_luid.LowPart != layer_luid.LowPart || host_luid.HighPart != layer_luid.HighPart)) {
+            std::fprintf(stderr, "Native D3D12 runs on another adapter than the layer's, which has tiled resources "
+                                 "tier 2 or more\n");
+            return 1;
+        }
         if (!run(*device.Get(), native) || native != observed) return 1;
         std::puts("Native D3D12 matched all three GPU readbacks");
     }
