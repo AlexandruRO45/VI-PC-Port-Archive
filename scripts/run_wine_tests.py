@@ -12,8 +12,8 @@ Some tests open files through absolute paths compiled into them (the GLSL test s
 runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
 ($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
 
-Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
-others show what does and doesn't work under Wine yet without failing the job.
+Every test is reported. Each name given by --require must appear in the listing and all tests with that
+name must pass. Other outcomes are reported without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 """
 import argparse
@@ -329,7 +329,8 @@ def main() -> int:
     ap.add_argument("--root", type=os.path.abspath, default=ROOT, help="the Linux checkout (default: this repository)")
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
-    ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
+    ap.add_argument("--require", action="append", default=[],
+                    help="a test name whose every occurrence must pass (repeatable)")
     ap.add_argument("--timeout", type=positive_seconds, default=120.0,
                     help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
@@ -352,7 +353,6 @@ def main() -> int:
         print("ERROR: CTest test dependencies form a cycle", file=sys.stderr)
         return 2
     wine = args.wine
-    results = {}
     results_by_index: dict[int, str] = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
     with DriveMap(args.windows_root, args.root, prefix) as drive:
@@ -362,17 +362,17 @@ def main() -> int:
             failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")
             status, detail = run_test(tests[index], args, wine, failed_setups=failed_setups)
             results_by_index[index] = status
-            results[name] = status
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":
                 for line in detail.rstrip().splitlines()[-40:]:
                     print(f"    {line}")
 
-    missing = [n for n in args.require if n not in results]
-    failed_required = [n for n in args.require if results.get(n) != "pass"]
-    counts = {s: sum(1 for v in results.values() if v == s) for s in ("pass", "fail", "skip")}
+    missing = [n for n in args.require if n not in indices]
+    nonpassing_names = {names[index] for index, status in results_by_index.items() if status != "pass"}
+    failed_required = [n for n in args.require if n not in indices or n in nonpassing_names]
+    counts = {s: sum(1 for v in results_by_index.values() if v == s) for s in ("pass", "fail", "skip")}
     print(f"\n{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped under Wine "
-          f"({len(results)} tests)")
+          f"({len(results_by_index)} tests)")
     for n in missing:
         print(f"required test not listed by the Windows build: {n}")
     if failed_required:
@@ -385,7 +385,8 @@ def main() -> int:
                 f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
                 f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
                 f.write("| Test | Result | Required |\n|---|---|---|\n")
-                for name, status in results.items():
+                for index, status in results_by_index.items():
+                    name = names[index]
                     f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
                 f.write("\n")
         except OSError as e:

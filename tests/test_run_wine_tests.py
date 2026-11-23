@@ -517,6 +517,20 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("required tests that did not pass: bad", out)
 
+    def test_results_keep_every_test_with_the_same_name(self):
+        summary = self.root / "summary.md"
+        entries = [
+            ctest_entry("repeated", self.command("bad.py")),
+            ctest_entry("repeated", self.command("ok.py")),
+        ]
+        code, out, _ = self.run_main(entries, "--require", "repeated", "--summary", str(summary))
+        self.assertEqual(code, 1, out)
+        self.assertIn("1 passed, 1 failed, 0 skipped under Wine (2 tests)", out)
+        self.assertIn("required tests that did not pass: repeated", out)
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("| `repeated` | fail | yes |", text)
+        self.assertIn("| `repeated` | pass | yes |", text)
+
     def test_a_required_test_that_is_not_listed_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "absent")
         self.assertEqual(code, 1)
