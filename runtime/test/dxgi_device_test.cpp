@@ -306,7 +306,9 @@ int main() {
 
     // The Vulkan-backed device, the way D3D12XboxCreateDevice hands it out with LEONIDA_D3D12=vulkan.
     vktest::Device d;
-    if (d.create()) {
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::failed) return 1;
+    if (device_status == vktest::DeviceStatus::ready) {
         label = "Vulkan";
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;

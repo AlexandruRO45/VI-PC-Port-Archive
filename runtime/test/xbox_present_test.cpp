@@ -258,7 +258,9 @@ int main() {
         EXPECT(!vktest::known_srgb_swapchain_storage_error(&data));
     }
     vktest::Device d;
-    if (!d.create(true)) {  // no Vulkan loader, device or presentation extensions: nothing to test (ctest: skipped)
+    const auto device_status = d.initialize(true);
+    if (device_status == vktest::DeviceStatus::failed) return 1;
+    if (device_status == vktest::DeviceStatus::unavailable) {  // no loader, device or presentation extensions
         std::printf("no Vulkan device with presentation: skipped\n");
         return 77;
     }

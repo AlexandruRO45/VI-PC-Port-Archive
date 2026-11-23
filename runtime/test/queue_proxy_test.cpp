@@ -723,10 +723,11 @@ int make_context(const char* label, ID3D12Device* device, DiffContext& c, Ref<ID
 
 // The real device for a backend kind: "warp", "hw" (the first hardware adapter) or "vulkan" (on `vk`). One
 // reference, or null.
-ID3D12Device* create_backend_device(const char* kind, vktest::Device& vk) {
+ID3D12Device* create_backend_device(const char* kind, vktest::Device& vk, vktest::DeviceStatus& device_status) {
     ID3D12Device* device = nullptr;
     if (!std::strcmp(kind, "vulkan")) {
-        if (!vk.create()) return nullptr;
+        device_status = vk.initialize();
+        if (device_status != vktest::DeviceStatus::ready) return nullptr;
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = vk.instance_proc;
         info.instance = vk.instance;
@@ -757,8 +758,13 @@ ID3D12Device* create_backend_device(const char* kind, vktest::Device& vk) {
 int run_diff_child(const char* kind, int index, bool through_proxy) {
     if (index < 0 || index >= static_cast<int>(std::size(kDiffCases))) return 2;
     vktest::Device vk;
-    ID3D12Device* real = create_backend_device(kind, vk);
-    if (!real) return 3;
+    auto device_status = vktest::DeviceStatus::ready;
+    ID3D12Device* real = create_backend_device(kind, vk, device_status);
+    if (!real) {
+        if (!std::strcmp(kind, "vulkan"))
+            return device_status == vktest::DeviceStatus::unavailable ? 77 : 1;
+        return 3;
+    }
     Ref<ID3D12Device> device;
     if (through_proxy) {
         if (FAILED(xs::create_device_proxy(real, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device.p)))) {
@@ -1753,7 +1759,9 @@ int main(int argc, char** argv) {
 
     // The Vulkan-backed device, the way D3D12XboxCreateDevice hands it out with LEONIDA_D3D12=vulkan.
     vktest::Device d;
-    if (d.create()) {
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::failed) return 1;
+    if (device_status == vktest::DeviceStatus::ready) {
         const char* label = "Vulkan";
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;

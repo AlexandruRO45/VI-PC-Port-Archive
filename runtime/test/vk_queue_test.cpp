@@ -103,7 +103,9 @@ int main() {
 
     vktest::Device d;
     d.all_queue_types = true;
-    if (!d.create()) {
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::failed) return 1;
+    if (device_status == vktest::DeviceStatus::unavailable) {
         std::printf("SKIP: no usable Vulkan device\n");
         return 77;
     }

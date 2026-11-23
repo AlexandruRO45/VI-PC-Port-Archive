@@ -275,7 +275,9 @@ int main() {
     using namespace leonida;
 
     vktest::Device d;
-    if (!d.create(false) || !d.bc) {
+    const auto device_status = d.initialize(false);
+    if (device_status == vktest::DeviceStatus::failed) return 1;
+    if (device_status == vktest::DeviceStatus::unavailable || !d.bc) {
         std::fprintf(stderr, "vk_bc_zero_init_test: no Vulkan 1.3 device with BC support, skipped\n");
         return 77;
     }
