@@ -471,5 +471,77 @@ class TestValuDot4I32I8NegativeControls(unittest.TestCase):
         s1 = pack_i8(1, 1, 1, 1)
         self.assertNotEqual(ref_dot4_i32_i8(s0, s1, 100), mutant_no_acc(s0, s1, 100))
 
+class TestValuDot4I32I8TranslationAndExecution(unittest.TestCase):
+    """Stage 8: End-to-end SPIR-V translation and fragment execution."""
+
+    def _run_ps(self, lines: list[str]) -> int:
+        full_lines = list(lines) + [
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_dot4_i32_i8", full_lines)
+        words = mrt0_words(spv)
+        return words[0]
+
+    def test_translator_basic_dot_product(self) -> None:
+        s0 = pack_i8(1, 2, 3, 4)
+        s1 = pack_i8(5, 6, 7, 8)
+        lines = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            "v_mov_b32 v3, 500",
+            "v_dot4_i32_i8 v0, v1, v2, v3",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 570)
+
+    def test_translator_signed_negative_bytes(self) -> None:
+        s0 = pack_i8(-1, 2, -3, -4)
+        s1 = pack_i8(5, -6, -7, 8)
+        lines = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            "v_mov_b32 v3, 0",
+            "v_dot4_i32_i8 v0, v1, v2, v3",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 0xFFFFFFE4)
+
+    def test_translator_with_sgpr_sources(self) -> None:
+        s0 = pack_i8(2, 3, 4, 5)
+        s1 = pack_i8(1, 1, 1, 1)
+        lines = [
+            f"s_mov_b32 s0, {s0:#x}",
+            f"v_mov_b32 v1, {s1:#x}",
+            "v_mov_b32 v2, 50",
+            "v_dot4_i32_i8 v0, s0, v1, v2",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 64)
+
+    def test_translator_clamp_saturation(self) -> None:
+        s0 = pack_i8(0x80, 0x80, 0x80, 0x80)
+        s1 = pack_i8(0x80, 0x80, 0x80, 0x80)
+        lines = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            f"v_mov_b32 v3, {INT32_MAX:#x}",
+            "v_dot4_i32_i8 v0, v1, v2, v3 clamp",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, INT32_MAX)
+
+    def test_translator_in_place_aliasing(self) -> None:
+        s0 = pack_i8(1, 2, 3, 4)
+        s1 = pack_i8(1, 1, 1, 1)
+        lines = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            "v_mov_b32 v0, 100",
+            "v_dot4_i32_i8 v0, v1, v2, v0",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 110)
+
 if __name__ == "__main__":
     unittest.main()
