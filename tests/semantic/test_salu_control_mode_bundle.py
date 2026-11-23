@@ -295,6 +295,18 @@ class TestSleepTranslator(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestNopOracle(unittest.TestCase):
+    def test_oracle_nop_counts(self):
+        self.assertEqual(model_nop(0), 1)
+        self.assertEqual(model_nop(1), 2)
+        self.assertEqual(model_nop(7), 8)
+
+    def test_translator_nop_oracle(self):
+        prog = ["s_nop 0", "s_endpgm"]
+        spv = support.translate_lines("cs_nop_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
