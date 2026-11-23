@@ -1562,11 +1562,18 @@ def run_suite(a, work: str) -> int:
                         f.write(struct.pack("<8f", *v))
                 env.update(VKH_GS_LINEAR=lin)
                 runs = [("non-indexed", raw, env)]
+                # Two copies of the triangle: the plain u16 run reads the first, and the first-offset run
+                # starts at index 3, drawing the second -- the same triangle, proving the first-index base.
                 idx = os.path.join(work, "gs_tri_indices_u16.bin")
                 with open(idx, "wb") as f:
-                    f.write(struct.pack("<3H", 0, 1, 2))
+                    f.write(struct.pack("<6H", 0, 1, 2, 0, 1, 2))
                 raw2 = os.path.join(raw_dir, f"{name}.u16.raw")
-                runs.append(("u16 indices", raw2, dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16")))
+                runs.append(("u16 indices", raw2, dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16",
+                                                        VKH_GS_COUNT="3")))
+                raw2f = os.path.join(raw_dir, f"{name}.u16_first.raw")
+                runs.append(("u16 indices from first 3", raw2f,
+                             dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16", VKH_GS_COUNT="3",
+                                  VKH_GS_FIRST="3")))
                 # A permuted u32 index run (LukeOsland1's fixture from #7696): the linear buffer's first three
                 # slots hold a degenerate triangle, so a scatter that ignored the index buffer would draw it and
                 # fail the gradient check -- only following indices (1, 3, 0) restores the real one.

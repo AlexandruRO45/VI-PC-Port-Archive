@@ -1156,6 +1156,15 @@ int main(int argc, char** argv) {
         }
         uint32_t gs_first = 0;
         if (const char* f = std::getenv("VKH_GS_FIRST")) gs_first = uint32_t(std::strtoul(f, nullptr, 0));
+        // VKH_GS_COUNT: draw fewer indices than the file holds, with VKH_GS_FIRST pointing at the first.
+        if (const char* c = std::getenv("VKH_GS_COUNT")) {
+            const uint32_t want = uint32_t(std::strtoul(c, nullptr, 0));
+            if (!want || want > gs_count) {
+                std::fprintf(stderr, "VKH_GS_COUNT must be between 1 and the file's %u indices\n", gs_count);
+                return 2;
+            }
+            gs_count = want;
+        }
         gs_prims = gs_count / gs_verts_in;
         gs_draw_verts = gs_prims * 3 * (gs_max_verts >= 3 ? gs_max_verts - 2 : 1);
         LOADD(vkGetBufferDeviceAddress);

@@ -3200,6 +3200,16 @@ public:
             }
             kind = index.format == DXGI_FORMAT_R16_UINT ? 0 : 1;
             index_va = index.va + std::uint64_t(first) * (kind == 0 ? 2 : 4);  // first: StartIndexLocation
+            if (kind == 0) {
+                // The fused pass reads the dword containing each u16 index: an odd count ending mid-dword
+                // would read past the buffer the game bound, so such a draw is out of scope, not undefined.
+                const std::uint64_t last = (std::uint64_t(first) + count - 1) * 2;
+                if (((last & ~std::uint64_t(3)) + 4) > index.size) {
+                    log_once("the geometry fallback reads u16 index buffers whole dwords; the last index's "
+                             "dword crosses the buffer's end; bytes", int(index.size));
+                    return false;
+                }
+            }
         }
         const std::uint64_t input_bytes = 16 + 16 * std::uint64_t(prims) * f.verts_in * (f.num_inputs + 1);
         const std::uint64_t record_bytes = 16 * std::uint64_t(prims) * f.max_verts * f.num_outputs;

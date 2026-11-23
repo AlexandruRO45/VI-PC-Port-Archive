@@ -277,14 +277,16 @@ def scatter_module(lay):
     slot_comp = x.umod(i, x.c(4 * nin))
     slot = x.udiv(slot_comp, x.c(4))
     comp = x.umod(i, x.c(4))
-    # The source vertex id: the u16 and u32 reads are both done, and member 3..4 only has to be readable
-    # when member 8 is 2, so the flag only picks the result (no path reads an unusable address).
+    # The source vertex id: the load touches only the width the kind selects -- the other width's bytes can
+    # lie past the index buffer the draw bound -- and member 3..4 only has to be readable when member 8 is 2,
+    # so a non-indexed draw can pass the linear buffer's address.
     ivc = x.add(x.mul(p, x.c(vin)), v)
-    byte = x.mul(ivc, x.c(2))
-    wv16 = x.load_word(x.add64(idx, x.and64(x.u64(byte), x.cl(4294967292))), 0)
-    v16 = x.and_(x.shr(wv16, x.shl(x.umod(byte, x.c(4)), x.c(3))), x.c(65535))
-    v32 = x.load_dword(idx, ivc)
-    vid = x.sel_u(x.eq(flag, x.c(1)), v32, v16)
+    byte16 = x.mul(ivc, x.c(2))
+    is32 = x.eq(flag, x.c(1))
+    off = x.sel_u(is32, x.mul(ivc, x.c(4)), x.and_(byte16, x.c(4294967292)))
+    wv = x.load_word(x.add64(idx, x.u64(off)), 0)
+    v16 = x.and_(x.shr(wv, x.shl(x.umod(byte16, x.c(4)), x.c(3))), x.c(65535))
+    vid = x.sel_u(is32, wv, v16)
     vid = x.sel_u(x.eq(flag, x.c(2)), ivc, vid)
     vid = x.add(vid, first)
     # linear[(vid * nin + slot) * 4 + comp] -> input data dword (pv * nin + slot) * 4 + comp.
@@ -540,13 +542,15 @@ def vs_input_module(text):
     x.store_word(in64, 0, prims)
     x.body += ["OpBranch %gsc_cntdone", "%gsc_cntdone = OpLabel"]
     # The source vertex id: flag 2 is the non-indexed base; 0/1 read u16/u32 indices (a non-indexed draw
-    # points the index VA anywhere readable, as tools/gs_compute_stages.py's harness scatter documents).
-    byte = x.mul("%gsc_pv", x.c(2))
-    waddr = x.add64(idx64, x.and64(x.u64(byte), x.cl(4294967292)))
+    # points the index VA anywhere readable). The load touches only the width the kind selects, as the other
+    # width's bytes can lie past the index buffer the draw bound.
+    byte16 = x.mul("%gsc_pv", x.c(2))
+    is32 = x.eq(flag, x.c(1))
+    off = x.sel_u(is32, x.mul("%gsc_pv", x.c(4)), x.and_(byte16, x.c(4294967292)))
+    waddr = x.add64(idx64, x.u64(off))
     wv = x.load_word(waddr, 0)
-    v16 = x.and_(x.shr(wv, x.mul(x.umod(byte, x.c(4)), x.c(8))), x.c(65535))
-    v32 = x.load_dword(idx64, "%gsc_pv")
-    vid = x.sel_u(x.eq(flag, x.c(1)), v32, v16)
+    v16 = x.and_(x.shr(wv, x.mul(x.umod(byte16, x.c(4)), x.c(8))), x.c(65535))
+    vid = x.sel_u(is32, wv, v16)
     vid = x.sel_u(x.eq(flag, x.c(2)), "%gsc_pv", vid)
     vid = x.add(vid, first)
 
