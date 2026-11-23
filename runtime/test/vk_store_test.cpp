@@ -9,12 +9,13 @@
 // "load" (cs_imgload.asm): the uint and sint images are filled before the dispatch, and the shader loads both
 // texels with image_load and stores their sum into the sint image. The device is made without
 // shaderStorageImageReadWithoutFormat, and a module that declares StorageImageReadWithoutFormat fails (SHADER-151).
-// "words" (cs_imgatomic.asm, cs_imgatomic3d.asm, cs_resinfo.asm): the uint and sint images are filled as for "load"
-// and a 4x4x4 r32 uint volume with 200 + i, and nothing is judged here: the 64 words of each are printed after the
-// dispatch (texel (x, y) at i = 8y + x, (x, y, z) at i = 16z + 4y + x) for check.py to compare. Three things are
-// bound for these shaders in every mode: the uint image as an r32ui storage image at set 0 binding 4 and the volume
-// at binding 7, where 2D and 3D image atomics address their image, and at index 4 of the sampled array a 16x4 rgba8
+// "words" (cs_imgatomic.asm, cs_imgatomic3d.asm, cs_resinfo.asm, cs_sample_lz_int3d_d16.asm): the uint and sint
+// images are filled as for "load" and a 4x4x4 r32 uint volume with 200 + i, and nothing is judged here: the 64 words
+// of each are printed after the dispatch (texel (x, y) at i = 8y + x, (x, y, z) at i = 16z + 4y + x) for check.py
+// to compare. The harness binds the uint image as an r32ui storage image at set 0 binding 4 and the volume at
+// binding 7, where 2D and 3D image atomics address their image, and at index 4 of the sampled array a 16x4 rgba8
 // image with all five mip levels (never read, only queried), behind the T# the runtime writes for such an image.
+// The volume view is also sampled through binding 6 for the 3D integer sample fixture.
 // "signed-zero" checks three direct float stores and all remaining RGBA32 guard words (SHADER-605).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
@@ -284,7 +285,8 @@ int main(int argc, char** argv) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ii.imageType = VK_IMAGE_TYPE_3D; ii.format = vkf[1]; ii.extent = {VOL, VOL, VOL};
         ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         CHECK(vkCreateImage(dev, &ii, nullptr, &vol));
         VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, vol, &mr);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -303,20 +305,21 @@ int main(int argc, char** argv) {
     // index 4. Binding 0 holds each image's view in its own format (typed image_load reads the uint and sint ones
     // through integer aliases); every element of a storage array holds the image of its class, so all of them are
     // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
-    // and the volume, in every element.
+    // and the volume, in every element. Binding 6 is the 3D sampled-image array used by typed image samples.
     constexpr uint32_t N = 5;
-    VkDescriptorSetLayoutBinding b[8]{};
+    VkDescriptorSetLayoutBinding b[9]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     for (int k = 0; k < 3; k++) b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[6] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[8] = {6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 8; dli.pBindings = b;
+    dli.bindingCount = std::size(b); dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
     VkDescriptorPoolSize ps[4] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * N},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * N},
@@ -336,7 +339,7 @@ int main(int argc, char** argv) {
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkDescriptorImageInfo dii[3][N];
     VkDescriptorImageInfo r32ui[N], r32ui_3d[N];
-    VkWriteDescriptorSet wr[8]{};
+    VkWriteDescriptorSet wr[9]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; w.descriptorCount = 1; }
     wr[0].dstBinding = 0; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = sii;
     wr[0].descriptorCount = N;
@@ -353,7 +356,9 @@ int main(int argc, char** argv) {
     for (uint32_t e = 0; e < N; e++) r32ui_3d[e] = {VK_NULL_HANDLE, vol_view, VK_IMAGE_LAYOUT_GENERAL};
     wr[7].dstBinding = 7; wr[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = N;
-    vkUpdateDescriptorSets(dev, 8, wr, 0, nullptr);
+    wr[8].dstBinding = 6; wr[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr[8].pImageInfo = r32ui_3d; wr[8].descriptorCount = N;
+    vkUpdateDescriptorSets(dev, std::size(wr), wr, 0, nullptr);
 
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());

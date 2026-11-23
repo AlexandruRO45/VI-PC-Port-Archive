@@ -583,6 +583,8 @@ STORE_WORDS = {
     # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
     "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
                        {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
+    # 3D integer sample with explicit LOD and D16 result: two exact texel centres on slices 1 and 2.
+    "cs_sample_lz_int3d_d16": ({}, {0: 225, 1: 239}, {}),
     # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
     # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone, and
     # level 5, past the last (2D depth 0 and the past-the-end zeros measured on RDNA2, SHADER-388)
