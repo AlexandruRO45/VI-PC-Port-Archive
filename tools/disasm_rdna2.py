@@ -795,6 +795,15 @@ VOP3_NATIVE_OPS = {
 }
 
 
+# GFX10 VOP3_INTERP 16-bit interpolation ops (VOP3Interp_gfx10 encoding).
+# Tuple: (mnemonic, comment, has_src2, has_omod)
+VOP3_INTERP16_OPS = {
+    0x342: ("v_interp_p1ll_f16", "Parameter interpolation P1LL float16 (VOP3_INTERP)", False, True),
+    0x343: ("v_interp_p1lv_f16", "Parameter interpolation P1LV float16 (VOP3_INTERP)", True, True),
+    0x35a: ("v_interp_p2_f16", "Parameter interpolation P2 float16 (VOP3_INTERP)", True, False),
+}
+
+
 VOP3P_OPS = {
     0x00: ("v_pk_mad_i16", "Multiply-add signed 16-bit packed"),
     0x01: ("v_pk_mul_lo_u16", "Multiply low unsigned 16-bit packed"),
@@ -2039,6 +2048,33 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src2 = (w1 >> 18) & 0x1ff
         omod = (w1 >> 27) & 0x3
         neg = [(w1 >> 29) & 1, (w1 >> 30) & 1, (w1 >> 31) & 1]
+
+        if op in VOP3_INTERP16_OPS:
+            op_name, comment, has_src2, has_omod = VOP3_INTERP16_OPS[op]
+            # VOP3Interp_gfx10 places attr[5:0] in w1[5:0], attrchan[1:0] in w1[7:6],
+            # high in w1[8], src0 in w1[17:9] (abs=w0[9], neg=w1[30]),
+            # and src2 in w1[26:18] (abs=w0[10], neg=w1[31]).
+            attr = w1 & 0x3f
+            attrchan = (w1 >> 6) & 0x3
+            high = (w1 >> 8) & 1
+            src0_str = _format_operand_modifiers(decode_v_reg(src1), (w0 >> 9) & 1, neg[1])
+            attr_str = f"attr{attr}.{'xyzw'[attrchan]}"
+            asm = f"{op_name} v{vdst}, {src0_str}, {attr_str}"
+            if has_src2:
+                src2_str = _format_operand_modifiers(decode_v_reg(src2), (w0 >> 10) & 1, neg[2])
+                asm += f", {src2_str}"
+            if high:
+                asm += " high"
+            if clamp:
+                asm += " clamp"
+            if has_omod:
+                if omod == 1:
+                    asm += " mul:2"
+                elif omod == 2:
+                    asm += " mul:4"
+                elif omod == 3:
+                    asm += " div:2"
+            return (8, op_name, asm, comment)
 
         is_vopc = False
         is_vop3b = False

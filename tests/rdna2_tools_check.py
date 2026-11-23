@@ -1795,6 +1795,86 @@ class TestRdna2Disasm(unittest.TestCase):
         # The first four lines are 8 bytes each; the three one-field variants must encode differently.
         self.assertEqual(len({emitted[i:i + 8] for i in range(0, 32, 8)}), 4)
 
+    def test_vop3_interp_f16_encodings(self):
+        """Issue #938 step 2: v_interp_p1ll_f16, v_interp_p1lv_f16, and v_interp_p2_f16 match LLVM 15 gfx1013."""
+        endpgm = bytes.fromhex("000081bf")
+        # Golden encodings from LLVM 15.0.7 test/MC/AMDGPU/gfx10_asm_vop3.s.
+        cases = (
+            ("050042d71f040200", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, v2, attr31.x"),
+            ("050042d7c0040200", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, v2, attr0.w"),
+            ("050042d700040240", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, -v2, attr0.x"),
+            ("050242d700040200", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, |v2|, attr0.x"),
+            ("050242d700040240", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, -|v2|, attr0.x"),
+            ("050042d700050200", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, v2, attr0.x high"),
+            ("058042d700040200", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, v2, attr0.x clamp"),
+            ("050042d700040210", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, v2, attr0.x mul:4"),
+            ("058042d700050208", "v_interp_p1ll_f16", "v_interp_p1ll_f16 v5, v2, attr0.x high clamp mul:2"),
+            ("050043d701040e04", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr1.x, v3"),
+            ("050043d780040e04", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr0.z, v3"),
+            ("050043d700040e44", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, -v2, attr0.x, v3"),
+            ("050043d700040e84", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr0.x, -v3"),
+            ("050243d700040e04", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, |v2|, attr0.x, v3"),
+            ("050443d700040e04", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr0.x, |v3|"),
+            ("050043d700050e04", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr0.x, v3 high"),
+            ("058043d700040e04", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr0.x, v3 clamp"),
+            ("050043d700040e0c", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr0.x, v3 mul:2"),
+            ("050043d700040e1c", "v_interp_p1lv_f16", "v_interp_p1lv_f16 v5, v2, attr0.x, v3 div:2"),
+            ("05005ad700040e04", "v_interp_p2_f16", "v_interp_p2_f16 v5, v2, attr0.x, v3"),
+            ("05005ad700040e44", "v_interp_p2_f16", "v_interp_p2_f16 v5, -v2, attr0.x, v3"),
+            ("05045ad700040e04", "v_interp_p2_f16", "v_interp_p2_f16 v5, v2, attr0.x, |v3|"),
+            ("05005ad7c0040e04", "v_interp_p2_f16", "v_interp_p2_f16 v5, v2, attr0.w, v3"),
+            ("05005ad700050e04", "v_interp_p2_f16", "v_interp_p2_f16 v5, v2, attr0.x, v3 high"),
+            ("05805ad700040e04", "v_interp_p2_f16", "v_interp_p2_f16 v5, v2, attr0.x, v3 clamp"),
+            ("05805ad700050e04", "v_interp_p2_f16", "v_interp_p2_f16 v5, v2, attr0.x, v3 high clamp"),
+        )
+        for raw, opcode, assembly in cases:
+            with self.subTest(raw=raw):
+                insns = disasm_rdna2(bytes.fromhex(raw) + endpgm)
+                self.assertEqual(
+                    [(i["offset"], i["length"], i["opcode"]) for i in insns],
+                    [(0, 8, opcode), (8, 4, "s_endpgm")],
+                )
+                self.assertEqual(insns[0]["assembly"], assembly)
+                trunc = disasm_rdna2(bytes.fromhex(raw)[:4])
+                self.assertEqual(len(trunc), 1)
+                self.assertEqual(trunc[0]["opcode"], "vop3_truncated")
+
+    def test_vop3_interp_f16_llvm_round_trip(self):
+        """Issue #938 step 2: v_interp_*_f16 round-trip identically through LLVM 15 on gfx1013."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(
+                f"v_interp_*_f16 round trip requires llvm-mc and llvm-objcopy "
+                f"(assembler={assembler}, objcopy={objcopy})"
+            )
+
+        source = [
+            "v_interp_p1ll_f16 v1, v2, attr0.x",
+            "v_interp_p1ll_f16 v1, v2, attr1.x",                  # attr only
+            "v_interp_p1ll_f16 v1, v2, attr0.y",                  # attrchan only
+            "v_interp_p1ll_f16 v1, v2, attr0.x high",             # high only
+            "v_interp_p1ll_f16 v1, v2, attr0.x clamp",            # clamp only
+            "v_interp_p1ll_f16 v1, v2, attr0.x mul:4",            # omod only
+            "v_interp_p1ll_f16 v5, -|v2|, attr31.w high clamp mul:2",
+            "v_interp_p1lv_f16 v5, v2, attr1.x, v3",
+            "v_interp_p1lv_f16 v5, -v2, attr0.z, |v3| high clamp div:2",
+            "v_interp_p2_f16 v1, v2, attr0.x, v3",
+            "v_interp_p2_f16 v5, -v2, attr0.w, |v3| high clamp",
+            "s_endpgm",
+        ]
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        llvm_lines = llvm_disassemble(emitted, resolved_lib)
+        decoded = [rec["assembly"] for rec in disasm_rdna2(emitted)]
+        self.assertEqual(llvm_lines, source)
+        self.assertEqual(decoded, llvm_lines)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+        # First six lines are 8 bytes each; each single-field mutation must produce distinct bytes.
+        self.assertEqual(len({emitted[i:i + 8] for i in range(0, 48, 8)}), 6)
+
 
 class TestRdna2Extractor(unittest.TestCase):
     """Test shader extraction from RPF archives against known source-owned fixtures."""
@@ -3464,6 +3544,37 @@ class TestRdna2Scanner(unittest.TestCase):
         # Negative control: v_div_scale_f32 must be rejected
         with self.assertRaises(ValueError):
             lower(["v_div_scale_f32 v12, vcc_lo, v19, v19, v20", *div_shader], 20, 24, [1, 2, 3, 4])
+
+    def test_binary_scan_recognizes_vop3_interp_f16(self):
+        """Issue #938 step 2: binary scan recognizes decoded v_interp_*_f16 while keeping them unlowered."""
+        interp_bin = bytes.fromhex(
+            "050042d71f040200"  # v_interp_p1ll_f16 v5, v2, attr31.x
+            "050043d701040e04"  # v_interp_p1lv_f16 v5, v2, attr1.x, v3
+            "05005ad700040e04"  # v_interp_p2_f16 v5, v2, attr0.x, v3
+            "000081bf"          # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_interp_f16.bin").write_bytes(interp_bin)
+            results = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}
+        res = results["ps_interp_f16.bin"]
+        self.assertEqual(res["total_instructions"], 4)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertEqual(res["unsupported_opcodes"], {})
+        self.assertFalse(res["translator_accepted"])
+        self.assertEqual(res["compatibility_category"], "opcode_recognized_translator_rejected")
+        self.assertEqual(res["unsupported_count"], 3)
+        self.assertEqual(
+            [d["raw"] for d in res["unsupported_details"]],
+            [
+                "v_interp_p1ll_f16 v5, v2, attr31.x",
+                "v_interp_p1lv_f16 v5, v2, attr1.x, v3",
+                "v_interp_p2_f16 v5, v2, attr0.x, v3",
+            ],
+        )
+        # Negative control: the previous unnamed VOP3 spellings fail ISA recognition.
+        for old_op in ("v_vop3_342", "v_vop3_343", "v_vop3_35a"):
+            self.assertFalse(is_opcode_recognized(old_op), old_op)
 
 
 if __name__ == "__main__":
