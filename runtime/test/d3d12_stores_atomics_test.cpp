@@ -17,6 +17,7 @@
 #include "../src/shader_library.h"
 #include "../src/spirv_stores.h"
 #include "../src/spirv_words.h"
+#include "test_temp_dir.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -121,8 +122,8 @@ int main() {
     const auto atomic_program = fssm_program({0x50530a70, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto atomic_container = shader_container(atomic_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_stores_atomics_test";
-    std::filesystem::create_directories(library);
+    const testfiles::ScratchDir scratch("leonida_stores_atomics_test");  // this process's own, removed on return
+    const auto& library = scratch.path();
     const struct { const char* compiled; const char* name; } files[] = {
         {LEONIDA_TEST_VS_FULLSCREEN_SPV, "vs_fullscreen.spv"},
         {LEONIDA_TEST_PS_SPV, "ps_draw.spv"},

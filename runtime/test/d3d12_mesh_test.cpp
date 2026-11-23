@@ -19,6 +19,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <array>
 #include <cstring>
@@ -110,7 +111,7 @@ int main() {
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
     const auto ms_container = shader_container(ms_program), ps_container = shader_container(ps_program);
     const auto vs_container = shader_container(vs_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
+    const auto library = testfiles::process_temp_dir("leonida_mesh_test");
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);

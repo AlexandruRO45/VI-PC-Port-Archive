@@ -16,6 +16,7 @@
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -444,8 +445,8 @@ int main() {
 
     const auto vs_program = d3d12test::fssm_program({0x56530501, 0xbf810000});
     const auto ps_program = d3d12test::fssm_program({0x50530501, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_state_sweep_test";
-    std::filesystem::create_directories(library);
+    const testfiles::ScratchDir scratch("leonida_state_sweep_test");  // this process's own, removed on return
+    const auto& library = scratch.path();
     const auto overwrite = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_SWEEP_VS_SPV, library / "vs.spv", overwrite);
     std::filesystem::copy_file(LEONIDA_SWEEP_PS_SPV, library / "ps.spv", overwrite);

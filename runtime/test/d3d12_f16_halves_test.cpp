@@ -17,6 +17,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
+#include "test_temp_dir.h"
 
 #include <cmath>
 #include <cstdint>
@@ -188,8 +189,8 @@ int main() {
     const auto ps1_c = shader_container(ps1_prog);
     const auto ps2_c = shader_container(ps2_prog);
 
-    const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_f16_halves_gpu_test";
-    std::filesystem::create_directories(lib_dir);
+    const testfiles::ScratchDir scratch("leonida_f16_halves_gpu_test");  // this process's own, removed on return
+    const auto& lib_dir = scratch.path();
     write_spv(lib_dir / "vs_16p.spv", make_16param_vs());
     write_spv(lib_dir / "ps_packed.spv", make_f16_ps(15, 20, 21));
     write_spv(lib_dir / "ps_reloc.spv", make_f16_ps(14, 14, 15));
