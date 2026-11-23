@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -473,6 +474,18 @@ class NavmeshLinksTest(unittest.TestCase):
                 self.assertEqual(nl.main([rpf, "--out", rpf_upper]), 2)
                 with open(rpf, "rb") as fh:
                     self.assertEqual(fh.read(4), b"9FPR")
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "out.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(previous)
+            with mock.patch.object(nl, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    nl.write_json_report(path, {"tiles": 0})
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), previous)
 
 
 if __name__ == "__main__":

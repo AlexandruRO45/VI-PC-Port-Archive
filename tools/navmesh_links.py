@@ -7,6 +7,7 @@ the 32-byte special-link records (+0xA8, count u32@0xD4), the u16 special-link i
 table (+0xB0, count u32@0xD8), and the polygon +0x20 special-link prefix-sum chain
 across all 0x00010015 navmesh tiles. Emits aggregate counts and invariant pass/fail
 totals only (no game data).
+`--out` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 Usage: `python -I tools/navmesh_links.py --help` lists the options.
 """
 
@@ -16,15 +17,21 @@ import json
 import math
 import mmap
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 try:
     from tools import navmesh_decode as nd
+    from tools.file_mode import published_mode
+    from tools.replace_retry import replace as replace_retry
     from tools.report_paths import same_report_path
 except ImportError:  # pragma: no cover - direct script execution
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import navmesh_decode as nd
+    from file_mode import published_mode
+    from replace_retry import replace as replace_retry
     from report_paths import same_report_path
 
 
@@ -607,12 +614,45 @@ def main(argv=None):
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(doc, fh, indent=2)
-            fh.write("\n")
+        write_json_report(args.out, doc)
     if not args.quiet:
         print(json.dumps(doc, indent=2))
     return 0
+
+
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(report, fh, indent=2)
+            fh.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".navmesh_links-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=2)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
