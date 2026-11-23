@@ -2292,6 +2292,14 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(dxgi_swapchain_count_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_swapchain_count_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_swapchain_count COMMAND dxgi_swapchain_count_test)
+    # IDXGISwapChain1..4 calls compared with the host DXGI: colour spaces, HDR metadata, rotation, background colour,
+    # interfaces, back buffer index, present count.
+    add_executable(dxgi_swapchain_methods_test test/dxgi_swapchain_methods_test.cpp)
+    target_link_libraries(dxgi_swapchain_methods_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(dxgi_swapchain_methods_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_swapchain_methods_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_swapchain_methods COMMAND dxgi_swapchain_methods_test)
+    set_tests_properties(dxgi_swapchain_methods PROPERTIES SKIP_RETURN_CODE 77)
 
     # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
     add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)

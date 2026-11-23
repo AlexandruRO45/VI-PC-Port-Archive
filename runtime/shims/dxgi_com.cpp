@@ -118,6 +118,30 @@ bool valid_flip_buffer_count(UINT count) {
     return count >= 2 && count <= DXGI_MAX_SWAP_CHAIN_BUFFERS;
 }
 
+// Whether a flip-model swap chain of `format` can present in colour space `space` (DXGI_SWAP_CHAIN_COLOR_SPACE_
+// SUPPORT_FLAG_PRESENT): the host's table on the RTX 4080 SUPER, the UHD 770 and WARP, the same on all three. An FP16
+// chain presents scRGB (G10) only; the 8-bit and 10-bit chains take the sRGB, studio-range, BT.2020 and HDR10 RGB
+// spaces. 27 is not in the SDK's enum, and the host takes it as well. Everything else, DXGI_COLOR_SPACE_CUSTOM
+// included, is refused.
+bool color_space_presentable(DXGI_FORMAT format, DXGI_COLOR_SPACE_TYPE space) {
+    const auto value = static_cast<std::uint32_t>(space);
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) return value == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+    switch (value) {
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709:
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P2020:
+    case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020:
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020:
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G24_NONE_P709:
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G24_NONE_P2020:
+    case 27:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool is_direct_present_queue(IUnknown* candidate) {
     ID3D12CommandQueue* queue = nullptr;
     if (!candidate || FAILED(candidate->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return false;
@@ -204,7 +228,7 @@ private:
     D3D12_RESOURCE_DESC desc_{};
 };
 
-class SwapChain final : public IDXGISwapChain3 {
+class SwapChain final : public IDXGISwapChain4 {
 public:
     SwapChain(IDXGIFactory4* parent, IUnknown* device, leonida::VulkanContext& context,
               PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
@@ -228,6 +252,9 @@ public:
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {
         hwnd_ = hwnd;
         flags_ = desc.Flags;
+        scaling_ = desc.Scaling;
+        alpha_mode_ = desc.AlphaMode;
+        stereo_ = desc.Stereo;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
@@ -257,8 +284,9 @@ public:
         *out = nullptr;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIDeviceSubObject) ||
             riid == __uuidof(IDXGISwapChain) || riid == __uuidof(IDXGISwapChain1) ||
-            riid == __uuidof(IDXGISwapChain2) || riid == __uuidof(IDXGISwapChain3)) {
-            *out = static_cast<IDXGISwapChain3*>(this);
+            riid == __uuidof(IDXGISwapChain2) || riid == __uuidof(IDXGISwapChain3) ||
+            riid == __uuidof(IDXGISwapChain4)) {
+            *out = static_cast<IDXGISwapChain4*>(this);
             AddRef();
             return S_OK;
         }
@@ -335,6 +363,7 @@ public:
         desc->BufferDesc.Width = swapchain_.extent().width;
         desc->BufferDesc.Height = swapchain_.extent().height;
         desc->BufferDesc.Format = vk_to_dxgi_format(swapchain_.format());
+        desc->BufferDesc.RefreshRate = {0, 1};  // as the host reports a windowed chain
         desc->SampleDesc.Count = 1;
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc->BufferCount = swapchain_.image_count();
@@ -457,15 +486,17 @@ public:
         desc->SampleDesc.Count = 1;
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc->BufferCount = swapchain_.image_count();
-        desc->Scaling = DXGI_SCALING_STRETCH;
+        desc->Stereo = stereo_;
+        desc->Scaling = scaling_;
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        desc->AlphaMode = alpha_mode_;
         desc->Flags = flags_;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
         std::memset(desc, 0, sizeof(*desc));
+        desc->RefreshRate = {0, 1};
         desc->Windowed = TRUE;
         return S_OK;
     }
@@ -496,6 +527,9 @@ public:
     }
     HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* color) override {
         if (!color) return E_INVALIDARG;
+        // A component outside 0..1 is DXGI_ERROR_INVALID_CALL on the host.
+        for (const float c : {color->r, color->g, color->b, color->a})
+            if (!(c >= 0.0f && c <= 1.0f)) return DXGI_ERROR_INVALID_CALL;
         background_color_ = *color;
         return S_OK;
     }
@@ -505,6 +539,10 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION rotation) override {
+        // IDENTITY..ROTATE270 only: UNSPECIFIED and anything past ROTATE270 are DXGI_ERROR_INVALID_CALL on the host,
+        // and the rotation stays what it was.
+        if (rotation < DXGI_MODE_ROTATION_IDENTITY || rotation > DXGI_MODE_ROTATION_ROTATE270)
+            return DXGI_ERROR_INVALID_CALL;
         rotation_ = rotation;
         return S_OK;
     }
@@ -559,14 +597,29 @@ public:
 
     // IDXGISwapChain3
     UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return swapchain_.current_back_buffer_index(); }
-    HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE, UINT* s) override {
-        if (s) *s = DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+    HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE space, UINT* s) override {
+        if (s)
+            *s = color_space_presentable(vk_to_dxgi_format(swapchain_.format()), space)
+                     ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT
+                     : 0;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE) override { return S_OK; }
+    // A space the chain cannot present is E_INVALIDARG. The presenter does not tag the surface with the colour space
+    // yet, so an accepted one changes nothing on screen.
+    HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE space) override {
+        return color_space_presentable(vk_to_dxgi_format(swapchain_.format()), space) ? S_OK : E_INVALIDARG;
+    }
     HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                              const UINT* node_masks, IUnknown* const* present_queues) override {
         return resize_buffers(count, w, h, fmt, flags, node_masks, present_queues);
+    }
+
+    // IDXGISwapChain4. The host takes no metadata (NONE, size 0, no data) or exactly one DXGI_HDR_METADATA_HDR10 with
+    // any values; every other combination is E_INVALIDARG. The presenter has no HDR output, so nothing is applied.
+    HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE type, UINT size, void* metadata) override {
+        if (type == DXGI_HDR_METADATA_TYPE_NONE) return !size && !metadata ? S_OK : E_INVALIDARG;
+        if (type == DXGI_HDR_METADATA_TYPE_HDR10 && size == sizeof(DXGI_HDR_METADATA_HDR10) && metadata) return S_OK;
+        return E_INVALIDARG;
     }
 
 private:
@@ -627,6 +680,9 @@ private:
     DXGI_RGBA background_color_{0, 0, 0, 0};
     DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
     VkExtent2D source_size_{0, 0};
+    DXGI_SCALING scaling_ = DXGI_SCALING_STRETCH;
+    DXGI_ALPHA_MODE alpha_mode_ = DXGI_ALPHA_MODE_UNSPECIFIED;
+    BOOL stereo_ = FALSE;
 };
 
 struct ReservationState {

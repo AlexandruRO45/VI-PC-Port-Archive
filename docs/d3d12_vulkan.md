@@ -3040,6 +3040,12 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   the first ~100k of ~175k characters of the file, which include the HDR10 conversion and the setter), so a title that sets none gets none there either.
   We invent no mastering values (Vulkan treats unknown `VkHdrMetadataEXT` fields as 0). Forwarding a title's explicit HDR10
   block is possible once a `SetHDRMetaData` slot exists.
+  The DXGI shim's swap chain now answers `IDXGISwapChain4` and validates `SetHDRMetaData` as the host runtime does (no
+  type with no data, or one `DXGI_HDR_METADATA_HDR10` of exactly 40 bytes, with any values; anything else is `E_INVALIDARG`),
+  and still discards the block. `CheckColorSpaceSupport` and `SetColorSpace1` follow the host's table per swap chain
+  format (FP16: scRGB only; the 8-bit and 10-bit formats: the RGB sRGB, studio, BT.2020 and HDR10 spaces), `SetRotation`
+  takes `IDENTITY` to `ROTATE270` and `SetBackgroundColor` components in 0..1. An accepted colour space changes nothing on
+  screen yet.
 
   Sources for the PQ chain: the constants are the exact rationals of SMPTE ST 2084 / ITU-R BT.2100 (m1 = 2610/16384,
   m2 = 2523/4096 x 128, c1 = 3424/4096, c2 = 2413/128, c3 = 2392/128; https://en.wikipedia.org/wiki/Perceptual_quantizer),
