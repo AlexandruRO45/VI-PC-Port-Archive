@@ -10,7 +10,7 @@ import unittest
 import zlib
 
 
-def awc_rpf(path):
+def awc_rpf(path, *, middle_bank=False):
     # "9FPR" archive holding one AWC bank: one nonstreamed XMA2 (codec 5) mono stream, id 0x1234, 64 data bytes.
     hlen = 16 + 4 + 2 * 8
     tag = lambda t, size, rel: struct.pack("<Q", (t << 56) | (size << 28) | rel)
@@ -21,6 +21,12 @@ def awc_rpf(path):
     bank = (b"ADAT" + struct.pack("<IIII", 0xFF000001, 1, hlen, (2 << 29) | 0x1234)
             + tag(0x76, 32, hlen) + tag(0x55, 64, hlen + 32) + bytes(fmt) + b"\x11" * 64)
     path.write_bytes(b"9FPR" + bytes(0x1000 - 4) + bank + bytes(0x1000))
+    if middle_bank:
+        # Outside the preview scan's first 128 MiB and last 16 MiB.
+        with path.open("r+b") as output:
+            output.seek(132 * 1024 * 1024)
+            output.write(bank[:-64] + b"\x22" * 64)
+            output.truncate(152 * 1024 * 1024)
 
 
 def texture_dictionary_rpf(path):
@@ -78,6 +84,19 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
                     self.assertIn("source is not a file", done.stderr)
                     self.assertNotIn("Unhandled exception", done.stderr)
                     self.assertFalse(out.exists(), f"{label} source left {out} behind")
+
+    def test_xma_without_a_scan_cache_exports_banks_in_the_middle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "audio.rpf"
+            awc_rpf(src, middle_bank=True)
+
+            out = root / "out"
+            result = run("xma", src, out)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            files = sorted((out / "audio" / "xma").rglob("*.xma.wav"))
+            samples = [wav.read_bytes()[-64:] for wav in files]
+            self.assertEqual(samples, [b"\x11" * 64, b"\x22" * 64])
 
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:

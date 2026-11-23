@@ -115,14 +115,7 @@ if (mode == "ttpf")
 }
 else if (mode == "audio")
 {
-    if (!AwcRecovery.HasCompleteCache(src))
-    {
-        long last = -1;
-        var prog = new Progress<long>(p => { long s = p / (4L << 30); if (s != last) { last = s; Console.WriteLine($"  awc scan {100.0 * p / length:0.0}%"); } });
-        var found = AwcRecovery.RecoverFull(src, prog);
-        AwcRecovery.WriteCache(src, found);
-        Console.WriteLine($"  {found.Count:N0} AWC banks ({sw.Elapsed.TotalSeconds:0}s)");
-    }
+    if (!AwcRecovery.HasCompleteCache(src)) AwcRecovery.WriteCache(src, ScanAudioBanks());
     var doc = ArchiveReader.Open(src);
     var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
     string sub = Path.Combine(outDir, "awc");
@@ -138,8 +131,18 @@ else if (mode == "audio")
 else if (mode == "xma")
 {
     // XMA2 streams (AWC codec 5) as RIFF XMA2 .wav files that ffmpeg decodes (AwcRecovery.WriteXmaWave).
-    var doc = ArchiveReader.Open(src);
-    var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
+    IReadOnlyList<ArchiveEntry> banks;
+    if (HasRpf9Header(src))
+    {
+        // ArchiveReader.Open can return only a preview of RPF9 audio. A successful export needs the full inventory.
+        var cached = AwcRecovery.HasCompleteCache(src) ? AwcRecovery.LoadCache(src) : null;
+        banks = cached ?? ScanAudioBanks();
+    }
+    else
+    {
+        var doc = ArchiveReader.Open(src);
+        banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
+    }
     string sub = Path.Combine(outDir, "xma"); Directory.CreateDirectory(sub);
     Parallel.ForEach(banks, par, e =>
     {
@@ -398,6 +401,29 @@ else if (mode is "models" or "textures")
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
 return (mode == "ttpf" && fail != 0) || writeFail != 0 ? 1 : 0;
+
+IReadOnlyList<ArchiveEntry> ScanAudioBanks()
+{
+    long last = -1;
+    var progress = new Progress<long>(position =>
+    {
+        long step = position / (4L << 30);
+        if (step == last) return;
+        last = step;
+        Console.WriteLine($"  awc scan {100.0 * position / length:0.0}%");
+    });
+    var banks = AwcRecovery.RecoverFull(src, progress);
+    Console.WriteLine($"  {banks.Count:N0} AWC banks ({sw.Elapsed.TotalSeconds:0}s)");
+    return banks;
+}
+
+static bool HasRpf9Header(string path)
+{
+    using var source = File.OpenRead(path);
+    Span<byte> header = stackalloc byte[4];
+    return source.ReadAtLeast(header, header.Length, false) == header.Length &&
+        (header.SequenceEqual("9FPR"u8) || header.SequenceEqual("RPF9"u8));
+}
 
 // A stale marker may be read-only from an earlier interrupted run; clear the attribute so the withdraw works.
 static void WithdrawMarker(string path)
