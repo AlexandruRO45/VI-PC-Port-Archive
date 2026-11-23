@@ -99,6 +99,9 @@ def not_found_message(build, missing):
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
+# The same two modules on vk_compute_test's "bvh_nan" scene: NaN in a triangle's vertices, so its words are the
+# canonical NaN 0xFFC00000 (and the -inf a miss derives from it), which the "bvh" scene never produces.
+COMPUTE += [("cs_bvh", "1", "bvh_nan"), ("cs_bvh32", "1", "bvh_nan")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
@@ -1772,7 +1775,8 @@ def main():
     tools = pick_build_dir(os.path.abspath(tools), tuple(t + EXE for t in TEST_PROGRAMS))
     results = []
     for name, groups, expect in COMPUTE:
-        results.append((name, compute_test(tools, spirv, name, groups, expect)))
+        label = f"{name} bvh_nan" if expect == "bvh_nan" else name
+        results.append((label, compute_test(tools, spirv, name, groups, expect)))
     results.append(("cs_wavemask", compute_test(tools, spirv, "cs_wavemask", "1", "wavemask",
                                                 require_wave64=not W64_EMULATED)))
     for name, want in CS_DUMPS:   # all but cs_store need a 64-wide subgroup unless wave64 is emulated

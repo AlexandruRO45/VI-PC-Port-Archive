@@ -3,6 +3,8 @@
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
 //            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
+//            "bvh_nan": the "bvh" scene with NaN in the first triangle's vertices, so its result words go through
+//            the canonical NaN (see the "bvh" scene below)
 //   VKC_BENCH=N (env): dispatch N more times after the checked one and print the median / min / max wall time of one
 //   dispatch (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
 //   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
@@ -153,7 +155,7 @@ static int run(int argc, char** argv) {
     // VKC_HEAP_FILE=<path>[@<offset>]: copy a file into the heap so a shader can read a buffer (a BVH, its
     // descriptor blocks and the records) without the test hard-coding it. The offset is a decimal or 0x hex byte
     // offset (no octal, sign or spaces); addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every
-    // other heap buffer here. Two overlaps to keep in mind: "bvh" mode writes its synthetic scene after this copy,
+    // other heap buffer here. Two overlaps to keep in mind: "bvh"/"bvh_nan" mode writes its synthetic scene after this copy,
     // so a file at 0x100..0x264 is overwritten there, and the output V# starts at heap offset 0, so a file at @0
     // shares bytes with the dispatch's output.
     const char* heap_file_env = std::getenv("VKC_HEAP_FILE");
@@ -348,9 +350,11 @@ static int run(int argc, char** argv) {
         const VkDeviceSize need = VkDeviceSize(heap_file_at + heap_file.size() + 3) / 4;
         if (need > words) words = need;
     }
-    // "bvh" writes its nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64 words give: the
-    // shader then read them through the device address outside the buffer (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
-    const bool bvh = !std::strcmp(argv[3], "bvh");
+    // "bvh" and "bvh_nan" write their nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64
+    // words give: the shader then read them through the device address outside the buffer
+    // (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
+    const bool bvh_nan = !std::strcmp(argv[3], "bvh_nan");
+    const bool bvh = bvh_nan || !std::strcmp(argv[3], "bvh");
     if (bvh && words < 0x280 / sizeof(uint32_t)) words = 0x280 / sizeof(uint32_t);
     const VkDeviceSize bytes = words * sizeof(uint32_t);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -385,7 +389,7 @@ static int run(int argc, char** argv) {
         std::printf("heap file: %s at 0x%llx (%zu bytes)\n", heap_file_path.c_str(),
                     static_cast<unsigned long long>(heap_file_at), heap_file.size());
     }
-    if (!std::strcmp(argv[3], "bvh")) {
+    if (bvh) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
         // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray
         // misses, and a box with a NaN min.x that RDNA2 still enters at t = 0 (SHADER-650). Node id = address >> 3 | type.
@@ -399,6 +403,10 @@ static int run(int argc, char** argv) {
         // Triangle-ID word at node +60: byte 0 (TRI0) = 0x09 returns vertex 1's and vertex 2's weights, what a
         // builder writes (AMD GPURT WriteTriangleIdField); the translator reads it since the remap fix.
         for (int t = 0; t < 2; t++) u32(0x200 + 0x40 * t + 60, 0x09);
+        // "bvh_nan" (scene from Kev-Ball on #7595): the first triangle's nine vertex words are a NaN with a payload,
+        // 0x7FC12345. The boxes, the ray and the triangle-ID word stay as above, so the four box words don't change.
+        if (bvh_nan)
+            for (int c = 0; c < 9; c++) u32(0x200 + 4 * c, 0x7FC12345u);
     }
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = buf;
@@ -665,8 +673,14 @@ static int run(int argc, char** argv) {
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }
-    if (!std::strcmp(argv[3], "bvh")) {
-        const uint32_t want[8] = {0x68, 0x48, 0x40, 0xFFFFFFFFu, 0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
+    if (bvh) {
+        // "bvh_nan": the translator canonicalizes the NaN triangle's words 1-3 (out[5..7]) to 0xFFC00000.
+        // Its miss rule makes word 0 (out[4]) copysign(inf, word 1): the canonical sign bit therefore gives -inf.
+        static const uint32_t want_bvh[8] = {0x68, 0x48, 0x40, 0xFFFFFFFFu,
+                                             0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
+        static const uint32_t want_nan[8] = {0x68, 0x48, 0x40, 0xFFFFFFFFu,
+                                             0xFF800000u, 0xFFC00000u, 0xFFC00000u, 0xFFC00000u};
+        const uint32_t* want = bvh_nan ? want_nan : want_bvh;
         for (int i = 0; i < 8; i++) if (out[i] != want[i]) { if (!bad) first_bad = i; bad++; }
         std::printf("bvh out = %08x %08x %08x %08x | %08x %08x %08x %08x\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
     }

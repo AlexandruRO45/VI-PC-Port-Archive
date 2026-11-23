@@ -984,7 +984,11 @@ def run_suite(a, work: str) -> int:
             results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
-            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
+            ok, detail = compute_result(rc, msg, rc == 0, verdict_line(rc, msg))
+            if ok:   # the same module on "bvh_nan": NaN in a triangle's vertices, the canonical NaN word 0xFFC00000
+                rc, msg = run_cmd([vk_compute, spv, "1", "bvh_nan"], env=cs_env)
+                ok, detail = compute_result(rc, msg, rc == 0, "bvh_nan: " + verdict_line(rc, msg))
+            results.append((name, ok, detail))
         elif name in STORE_WORDS:
             # TEST-184: image atomics (cs_imgatomic, cs_imgatomic3d) and image_get_resinfo (cs_resinfo). vk_store_test
             # binds the images and prints the r32 ones after the dispatch; the expected words are check.py's.
