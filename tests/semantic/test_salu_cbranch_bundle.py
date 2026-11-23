@@ -427,5 +427,21 @@ class SCbranchVccnzTranslatorTests(unittest.TestCase):
         val = run_cs_branch(spv)
         self.assertEqual(val, 7)
 
+# -----------------------------------------------------------------------------
+# Opcode 6: s_cbranch_vccz
+# -----------------------------------------------------------------------------
+
+def ref_oracle_vccz(vcc: int) -> bool:
+    return (vcc & MASK64) == 0
+
+
+class SCbranchVcczOracleTests(unittest.TestCase):
+    def test_vcc_zero(self):
+        self.assertTrue(ref_oracle_vccz(0))
+
+    def test_vcc_nonzero(self):
+        self.assertFalse(ref_oracle_vccz(0x1))
+        self.assertFalse(ref_oracle_vccz(0xFFFFFFFFFFFFFFFF))
+
 if __name__ == '__main__':
     unittest.main()
