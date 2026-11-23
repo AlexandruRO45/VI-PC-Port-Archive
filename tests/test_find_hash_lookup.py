@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -154,6 +155,30 @@ class ReportPathTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("ERROR: cannot write", err)
         self.assertNotIn("Traceback", err)
+
+
+class ReadOnlyReportTests(unittest.TestCase):
+    def test_an_existing_read_only_report_is_refused_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "fake.exe")
+            data, _, _ = image()
+            with open(exe, "wb") as f:
+                f.write(data)
+            target = os.path.join(tmp, "report.json")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("previous report")
+            os.chmod(target, stat.S_IREAD)
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = fhl.main([exe, "--json", target])
+            finally:
+                os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+            self.assertEqual(rc, 2)
+            self.assertIn("not writable", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            with open(target, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "previous report")
 
 
 if __name__ == "__main__":
