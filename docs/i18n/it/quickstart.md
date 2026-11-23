@@ -42,6 +42,10 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
 
     Lo script richiede `git` e gli strumenti C++ di Visual Studio (vedi sotto), imposta `LLVM_MC` per il tuo
     utente e ti chiede di aprire un nuovo terminale per caricare la variabile.
+  - Un'alternativa più rapida, se usi [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools`
+    (la build Windows include il target AMDGPU; [docs/testing.md](../../testing.md) usa la versione 23.1.6), poi
+    imposta `LLVM_MC` sul percorso completo del `llvm-mc.exe` che installa (`where.exe llvm-mc` lo mostra con
+    l'ambiente attivo; in PowerShell un semplice `where` è `Where-Object`).
   - In alternativa, installa `llvm-21` in WSL (Ubuntu) e imposta la variabile con il comando completo, nella
     stessa sessione PowerShell da cui avvierai `make_game.py`:
 
