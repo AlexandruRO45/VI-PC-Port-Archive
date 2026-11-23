@@ -714,6 +714,73 @@ class GlbInspectTests(unittest.TestCase):
                         self.assertEqual(len(issues), 1, issues)
                         self.assertIn(f"sampler[0] has {count} output values", issues[0])
 
+    def test_animation_weights_channel_reports_unknown_target_count(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "weights.glb")
+            out = os.path.join(folder, "report.json")
+            cases = (
+                ("node without a mesh", lambda g: g["nodes"][0].pop("mesh")),
+                ("mesh with zero targets",
+                 lambda g: g["meshes"][0]["primitives"][0].update(targets=[])),
+                ("primitives with different target counts",
+                 lambda g: (g["meshes"][0]["primitives"][0].update(
+                     targets=[{"POSITION": 0}, {"POSITION": 0}]),
+                     g["meshes"][0]["primitives"].append(
+                         {"attributes": {"POSITION": 0}, "targets": [{"POSITION": 0}]}))),
+            )
+            for name, mutate in cases:
+                with self.subTest(case=name):
+                    gltf = animated_gltf()
+                    mutate(gltf)
+                    gltf["animations"][0]["channels"][0]["target"]["path"] = "weights"
+                    # Two keys and three scalar outputs: with the expected width
+                    # unknown the count check must not silently accept this.
+                    gltf["accessors"][3].update(type="SCALAR", count=3)
+                    with open(path, "wb") as handle:
+                        handle.write(glb(gltf, triangle_bin()))
+                    result = self.run_tool(path, "--json", out)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    with open(out, encoding="utf-8") as handle:
+                        issues = json.load(handle)["animations"][0]["issues"]
+                    self.assertTrue(
+                        any("channel[0] targets a mesh without a positive, "
+                            "consistent morph-target count" in issue
+                            for issue in issues), issues)
+                    self.assertFalse(
+                        any("output values" in issue for issue in issues), issues)
+
+    def test_animation_shared_sampler_keeps_valid_channel_width(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "weights.glb")
+            out = os.path.join(folder, "report.json")
+            gltf = animated_gltf()
+            gltf["nodes"].append({"name": "Meshless"})
+            gltf["meshes"][0]["primitives"][0]["targets"] = [
+                {"POSITION": 0}, {"POSITION": 0},
+            ]
+            # channel[0] is a valid weights channel on a two-target mesh;
+            # channel[1] shares its sampler but targets a node without a mesh.
+            gltf["animations"][0]["channels"][0]["target"]["path"] = "weights"
+            gltf["animations"][0]["channels"].append(
+                {"sampler": 0, "target": {"node": 1, "path": "weights"}})
+            gltf["accessors"][3].update(type="SCALAR", count=3)
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                issues = json.load(handle)["animations"][0]["issues"]
+            self.assertTrue(
+                any("channel[1] targets a mesh without a positive, "
+                    "consistent morph-target count" in issue
+                    for issue in issues), issues)
+            # The valid channel still contributes its width: two targets over
+            # two LINEAR keys expect four scalar outputs.
+            self.assertTrue(
+                any("sampler[0] has 3 output values for 2 keys with LINEAR "
+                    "interpolation (expected 4)" in issue
+                    for issue in issues), issues)
+
 
 if __name__ == "__main__":
     unittest.main()

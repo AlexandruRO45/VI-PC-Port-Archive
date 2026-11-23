@@ -327,6 +327,11 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             width = _morph_target_count(gltf, node) if path == "weights" else 1
             if width is not None:
                 widths.add(width)
+            elif path == "weights" and node is not None:
+                issues.append(
+                    f"channel[{channel_index}] targets a mesh without a "
+                    f"positive, consistent morph-target count"
+                )
         if node_index is None:
             issues.append(f"channel[{channel_index}] has no target node")
         elif node is None:
