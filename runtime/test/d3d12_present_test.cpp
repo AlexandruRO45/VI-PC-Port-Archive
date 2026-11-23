@@ -159,6 +159,7 @@ PFN_vkGetInstanceProcAddr real_get_instance = nullptr;
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkQueueSubmit real_submit = nullptr;
 PFN_vkQueuePresentKHR real_present = nullptr;
+PFN_vkAcquireNextImageKHR real_acquire = nullptr;
 PFN_vkCreateSemaphore real_create_semaphore = nullptr;
 PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_surface_formats = nullptr;
@@ -178,6 +179,8 @@ VkExtent2D last_swapchain_extent{};
 VkSwapchainKHR last_created_swapchain = VK_NULL_HANDLE;
 VkSwapchainKHR observed_old_swapchain = VK_NULL_HANDLE;
 unsigned out_of_date = 0;                // presents the real driver reported out of date
+VkSwapchainKHR watched_swapchain = VK_NULL_HANDLE;  // armed: acquires and presents on this swapchain are counted
+unsigned watched_uses = 0;
 std::vector<VkSemaphore> binary;         // binary semaphores alive (the device's fences are timeline ones)
 
 VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
@@ -190,7 +193,16 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, 
     return real_submit(queue, count, submits, fence);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL acquire_next_image(VkDevice device, VkSwapchainKHR swapchain, std::uint64_t timeout,
+                                                  VkSemaphore semaphore, VkFence fence, std::uint32_t* image) {
+    if (watched_swapchain && swapchain == watched_swapchain) ++watched_uses;
+    return real_acquire(device, swapchain, timeout, semaphore, fence, image);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoKHR* info) {
+    if (watched_swapchain && info)
+        for (std::uint32_t i = 0; i < info->swapchainCount; ++i)
+            if (info->pSwapchains[i] == watched_swapchain) ++watched_uses;
     VkResult result = real_present(queue, info);
     if (result == VK_ERROR_OUT_OF_DATE_KHR) ++out_of_date;
     if (result == VK_SUCCESS && next_present != VK_SUCCESS) {
@@ -255,6 +267,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
     const std::string_view n = name;
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
     if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
+    if (n == "vkAcquireNextImageKHR") return reinterpret_cast<PFN_vkVoidFunction>(acquire_next_image);
     if (n == "vkCreateSemaphore") return reinterpret_cast<PFN_vkVoidFunction>(create_semaphore);
     if (n == "vkDestroySemaphore") return reinterpret_cast<PFN_vkVoidFunction>(destroy_semaphore);
     if (n == "vkCreateSwapchainKHR") return reinterpret_cast<PFN_vkVoidFunction>(create_swapchain);
@@ -288,6 +301,7 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
     real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
+    real_acquire = reinterpret_cast<PFN_vkAcquireNextImageKHR>(real_get_device(device, "vkAcquireNextImageKHR"));
     real_create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(real_get_device(device, "vkCreateSemaphore"));
     real_destroy_semaphore = reinterpret_cast<PFN_vkDestroySemaphore>(real_get_device(device, "vkDestroySemaphore"));
     real_surface_formats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
@@ -457,8 +471,22 @@ int main() {
 
         // A resize recreates the swapchain; the 320x240 back buffer is scaled to the new size. Unsynchronised
         // presents (sync interval 0) switch the present mode on the way.
+        // The first present after the resize builds the 400x300 swapchain from the window's client size before it
+        // acquires from or presents to the old one, so it does not depend on the driver reporting the old swapchain
+        // out of date or suboptimal (some, NVIDIA on Win32, keep returning VK_SUCCESS for a few presents).
+        const VkSwapchainKHR before_resize = driver::last_created_swapchain;
         set_client_size(window, 400, 300);
-        for (int i = 0; i < 10; ++i) EXPECT(frame(i < 5 ? 1 : 0));
+        driver::watched_swapchain = before_resize;
+        driver::watched_uses = 0;
+        EXPECT(frame(1));
+        driver::watched_swapchain = VK_NULL_HANDLE;
+        EXPECT(driver::last_created_swapchain != before_resize);
+        EXPECT(driver::last_swapchain_extent.width == 400 && driver::last_swapchain_extent.height == 300);
+        if (driver::watched_uses)
+            std::fprintf(stderr, "the first present after the resize used the old swapchain %u time(s)\n",
+                         driver::watched_uses);
+        EXPECT(driver::watched_uses == 0);
+        for (int i = 1; i < 10; ++i) EXPECT(frame(i < 5 ? 1 : 0));
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
         EXPECT(presenter->presented() == 70 - driver::out_of_date);
         EXPECT(presented_image_is_clear_colour());  // the 320x240 back buffer scaled to the whole 400x300 image
