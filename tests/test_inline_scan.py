@@ -157,6 +157,80 @@ class InlineScanTests(unittest.TestCase):
         self.assertEqual(stats["instructions"], len(GUARDED))
         self.assertIn(f"instructions scanned: {len(GUARDED)}", inline_scan.summarize(sites, stats["instructions"]))
 
+    def test_summary_header_dwords_excludes_unrelated_structure_stores(self):
+        checked_reg_header = (
+            "mov rax,qword ptr [rbx+18h]",
+            "cmp rax,qword ptr [rbx+30h]",
+            "jae 0000000140002000",
+            "mov edx,dword ptr [rbx+0000000000000344h]",
+            "mov dword ptr [rax],edx",
+            "add rax,8",
+            "mov qword ptr [rbx+18h],rax",
+            "ret",
+        )
+        unrelated_zero = (
+            "mov rax,qword ptr [rdi+18h]",
+            "mov dword ptr [rax],0",
+            "add rax,8",
+            "mov qword ptr [rdi+18h],rax",
+            "ret",
+        )
+        unrelated_float_one = (
+            "mov rax,qword ptr [rsi+18h]",
+            "mov dword ptr [rax],3F800000h",
+            "add rax,10h",
+            "mov qword ptr [rsi+18h],rax",
+            "ret",
+        )
+        found = sites(checked_reg_header + unrelated_zero + unrelated_float_one)
+        self.assertEqual([s["list"] for s in found], [True, False, False])
+        self.assertEqual([s["header"] for s in found], [None, 0, 0x3F800000])
+        text = inline_scan.summarize(found)
+        self.assertIn("list sites 1: checked 1, UNCHECKED 0 (plus 2 cursor-like stores", text)
+        self.assertIn("header dwords: ", text.splitlines())
+        self.assertNotIn("0x00000000", text)
+        self.assertNotIn("0x3f800000", text)
+
+    def test_summary_header_dwords_counts_checked_and_unchecked_list_sites(self):
+        unchecked_five_word = tuple(
+            r.replace("4002C400h", "4003CC00h") for r in UNGUARDED
+        ) + ("ret",)
+        unrelated = (
+            "mov rax,qword ptr [rdi+18h]",
+            "mov dword ptr [rax],0DEADBEEFh",
+            "add rax,8",
+            "mov qword ptr [rdi+18h],rax",
+        )
+        found = sites(GUARDED + ("ret",) + unchecked_five_word + unrelated)
+        self.assertEqual([s["list"] for s in found], [True, True, False])
+        self.assertEqual([s["header"] for s in found], [0x4002C400, 0x4003CC00, 0xDEADBEEF])
+        text = inline_scan.summarize(found)
+        self.assertIn("header dwords: 0x4002c400 x1, 0x4003cc00 x1", text.splitlines())
+        self.assertNotIn("0xdeadbeef", text)
+
+    def test_negative_and_sign_extended_immediate_headers_are_masked_to_32_bits(self):
+        def guarded_with_store(store_insn):
+            return tuple(store_insn if r == "mov dword ptr [rax],4002C400h" else r for r in GUARDED) + ("ret",)
+
+        found = sites(
+            guarded_with_store("mov dword ptr [rax],-1")
+            + guarded_with_store("mov dword ptr [rax],-10h")
+            + guarded_with_store("mov dword ptr [rax],-80000000h")
+            + guarded_with_store("mov dword ptr [rax],-0x80000000")
+            + guarded_with_store("mov qword ptr [rax],0FFFFFFFFFFFFFFFFh")
+        )
+        self.assertEqual(
+            [s["header"] for s in found],
+            [0xFFFFFFFF, 0xFFFFFFF0, 0x80000000, 0x80000000, 0xFFFFFFFF],
+        )
+        text = inline_scan.summarize(found)
+        self.assertIn("header dwords: 0xffffffff x2, 0x80000000 x2, 0xfffffff0 x1", text.splitlines())
+        self.assertNotIn("-0x", text)
+        self.assertNotIn("0xffffffffffffffff", text)
+
+        synthetic = dict(found[0], header=-0x20)
+        self.assertIn("header dwords: 0xffffffe0 x1", inline_scan.summarize([synthetic]).splitlines())
+
 
 class InlineScanCliTests(unittest.TestCase):
     """An input with no instructions must not read as a clean image ("UNCHECKED 0")."""

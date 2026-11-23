@@ -47,7 +47,7 @@ CMP = re.compile(rf"^(?:({REG64}),qword ptr \[({REG64})\+([0-9A-F]+)h?\]|qword p
 LEA = re.compile(rf"^({REG64}),\[({REG64})\+([0-9A-F]+)h?\]$")
 ADD = re.compile(rf"^({REG64}),([0-9A-F]+)h?$")
 STORE = re.compile(r"^(?:byte|word|dword|qword|xmmword|ymmword) ptr \[(\w+)(?:\+([0-9A-F]+)h?)?\],(.+)$")
-IMM = re.compile(r"^([0-9A-F]+)h?$")
+IMM = re.compile(r"^(-?(?:0x)?[0-9A-F]+)h?$")
 COPY = re.compile(rf"^({REG64}),({REG64})$")
 LIMIT_LOAD = re.compile(rf"^({REG64}),qword ptr \[({REG64})\+([0-9A-F]+)h?\]$")
 LIST_FIELDS = re.compile(r"\[(\w+)(?:\+\w+\*\d)?\+0*(?:140|141|143|344|544)h\]")  # fields only a D3D12.X list has
@@ -119,7 +119,7 @@ def classify(window, base, stored):
             stores += 1
             imm = IMM.match(st.group(3))
             if header is None and not st.group(2) and imm and mnem == "mov":
-                header = int(imm.group(1), 16)
+                header = int(imm.group(1), 16) & 0xFFFFFFFF
         if (lf := LIST_FIELDS.search(ops)) and lf.group(1) in bases:
             evidence = True
         if mnem == "cmp" and (cm := CMP.match(ops)):
@@ -199,7 +199,7 @@ def summarize(sites, instructions=None):
                                    ("packet sizes, unchecked", "size", unchecked, plain)):
         hist = collections.Counter(s[key] for s in group)
         out.append(f"{title}: " + ", ".join(f"{fmt(k)} x{n}" for k, n in hist.most_common(12)))
-    headers = collections.Counter(s["header"] for s in sites if s["header"] is not None)
+    headers = collections.Counter(s["header"] & 0xFFFFFFFF for s in sites if s["list"] and s["header"] is not None)
     out.append("header dwords: " + ", ".join(f"0x{h:08x} x{n}" for h, n in headers.most_common(12)))
     return "\n".join(out)
 
@@ -225,7 +225,7 @@ def main() -> int:
         rva = lambda a: "?" if a is None else f"+0x{a - base:x}"
         for s in sites:
             state = f"checked {limit_text(s['limit'])}" if s["checked"] else "UNCHECKED" if s["list"] else "unrelated"
-            header = "-" if s["header"] is None else f"0x{s['header']:08x}"
+            header = "-" if s["header"] is None else f"0x{s['header'] & 0xFFFFFFFF:08x}"
             print(f"  load {rva(s['load'])} store {rva(s['store_back'])} [{s['base']}] {state} size {s['size']} "
                   f"stores {s['stores']} header {header} fallback {s['fallback_slot']}")
     return 0
