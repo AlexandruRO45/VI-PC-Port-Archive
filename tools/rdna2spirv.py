@@ -11056,7 +11056,7 @@ class Gen:
                 lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
             elif sv["k"] == "imm":
                 v = sv["v"]
-                if -16 <= v <= 64 or v > 0xFFFFFFFF or v < -0x80000000:
+                if not sv.get("literal") and (-16 <= v <= 64 or v > 0xFFFFFFFF or v < -0x80000000):
                     bits = v & 0xFFFFFFFFFFFFFFFF
                     lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
                 else:

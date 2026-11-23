@@ -162,7 +162,8 @@ class OperandTests(unittest.TestCase):
         for text, plain in (("lit(0x42200000)", "0x42200000"), ("|lit(0x3f800000)|", "|0x3f800000|"),
                             ("neg(lit(0x3f800000))", "neg(0x3f800000)"), ("-lit(0x3f800000)", "neg(0x3f800000)")):
             with self.subTest(text=text):
-                self.assertEqual(shader_ir.operand(text), shader_ir.operand(plain))
+                # The same imm, marked "literal" (tests/semantic/test_lit_literal.py).
+                self.assertEqual(shader_ir.operand(text), dict(shader_ir.operand(plain), literal=True))
 
     def test_llvm23_lit_of_a_register_is_not_unwrapped(self):
         # lit() wraps a constant; a register inside it is not a literal and must not parse as the register (or as a

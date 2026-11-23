@@ -37,17 +37,34 @@ _INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
 _FLOAT = re.compile(r"-?\d+\.\d+(e[+-]?\d+)?")
 # LLVM 23 prints a literal it could also show as an inline constant as lit(V), e.g. a v_fma_mix* f32 source
 # `lit(0x42200000)`, where LLVM 21 printed the inline constant of the low half (0) and dropped the literal.
-# Only a numeric constant is unwrapped: lit(v2) is no literal and stays raw (Unsupported), as before.
-_LIT = re.compile(r"lit\((-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+(?:e[+-]?\d+)?)?))\)")
+# Only an unsigned hex or decimal constant of one dword is unwrapped: lit(v2) is no literal, and lit(-1), lit(1.0),
+# lit(0x100000000) and lit64(..) are spellings LLVM's gfx10 printer never writes (its assembler encodes the first
+# two as a literal of the operand's type, rejects the third and has no lit64 before gfx1250). They stay "special",
+# which the translator refuses (Unsupported).
+_LIT = re.compile(r"lit\((0x[0-9a-fA-F]+|\d+)\)")
+
+
+def _lit_dword(digits):
+    v = int(digits, 16) if digits[:2].lower() == "0x" else int(digits, 10)
+    return v if v <= 0xFFFFFFFF else None
 
 
 def operand(tok):
     t = tok.strip()
     if "lit(" in t:
-        # lit(V) is the constant V. A leading '-' on it is the VOP3 neg modifier, as neg(V) (not integer negation).
-        t = _LIT.sub(r"\1", t)
-        if t.startswith("-"):
-            t = "neg(" + t[1:] + ")"
+        m = _LIT.search(t)
+        if m and _lit_dword(m.group(1)) is not None:
+            # lit(V) is the constant V. A leading '-' on it is the VOP3 neg modifier, as neg(V) (not integer
+            # negation). The imm is marked "literal": it is the literal dword even when V is in the inline range, so
+            # a 64-bit source reads it as bits 63:32 of an f64 (lit(1) or lit(0x1) on v_add_f64 is 2^-1042, not the
+            # inline integer 1 in bits 31:0).
+            t = t[:m.start()] + m.group(1) + t[m.end():]
+            if t.startswith("-"):
+                t = "neg(" + t[1:] + ")"
+            out = operand(t)
+            if out["k"] == "imm":
+                out["literal"] = True
+            return out
     neg = t.startswith("-")
     core = t[1:] if neg else t
     absm = len(core) > 2 and core.startswith("|") and core.endswith("|")
@@ -230,7 +247,7 @@ def parse_line(line):
         for src, spelling in zip(args[1:], parts[1:]):
             # LLVM prints inline integers in decimal and the separate literal dword in hex,
             # even for two sources with the same numeric value (e.g. 0x1 and 1).
-            if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
+            if src["k"] == "imm" and (src.get("literal") or "0x" in spelling or not -16 <= src["v"] <= 64):
                 src["f64_literal"] = True
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}
 

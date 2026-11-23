@@ -25,8 +25,8 @@ Sides:
     translator  tools/rdna2spirv.py on a listing whose printed encodings are llvm-mc's (the literal cut to 16 bits)
                 with the real bytes next to it, run in tests/semantic/spirv_mini_interp.py on the CPU. Always runs.
                 The text and encodings are what llvm-mc 23.1.5 prints for these bytes, except D's text: it prints
-                that f32 literal as lit(0x40400000), which the translator does not parse, so D's listing says
-                0x40400000.
+                that f32 literal as lit(0x40400000); D's listing says 0x40400000, which tools/shader_ir.py
+                reads as the same literal.
     hw          the instruction's exact bytes (`.long`, since LLVM's assembler can't encode the literal either) on an
                 AMD GPU through tools/hw_oracle (HIP on Windows, libdrm on Linux), one wave32 lane. The measurement.
 
