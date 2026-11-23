@@ -478,7 +478,7 @@ def _carve_successors(folder):
             entries = json.load(f).get("files", [])
         def _as_int(value):
             # A fractional offset would silently truncate onto another file's offset.
-            if not isinstance(value, int):
+            if type(value) is not int:
                 raise TypeError("index offsets and sizes must be integers")
             return value
         by_off = {_as_int(e["off"]): _as_int(e["stored"]) for e in entries}
