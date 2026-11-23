@@ -160,6 +160,68 @@ class VsModelTest(unittest.TestCase):
         self.assertEqual(pred.params, {0: 0, 5: 5})
         self.assertIn("Location %out_param5 5", export_diff.vs_structure(pred))
 
+    def test_all_off_param_still_declares_its_output(self):
+        # "exp paramN -> location N" has no exception for off components, and the translator registers the output
+        # for any such export (rdna2spirv.py:14349). Found by the first randomized run (seed 1, program 4).
+        pred = export_diff.vs_model(export_diff.VsShape([], True),
+                                    [self.pos(0), export_diff.VsExport("param", 4, (0, 0, 0, 0))])
+        self.assertEqual(pred.params, {4: 4})
+        self.assertIn("Location %out_param4 4", export_diff.vs_structure(pred))
+
+
+class HarnessTest(unittest.TestCase):
+    E = export_diff.PsExport
+    TWO_EXPORTS = ["v_mov_b32_e32 v0, 1.0", "v_mov_b32_e32 v1, 2.0", "exp mrt0 v0, v0, v0, v0",
+                   "exp mrt1 v1, v1, v1, v1 done vm", "s_endpgm"]
+
+    def sparse_module(self):
+        elems = [export_diff.Osg1Element(export_diff.D3D_NAME["target"], n, n, 0xF, 0xF) for n in (0, 2)]
+        return support.translate_lines("ps_cmp_probe", self.TWO_EXPORTS, dxbc=export_diff.osg1_dxbc(elems))
+
+    def test_generate_is_deterministic(self):
+        a, b = export_diff.generate(7, 3), export_diff.generate(7, 3)
+        self.assertEqual((a.listing, a.dxbc, a.expected, a.refusals), (b.listing, b.dxbc, b.expected, b.refusals))
+        self.assertNotEqual(export_diff.generate(7, 3).listing, export_diff.generate(7, 4).listing)
+
+    def test_compare_catches_swap(self):
+        spvasm = self.sparse_module()
+        self.assertIsNone(export_diff.compare(spvasm, ["Location %out_mrt0 0", "Location %out_mrt2 2"]))
+        message = export_diff.compare(spvasm, ["Location %out_mrt0 0", "Location %out_mrt2 1"])
+        self.assertIn("%out_mrt2", message)
+
+    def test_self_test_canaries(self):
+        self.assertEqual(export_diff.main(["--self-test"]), 0)
+        self.assertTrue(any("clip/cull" in name for name in export_diff.CANARIES))
+
+    def test_happy_run_contract(self):
+        self.assertIn(export_diff.main(["--programs", "5", "--seed", "1"]), (0, 1))
+
+    def test_all_skipped_is_harness_error(self):
+        self.assertEqual(export_diff.main(["--programs", "0", "--seed", "1"]), 2)
+
+    def test_calibration_sparse_targets(self):
+        for targets in ([0, 2], [1, 3], [0, 7]):
+            case = export_diff.make_case(f"ps_cal_{''.join(map(str, targets))}", "ps", export_diff.PsShape(targets, True),
+                                         [self.E("mrt", k, False, False) for k in range(len(targets))])
+            self.assertEqual(export_diff.run_case(case)[0], "match", targets)
+
+    def test_empty_osg1_ps_matches_translator(self):
+        case = export_diff.make_case("ps_empty_osg1", "ps", export_diff.PsShape([], True), [self.E("mrt", 2, False, False)])
+        self.assertEqual(export_diff.run_case(case)[0], "match")
+
+    def test_past_declared_is_an_expected_skip(self):
+        case = export_diff.make_case("ps_past", "ps", export_diff.PsShape([0], True),
+                                     [self.E("mrt", 0, False, False), self.E("mrt", 1, False, False)])
+        self.assertEqual(export_diff.run_case(case)[0], "skip")
+
+    def test_vs_probe_matches_translator(self):
+        svs = [export_diff.Osg1Element(2, 0, 0, 0x3, 0), export_diff.Osg1Element(3, 0, 1, 0x1, 0),
+               export_diff.Osg1Element(4, 0, 2, 0x1, 0)]
+        exports = [export_diff.VsExport("pos", 0, (1, 1, 1, 1)), export_diff.VsExport("pos", 1, (1, 1, 1, 1)),
+                   export_diff.VsExport("pos", 2, (1, 1, 1, 1)), export_diff.VsExport("param", 3, (1, 1, 1, 1))]
+        case = export_diff.make_case("vs_probe_cal", "vs", export_diff.VsShape(svs, True), exports)
+        self.assertEqual(export_diff.run_case(case)[0], "match", export_diff.run_case(case)[1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

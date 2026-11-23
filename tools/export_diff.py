@@ -1,14 +1,37 @@
 r"""FUZZ-114: differential fuzzer for VS/PS export shapes (standard library only).
 
+Generates seeded vertex- and pixel-shader programs from the export shapes compilers emit and compares the structure
+of the translated module with a model of the packing rules in docs/design.md ("Inputs and outputs"):
+
+  * the model, here: output locations and built-ins, the ClipDistance/CullDistance arrays, expected refusals
+  * tools/rdna2spirv.py through tests/semantic/support.py: the translated SPIR-V's OpDecorate lines and arrays
+
+Shapes: a pixel shader's declared SV_Target set (consecutive, sparse or none, with or without an OSG1), `exp mrtK`
+in any order, compressed or not, and an optional `exp mrtz` (x on or off, compressed or not); a vertex shader's
+declared SV_ClipDistance/SV_CullDistance components (up to 9 + 4, in elements of 1 to 4 components), its misc
+system values (RenderTargetArrayIndex, ViewportArrayIndex, ShadingRate), `exp pos0..pos3` with any on/off component
+pattern and `exp paramN` for a few N.
+
 Usage:
-    python -I tools/export_diff.py --programs N [--seed S]
+    python -I tools/export_diff.py [--programs N] [--seed S]
+    python -I tools/export_diff.py --seed S --program K --show     # print one program, its prediction and the module
     python -I tools/export_diff.py --self-test
     python -I tools/export_diff.py --list-ops
+
+Exit code 0 when every program matches, 1 on the first mismatch (case, seed, program, the listing, and the expected
+against the actual structure), 2 on a harness error or when no program was compared. Skips are counted with reasons:
+a refusal the model predicts is a skip, one it does not is a mismatch.
+
+A mismatch is a finding to post in the coordination issue before anything is fixed: the model is wrong until the
+contract row proves otherwise, and then the translator is.
 """
+import argparse
 import os
+import random
+import re
 import struct
 import sys
-from collections import namedtuple
+from collections import Counter, namedtuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -17,6 +40,9 @@ if HERE not in sys.path:
 SEM_DIR = os.path.join(os.path.dirname(HERE), "tests", "semantic")
 if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
+
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
 
 # D3D_NAME system values the export rules read (rdna2spirv.output_signature_full / pos_export_layout).
 D3D_NAME = {"clip": 2, "cull": 3, "rtai": 4, "vai": 5, "shading_rate": 23, "target": 64, "depth": 65}
@@ -135,8 +161,7 @@ def vs_model(shape, exports):
     distances, params, discarded = [], {}, []
     for e in exports:
         if e.kind == "param":
-            if any(e.comps):
-                params[e.index] = e.index
+            params[e.index] = e.index      # the output is declared for any `exp paramN`, off components included
             continue
         if not any(e.comps):
             if e.index:
@@ -176,3 +201,218 @@ def vs_structure(prediction):
     if prediction.viewport:
         lines.append("BuiltIn %out_viewport ViewportIndex")
     return sorted(lines + structure_lines({f"%out_param{n}": n for n in prediction.params}))
+
+
+# ---- programs --------------------------------------------------------------------------------------------------------
+Case = namedtuple("Case", "name stage shape exports listing dxbc expected refusals")
+ON = (1, 1, 1, 1)
+MISC_REGISTERS = {"rtai": 1, "vai": 2, "shading_rate": 3}
+
+
+def export_line(e):
+    """The `exp` instruction for one modelled export; the caller adds `done vm` to the last of a program."""
+    if isinstance(e, PsExport):
+        if e.kind == "mrtz":
+            x = "v0" if e.depth_x else "off"
+            return f"exp mrtz {x}, off, off, off" + (" compr" if e.compr else "")
+        # Compressed exports list each of the two registers twice, one slot per 16-bit half.
+        operands = ("v0, v0, v1, v1 compr") if e.compr else "v0, v1, v2, v3"
+        return f"exp mrt{e.index} {operands}"
+    operands = ", ".join(f"v{c}" if on else "off" for c, on in enumerate(e.comps))
+    return f"exp {'pos' if e.kind == 'pos' else 'param'}{e.index} {operands}"
+
+
+def make_case(name, stage, shape, exports):
+    """A program from a shape and its exports: the listing, its DXBC container, and what the model predicts."""
+    if stage == "ps":
+        prediction = ps_model(shape, exports)
+        expected = ps_structure(prediction)
+        dxbc = osg1_dxbc([Osg1Element(D3D_NAME["target"], n, n, 0xF, 0xF) for n in shape.targets]) if shape.has_osg1 \
+            else support.STUB_DXBC
+    else:
+        prediction = vs_model(shape, exports)
+        expected = vs_structure(prediction)
+        dxbc = osg1_dxbc(shape.svs) if shape.has_osg1 else support.STUB_DXBC
+    lines = [f"v_mov_b32_e32 v{c}, {float(1 << c)!r}" for c in range(4)]
+    instructions = [export_line(e) for e in exports]
+    if instructions:
+        instructions[-1] += " done vm"
+    return Case(name, stage, shape, exports, lines + instructions + ["s_endpgm"], dxbc, expected, prediction.refusals)
+
+
+def _distance_elements(rng, kind, count):
+    """SV_ClipDistance/SV_CullDistance declarations: `count` components in elements of 1 to 4, four per register."""
+    svs, first = [], 0
+    while first < count:
+        width = min(rng.randint(1, 4), count - first, 4 - first % 4)
+        svs.append(Osg1Element(D3D_NAME[kind], first, first // 4, ((1 << width) - 1) << (first % 4), 0))
+        first += width
+    return svs
+
+
+def _components(rng, never_empty):
+    comps = tuple(rng.getrandbits(1) for _ in range(4))
+    return (1, 0, 0, 0) if never_empty and not any(comps) else comps
+
+
+def generate(seed, index):
+    """Program `index` of `seed`: the same (seed, index) always gives the same program.
+
+    The name starts with the stage: rdna2spirv.stage_of() takes it from there when no carve index is at hand."""
+    rng = random.Random(f"export-diff:{seed}:{index}")
+    name = f"ed_{seed}_{index}"
+    if rng.random() < 0.5:
+        has_osg1 = rng.random() > 0.1
+        svs = []
+        if has_osg1:
+            svs = _distance_elements(rng, "clip", rng.choice((0, 1, 2, 2, 3, 4, 6, 8, 9)))
+            svs += _distance_elements(rng, "cull", rng.choice((0, 0, 1, 2, 4)))
+            svs += [Osg1Element(D3D_NAME[m], 0, MISC_REGISTERS[m], 0x1, 0) for m in MISC_REGISTERS if rng.random() < 0.3]
+        exports = [VsExport("pos", 0, _components(rng, True))]
+        exports += [VsExport("pos", p, _components(rng, False)) for p in (1, 2, 3) if rng.random() < 0.6]
+        exports += [VsExport("param", n, _components(rng, False)) for n in range(8) if rng.random() < 0.25]
+        rng.shuffle(exports)
+        return make_case("vs_" + name, "vs", VsShape(svs, has_osg1), exports)
+    has_osg1 = rng.random() > 0.15
+    targets = sorted(rng.sample(range(8), rng.randint(1, 8))) if has_osg1 and rng.random() > 0.1 else []
+    indices = list(range(len(targets))) if targets else sorted(rng.sample(range(8), rng.randint(1, 8)))
+    exports = [PsExport("mrt", k, False, rng.random() < 0.3) for k in indices]
+    if rng.random() < 0.5:
+        exports.append(PsExport("mrtz", 0, rng.random() < 0.5, rng.random() < 0.5))
+    rng.shuffle(exports)
+    return make_case("ps_" + name, "ps", PsShape(targets, has_osg1), exports)
+
+
+# ---- the comparator --------------------------------------------------------------------------------------------------
+def module_structure(spvasm):
+    """What the translated module declares for its outputs, in the models' canonical form."""
+    lines = [f"Location {var} {n}" for var, n in re.findall(r"OpDecorate (%out_\S+) Location (\d+)", spvasm)]
+    lines += [f"BuiltIn {var} {built_in}" for var, built_in in re.findall(r"OpDecorate (%out_\S+) BuiltIn (\S+)", spvasm)]
+    for array, var in (("arr_clip", "%out_clip"), ("arr_cull", "%out_cull")):
+        found = re.search(rf"%{array} = OpTypeArray %float %c(\d+)", spvasm)
+        if found:
+            lines.append(f"Array {var} {found.group(1)}")
+    return sorted(lines)
+
+
+def compare(spvasm, expected):
+    """None when the module's output structure is exactly `expected`; otherwise what is missing and what is extra."""
+    actual = module_structure(spvasm)
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    if not missing and not extra:
+        return None
+    return "; ".join(part for part in ("missing: " + ", ".join(missing) if missing else "",
+                                       "unexpected: " + ", ".join(extra) if extra else "") if part)
+
+
+def run_case(case):
+    """('match' | 'skip' | 'mismatch', detail) for one program."""
+    try:
+        spvasm = support.translate_lines(case.name, case.listing, dxbc=case.dxbc)
+    except rdna2spirv.Unsupported as refusal:
+        if case.refusals and any(r in str(refusal) for r in case.refusals):
+            return "skip", f"expected refusal: {refusal}"
+        return "mismatch", f"the translator refused what the model accepts: Unsupported: {refusal}"
+    message = compare(spvasm, case.expected)
+    if message:
+        return "mismatch", message
+    if case.refusals:
+        return "mismatch", f"the model expected a refusal of {', '.join(case.refusals)}; the translator accepted it"
+    return "match", ""
+
+
+# ---- canaries --------------------------------------------------------------------------------------------------------
+CANARIES = ("clip/cull swap", "sparse location", "compr depth", "misc shift")
+
+
+def self_test():
+    """The canaries compare() failed to flag: each translates a real program and predicts its structure wrongly in
+    one named way, so an empty list means the comparator still sees what it is meant to see."""
+    missed = []
+
+    def canary(name, case, wrong):
+        status, detail = run_case(case)
+        if status != "match":
+            missed.append(f"{name} (the model itself: {detail})")
+            return
+        spvasm = support.translate_lines(case.name, case.listing, dxbc=case.dxbc)
+        if compare(spvasm, wrong) is None:
+            missed.append(name)
+
+    clip_cull = [Osg1Element(D3D_NAME["clip"], 0, 0, 0x1, 0), Osg1Element(D3D_NAME["cull"], 0, 1, 0x1, 0)]
+    both = [VsExport("pos", 0, ON), VsExport("pos", 1, ON)]
+    canary(CANARIES[0], make_case("vs_canary_swap", "vs", VsShape(clip_cull, True), both),
+           ["BuiltIn %out_pos Position", "BuiltIn %out_cull CullDistance", "Array %out_cull 2"])
+    sparse = make_case("ps_canary_sparse", "ps", PsShape([0, 2], True), [PsExport("mrt", 0, False, False),
+                                                                         PsExport("mrt", 1, False, False)])
+    canary(CANARIES[1], sparse, ["Location %out_mrt0 0", "Location %out_mrt1 1"])
+    depth = make_case("ps_canary_depth", "ps", PsShape([], False), [PsExport("mrtz", 0, True, True)])
+    canary(CANARIES[2], depth, ["BuiltIn %out_depth FragDepth"])
+    shifted = make_case("vs_canary_shift", "vs", VsShape(clip_cull[:1] + [Osg1Element(D3D_NAME["rtai"], 0, 1, 0x1, 0)],
+                                                         True), both)
+    canary(CANARIES[3], shifted, ["BuiltIn %out_pos Position", "BuiltIn %out_layer Layer",
+                                  "BuiltIn %out_clip ClipDistance", "Array %out_clip 1"])
+    return missed
+
+
+# ---- the runner ------------------------------------------------------------------------------------------------------
+def describe(case):
+    return "\n".join([f"{case.name} ({case.stage})"] + ["    " + ln for ln in case.listing] +
+                     ["  model: " + (", ".join(case.expected) or "no outputs") +
+                      ("  refused: " + ", ".join(case.refusals) if case.refusals else "")])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Differential fuzzer for VS/PS export shapes.")
+    parser.add_argument("--programs", type=int, default=200, help="how many programs of the seed to run")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--program", type=int, metavar="K", help="with --show: the program to print")
+    parser.add_argument("--show", action="store_true", help="print one program, its prediction and the module")
+    parser.add_argument("--self-test", action="store_true", help="run the comparator canaries")
+    parser.add_argument("--list-ops", action="store_true", help="list the export forms the generator emits")
+    args = parser.parse_args(argv)
+    if args.self_test:
+        missed = self_test()
+        for name in missed:
+            print(f"CANARY MISSED: {name}")
+        print(f"self-test: {len(CANARIES) - len(missed)} of {len(CANARIES)} canaries caught")
+        return 2 if missed else 0
+    if args.list_ops:
+        for line in ("exp mrtK v0, v1, v2, v3 [done vm]", "exp mrtK v0, v0, v1, v1 compr [done vm]",
+                     "exp mrtz {v0 | off}, off, off, off [compr] [done vm]",
+                     "exp pos0..3 {vN | off} x4 [done vm]", "exp paramN {vN | off} x4 [done vm]"):
+            print(line)
+        return 0
+    if args.show:
+        case = generate(args.seed, args.program or 0)
+        print(describe(case))
+        status, detail = run_case(case)
+        print("  translator: " + ("matches the model" if status == "match" else detail))
+        return 0
+    if args.programs <= 0:
+        print("no program ran: --programs must be positive")
+        return 2
+    matched, skipped, reasons = 0, 0, Counter()
+    for index in range(args.programs):
+        case = generate(args.seed, index)
+        status, detail = run_case(case)
+        if status == "match":
+            matched += 1
+        elif status == "skip":
+            skipped += 1
+            reasons[detail] += 1
+        else:
+            print("MISMATCH\n" + describe(case) + f"\n  {detail}")
+            print(f"seed {args.seed}, program {index}: mismatch")
+            return 1
+    if not matched:
+        print("no program ran: every one was skipped")
+        return 2
+    summary = f"seed {args.seed}: {matched} programs matched the model, {skipped} skipped"
+    print(summary + (": " + "; ".join(f"{n} x {why}" for why, n in reasons.items()) if skipped else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
