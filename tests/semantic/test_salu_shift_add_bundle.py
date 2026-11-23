@@ -353,6 +353,13 @@ class TestSPackLlB32B16AST(unittest.TestCase):
         expr = SPackLlB32B16Expr(0x1111, 0x2222)
         self.assertEqual(expr.eval(), 0x22221111)
 
+class TestSPackLlB32B16HalfWords(unittest.TestCase):
+    def test_halfword_permutations(self) -> None:
+        for a in (0x0000, 0x5555, 0xAAAA, 0xFFFF):
+            for b in (0x0000, 0x1234, 0x89AB, 0xFFFF):
+                got = ref_s_pack_ll_b32_b16(a, b)
+                self.assertEqual(got, (b << 16) | a)
+
 
 if __name__ == "__main__":
     unittest.main()
