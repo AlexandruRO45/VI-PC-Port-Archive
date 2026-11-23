@@ -120,11 +120,10 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
 
     if (plane_count == 0) {
         const HRESULT result = presenter_->present_blank(sync_interval);
-        if (SUCCEEDED(result)) {
-            pacer_.note_untokened_present();
-            ++presents_;
-        }
-        return result;
+        if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
+        pacer_.note_untokened_present();
+        ++presents_;
+        return S_OK;
     }
 
     // All planes carry the token of one frame.
