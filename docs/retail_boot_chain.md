@@ -145,7 +145,7 @@ starts the count again. No pipeline is skipped and the check stays armed.
 |---|---|
 | Only a `Sleep` of 1,000 ms or more is held | A shorter one is a poll: its caller waits for another thread, possibly the one that holds the stall. It stays the host's `Sleep`. |
 | A `Sleep` no stall overlaps is the host's | Whenever the host wakes it, early or late. |
-| One stall counts for at most 10 min | Work that has not come back by then is not treated as a compile: held `Sleep`s return, the time counts as the title's again, and the runtime prints one line. The longest single compute pipeline compile measured on this machine took 50 s. |
+| One stall counts for at most 60 min | Work that has not come back by then is not treated as a compile: held `Sleep`s return, the time counts as the title's again, and the runtime prints one line. The longest single compute pipeline compile measured on this machine took 626 s (a module of 8.6 MiB translated with `--wave64-emulate`, alone in `vk_pipeline_check`). |
 | A stall is the driver call alone | The pipeline cache is fetched before it, and a thread that waits its turn to compile (a lock, a compile gate) waits outside it: no stall time is counted while no driver call runs. |
 
 How long the check can be late for a boot that really hangs, from those rules (`host_stall_test` runs each case on
@@ -154,7 +154,7 @@ a virtual clock):
 | The main thread hangs | The check fires |
 |---|---|
 | with no stall open and none after | after 30 rounds, as on the console |
-| inside a marked host call that never returns | within 10 min + 31 s of that call |
+| inside a marked host call that never returns | within 60 min + 31 s of that call |
 | while other threads go on compiling | within 31 s of the last such compile; each compile is one pipeline of the title, so there are finitely many |
 
 A stall shorter than the title's 2 s rule starts no count again: with 100 ms of stall in every second the check

@@ -38,9 +38,9 @@ using Nanoseconds = std::chrono::nanoseconds;
 
 // The shortest guest Sleep that is held: the round of the title's hang check.
 inline constexpr std::uint32_t kHeldSleepMs = 1000;
-// How long one stall may count. One stall is one driver call for one pipeline; the longest measured took 50 s
+// How long one stall may count. One stall is one driver call for one pipeline; the longest measured took 626 s
 // (docs/retail_boot_chain.md, 5.2), and a slower machine needs room above that.
-inline constexpr Nanoseconds kStallLimit = std::chrono::minutes(10);
+inline constexpr Nanoseconds kStallLimit = std::chrono::minutes(60);
 
 // Whether a guest Sleep of this length is held. A yield and an endless sleep have no duration to stretch.
 inline bool sleep_is_held(std::uint32_t milliseconds) {
