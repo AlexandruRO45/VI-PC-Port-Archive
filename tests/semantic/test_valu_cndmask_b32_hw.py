@@ -337,5 +337,21 @@ class TestValuCndmaskB32ConditionCodes(unittest.TestCase):
                     self.assertEqual(res, exp_res)
                     self.assertEqual(out_scc, scc)
 
+# --- Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling ---
+
+class TestValuCndmaskB32IEEE754BitPatterns(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling tests."""
+
+    def test_float_bit_exactness(self) -> None:
+        nan_cases = [
+            (0x7FC00000, 0x7F800000),  # qNaN, +inf
+            (0xFFC00000, 0x80000000),  # -qNaN, -0.0
+            (0x00000001, 0x7F7FFFFF),  # min subnormal, max normal
+        ]
+        for f0, f1 in nan_cases:
+            with self.subTest(f0=hex(f0), f1=hex(f1)):
+                self.assertEqual(run_valu_cndmask_ps(f0, f1, 0), f0)
+                self.assertEqual(run_valu_cndmask_ps(f0, f1, 1), f1)
+
 if __name__ == "__main__":
     unittest.main()
