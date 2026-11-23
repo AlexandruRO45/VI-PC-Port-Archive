@@ -38,6 +38,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "spirv_capability.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
@@ -67,8 +68,8 @@ static std::vector<uint32_t> read_spv(const char* path) {
     return w;
 }
 
-static bool parse_u32(const char*& s, uint32_t& v) {
-    const bool hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+static bool parse_u32(const char*& s, uint32_t& v, bool allow_hex = true) {
+    const bool hex = allow_hex && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
     const char* digits = hex ? s + 2 : s;
     if (!(hex ? std::isxdigit(uint8_t(*digits)) : std::isdigit(uint8_t(*digits)))) return false;   // no sign or space
     char* end;
@@ -163,8 +164,20 @@ int main(int argc, char** argv) {
             groups[i] = uint32_t(n);
             W *= groups[i];
         }
-    } else if (argc > 5) {
-        W = atoi(argv[4]); H = atoi(argv[5]);
+    } else if (argc != 4) {
+        if (argc != 6 && argc != 8) {
+            std::fprintf(stderr, "expected width and height, optionally followed by two clip shifts; got %d optional arguments\n",
+                         argc - 4);
+            return 2;
+        }
+        const char* width = argv[4];
+        const char* height = argv[5];
+        if (!parse_u32(width, W, /*allow_hex=*/false) || *width || !W ||
+            !parse_u32(height, H, /*allow_hex=*/false) || *height || !H) {
+            std::fprintf(stderr, "width and height must be decimal integers in 1..4294967295; got \"%s\" and \"%s\"\n",
+                         argv[4], argv[5]);
+            return 2;
+        }
     }
     // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37).
     uint32_t pc[38] = {};
@@ -268,6 +281,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    const auto& limits = props.limits;
+    const auto max_width = std::min({limits.maxFramebufferWidth, limits.maxImageDimension2D,
+                                     limits.maxViewportDimensions[0]});
+    const auto max_height = std::min({limits.maxFramebufferHeight, limits.maxImageDimension2D,
+                                      limits.maxViewportDimensions[1]});
+    if (W > max_width || H > max_height) {
+        std::fprintf(stderr, "framebuffer extent %ux%u exceeds this device's limit of %ux%u\n",
+                     W, H, max_width, max_height);
+        return 2;
+    }
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     if (props.apiVersion >= VK_API_VERSION_1_2) sgProps.pNext = &driver;

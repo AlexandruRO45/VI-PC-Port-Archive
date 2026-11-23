@@ -1260,6 +1260,10 @@ if(TARGET Vulkan::Headers)
     endif()
   endif()
   if(BUILD_TESTING)
+    add_test(NAME vk_harness_cli COMMAND "${CMAKE_COMMAND}"
+             "-DTOOL=$<TARGET_FILE:vk_harness>"
+             "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+             -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_harness_cli.cmake")
     if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
       # It includes the runtime's D3D12 shim headers, so it needs the same Windows SDK as the runtime.
