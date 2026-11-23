@@ -420,5 +420,15 @@ class SPackLlB32B16AstInterpreterTests(unittest.TestCase):
         state.set_sgpr(2, res)
         self.assertEqual(state.get_sgpr(2), 0x22221111)
 
+class SPackLlB32B16SimdDivergenceTests(unittest.TestCase):
+    def test_pack_ll_scc_preserved(self):
+        # Hardware rule: s_pack_* does NOT modify SCC
+        state = ScalarRegisterState()
+        state.scc = 1
+        res = oracle_pack_ll_b32_b16(0x0001, 0x0002)
+        # scc remains 1
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(res, 0x00020001)
+
 if __name__ == "__main__":
     unittest.main()
