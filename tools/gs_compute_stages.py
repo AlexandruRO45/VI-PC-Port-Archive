@@ -459,9 +459,10 @@ def vs_input_module(text):
     The parameters block (per pipeline, heap-relative): dword 0 the geometry shader's input slot count (nin),
     1 its verts_in, 2 this shader's output slot count; then per output slot j (position first, then locations
     ascending) the geometry shader input slot that consumes output j, or 0xffffffff when none does (that store
-    goes to a scratch slot the capture pass never reads, so the module stays free of data-dependent branches);
-    then per input location, ascending, its input layout slot and byte offset. The capture input buffer holds
-    one scratch vec4 per slot past the geometry shader's own, plus the 16-byte header.
+    goes to a scratch vec4 the capture pass never reads, so the module stays free of data-dependent branches);
+    then per input location, ascending, its input layout slot and byte offset. The capture input buffer is the
+    16-byte header, then the dense rows the capture pass reads (slots*nin vec4s), then one scratch vec4 per
+    slot; a scratch store lands at slots*nin + pv, so it never races another invocation's row.
     """
     types, const_vals, locs, builtins, member_builtins, variables, pointee = _parse_vs(text)
     uint = next((i for i, (op, ops) in types.items() if op == "OpTypeInt" and ops[:2] == ["32", "0"]), None)
@@ -671,9 +672,13 @@ def vs_input_module(text):
         m = re.match(r"^OpStore (%\w+) (%\w+)$", s)
         if m and (m.group(1) in pos_targets or m.group(1) in out_vars):
             j = 0 if m.group(1) in pos_targets else out_slot_of[m.group(1)]
+            # An unconsumed output goes to this slot's own scratch vec4 in the region past the dense rows
+            # (slots*nin + pv), never into the next row: a dense-row scratch would race the next slot's own
+            # position store within the dispatch.
             perm = x.load_dword(params64, 3 + j)
-            slot_eff = x.sel_u(x.ne(perm, x.c(4294967295)), perm, nin)
-            idx = x.add(x.mul("%gsc_pv", nin), slot_eff)
+            dense = x.add(x.mul("%gsc_pv", nin), perm)
+            scratch = x.add(x.mul(slots, nin), "%gsc_pv")
+            idx = x.sel_u(x.eq(perm, x.c(4294967295)), scratch, dense)
             base = x.add64(in64, x.u64(x.mul(idx, x.c(16))))
             x.store_vec4(base, 16, m.group(2))
             out_body += x.body
