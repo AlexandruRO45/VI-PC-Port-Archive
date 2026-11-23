@@ -602,5 +602,64 @@ class SaluOrB32AliasingTests(unittest.TestCase):
         self.assertEqual(out[0], MASK32)
         self.assertEqual(out[1], 0xF0F0F0F0)
 
+
+class SaluOrB32ConditionCodeTests(unittest.TestCase):
+    """Condition codes, status flags, and carry/borrow generation for s_or_b32."""
+
+    def test_scc_zero_flag_exhaustion(self):
+        """SCC must be 0 if and only if the bitwise result is exactly zero."""
+        state = ScalarRegisterState()
+        state.execute_s_or_b32("s0", 0, 0)
+        self.assertEqual(state.scc, 0)
+
+        for bit in range(32):
+            val = 1 << bit
+            state.execute_s_or_b32("s0", val, 0)
+            self.assertEqual(state.scc, 1)
+
+    def test_scc_preservation_across_mov(self):
+        """s_mov_b32 does NOT alter the SCC flag set by s_or_b32."""
+        state = ScalarRegisterState()
+        state.execute_s_or_b32("s0", 0, 0)
+        self.assertEqual(state.scc, 0)
+        state.run_program([
+            "s_mov_b32 s1, 0x12345678",
+            "s_cselect_b32 s2, 100, 200",
+        ])
+        self.assertEqual(state.read_reg("s2"), 200)
+
+        state.execute_s_or_b32("s0", 1, 0)
+        self.assertEqual(state.scc, 1)
+        state.run_program([
+            "s_mov_b32 s1, 0x00000000",
+            "s_cselect_b32 s2, 100, 200",
+        ])
+        self.assertEqual(state.read_reg("s2"), 100)
+
+    def test_scc_conditional_branching_shader(self):
+        """Translate shader utilizing SCC from s_or_b32 to drive s_cselect_b32."""
+        cases = [
+            (0, 0, 0, 555),
+            (0, 1, 1, 777),
+            (0x80000000, 0, 1, 777),
+        ]
+        for idx, (a, b, expected_scc, expected_sel) in enumerate(cases):
+            with self.subTest(a=hex(a), b=hex(b)):
+                lines = [
+                    f"s_mov_b32 s0, {a:#x}",
+                    f"s_mov_b32 s1, {b:#x}",
+                    "s_or_b32 s2, s0, s1",
+                    "s_cselect_b32 s3, 777, 555",
+                    "v_mov_b32 v0, s2",
+                    "v_mov_b32 v1, s3",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = translate_lines(f"ps_scc_cselect_{idx}", lines)
+                out = mrt0_words(spv)
+                self.assertEqual(out[1], expected_sel)
+
 if __name__ == "__main__":
     unittest.main()
