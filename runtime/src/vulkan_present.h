@@ -79,6 +79,12 @@ struct PresentPlanes {
 };
 
 namespace detail {
+
+inline bool blit_presentable(const ResourceBinding* binding) {
+    return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+           binding->samples == 1 && !binding->volume;
+}
+
 inline bool is_srgb_format(VkFormat format) {
     switch (format) {
     case VK_FORMAT_R8_SRGB: case VK_FORMAT_R8G8_SRGB: case VK_FORMAT_R8G8B8_SRGB: case VK_FORMAT_B8G8R8_SRGB:
@@ -230,12 +236,11 @@ public:
         {
             std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
             const ResourceBinding* found = context_.resolve(source);
-            if (!found || !found->image || found->aspects != VK_IMAGE_ASPECT_COLOR_BIT) return VK_ERROR_UNKNOWN;
+            if (!detail::blit_presentable(found)) return VK_ERROR_UNKNOWN;
             binding = *found;
         }
-        // Multisampled sources (no resolve into a temporary yet), integer formats (a UNORM swapchain cannot take them)
-        // and anything the GPU cannot blit from are refused.
-        if (binding.samples > 1 || detail::blit_unsupported_format(binding.format) ||
+        // Integer formats (a UNORM swapchain cannot take them) and anything the GPU cannot blit from are refused.
+        if (detail::blit_unsupported_format(binding.format) ||
             !(format_features(binding.format) & VK_FORMAT_FEATURE_BLIT_SRC_BIT))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (source_rect && (source_rect->left < 0 || source_rect->top < 0 || source_rect->left >= source_rect->right ||
@@ -515,7 +520,7 @@ private:
             // rolls back a failed submit in O(1) without copying the entire LayoutTracker map.
             std::shared_lock resource_lock(context_.resource_mutex_);
             const ResourceBinding* current = context_.resolve(source);
-            if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+            if (detail::blit_presentable(current)) {
                 tracker_lock.lock();
                 rollback_source = context_.tracker_.tracked(source);
                 if (rollback_source) prev_layout = context_.tracker_.layout(source, 0);
@@ -621,7 +626,7 @@ private:
     bool presentable(ResourceId source) {
         std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
         const ResourceBinding* binding = context_.resolve(source);
-        return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT;
+        return detail::blit_presentable(binding);
     }
 
     // An image was acquired into `frame` but its blit was not submitted. An empty batch waits on the acquire
