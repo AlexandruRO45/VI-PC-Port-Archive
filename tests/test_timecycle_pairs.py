@@ -113,5 +113,29 @@ class TimecyclePairsTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, 2)
 
 
+class ReportModeTests(unittest.TestCase):
+    """--out is published through a private staging file; it must get the bits open() would give."""
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_new_report_gets_the_bits_of_a_plain_open(self):
+        with tempfile.TemporaryDirectory() as folder:
+            plain = os.path.join(folder, "plain.json")
+            with open(plain, "w", encoding="utf-8", newline="\n"):
+                pass
+            report = os.path.join(folder, "report.json")
+            tp._write_json_atomic(report, {})
+            self.assertEqual(oct(os.stat(report).st_mode & 0o777), oct(os.stat(plain).st_mode & 0o777))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_replaced_report_keeps_its_bits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            report = os.path.join(folder, "report.json")
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            os.chmod(report, 0o640)
+            tp._write_json_atomic(report, {"a": 1})
+            self.assertEqual(oct(os.stat(report).st_mode & 0o777), oct(0o640))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import gamedata_index as gi  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 TARGET_ROOTS = ("timecycle_modifier_data", "timecycle_keyframe_data")
@@ -254,6 +255,8 @@ def _write_json_atomic(path: str, payload: dict) -> None:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(payload, f, indent=1, sort_keys=True)
             f.write("\n")
+        # mkstemp makes the staged file 0600; give it the bits the report would have had.
+        os.chmod(tmp_path, published_mode(path))
         os.replace(tmp_path, path)
     except BaseException:
         try:
