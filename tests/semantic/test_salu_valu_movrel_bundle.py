@@ -206,3 +206,38 @@ class TestSMovrelsB32Indexing(unittest.TestCase):
         spv = support.translate_lines("ps_smovrels_scc", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0x1111)
+
+
+class TestSMovrelsB32Integration(unittest.TestCase):
+    def test_full_pipeline_compilation(self):
+        lines = [
+            "s_mov_b32 s16, 0x55555555",
+            "s_mov_b32 m0, 0",
+            "s_movrels_b32 s18, s16",
+            "v_mov_b32 v0, s18",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_full", lines)
+        self.assertIn("OpCapability Shader", spv)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x55555555)
+
+    def test_negative_rejects_vgpr_operands(self):
+        lines = [
+            "s_movrels_b32 v0, s10",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_smovrels_vgpr_dst", lines)
+
+    def test_negative_rejects_literal_operands(self):
+        lines = [
+            "s_movrels_b32 s10, 42",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_smovrels_lit_src", lines)
