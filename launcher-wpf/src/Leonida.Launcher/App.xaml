@@ -261,7 +261,7 @@
           <Setter.Value>
             <ControlTemplate TargetType="Button">
               <StackPanel Orientation="Horizontal" Background="Transparent">
-                <ContentPresenter x:Name="c" VerticalAlignment="Center"/>
+                <ContentPresenter x:Name="c" VerticalAlignment="Center" HorizontalAlignment="Center"/>
                 <TextBlock Text="&#xE8A7;" FontFamily="{StaticResource Icons}" FontSize="12" Margin="7,1,0,0" VerticalAlignment="Center"/>
               </StackPanel>
               <ControlTemplate.Triggers>

@@ -143,6 +143,20 @@ public partial class CanIRunView : UserControl
     {
         if (!pageReady || web?.CoreWebView2 == null) return;
         CompareStatus.Text = Loc.T("Comparing…");
+        // The checker loads its code as modules after the page itself has loaded, then its hardware lists. Until its
+        // code runs the verdict is still the page's placeholder, and filling the form then changes nothing; so wait
+        // for the code (up to 20 s) and, a little longer, for the lists (they make more CPUs and GPUs match).
+        var ready = false;
+        for (var i = 0; i < 80 && web?.CoreWebView2 != null; i++)
+        {
+            string state;
+            try { state = JsonSerializer.Deserialize<string>(await web.CoreWebView2.ExecuteScriptAsync(ReadyScript)) ?? ""; }
+            catch (Exception) { state = ""; }
+            if (state == "lists") { ready = true; break; }
+            if (state == "code") { ready = true; if (i >= 32) break; }   // the lists are late or failed: compare without them
+            await Task.Delay(250);
+        }
+        if (!ready || web?.CoreWebView2 == null) { Offline("its page did not finish loading"); return; }
         var (cpu, gpu, ram, type) = Values();
         var script = Script.Replace("__VALUES__", JsonSerializer.Serialize(new { cpu, gpu, ram, ramType = type }));
         string raw;
@@ -211,6 +225,19 @@ public partial class CanIRunView : UserControl
 
     // The page's form (#settings) runs its update() on every input event: set the fields as a visitor would, pick
     // each <option> of the reference list in turn, and read what the page then shows. Returns a JSON string.
+    /// <summary>"wait" until the checker's code has run (its verdict is no longer the page's "Checking specs…"),
+    /// "code" when it has, "lists" when the hardware lists have been grouped too.</summary>
+    const string ReadyScript = """
+        (() => {
+          const v = document.getElementById('verdict');
+          const form = document.getElementById('settings');
+          if (!v || !form) return 'wait';
+          const t = v.textContent.trim();
+          if (!t || t.startsWith('Checking specs')) return 'wait';
+          return form.elements.cpu && form.elements.cpu.querySelector('optgroup') ? 'lists' : 'code';
+        })()
+        """;
+
     const string Script = """
         (() => {
           try {
