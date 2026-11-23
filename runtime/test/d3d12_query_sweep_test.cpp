@@ -179,15 +179,24 @@ Words allocation(ID3D12Device* d, const D3D12_RESOURCE_DESC& desc) {
     return {info.SizeInBytes, info.Alignment};
 }
 
+// An alignment smaller than the host's lets CreatePlacedResource accept an offset the host would refuse, and callers
+// are told to take the alignment from GetResourceAllocationInfo. It is an error whenever both answers are valid. A
+// larger alignment only wastes space, so it stays a gap.
+bool alignment_undersized(const Words& ours, const Words& host) {
+    return ours[0] != kInvalid && host[0] != kInvalid && ours[1] < host[1];
+}
+
 // A size where the host refuses is an error. A smaller size than the host's would let two placed resources overlap, so it
 // is an error for the descriptions an engine makes and a gap for the odd grid (formats without their flag).
 Verdict allocation_rule(const Words& ours, const Words& host) {
     if (ours[0] != kInvalid && host[0] == kInvalid) return Verdict::error;
+    if (alignment_undersized(ours, host)) return Verdict::error;
     return Verdict::gap;
 }
 
 Verdict engine_allocation_rule(const Words& ours, const Words& host) {
     if (ours[0] != kInvalid && (host[0] == kInvalid || ours[0] < host[0])) return Verdict::error;
+    if (alignment_undersized(ours, host)) return Verdict::error;
     return Verdict::gap;
 }
 
@@ -351,7 +360,31 @@ bool enabled(const char* name) {
 }
 }  // namespace
 
+// The allocation rules, on answers made up here, so they are checked where there is no Vulkan GPU or no host device.
+bool check_allocation_rules() {
+    bool ok = true;
+    const auto expect = [&](bool good, const char* what) {
+        if (!good) {
+            std::fprintf(stderr, "FAIL allocation rules: %s\n", what);
+            ok = false;
+        }
+    };
+    const Words host{65536, 65536};
+    for (const auto rule : {allocation_rule, engine_allocation_rule}) {
+        expect(rule({65536, 4096}, host) == Verdict::error, "an alignment below the host's is an error");
+        expect(rule({65536, 65536}, host) == Verdict::gap, "an equal answer reaching a rule is a gap");
+        expect(rule({65536, 4194304}, host) == Verdict::gap, "an alignment above the host's is a gap");
+        expect(rule({kInvalid, 0}, host) == Verdict::gap, "a refusal where the host answers is a gap");
+        expect(rule({65536, 65536}, {kInvalid, 0}) == Verdict::error, "an answer where the host refuses is an error");
+        expect(rule({65536, 4096}, {kInvalid, 0}) == Verdict::error, "an answer where the host refuses stays an error");
+    }
+    expect(engine_allocation_rule({32768, 65536}, host) == Verdict::error, "a size below the host's is an error");
+    expect(allocation_rule({32768, 65536}, host) == Verdict::gap, "a size below the host's is a gap for the odd grid");
+    return ok;
+}
+
 int main() {
+    if (!check_allocation_rules()) return 1;
     vktest::Device vk;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips

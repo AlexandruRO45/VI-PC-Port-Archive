@@ -451,10 +451,12 @@ counts only when the hardware adapter and WARP agree, since where they differ th
 The layer may know less than the host: a refused video format, no tiled support, a missing MSAA unordered-access
 texture are gaps, printed with `LEONIDA_SWEEP_GAPS=1`. It must not claim more or answer differently, and those fail the
 run: a `Support1`/`Support2` bit or a quality level the host lacks, a size where the host refuses (or, for render
-targets, depth buffers and block-compressed textures with their flags, a size smaller than the host's), and any
+targets, depth buffers and block-compressed textures with their flags, a size smaller than the host's), an allocation
+alignment smaller than the host's wherever both answer (a larger one only wastes space and is a gap), and any
 footprint that is not the host's. Each failure is one query and format with its smallest description.
 `LEONIDA_SWEEP_REPORT=1` prints every group and exits 0, for exploring a new area. It needs a Vulkan GPU and runs
-explicitly.
+explicitly; the rules that sort an answer into a gap or an error are first checked on made-up answers, which needs
+no GPU.
 
 ```powershell
 .\runtime\build\RelWithDebInfo\d3d12_query_sweep_test.exe
