@@ -1,15 +1,19 @@
 """run_lanterns.py: its timeout keeps its promise against a launcher that never ends and a child that leaves its
 session, each run gets its own folder, and only a complete transcript (exit 0, the stage's whole PASS line once with
-numbers that fit, the shim's Vulkan device line) counts as a pass.
+numbers that fit, the shim's Vulkan device line) counts as a pass. In Wine mode the prefix's wineserver is stopped first, within a hard bound, and on Linux nothing is
+launched unless the runner is a child subreaper.
 
     python -I tests/test_run_lanterns.py
 """
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNNER = os.path.join(ROOT, "runtime", "test", "lanterns", "run_lanterns.py")
@@ -75,19 +79,24 @@ class StalledLauncher(unittest.TestCase):
             self.assertFalse([p for p in launched if alive(p)])
 
     def test_wine_mode_stops_the_prefix_wineserver_first(self):
-        # A wineserver and a wine that only log their calls: -k, then -w, then the launch. A wineserver that hangs
-        # fails the run within its timeout, before any launch.
-        for hang, want_code, want_calls in ((False, 1, ["wineserver -k", "wineserver -w", "wine"]),
-                                            (True, run_lanterns.CLEANUP_EXIT, ["wineserver -k"])):
-            with self.subTest(hang=hang), tempfile.TemporaryDirectory() as tmp:
+        # A wineserver and a wine that only log their calls: -k, then -w, then the launch. A wineserver that hangs, or
+        # one that ignores SIGTERM and leaves a child holding its output open, fails the run within its timeout, before
+        # any launch.
+        hangs = "exec sleep 300\n"
+        holds_output = "trap '' TERM\nsleep 300 &\necho $! > {tmp}/child\nwait\n"
+        for name, server, want_code, want_calls in (
+                ("stops", "", 1, ["wineserver -k", "wineserver -w", "wine"]),
+                ("hangs", hangs, run_lanterns.CLEANUP_EXIT, ["wineserver -k"]),
+                ("holds its output", holds_output, run_lanterns.CLEANUP_EXIT, ["wineserver -k"])):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 calls = os.path.join(tmp, "calls")
                 bin_dir = os.path.join(tmp, "bin")
                 os.makedirs(bin_dir)
-                for name, body in (("wineserver", f'echo "wineserver $1" >> {calls}\n' + ("exec sleep 300\n" if hang else "")),
+                for prog, body in (("wineserver", f'echo "wineserver $1" >> {calls}\n' + server.format(tmp=tmp)),
                                    ("wine", f"echo wine >> {calls}\n")):
-                    with open(os.path.join(bin_dir, name), "w", encoding="utf-8") as f:
+                    with open(os.path.join(bin_dir, prog), "w", encoding="utf-8") as f:
                         f.write("#!/bin/sh\n" + body)
-                    os.chmod(os.path.join(bin_dir, name), 0o755)
+                    os.chmod(os.path.join(bin_dir, prog), 0o755)
                 env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
                 started = time.monotonic()
                 r = fake_run(tmp, "exit 0\n", env=env, wine=True)[0]
@@ -95,6 +104,33 @@ class StalledLauncher(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, run_lanterns.WINESERVER_TIMEOUT + 15)
                 with open(calls, encoding="utf-8") as f:
                     self.assertEqual(f.read().split("\n")[:-1], want_calls)
+                if os.path.exists(os.path.join(tmp, "child")):   # what the wineserver started is gone too
+                    with open(os.path.join(tmp, "child"), encoding="utf-8") as f:
+                        child = int(f.read())
+                    time.sleep(0.2)
+                    self.assertFalse(alive(child), f"pid {child} survived")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the subreaper is Linux's")
+    def test_no_launch_without_the_subreaper(self):
+        # prctl(PR_SET_CHILD_SUBREAPER) refused: an escaped grandchild could not be found, so the runner must not
+        # launch (and later claim it killed everything).
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "launched")
+            fake = os.path.join(tmp, "gta6rt")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write(f"#!/bin/sh\ntouch {marker}\n")
+            os.chmod(fake, 0o755)
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            open(os.path.join(shaders, "spirv", "index.json"), "w").close()
+            refusing = mock.Mock()
+            refusing.return_value.prctl.return_value = -1
+            with mock.patch("ctypes.CDLL", refusing), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code = run_lanterns.main(["--gta6rt", fake, "--guest", fake, "--shaders", shaders,
+                                          "--out", os.path.join(tmp, "out"), "--timeout", "5"])
+            self.assertEqual(code, run_lanterns.CLEANUP_EXIT, err.getvalue())
+            self.assertFalse(os.path.exists(marker))
 
     def test_each_run_has_its_own_folder(self):
         # Two runs of a launcher that exits at once without a PASS line: both fail, each in a folder of its own.

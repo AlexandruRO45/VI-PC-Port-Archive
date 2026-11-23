@@ -128,8 +128,9 @@ def kill_tree(proc):
     problems = []
     if os.name == "nt":
         try:
+            # taskkill fails (128) for a launcher that exited after the timeout fired: that is not a survivor.
             r = subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
-            if r.returncode != 0:
+            if r.returncode != 0 and proc.poll() is None:
                 problems.append(f"taskkill /T /F exited with {r.returncode}: "
                                 f"{(r.stdout + r.stderr).decode('utf-8', 'replace').strip()}")
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -172,14 +173,37 @@ def stop_wineserver(env):
     DISPLAY: 20 of 20 such launches hung, 20 of 20 passed with this first. Returns what went wrong (empty: stopped, or
     none was running; wineserver exits nonzero when there is none)."""
     for flag in ("-k", "-w"):
-        try:
-            subprocess.run(["wineserver", flag], env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                           timeout=WINESERVER_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            return [f"wineserver {flag} did not return in {WINESERVER_TIMEOUT} s"]
-        except OSError as e:
-            return [f"wineserver {flag} did not start: {e}"]
+        problem = run_bounded(["wineserver", flag], env, WINESERVER_TIMEOUT)
+        if problem:
+            return [problem]
     return []
+
+
+def run_bounded(cmd, env, seconds):
+    """Run cmd for at most seconds (plus 5 to reap it after SIGKILL); None when it exited in time, else what happened.
+    Its output goes nowhere: a pipe a child of cmd keeps open would make even subprocess.run's own timeout wait."""
+    try:
+        proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
+    except OSError as e:
+        return f"{' '.join(cmd)} did not start: {e}"
+    try:
+        proc.wait(timeout=seconds)
+        return None
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return f"{' '.join(cmd)} did not return in {seconds:g} s and is still alive after SIGKILL (pid {proc.pid})"
+    return f"{' '.join(cmd)} did not return in {seconds:g} s; killed"
 
 
 def run(cmd, env, timeout, log_base):
@@ -310,7 +334,12 @@ def main(argv=None):
     os.makedirs(a.out, exist_ok=True)
     run_dir = tempfile.mkdtemp(prefix=time.strftime(f"stage{a.stage}-%Y%m%d-%H%M%S-"), dir=a.out)
     print(f"lanterns: this run's files go to {run_dir}")
-    become_subreaper()
+    if sys.platform.startswith("linux") and not become_subreaper():
+        # Without it a process that left the launcher's session and lost its parent goes to init, where the cleanup
+        # cannot find it; the runner would then claim a full cleanup it cannot check.
+        print("lanterns: FAILED: prctl(PR_SET_CHILD_SUBREAPER) was refused, so the runner could not kill everything the "
+              "run might start; not launching", file=sys.stderr)
+        return CLEANUP_EXIT
     conv = wine_path if a.wine else os.path.abspath
     env = dict(os.environ, LEONIDA_D3D12="vulkan", LEONIDA_SHADERS=conv(os.path.join(a.shaders, "spirv")))
     cmd = (["wine"] if a.wine else []) + [a.gta6rt, "--run", conv(a.guest), "--", "--stage", str(a.stage),

@@ -105,9 +105,10 @@ numbers that fit together (exact and edge pixels add up to the frame, at least 1
 complete factory line, `[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy 0x... (Vulkan device 0x...)`. That last line
 means the device is the Vulkan one, not the host's. The guest waits for each fence for at most 30 s and fails with a
 line saying so. With `--wine`, the runner first stops the prefix's `wineserver` (`wineserver -k`, then `-w`,
-10 s each): a launch under a new virtual X server while the last run's `explorer.exe` is still alive hangs in
+10 s each, killed with everything it started if it overruns): a launch under a new virtual X server while the last run's `explorer.exe` is still alive hangs in
 winevulkan's device creation, because that explorer keeps the old, closed display. The runner's timeout kills everything the run started, so a stalled guest, Wine or GPU fails the run
-with exit code 3 instead of hanging it. On Linux it also catches a process that left the launcher's session; if
+with exit code 3 instead of hanging it. On Linux it also catches a process that left the launcher's session (it makes itself a child subreaper, and if the kernel
+refuses that it does not launch at all and exits with code 4); if
 anything survives the kill, or taskkill fails on Windows, the run fails with exit code 4 and names what is left.
 Each run writes into a new folder under `--out`: the guest's dumps, the launcher's output, `lanterns-stage1.png`
 and `lanterns-stage1-sheet.png`. The sheet shows the GPU frame, the reference, the control frame, a mask (grey:
