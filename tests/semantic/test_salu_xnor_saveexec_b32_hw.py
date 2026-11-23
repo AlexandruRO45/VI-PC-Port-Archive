@@ -145,5 +145,108 @@ class TestSaluXnorSaveexecB32Oracle(unittest.TestCase):
                 self.assertEqual(hw_scc, exp_scc)
                 self.assertEqual(hw_popcount, bin(exp_saved_d).count("1"))
 
+# --- Section 2: Symbolic AST Opcode Definitions and Typed Expressions ---
+
+class OpcodeClass(enum.Enum):
+    SOP1 = enum.auto()
+
+
+class OperandKind(enum.Enum):
+    SGPR = enum.auto()
+    IMM_INT = enum.auto()
+    LITERAL32 = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class OperandAST:
+    kind: OperandKind
+    raw: str
+    value: int
+    reg_idx: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: OperandAST
+    src0: OperandAST
+    opcode_class: OpcodeClass = OpcodeClass.SOP1
+    modifies_scc: bool = True
+    modifies_exec: bool = True
+
+
+def parse_operand(op_str: str) -> OperandAST:
+    raw = op_str.strip()
+    if raw.startswith("s") and raw[1:].isdigit():
+        idx = int(raw[1:])
+        if idx > 105:
+            raise ValueError(f"SGPR index out of range 0..105: {raw}")
+        return OperandAST(kind=OperandKind.SGPR, raw=raw, value=0, reg_idx=idx)
+    if raw.startswith("v"):
+        raise ValueError(f"Vector register {raw} invalid in SALU instruction")
+    try:
+        val = int(raw, 0)
+    except ValueError as e:
+        raise ValueError(f"Invalid operand syntax: {raw}") from e
+    if -16 <= val <= 64:
+        return OperandAST(kind=OperandKind.IMM_INT, raw=raw, value=val & MASK32)
+    return OperandAST(kind=OperandKind.LITERAL32, raw=raw, value=val & MASK32)
+
+
+def parse_salu_instruction(line: str) -> InstructionAST:
+    clean = line.split(";")[0].strip()
+    if not clean:
+        raise ValueError("Empty instruction line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0]
+    if mnemonic != "s_xnor_saveexec_b32":
+        raise ValueError(f"Unexpected mnemonic: {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError(f"Missing operands for {mnemonic}")
+    operands = [op.strip() for op in parts[1].split(",")]
+    if len(operands) != 2:
+        raise ValueError(f"s_xnor_saveexec_b32 requires 2 operands (dst, src0), got {len(operands)}")
+    dst = parse_operand(operands[0])
+    if dst.kind != OperandKind.SGPR:
+        raise ValueError(f"Destination must be an SGPR, got {dst.kind}")
+    src0 = parse_operand(operands[1])
+    return InstructionAST(
+        mnemonic=mnemonic,
+        dst=dst,
+        src0=src0,
+        opcode_class=OpcodeClass.SOP1,
+        modifies_scc=True,
+        modifies_exec=True,
+    )
+
+
+class TestSaluXnorSaveexecB32AST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions tests."""
+
+    def test_ast_parse_valid(self) -> None:
+        inst = parse_salu_instruction("s_xnor_saveexec_b32 s8, s2")
+        self.assertEqual(inst.mnemonic, "s_xnor_saveexec_b32")
+        self.assertEqual(inst.dst.reg_idx, 8)
+        self.assertEqual(inst.src0.reg_idx, 2)
+        self.assertTrue(inst.modifies_scc)
+        self.assertTrue(inst.modifies_exec)
+
+    def test_ast_parse_immediate(self) -> None:
+        inst = parse_salu_instruction("s_xnor_saveexec_b32 s0, 0")
+        self.assertEqual(inst.src0.kind, OperandKind.IMM_INT)
+        self.assertEqual(inst.src0.value, 0)
+
+    def test_ast_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_xnor_saveexec_b32")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_xnor_saveexec_b32 s0")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_xnor_saveexec_b32 v0, s1")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_xnor_saveexec_b32 s0, v1")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_xnor_saveexec_b32 s106, s0")
+
 if __name__ == "__main__":
     unittest.main()
