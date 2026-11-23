@@ -109,6 +109,24 @@ class TestReadFirstLaneAST(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestReadFirstLaneDivergence(unittest.TestCase):
+    def test_exec_mask_variations(self):
+        lanes = [i for i in range(64)]
+        self.assertEqual(model_readfirstlane(lanes, 0x8000_0000_0000_0000), 63)
+        self.assertEqual(model_readfirstlane(lanes, 0), 0)
+
+    def test_translator_readfirstlane_divergence(self):
+        prog = [
+            "s_mov_b32 exec_lo, 0x00000000",
+            "s_mov_b32 exec_hi, 0x00010000",
+            "v_mov_b32_e32 v1, 555",
+            "v_readfirstlane_b32 s8, v1",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_rfl_div", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
