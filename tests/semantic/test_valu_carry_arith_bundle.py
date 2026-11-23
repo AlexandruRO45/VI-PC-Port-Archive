@@ -99,5 +99,35 @@ class VAddCoU32OracleTests(unittest.TestCase):
         self.assertEqual(s, 0x12345678)
         self.assertEqual(c, 0)
 
+@dataclasses.dataclass
+class CarryAstNode:
+    opcode: str
+    dst: str
+    cd: str
+    src0: str
+    src1: str
+    src2: Optional[str] = None
+
+    def emit_asm(self) -> str:
+        if self.src2 is not None:
+            return f"{self.opcode} {self.dst}, {self.cd}, {self.src0}, {self.src1}, {self.src2}"
+        return f"{self.opcode} {self.dst}, {self.cd}, {self.src0}, {self.src1}"
+
+
+class VAddCoU32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_add_co_u32."""
+
+    def test_ast_emission(self):
+        node = CarryAstNode("v_add_co_u32", "v0", "vcc", "v1", "v2")
+        self.assertEqual(node.emit_asm(), "v_add_co_u32 v0, vcc, v1, v2")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": 0xFFFFFFFF, "v2": 5}
+        s, c = ref_add_co_u32(regs["v1"], regs["v2"])
+        regs["v0"] = s
+        regs["vcc"] = c
+        self.assertEqual(regs["v0"], 4)
+        self.assertEqual(regs["vcc"], 1)
+
 if __name__ == "__main__":
     unittest.main()
