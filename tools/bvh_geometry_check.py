@@ -19,7 +19,7 @@ Usage:
                                           [--index16] [--transform 12 floats] [--json <report.json>]
 
 The geometry options are those of tools/bvh_rehydrate.py. It prints one line per check; exit status is 0 when bounds,
-overrides and pairs are consistent, 1 when one is not, 2 on an input error.
+overrides and pairs are consistent, 1 when one is not, 2 on an input or output error.
 """
 import argparse
 import json
@@ -163,6 +163,13 @@ def main(argv=None):
         parts = spec.split(",")
         geom_paths.append((parts[0], parts[1] if len(parts) > 1 else ""))
     if a.json:
+        folder = os.path.dirname(os.path.abspath(a.json))
+        if os.path.isdir(a.json):       # open() on a folder ends the run in an IsADirectoryError traceback
+            print("error: --json %s is a folder, not a JSON file" % a.json, file=sys.stderr)
+            return 2
+        if not os.path.isdir(folder):   # the check can run for seconds before it reaches this write
+            print("error: --json folder does not exist: %s" % folder, file=sys.stderr)
+            return 2
         if same_report_path(a.json, a.dehydrated):
             print("error: --json %s must not overwrite the dehydrated input" % a.json, file=sys.stderr)
             return 2
@@ -194,8 +201,12 @@ def main(argv=None):
     print("internal box area: %.6g" % report["internal_area"])
     print("consistent" if report["consistent"] else "NOT consistent")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+        except OSError as e:            # a read-only file or a full disk: one line, not a traceback
+            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0 if report["consistent"] else 1
 
 
