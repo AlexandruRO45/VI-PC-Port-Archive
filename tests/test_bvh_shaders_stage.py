@@ -223,6 +223,23 @@ class BvhStage(unittest.TestCase):
         self.assertFalse(os.path.exists(self.spirv))
         self.assertFalse(os.path.exists(self.unpacked))
 
+    def test_a_dll_that_is_gone_takes_the_old_index_with_it(self):
+        """A work folder reused for a package without the DLL: the runtime loads <shaders>/bvh/index.json whenever
+        it exists, so the index of the earlier run must not stay, and the DLL coming back runs the step again."""
+        self.assertEqual(self.run_step(), TOOLS)
+        index, settings = os.path.join(self.spirv, "index.json"), os.path.join(self.spirv, "bvh_build.json")
+        self.assertTrue(os.path.isfile(index) and os.path.isfile(settings))
+        os.remove(self.dll)
+        self.assertEqual(self.run_step(), [])
+        self.assertFalse(os.path.exists(index))
+        self.assertFalse(os.path.exists(settings))
+        self.assertEqual(self.logs, [f"shaders: no {make_game.BVH_DLL} in the game folder, so no BVH builder "
+                                     "programs to translate"])
+        self.assertEqual(self.run_step(), [])                      # and again, with nothing left to remove
+        self.write_dll()
+        self.assertEqual(self.run_step(), TOOLS)
+        self.assertTrue(os.path.isfile(index) and os.path.isfile(settings))
+
     def test_each_input_change_runs_it_again(self):
         self.run_step()
         self.assertEqual(self.run_step(signature="llvm-mc 24"), TOOLS)
