@@ -74,6 +74,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name Leonida-windows-x64 `
+            --icon "assets/logo.png" `
             --add-data "assets/fonts;assets/fonts" `
             --add-data "assets/logo.png;assets" `
             --add-data "game/xbox-1.0.2.1.json;game" `
@@ -120,6 +121,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onedir --windowed \
             --name Leonida \
+            --icon "assets/logo.png" \
             --add-data "assets/fonts:assets/fonts" \
             --add-data "assets/logo.png:assets" \
             --add-data "game/xbox-1.0.2.1.json:game" \

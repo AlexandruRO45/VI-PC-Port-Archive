@@ -970,6 +970,9 @@ def run_gui() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     repo_root = resolve_repo_root()
+    logo_path = os.path.join(repo_root, "assets", "logo.png")
+    if os.path.isfile(logo_path):
+        app.setWindowIcon(QIcon(logo_path))
     font_family = load_outfit_fonts(repo_root)
     app.setFont(QFont(font_family, 10))
     app.setStyleSheet(STYLESHEET)
