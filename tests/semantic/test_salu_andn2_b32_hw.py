@@ -103,3 +103,93 @@ class TestSaluAndn2B32Oracle(unittest.TestCase):
         self.assertNotEqual(res_01, res_10)
         self.assertEqual(res_01, 0x0000FF00)
         self.assertEqual(res_10, 0x00FF0000)
+
+
+class Opcode(Enum):
+    S_ANDN2_B32 = auto()
+
+
+class OperandKind(Enum):
+    SGPR = auto()
+    EXEC_LO = auto()
+    VCC_LO = auto()
+    LITERAL32 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    count: int = 1
+    value: int = 0
+
+    @classmethod
+    def sgpr(cls, index: int) -> ASTOperand:
+        if index < 0 or index > 105:
+            raise ValueError(f"SGPR index out of range: s{index}")
+        return cls(kind=OperandKind.SGPR, index=index)
+
+    @classmethod
+    def exec_lo(cls) -> ASTOperand:
+        return cls(kind=OperandKind.EXEC_LO)
+
+    @classmethod
+    def vcc_lo(cls) -> ASTOperand:
+        return cls(kind=OperandKind.VCC_LO)
+
+    @classmethod
+    def literal32(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL32, value=u32(val))
+
+    @classmethod
+    def inline_const(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_CONST, value=u32(val))
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.S_ANDN2_B32:
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind not in (OperandKind.SGPR, OperandKind.EXEC_LO, OperandKind.VCC_LO):
+            raise TypeError(f"Destination must be SGPR, EXEC_LO, or VCC_LO, got {self.dst.kind}")
+        if self.dst.count != 1 or self.src0.count != 1 or self.src1.count != 1:
+            raise ValueError("All operands must be 32-bit single registers")
+
+
+class TestSaluAndn2B32AST(unittest.TestCase):
+    """Test suite for AST opcode definitions and operand validation."""
+
+    def test_ast_construction_valid_operands(self):
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B32,
+            dst=ASTOperand.sgpr(4),
+            src0=ASTOperand.sgpr(6),
+            src1=ASTOperand.sgpr(8),
+        )
+        inst.validate()
+        self.assertEqual(inst.opcode, Opcode.S_ANDN2_B32)
+        self.assertEqual(inst.dst.kind, OperandKind.SGPR)
+        self.assertEqual(inst.dst.index, 4)
+        self.assertEqual(inst.src0.index, 6)
+        self.assertEqual(inst.src1.index, 8)
+
+    def test_ast_rejects_out_of_range_sgpr(self):
+        with self.assertRaises(ValueError):
+            ASTOperand.sgpr(106)
+
+    def test_ast_rejects_invalid_dst_kind(self):
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B32,
+            dst=ASTOperand.literal32(0x123),
+            src0=ASTOperand.sgpr(6),
+            src1=ASTOperand.sgpr(8),
+        )
+        with self.assertRaises(TypeError):
+            inst.validate()
