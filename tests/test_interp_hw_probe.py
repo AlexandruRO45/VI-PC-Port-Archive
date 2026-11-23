@@ -209,6 +209,38 @@ class RandomCheckTest(unittest.TestCase):
         ihp.check_random(list(words), info, False, tally, bad)
         return tally, bad
 
+    def test_a_wrong_p2_f32_word_is_a_mismatch(self):
+        words = list(self.WORDS)
+        words[1] = 0x40400001                       # 3.0000001 where the model wants 3.0
+        tally, bad = self.run_check(words)
+        self.assertEqual(tally[("f32", "p2_f32 = fma(P20, J, p1)")], [0, 1])
+        self.assertTrue(any("p2_f32 = fma(P20, J, p1)" in b for b in bad))
+
+    def test_a_wrong_p2_f16_result_is_a_mismatch(self):
+        # The canary is intact and only the fma result is wrong, so this is the one path that
+        # exercises the same(o[1], w2) comparison; 0x4240 is 3.0 where the model wants 5.625.
+        words = list(self.WORDS)
+        words[5] = 0xDEAD4240
+        tally, bad = self.run_check(words)
+        self.assertEqual(tally[("f32", "p2_f16 high = fma(h20, J, p1ll) in f16")], [0, 1])
+        self.assertTrue(any("p2_f16 high = fma" in b for b in bad))
+
+    def test_a_wrong_mov_word_is_a_mismatch(self):
+        words = list(self.WORDS)
+        words[6] = 0x3F800001                       # one bit off the raw p0 word it should echo
+        tally, bad = self.run_check(words)
+        self.assertEqual(tally[("f32", "mov p0 = raw word")], [0, 1])
+        self.assertTrue(any("mov p0" in b for b in bad))
+
+    def test_a_wrong_p1ll_word_is_a_mismatch(self):
+        # words[4] is p1ll high, the input the p2_f16 high lane reads next; 0x40000000 is 2.0
+        # where the model wants 3.75, and the canary in words[5] stays put.
+        words = list(self.WORDS)
+        words[4] = 0x40000000
+        tally, bad = self.run_check(words)
+        self.assertEqual(tally[("f32", "p1ll_f16 high = fma(h10, I, h0) in f32")], [0, 1])
+        self.assertTrue(any("p1ll_f16 high" in b for b in bad))
+
     def test_hand_computed_words_all_match(self):
         tally, bad = self.run_check(self.WORDS)
         self.assertEqual(bad, [])
