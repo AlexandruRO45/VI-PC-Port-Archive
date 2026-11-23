@@ -407,6 +407,18 @@ class TestSAshrI64SignAndSCC(unittest.TestCase):
         res, scc = ref_s_ashr_i64(0, 10)
         self.assertEqual((res, scc), (0, 0))
 
+class TestSAshrI64Translator(unittest.TestCase):
+    def test_translator_s_ashr_i64_execution(self) -> None:
+        body = [
+            "s_mov_b64 s[4:5], 0x8000000000000000",
+            "s_ashr_i64 s[6:7], s[4:5], 8",
+            "v_mov_b32_e32 v1, s7",  # upper dword
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_ashr_i64")
+        for l in range(32):
+            self.assertEqual(results[l], 0xFF800000)
+
 
 if __name__ == "__main__":
     unittest.main()
