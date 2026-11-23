@@ -375,6 +375,15 @@ impl Module {
         let ty = self.type_of(a);
         self.push(block, ty, Op::Bin(op, a, b))
     }
+
+    #[cfg(test)]
+    pub(crate) fn bin_opcode(&self, value: V) -> Option<Bin> {
+        let V::Inst(index) = value else { return None };
+        match self.insts[index as usize].op {
+            Op::Bin(op, ..) => Some(op),
+            _ => None,
+        }
+    }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
         self.push(block, to, Op::Cast(op, v))
     }

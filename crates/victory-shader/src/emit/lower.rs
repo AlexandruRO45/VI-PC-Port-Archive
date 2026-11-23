@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -316,6 +316,12 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
+}
+
+fn bfe_shift(module: &mut Module, block: usize, value: V, offset: V, signed: bool) -> V {
+    // Arithmetic shifting fills any field bits past bit 31 with the source sign.
+    let op = if signed { Bin::AShr } else { Bin::LShr };
+    module.bin(block, op, value, offset)
 }
 
 impl<'a> Lower<'a> {
@@ -1367,7 +1373,7 @@ impl<'a> Lower<'a> {
             self.s.m.i32(u32::MAX),
         );
         let off = self.s.m.bin(c, Bin::And, off, k31);
-        let shifted = self.s.m.bin(c, Bin::LShr, a, off);
+        let shifted = bfe_shift(&mut self.s.m, c, a, off, signed);
         let full = self.s.m.cmp(c, pred::IUGE, width, k32);
         let w = self.s.m.bin(c, Bin::And, width, k31);
         let mask = self.s.m.bin(c, Bin::Shl, one, w);
@@ -6475,7 +6481,21 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, buffer_format};
+    use super::{Bin, Module, Numeric, bfe_shift, buffer_format};
+
+    #[test]
+    fn bfe_preserves_sign_when_field_crosses_bit_31() {
+        let mut module = Module::default();
+        let block = module.new_block();
+        let value = module.i32(0x8000_0000);
+        let offset = module.i32(31);
+
+        let signed = bfe_shift(&mut module, block, value, offset, true);
+        let unsigned = bfe_shift(&mut module, block, value, offset, false);
+
+        assert_eq!(module.bin_opcode(signed), Some(Bin::AShr));
+        assert_eq!(module.bin_opcode(unsigned), Some(Bin::LShr));
+    }
 
     #[test]
     fn buffer_formats_by_number() {
