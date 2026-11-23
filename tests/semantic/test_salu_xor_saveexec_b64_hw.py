@@ -244,5 +244,108 @@ class TestSXorSaveExecAST(unittest.TestCase):
         with self.assertRaises(TypeError):
             instr.validate()
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ScalarHardwareState:
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    exec_mask: int = ALL64
+    scc: int = 0
+    vcc: int = 0
+
+    def get_sgpr_pair(self, index: int) -> int:
+        if index % 2 != 0 or index > 104:
+            raise ValueError(f"Invalid SGPR pair index: {index}")
+        lo = self.sgprs[index] & MASK32
+        hi = self.sgprs[index + 1] & MASK32
+        return (hi << 32) | lo
+
+    def set_sgpr_pair(self, index: int, val: int) -> None:
+        if index % 2 != 0 or index > 104:
+            raise ValueError(f"Invalid SGPR pair index: {index}")
+        self.sgprs[index] = val & MASK32
+        self.sgprs[index + 1] = (val >> 32) & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter executing s_xor_saveexec_b64."""
+
+    @staticmethod
+    def step(instr: SXorSaveExecB64Instruction, state: ScalarHardwareState) -> None:
+        instr.validate()
+        # Read source operand
+        if instr.src0.kind == RegisterKind.SGPR:
+            s0_val = state.get_sgpr_pair(instr.src0.index)
+        elif instr.src0.kind == RegisterKind.EXEC:
+            s0_val = state.exec_mask
+        elif instr.src0.kind == RegisterKind.VCC:
+            s0_val = state.vcc
+        elif instr.src0.kind == RegisterKind.LITERAL64:
+            s0_val = instr.src0.index
+        else:
+            raise NotImplementedError(f"Unsupported source kind: {instr.src0.kind}")
+
+        new_exec, d, scc = s_xor_saveexec_b64_oracle(s0_val, state.exec_mask)
+        # Update destination SGPR pair with old EXEC
+        state.set_sgpr_pair(instr.dst.index, d)
+        # Update EXEC and SCC
+        state.exec_mask = new_exec
+        state.scc = scc
+
+
+class TestSXorSaveExecScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter state transitions."""
+
+    def setUp(self):
+        self.state = ScalarHardwareState()
+
+    def test_interpreter_step_basic(self):
+        self.state.set_sgpr_pair(4, 0x00FF_0000_00FF_0000)
+        self.state.exec_mask = 0x00FF_00FF_00FF_00FF
+        self.state.scc = 0
+
+        instr = SXorSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, self.state)
+
+        # Destination must hold old EXEC
+        self.assertEqual(self.state.get_sgpr_pair(6), 0x00FF_00FF_00FF_00FF)
+        # EXEC must be bitwise XOR of s0 and old EXEC
+        self.assertEqual(self.state.exec_mask, 0x0000_00FF_0000_00FF)
+        # SCC must be 1 because new EXEC != 0
+        self.assertEqual(self.state.scc, 1)
+
+    def test_interpreter_step_zero_result(self):
+        val = 0x1111_2222_3333_4444
+        self.state.set_sgpr_pair(4, val)
+        self.state.exec_mask = val
+        self.state.scc = 1  # Previous SCC was 1
+
+        instr = SXorSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, self.state)
+
+        self.assertEqual(self.state.get_sgpr_pair(6), val)
+        self.assertEqual(self.state.exec_mask, 0)
+        self.assertEqual(self.state.scc, 0)  # SCC cleared to 0
+
+    def test_interpreter_step_from_vcc(self):
+        self.state.vcc = 0x1111_2222_3333_4444
+        self.state.exec_mask = 0x5555_6666_7777_8888
+        instr = SXorSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=12, size_bits=64),
+            src0=RegOperand(RegisterKind.VCC, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, self.state)
+        self.assertEqual(self.state.get_sgpr_pair(12), 0x5555_6666_7777_8888)
+        self.assertEqual(self.state.exec_mask, 0x1111_2222_3333_4444 ^ 0x5555_6666_7777_8888)
+        self.assertEqual(self.state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
