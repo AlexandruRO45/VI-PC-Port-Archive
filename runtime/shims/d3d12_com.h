@@ -29,6 +29,7 @@
 
 namespace leonida {
 class VulkanPresenter;
+struct PresentPlanes;
 }
 
 namespace rt::d3d12 {
@@ -77,6 +78,10 @@ struct VulkanDeviceInfo {
     // Distinct handles from queue_family, when the creator requested more than one queue.
     // Empty for caller-owned devices that only supplied queue above.
     std::vector<VkQueue> command_queues;
+    std::uint32_t compute_family = UINT32_MAX;
+    std::uint32_t copy_family = UINT32_MAX;
+    std::vector<VkQueue> compute_queues;
+    std::vector<VkQueue> copy_queues;
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
@@ -101,6 +106,9 @@ struct VulkanDeviceInfo {
     // rejected at ExecuteCommandLists.
     bool conditional_rendering = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled: byte-granular predicated buffer copies.
+    // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1 is exposed only when its
+    // physical-device precision/overestimation properties also meet the implemented requirements.
+    bool conservative_rasterization = false;
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
     bool host_image_copy = false;
@@ -109,10 +117,12 @@ struct VulkanDeviceInfo {
     // default `--fma glsl` shaders can.
     bool shader_fma = false;
     // VK_EXT_shader_image_atomic_int64 and its shaderImageInt64Atomics feature are enabled on `device` (with
-    // shaderInt64): set 0 gets the r64ui storage bindings, R32G32_UINT/SINT/TYPELESS UAV textures get an R64_UINT
-    // view there for the translator's 64-bit image atomics, and D3D12_OPTIONS9 reports
-    // AtomicInt64OnTypedResourceSupported.
+    // shaderInt64): set 0 gets the r64ui storage bindings and R32G32_UINT/SINT/TYPELESS UAV textures get an R64_UINT
+    // view there for the translator's 64-bit image atomics. D3D12_OPTIONS9 still answers
+    // AtomicInt64OnTypedResourceSupported FALSE (no buffer or 3D texture UAVs yet).
     bool shader_image_int64_atomics = false;
+    bool shader_subgroup_clock = false;
+    bool shader_device_clock = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
     // Optional device features the caller enabled. Without occlusionQueryPrecise, D3D12_QUERY_TYPE_OCCLUSION counts
@@ -125,8 +135,13 @@ struct VulkanDeviceInfo {
     // instance (only meaningful with `presentation`): a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per
     // present, which PresentX's ImmediateThresholdPercent uses.
     bool swapchain_maintenance1 = false;
+    // VK_EXT_swapchain_colorspace is enabled on the instance (with `presentation`): the surface can list its HDR10
+    // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are tone mapped to SDR.
+    bool swapchain_colorspace = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
+    // VK_KHR_vertex_attribute_divisor or VK_EXT_vertex_attribute_divisor with vertexAttributeInstanceRateDivisor.
+    bool vertex_attribute_divisor = false;
     // Pixel-shader extensions translated shaders can declare, each enabled with its feature where the GPU has it:
     // VK_KHR_fragment_shader_barycentric (BaryCoordKHR / PerVertexKHR reads), VK_EXT_fragment_shader_interlock
     // (fragmentShaderPixelInterlock: POPS shaders run in PixelInterlockOrderedEXT) and VK_KHR_maintenance8 (texel
@@ -175,7 +190,9 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
-// GetDevice must return. No reference is taken: the outer object owns the device.
+// GetDevice must return. No reference is taken: the outer object owns the device. `outer` may be the proxy's
+// IDXGIDevice1 pointer (what create_device_proxy returns for that IID); the proxy itself becomes the outer. For a
+// proxy it also makes the proxy's IDXGIDevice1::GetAdapter return this layer's adapter (d3d12_xs_device.h).
 void set_device_outer(ID3D12Device* device, IUnknown* outer);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
@@ -250,6 +267,9 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 // Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
 
+// SDRWhiteLevel of DISPLAYCONFIG_SDR_WHITE_LEVEL (1000 = 80 nits) to nits.
+float sdr_white_nits_from_level(unsigned long level);
+
 // Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
 // presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
 class WindowPresenter {
@@ -268,6 +288,17 @@ public:
                     bool tear = false);
     // A black frame, nothing read (PresentX with no planes).
     HRESULT present_blank(UINT sync_interval);
+    // One or two planes composed (VulkanPresenter::present_planes); `planes` names the textures by ResourceId, so the
+    // caller fills it with resource_id(). DXGI_ERROR_UNSUPPORTED for a source the compose pass cannot read.
+    HRESULT present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear = false);
+    // The swapchain holds HDR10 (ST.2084) values; and a test hook (VulkanPresenter::force_hdr_encoding).
+    bool hdr_active() const;
+    void force_hdr_encoding(bool on);
+    std::uint64_t composed_presents() const;  // presents that went through the compose pass
+    // Nits of SDR white the user set in Windows for the output the window is on (DISPLAYCONFIG_SDR_WHITE_LEVEL), or 0 when
+    // it cannot be read (no window, no display config, not Windows). Only meaningful while hdr_active().
+    float display_sdr_white_nits() const;
+    void set_window(HWND window) { window_ = window; }
     bool tear_supported() const;
     bool last_present_tore() const;
     std::uint64_t tear_presents() const;
@@ -275,14 +306,19 @@ public:
     bool enable_capture();
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
     void set_abort(std::function<bool()> abort);
+    // See VulkanPresenter::read_back: false after a present skipped while the window is minimised, too.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
     VkExtent2D extent() const;
     std::uint64_t presented() const;
 
 private:
     IUnknown* device_;
+    HWND window_ = nullptr;
     std::unique_ptr<leonida::VulkanPresenter> presenter_;
 };
+
+// Whether `device` (from create_vulkan_device*) was created with VK_EXT_swapchain_colorspace on its instance.
+bool device_has_swapchain_colorspace(ID3D12Device* device);
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);

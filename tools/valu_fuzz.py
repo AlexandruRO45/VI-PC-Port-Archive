@@ -833,7 +833,12 @@ def compare(p, data):
     return diffs
 
 
-def translate(progs, work, emulate):
+def pc_tail_env():
+    """True when LEONIDA_PC_TAIL_UBO asks for rdna2spirv.py --pc-tail-ubo (128-byte push constants)."""
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def translate(progs, work, emulate, pc_tail=False):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     for d in (disasm, fssm, spirv):
         if d.exists():
@@ -857,6 +862,8 @@ def translate(progs, work, emulate):
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
+    if pc_tail:
+        cmd.append("--pc-tail-ubo")
     r = subprocess.run(cmd, capture_output=True, text=True)
     index = spirv / "index.json"
     if not index.exists():
@@ -864,12 +871,14 @@ def translate(progs, work, emulate):
     return json.loads(index.read_text(encoding="utf-8")), (r.stdout + r.stderr)
 
 
-def run_gpu(p, spv, build, index_entry, emulate, dump):
+def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
     if not os.path.isfile(exe):
         sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
                  "build it first (cmake --build <build dir> --target vk_compute_test)")
     env = dict(os.environ, VKC_OUT_WORDS=str(p.out_words()), VKC_DUMP=str(dump))
+    if pc_tail:
+        env["LEONIDA_PC_TAIL_UBO"] = "1"
     args = [exe, str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
         args.append("--require-wave64")
@@ -965,10 +974,14 @@ def negative_control(oracle, a, waves):
 def run_translator(progs, a):
     """The translator path: assemble for gfx1013, translate, run with vk_compute_test. Returns an exit code."""
     a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
-    work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_"))
-    work.mkdir(parents=True, exist_ok=True)
+    parent = Path(a.work).resolve() if a.work else None
+    if parent is not None:
+        parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_", dir=parent))
+    print(f"work dir {work}")
+    pc_tail = bool(getattr(a, "pc_tail_ubo", False))
     try:
-        index, log = translate(progs, work, a.emulate)
+        index, log = translate(progs, work, a.emulate, pc_tail=True) if pc_tail else translate(progs, work, a.emulate)
     except RuntimeError as e:
         print(e)
         return 2
@@ -984,7 +997,8 @@ def run_translator(progs, a):
             continue
         dump = work / (p.name + ".bin")
         dump.unlink(missing_ok=True)
-        rc, msg = run_gpu(p, spv, a.build, index[p.name], a.emulate, dump)
+        rc, msg = (run_gpu(p, spv, a.build, index[p.name], a.emulate, dump, pc_tail=True)
+                   if pc_tail else run_gpu(p, spv, a.build, index[p.name], a.emulate, dump))
         if rc == 77:
             skipped += 1
             print(f"SKIP {p.name}: {msg.splitlines()[-1] if msg else 'unsupported'}")
@@ -1028,8 +1042,11 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--wave", choices=("64", "32", "both"), default="both")
     ap.add_argument("--emulate", action="store_true", help="translate with --wave64-emulate, run at subgroup 32")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1 "
+                         "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
-    ap.add_argument("--work", default=None, help="keep the generated .asm and SPIR-V here")
+    ap.add_argument("--work", default=None, help="keep each run's generated .asm and SPIR-V in a new subfolder here")
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--show", default=None, metavar="SEED:INDEX[:WAVE]")
     ap.add_argument("--max-report", type=int, default=8)
@@ -1048,6 +1065,7 @@ def main():
                     help="mem on the hardware: V# word 3 in the GFX10 layout (RESOURCE_LEVEL set); informational")
     ap.add_argument("--keep", default=None, help="hw: write the native kernel of each mismatching program here")
     a = ap.parse_args()
+    a.pc_tail_ubo = a.pc_tail_ubo or pc_tail_env()
     global HW_SYNC, W3_LAYOUT
     HW_SYNC = a.hw_sync
     W3_LAYOUT = "gfx10" if a.gfx10_word3 else None
