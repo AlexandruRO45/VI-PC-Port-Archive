@@ -3777,7 +3777,7 @@ To delegate an entire batch to Rust, build the standalone Leonida exporter at th
 
 ```powershell
 $batchCheckout = "$out/Leonida-rust-batch"
-$batchCommit = '39be7f419af3baa261aca8a480af45935c919ccd'
+$batchCommit = 'cde8956d2124327f076ab0f9b1ca903f6d70152b'
 git init "$batchCheckout"
 git -C "$batchCheckout" fetch --depth=1 https://github.com/wish131400/Leonida.git $batchCommit
 git -C "$batchCheckout" checkout --detach $batchCommit
