@@ -493,6 +493,47 @@ class TableTest(unittest.TestCase):
         self.assertEqual(grc.ranges([3, 4, 5, 9, 12, 13]), "3-5, 9, 12-13")
 
 
+class TableShapeTest(unittest.TestCase):
+    """A --table of the wrong shape is one error line, not an AttributeError traceback.
+
+    main() catches (OSError, ValueError, KeyError, TypeError), so a missing key or a bad subscript already
+    reports cleanly; a non-object doc/classes/interfaces used to raise AttributeError past that handler.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _run(self, doc):
+        table = os.path.join(self.tmp, "table.json")
+        with open(table, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        image = os.path.join(self.tmp, "missing.dll")  # the table is read before any image
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = grc.main([image, "--table", table])
+        return rc, stderr.getvalue()
+
+    def test_a_non_object_table_is_one_error_line(self):
+        cases = {
+            "top-level list": [],
+            "top-level string": "nope",
+            "top-level number": 5,
+            "top-level null": None,
+            "classes is a list": {"classes": [], "interfaces": {}},
+            "interfaces is a list": {"classes": {}, "interfaces": []},
+            "classes is null": {"classes": None, "interfaces": {}},
+            "interfaces is a number": {"classes": {}, "interfaces": 3},
+        }
+        for label, doc in cases.items():
+            with self.subTest(label=label):
+                rc, err = self._run(doc)
+                self.assertEqual(rc, 1)
+                self.assertIn("cannot read the class table", err)
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(len(err.strip().splitlines()), 1)
+
+
 class GeneratorTest(unittest.TestCase):
     PAGES = {
         "README.md": "# XFooImpl\n\nClass Id: `aaaaaaaa-0000-0000-0000-000000000001`\n\n"

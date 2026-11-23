@@ -328,9 +328,14 @@ class RuntimeTable:
     """tools/gdk_runtime_classes.json: class and interface ids, inheritance and method order."""
 
     def __init__(self, doc: dict):
+        if not isinstance(doc, dict):
+            raise TypeError("the class table must be a JSON object of class and interface entries")
         self.source = doc.get("source", "")
         self.classes: dict = doc["classes"]
         self.interfaces: dict = doc["interfaces"]
+        for field, table in (("classes", self.classes), ("interfaces", self.interfaces)):
+            if not isinstance(table, dict):
+                raise TypeError(f"'{field}' must be a JSON object of name -> entry")
         self.class_by_id = {c["id"]: name for name, c in self.classes.items()}
         self.interface_by_id = {i["id"]: name for name, i in self.interfaces.items()}
 
