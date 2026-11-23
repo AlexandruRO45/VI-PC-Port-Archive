@@ -717,6 +717,11 @@ class Analysis:
         if op.startswith(("buffer_load", "tbuffer_load")):
             t_src |= self.add_tid_lane(n, i, a, mods)
 
+        # --- exec writes (before the handlers below, whose put() skips EXEC: s_bfm_b64, v_readfirstlane, v_readlane)
+        if op.startswith(SAVEEXEC) or "exec" in defs or any(_regs(d) == ["exec"] for d in dests):
+            self.exec_write(n, i, ins, op, a, dests, srcs, st, ev, violation, idiom, t_src)
+            return
+
         # --- lane masks and counts
         if op in ("s_bcnt1_i32_b64", "s_ff1_i32_b64") and len(a) == 2 and self.is_mask(ins, a[1]):
             if t_src & ~0:
@@ -849,10 +854,7 @@ class Analysis:
                 put(d, put_t)
             return
 
-        # --- exec writes and mask producers
-        if op.startswith(SAVEEXEC) or "exec" in defs or any(_regs(d) == ["exec"] for d in dests):
-            self.exec_write(n, i, ins, op, a, dests, srcs, st, ev, violation, idiom, t_src)
-            return
+        # --- mask producers
         if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
             d = dests[0] if dests else {"k": "special", "t": "vcc"}
             tag, tj = self.cmp_tag(st, ins, op, srcs, t_src, idiom)
@@ -1171,6 +1173,13 @@ class Analysis:
         old = st["x"]
         if any(_half(x) for x in dests + srcs) or (op.startswith("s_") and op.endswith("_b32")):
             violation("mask-half")
+        # bit L of the new EXEC is lane L in the wave but lane L - 32 of the second half: the same lanes only for an
+        # op that works lane by lane on EXEC, lane masks and 0 / -1 (a v_cmp / v_cmpx compares per lane, see below)
+        lanewise = op.startswith(MASK_BITWISE + SAVEEXEC + ("s_cmov_b", "v_readfirstlane"))
+        if not op.startswith("v_cmp") and not self.gs_prologue_bfm(n, i, op, a) and (not lanewise or any(
+                not self.is_mask(ins, x) and not (x.get("k") == "imm" and x["v"] in (0, -1, 0xFFFFFFFFFFFFFFFF))
+                and not (x.get("k") == "special" and x.get("t") == "null") for x in srcs)):
+            violation("tainted-exec")
         if any(op.startswith(p) for p in SAVEEXEC):
             m = srcs[0] if srcs else None
             mt = self.rd(st, ins, m) if m else 0
@@ -1225,7 +1234,7 @@ class Analysis:
                         if mt & b and not (b & ELECT):
                             violation("tainted-exec")
                             break
-            if op.startswith("s_") and op != "s_mov_b64":
+            if op.startswith("s_") and op not in ("s_mov_b64", "s_bfm_b64"):
                 T["scc"] = X
                 st["g"]["scc"] = ("vote", "exec")
             return
@@ -1245,6 +1254,22 @@ class Analysis:
             if any(("v", r) in _regs(d) for d in dests):
                 return all(x.get("k") in ("sgpr", "imm") or (x.get("k") == "special" and x.get("t") not in (
                     "exec", "exec_lo", "exec_hi", "vcc", "vcc_lo", "vcc_hi")) for x in srcs)
+
+    def gs_prologue_bfm(self, n, i, op, a):
+        """Whether this is a legacy GS prologue's `s_bfm_b64 exec, sN, ...` with sN = s3[15:8] (`s_bfe_i32/u32 sN, s3,
+        0x80008` earlier in the entry block, s3 not written before it): rdna2spirv pins s3 at 0x4000, 64 lanes, so
+        the size is 0 modulo 64 and EXEC 0 in the wave and in each half (the `s_cselect_b64 exec, -1, exec` that
+        follows makes it full)."""
+        if self.stage != "gs" or op != "s_bfm_b64" or n != 0 or any(0 in s for s in self.succ) or len(a) < 2 \
+                or a[1].get("k") != "sgpr" or a[1].get("n", 1) != 1:
+            return False
+        writes = [[r for d in operands(x)[0] for r in _regs(d)] for x in self.blocks[0][:i]]
+        for j in range(i - 1, -1, -1):
+            if ("s", a[1]["r"]) in writes[j]:
+                b = self.blocks[0][j]["args"]
+                return base_op(self.blocks[0][j]["op"]) in ("s_bfe_i32", "s_bfe_u32") and len(b) == 3 and \
+                    _regs(b[1]) == [("s", 3)] and b[2].get("k") == "imm" and b[2]["v"] == 0x80008 and \
+                    not any(("s", 3) in w for w in writes[:j])
         return False
 
     def ancestor(self, anc, tok):

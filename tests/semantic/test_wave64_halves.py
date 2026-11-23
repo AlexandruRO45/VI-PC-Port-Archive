@@ -593,6 +593,39 @@ class Execution(unittest.TestCase):
         self.assertEqual({w[0] for w in halves[:32]}, {8})
         self.assertEqual({w[0] for w in halves[32:]}, {7})                # the other half voted no
 
+    def test_c_exec_from_data_differs(self):
+        # bit L of EXEC is lane L in the wave and lane L - 32 of the second half in halves: an EXEC value made from a
+        # constant other than 0 / -1 or from plain data is tier C tainted-exec (a 32-bit half also mask-half)
+        add = ["v_add_nc_u32_e32 v6, 1, v6"]
+        for name, body, reasons, lanes in (
+                ("vs_c_exec_xor_const", ["s_xor_b64 exec, s[10:11], 0xff"] + add + ["s_mov_b64 exec, s[10:11]"],
+                 ["tainted-exec"], 8),
+                ("vs_c_exec_bfm", ["s_bfm_b64 exec, 40, 0"] + add + ["s_mov_b64 exec, s[10:11]"],
+                 ["tainted-exec"], 24),
+                ("vs_c_exec_rfl_hi", ["v_readfirstlane_b32 exec_hi, v0"] + add + ["s_mov_b64 exec, s[10:11]"],
+                 ["mask-half", "tainted-exec"], 32),
+                ("vs_c_saveexec_data", ["s_mov_b32 s20, 0xff", "s_mov_b32 s21, 0",
+                                        "s_and_saveexec_b64 s[12:13], s[20:21]"] + add + ["s_mov_b64 exec, s[12:13]"],
+                 ["tainted-exec"], 8)):
+            with self.subTest(name):
+                (tier, r, _), asm = meta_of(name, vs(body))
+                whole, halves = out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32))
+                self.assertEqual((tier, r), ("C", reasons))
+                self.assertEqual(sum(w != h for w, h in zip(whole, halves)), lanes)
+
+    def test_a_exec_from_a_mask_0_or_minus_1_invariant(self):
+        narrow = ["v_cmp_gt_u32_e32 vcc, 40, v0", "s_and_saveexec_b64 s[12:13], vcc", "v_add_nc_u32_e32 v6, 1, v6"]
+        for name, body, want in (
+                ("vs_a_exec_minus_1", narrow + ["s_mov_b64 exec, -1"], [int(k < 40) for k in range(64)]),
+                ("vs_a_exec_saved", narrow + ["s_mov_b64 exec, s[12:13]"], [int(k < 40) for k in range(64)]),
+                ("vs_a_exec_zero", ["s_mov_b64 exec, 0", "v_add_nc_u32_e32 v6, 1, v6", "s_mov_b64 exec, s[10:11]"],
+                 [0] * 64)):
+            with self.subTest(name):
+                tier, whole, halves = self.run_both(name, vs(body))
+                self.assertEqual(tier, "A")
+                self.assertEqual(whole, halves)
+                self.assertEqual([w[0] for w in whole], want)
+
 
 AGG_HEAD = ["v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc"]
 AGG_RANK = ["v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10"]
@@ -1240,6 +1273,10 @@ class GeometryRing(unittest.TestCase):
         self.assertEqual(self.tier(["v_mov_b32_e32 v14, 0", "v_lshlrev_b32_e32 v12, 2, v13",
                                     "buffer_store_dword v14, v12, s[4:7], 0 offen",
                                     "ds_write2_b32 v14, v14, v14 offset0:0 offset1:1"]), ("C", ["lane-id"]))
+
+    def test_exec_from_a_bfm_of_a_constant_is_tier_c(self):
+        # only the prologue's s_bfm_b64 of s3[15:8] (pinned at 64 lanes) is exempt
+        self.assertEqual(self.tier(["s_bfm_b64 exec, 40, 0", "s_mov_b64 exec, -1"]), ("C", ["tainted-exec"]))
 
 
 
