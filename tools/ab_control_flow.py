@@ -215,7 +215,7 @@ def render_targets(forms, name, harness, vs, out, runs, timeout, observed, decla
             failure = None
             try:
                 h = subprocess.run([harness, vs, spirv, raw, *args], capture_output=True, text=True,
-                                   timeout=timeout)
+                                   errors="replace", timeout=timeout)
                 if all_attachments and h.returncode == 3:
                     failure = "timeout"
                 if h.returncode == 0 and os.path.isfile(raw):

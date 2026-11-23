@@ -569,7 +569,8 @@ def native_ask(tool: str, exe: str, start: str) -> str:
     else:
         cmd = [exe, "--file-selection", "--directory", "--title=" + PICK_TITLE,
                "--filename=" + os.path.join(start, "")]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    # The answer is a path: surrogateescape keeps bytes that are not UTF-8 for the os functions that take it.
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="surrogateescape")
     if r.returncode == 1:       # both tools: the dialog was cancelled or closed
         return ""
     if r.returncode != 0:

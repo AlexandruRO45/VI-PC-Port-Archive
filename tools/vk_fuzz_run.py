@@ -147,7 +147,7 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
             for _ in range(retries + 1):
                 if os.path.isfile(dump):
                     os.remove(dump)
-                r = subprocess.run(args, capture_output=True, text=True, env=env)
+                r = subprocess.run(args, capture_output=True, text=True, errors="replace", env=env)
                 if r.returncode in (0, 77):
                     break
             msg = (r.stdout + r.stderr).strip()
