@@ -99,7 +99,7 @@ inline constexpr std::uint32_t no_binding = 0xffffffffu;
 inline constexpr VkFormat depth_2d_fallback_format = VK_FORMAT_D32_SFLOAT;
 
 // Indexed by binding number.
-inline constexpr std::array<Binding, binding_count> bindings = {{
+inline constexpr std::array<Binding, 30> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
@@ -113,7 +113,8 @@ inline constexpr std::array<Binding, binding_count> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
-    {}, {}, {}, // 26..28 reserved for other proposed typed resources.
+    // Slots 26..28 are reserved for other proposed typed resources; they consume no descriptor IDs.
+    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 0}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 0}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 0},
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096},
 }};
 

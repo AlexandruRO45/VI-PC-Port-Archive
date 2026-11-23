@@ -33,7 +33,7 @@ MODULE = """\
 def test_capacities_match_vulkan_bindless():
     counts = m.capacities()
     assert counts[:5] == [4096, 1024, 1, 1024, 1024]
-    assert len(counts) == 26
+    assert len(counts) == 30
 
 
 def test_metal_ids_are_running_sums():

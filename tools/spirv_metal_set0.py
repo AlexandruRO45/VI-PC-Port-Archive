@@ -73,7 +73,7 @@ def rewrite(text, counts):
             binds[m.group(1)] = int(m.group(2))
     set0 = {v: b for v, b in binds.items() if sets.get(v) == 0}
     for v, b in set0.items():
-        if b >= len(counts):
+        if b >= len(counts) or counts[b] == 0:
             raise SystemExit(f"{v}: binding {b} isn't in vulkan_bindless.h")
 
     defs = {}       # result id -> instruction text
@@ -157,6 +157,8 @@ def main(argv):
     counts = capacities()
     if argv[1:] == ["--print-layout"]:
         for b, (c, i) in enumerate(zip(counts, metal_ids(counts))):
+            if not c:
+                continue
             print(f"binding {b:2}: {c:5} descriptors at IDs {i}..{i + c - 1}")
         return 0
     if len(argv) != 3:
