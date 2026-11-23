@@ -1327,6 +1327,8 @@ int main() {
             return fail("Output::DuplicateOutput checks failed");
 
         // Compare directly against Windows host dxgi.dll when a host adapter has attached outputs.
+        const bool compare_output_color = GetEnvironmentVariableW(L"LEONIDA_COMPARE_OUTPUT_COLOR", nullptr, 0) != 0;
+        bool compared_output_color = false;
         if (const HMODULE host_dxgi = LoadLibraryW(L"dxgi.dll")) {
             using CreateFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
             if (const auto create_host =
@@ -1354,7 +1356,7 @@ int main() {
                                         if (SUCCEEDED(cur->GetDesc(&cur_desc)) &&
                                             std::wcscmp(hod.DeviceName, cur_desc.DeviceName) == 0)
                                             found_name = true;
-                                        if (found_name && GetEnvironmentVariableW(L"LEONIDA_COMPARE_OUTPUT_COLOR", nullptr, 0)) {
+                                        if (found_name && compare_output_color) {
                                             IDXGIOutput6* host6 = nullptr;
                                             IDXGIOutput6* shim6 = nullptr;
                                             DXGI_OUTPUT_DESC1 native_color{}, shim_color{};
@@ -1365,8 +1367,18 @@ int main() {
                                                 SUCCEEDED(shim6->GetDesc1(&shim_color));
                                             if (shim6) shim6->Release();
                                             if (host6) host6->Release();
+                                            const auto same_xy = [](const float (&a)[2], const float (&b)[2]) {
+                                                return a[0] == b[0] && a[1] == b[1];
+                                            };
                                             if (!queried || native_color.BitsPerColor != shim_color.BitsPerColor ||
-                                                native_color.ColorSpace != shim_color.ColorSpace) {
+                                                native_color.ColorSpace != shim_color.ColorSpace ||
+                                                !same_xy(native_color.RedPrimary, shim_color.RedPrimary) ||
+                                                !same_xy(native_color.GreenPrimary, shim_color.GreenPrimary) ||
+                                                !same_xy(native_color.BluePrimary, shim_color.BluePrimary) ||
+                                                !same_xy(native_color.WhitePoint, shim_color.WhitePoint) ||
+                                                native_color.MinLuminance != shim_color.MinLuminance ||
+                                                native_color.MaxLuminance != shim_color.MaxLuminance ||
+                                                native_color.MaxFullFrameLuminance != shim_color.MaxFullFrameLuminance) {
                                                 std::fprintf(stderr, "Output color mismatch: native %u bpc / %u, shim %u bpc / %u\n",
                                                              native_color.BitsPerColor, unsigned(native_color.ColorSpace),
                                                              shim_color.BitsPerColor, unsigned(shim_color.ColorSpace));
@@ -1377,7 +1389,8 @@ int main() {
                                                 FreeLibrary(host_dxgi);
                                                 return fail("IDXGIOutput6::GetDesc1 color differs from native DXGI");
                                             }
-                                            std::printf("IDXGIOutput6::GetDesc1 matches native DXGI: %u bpc, color space %u\n",
+                                            compared_output_color = true;
+                                            std::printf("IDXGIOutput6::GetDesc1 matches native DXGI: %u bpc, color space %u, chromaticity and luminance\n",
                                                         native_color.BitsPerColor, unsigned(native_color.ColorSpace));
                                         }
                                         cur->Release();
@@ -1418,6 +1431,8 @@ int main() {
             }
             FreeLibrary(host_dxgi);
         }
+        if (compare_output_color && !compared_output_color)
+            std::puts("IDXGIOutput6::GetDesc1 comparison skipped: no matching native output");
 
         // SwapChain::GetContainingOutput validation and monitor lookup.
         if (sc->GetContainingOutput(nullptr) != DXGI_ERROR_INVALID_CALL)
