@@ -60,6 +60,27 @@ class CliBadJsonTests(unittest.TestCase):
     def list_cli(self):
         return self.run_cli("--list", "--game", self.game, "--work", self.work)
 
+    def test_check_names_a_missing_manifest(self):
+        path = os.path.join(self.out, "manifest.json")
+        self.assert_one_clean_line(self.check_cli(), path)
+
+    def test_check_rejects_a_directory_at_the_manifest_path(self):
+        path = os.path.join(self.out, "manifest.json")
+        os.mkdir(path)
+        result = self.check_cli()
+        self.assert_one_clean_line(result, path)
+        self.assertIn("not a regular file", result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX read permissions")
+    def test_check_and_list_name_unreadable_json_inputs(self):
+        for path, command in ((self.bad_manifest("{}"), self.check_cli), (self.bad_index("[]"), self.list_cli)):
+            with self.subTest(path=path):
+                os.chmod(path, 0)
+                self.addCleanup(os.chmod, path, 0o600)
+                if os.access(path, os.R_OK):
+                    self.skipTest("runner can read files regardless of file permissions")
+                self.assert_one_clean_line(command(), path)
+
     def test_check_reports_a_truncated_manifest(self):
         path = self.bad_manifest('{"vs": ')
         self.assert_one_clean_line(self.check_cli(), path)

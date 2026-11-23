@@ -35,6 +35,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -691,6 +692,8 @@ def load_json(
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+    except OSError as e:
+        raise SystemExit(f"cannot read the {kind} {path}: {e.strerror or e}") from e
     except UnicodeDecodeError as e:
         raise SystemExit(f"the {kind} {path} is not valid UTF-8 ({e.reason})") from e
     except json.JSONDecodeError as e:
@@ -780,7 +783,13 @@ def main(argv=None) -> int:
                 print(f"{e['stage']} {e['name']}")
         return 0
     existing = os.path.join(out_dir, "manifest.json")
-    if a.check and not a.game and os.path.isfile(existing):
+    if a.check and not a.game:
+        try:
+            mode = os.stat(existing).st_mode
+        except OSError as e:
+            raise SystemExit(f"cannot read the first-light manifest {existing}: {e.strerror or e}") from e
+        if not stat.S_ISREG(mode):
+            raise SystemExit(f"the first-light manifest {existing} is not a regular file")
         manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
         run_draw(a, manifest, out_dir)
         return 0
