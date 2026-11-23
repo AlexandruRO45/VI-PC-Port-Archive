@@ -84,5 +84,33 @@ class TestSTtraceDataReference(unittest.TestCase):
         self.assertEqual(words, [0x10, 0x20, 0x30, 0x40])
 
 
+class TestSTtraceDataOperands(unittest.TestCase):
+    def test_sgpr_source(self):
+        lines = [
+            "s_mov_b32 s1, 0xAABBCCDD",
+            "s_ttracedata s1",
+            "v_mov_b32 v0, s1",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0xAABBCCDD, 0xAABBCCDD, 0xAABBCCDD, 0xAABBCCDD])
+
+    def test_literal_source(self):
+        lines = [
+            "s_ttracedata 0xDEADBEEF",
+            "v_mov_b32 v0, 0x77777777",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x77777777, 0x77777777, 0x77777777, 0x77777777])
+
+    def test_inline_integer_source(self):
+        lines = [
+            "s_ttracedata -1",
+            "s_ttracedata 42",
+            "v_mov_b32 v0, 0x55555555",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x55555555, 0x55555555, 0x55555555, 0x55555555])
+
+
 if __name__ == "__main__":
     unittest.main()
