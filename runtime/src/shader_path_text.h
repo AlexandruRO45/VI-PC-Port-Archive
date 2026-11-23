@@ -5,8 +5,10 @@
 // directory whose name carries those bytes: the shader library is not found and every pipeline fails. A UTF-8 BOM is
 // also what a file saved as "UTF-8 with BOM" starts with, which is Notepad's default for a new text file.
 //
-// Drop a leading UTF-8 BOM and the trailing whitespace an editor adds (CR, LF, space, tab); no Windows path can end
-// in one of those, so this cannot merge two different paths. The rest of the value stays byte-exact.
+// Drop a leading UTF-8 BOM and the line terminator an editor adds (CR, LF). Those bytes are never part of a path a
+// person typed, but a trailing space or tab can be: a filesystem holds names that end in one even though the Windows
+// shell conventions exclude them, so trimming one would silently select a different directory (catalog vs "catalog ").
+// The rest of the value stays byte-exact.
 
 #include <string>
 
@@ -19,7 +21,7 @@ inline std::string normalize_shader_path_text(std::string text) {
     }
     while (!text.empty()) {
         const char last = text.back();
-        if (last != '\r' && last != '\n' && last != ' ' && last != '\t') break;
+        if (last != '\r' && last != '\n') break;
         text.pop_back();
     }
     return text;

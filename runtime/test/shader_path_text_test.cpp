@@ -23,7 +23,13 @@ int main() {
     expect_text("plain path is byte-exact", leonida::normalize_shader_path_text(plain), plain);
     expect_text("CRLF is dropped", leonida::normalize_shader_path_text(plain + "\r\n"), plain);
     expect_text("LF is dropped", leonida::normalize_shader_path_text(plain + "\n"), plain);
-    expect_text("trailing spaces and tabs are dropped", leonida::normalize_shader_path_text(plain + " \t\r\n"), plain);
+    expect_text("CR alone is dropped", leonida::normalize_shader_path_text(plain + "\r"), plain);
+    // A trailing space or tab is a valid name on the filesystem, so it is kept: "catalog " and "catalog" are two
+    // different directories, and selecting the wrong one silently is worse than not finding the typed one.
+    expect_text("a trailing space is kept", leonida::normalize_shader_path_text(plain + " "), plain + " ");
+    expect_text("a trailing tab is kept", leonida::normalize_shader_path_text(plain + "\t"), plain + "\t");
+    expect_text("a space before the line ending is kept",
+                leonida::normalize_shader_path_text(plain + " \r\n"), plain + " ");
     expect_text("a UTF-8 BOM is dropped", leonida::normalize_shader_path_text("\xEF\xBB\xBF" + plain), plain);
     expect_text("a BOM and CRLF together are dropped",
                 leonida::normalize_shader_path_text("\xEF\xBB\xBF" + plain + "\r\n"), plain);
@@ -35,7 +41,8 @@ int main() {
     expect_text("UTF-8 bytes are kept", leonida::normalize_shader_path_text(utf8 + "\n"), utf8);
 
     // What the reader tests next: an empty value is not a directory (the caller returns {} on empty).
-    expect_text("only whitespace normalizes to empty", leonida::normalize_shader_path_text(" \r\n\t"), "");
+    expect_text("a file of only a line ending normalizes to empty", leonida::normalize_shader_path_text("\r\n"), "");
+    expect_text("whitespace before the line ending is kept", leonida::normalize_shader_path_text(" \r\n"), " ");
     expect_text("an empty file stays empty", leonida::normalize_shader_path_text(""), "");
     // A BOM on its own is a path of zero bytes, not a directory named "\xEF\xBB\xBF".
     expect_text("a lone BOM normalizes to empty", leonida::normalize_shader_path_text("\xEF\xBB\xBF"), "");
