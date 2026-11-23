@@ -1400,17 +1400,23 @@ class Gen:
         self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
         self.dst(d, v)
 
-    def f16_out(self, d, r, hi=0, fract=False, mode=True, exact_tiny=False):
+    def f16_out(self, d, r, hi=0, fract=False, mode=True, exact_tiny=False, nan_keep=None):
         """Narrow f32 ``r`` to f16 (f16_res: nearest even, or toward zero under MODE) and write it to the low half of ``d``, or to the high half when
         ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16).
         ``fract`` (v_fract_f16): a result that rounded up to 1.0 (0x3c00) becomes 0x3bff, the largest f16 below 1,
-        as on hardware (docs/design.md, float min/max/med3 with NaN and v_fract)."""
+        as on hardware (docs/design.md, float min/max/med3 with NaN and v_fract).
+        ``nan_keep`` = (bool, 16-bit %uint): where the bool holds, write those bits instead (a NaN the op returns
+        unchanged; the f32 round trip would quiet it and drop its payload)."""
         lo = self.f16_res(r, exact_tiny) if mode else self.f16_bits(r)     # mode=False: the op ignores MODE rounding (rcp/rsq/sqrt)
         if fract:
             one, below = self.tmp(), self.tmp()
             self.emit(f"{one} = OpIEqual %bool {lo} {self.cu(0x3C00)}")
             self.emit(f"{below} = OpSelect %uint {one} {self.cu(0x3BFF)} {lo}")
             lo = below
+        if nan_keep:
+            kept = self.tmp()
+            self.emit(f"{kept} = OpSelect %uint {nan_keep[0]} {nan_keep[1]} {lo}")
+            lo = kept
         self.put_f16_bits(d, lo, hi)
 
     def f16_roundtrip(self, f):
@@ -8876,19 +8882,27 @@ class Gen:
             # f16 unary on the low half (op_sel:[src,dst] picks the high half of the source / of the destination);
             # the other half of the destination is kept.
             sel, dhi = self.opsel_bits(mods, 1)
-            f = self.f16_in(a[1], sel[0])
             r = self.tmp()
             fn = {"v_rsq_f16": "InverseSqrt", "v_sqrt_f16": "Sqrt", "v_exp_f16": "Exp2", "v_log_f16": "Log2",
                   "v_floor_f16": "Floor", "v_fract_f16": "Fract", "v_ceil_f16": "Ceil", "v_trunc_f16": "Trunc",
                   "v_rndne_f16": "RoundEven"}.get(op)
+            nan_keep = None
             if fn == "Fract":
-                inf = self.tmp()
+                # gfx1036, game MODE (IEEE 0, DX10_CLAMP 1): a NaN operand comes back as the source half with its
+                # neg/abs applied to the sign bit only (payload and signalling bit kept), and +0 with clamp.
+                f, h_mod, _ = self.f16_in_bits(a[1], sel[0])
+                inf, nan = self.tmp(), self._f16_half_nan(h_mod)
                 self.emit(f"{inf} = OpIsInf %bool {f}")
                 if "clamp" in mods:
-                    # DX10_CLAMP maps the infinity result to +0. Give FClamp a defined operand.
-                    clamp_input = self.tmp()
-                    self.emit(f"{clamp_input} = OpSelect %float {inf} %f0 {f}")
+                    # DX10_CLAMP maps the infinity and NaN results to +0. Give FClamp a defined operand.
+                    bad, clamp_input = self.tmp(), self.tmp()
+                    self.emit(f"{bad} = OpLogicalOr %bool {inf} {nan}")
+                    self.emit(f"{clamp_input} = OpSelect %float {bad} %f0 {f}")
                     f = clamp_input
+                else:
+                    nan_keep = (nan, h_mod)
+            else:
+                f = self.f16_in(a[1], sel[0])
             # SPIR-V leaves 1/0, InverseSqrt(x <= 0) and Sqrt(x < 0) undefined, so those operands are replaced by 1.0
             # and the hardware's result is selected afterwards (docs/design.md, f16 transcendentals): rcp(+-0) = +-inf,
             # rsq(+-0) = +-inf, rsq and sqrt of a negative operand (-inf included) = 0xfe00 (a negative quiet NaN).
@@ -8934,7 +8948,8 @@ class Gen:
             # rcp/rsq/sqrt (and sin below) ignore MODE rounding on hardware (RX 6800, SHADER-35); exp, log (and cos
             # below) are unmeasured, assumed like them: nearest even always.
             self.f16_out(a[0], r, dhi, fract=fn == "Fract",
-                         mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16"))  # GFX10: f16 ops keep the other half
+                         mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16"),
+                         nan_keep=nan_keep)  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
             x = self.src_u(a[1])
             r = self.tmp()
