@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -224,6 +225,32 @@ class FindHashLookupTest(unittest.TestCase):
                     self.assertIn("ERROR:", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
                     self.assertEqual(r.stdout, "")
+
+    def test_rank_scans_executable_sections_without_copying_bytes(self):
+        n, size = 8, 128 * 1024
+        hdr = bytearray(TEXT_RAW)
+        hdr[0:2] = b"MZ"
+        struct.pack_into("<I", hdr, 0x3C, 0x40)
+        hdr[0x40:0x44] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", hdr, 0x44, 0x8664, n, 0, 0, 0, 0xF0, 0x22)
+        first = 0x44 + 20 + 0xF0
+        for i in range(n):
+            struct.pack_into("<8sIIIIIIHHI", hdr, first + 40 * i, b".text", size,
+                             TEXT_RVA + i * size, size, TEXT_RAW + i * size, 0, 0, 0, 0, 0x60000020)
+        data = bytes(hdr) + b"\x90" * (n * size)
+        was_tracing = tracemalloc.is_tracing()
+        if not was_tracing:
+            tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            report = fhl.rank(data, [("sample", 0x12345678)])
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            if not was_tracing:
+                tracemalloc.stop()
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(report["hashes"][0]["occurrences"], 0)
+        self.assertLess(peak, size // 2)
 
 
 if __name__ == "__main__":

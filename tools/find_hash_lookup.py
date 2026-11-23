@@ -67,15 +67,19 @@ def sections(data):
     return out
 
 
-def direct_calls(code, base_rva):
-    """{target rva: [call site rva, ...]} for every E8 rel32 in `code` (which starts at base_rva)."""
+def direct_calls(code, base_rva, start=0, end=None):
+    """{target rva: [call site rva, ...]} for every E8 rel32 in `code[start:end]` (which starts at base_rva)."""
+    if end is None:
+        end = len(code)
     calls = defaultdict(list)
     find = code.find
-    i = find(b"\xE8")
-    while 0 <= i <= len(code) - 5:
+    limit = end - 5
+    i = find(b"\xE8", start, end)
+    while 0 <= i <= limit:
         rel = struct.unpack_from("<i", code, i + 1)[0]
-        calls[base_rva + i + 5 + rel].append(base_rva + i)
-        i = find(b"\xE8", i + 1)
+        site = base_rva + (i - start)
+        calls[site + 5 + rel].append(site)
+        i = find(b"\xE8", i + 1, end)
     return calls
 
 
@@ -87,9 +91,15 @@ def rank(data, hashes, window=48, top=15):
     code_sections = [s for s in sections(data) if s[4]]
     if not code_sections:
         raise ValueError("no executable section")
-    code_slices = [(rva, data[raw:raw + size]) for _, rva, raw, size, _ in code_sections]
+    data_len = len(data)
+    code_spans = []
+    for _, rva, raw, size, _ in code_sections:
+        start = min(raw, data_len)
+        end = min(raw + size, data_len)
+        if end > start:
+            code_spans.append((rva, start, end))
     merged = []
-    for lo, hi in sorted((rva, rva + len(code)) for rva, code in code_slices if code):
+    for lo, hi in sorted((rva, rva + (end - start)) for rva, start, end in code_spans):
         if merged and lo <= merged[-1][1]:
             if hi > merged[-1][1]:
                 merged[-1] = (merged[-1][0], hi)
@@ -116,27 +126,30 @@ def rank(data, hashes, window=48, top=15):
             seen_values.add(value)
             unique_hashes.append((name, value))
     all_calls = defaultdict(list)
-    for rva, code in code_slices:
-        for target, sites in direct_calls(code, rva).items():
+    for rva, start, end in code_spans:
+        for target, sites in direct_calls(data, rva, start, end).items():
             if in_code(target):
                 all_calls[target].extend(sites)
     leads = defaultdict(set)      # candidate rva -> hashes that lead to it
     hits = Counter()              # hash value -> occurrences found
+    find = data.find
     for name, value in unique_hashes:
         needle = struct.pack("<I", value)
-        for rva, code in code_slices:
-            at = code.find(needle)
+        for rva, start, end in code_spans:
+            at = find(needle, start, end)
             while at >= 0:
                 hits[value] += 1
-                tail = code[at + 4:at + 4 + window]
-                j = tail.find(b"\xE8")
-                while 0 <= j <= len(tail) - 5:
-                    rel = struct.unpack_from("<i", tail, j + 1)[0]
-                    target = rva + at + 4 + j + 5 + rel
+                tail_start = at + 4
+                tail_end = min(tail_start + window, end)
+                tail_limit = tail_end - 5
+                j = find(b"\xE8", tail_start, tail_end)
+                while 0 <= j <= tail_limit:
+                    rel = struct.unpack_from("<i", data, j + 1)[0]
+                    target = rva + (j - start) + 5 + rel
                     if in_code(target):
                         leads[target].add(name)
-                    j = tail.find(b"\xE8", j + 1)
-                at = code.find(needle, at + 1)
+                    j = find(b"\xE8", j + 1, tail_end)
+                at = find(needle, at + 1, end)
     ranked = sorted(leads, key=lambda t: (-len(leads[t]), -len(all_calls.get(t, ())), t))[:top]
     return {
         "hashes": [{"name": n, "value": f"0x{v:08X}", "occurrences": hits[v]} for n, v in unique_hashes],
