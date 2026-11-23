@@ -724,6 +724,18 @@ def _linked(path: str) -> bool:
     return os.path.islink(path) or os.path.isjunction(path)
 
 
+def _remove_tree(path: str) -> None:
+    """Remove an export folder before it is written again. A symbolic link or junction is unlinked, not walked:
+    shutil.rmtree raises `OSError: Cannot call rmtree on a symbolic link` for one, and what it points at may be on
+    another drive, so its files are not this export's to delete."""
+    if os.path.islink(path):
+        os.unlink(path)
+    elif os.path.isjunction(path):
+        os.rmdir(path)
+    else:
+        shutil.rmtree(path)
+
+
 def _tree_bytes(root: str, skip: tuple = (), ignore_suffix: str = "") -> int:
     """Bytes of the regular files under root, without following links or junctions (root's own names in skip and
     files ending in ignore_suffix are left out). One os.scandir walk; on Windows the sizes come with the directory listing, so no file is opened."""
@@ -2043,7 +2055,7 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         record = os.path.join(pool_dir, DECODER_RECORD)
         if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
             log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
-            shutil.rmtree(pool_dir)
+            _remove_tree(pool_dir)
         pool_jobs.append((p, name, root, pool_dir, record))
 
     pool_todo = [(p, name, root, pool_dir, record) for p, name, root, pool_dir, record in pool_jobs
