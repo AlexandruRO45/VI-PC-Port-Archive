@@ -12,6 +12,10 @@
 //               b = 0.25 + 0.15 * z or layer, a = 1) in every sampled dimension (2D, 2D array of 6, 1D, 3D of
 //               depth 4) and a linear clamping sampler, so a shader whose T# and S# miss the table (a zeroed heap)
 //               samples texels; the storage bindings keep their 1x1 fallbacks
+//   VKS_GS=<gs.spv>
+//               a geometry shader between the two (tools/bary_fallback_gs.py's pass-through GS for a pixel shader
+//               translated with --bary-fallback: it writes the barycentric input that shader reads); needs the
+//               geometryShader feature
 //   push        s0..s31 from VKS_SGPRS (like VKH_SGPRS), then the heap base
 //   heap        VKS_HEAP_KB KiB (default 1024), zero unless VKS_HEAP_FILL=<offset>,<bytes>,<seed> fills a range with
 //               floats in [0.25, 1)
@@ -249,6 +253,17 @@ int main(int argc, char** argv) {
                      "fragmentShaderPixelInterlock");
                 break;
         }
+    }
+    const char* gs_path = std::getenv("VKS_GS");
+    std::vector<uint32_t> gs_code;
+    if (gs_path && *gs_path) {
+        gs_code = read_spv(gs_path);
+        if (gs_code.size() < 6) {
+            std::fprintf(stderr, "cannot read %s\n", gs_path);
+            return 1;
+        }
+        need(have.features.geometryShader, "geometryShader");
+        enable.features.geometryShader = VK_TRUE;
     }
     if (std::getenv("VKS_NEED_MAINTENANCE8")) need(has_ext("VK_KHR_maintenance8"), "maintenance8");
     if (subgroup_ops) {
@@ -566,10 +581,22 @@ int main(int argc, char** argv) {
     VkShaderModuleCreateInfo fsi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     fsi.codeSize = fs_code.size() * 4; fsi.pCode = fs_code.data();
     CHECK(vkCreateShaderModule(dev, &fsi, nullptr, &fs));
-    VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+    VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
+    uint32_t stage_count = 0;
+    stages[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[stage_count].module = vs;
+    stages[stage_count++].pName = "main";
+    if (!gs_code.empty()) {
+        VkShaderModule gs;
+        VkShaderModuleCreateInfo gsi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        gsi.codeSize = gs_code.size() * 4; gsi.pCode = gs_code.data();
+        CHECK(vkCreateShaderModule(dev, &gsi, nullptr, &gs));
+        stages[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT; stages[stage_count].module = gs;
+        stages[stage_count++].pName = "main";
+    }
+    stages[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[stage_count].module = fs;
+    stages[stage_count++].pName = "main";
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -593,7 +620,7 @@ int main(int argc, char** argv) {
     VkPipelineLayout pl;
     CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    gpi.stageCount = 2; gpi.pStages = stages; gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.stageCount = stage_count; gpi.pStages = stages; gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
     gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms; gpi.pColorBlendState = &cb;
     gpi.layout = pl; gpi.renderPass = rp;
     VkPipeline pipe;

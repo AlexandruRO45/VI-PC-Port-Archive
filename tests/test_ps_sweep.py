@@ -93,6 +93,15 @@ class VertexShader(unittest.TestCase):
         self.assertIn("gl_Position", glsl)
 
 
+class GeometryShaderLookup(unittest.TestCase):
+    def test_gs_is_the_bary_gs_file_beside_the_pixel_shader(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(ps_sweep.gs_for(d, "x1"))
+            open(os.path.join(d, "x1.bary_gs.spv"), "wb").close()
+            self.assertEqual(ps_sweep.gs_for(d, "x1"), os.path.join(d, "x1.bary_gs.spv"))
+            self.assertIsNone(ps_sweep.gs_for(d, "x2"))
+
+
 class Classification(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

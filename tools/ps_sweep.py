@@ -9,6 +9,11 @@ inputs are the same on every device. Run the same sample on each GPU, then compa
     VK_LOADER_DRIVERS_DISABLE=*nv* python -I tools/ps_sweep.py run ... --tag b      # another GPU (any loader filter)
     python -I tools/ps_sweep.py compare --out <dir> --tags a b
 
+A `--spirv` folder translated with `--bary-fallback`, with `python -I tools/bary_fallback_gs.py <folder>` run on it
+(it writes `<name>.bary_gs.spv`), draws each shader that reads raw barycentrics through that pass-through geometry
+shader (`VKS_GS`), so it runs on a device without `fragmentShaderBarycentric`; the sample itself comes from the
+normal translation (`sample` keeps its own strata), and the folder only has to contain the sampled shaders.
+
 `--variant z` (default) leaves every texture lookup on the zero fallback; `--variant t` replaces the fallback images
 with a gradient (VKS_TEX=1), so sampled values are not all zero. `--lo/--hi` split the sample over parallel workers
 and `--only 3,7` re-runs single shaders (into `<tag>_<variant>_re`, which `compare` prefers), for example the ones that
@@ -82,6 +87,13 @@ def vs_glsl(locations, flats):
     return "\n".join(lines) + "\n"
 
 
+def gs_for(spirv, name):
+    """The pass-through geometry shader of a pixel shader translated with --bary-fallback
+    (`python -I tools/bary_fallback_gs.py <spirv dir>` writes `<name>.bary_gs.spv` beside it), or None."""
+    path = os.path.join(spirv, name + ".bary_gs.spv")
+    return path if os.path.isfile(path) else None
+
+
 def make_vs(glslang, meta, cache_dir):
     locs = sorted(meta.get("inputs", []))
     flats = set(meta.get("ps_flat_interpolants", [])) & set(locs)
@@ -137,6 +149,9 @@ def cmd_run(a):
         env = dict(os.environ, VKS_TIMEOUT_S=str(a.timeout), VKS_HEAP_KB="1024")
         if a.variant == "t":
             env["VKS_TEX"] = "1"
+        gs = gs_for(a.spirv, s["name"]) if meta.get("bary_fallback_input") else None
+        if gs:
+            env["VKS_GS"] = gs
         if meta.get("needs_maintenance8"):
             env["VKS_NEED_MAINTENANCE8"] = "1"
         cmd = [a.exe, make_vs(a.glslang, meta, cache), os.path.join(a.spirv, s["name"] + ".spv"), raw,
