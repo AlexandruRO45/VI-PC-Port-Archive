@@ -116,6 +116,7 @@ def main(argv=None):
     ap.add_argument("--max-props", type=int, default=400)
     ap.add_argument("--build", default=os.path.join(HERE, "..", "runtime", "build"))
     ap.add_argument("--scene", help="scene file to write (default: a temporary file)")
+    ap.add_argument("--no-cull", action="store_true", help="submit every scene draw for a visibility comparison")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--window", action="store_true")
     mode.add_argument("--check", action="store_true")
@@ -148,14 +149,20 @@ def main(argv=None):
             return 77
         x, y, z = stats["center"]
         cam = [str(x - 40), str(y - 40), str(z + 25), "45", "-20"]
+        draw = [tool, scene, *pair, "--cam", *cam]
+        if a.no_cull:
+            draw.append("--no-cull")
         if a.window:
-            return subprocess.call([tool, scene, *pair, "--window", "--cam", *cam])
+            return subprocess.call([*draw, "--window"])
         frame = scene + ".ppm"
-        r = subprocess.run([tool, scene, *pair, "--out", frame, "--size", "640", "360", "--cam", *cam],
+        r = subprocess.run([*draw, "--out", frame, "--size", "640", "360"],
                            capture_output=True, text=True)
         if r.returncode:
             print((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "vk_sandbox failed")
             return r.returncode
+        for line in r.stdout.splitlines():
+            if line.startswith("culling:"):
+                print(line)
         ok, msg = check_frame(frame, stats["textured_draws"] > 0)
         print(("PASS: " if ok else "FAIL: ") + msg)
         return 0 if ok else 1

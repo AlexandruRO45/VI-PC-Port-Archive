@@ -1,6 +1,6 @@
 // Real-shader sandbox: draws a tools/sandbox_scene.py scene through two translated game shaders.
 //
-//   vk_sandbox <scene.bin> <vs.spv> <ps.spv> --out <image.ppm> [--size W H] [--cam x y z yaw pitch] [--fov deg]
+//   vk_sandbox <scene.bin> <vs.spv> <ps.spv> --out <image.ppm> [--size W H] [--cam x y z yaw pitch] [--fov deg] [--no-cull]
 //   vk_sandbox <scene.bin> <vs.spv> <ps.spv> --window [--size W H] [--cam ...] [--mode fly|walk|drive]   (Windows only)
 //   --window --frames N --out <image.ppm>: test run, the window shows without activation and quits after N frames
 //
@@ -24,6 +24,7 @@
 #endif
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "sandbox_visibility.h"
 
 #include <algorithm>
 #include <array>
@@ -53,7 +54,10 @@ static PFN_vkGetInstanceProcAddr gipa;
 namespace {
 
 struct Texture { uint32_t w, h; std::vector<uint8_t> rgba; };
-struct Mesh { uint32_t first_vertex, vertex_count, first_index, index_count; };
+struct Mesh {
+    uint32_t first_vertex, vertex_count, first_index, index_count;
+    sandbox_visibility::Bounds bounds;
+};
 struct Draw { uint32_t mesh; int32_t texture; float rows[4][3]; };
 struct Scene {
     std::vector<Texture> textures;
@@ -93,6 +97,8 @@ bool load_scene(const char* path, Scene& s) {
         if (!f) return false;
         for (uint32_t k = 0; k < ic; ++k)
             if (s.indices[m.first_index + k] >= vc) return false;
+        for (uint32_t k = 0; k < vc; ++k)
+            m.bounds.include(&s.vertices[size_t(m.first_vertex + k) * 8]);
         s.meshes.push_back(m);
     }
     for (uint32_t i = 0; i < hdr[3]; ++i) {
@@ -225,7 +231,7 @@ bool write_ppm(const char* path, const uint8_t* bgra_or_rgba, uint32_t w, uint32
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_sandbox scene.bin vs.spv ps.spv (--out image.ppm | --window) [--size W H] "
-                             "[--cam x y z yaw pitch] [--fov deg]\n");
+                             "[--cam x y z yaw pitch] [--fov deg] [--no-cull]\n");
         return 2;
     }
     Scene scene;
@@ -233,6 +239,7 @@ int main(int argc, char** argv) {
     uint32_t W = 1280, H = 720;
     const char* out_path = nullptr;
     bool window = false;
+    bool cull = true;
     int frames = 0;   // --frames N: window test run, shown without activation, quits after N frames
     Camera cam{};
     cam.pos[0] = scene.center[0] - 40; cam.pos[1] = scene.center[1] - 40; cam.pos[2] = scene.center[2] + 25;
@@ -240,6 +247,7 @@ int main(int argc, char** argv) {
     for (int i = 4; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
         else if (!std::strcmp(argv[i], "--window")) window = true;
+        else if (!std::strcmp(argv[i], "--no-cull")) cull = false;
         else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) frames = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* m = argv[++i];
@@ -257,6 +265,12 @@ int main(int argc, char** argv) {
 #endif
     if (window && frames && !out_path) { std::fprintf(stderr, "--frames needs --out\n"); return 2; }
     if (!out_path && !window) { std::fprintf(stderr, "give --out or --window\n"); return 2; }
+    std::vector<sandbox_visibility::Bounds> draw_bounds;
+    if (cull) {
+        draw_bounds.reserve(scene.draws.size());
+        for (const Draw& draw : scene.draws)
+            draw_bounds.push_back(sandbox_visibility::transformed(scene.meshes[draw.mesh].bounds, draw.rows));
+    }
     std::fprintf(stderr, "scene: %zu draws, %zu meshes, %zu textures, %zu triangles\n", scene.draws.size(),
                  scene.meshes.size(), scene.textures.size(), scene.indices.size() / 3);
 
@@ -556,8 +570,12 @@ int main(int argc, char** argv) {
         CHECK(vkEndCommandBuffer(cmd)); CHECK(submit());
     }
     // Records the scene into rt (left in TRANSFER_SRC_OPTIMAL). The caller ends and submits.
+    uint32_t submitted = 0;
     auto record = [&]() {
-        view_projection(cam, float(W) / float(H), heap_f32(view_va + 0x160));
+        float* projection = heap_f32(view_va + 0x160);
+        view_projection(cam, float(W) / float(H), projection);
+        const sandbox_visibility::Frustum frustum(projection);
+        submitted = 0;
         VkClearValue clear[2]{}; clear[0].color = {{0.55f, 0.68f, 0.85f, 1}}; clear[1].depthStencil = {1, 0};
         VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rbi.renderPass = rp; rbi.framebuffer = fb; rbi.renderArea = sc; rbi.clearValueCount = 2; rbi.pClearValues = clear;
@@ -570,10 +588,12 @@ int main(int argc, char** argv) {
         uint32_t pc[push_words] = {};
         pc[32] = uint32_t(heap_base); pc[33] = uint32_t(heap_base >> 32);
         for (uint32_t d = 0; d < ndraw; ++d) {
+            if (cull && !frustum.visible(draw_bounds[d])) continue;
             const Mesh& m = scene.meshes[scene.draws[d].mesh];
             pc[8] = table_va + d * 0x80;   // s8: the descriptor table; s9 (the PS's M0) stays 0
             vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, push_bytes, pc);
             vkCmdDrawIndexed(cmd, m.index_count, 1, m.first_index, int32_t(m.first_vertex), 0);
+            ++submitted;
         }
         vkCmdEndRenderPass(cmd);
     };
@@ -596,6 +616,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < size_t(W) * H; ++i)
             covered += std::abs(px[i * 4] - clear_px[0]) > 1 || std::abs(px[i * 4 + 1] - clear_px[1]) > 1 || std::abs(px[i * 4 + 2] - clear_px[2]) > 1;
         std::printf("vk_sandbox: %u draws, %zu of %u pixels covered -> %s\n", ndraw, covered, W * H, out_path);
+        std::printf("culling: submitted=%u culled=%u total=%u\n", submitted, ndraw - submitted, ndraw);
         return 0;
     }
 
@@ -719,10 +740,12 @@ int main(int argc, char** argv) {
             if (!made) { vkDestroySwapchainKHR(dev, swap, nullptr); swap = VK_NULL_HANDLE; }
         }
         char title[160];
-        std::snprintf(title, sizeof title, "Leonida real-shader sandbox  [%s]  %.0f %.0f %.0f  %.0f fps", cam.mode == 0 ? "fly" : cam.mode == 1 ? "walk" : "drive",
-                      cam.pos[0], cam.pos[1], cam.pos[2], 1.f / std::max(dt, 1e-4f));
+        std::snprintf(title, sizeof title, "Leonida real-shader sandbox  [%s]  %.0f %.0f %.0f  %.0f fps  %u/%u draws",
+                      cam.mode == 0 ? "fly" : cam.mode == 1 ? "walk" : "drive",
+                      cam.pos[0], cam.pos[1], cam.pos[2], 1.f / std::max(dt, 1e-4f), submitted, ndraw);
         SetWindowTextA(hwnd, title);
         if (last_frame) {
+            std::printf("culling: submitted=%u culled=%u total=%u\n", submitted, ndraw - submitted, ndraw);
             std::printf("vk_sandbox: window ran %d frames -> %s, camera %.2f %.2f %.2f\n", frame, out_path,
                         cam.pos[0], cam.pos[1], cam.pos[2]);
             break;

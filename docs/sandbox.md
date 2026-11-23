@@ -76,11 +76,40 @@ Esc quit. `--center` is in RAGE world metres; without it the densest 50 m cell o
 | window | about 90 frames per second with a `vkQueueWaitIdle` per frame; a 60-frame windowed run ends on the same pixels as the headless render |
 | walk / drive | eye at 1.70 m / 1.20 m over the roof the camera starts above |
 
-## 6. Limits and next
+## 6. Camera visibility
+
+The forward sandbox computes each mesh's bounds once and transforms them for each
+instance. Each frame tests those bounds against the camera's six clip planes.
+Objects crossing a plane stay visible, with a rounding margin around the boundary.
+Empty or non-finite bounds stay visible too.
+
+Headless runs report `culling: submitted=N culled=N total=N`; `sandbox.py --check`
+prints that line as well. The window title shows submitted and total draws. Pass
+`--no-cull` to either command to compare the same camera with every draw submitted.
+
+The CPU visibility checks and optional Vulkan readback check use synthetic inputs.
+The readback check compiles original GLSL shaders with `glslangValidator` and compares
+the complete image with culling on and off, including near-plane crossings,
+reflected/nonuniform transforms and camera movement. Its larger fixture has three
+visible draws and 1,000 behind the camera. Removing the visible geometry must change
+the image.
+
+```sh
+cmake --build runtime/build --target sandbox_visibility_test vk_sandbox
+ctest --test-dir runtime/build --no-tests=error -R '^sandbox_visibility$' --output-on-failure
+LEONIDA_SANDBOX_BUILD=runtime/build python -I tests/test_sandbox_culling.py -v
+```
+
+On Windows, set `LEONIDA_SANDBOX_BUILD` to the build directory containing
+`vk_sandbox.exe` and run the same Python test. Without that variable, the Python
+test runs the command-line forwarding check and skips the two Vulkan checks.
+
+## 7. Limits and next
 
 * One pair, one forward pass. The world's own material shaders pull vertices (`SV_VertexID` only) and write the
   G-buffer; drawing those needs their vertex fetch tables and the lighting passes that read the G-buffer.
 * The scene stores mip 0 box-scaled to 256 px (`--tex-size`), so the sampler's LOD range is clamped to 0.
 * Ground following uses the scene's own triangles; there is no collision against walls.
-* Draws are not culled or sorted, and every frame waits for the GPU; a large `--max-props` gets slow (each prop is
-  one draw per mesh: 150 props gave 446 draws).
+* Visible draws are submitted in scene order, and every frame waits for the GPU.
+  All scene geometry and textures are resident. Each visible prop uses one draw per
+  mesh; 150 props gave 446 draws in the measured scene.

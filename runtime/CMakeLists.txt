@@ -408,6 +408,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(sandbox_visibility_test test/sandbox_visibility_test.cpp)
+  add_test(NAME sandbox_visibility COMMAND sandbox_visibility_test)
+
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
 
