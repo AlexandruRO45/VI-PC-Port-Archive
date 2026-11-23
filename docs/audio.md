@@ -304,9 +304,11 @@ The dictionary comes from two kinds of input:
   they give 138,104 wave names.
 
 Measured on the 1.0.2.1 package (2026-11-22) with 2,455,498 distinct lowercase words: identifiers harvested from the
-carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves:
+carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves. The columns are
+the ones the tool prints per source, so the second one is its distinct bank/ID pairs: an id that appears in two banks
+counts once in each (`Index.streams` in `tools/awc_names.py`):
 
-| Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
+| Archive | Banks | Distinct bank/ID pairs | Named | Dialogue | Family | Control (expected false) |
 |---|---:|---:|---:|---:|---:|---:|
 | `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
 | `story000.rpf` | 63,861 | 234,458 | 173,800 | 120,511 | 53,289 | 62 |
@@ -350,6 +352,10 @@ Subtitle markup (`~n~`, `~sl:...~`, `~COLOR_...~` and other `~...~` tokens) beco
 out. A file is matched by its stream id and its bank: the folder below the Opus folder, or that path with leading
 folders removed, so one Opus folder can hold several archives' exports. `--source` limits the names to one source
 label of the names CSV.
+
+Dialogue wave names are matched without case. Repeated rows are accepted when they produce identical tags,
+including after subtitle markup is removed. Conflicting labels, speakers or subtitles stop the pass with a CSV
+line diagnostic before any Ogg file is modified; this also applies to `--dry-run`.
 
 ```sh
 python -I tools/opus_tags.py <work>/assets/audio/ogg --names <temp>/awc_names.csv --dialogue <temp>/dialogue.csv
