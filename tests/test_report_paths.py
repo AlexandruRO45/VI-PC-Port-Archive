@@ -127,6 +127,65 @@ class MacVolumeTests(unittest.TestCase):
             self.assertTrue(os.path.exists(asked), asked)
 
 
+class WindowsVolumeTests(unittest.TestCase):
+    """The Windows branch: NTFS case sensitivity is per-directory, so probe the directory itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = os.path.realpath(self.tmp.name)
+
+    def p(self, *parts):
+        return os.path.join(self.dir, *parts)
+
+    def win32(self, case_insensitive):
+        real_exists = os.path.exists
+        real_samefile = os.path.samefile
+
+        def fake_exists(path):
+            if ".LEONIDA-CASE-" in os.path.basename(path):
+                return case_insensitive
+            return real_exists(path)
+
+        def fake_samefile(a, b):
+            if not case_insensitive and os.path.basename(a) != os.path.basename(b):
+                raise FileNotFoundError(b)
+            return real_samefile(a, b)
+
+        fake_path = mock.Mock(wraps=os.path, exists=fake_exists, samefile=fake_samefile,
+                              realpath=os.path.realpath if case_insensitive else os.path.abspath)
+        fake_os = mock.Mock(wraps=os, path=fake_path)
+        return mock.patch.multiple(report_paths, sys=mock.Mock(platform="win32"), os=fake_os)
+
+    def test_windows_case_sensitive_directory_keeps_case(self):
+        touch(self.p("mesh.obj"))
+        with self.win32(case_insensitive=False):
+            self.assertFalse(report_paths.case_insensitive_volume(self.p("MESH.OBJ")))
+            self.assertFalse(report_paths.same_report_path(self.p("mesh.obj"), self.p("MESH.OBJ")))
+
+    def test_windows_case_insensitive_directory_folds_case(self):
+        with self.win32(case_insensitive=True):
+            self.assertTrue(report_paths.case_insensitive_volume(self.p("MESH.OBJ")))
+            self.assertTrue(report_paths.same_report_path(self.p("mesh.obj"), self.p("MESH.OBJ")))
+
+    def test_windows_drive_letter_case_still_matches(self):
+        with mock.patch.object(report_paths, "sys", mock.Mock(platform="win32")), \
+             mock.patch.object(report_paths, "case_insensitive_volume", return_value=False), \
+             mock.patch.object(report_paths.os.path, "realpath", side_effect=lambda p: p):
+            self.assertTrue(report_paths.same_report_path(r"C:\cs\mesh.obj", r"c:\cs\mesh.obj"))
+            self.assertFalse(report_paths.same_report_path(r"C:\cs\mesh.obj", r"C:\cs\MESH.OBJ"))
+
+    def test_windows_probe_error_counts_as_case_insensitive(self):
+        with mock.patch.object(report_paths, "sys", mock.Mock(platform="win32")), \
+             mock.patch.object(report_paths.tempfile, "mkstemp", side_effect=OSError("read-only")):
+            self.assertTrue(report_paths.case_insensitive_volume(self.dir))
+
+    def test_windows_probe_leaves_no_file_behind(self):
+        with mock.patch.object(report_paths, "sys", mock.Mock(platform="win32")):
+            report_paths.case_insensitive_volume(self.p("sub", "x.json"))
+        self.assertEqual(os.listdir(self.dir), [])
+
+
 class FoldingVolumeTests(unittest.TestCase):
     """A volume that ignores case without normcase or pathconf saying so is found with one scratch folder."""
 

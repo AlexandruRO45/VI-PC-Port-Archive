@@ -11,6 +11,7 @@ ignores case. Where the name rules cannot tell, `same_name_on_folding_volume` as
 scratch folder: a Linux mount that folds case (vfat, exFAT, CIFS) answers neither `normcase` nor `pathconf`.
 Standard library only; no game data.
 """
+import ntpath
 import os
 import posixpath
 import sys
@@ -20,31 +21,61 @@ import unicodedata
 _PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
 
 
-def case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
+def _existing_ancestor(path, require_dir=False):
+    check = os.path.isdir if require_dir else os.path.exists
+    while not check(path):
         parent = os.path.dirname(path)
         if parent == path:
             break
         path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+    return path
+
+
+def case_insensitive_volume(path):
+    """True when the directory that will hold `path` ignores letter case (macOS APFS/HFS+ or Windows NTFS)."""
+    if sys.platform == "darwin":
+        path = _existing_ancestor(path)
+        try:
+            return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+        except (OSError, ValueError):
+            return True  # the macOS default; folding can only refuse a pair, never overwrite one
+    if sys.platform == "win32":
+        # NTFS case sensitivity is per-directory and not inherited by new subdirectories, so probe the directory itself.
+        folder = _existing_ancestor(path, require_dir=True)
+        if not os.path.isdir(folder):
+            return True
+        try:
+            fd, probe_path = tempfile.mkstemp(prefix=".leonida-case-", dir=folder)
+            try:
+                os.close(fd)
+                swapped = os.path.join(folder, os.path.basename(probe_path).swapcase())
+                return os.path.exists(swapped)
+            finally:
+                try:
+                    os.unlink(probe_path)
+                except OSError:
+                    pass
+        except OSError:
+            return True  # the Windows default; folding can only refuse a pair, never overwrite one
+    return False
 
 
 def path_key(path):
     """A name two spellings of one path share: realpath, normcase, and on a case-insensitive volume case-folded NFD."""
     path = os.path.realpath(path)
+    insensitive = case_insensitive_volume(path)
     # Use the path rules of the platform we are resolving for. On macOS os.path is
-    # posixpath and keeps case; on Windows ntpath lowercases. Resolving a simulated
-    # macOS path through ntpath would hide the case-sensitive branch under test.
-    path = posixpath.normcase(path) if sys.platform == "darwin" else os.path.normcase(path)
-    if case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
+    # posixpath and keeps case; on Windows ntpath lowercases the whole path, which would
+    # hide per-directory case sensitivity, so only fold the drive letter and slashes there.
+    if sys.platform == "darwin":
+        path = posixpath.normcase(path)
+    elif sys.platform == "win32":
+        drive, rest = ntpath.splitdrive(path)
+        path = drive.lower() + rest.replace("/", "\\")
+    else:
+        path = os.path.normcase(path)
+    if insensitive:
+        # APFS, HFS+, and case-insensitive NTFS treat case (and on macOS, NFD/NFC) as one name.
         path = unicodedata.normalize("NFD", path.casefold())
     return path
 
@@ -65,6 +96,8 @@ def same_name_on_folding_volume(first, second):
     try:
         if not os.path.samefile(first_dir, second_dir):
             return False
+        if sys.platform == "win32":
+            return case_insensitive_volume(first_dir)
         with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=first_dir) as probe:
             with open(os.path.join(probe, first_name), "xb"):
                 return os.path.exists(os.path.join(probe, second_name))
