@@ -490,6 +490,51 @@ class SaluNandB64RegisterAliasingTests(unittest.TestCase):
         self.assertEqual(state.sgprs[2], 0x55555555)
         self.assertEqual(state.read_sgpr64(3), s1_val)
 
+class SaluNandB64ConditionCodesTests(unittest.TestCase):
+    """Condition codes (SCC status flag) generation and propagation tests for s_nand_b64."""
+
+    def test_scc_exhaustive_lo_hi_zero_matrix(self):
+        state = ScalarState()
+        cases = [
+            (MASK64, MASK64, 0),                       # result = 0x00000000_00000000 -> SCC = 0
+            (MASK64, 0xFFFFFFFF_00000000, 1),           # result = 0x00000000_FFFFFFFF -> SCC = 1
+            (MASK64, 0x00000000_FFFFFFFF, 1),           # result = 0xFFFFFFFF_00000000 -> SCC = 1
+            (MASK64, 0, 1),                             # result = 0xFFFFFFFF_FFFFFFFF -> SCC = 1
+            (0x12345678_00000000, 0xFFFFFFFF_00000000, 1),
+            (0x00000000_12345678, 0x00000000_FFFFFFFF, 1),
+        ]
+        for s0, s1, expected_scc in cases:
+            with self.subTest(s0=hex(s0), s1=hex(s1)):
+                state.write_sgpr64(0, s0)
+                state.write_sgpr64(2, s1)
+                res = state.execute_nand_b64("s[4:5]", "s[0:1]", "s[2:3]")
+                self.assertEqual(state.scc, expected_scc)
+                self.assertEqual(state.scc, 1 if res != 0 else 0)
+
+    def test_scc_cleared_exclusively_on_all_ones(self):
+        state = ScalarState()
+        # SCC is 0 ONLY if every single bit of (s0 & s1) is 1
+        state.write_sgpr64(0, MASK64)
+        state.write_sgpr64(2, MASK64)
+        state.execute_nand_b64("s[4:5]", "s[0:1]", "s[2:3]")
+        self.assertEqual(state.scc, 0)
+
+        # Clear one bit at a time across all 64 bits -> SCC MUST be 1
+        for bit in range(64):
+            state.write_sgpr64(0, MASK64 ^ (1 << bit))
+            state.write_sgpr64(2, MASK64)
+            state.execute_nand_b64("s[4:5]", "s[0:1]", "s[2:3]")
+            self.assertEqual(state.scc, 1)
+
+    def test_scc_bitwise_independence_from_arithmetic_overflow(self):
+        state = ScalarState()
+        # 0x7FFFFFFF_FFFFFFFF & 0x80000000_00000000 == 0 -> NAND is MASK64
+        state.write_sgpr64(0, 0x7FFFFFFF_FFFFFFFF)
+        state.write_sgpr64(2, 0x80000000_00000000)
+        res = state.execute_nand_b64("s[4:5]", "s[0:1]", "s[2:3]")
+        self.assertEqual(res, MASK64)
+        self.assertEqual(state.scc, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
