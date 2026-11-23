@@ -24,11 +24,22 @@ def write(path, text):
 
 
 class Done:
+    """What subprocess.run() and make_game's poll() loop ask of a finished process."""
+
     def poll(self):
         return 0
 
     def wait(self):
         return 0
+
+    def communicate(self, input=None, timeout=None):
+        return None, None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
     def terminate(self):
         pass
@@ -102,6 +113,9 @@ class TranslateLockedIndexTest(unittest.TestCase):
             return real_open(path, mode, *a, **k)
 
         class Exited(Done):
+            def poll(self):
+                return shard_code
+
             def wait(self):
                 return shard_code
 

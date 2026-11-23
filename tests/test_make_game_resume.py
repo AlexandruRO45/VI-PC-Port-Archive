@@ -40,6 +40,11 @@ class ResumeShardsTest(unittest.TestCase):
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
 
+            stdout = None  # pump_process() reads it when a board is up
+
+            def poll(self):
+                return self.wait()
+
             def wait(self):
                 if self.i in crash:
                     return 1

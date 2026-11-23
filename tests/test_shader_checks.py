@@ -35,8 +35,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 16)  # four mesh fixtures (ms_v5_workgroup is the fourth), ps_tex, ps_imgatomic,
+         # six compute fixtures, ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps
+         # (net one more case) and cs_fmt_all
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -59,7 +60,7 @@ def cvt_answer(env, wrong_for=None):
 
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT)):
-        def harness(_tool, shader, *args, env=None):
+        def harness(_tool, shader, *args, env=None, cwd=None):
             name = Path(shader).stem
             if name == "cs_fmt_1010102":
                 self.assertEqual(args, ("1", "dump"))
@@ -160,6 +161,9 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
             if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
+            if name in ("fetch-sint", "fetch-uint", "fetch-miss"):   # table_fetch_test: vk_texture_test writes each readback
+                Path(args[0]).write_bytes(b"\0\0\0\0")
+                return 0, f"{name}: 4096 exact pixels\n"
             if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
                 self.assertEqual(args, ("words",))
                 return 0, words_output(name)
@@ -266,7 +270,7 @@ class FloatToIntSweep(unittest.TestCase):
     def sweep(self, wrong_for=None):
         sent = []
 
-        def harness(_tool, shader, *_args, env=None):
+        def harness(_tool, shader, *_args, env=None, cwd=None):
             self.assertEqual(Path(shader).stem, "cs_cvt_f32_sat")
             sent.append(int(env["VKC_SGPRS"], 0))
             return cvt_answer(env, wrong_for)
