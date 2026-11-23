@@ -668,3 +668,40 @@ class TestCmpxClassF16Oracle(unittest.TestCase):
         # Zero mask deactivates lane
         val_zero, _ = run_cmp_shader("f16", 0x7C00, 0, is_cmpx=True, test_id="cmpx_id_zero")
         self.assertEqual(val_zero, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f16 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VCmpxClassF16Instruction:
+    src0: Union[RegisterOperand, LiteralOperand]
+    mask: Union[RegisterOperand, LiteralOperand]
+
+
+def step_cmpx_class_f16(machine: ScalarMachineClassLogic, insn: VCmpxClassF16Instruction):
+    s0 = machine.read_operand(insn.src0) & 0xFFFF
+    mask = machine.read_operand(insn.mask) & 0xFFFF
+    cond = ref_cmp_class_f16(s0, mask)
+    if not cond:
+        machine.exec = 0
+
+
+class TestCmpxClassF16ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineClassLogic()
+        machine.vgprs[1] = 0x3C00
+        insn = VCmpxClassF16Instruction(
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        step_cmpx_class_f16(machine, insn)
+
+        val_hw, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=True, test_id="ast_scalar_match")
+        self.assertEqual(machine.exec, MASK32)
+        self.assertEqual(val_hw, 1)
+
+    def test_scalar_predicated_execution_hardware(self):
+        val_hw, _ = run_cmp_shader("f16", 0x0000, CLASS_NEG_NORMAL, is_cmpx=True, test_id="ast_scalar_pred")
+        self.assertEqual(val_hw, 0)
