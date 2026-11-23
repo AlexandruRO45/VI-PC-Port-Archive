@@ -11989,13 +11989,8 @@ def assemble(gen):
     if gen.uses_viewport:
         caps.append("ShaderViewportIndex")
     if FLOAT_CONTROLS:
-        # RDNA2 float ops are IEEE: NaN, +-inf and -0 come out as computed, and f16 denormals are kept. Without these
-        # execution modes Vulkan lets the driver assume none of them occur, and drivers do: AMD's compiler folded a
-        # -0 product to +0 and lost a NaN result narrowed to f16 with integer ops (RX 9070 XT), and NVIDIA flushed
-        # an f16 denormal on its way into f32 (SHADER-526: the 0x0040 that _sdwa src0_sel:BYTE_1 selects read as
-        # +0, RTX 3090 and RTX 4070 SUPER; docs/design.md, "Float controls").
-        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls".
-        caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
+        # Keep NaN, +-inf and -0 as RDNA2 computes them. Core in SPIR-V 1.4, so no extension at vulkan1.2.
+        caps.append("SignedZeroInfNanPreserve")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
@@ -12032,8 +12027,7 @@ def assemble(gen):
         if gen.writes_depth:
             hdr.append("OpExecutionMode %main DepthReplacing")
     if FLOAT_CONTROLS:
-        hdr += ["OpExecutionMode %main SignedZeroInfNanPreserve 32",
-                "OpExecutionMode %main DenormPreserve 16"]
+        hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 32")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -12695,7 +12689,7 @@ def assemble(gen):
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
     if pops:
         fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
-    out = hdr + dec + types + gvars + helpers + fn
+    out = dec + types + gvars + helpers + fn
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if msc:
         end_lock = gen.msc_epilogue + end_lock
@@ -12779,9 +12773,16 @@ def assemble(gen):
                 "%live = OpLabel\n         OpReturn\n         OpFunctionEnd\n")
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
-    return split_big_switch(no_contraction(dedupe_types(
-        "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail)))
+    body = ("\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
+            "\n" + "\n".join(gen.body) + "\n" + tail)
+    # Unpacking can flush an f16 denormal even though the result is f32 (SHADER-526). Check the assembled
+    # instructions because generated code such as the mesh epilogue can add half conversions too.
+    if FLOAT_CONTROLS and any(op in body for op in (
+            " UnpackHalf2x16 ", " PackHalf2x16 ", " = OpQuantizeToF16 ", " = OpTypeFloat 16\n")):
+        hdr.insert(caps.index("SignedZeroInfNanPreserve") + 1, "OpCapability DenormPreserve")
+        hdr.append("OpExecutionMode %main DenormPreserve 16")
+    text = "\n".join("         " + l for l in hdr) + "\n" + body
+    return split_big_switch(no_contraction(dedupe_types(text)))
 
 
 # SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,

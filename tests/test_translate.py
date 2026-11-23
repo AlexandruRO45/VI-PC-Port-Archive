@@ -788,19 +788,16 @@ s_endpgm
 def test_float_controls_declared(stage, make_shader):
     """Every module declares SignedZeroInfNanPreserve for 32-bit floats, so the driver keeps NaN, inf and -0 as
     RDNA2 computes them (AMD folded x != x to false and turned -0 products into +0 without it; see
-    runtime/test/shaders/cs_signed_zero_nan.asm), and DenormPreserve for 16-bit floats, so it keeps an f16 denormal
-    instead of flushing it (NVIDIA read the 0x0040 of ps_sdwa_f16_const's `src0_sel:BYTE_1` as +0 without it,
-    SHADER-526). Its index entry names the device properties the runtime checks."""
+    runtime/test/shaders/cs_signed_zero_nan.asm). These FP32-only shaders need only the 32-bit property."""
     body = FLOAT_CONTROLS_CS if stage == "cs" else program("v_mul_f32 v1, v0, v0")
     shader = make_shader(body, name=f"{stage}_float_controls")
     spv = shader.translate()
     shader.validate(spv)
     assert "OpCapability SignedZeroInfNanPreserve" in spv
     assert "OpExecutionMode %main SignedZeroInfNanPreserve 32" in spv
-    assert "OpCapability DenormPreserve" in spv
-    assert "OpExecutionMode %main DenormPreserve 16" in spv
+    assert "DenormPreserve" not in spv
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
-    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"]
+    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32"]
 
 
 def test_no_float_controls_leaves_them_out(make_shader, monkeypatch):

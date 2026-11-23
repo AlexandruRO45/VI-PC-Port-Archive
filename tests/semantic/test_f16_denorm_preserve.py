@@ -1,4 +1,4 @@
-"""SHADER-526: every module declares DenormPreserve 16, so a driver keeps an f16 denormal instead of flushing it.
+"""SHADER-526: half-float operations retain DenormPreserve 16 so a driver keeps f16 denormals.
 
 RDNA2 keeps f16 denormals. `v_mul_f16_sdwa v3, 2.0, v1 src0_sel:BYTE_1` reads the denormal 0x0040 (2^-18) and
 multiplies it by 1024.0 to 0x1c00 (runtime/test/shaders/ps_sdwa_f16_const.asm, measured on gfx1036 with
@@ -8,9 +8,8 @@ driver emits for it. Without the mode NVIDIA flushed that conversion and the sam
 RTX 3090 (driver 610.88) and an RTX 4070 SUPER (610.88), 4096/4096 pixels; with it, 4096/4096 pixels exact.
 
 SPV_KHR_float_controls is core since SPIR-V 1.4, so the mode needs no extension at `--target-env vulkan1.2` (the
-header the assembler writes is 1.5). The index lists the device property it needs, shaderDenormPreserveFloat16, next
-to shaderSignedZeroInfNanPreserveFloat32: `vk_pipeline_check` skips a shader where the device reports false, and
-`--no-float-controls` leaves both modes out.
+header the assembler writes is 1.5). Modules with half-float operations list shaderDenormPreserveFloat16 next to
+shaderSignedZeroInfNanPreserveFloat32. `--no-float-controls` leaves both modes out.
 """
 import os
 import shutil
@@ -29,8 +28,8 @@ import rdna2spirv  # noqa: E402
 import support  # noqa: E402
 
 EXIT = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
-# A pixel shader with nothing but an ordinary value in it: the mode is a property of the module, not of the op.
 PLAIN = ["v_mov_b32 v0, 0", "v_mov_b32 v1, 0", "v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+HALF = PLAIN + ["v_cvt_f32_f16 v0, v0"]
 
 MODE = "OpExecutionMode %main DenormPreserve 16"
 CAP = "OpCapability DenormPreserve"
@@ -59,7 +58,7 @@ def without_modes(spv):
 
 class F16DenormPreserveTests(unittest.TestCase):
     def test_module_declares_denorm_preserve_16(self):
-        spv = translate(PLAIN)
+        spv = translate(HALF)
         self.assertIn(CAP, spv)
         self.assertIn(MODE, spv)
         # module layout: capabilities, then extensions, then imports
@@ -67,18 +66,23 @@ class F16DenormPreserveTests(unittest.TestCase):
         self.assertLess(spv.index("OpCapability SignedZeroInfNanPreserve"), spv.index(CAP))
 
     def test_index_metadata_names_the_property(self):
-        self.assertEqual(meta(translate(PLAIN))["float_controls"],
+        self.assertEqual(meta(translate(HALF))["float_controls"],
                          ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"])
 
+    def test_plain_module_omits_f16_mode_and_property(self):
+        spv = translate(PLAIN)
+        self.assertNotIn("DenormPreserve", spv)
+        self.assertEqual(meta(spv)["float_controls"], ["shaderSignedZeroInfNanPreserveFloat32"])
+
     def test_no_float_controls_leaves_it_out(self):
-        spv = translate(PLAIN, float_controls=False)
+        spv = translate(HALF, float_controls=False)
         self.assertNotIn("DenormPreserve", spv)
         self.assertNotIn("SignedZeroInfNanPreserve", spv)
         self.assertNotIn("float_controls", meta(spv))
 
     def test_the_mode_changes_only_the_header(self):
         # Nothing of the translated code depends on it: the driver is the one that has to honour it.
-        self.assertEqual(without_modes(translate(PLAIN)), without_modes(translate(PLAIN, float_controls=False)))
+        self.assertEqual(without_modes(translate(HALF)), without_modes(translate(HALF, float_controls=False)))
 
     def test_the_f16_denormal_words_and_the_mode_together(self):
         spv = support.translate_fixture("ps_sdwa_f16_const")
