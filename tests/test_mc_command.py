@@ -96,6 +96,17 @@ class SplitCommandTest(unittest.TestCase):
             path = os.path.join(folder, "llvm-mc")
             self.assertEqual(mc_command.split_command(path), [path])
 
+    @unittest.skipUnless(os.name == "nt", "Windows command wrapper")
+    def test_windows_cmd_wrapper_with_and_without_extension(self):
+        with tempfile.TemporaryDirectory(prefix="llvm tools ") as tmp:
+            path = os.path.join(tmp, "llvm-mc")
+            with open(path + ".cmd", "w", encoding="ascii", newline="\r\n") as f:
+                f.write("@echo synthetic-wrapper\n")
+            for command in (path + ".cmd", path):
+                with self.subTest(command=command):
+                    result = mc_command.run(mc_command.mc_command(command), capture_output=True, text=True, check=True)
+                    self.assertEqual(result.stdout.strip(), "synthetic-wrapper")
+
     def test_command_line_is_still_split_when_its_first_word_is_on_path(self):
         # Only a value with a directory part is tried as one path: "wsl -d Ubuntu ..." stays a command line
         # whatever is on PATH, and a bare name is not looked up at all.
