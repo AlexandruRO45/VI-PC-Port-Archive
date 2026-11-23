@@ -1596,16 +1596,22 @@ std::vector<TitlePageBuffer>& title_page_buffers() {
     return *v;
 }
 
+// Runs in the device's final Release, so it allocates nothing: it takes the device's entries out one at a time
+// (erasing from a vector moves the tail down, it never allocates) and releases each resource outside the lock.
 void forget_title_page_buffers_of(const DeviceProxy* device) {
-    std::vector<ID3D12Resource*> dead;
-    {
-        std::lock_guard lock(title_page_buffer_mutex());
-        auto& buffers = title_page_buffers();
-        for (const TitlePageBuffer& buffer : buffers)
-            if (buffer.device == device) dead.push_back(buffer.resource);
-        std::erase_if(buffers, [device](const TitlePageBuffer& buffer) { return buffer.device == device; });
+    for (;;) {
+        ID3D12Resource* resource = nullptr;
+        {
+            std::lock_guard lock(title_page_buffer_mutex());
+            auto& buffers = title_page_buffers();
+            const auto it = std::find_if(buffers.begin(), buffers.end(),
+                                         [device](const TitlePageBuffer& buffer) { return buffer.device == device; });
+            if (it == buffers.end()) return;
+            resource = it->resource;
+            buffers.erase(it);
+        }
+        resource->Release();
     }
-    for (ID3D12Resource* resource : dead) resource->Release();
 }
 
 // A buffer on the title's pages that holds [va, va + width), made the first time, with a reference added for the

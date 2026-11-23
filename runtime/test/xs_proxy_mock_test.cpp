@@ -1619,6 +1619,56 @@ int check_slot70_title_pages() {
     return 0;
 }
 
+// The device's final Release frees the buffers slot 70 made on the title's pages without allocating: with the next
+// allocation refused (svds12343's probe on #9068), it still returns 0, the real device and both buffers lose their
+// last reference, and the refused allocation is left unused.
+Mock* g_release_buffers[2]{};
+unsigned g_release_buffer_count = 0;
+
+int check_slot70_title_pages_release(bool fail_allocation) {
+    constexpr std::uint64_t kVa = 0x42000000;
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    g_release_buffers[0] = g_release_buffers[1] = nullptr;
+    g_release_buffer_count = 0;
+    xs::set_placed_at_va_handler([](ID3D12Device*, void*, const D3D12_RESOURCE_DESC&, std::uint32_t, REFIID,
+                                    void** out) -> HRESULT {
+        if (g_release_buffer_count == std::size(g_release_buffers)) return E_OUTOFMEMORY;
+        Mock* const resource = new_mock(Kind::resource);
+        resource->refs = 1;
+        g_release_buffers[g_release_buffer_count++] = resource;
+        *out = resource;
+        return S_OK;
+    });
+    for (unsigned index = 0; index < std::size(g_release_buffers); ++index) {
+        RawShape shape = buffer_view_shape(kVa + index * 0x10000, 128, DXGI_FORMAT_R16_UINT);
+        raw(device, 70, word(&shape.resource), word(&shape.view), 0x7000);
+        EXPECT(g_release_buffer_count == index + 1 && mock->args[18][0] == word(g_release_buffers[index]));
+    }
+    xs::set_placed_at_va_handler(nullptr);
+    Mock* const first = g_release_buffers[0];
+    Mock* const second = g_release_buffers[1];
+    EXPECT(first->refs == 1 && second->refs == 1 && mock->refs == 1);
+
+    const int refused = g_failed_news;
+    g_fail_news = fail_allocation ? 1 : 0;
+    unsigned long remaining = 99;
+    bool threw = false;
+    try {
+        remaining = static_cast<unsigned long>(release(device));
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    const int unused = g_fail_news;
+    g_fail_news = 0;
+    EXPECT(!threw && g_failed_news == refused && unused == (fail_allocation ? 1 : 0));
+    EXPECT(remaining == 0 && mock->refs == 0 && first->refs == 0 && second->refs == 0);
+    std::printf("%s: the device's final Release frees slot 70's buffers on the title's pages%s\n", g_label,
+                fail_allocation ? " with no allocation, the next one refused" : "");
+    return 0;
+}
+
 // ---- 9. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -2064,6 +2114,7 @@ int main(int argc, char** argv) {
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_slot70() || check_slot70_raw_buffer() ||
         check_slot70_placed_buffer() || check_slot70_typed_buffer() || check_slot70_title_pages() ||
+        check_slot70_title_pages_release(false) || check_slot70_title_pages_release(true) ||
         check_descriptor_heap_hooks() || check_committed_resource3_x() ||
         check_committed_resource3_xmem_hook())
         return 1;
