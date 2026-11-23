@@ -15,6 +15,7 @@
 //   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
 //   vk_texture_test dref_o [out.raw]: ps_sample_c_lz_o against an 8x8 D32 texture whose texel (x, y) holds depth
 //   (8y + x + 0.5) / 64 and the same compare sampler; every pixel must read (1, 1, 0, 1) (see the shader's header).
+//   vk_texture_test dref_c / dref_c_b [out.raw]: the same with ps_sample_c (implicit LOD) / ps_sample_c_b (LOD bias).
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
@@ -74,9 +75,17 @@ int main(int argc, char** argv) {
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
-    const bool dref_a16 = argc >= 2 && !std::strcmp(argv[1], "dref_a16");
+    // dref_c / dref_c_b: image_sample_c / image_sample_c_b (implicit LOD, bias), same texture and expected results.
+    const char* dref_ps = nullptr;
+    if (argc >= 2) {
+        if (!std::strcmp(argv[1], "dref")) dref_ps = "ps_sample_c_lz.spv";
+        else if (!std::strcmp(argv[1], "dref_a16")) dref_ps = "ps_sample_c_lz_a16.spv";
+        else if (!std::strcmp(argv[1], "dref_o")) dref_ps = "ps_sample_c_lz_o.spv";
+        else if (!std::strcmp(argv[1], "dref_c")) dref_ps = "ps_sample_c.spv";
+        else if (!std::strcmp(argv[1], "dref_c_b")) dref_ps = "ps_sample_c_b.spv";
+    }
+    const bool dref = dref_ps != nullptr;
     const bool dref_o = argc >= 2 && !std::strcmp(argv[1], "dref_o");
-    const bool dref = dref_a16 || dref_o || (argc >= 2 && !std::strcmp(argv[1], "dref"));
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -105,15 +114,14 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref_a16 ? "ps_sample_c_lz_a16.spv"
-                           : dref_o ? "ps_sample_c_lz_o.spv" : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
+        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
         const int out_arg = cube || dref ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_o] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_o|dref_c|dref_c_b] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
@@ -212,7 +220,7 @@ int main(int argc, char** argv) {
     for (auto& x : exts) m8_on = m8_on || !std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     if (m8_on) {
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
-        m8.maintenance8 = VK_TRUE; f12.pNext = &m8;
+        m8.maintenance8 = VK_TRUE; f11.pNext = &m8;
         std::fprintf(stderr, "enabled %s\n", VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     }
 #endif
