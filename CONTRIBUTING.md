@@ -35,6 +35,9 @@ methods are still open.
   `tools/file_mode.py` (`published_mode`, then the usual `os.replace`) instead of `os.umask`: a
   `tempfile.NamedTemporaryFile` is created 0600, and reading the umask with `os.umask(0)`/`os.umask(mask)` sets
   process-wide state that a thread creating a file between the two calls sees.
+- An `--out` that is an input, another report or the index the tool reads is refused with `same_report_path` from
+  `tools/report_paths.py`, which also catches the spellings `normcase` alone misses (a case-folding volume, a hard
+  link, a composed vs decomposed accent) and needs neither path to exist yet.
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
