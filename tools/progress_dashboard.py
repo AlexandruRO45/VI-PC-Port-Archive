@@ -818,6 +818,23 @@ def collect_pulls(col, repo, merged, open_prs, limit=PR_LIMIT):
              "items": item_ids(p.get("title")), "author": (p.get("author") or {}).get("login")} for p in latest]
 
 
+def claim_lines(body):
+    """Yield plain-text claiming commands in comment order, skipping Markdown examples."""
+    fence = None
+    for line in body.splitlines():
+        marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)", line)
+        if fence:
+            if marker and marker[1].startswith(fence) and not marker[2].strip():
+                fence = None
+            continue
+        if marker and (marker[1].startswith("~") or "`" not in marker[2]):
+            fence = marker[1]
+        elif re.match(r" {0,3}claiming:", line, re.I):
+            text = plain(line)
+            if text.partition(":")[2].strip():
+                yield text
+
+
 def collect_github(col, repo, login):
     col.panel("d3d12", "D3D12 → Vulkan layer items (#313)", "D3D- items")
     col.panel("ci", "CI on main", "workflows")
@@ -911,9 +928,10 @@ def collect_github(col, repo, login):
             claims = []
             for n in [num] + ([int(prev.group(1))] if prev else []):
                 comments = gh_json(["issue", "view", str(n), "-R", repo, "--json", "comments"]) or {}
-                claims += [{"at": c.get("createdAt"), "issue": n, "text": plain(c["body"].splitlines()[0])[:160]}
+                claims += [{"at": c.get("createdAt"), "issue": n, "text": line[:160]}
                            for c in comments.get("comments", [])
-                           if c.get("author", {}).get("login") == login and "claiming" in c["body"].lower()]
+                           if (c.get("author") or {}).get("login") == login
+                           for line in claim_lines(c["body"])]
             prs = gh_json(["pr", "list", "-R", repo, "--author", login, "--state", "all", "--limit", "50",
                            "--json", "number,title,state,isDraft,updatedAt"]) or []
             summary["mine"] = {"login": login, "claims": claims,

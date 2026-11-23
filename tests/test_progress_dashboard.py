@@ -276,6 +276,53 @@ class GpuLog(unittest.TestCase):
 
 
 class Github(unittest.TestCase):
+    def test_personal_summary_lists_each_claim_command(self):
+        first_at = "2026-11-22T10:00:00Z"
+        second_at = "2026-11-22T11:00:00Z"
+        previous_at = "2026-11-21T10:00:00Z"
+        long_text = "x" * 180
+
+        def comment(login, at, body):
+            return {"author": {"login": login}, "createdAt": at, "body": body}
+
+        issues = {
+            ("102", "body"): {"body": "This issue continues #101."},
+            ("102", "comments"): {"comments": [
+                comment("me", first_at, "I can take two tasks.\n"
+                        "claiming: **DOC-1** [guide](https://example.invalid/guide)\n"
+                        "I am not claiming: DOC-3.\n"
+                        "`claiming: DOC-4`\n"
+                        "> claiming: DOC-5\n\n"
+                        "    claiming: DOC-6\n\n"
+                        "````text\n```\nclaiming: DOC-7\n````\n"
+                        "~~~text\nclaiming: DOC-8\n~~~\n"
+                        "claiming: \t\n"
+                        "claiming: ``\n"
+                        f"  CLAIMING: `DOC-2` {long_text}"),
+                comment("other", first_at, "claiming: DOC-9"),
+                comment("me", second_at, "Still claiming nothing this week."),
+                comment("me", second_at, "claiming: DOC-10"),
+            ]},
+            ("101", "comments"): {"comments": [comment("me", previous_at, "claiming: DOC-11")]},
+        }
+
+        def fake_gh(args, timeout=60):
+            if args[:2] == ["issue", "list"]:
+                return [{"number": 102, "updatedAt": second_at}]
+            if args[:2] == ["issue", "view"]:
+                return issues.get((args[2], args[-1]))
+            return []
+
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", return_value="gh"):
+            summary = pd.collect_github(pd.Collector(), "o/r", "me")
+
+        self.assertEqual(summary["mine"]["claims"], [
+            {"at": first_at, "issue": 102, "text": "claiming: DOC-1 guide"},
+            {"at": first_at, "issue": 102, "text": ("CLAIMING: DOC-2 " + long_text)[:160]},
+            {"at": second_at, "issue": 102, "text": "claiming: DOC-10"},
+            {"at": previous_at, "issue": 101, "text": "claiming: DOC-11"},
+        ])
+
     def test_d3d_states(self):
         self.assertEqual(pd.d3d_state("@a", "#291 merged, #819, #831 on main", "")[0], "partial")
         self.assertEqual(pd.d3d_state("@a", "#1489 merged, #907 closed", "")[0], "implemented")
