@@ -144,7 +144,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--header", help="d3d12.h to read the IIDs from (default: newest Windows SDK)")
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
+    # Check every input and the report path before the scan: a missing image ended in a FileNotFoundError traceback
+    # after the earlier images had already been printed, and --json naming a folder or living under a regular file
+    # failed at the end of the run.
+    for path in args.images:
+        if not os.path.isfile(path):
+            print(f"ERROR: cannot read {path}: no such file", file=sys.stderr)
+            return 2
     if args.json:
+        if os.path.isdir(args.json):
+            print(f"ERROR: --json {args.json} is a folder, not a file", file=sys.stderr)
+            return 2
+        parent = os.path.dirname(os.path.abspath(args.json))
+        if not os.path.isdir(parent):
+            # The report is written last, so refuse an unwritable path before the scan instead of after it.
+            print(f"ERROR: cannot write {args.json}: {parent} is not a folder", file=sys.stderr)
+            return 2
         # The report is written last, after every input has been read, so an aliased input would
         # silently be replaced by it. Refuse the alias before anything is opened.
         for what, other in (("--header", args.header), *(("an input image", p) for p in args.images)):

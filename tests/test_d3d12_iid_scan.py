@@ -201,6 +201,32 @@ class IidScan(unittest.TestCase):
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertFalse(os.path.exists(report))
 
+    def test_cli_missing_image_is_one_error_before_the_scan(self):
+        # A missing image ended in a FileNotFoundError traceback, after the images before it were already printed.
+        dll = self.image("f.dll", b"MZ")
+        missing = os.path.join(self.tmp.name, "no-such-image.dll")
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll, missing,
+                            "--header", self.header], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("no such file", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("==", p.stdout)          # nothing was scanned before the check
+
+    def test_cli_json_folder_or_under_a_file_is_one_error(self):
+        dll = self.image("g.dll", b"MZ")
+        tool = os.path.join(ROOT, "tools", "d3d12_iid_scan.py")
+        p = subprocess.run([sys.executable, "-I", tool, dll, "--header", self.header, "--json", self.tmp.name],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("folder", p.stderr)
+        blocked = os.path.join(self.tmp.name, "blocked.txt")
+        open(blocked, "wb").close()
+        p = subprocess.run([sys.executable, "-I", tool, dll, "--header", self.header,
+                            "--json", os.path.join(blocked, "r.json")], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("ERROR", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
     def test_cli_missing_header_fails_cleanly(self):
         dll = self.image("e.dll", b"MZ")
         p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
