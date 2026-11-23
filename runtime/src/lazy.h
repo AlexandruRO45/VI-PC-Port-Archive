@@ -18,6 +18,19 @@ public:
         }
         return value_;
     }
+    // Like get(), but keeps the slot unset when make() returns a falsy/null value so a failed probe can be retried
+    // if a later dependency makes the target available.
+    template <class Make>
+    T get_if_truthy(Make&& make) {
+        if (set_) return value_;
+        T v = std::forward<Make>(make)();
+        if (v) {
+            value_ = std::move(v);
+            set_ = true;
+            return value_;
+        }
+        return v;
+    }
     bool has_value() const { return set_; }
 
 private:

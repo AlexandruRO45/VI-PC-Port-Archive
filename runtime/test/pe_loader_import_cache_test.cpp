@@ -72,10 +72,18 @@ void test_lazy() {
     CHECK(v.get([&] { return ++calls, 9; }) == 7);  // kept, not recomputed
     CHECK(calls == 1 && v.has_value());
 
-    rt::Lazy<void*> p;  // a null result is a result: it is kept as well
+    rt::Lazy<void*> p;  // a null result is a result for get(), but get_if_truthy() leaves it unset so probes can retry
     CHECK(p.get([&] { return ++calls, static_cast<void*>(nullptr); }) == nullptr);
     CHECK(p.get([&] { return ++calls, static_cast<void*>(&calls); }) == nullptr);
     CHECK(calls == 2);
+
+    rt::Lazy<void*> retryable;
+    CHECK(retryable.get_if_truthy([&] { return ++calls, static_cast<void*>(nullptr); }) == nullptr);
+    CHECK(!retryable.has_value());
+    CHECK(retryable.get_if_truthy([&] { return ++calls, static_cast<void*>(&calls); }) == static_cast<void*>(&calls));
+    CHECK(retryable.has_value());
+    CHECK(retryable.get_if_truthy([&] { return ++calls, static_cast<void*>(nullptr); }) == static_cast<void*>(&calls));
+    CHECK(calls == 4);
 
     rt::Lazy<int> t;  // a throw leaves it unset, so the next get runs make again
     bool threw = false;
@@ -231,8 +239,10 @@ void* resolve_after(World& w, ImportCache& cache, const std::string& dll, const 
         w.records.push_back({dll, sym, Binding::Shim});
         return p;
     }
-    FakeModule* bundled = imported.bundled.get(
-        [&]() -> FakeModule* { return !imported.host_crt && w.exists(dll) ? &w.load(dll) : nullptr; });
+    FakeModule* bundled = imported.bundled.get_if_truthy([&]() -> FakeModule* {
+        if (imported.host.has_value()) return nullptr;
+        return !imported.host_crt && w.exists(dll) ? &w.load(dll) : nullptr;
+    });
     if (bundled) {
         FakeModule& dep = *bundled;
         if (auto it = dep.exports.find(sym); it != dep.exports.end()) {
@@ -247,7 +257,7 @@ void* resolve_after(World& w, ImportCache& cache, const std::string& dll, const 
             }
         }
     }
-    if (FakeHostDll* h = imported.host.get([&] {
+    if (FakeHostDll* h = imported.host.get_if_truthy([&] {
             FakeHostDll* loaded = w.load_library(dll);
             if (loaded && imported.host_crt) w.redirect(loaded);
             return loaded;
@@ -304,14 +314,14 @@ Run bind(World& w, const std::vector<Descriptor>& table, bool cached) {
     return r;
 }
 
-// Same results and visible side effects; the cached run calls exists, load(), LoadLibraryExA and redirect at most once
-// per descriptor (once per distinct DLL name), never more often than before; GetProcAddress runs exactly as often.
+// Same results and visible side effects; the cached run never makes more calls than the uncached run, and for any
+// resolved DLL it calls load() and redirect at most once per descriptor; GetProcAddress runs exactly as often.
 bool same_and_bounded(const Run& a, const Run& b, size_t descriptors) {
     bool ok = a.iat == b.iat && a.records == b.records && a.redirected_at == b.redirected_at &&
               a.redirected == b.redirected && a.loaded_order == b.loaded_order && a.getproc_calls == b.getproc_calls;
-    ok = ok && b.exists_calls <= std::min<uint64_t>(a.exists_calls, descriptors);
+    ok = ok && b.exists_calls <= a.exists_calls;
     ok = ok && b.load_calls <= std::min<uint64_t>(a.load_calls, descriptors);
-    ok = ok && b.loadlib_calls <= std::min<uint64_t>(a.loadlib_calls, descriptors);
+    ok = ok && b.loadlib_calls <= a.loadlib_calls;
     ok = ok && b.redirect_calls <= std::min<uint64_t>(a.redirect_calls, descriptors);
     // Each cached call happens iff the uncached run made that call at least once for the descriptor's DLL.
     ok = ok && (a.exists_calls == 0) == (b.exists_calls == 0) && (a.loadlib_calls == 0) == (b.loadlib_calls == 0);
@@ -369,6 +379,30 @@ void test_fixed() {
     // Two descriptors that spell the same DLL share one entry: one probe and one load for the module's three imports.
     const Run g = bind(w, cases[10], false), h = bind(w, cases[10], true);
     CHECK(g.exists_calls == 3 && g.loadlib_calls == 3 && h.exists_calls == 1 && h.loadlib_calls == 1);
+
+    // Failed probes are not frozen: if A.dll initially fails to load, then B.dll makes A.dll available (e.g. via
+    // DllMain or a later load), a subsequent import of A.dll in the same bind_imports still resolves as Host.
+    {
+        auto run_dynamic = [&](bool cached) {
+            World dw;
+            dw.host["b.dll"] = {{{"InitB", 0xB000}}, {}};
+            ImportCache cache;
+            auto call = [&](const std::string& dll, const std::string& name) {
+                return cached ? resolve_after(dw, cache, dll, name, 0, false)
+                              : resolve_before(dw, dll, name, 0, false);
+            };
+            call("a.dll", "FnA");  // fails -> Unimplemented
+            call("b.dll", "InitB");
+            dw.host["a.dll"] = {{{"FnA", 0xA000}}, {}};  // B's DllMain made A.dll available
+            call("a.dll", "FnA");                        // must retry and bind as Host
+            return dw.records;
+        };
+        const auto rec_before = run_dynamic(false);
+        const auto rec_after = run_dynamic(true);
+        CHECK(rec_before == rec_after);
+        CHECK(rec_after.size() == 3 && rec_after[0].binding == Binding::Unimplemented &&
+              rec_after[1].binding == Binding::Host && rec_after[2].binding == Binding::Host);
+    }
 }
 
 void test_random() {

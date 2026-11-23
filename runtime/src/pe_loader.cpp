@@ -1603,7 +1603,10 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         return p;
     }
     // Bundled game module (an Xbox build that ships beside the game)?
-    Module* bundled = imported.bundled.get([&]() -> Module* {
+    // Only cache successful lookups (or skip re-probing bundled once the host DLL succeeded), so a failed probe can
+    // still succeed later in the same bind_imports if another DLL's DllMain or load makes it available.
+    Module* bundled = imported.bundled.get_if_truthy([&]() -> Module* {
+        if (imported.host.has_value()) return nullptr;
         auto path = game_dir_ / dll;
         return !imported.host_crt && std::filesystem::exists(path) ? &load(path) : nullptr;
     });
@@ -1622,7 +1625,7 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
-    if (HMODULE h = imported.host.get([&] {
+    if (HMODULE h = imported.host.get_if_truthy([&] {
             HMODULE loaded = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
             // Before any mapped code can throw through it (later calls for the same module return at once).
             if (loaded && imported.host_crt) redirect_pc_to_file_header(loaded);
