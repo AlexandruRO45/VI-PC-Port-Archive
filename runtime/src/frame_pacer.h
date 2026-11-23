@@ -396,7 +396,9 @@ private:
         for (;;) {
             if (shutdown_ || suspended_ || !interval_set_ || !armed_) return pacer_hr::invalid_state;
             const std::uint64_t now = clock_.now_us();
-            retire_locked(now);
+            // Frames are retired only up to the deadline: after a late wake, a frame that showed after the deadline
+            // must not free the latency slot (a later call retires it).
+            retire_locked(std::min(now, give_up));
             const std::uint64_t first = epoch_us_ + offset_us_;  // origin 0
             const std::int64_t next = last_origin_ + 1;
             const std::uint64_t next_us = first + std::uint64_t(next) * period_us_;
