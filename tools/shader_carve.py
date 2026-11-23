@@ -10,6 +10,15 @@ Usage:
     python -I shader_carve.py <archive.rpf> <out_dir>
 
 Writes <out_dir>/<name>.dxbc and <out_dir>/index.json (name, offset, stage, shader model, parts).
+
+Reruns stage all files on the output volume. Publishers using this tool acquire .shader-publish by
+creating that directory exclusively. A competing publisher fails if the directory is already present.
+The index rename commits a run. An I/O failure before commit rolls back the installed files, including
+new names. Unrelated files remain in place. Readers needing a consistent snapshot must finish before
+publication or wait until the writer exits: stable DXBC paths change individually during publication.
+There is no crash recovery. A crash or a second I/O failure during rollback can leave .shader-publish
+with the remaining original files. Inspect the output and recover it before clearing the guard.
+A cleanup error after commit leaves the new index and payloads published.
 """
 import argparse
 import json
@@ -93,6 +102,48 @@ def main(argv=None) -> int:
         os.makedirs(out, exist_ok=True)
     except OSError as e:  # a regular file where a parent folder is expected
         ap.error(f"cannot create {out}: {e.strerror or e}")
+    try:
+        with tempfile.TemporaryDirectory(dir=out, prefix=".shader-stage-") as staging:
+            return carve(src, out, staging)
+    except OSError as e:
+        print(f"ERROR: cannot write {out}: {e}", file=sys.stderr)
+        return 1
+
+
+def publish(index, staging, out):
+    """Publish staged files under their stable names; restore the previous files on failure."""
+    backup = os.path.join(out, ".shader-publish")
+    os.mkdir(backup)  # Exclusive publication, including rollback, for cooperating writers.
+    undo = []
+    try:
+        for row in index:
+            name = row["file"]
+            dest = os.path.join(out, name)
+            old = os.path.join(backup, name)
+            if os.path.isdir(dest):
+                raise IsADirectoryError(dest)
+            if os.path.lexists(dest):
+                os.replace(dest, old)
+                undo.append((dest, old))
+                os.replace(os.path.join(staging, name), dest)
+            else:
+                os.replace(os.path.join(staging, name), dest)
+                undo.append((dest, None))
+        os.replace(os.path.join(staging, "index.json"), os.path.join(out, "index.json"))
+    except OSError:
+        # If restoration itself fails, leave the backups and writer guard in place.
+        for dest, old in reversed(undo):
+            if old is None:
+                os.unlink(dest)
+            else:
+                os.replace(old, dest)
+        os.rmdir(backup)
+        raise
+    # The index commit succeeded. Move backups to our private staging area for cleanup.
+    os.rename(backup, os.path.join(staging, "previous"))
+
+
+def carve(src, out, staging):
     index, seen, used, bad = [], {}, set(), 0
     try:
         with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
@@ -124,7 +175,7 @@ def main(argv=None) -> int:
                     continue
                 pos = start + stored
                 fname = file_name(name, seen, used)
-                out_path = os.path.join(out, fname)
+                out_path = os.path.join(staging, fname)
                 try:
                     with open(out_path, "wb") as f:
                         f.write(data)
@@ -140,18 +191,11 @@ def main(argv=None) -> int:
         print(f"ERROR: no shaders carved from {src} (rejected candidates: {bad}).", file=sys.stderr)
         return 1
     # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
-    index_path = os.path.join(out, "index.json")
-    try:
-        with tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-") as staging:
-            tmp = os.path.join(staging, "index.json")
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(index, f, indent=1)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, index_path)
-    except OSError as e:
-        print(f"ERROR: cannot write {index_path}: {e.strerror or e}", file=sys.stderr)
-        return 1
+    with open(os.path.join(staging, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(index, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    publish(index, staging, out)
     from collections import Counter
     print(f"{len(index)} shaders carved, {bad} candidates rejected")
     print("stages:", dict(Counter(e["stage"] for e in index)))

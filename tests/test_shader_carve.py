@@ -15,6 +15,7 @@ import io
 import json
 import mmap
 import os
+from pathlib import Path
 import struct
 import subprocess
 import sys
@@ -653,6 +654,45 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
             index = json.load(f)
         self.assertEqual([(r["name"], r["offset"]) for r in index], [("real_shader", len(bogus))])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows deny-delete file sharing")
+    def test_locked_index_restores_payloads_and_allows_retry(self):
+        first = make_dxbc([(b"PRIV", bytes(range(32)))])
+        second = make_dxbc([(b"PRIV", bytes(reversed(range(32))))])
+        Path(self.archive).write_bytes(make_rpf_entry("existing", 1, first))
+        initial = self.run_carve(self.archive, self.out)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        out = Path(self.out)
+        index = out / "index.json"
+        previous = index.read_bytes()
+        Path(self.archive).write_bytes(make_rpf_entry("existing", 1, second)
+                                       + make_rpf_entry("additional", 1, first))
+
+        with index.open("rb"):
+            failed = self.run_carve(self.archive, self.out)
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertIn("index.json", failed.stderr)
+        self.assertEqual(index.read_bytes(), previous)
+        self.assertEqual((out / "existing.dxbc").read_bytes(), first)
+        self.assertEqual(sorted(os.listdir(out)), ["existing.dxbc", "index.json"])
+
+        retry = self.run_carve(self.archive, self.out)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual([row["file"] for row in json.loads(index.read_bytes())],
+                         ["existing.dxbc", "additional.dxbc"])
+        self.assertEqual((out / "existing.dxbc").read_bytes(), second)
+        self.assertEqual((out / "additional.dxbc").read_bytes(), first)
+
+    def test_busy_publisher_keeps_its_guard_and_payloads(self):
+        payload = make_dxbc([(b"PRIV", bytes(range(32)))])
+        Path(self.archive).write_bytes(make_rpf_entry("valid", 1, payload))
+        guard = Path(self.out) / ".shader-publish"
+        guard.mkdir(parents=True)
+        (guard / "valid.dxbc").write_bytes(b"prior")
+        result = self.run_carve(self.archive, self.out)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((guard / "valid.dxbc").read_bytes(), b"prior")
+        self.assertEqual(os.listdir(self.out), [guard.name])
 
     def test_oserror_on_archive_read_dxbc_write_and_index_replace(self):
         dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
