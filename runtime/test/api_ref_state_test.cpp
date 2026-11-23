@@ -16,6 +16,21 @@ void Check(bool condition, const char* name)
         ++failures;
 }
 
+// Blocks until another thread stores at least `value` in `step` and notifies it. The hand-offs between the
+// threads used to be `while (!flag) std::this_thread::yield();`, which costs a scheduler quantum or more per
+// round when every core is busy: the test took 0.16 s idle and 221 s with 32 busy processes on 16 cores, against
+// ctest's 10 s. A thread released from a wait is boosted on Windows; one spinning on yield is not.
+void WaitUntil(const std::atomic<int>& step, int value)
+{
+    for (int seen = step.load(std::memory_order_acquire); seen < value; seen = step.load(std::memory_order_acquire))
+        step.wait(seen, std::memory_order_acquire);
+}
+
+// The race's start: how long the contender spins on `go` before it blocks, and how many different Release
+// delays the rounds cycle through (in YieldProcessor pauses).
+constexpr int kStartSpin = 1 << 14;
+constexpr int kReleaseDelaySteps = 8;
+
 struct RaceContext
 {
     ApiRefState state;
@@ -60,66 +75,76 @@ void CheckPinWinsBeforeFinalRelease()
     constexpr int rounds = 200;
     int failuresLocal = 0;
 
-    for (int i = 0; i < rounds; ++i)
+    // One contender thread for every round, and each hand-off blocks in atomic::wait (see WaitUntil and
+    // CheckFinalReleaseRace for why neither a yield spin nor a new thread per round holds up on a busy machine).
+    // Each step of a round is numbered by the round, so no flag needs resetting between rounds.
+    ApiRefState* state = nullptr;
+    bool acquired = false;
+    ApiRefState::ReleaseResult pinRelease{ 0, false };
+    std::atomic<int> started{ 0 }, pinAttempted{ 0 }, pinReleaseAllowed{ 0 }, finished{ 0 };
+
+    std::thread contender([&]
     {
-        ApiRefState state;
-        state.AddRef();
-
-        std::atomic<bool> pinFinished{ false };
-        std::atomic<bool> allowPinRelease{ false };
-
-        bool acquired = false;
-        ApiRefState::ReleaseResult pinRelease{ 0, false };
-
-        std::thread contender([&]
+        for (int round = 1; round <= rounds; ++round)
         {
-            acquired = state.TryAddRef();
+            WaitUntil(started, round);
 
-            pinFinished.store(true, std::memory_order_release);
+            acquired = state->TryAddRef();
+
+            pinAttempted.store(round, std::memory_order_release);
+            pinAttempted.notify_one();
 
             if (acquired)
             {
-                while (!allowPinRelease.load(
-                    std::memory_order_acquire))
-                {
-                    std::this_thread::yield();
-                }
+                WaitUntil(pinReleaseAllowed, round);
 
-                pinRelease = state.Release();
+                pinRelease = state->Release();
             }
-        });
 
-        while (!pinFinished.load(std::memory_order_acquire))
-        {
-            std::this_thread::yield();
+            finished.store(round, std::memory_order_release);
+            finished.notify_one();
         }
+    });
 
-        const auto ownerRelease = state.Release();
+    for (int round = 1; round <= rounds; ++round)
+    {
+        ApiRefState roundState;
+        roundState.AddRef();
+        state = &roundState;
+        pinRelease = { 0, false };
+
+        started.store(round, std::memory_order_release);
+        started.notify_one();
+        WaitUntil(pinAttempted, round);
+
+        const auto ownerRelease = roundState.Release();
 
         bool valid =
             acquired &&
             ownerRelease.remaining == 1 &&
             !ownerRelease.startRundown &&
-            state.RefCount() == 1 &&
-            !state.IsDying();
+            roundState.RefCount() == 1 &&
+            !roundState.IsDying();
 
-        allowPinRelease.store(true, std::memory_order_release);
-
-        contender.join();
+        pinReleaseAllowed.store(round, std::memory_order_release);
+        pinReleaseAllowed.notify_one();
+        WaitUntil(finished, round);
 
         valid =
             valid &&
             pinRelease.remaining == 0 &&
             pinRelease.startRundown &&
-            state.RefCount() == 0 &&
-            state.IsDying() &&
-            !state.TryAddRef();
+            roundState.RefCount() == 0 &&
+            roundState.IsDying() &&
+            !roundState.TryAddRef();
 
         if (!valid)
         {
             ++failuresLocal;
         }
     }
+
+    contender.join();
 
     Check(failuresLocal == 0,
           "pin acquired before final owner Release stays valid");
@@ -135,60 +160,86 @@ void CheckFinalReleaseRace()
     int badFinalState = 0;
     int successfulPins = 0;
 
+    // One contender thread for every round. A new thread per round waits for a scheduler quantum before it
+    // first runs when the cores are busy (no wake-up boost, unlike a thread released from a wait), which
+    // alone kept 1000 rounds past ctest's timeout. Each step of a round is numbered by the round, so no flag
+    // needs resetting between rounds.
+    ApiRefState* state = nullptr;
+    std::atomic<int> rundownCount{ 0 };
+    bool pinned = false;
+    std::atomic<int> started{ 0 }, ready{ 0 }, go{ 0 }, finished{ 0 };
+
+    std::thread contender([&]
+    {
+        for (int round = 1; round <= rounds; ++round)
+        {
+            WaitUntil(started, round);
+
+            ready.store(round, std::memory_order_release);
+            ready.notify_one();
+
+            // Spin briefly so both sides leave the start line together, then block if the owner thread
+            // isn't running (a busy machine).
+            for (int spin = 0; spin < kStartSpin && go.load(std::memory_order_acquire) < round; ++spin)
+                YieldProcessor();
+            WaitUntil(go, round);
+
+            pinned = state->TryAddRef();
+
+            if (pinned && state->Release().startRundown)
+                rundownCount.fetch_add(1);
+
+            finished.store(round, std::memory_order_release);
+            finished.notify_one();
+        }
+    });
+
     for (int i = 0; i < rounds; ++i)
     {
-        ApiRefState state;
-        state.AddRef();
+        const int round = i + 1;
+        ApiRefState roundState;
+        roundState.AddRef();
+        state = &roundState;
+        rundownCount.store(0);
 
-        std::atomic<bool> ready{ false };
-        std::atomic<bool> go{ false };
-        std::atomic<int> rundownCount{ 0 };
-        std::atomic<bool> pinned{ false };
+        started.store(round, std::memory_order_release);
+        started.notify_one();
+        WaitUntil(ready, round);
 
-        std::thread contender([&]
-        {
-            ready.store(true, std::memory_order_release);
+        go.store(round, std::memory_order_release);
+        go.notify_one();
 
-            while (!go.load(std::memory_order_acquire))
-                std::this_thread::yield();
+        // The contender has to see `go` before its TryAddRef, so a Release straight after the store always
+        // wins (every round was a rejected pin). Delaying it by a different number of pauses each round
+        // sweeps the window, so both orders occur: the contender's pin first, and the final Release first.
+        for (int pause = 0; pause < i % kReleaseDelaySteps; ++pause)
+            YieldProcessor();
 
-            if (state.TryAddRef())
-            {
-                pinned.store(true, std::memory_order_relaxed);
-
-                if (state.Release().startRundown)
-                    rundownCount.fetch_add(1);
-            }
-        });
-
-        while (!ready.load(std::memory_order_acquire))
-            std::this_thread::yield();
-
-        go.store(true, std::memory_order_release);
-
-        if (state.Release().startRundown)
+        if (roundState.Release().startRundown)
             rundownCount.fetch_add(1);
 
-        contender.join();
+        WaitUntil(finished, round);
 
-        if (pinned.load(std::memory_order_relaxed))
+        if (pinned)
             ++successfulPins;
 
         if (rundownCount.load() != 1)
             ++badRundown;
 
-        bool unexpectedPin = state.TryAddRef();
+        bool unexpectedPin = roundState.TryAddRef();
 
         if (unexpectedPin)
-            state.Release();
+            roundState.Release();
 
-        if (state.RefCount() != 0 ||
-            !state.IsDying() ||
+        if (roundState.RefCount() != 0 ||
+            !roundState.IsDying() ||
             unexpectedPin)
         {
             ++badFinalState;
         }
     }
+
+    contender.join();
 
     Check(badRundown == 0,
           "racing final Release starts rundown exactly once");
