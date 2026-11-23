@@ -6,6 +6,7 @@ import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 
 import json
 import os
+import stat
 import struct
 import sys
 from collections.abc import Callable
@@ -680,3 +681,53 @@ def test_main_still_accepts_an_empty_list(tmp_path, monkeypatch, capsys):
     _argv(monkeypatch, index, tmp_path, out)
     assert T.main() in (None, 0)   # main() has no explicit return; sys.exit(None) is exit 0
     assert (out / "export_log.json").is_file()
+
+
+def test_main_reads_utf8_bom_index(eq, tmp_path, monkeypatch):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    t = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    index = tmp_path / "textures_index.json"
+    index.write_bytes(b"\xef\xbb\xbf" + json.dumps([t]).encode("utf-8"))
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, carve, out)
+    assert T.main() in (None, 0)
+    log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert len(log) == 1
+    assert log[0]["export"]["place"] == "first"
+    assert (out / "x.rpf" / log[0]["export"]["file"]).is_file()
+
+
+def test_main_writes_export_log_atomically_preserving_existing_on_failure(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    report = out / "export_log.json"
+    report.write_text('{"sentinel": true}', encoding="utf-8")
+
+    def fail_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(T.os, "replace", fail_replace)
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 1
+    captured = capsys.readouterr()
+    assert "ERROR: cannot write" in captured.err
+    assert report.read_text(encoding="utf-8") == '{"sentinel": true}'
+    assert [p.name for p in out.iterdir()] == ["export_log.json"]
+
+
+def test_main_cleans_up_staging_file_when_destination_is_read_only(tmp_path, monkeypatch):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    report = out / "export_log.json"
+    report.write_bytes(b"old")
+    report.chmod(stat.S_IREAD)
+    try:
+        _argv(monkeypatch, index, tmp_path, out)
+        T.main()
+        assert len(list(out.glob(".export_log.*.tmp"))) == 0
+    finally:
+        report.chmod(stat.S_IWRITE)

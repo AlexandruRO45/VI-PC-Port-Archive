@@ -26,14 +26,17 @@ import argparse
 import io
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from collections import Counter
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from amd_swizzle import _parity, equation, load  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from tex_headers import FMT_INFO  # noqa: E402
 
 # DXGI format -> (bytes per element, block dimension), from the indexer's table; eq4k has SW_4K_S equations
@@ -238,12 +241,30 @@ def main():
         if i % 2000 == 0:
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
     report = os.path.join(a.out, "export_log.json")
+    tmp_path = None
     try:
-        with open(report, "w", encoding="utf-8", newline="\n") as f:
+        fd, tmp_path = tempfile.mkstemp(dir=a.out, prefix=".export_log.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(texs, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, published_mode(report))
+        os.replace(tmp_path, report)
+        tmp_path = None
     except OSError as e:
         print(f"ERROR: cannot write {report}: {e.strerror or e}", file=sys.stderr)
         return 1
+    finally:
+        if tmp_path is not None:
+            if os.name == "nt":
+                try:
+                    os.chmod(tmp_path, stat.S_IWRITE)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
     if a.png:
         print(f"png: {dict(pngs)}")
