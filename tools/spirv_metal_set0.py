@@ -139,8 +139,9 @@ def rewrite(text, counts):
         m = re.match(r"(\s*(%\S+) = OpVariable )(%\S+)( UniformConstant)$", ln)
         if m and m.group(2) in retype:
             ln = f"{m.group(1)}{retype[m.group(2)]}{m.group(4)}"
-        # Retype copies by source ID so arrays sharing a type in other sets are unaffected.
-        m = re.match(r"(\s*(%\S+) = OpCopyObject )%\S+ (%\S+)$", ln)
+        # Copies and index-free access chains preserve the entire pointer type.
+        # Retype by source ID so indexed elements and arrays in other sets are unaffected.
+        m = re.match(r"(\s*(%\S+) = (?:OpCopyObject|OpAccessChain|OpInBoundsAccessChain) )%\S+ (%\S+)$", ln)
         if m and m.group(3) in retype:
             ptr = retype[m.group(3)]
             retype[m.group(2)] = ptr

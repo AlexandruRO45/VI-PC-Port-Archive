@@ -80,6 +80,10 @@ OpName %images "images"
 OpName %samplers "samplers"
 OpName %foreign_samplers "foreign_samplers"
 OpName %foreign_copy "foreign_copy"
+OpName %foreign_zero "foreign_zero"
+OpName %image_access "image_access"
+OpName %sampler_access "sampler_access"
+OpName %foreign_access "foreign_access"
 OpDecorate %images DescriptorSet 0
 OpDecorate %images Binding 0
 OpDecorate %samplers DescriptorSet 0
@@ -112,13 +116,14 @@ OpDecorate %color Location 0
 %color = OpVariable %color_ptr Output
 %main = OpFunction %void None %fn
 %entry = OpLabel
-%foreign_copy = OpCopyObject %samplers_ptr %foreign_samplers
-%ip = OpAccessChain %image_ptr %images %zero
-%sp = OpAccessChain %sampler_ptr %samplers %zero
-%fp = OpAccessChain %sampler_ptr %foreign_copy %zero
-%i = OpLoad %image %ip
-%s = OpLoad %smp %sp
-%f = OpLoad %smp %fp
+%foreign_zero = OpInBoundsAccessChain %samplers_ptr %foreign_samplers
+%foreign_copy = OpCopyObject %samplers_ptr %foreign_zero
+%image_access = OpAccessChain %image_ptr %images %zero
+%sampler_access = OpAccessChain %sampler_ptr %samplers %zero
+%foreign_access = OpAccessChain %sampler_ptr %foreign_copy %zero
+%i = OpLoad %image %image_access
+%s = OpLoad %smp %sampler_access
+%f = OpLoad %smp %foreign_access
 %local_texture = OpSampledImage %sampled %i %s
 %foreign_texture = OpSampledImage %sampled %i %f
 %a = OpImageSampleImplicitLod %v4f %local_texture %uv
@@ -130,20 +135,28 @@ OpFunctionEnd
 """
 
 
-@pytest.mark.skipif(not all(shutil.which(tool) for tool in ("spirv-as", "spirv-dis", "spirv-val")),
-                    reason="needs SPIRV-Tools on PATH")
-@pytest.mark.parametrize("resource,binding,depth", [
-    ("samplers", 1, 0),
-    ("samplers", 1, 1),
-    ("samplers", 1, 2),
-    ("images", 3, 1),
-], ids=["direct", "sampler-copy", "sampler-chain", "image-copy"])
-def test_cli_retypes_descriptor_array_copies(tmp_path, resource, binding, depth):
+ALIAS_CASES = [
+    pytest.param("samplers", 1, (), id="direct"),
+    pytest.param("samplers", 1, ("OpCopyObject",), id="sampler-copy"),
+    pytest.param("samplers", 1, ("OpCopyObject", "OpCopyObject"), id="sampler-copy-chain"),
+    pytest.param("images", 3, ("OpCopyObject",), id="image-copy"),
+    pytest.param("samplers", 1, ("OpAccessChain",), id="sampler-zero-chain"),
+    pytest.param("samplers", 1, ("OpInBoundsAccessChain",), id="sampler-zero-inbounds"),
+    pytest.param("images", 3, ("OpAccessChain",), id="image-zero-chain"),
+    pytest.param("images", 3, ("OpInBoundsAccessChain",), id="image-zero-inbounds"),
+    pytest.param("samplers", 1, ("OpCopyObject", "OpAccessChain", "OpInBoundsAccessChain", "OpCopyObject"),
+                 id="sampler-mixed-chain"),
+    pytest.param("images", 3, ("OpInBoundsAccessChain", "OpCopyObject", "OpAccessChain"),
+                 id="image-mixed-chain"),
+]
+
+
+def descriptor_alias_fragment(resource, binding, operations):
     assembly = SAMPLE_FRAGMENT
     if resource == "images":
         assembly = assembly.replace("OpDecorate %images Binding 0", f"OpDecorate %images Binding {binding}")
     base = f"%{resource}"
-    for i in range(depth):
+    for i, op in enumerate(operations):
         copy = f"%copy{i}"
         assembly = assembly.replace(
             "OpDecorate %images DescriptorSet 0",
@@ -152,29 +165,53 @@ def test_cli_retypes_descriptor_array_copies(tmp_path, resource, binding, depth)
             f" {base} %zero",
             f" {copy} %zero",
         ).replace(
-            "%foreign_copy = OpCopyObject",
-            f"{copy} = OpCopyObject %{resource}_ptr {base}\n%foreign_copy = OpCopyObject",
+            "%foreign_zero = OpInBoundsAccessChain",
+            f"{copy} = {op} %{resource}_ptr {base}\n%foreign_zero = OpInBoundsAccessChain",
         )
         base = copy
+    return assembly
 
+
+def assert_descriptor_aliases(text, resource, binding, operations):
+    # OpName keeps these IDs stable after the CLI's spirv-dis round trip.
+    definitions = {parts[0]: parts[2:] for parts in map(str.split, text.splitlines())
+                   if len(parts) > 2 and parts[1] == "="}
+    base = f"%{resource}"
+    local_type = definitions[base][1]
+    array = definitions[definitions[local_type][2]]
+    assert array[0] == "OpTypeArray"
+    assert f"OpDecorate {base} Binding {m.metal_ids(m.capacities())[binding]}" in text
+    for i, op in enumerate(operations):
+        copy = f"%copy{i}"
+        assert definitions[copy] == [op, local_type, base]
+        base = copy
+    indexed = definitions["%sampler_access" if resource == "samplers" else "%image_access"]
+    assert indexed[0] == "OpAccessChain"
+    assert indexed[2] == base
+    assert definitions[indexed[1]] == ["OpTypePointer", "UniformConstant", array[1]]
+    foreign_type = definitions["%foreign_samplers"][1]
+    assert definitions[definitions[foreign_type][2]][0] == "OpTypeRuntimeArray"
+    assert definitions["%foreign_zero"] == ["OpInBoundsAccessChain", foreign_type, "%foreign_samplers"]
+    assert definitions["%foreign_copy"] == ["OpCopyObject", foreign_type, "%foreign_zero"]
+    assert definitions["%sampler_access"][1] == definitions["%foreign_access"][1]
+
+
+@pytest.mark.parametrize("resource,binding,operations", ALIAS_CASES)
+def test_rewrite_retypes_only_pointer_preserving_descriptor_aliases(resource, binding, operations):
+    assembly = descriptor_alias_fragment(resource, binding, operations)
+    assert_descriptor_aliases(m.rewrite(assembly, m.capacities()), resource, binding, operations)
+
+
+@pytest.mark.skipif(not all(shutil.which(tool) for tool in ("spirv-as", "spirv-dis", "spirv-val")),
+                    reason="needs SPIRV-Tools on PATH")
+@pytest.mark.parametrize("resource,binding,operations", ALIAS_CASES)
+def test_cli_retypes_descriptor_array_aliases(tmp_path, resource, binding, operations):
+    assembly = descriptor_alias_fragment(resource, binding, operations)
     src, dst = tmp_path / "input.spv", tmp_path / "metal.spv"
     target = ["--target-env", "vulkan1.2"]
     subprocess.run(["spirv-as", *target, "-", "-o", str(src)], input=assembly, text=True, check=True)
     subprocess.run(["spirv-val", *target, str(src)], check=True)
     subprocess.run([sys.executable, "-I", m.__file__, str(src), str(dst)], check=True)
     subprocess.run(["spirv-val", *target, str(dst)], check=True)
-
     text = subprocess.check_output(["spirv-dis", str(dst)], text=True)
-    base = f"%{resource}"
-    definitions = {parts[0]: parts[2:] for parts in map(str.split, text.splitlines())
-                   if len(parts) > 2 and parts[1] == "="}
-    local_type = definitions[base][1]
-    assert definitions[definitions[local_type][2]][0] == "OpTypeArray"
-    assert f"OpDecorate {base} Binding {m.metal_ids(m.capacities())[binding]}" in text
-    for i in range(depth):
-        copy = f"%copy{i}"
-        assert definitions[copy] == ["OpCopyObject", local_type, base]
-        base = copy
-    foreign_type = definitions["%foreign_samplers"][1]
-    assert definitions[definitions[foreign_type][2]][0] == "OpTypeRuntimeArray"
-    assert definitions["%foreign_copy"] == ["OpCopyObject", foreign_type, "%foreign_samplers"]
+    assert_descriptor_aliases(text, resource, binding, operations)
