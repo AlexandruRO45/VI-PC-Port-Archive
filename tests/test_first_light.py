@@ -660,6 +660,18 @@ class ReadObjTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 fl.read_obj(self._write_obj(bad))
 
+    def test_rejects_out_of_range_texture_coordinate_indices(self):
+        positions = "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+        for bad in (
+            positions + "vt 0.25 0.75\nf 1/2 2/2 3/2\n",
+            positions + "vt 0.25 0.75\nf 1/-2 2/-2 3/-2\n",
+            positions + "f 1/1 2/1 3/1\n",
+        ):
+            with self.subTest(bad=bad), self.assertRaisesRegex(
+                SystemExit, r"texture-coordinate index -?\d+ is out of range"
+            ):
+                fl.read_obj(self._write_obj(bad))
+
 
 class TexturedOracleTests(unittest.TestCase):
     """Synthetic tests for the textured first-light path (TEST-524): no GPU or game files."""

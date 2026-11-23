@@ -275,8 +275,11 @@ def read_obj(
                             ti = -1
                         else:
                             ti = len(uvs) + raw_ti if raw_ti < 0 else raw_ti - 1
-                            if raw_ti < 0 and ti < 0:
-                                ti = -1
+                            if not 0 <= ti < len(uvs):
+                                raise SystemExit(
+                                    f"{path}: texture-coordinate index {raw_ti} is out of range for "
+                                    f"{len(uvs)} texture coordinate(s)"
+                                )
                     else:
                         ti = -1
                     face.append((vi, ti))
