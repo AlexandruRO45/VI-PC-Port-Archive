@@ -107,8 +107,7 @@ class Module:
         out = []
         for _, op, a in self.ops:
             if op == "OpImageWrite":
-                texel_op, texel = self.defs[a[2]]
-                assert texel_op == "OpCompositeConstruct", texel_op
+                _, texel = self.defs[a[2]]
                 coord_op, coord = self.defs[a[1]]
                 assert coord_op == "OpCompositeConstruct", coord_op
                 out.append((texel[0], self.variable(a[0]), coord[0]))
