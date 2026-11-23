@@ -73,6 +73,34 @@ class InterpreterTests(unittest.TestCase):
     def test_bitfield_insert(self):
         self.assertEqual(run_word("%res = OpBitFieldInsert %uint %cF0 %c1 %c0 %c4\n"), 0xFFFFFFF1)
 
+    def test_bitfield_operations_use_the_result_width(self):
+        # SPIR-V 3.32.11, OpBitFieldInsert / OpBitField{SU}Extract: Base and the result have the same type, and
+        # Offset + Count is undefined only past the *result's* bit width. A 64-bit insert keeps the bits of Base
+        # outside the mask (the high word), and a 64-bit SExtract sign-extends the field across all 64 bits;
+        # the width used to be hard-coded to 32, so both silently lost their high word and an extract at bit 32
+        # was refused.
+        setup = self.WIDE.replace("%c0 = OpConstant %uint 0",
+                                  "%c64_0 = OpConstant %ulong 0\n"
+                                  "%c64_4 = OpConstant %ulong 4\n"
+                                  "%c64_32 = OpConstant %ulong 32\n"
+                                  "%cl_12 = OpConstant %ulong 12\n"
+                                  "%cl_15 = OpConstant %ulong 15\n"
+                                  "%cl_inserted = OpConstant %ulong 18446744069414584336\n"    # 0xFFFFFFFF00000010
+                                  "%cl_sext4 = OpConstant %ulong 18446744073709551612\n"       # 0xFFFFFFFFFFFFFFFC
+                                  "%c0 = OpConstant %uint 0")
+
+        def run(inst, want):
+            body = f"%r = {inst}\n%eq = OpIEqual %bool %r {want}\n%res = OpSelect %uint %eq %c1 %c0\n"
+            return si.run_fragment(setup + body + "OpStore %out %res\n" + FOOTER)["%out"][0]
+
+        for inst, want in (
+                ("OpBitFieldInsert %ulong %cl_hi %cl_1 %c64_4 %c64_4", "%cl_inserted"),
+                ("OpBitFieldSExtract %ulong %cl_12 %c64_0 %c64_4", "%cl_sext4"),
+                ("OpBitFieldUExtract %ulong %cl_hi %c64_32 %c64_4", "%cl_15"),      # bits 32..35 of the high word
+                ("OpBitFieldUExtract %ulong %cl_12 %c64_0 %c64_4", "%cl_12")):
+            with self.subTest(inst=inst):
+                self.assertEqual(run(inst, want), 1)
+
     def test_half_pack_unpack(self):
         self.assertEqual(run_word("%v = OpCompositeConstruct %v2float %f1 %f2\n"
                                   "%res = OpExtInst %uint %glsl PackHalf2x16 %v\n"), 0x40003C00)

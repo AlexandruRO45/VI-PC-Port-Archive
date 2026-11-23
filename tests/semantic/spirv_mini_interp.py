@@ -1141,19 +1141,25 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 raise UnsupportedConstruct(f"{op} on non-float")
             values[res] = math.isnan(x) if op == "OpIsNan" else math.isinf(x)
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract"):
+            # Base and the result have the same type (SPIR-V, OpBitFieldUExtract/OpBitFieldSExtract): the field,
+            # its sign extension and the undefined Offset + Count > width rule are all at the result's width, so a
+            # 64-bit extract reaches past bit 31 and a sign-extracted field fills all 64 bits.
             base, off, cnt = val(a[1]), val(a[2]), val(a[3])
-            if off + cnt > 32:
-                raise UnsupportedConstruct("bit-field extract beyond 32 bits (undefined in SPIR-V)")
+            bits = types.bits(a[0])
+            if off + cnt > bits:
+                raise UnsupportedConstruct("bit-field extract beyond the result width (undefined in SPIR-V)")
             field = (base >> off) & ((1 << cnt) - 1)
             if op == "OpBitFieldSExtract" and cnt and field >> (cnt - 1):
                 field -= 1 << cnt
-            values[res] = field & MASK
+            values[res] = field & wmask(a[0])
         elif op == "OpBitFieldInsert":
+            # As above: bits of a 64-bit Base outside Insert's mask must survive, not be truncated to 32 bits.
             base, ins, off, cnt = (val(x) for x in a[1:5])
-            if off + cnt > 32:
-                raise UnsupportedConstruct("bit-field insert beyond 32 bits (undefined in SPIR-V)")
+            bits = types.bits(a[0])
+            if off + cnt > bits:
+                raise UnsupportedConstruct("bit-field insert beyond the result width (undefined in SPIR-V)")
             mk = ((1 << cnt) - 1) << off
-            values[res] = ((base & ~mk) | ((ins << off) & mk)) & MASK
+            values[res] = ((base & ~mk) | ((ins << off) & mk)) & wmask(a[0])
         elif op == "OpConvertUToPtr":
             values[res] = ("psb", val(a[1]))
             pointers[res] = values[res]
