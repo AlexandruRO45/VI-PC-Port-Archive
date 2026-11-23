@@ -299,6 +299,20 @@ class ParsingTests(unittest.TestCase):
             struct.pack_into(fmt, mut, offset, val)
             self.assertFalse(smh_groom.system_page_is_groom(mut))
 
+    def assert_signature_without_copy(self, view, valid):
+        measure = not tracemalloc.is_tracing()
+        if measure:
+            tracemalloc.start()
+        try:
+            matches = smh_groom.system_page_is_groom(view)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            if measure:
+                tracemalloc.stop()
+        self.assertEqual(matches, valid)
+        if measure:
+            self.assertLess(peak, 64 << 10)
+
     def test_system_page_signature_reads_bounded_slices_of_strided_views(self):
         sysd, _ = build_synthetic_groom_buffers()
         page = bytearray(1 << 20)
@@ -313,18 +327,28 @@ class ParsingTests(unittest.TestCase):
             for first, valid in ((0, True), (1, False)):
                 with self.subTest(fmt=fmt, valid=valid):
                     view[0] = first
-                    measure = not tracemalloc.is_tracing()
-                    if measure:
-                        tracemalloc.start()
-                    try:
-                        matches = smh_groom.system_page_is_groom(view)
-                        peak = tracemalloc.get_traced_memory()[1]
-                    finally:
-                        if measure:
-                            tracemalloc.stop()
-                    self.assertEqual(matches, valid)
-                    if measure:
-                        self.assertLess(peak, 64 << 10)
+                    self.assert_signature_without_copy(view, valid)
+
+    def test_system_page_signature_reads_bounded_slices_of_strided_rows(self):
+        system, _ = build_synthetic_groom_buffers()
+        row_size = 1 << 20
+        backing = bytearray(4 * row_size)
+        backing[:len(system)] = system
+        view = memoryview(backing).cast("B", shape=(4, row_size))[::2]
+        self.assert_signature_without_copy(view, True)
+        backing[0] = 1
+        self.assert_signature_without_copy(view, False)
+
+    def test_system_page_signature_reads_fields_crossing_strided_rows(self):
+        system, _ = build_synthetic_groom_buffers()
+        row_size = 6
+        system += bytes((-len(system)) % row_size)
+        backing = bytearray(2 * len(system))
+        for offset in range(0, len(system), row_size):
+            backing[2 * offset:2 * offset + row_size] = system[offset:offset + row_size]
+        view = memoryview(backing).cast("H", shape=(len(backing) // row_size, row_size // 2))[::2]
+        self.assertTrue(smh_groom.system_page_is_groom(view))
+        self.assertFalse(smh_groom.system_page_is_groom(view[::-1]))
 
     def test_parse_full_groom_and_optional_sections(self):
         sysd, gpu = build_synthetic_groom_buffers(

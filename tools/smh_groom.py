@@ -185,6 +185,23 @@ def _sys_ptr(sysd: bytes, at: int) -> int:
     return value
 
 
+def _unpack_strided_rows(fmt: str, view: memoryview, offset: int) -> tuple:
+    """Read one field from a view with a contiguous slice at each first-axis index."""
+    row_size = view.nbytes // len(view)
+    index, start = divmod(offset, row_size)
+    width = struct.calcsize(fmt)
+    row = view[index:index + 1].cast("B")
+    if start + width <= row_size:
+        return struct.unpack_from(fmt, row, start)
+
+    field = bytearray(row[start:])
+    while len(field) < width:
+        index += 1
+        row = view[index:index + 1].cast("B")
+        field.extend(row[:width - len(field)])
+    return struct.unpack(fmt, field)
+
+
 def system_page_is_groom(sysd: bytes | bytearray | memoryview) -> bool:
     """Return True if ``sysd`` starts like an inflated smh groom LOD system page."""
     unpack = struct.unpack_from
@@ -197,6 +214,10 @@ def system_page_is_groom(sysd: bytes | bytearray | memoryview) -> bool:
             first, skip = divmod(offset, itemsize)
             last = (offset + struct.calcsize(fmt) + itemsize - 1) // itemsize
             return struct.unpack_from(fmt, view[first:last].tobytes(), skip)
+    elif (isinstance(sysd, memoryview) and sysd.ndim > 1 and not sysd.c_contiguous
+          and sysd[:1].c_contiguous):
+        size = sysd.nbytes
+        unpack = _unpack_strided_rows
     else:
         sysd = _byte_source(sysd)
         size = len(sysd)
