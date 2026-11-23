@@ -1,4 +1,4 @@
-"""Native/AOT/reference comparisons for vector data moves in the control-flow translator.
+﻿"""Native/AOT/reference comparisons for vector data moves in the control-flow translator.
 
 mutants IMAGE OUTPUT    write three incorrect translations that the comparison must detect
 check GUARD NATIVE LIFTED OPTIMIZED MUTANTS
@@ -226,9 +226,13 @@ class Pages:
 
 
 def faults(guard_path, native_path, lifted_path, optimized_path):
-    guarded = C.CDLL(str(Path(guard_path).resolve())).guarded_call
+    guard = C.CDLL(str(Path(guard_path).resolve()))
+    guarded = guard.guarded_call
     guarded.argtypes = [C.c_void_p, WORD, WORD, C.POINTER(WORD), C.POINTER(WORD)]
     guarded.restype = C.c_uint32
+    detailed = guard.guarded_call_detail
+    detailed.argtypes = [C.c_void_p, WORD, WORD, C.POINTER(WORD), C.POINTER(WORD), C.POINTER(WORD * 2)]
+    detailed.restype = C.c_uint32
     native, _ = bind(native_path, "")
     pages = Pages()
     count = 0
@@ -258,6 +262,8 @@ def faults(guard_path, native_path, lifted_path, optimized_path):
             ("copy_legacy", page_end - 24, "buffer", None),       # the first store straddles into the last page
             ("copy_vex", page - 8, "buffer", None),               # a store that starts in the first page
             ("copy_vex", "buffer", page_end - 16, None),          # a 32-byte load that straddles
+            ("copy_vex", page_end - 24, "buffer", None),          # a 32-byte store that straddles the end
+            ("copy_legacy", page - 4, "buffer", None),            # a 16-byte store that straddles the start
         ]
         outcomes = {}
         for index, (name, destination, source, _) in enumerate(scenarios):
@@ -275,8 +281,10 @@ def faults(guard_path, native_path, lifted_path, optimized_path):
                 dst, src = place(destination, aligned_dst), place(source, aligned_src)
                 aligned_dst.fill(b"\xa5" * SIZE)
                 result = WORD(0x5a5a)
-                code = guarded(getattr(library, prefix + name), dst, src, None, C.byref(result))
-                observed = (code, result.value, aligned_dst.read(), C.string_at(page, 4096))
+                detail = (WORD * 2)()
+                code = detailed(getattr(library, prefix + name), dst, src, None, C.byref(result), C.byref(detail))
+                # The access type (0 read, 1 write) and inaccessible address must match the native fault too.
+                observed = (code, result.value, aligned_dst.read(), C.string_at(page, 4096), tuple(detail))
                 assert code == ACCESS_VIOLATION, (label, name, index, hex(code))
                 assert outcomes.setdefault(index, observed) == observed, (label, name, index, "differs from native")
                 count += 1
@@ -286,7 +294,11 @@ def faults(guard_path, native_path, lifted_path, optimized_path):
         partial = bytes([FILL]) * (GUARD + 16) + bytes(range(16)) + bytes([FILL]) * (SIZE - 32 + GUARD)
         for index, outcome in outcomes.items():
             assert outcome[2] == (partial if index == 3 else untouched), (scenarios[index][0], index)
-        for index in (4, 5, 6, 7):
+        writes = {5, 6, 8, 9}  # page faults of stores; a misaligned aligned move (#GP) reports a read of ~0
+        for index, outcome in outcomes.items():
+            assert outcome[4][0] == (1 if index in writes else 0), (scenarios[index][0], index, outcome[4])
+        # copy_legacy at the page start (9) completes two other stores in the page before the faulting one.
+        for index in (4, 5, 6, 7, 8):
             assert outcomes[index][3] == b"\x6c" * 4096, (scenarios[index][0], "the page changed before the fault")
     finally:
         pages.close()
@@ -305,7 +317,7 @@ MUTANTS = (
 
 def emit_mutants(image, output):
     """Three incorrect translations: a legacy write that clears bytes 16-31, an aligned move without its
-    alignment check and a store without its last-byte probe."""
+    alignment check and a store split into two quadword stores."""
     bodies = []
     for name, export, old, new in MUTANTS:
         source, _ = translate(image, [name])

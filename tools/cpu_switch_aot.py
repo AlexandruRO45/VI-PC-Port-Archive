@@ -2023,6 +2023,7 @@ template <class T> static T load_always(word address) {
 template <class T> static void store(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
 }
+#include <immintrin.h>
 // A vector register: q[0] and q[1] are XMMn, all four quadwords YMMn.
 struct vec { std::uint64_t q[4]; };
 extern "C" __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long, unsigned long,
@@ -2039,12 +2040,15 @@ static inline void vector_alignment(word address, word mask) {
 template <int N> static void load_vector(vec& v, word address) {
     for (int k = 0; k < N; ++k) v.q[k] = load_always<std::uint64_t>(address + 8ull * k);
 }
-// A guest vector write. The last byte is first written back with its own value, so a store that reaches an
-// unwritable page faults before it changes any byte, as the single original store does.
+// A guest vector write: one unaligned store of the guest's width and nothing else, so it neither reads its
+// destination nor writes before the guest store. A store that reaches an unwritable page faults as a write
+// before it changes any byte, as the original does; the guarded comparison checks the access type and address.
 template <int N> static void store_vector(word address, const vec& v) {
-    volatile std::uint8_t* const last = reinterpret_cast<volatile std::uint8_t*>(address + 8ull * N - 1);
-    *last = *last;
-    for (int k = 0; k < N; ++k) *reinterpret_cast<volatile std::uint64_t __unaligned*>(address + 8ull * k) = v.q[k];
+    if (N == 2)
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(address), _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.q)));
+    else
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(address),
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v.q)));
 }
 """
 

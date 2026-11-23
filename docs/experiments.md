@@ -1641,8 +1641,10 @@ The aligned forms fault when an operand is not aligned to its width. On the fram
 alignment mod 32 is unknown. A RIP-relative operand is checked by its RVA, since the image mapping is 64 KiB aligned.
 Any other operand is checked when the translation runs, which raises `STATUS_ACCESS_VIOLATION` before the access,
 the code Windows reports for the #GP. A guest read is performed as volatile quadword reads in ascending order. A
-guest write first writes its last byte back with its own value, so a write that reaches an unwritable page faults
-before it changes memory, in either direction across a page boundary.
+guest write is one unaligned store of the guest's width (`_mm_storeu_si128` or `_mm256_storeu_si256`): it does not
+read its destination or write anything before the guest store. A write that reaches an unwritable page faults as a
+write at the same inaccessible address as the original, before it changes memory, in either direction across a page
+boundary.
 
 EVEX forms, registers 16-31, every other vector instruction (arithmetic, shuffles, scalar moves), and transfers
 between vector and integer registers remain refused. Nontemporal stores, memory ordering against other threads,
@@ -1671,17 +1673,19 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_switch_vectors$' -V
 
 Results on Windows 11 build 26300 with MSVC/ML64 19.44.35207 and Python 3.12.14:
 - **Comparisons:** 1,848 native, translated (`/Od` and `/O2`) and byte-reference comparisons matched, over 11 exports and source and destination offsets of 0 to 31 bytes. Each comparison covers the whole destination with 32 guard bytes on either side, plus the return value.
-- **Faults:** 24 access violations matched, together with the memory left behind.
+- **Faults:** 30 access violations matched in the exception code, the access type (read or write), the inaccessible
+  address and the memory left behind.
   - Misaligned MOVAPS loads and stores.
   - A 16-mod-32 VMOVDQA load.
   - A VMOVDQA store that faults after a VMOVAPD store has completed.
   - A load that reaches a protected page.
-  - Stores and a 32-byte load that straddle a protected page at its start or its end.
+  - 16- and 32-byte stores and a 32-byte load that straddle a protected page at its start or its end, in the
+    `/Od` and `/O2` translations.
 - **Unbound image:** both translations raise the unbound-image exception before the image is bound.
 - **Mutants:** three compiled `/O2` mutations must fail, and do.
   - A legacy write that clears bytes 16-31.
   - An aligned move without its alignment check.
-  - A store without its last-byte write-back, which leaves a partial store before the fault.
+  - A store split into two quadword stores, which leaves a partial store before the fault.
 
 No title startup result is claimed. Register volatility follows
 [Microsoft's x64 register conventions](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions).
