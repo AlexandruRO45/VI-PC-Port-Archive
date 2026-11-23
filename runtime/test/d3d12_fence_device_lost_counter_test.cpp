@@ -126,9 +126,9 @@ int native_warp_control() {
     Ref<ID3D12Fence> fence;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
         FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
-        FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device.p))) ||
-        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
+        FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device.p))))
         return 77;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)))) return 1;
     Event event;
     if (!event.handle || fence->GetCompletedValue() != 0 ||
         FAILED(fence->SetEventOnCompletion(2, event.handle)) || event.ready(0) ||
