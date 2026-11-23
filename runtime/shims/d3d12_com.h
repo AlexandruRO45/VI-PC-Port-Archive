@@ -256,6 +256,9 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
 
+// The property flags of the Vulkan memory type backing the device's GPU address arena, or 0 without one. For tests.
+VkMemoryPropertyFlags device_arena_memory_flags(ID3D12Device* device);
+
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.

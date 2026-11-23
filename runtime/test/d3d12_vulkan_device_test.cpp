@@ -5894,8 +5894,82 @@ int main() {
             EXPECT((upload_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
                    (upload_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
             if (in_vram) EXPECT(upload_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            EXPECT(rt::d3d12::vulkan_memory_flags(readback.p) & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-            std::printf("upload buffer memory: %s\n", in_vram ? "VRAM (Resizable BAR)" : "system memory");
+            const VkMemoryPropertyFlags rb_flags = rt::d3d12::vulkan_memory_flags(readback.p);
+            EXPECT(rb_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            // Custom WRITE_BACK heaps are CPU-readable like READBACK and should also prefer HOST_CACHED memory.
+            const D3D12_HEAP_PROPERTIES wb_heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                                                D3D12_MEMORY_POOL_L0};
+            Ref<ID3D12Resource> custom_wb;
+            EXPECT(SUCCEEDED(create(wb_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_COMMON, custom_wb)));
+            const VkMemoryPropertyFlags wb_flags = rt::d3d12::vulkan_memory_flags(custom_wb.p);
+            EXPECT((wb_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                   (wb_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+            EXPECT(bool(wb_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ==
+                   bool(rb_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
+            std::uint8_t* wb_ptr = nullptr;
+            EXPECT(SUCCEEDED(custom_wb->Map(0, nullptr, reinterpret_cast<void**>(&wb_ptr))) && wb_ptr);
+            bool wb_zeroed = true;
+            for (int i = 0; i < 4096; ++i) wb_zeroed = wb_zeroed && wb_ptr[i] == 0;
+            EXPECT(wb_zeroed);
+            wb_ptr[0] = 0x5a;
+            EXPECT(wb_ptr[0] == 0x5a);
+            custom_wb->Unmap(0, nullptr);
+            std::printf("upload buffer memory: %s; custom WRITE_BACK buffer: %s\n",
+                        in_vram ? "VRAM (Resizable BAR)" : "system memory",
+                        (wb_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "HOST_CACHED" : "uncached");
+        }
+
+        // No-ReBAR arena placement: a small arena (32 MiB, smaller than a discrete GPU's 214-256 MiB BAR1 window)
+        // stays out of DEVICE_LOCAL memory when upload_in_vram is false (no Resizable BAR or LEONIDA_UPLOAD_SYSMEM=1),
+        // and uses DEVICE_LOCAL when upload_in_vram is true; a device without an arena reports 0 flags.
+        {
+            Ref<ID3D12Device> probe;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&probe.p))));
+            const rt::d3d12::VulkanDeviceInfo* probe_info = rt::d3d12::vulkan_device_info(probe.p);
+            EXPECT(probe_info != nullptr);
+            if (probe_info && probe_info->buffer_device_address) {
+                constexpr std::uint64_t small_limit = 32ull << 20;
+                rt::d3d12::VulkanDeviceInfo small_info = *probe_info;
+                small_info.max_memory_allocation_size = small_limit;
+                small_info.bindless = false;
+                Ref<ID3D12Device> small_dev;
+                EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(small_info, IID_PPV_ARGS(&small_dev.p))));
+                const std::uint64_t arena_bytes = rt::d3d12::device_arena_size(small_dev.p);
+                EXPECT(arena_bytes > 0 && arena_bytes <= small_limit);
+                const VkMemoryPropertyFlags arena_flags = rt::d3d12::device_arena_memory_flags(small_dev.p);
+                EXPECT((arena_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                       (arena_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+                const auto get_mem = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+                    small_info.get_instance_proc(small_info.instance, "vkGetPhysicalDeviceMemoryProperties"));
+                EXPECT(get_mem != nullptr);
+                VkPhysicalDeviceMemoryProperties mem{};
+                get_mem(small_info.physical, &mem);
+                bool sysmem_before_bar = false;
+                for (std::uint32_t i = 0; i < mem.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+                    const VkMemoryType& t = mem.memoryTypes[i];
+                    if ((t.propertyFlags &
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
+                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                        continue;
+                    if (t.heapIndex >= mem.memoryHeapCount || mem.memoryHeaps[t.heapIndex].size < arena_bytes)
+                        continue;
+                    sysmem_before_bar = (t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0;
+                    break;
+                }
+                const bool in_vram = rt::d3d12::device_upload_in_vram(small_dev.p);
+                if (in_vram) EXPECT(arena_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                else if (sysmem_before_bar) EXPECT(!(arena_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+
+                rt::d3d12::VulkanDeviceInfo no_arena_info = *probe_info;
+                no_arena_info.buffer_device_address = false;
+                no_arena_info.bindless = false;
+                Ref<ID3D12Device> no_arena_dev;
+                EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(no_arena_info, IID_PPV_ARGS(&no_arena_dev.p))));
+                EXPECT(rt::d3d12::device_arena_size(no_arena_dev.p) == 0);
+                EXPECT(rt::d3d12::device_arena_memory_flags(no_arena_dev.p) == 0);
+                std::printf("small arena (%llu MiB): %s\n", static_cast<unsigned long long>(arena_bytes >> 20),
+                            (arena_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "DEVICE_LOCAL" : "system memory");
+            }
         }
 
         // Views into the heaps.

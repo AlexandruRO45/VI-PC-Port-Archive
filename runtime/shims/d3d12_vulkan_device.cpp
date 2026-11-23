@@ -655,6 +655,7 @@ struct DeviceState {
         VkDeviceAddress address = 0;
         VkDeviceSize size = 0;
         std::uint32_t memory_type = 0;
+        VkMemoryPropertyFlags memory_flags = 0;
         std::mutex mutex;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
 
@@ -1820,11 +1821,15 @@ public:
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
-        // Readback buffers prefer cached memory, which the CPU reads quickly. Upload buffers prefer VRAM the CPU
-        // writes through Resizable BAR, where the GPU reads them quickly (D3D-96); without it, system memory.
+        // Readback and custom WRITE_BACK buffers prefer cached memory, which the CPU reads quickly. Upload buffers
+        // prefer VRAM the CPU writes through Resizable BAR, where the GPU reads them quickly (D3D-96); without it,
+        // system memory.
+        const bool host_readable = heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                   (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                    heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
         VkMemoryPropertyFlags host_preferred = 0;
-        if (heap_.Type == D3D12_HEAP_TYPE_READBACK) host_preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_in_vram)
+        if (host_readable) host_preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        else if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_in_vram)
             host_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         memory_ = host ? device_.allocate(requirements,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -1837,8 +1842,7 @@ public:
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
             va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
-            device_.log_va(heap_.Type == D3D12_HEAP_TYPE_READBACK ? "readback buffer" : "upload buffer", va_,
-                           desc_.Width);
+            device_.log_va(host_readable ? "readback buffer" : "upload buffer", va_, desc_.Width);
         }
         if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
@@ -1872,9 +1876,7 @@ public:
         binding.buffer = buffer_;
         binding.size = desc_.Width;
         binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(mapped_) : nullptr;
-        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
-                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
-                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+        binding.host_readable = host_readable;
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         // Committed resources start zeroed unless the heap says otherwise; the host cannot reach device-local memory,
@@ -2633,7 +2635,7 @@ public:
             if (!image) memory_types = device_.sparse_buffer_memory_types;
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
                                                     memory_types};
-            const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+            const auto memory = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                                   nullptr, !image, &memory_type);
             if (!memory) return {};
             image_tiles_ = image;
@@ -5156,9 +5158,14 @@ public:
                                  "device's %s\n",
                          static_cast<unsigned long long>(size.bytes >> 20),
                          static_cast<unsigned long long>(size.requested >> 20), leonida::arena_cap_name(size.capped));
+        // Without Resizable BAR (or with LEONIDA_UPLOAD_SYSMEM), keep the arena in system memory rather than
+        // preferring DEVICE_LOCAL, which would otherwise consume a discrete GPU's small 214-256 MiB BAR1 window
+        // whenever LEONIDA_ARENA_MB (or maxMemoryAllocationSize) fits inside it.
+        const VkMemoryPropertyFlags arena_preferred =
+            state_.upload_in_vram ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0;
         arena.memory = state_.allocate(requirements,
                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
+                                       arena_preferred, &arena.memory_flags, true, &arena.memory_type);
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
@@ -5168,6 +5175,7 @@ public:
             if (arena.memory) vk.vkFreeMemory(state_.info.device, arena.memory, nullptr);
             arena.buffer = VK_NULL_HANDLE;
             arena.memory = VK_NULL_HANDLE;
+            arena.memory_flags = 0;
             return false;
         }
         arena.mapped = static_cast<std::uint8_t*>(mapped);
@@ -8470,6 +8478,14 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
     return d ? d->state().arena.size : 0;
+}
+
+VkMemoryPropertyFlags device_arena_memory_flags(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    return d ? d->state().arena.memory_flags : 0;
 }
 
 namespace {
