@@ -381,6 +381,22 @@ compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders 
 capabilities first: they enable `shaderInt64` only for one that declares `Int64` (or `Int64Atomics`), and report 77
 (SKIP, with the reason) when the device lacks it.
 
+## GPUs without a geometry stage (Apple GPUs)
+
+Metal has no geometry stage, so MoltenVK and KosmicKrisp report no `geometryShader` and the `gs_*` tests skip. To
+run them through the capture path instead (`docs/design.md`, "Geometry shaders"), set `LEONIDA_GS_COMPUTE=1` for
+`run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1` on a 32-wide GPU (every geometry shader in the corpus is
+wave64). The shaders are then translated with `--gs-compute`, which publishes the capture module next to the native
+one, and `tools/gs_compute_stages.py` writes the scatter and the record-driven vertex shader; the device needs
+`bufferDeviceAddress` and, for a module that declares it, `shaderInt64`, as for `--mesh-compute`. `gs_tri` then
+runs four ways -- non-indexed, u16 indices, u16 indices with a base vertex, and permuted u32 indices -- and each
+must draw 4096/4096 pixels exact.
+
+`runtime/test/vk_gs_fallback_test` (CMake builds it with the runtime tests when glslang, spirv-dis and Python 3 are
+available) drives the D3D12 layer's command sequence -- the fused fetch dispatch, the capture dispatch, the
+barriers and the record-driven draw -- through `vulkan_replay` against the glslang fixtures `gs_double.geom` and
+`vs_pair.vert`, and prints `non-indexed, u16 and u32 all drew the doubled quad: 64x64 pixels exact`.
+
 ## Without a GPU: Mesa llvmpipe
 
 Mesa's llvmpipe is a software Vulkan driver (`mesa-vulkan-drivers` on Debian and Ubuntu). CI runs the suite on it
