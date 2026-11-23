@@ -737,6 +737,8 @@ def run_suite(a, work: str) -> int:
         cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
         if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
             cmd.append("--wave64-emulate")
+        if os.environ.get("LEONIDA_LDS_WAVE_ORDER") == "1":   # subgroup barriers between LDS accesses of one wave
+            cmd += ["--lds-wave-order", "on"]
         if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
             cmd.append("--bary-fallback")
         if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
