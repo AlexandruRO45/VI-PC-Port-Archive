@@ -117,8 +117,9 @@ python -I make_game.py --wave64-emulate off            # auto (par défaut), on 
 
 Les étapes s'exécutent dans cet ordre : `check` → `shaders` → `assets` → `runtime` → `pipelines`. L'étape
 `pipelines` crée chaque shader traduit avec le pilote de votre GPU, vérifie qu'il compile, signale ceux qu'elle doit
-ignorer et enregistre un cache de pipelines dans `pipeline_cache.bin` (dans `--out`) ; le runtime ne charge pas
-encore ce cache.
+ignorer et enregistre un cache de pipelines dans `pipeline_cache.bin` (dans `--out`, à côté de `gta6rt.exe`) ; le
+runtime amorce son `VkPipelineCache` avec ce fichier quand son en-tête correspond au périphérique Vulkan, donc le
+démarrage suivant ne les recompile pas.
 
 - **`--wave64-emulate`** : traduit les shaders compute et mesh wave64 de façon exacte quelle que soit la taille des
   sous-groupes du GPU. Les GPU NVIDIA et Intel ont des sous-groupes de 32 et en ont besoin. La valeur par défaut,
