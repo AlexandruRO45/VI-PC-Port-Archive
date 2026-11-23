@@ -10,6 +10,7 @@ As a tool:
 tries every pattern table whose name has the --modes part (64K by default; 4K, 256, S_X, ...) and configuration
 for that element size, each with its own block size, scores each by image smoothness, and renders the best. As a
 module, `detile(data, pattern, bpe, wb, hb, block_bytes)` returns linear blocks.
+numpy is imported lazily, so `--help` works on a checkout without it.
 """
 import argparse
 import os
