@@ -51,7 +51,7 @@ public partial class LeonidaView : UserControl
         else
         {
             action = MainAction.Build;
-            MainButton.Content = install?.RuntimeBuilt == true ? Loc.T("UPDATE BUILD") : (Loc.Polish ? "ZBUDUJ" : "BUILD");
+            MainButton.Content = install?.RuntimeBuilt == true ? Loc.T("UPDATE BUILD") : Loc.BuildLabel;
             Status.Text = !state.HasRepo ? Loc.T("Leonida.exe needs to be next to Build.bat in your Leonida folder (or choose the folder in Settings).")
                 : install?.RuntimeBuilt == true ? Why(install.WhyNotPlayable)
                 : Loc.T("Builds the PC port from your own copy of the game, on this PC.");

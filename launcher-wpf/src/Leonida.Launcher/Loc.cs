@@ -7,45 +7,72 @@ using System.Windows.Markup;
 namespace Leonida.Launcher;
 
 /// <summary>
-/// The launcher's languages: English (the text as written) and Polish. Static text in the XAML is translated when a
-/// window loads (<see cref="Apply"/> walks it and swaps any string it has a translation for; bound values are left
-/// alone); text made in code goes through <see cref="T"/> and <see cref="F"/>. Changing the language reloads the
+/// The launcher's languages: English (the text as written), Polish and Russian. Static text in the XAML is translated
+/// when a window loads (<see cref="Apply"/> walks it and swaps any string it has a translation for; bound values are
+/// left alone); text made in code goes through <see cref="T"/> and <see cref="F"/>. Changing the language reloads the
 /// window. README pages, make_game.py's output and other people's names stay as they are.
 /// </summary>
-public static class Loc
+public static partial class Loc
 {
-    public static readonly (string Code, string Name)[] Languages = [("en", "English"), ("pl", "Polski")];
+    public static readonly (string Code, string Name)[] Languages =
+        [("en", "English"), ("pl", "Polski"), ("ru", "Русский")];
     static string language = "en";
 
-    /// <summary>"en" or "pl". Numbers, dates and sizes follow it too (1.0 GB / 1,0 GB), not the Windows locale.</summary>
+    /// <summary>"en", "pl" or "ru". Numbers, dates and sizes follow it too (1.0 GB / 1,0 GB), not the Windows locale.</summary>
     public static string Language
     {
         get => language;
         set
         {
             language = value;
-            var culture = System.Globalization.CultureInfo.GetCultureInfo(value == "pl" ? "pl-PL" : "en-US");
+            var culture = System.Globalization.CultureInfo.GetCultureInfo(value switch
+            {
+                "pl" => "pl-PL",
+                "ru" => "ru-RU",
+                _ => "en-US",
+            });
             System.Globalization.CultureInfo.DefaultThreadCurrentCulture = culture;
             System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = culture;
             System.Globalization.CultureInfo.CurrentCulture = culture;
             System.Globalization.CultureInfo.CurrentUICulture = culture;
         }
     }
-    public static bool Polish => Language == "pl";
 
-    public static string T(string en) => Polish && Pl.TryGetValue(en, out var p) ? p : en;
+    /// <summary>The dictionary for the current language, or null for English (the text as it is written in the UI).</summary>
+    static Dictionary<string, string>? Map => Language switch
+    {
+        "pl" => Pl,
+        "ru" => Ru,
+        _ => null,
+    };
+
+    /// <summary>
+    /// The main button's verb, which is an action ("build it") rather than the BUILD tab's noun, so it needs a word
+    /// of its own in each language.
+    /// </summary>
+    public static string BuildLabel => Language switch
+    {
+        "pl" => "ZBUDUJ",
+        "ru" => "СОБРАТЬ",
+        _ => "BUILD",
+    };
+
+    public static string T(string en) => Map is { } map && map.TryGetValue(en, out var t) ? t : en;
     public static string F(string en, params object?[] args) => string.Format(T(en), args);
 
     /// <summary>Translates every static string under <paramref name="root"/> (logical tree, tooltips, context menus,
     /// list columns).</summary>
     public static void Apply(DependencyObject root)
     {
-        if (!Polish) return;
+        if (Map is not { } map) return;
         var seen = new HashSet<DependencyObject>();
-        Walk(root, seen);
+        Walk(root, seen, map);
+        // Templates and bound lists are built after the window is loaded, so the same walk runs once more then.
+        if (root is FrameworkElement { IsLoaded: false } fe)
+            fe.Loaded += (_, _) => Walk(root, new HashSet<DependencyObject>(), map);
     }
 
-    static void Walk(DependencyObject d, HashSet<DependencyObject> seen)
+    static void Walk(DependencyObject d, HashSet<DependencyObject> seen, Dictionary<string, string> map)
     {
         if (!seen.Add(d)) return;
         switch (d)
@@ -53,35 +80,42 @@ public static class Loc
             case TextBlock tb when !BindingOperations.IsDataBound(tb, TextBlock.TextProperty):
                 // Text set as an attribute leaves Inlines empty, so the whole text is looked up first; text made of
                 // several runs (some bold, some bound) is translated run by run.
-                if (Pl.TryGetValue(tb.Text, out var t)) tb.Text = t;
-                else foreach (var i in tb.Inlines.ToList()) Walk(i, seen);
+                if (map.TryGetValue(tb.Text, out var t)) tb.Text = t;
+                else foreach (var i in tb.Inlines.ToList()) Walk(i, seen, map);
                 break;
             case Run r when !BindingOperations.IsDataBound(r, Run.TextProperty):
-                if (Pl.TryGetValue(r.Text, out var rt)) r.Text = rt;
+                if (map.TryGetValue(r.Text, out var rt)) r.Text = rt;
                 break;
             case HeaderedItemsControl h when h.Header is string hs && !BindingOperations.IsDataBound(h, HeaderedItemsControl.HeaderProperty):
-                if (Pl.TryGetValue(hs, out var ht)) h.Header = ht;
+                if (map.TryGetValue(hs, out var ht)) h.Header = ht;
                 break;
             case HeaderedContentControl hc when hc.Header is string hcs:
-                if (Pl.TryGetValue(hcs, out var hct)) hc.Header = hct;
+                if (map.TryGetValue(hcs, out var hct)) hc.Header = hct;
                 break;
             case ContentControl cc when cc.Content is string cs && !BindingOperations.IsDataBound(cc, ContentControl.ContentProperty):
-                if (Pl.TryGetValue(cs, out var ct)) cc.Content = ct;
+                if (map.TryGetValue(cs, out var ct)) cc.Content = ct;
                 break;
-            case Window w when Pl.TryGetValue(w.Title, out var wt):
+            case Window w when map.TryGetValue(w.Title, out var wt):
                 w.Title = wt;
                 break;
         }
         if (d is FrameworkElement fe)
         {
-            if (fe.ToolTip is string tip && Pl.TryGetValue(tip, out var tt)) fe.ToolTip = tt;
-            if (fe.ContextMenu != null) Walk(fe.ContextMenu, seen);
+            if (fe.ToolTip is string tip && map.TryGetValue(tip, out var tt)) fe.ToolTip = tt;
+            // The name screen readers announce is a string of its own; it is written next to many tooltips.
+            var said = System.Windows.Automation.AutomationProperties.GetName(d);
+            if (!string.IsNullOrEmpty(said) && map.TryGetValue(said, out var saidT)) System.Windows.Automation.AutomationProperties.SetName(d, saidT);
+            if (fe.ContextMenu != null) Walk(fe.ContextMenu, seen, map);
             if (fe is ListView { View: GridView gv })
                 foreach (var col in gv.Columns)
-                    if (col.Header is string ch && Pl.TryGetValue(ch, out var cht)) col.Header = cht;
+                    if (col.Header is string ch && map.TryGetValue(ch, out var cht)) col.Header = cht;
         }
         foreach (var child in LogicalTreeHelper.GetChildren(d))
-            if (child is DependencyObject c) Walk(c, seen);
+            if (child is DependencyObject c) Walk(c, seen, map);
+        // Template parts (the title bar's buttons, list rows) are only in the visual tree, so it is walked too.
+        if (d is System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D)
+            for (int i = 0, n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(d); i < n; i++)
+                Walk(System.Windows.Media.VisualTreeHelper.GetChild(d, i), seen, map);
     }
 
     /// <summary>{l:T text} for text inside templates, which the walk can't reach.</summary>
@@ -91,7 +125,7 @@ public static class Loc
         public override object ProvideValue(IServiceProvider serviceProvider) => T(text);
     }
 
-    // English as written → Polish.
+    // English as written → Polish. The Russian ones live next door, in Loc.Ru.cs.
     static readonly Dictionary<string, string> Pl = new()
     {
         // ---- window, sidebar, navbar
@@ -547,5 +581,16 @@ public static class Loc
         ["Partial {0} comparison"] = "Częściowe porównanie z {0}",
         ["Uncertain {0} comparison"] = "Niepewne porównanie z {0}",
         ["Your PC is outside Leonida’s x64 target"] = "Twój PC nie jest platformą x64, na którą celuje Leonida",
+
+        // ---- announced by screen readers
+        ["Build progress"] = "Postęp budowania",
+        ["Choose stages"] = "Wybierz etapy",
+        ["Everything"] = "Wszystko",
+        ["Game folder"] = "Folder gry",
+        ["Library Leonida"] = "Biblioteka Leonida",
+        ["Output folder"] = "Folder wynikowy",
+        ["Play options"] = "Opcje gry",
+        ["Python"] = "Python",
+        ["Ready to run"] = "Gotowe do uruchomienia",
     };
 }
