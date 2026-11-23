@@ -116,6 +116,28 @@ bool trace_enabled() {
     return enabled;
 }
 
+// Strict console slots (set_strict_console_slots; gta6rt turns them on before the title's code runs). The console
+// device keeps the PC order through the base ID3D12Device chain (slots 3-43) and diverges past it: 48, 62, 67, 73, 76
+// and 78-80 are console methods at the indices of unrelated PC methods. Measured with the retail 1.0.2.1 executable:
+// device slot 70, forwarded to the PC slot 70 (ID3D12Device8::CreatePlacedResource1), took one of the title's words for
+// its output pointer and wrote into the title's code. So, while strict slots are on, a slot past 43 that the proxy
+// neither handles nor routes is refused with E_NOTIMPL and one line with its first four words, and nothing reaches the
+// PC device. LEONIDA_XS_FORWARD_UNCONFIRMED=1 keeps the old forwarding (for experiments).
+constexpr unsigned kLastConfirmedSlot = 43;  // ID3D12Device::GetAdapterLuid, the end of the base chain
+std::atomic<bool> g_strict_console_slots{false};
+std::atomic<bool> g_unconfirmed_warned[kMaxSlots];
+
+HRESULT refuse_unconfirmed(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
+    if (slot < kMaxSlots && first_call(g_unconfirmed_warned[slot]))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot %u is not confirmed against the console ABI (the PC slot %u is not "
+                     "known to match); refused with E_NOTIMPL, nothing forwarded (args 0x%llx 0x%llx 0x%llx 0x%llx; "
+                     "LEONIDA_XS_FORWARD_UNCONFIRMED=1 forwards it)\n",
+                     slot, slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+    return E_NOTIMPL;
+}
+
 const char* slot_name(unsigned slot) {
     switch (slot) {
         case 0: return "QueryInterface";
@@ -1560,6 +1582,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
+        // Past the base chain, a slot nothing above handled or routed is not known to be the PC method of that index.
+        if constexpr (Slot > kLastConfirmedSlot) {
+            if (g_strict_console_slots.load(std::memory_order_relaxed))
+                return hr_to_u64(refuse_unconfirmed(Slot, a1, a2, a3, a4));
+        }
+
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -1836,6 +1864,7 @@ bool heap_slot_first_call_seen(unsigned slot) {
 void reset_device_proxy_stats() {
     start_hit_counts();
     for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
+        g_unconfirmed_warned[slot].store(false, std::memory_order_relaxed);
         g_hits[slot].store(0, std::memory_order_relaxed);
         g_first[slot].store(false, std::memory_order_relaxed);
         g_beyond_warned[slot].store(false, std::memory_order_relaxed);
@@ -1848,5 +1877,22 @@ void reset_device_proxy_stats() {
     reset_child_stats<ChildKind::fence>();
     reset_child_stats<ChildKind::allocator>();
 }
+
+bool set_strict_console_slots(bool strict) {
+    if (strict) {
+        char value[8] = {};
+        const DWORD length = GetEnvironmentVariableA("LEONIDA_XS_FORWARD_UNCONFIRMED", value, sizeof(value));
+        if (length > 0 && length < sizeof(value) && value[0] == '1' && value[1] == '\0') {
+            std::fprintf(stderr, "[rt] d3d12_xs: LEONIDA_XS_FORWARD_UNCONFIRMED=1: device slots past %u that the "
+                                 "proxy does not handle are forwarded to the PC methods of the same index\n",
+                         kLastConfirmedSlot);
+            strict = false;
+        }
+    }
+    g_strict_console_slots.store(strict, std::memory_order_relaxed);
+    return strict;
+}
+
+bool strict_console_slots() { return g_strict_console_slots.load(std::memory_order_relaxed); }
 
 }  // namespace rt::d3d12_xs

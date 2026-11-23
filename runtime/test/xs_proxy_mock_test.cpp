@@ -609,6 +609,53 @@ int check_alloc_failures() {
     return 0;
 }
 
+// ---- Strict console slots: past the base chain (43), a slot the proxy neither handles nor routes is refused ----
+// Its own process (--strict-slots): the switch is process-wide.
+
+int check_strict_slots() {
+    SetEnvironmentVariableA("LEONIDA_XS_FORWARD_UNCONFIRMED", nullptr);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 76);
+    // Off, the default for PC callers: slot 69 reaches the PC method of the same index.
+    EXPECT(!xs::strict_console_slots());
+    EXPECT(hr_of(raw(device, 69, 1, 2, 3, 4)) == S_OK && mock->calls[69] == 1);
+
+    // On: 44, 47 and 69 are refused without reaching the device.
+    EXPECT(xs::set_strict_console_slots(true) && xs::strict_console_slots());
+    EXPECT(hr_of(raw(device, 69, 1, 2, 3, 4)) == E_NOTIMPL && mock->calls[69] == 1);
+    EXPECT(hr_of(raw(device, 44)) == E_NOTIMPL && hr_of(raw(device, 47)) == E_NOTIMPL);
+    EXPECT(mock->calls[44] == 0 && mock->calls[47] == 0);
+    // The base chain is still forwarded, up to GetAdapterLuid (43), the last confirmed slot.
+    EXPECT(hr_of(raw(device, 30)) == S_OK && mock->calls[30] == 1);
+    EXPECT(hr_of(raw(device, 43)) == S_OK && mock->calls[43] == 1);
+    // Slots the proxy handles (75) or routes (48) past the base chain answer as before.
+    void* queue = nullptr;
+    EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK &&
+           xs::is_queue_proxy(queue) && mock->calls[48] == 0);
+    void* queue1 = nullptr;
+    EXPECT(hr_of(raw(device, 75, word(&kQueueDesc), 0, word(&kQueueIid), word(&queue1))) == S_OK &&
+           xs::is_queue_proxy(queue1) && mock->calls[75] == 1);
+    EXPECT(release(queue1) == 0 && release(queue) == 0);
+    // A slot past the PC vtable is refused as before (this device has 76 slots).
+    EXPECT(hr_of(raw(device, 77)) == E_NOTIMPL && mock->calls[77] == 0);
+
+    // LEONIDA_XS_FORWARD_UNCONFIRMED=1 keeps the forwarding; another value does not.
+    EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FORWARD_UNCONFIRMED", "1") != FALSE);
+    EXPECT(!xs::set_strict_console_slots(true) && !xs::strict_console_slots());
+    EXPECT(hr_of(raw(device, 69, 1, 2, 3, 4)) == S_OK && mock->calls[69] == 2);
+    EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FORWARD_UNCONFIRMED", "10") != FALSE);
+    EXPECT(xs::set_strict_console_slots(true));
+    EXPECT(hr_of(raw(device, 69, 1, 2, 3, 4)) == E_NOTIMPL && mock->calls[69] == 2);
+    SetEnvironmentVariableA("LEONIDA_XS_FORWARD_UNCONFIRMED", nullptr);
+    EXPECT(!xs::set_strict_console_slots(false));
+    EXPECT(hr_of(raw(device, 69, 1, 2, 3, 4)) == S_OK && mock->calls[69] == 3);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: strict console slots refuse unhandled slots past 43 (44, 47, 69), keep the base chain, the "
+                "handled and routed slots, and LEONIDA_XS_FORWARD_UNCONFIRMED=1 forwards\n", g_label);
+    return 0;
+}
+
 // ---- 6. Command allocators (device slot 9) ----
 
 int check_allocators() {
@@ -804,6 +851,15 @@ int run_env_slots(bool valid) {
         void* list = nullptr;
         EXPECT(hr_of(raw(device, 100, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);
+        // Strict console slots: a moved route still answers, and its default slot, now unrouted, is refused.
+        SetEnvironmentVariableA("LEONIDA_XS_FORWARD_UNCONFIRMED", nullptr);
+        EXPECT(xs::set_strict_console_slots(true));
+        void* queue2 = nullptr;
+        EXPECT(hr_of(raw(device, 99, word(&kQueueDesc), word(&kQueueIid), word(&queue2))) == S_OK &&
+               xs::is_queue_proxy(queue2) && mock->calls[99] == 0);
+        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == E_NOTIMPL && mock->calls[78] == 1);
+        EXPECT(!xs::set_strict_console_slots(false));
+        EXPECT(release(queue2) == 0);
         EXPECT(release(list) == 0);
         EXPECT(release(allocator) == 0);
         EXPECT(release(queue) == 0);
@@ -943,6 +999,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
+        if (std::strcmp(argv[1], "--strict-slots") == 0) return check_strict_slots();
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
         return run_fault_mode(argv[1]);
     }

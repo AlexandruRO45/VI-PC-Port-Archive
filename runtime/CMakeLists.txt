@@ -875,6 +875,8 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_no_reserve COMMAND xs_proxy_mock_test --fail-virtualalloc)
     add_test(NAME xs_proxy_mock_no_protect COMMAND xs_proxy_mock_test --fail-virtualprotect)
     add_test(NAME xs_proxy_mock_no_handler COMMAND xs_proxy_mock_test --fail-veh)
+    # Strict console slots are a process-wide switch.
+    add_test(NAME xs_proxy_mock_strict_slots COMMAND xs_proxy_mock_test --strict-slots)
     # The routes are read once per process, so each override case is its own test.
     add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)

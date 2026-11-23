@@ -31,7 +31,8 @@
 // Every other PC device slot is forwarded by a generated thunk that swaps `this` to the PC device. The proxy's
 // vtable therefore follows the PC device order, with slots 62 and 76 and the public HLE's 48/73/78/79/80 deliberately
 // shadowed. The full Xbox vtable order is not known from the spec; slots beyond the PC device's own vtable return
-// E_NOTIMPL and log once.
+// E_NOTIMPL and log once. While gta6rt runs a title, a slot past the base ID3D12Device chain (43) that the proxy
+// neither handles nor routes is refused the same way instead of being forwarded (set_strict_console_slots below).
 //
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
@@ -95,6 +96,17 @@ ID3D12Device* device_proxy_real_device(const void* device);
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
+
+// Strict console slots. The console device keeps the PC order through the base ID3D12Device chain (slots 3-43) and
+// diverges past it (48, 62, 67, 73, 76 and 78-80 are console methods at the indices of unrelated PC methods; slot 70,
+// forwarded to the PC CreatePlacedResource1, wrote into the retail title's code). While strict slots are on, a device
+// slot past 43 that the proxy neither handles (device_slot_overridden) nor routes is refused with E_NOTIMPL and one
+// log line with its first four argument words; nothing reaches the PC device. A slot past the PC vtable is refused as
+// before. gta6rt turns strict slots on before the image's code runs (--init, --run); PC callers, the tests included,
+// keep the forwarding unless they turn it on. LEONIDA_XS_FORWARD_UNCONFIRMED=1 keeps the forwarding even then.
+// Returns whether strict slots are now on.
+bool set_strict_console_slots(bool strict);
+bool strict_console_slots();
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.

@@ -32,6 +32,7 @@
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
+#include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
@@ -182,6 +183,9 @@ int wmain(int argc, wchar_t** argv) {
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
         std::exception_ptr init_failure;
         if (init || run) {
+            // The image calls the console device ABI: device slots not confirmed against it are refused, not
+            // forwarded to the PC method of the same index (d3d12_xs_device.h, set_strict_console_slots).
+            rt::d3d12_xs::set_strict_console_slots(true);
             try {
                 loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
                 std::printf("%zu module(s) initialised\n", loader.modules().size());
