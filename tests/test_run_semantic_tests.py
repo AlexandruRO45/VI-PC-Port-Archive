@@ -8,7 +8,9 @@ import io
 import os
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -70,6 +72,31 @@ class RunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS})
             self.assertEqual(run(tmp, "-j", "1")[0], 0)
+
+    def test_interrupt_stops_running_files_and_drops_the_queue(self):
+        slow = ("from pathlib import Path\n"
+                "import time\n"
+                "marker = Path(__file__).with_suffix('.started')\n"
+                "marker.touch()\n"
+                "time.sleep(6)\n"
+                "marker.with_suffix('.finished').touch()\n")
+        quick = "from pathlib import Path\nPath('queued.started').touch()\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_slow_a.py": slow, "test_slow_b.py": slow, "test_queued.py": quick})
+
+            def interrupt(_):
+                deadline = time.monotonic() + 5
+                while not all(os.path.isfile(os.path.join(tmp, f"test_slow_{name}.started"))
+                              for name in ("a", "b")):
+                    self.assertLess(time.monotonic(), deadline, "both test subprocesses must start")
+                    time.sleep(0.01)
+                raise KeyboardInterrupt
+
+            with patch.object(r.concurrent.futures, "as_completed", side_effect=interrupt):
+                code, _ = run(tmp, "-j", "2")
+            self.assertEqual(code, 130)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "queued.started")))
+            self.assertFalse(any(name.endswith(".finished") for name in os.listdir(tmp)))
 
     def test_an_empty_suite_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

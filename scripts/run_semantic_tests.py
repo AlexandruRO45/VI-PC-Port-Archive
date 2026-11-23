@@ -8,7 +8,8 @@ It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
-line, and exits 1 if a file fails or none is found. Standard library only.
+line, and exits 1 if a file fails or none is found. Interrupting a parallel run stops its workers and exits 130.
+Standard library only.
 """
 import argparse
 import concurrent.futures
@@ -17,6 +18,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 
@@ -32,13 +35,39 @@ def test_modules(directory):
     return names
 
 
-def run_module(directory, module, verbose):
-    """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
-    p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                       errors="replace")
-    ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
+class ModuleWorkers:
+    """Track subprocesses so an interrupt can stop active and queued files."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = set()
+        self.stopped = False
+
+    def run(self, directory, module, verbose):
+        """(return code, tests run, output) of unittest for one module."""
+        cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
+        # Wait on the process itself. An inherited output pipe could stay open after it exits.
+        with tempfile.TemporaryFile(mode="w+t", errors="replace", newline=None) as log:
+            with self.lock:
+                if self.stopped:
+                    return 130, 0, ""
+                proc = subprocess.Popen(cmd, cwd=directory, stdout=log, stderr=subprocess.STDOUT)
+                self.active.add(proc)
+            try:
+                code = proc.wait()
+            finally:
+                with self.lock:
+                    self.active.remove(proc)
+            log.seek(0)
+            out = log.read()
+        ran = re.search(r"^Ran (\d+) tests? in", out, re.M)
+        return code, int(ran.group(1)) if ran else 0, out
+
+    def stop(self):
+        with self.lock:
+            self.stopped = True
+            for proc in self.active:
+                proc.kill()
 
 
 def main(argv=None):
@@ -58,8 +87,10 @@ def main(argv=None):
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
     start, total, failed = time.monotonic(), 0, []
-    with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        jobs = {pool.submit(run_module, directory, m, a.verbose): m for m in modules}
+    workers = ModuleWorkers()
+    pool = concurrent.futures.ThreadPoolExecutor(a.jobs)
+    try:
+        jobs = {pool.submit(workers.run, directory, m, a.verbose): m for m in modules}
         for job in concurrent.futures.as_completed(jobs):
             code, ran, out = job.result()
             total += ran
@@ -68,6 +99,12 @@ def main(argv=None):
                 print(f"==== FAILED: {jobs[job]}\n{out}", flush=True)
             elif a.verbose:
                 print(f"==== {jobs[job]}\n{out}", flush=True)
+    except KeyboardInterrupt:
+        workers.stop()
+        print("Interrupted: stopped semantic test workers.", file=sys.stderr)
+        return 130
+    finally:
+        pool.shutdown(cancel_futures=True)
     took = time.monotonic() - start
     summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
