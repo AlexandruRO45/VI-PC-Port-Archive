@@ -72,7 +72,9 @@ public:
 
 private:
     bool admits(std::uint64_t weight) const {
-        return budget_ == 0 || in_flight_ == 0 || in_use_ + weight <= budget_;
+        // Written so neither side can wrap: in_use_ never exceeds budget_ unless a lone oversized compile is running,
+        // and then in_flight_ != 0 and the weight check fails first.
+        return budget_ == 0 || in_flight_ == 0 || (weight <= budget_ && in_use_ <= budget_ - weight);
     }
 
     void leave(std::uint64_t weight) {

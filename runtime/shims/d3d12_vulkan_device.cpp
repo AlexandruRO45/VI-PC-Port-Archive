@@ -3878,9 +3878,12 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
+        // Fetched before the gate: creating the cache (and loading its seed) is not the compile, so it holds no ticket.
+        const VkPipelineCache cache = device_.pipeline_cache();
         {
             // The title creates these on several job threads at once; the gate keeps the driver's compile memory
-            // inside a budget (src/compile_gate.h, LEONIDA_COMPILE_BUDGET_MIB).
+            // inside a budget (src/compile_gate.h, LEONIDA_COMPILE_BUDGET_MIB). The ticket covers the driver call and
+            // nothing else that can wait, so a marker placed around the call alone nests inside it.
             const leonida::CompileGate::Ticket ticket =
                 compute_compile_gate().enter(leonida::compile_weight(module_info.codeSize));
             if (ticket.waited()) {
@@ -3891,8 +3894,7 @@ public:
                                  "(LEONIDA_COMPILE_BUDGET_MIB; 0 turns the gate off)\n",
                                  static_cast<unsigned long long>(compute_compile_gate().budget() >> 20));
             }
-            if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
-                                            &pipeline_.pipeline) != VK_SUCCESS)
+            if (vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &pipeline_.pipeline) != VK_SUCCESS)
                 return E_FAIL;
         }
 
