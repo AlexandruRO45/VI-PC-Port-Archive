@@ -770,6 +770,30 @@ The compute path, end to end:
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
+  - **Unchanged state** (D3D-393): a draw skips each bind and set whose value an earlier draw of the same list left
+    bound: the pipeline, set 0, the push constants (compared as their 144 bytes), viewport, scissor, topology,
+    primitive restart, both stencil references, blend constants, each vertex-buffer slot and the index buffer
+    (`detail::BoundDrawState`). Vulkan keeps bound state for the life of the command buffer, per bind point, and a
+    rendering scope's begin and end, a barrier, a transfer or `vkCmdClearAttachments` leave it alone, so it carries
+    from one draw's scope to the next. What does disturb it:
+    - Binding a pipeline replaces the state it does not declare dynamic. Every PSO declares the six dynamic states a
+      draw sets, and the vertex-input stride when it has vertex bindings, so only a PSO without vertex input makes
+      the vertex buffers bind again after it (the strides they were bound with are invalid then).
+    - Set 0 and push constants stay valid across layouts compatible for them. Every graphics layout has one
+      push-constant range, `{push_stages, 0, 144}`, and set 0 is the device's one bindless set, so both are keyed on
+      the stage flags as well as the value.
+    - A command that binds, or runs a helper that does, forgets everything: a dispatch, direct or indirect (it pushes
+      constants with a layout not compatible for push constants with the graphics ones), `SetPredication` on a buffer
+      (the capture dispatch), a copy through the predicated-copy or depth24 pass, `ResolveQueryData`, the
+      acceleration-structure commands, and any command kind added later (`detail::keeps_draw_state` names the ones
+      that keep the state). Each list starts with nothing known, since the caller may record anything between two
+      lists.
+
+    In `replay_cpu_bench` a draw goes from 16 Vulkan calls to 7 (indexed: 17 to 8), and the frame from 8.30 calls
+    per command to 4.65. `replay_draw_state_test` counts the calls for each rule with mocks; `d3d12_draw_state_test`
+    renders draws that change and keep state around clears, a copy, a dispatch, a query resolve, a bundle and a
+    pipeline without vertex input, on the layer and on the host's D3D12 (default adapter and WARP); without the
+    re-bind after that pipeline, the validation layer reports `VUID-vkCmdDraw-pStrides-04913`.
   - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
 
   **Resources and heaps:**

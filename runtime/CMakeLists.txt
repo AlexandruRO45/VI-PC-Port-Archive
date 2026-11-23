@@ -2099,6 +2099,19 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_bundle_forbidden_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle_forbidden COMMAND d3d12_bundle_forbidden_test)
       set_tests_properties(d3d12_bundle_forbidden PROPERTIES SKIP_RETURN_CODE 77)
+      # Draw state the replay keeps from one draw to the next or sets again (D3D-393), against the host runtime and
+      # WARP: state changes between draws, clears, a copy, a dispatch, a query resolve, a bundle and a pipeline
+      # without vertex input.
+      add_executable(d3d12_draw_state_test test/d3d12_draw_state_test.cpp ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS}
+                     ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS_FULLSCREEN})
+      target_link_libraries(d3d12_draw_state_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_draw_state_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}"
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
+      target_compile_options(d3d12_draw_state_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_draw_state COMMAND d3d12_draw_state_test)
+      set_tests_properties(d3d12_draw_state PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()
@@ -2287,6 +2300,14 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # Draw state still bound from the last draw is not set again, and is forgotten where it may be disturbed
+    # (D3D-393), with CPU mocks (no GPU or game data).
+    add_executable(replay_draw_state_test test/replay_draw_state_test.cpp)
+    target_link_libraries(replay_draw_state_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_draw_state_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_draw_state COMMAND replay_draw_state_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)

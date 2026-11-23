@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <map>
@@ -743,12 +744,17 @@ struct ComputePipeline {
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
 // reads. code_base: as for compute (one per pipeline; two stages that both read theirs are refused, question 14).
+// Its dynamic state is what a draw sets: viewport, scissor, primitive topology, primitive restart, stencil reference
+// and blend constants, and the vertex-input binding stride when vertex_slots is not 0. emit keeps that state from
+// one draw to the next across pipeline binds (detail::BoundDrawState).
 struct GraphicsPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
+    // The layout's one push-constant range: these stages, the whole ShaderUserData. vkCmdPushConstants must name the
+    // same, and layouts with the same stages are compatible for push constants.
+    VkShaderStageFlags push_stages = 0;
     std::uint64_t code_base = 0;
-    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every draw; null: none
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound before a draw; null: none
     std::vector<VkFormat> color_formats;  // by render-target slot
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depth_aspects = 0;
@@ -2100,6 +2106,84 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
     if (tracker) tracker->set(a.id, range, layout);
 }
 
+// The draw state emit last recorded in the command buffer (D3D-393). A draw skips each bind and set whose value is
+// still bound: pipeline, set 0, push constants, the dynamic state, each vertex-buffer slot and the index buffer.
+// Vulkan keeps all of it for the life of the command buffer, per bind point; vkCmdBeginRendering and
+// vkCmdEndRendering, barriers, transfers and vkCmdClearAttachments leave it alone, so it carries over from one
+// draw's rendering scope to the next. What disturbs it, and what is done about it:
+//   - A graphics pipeline bind replaces the state the pipeline does not declare dynamic. Every pipeline declares
+//     the dynamic state a draw sets (GraphicsPipeline), so that survives pipeline changes, except the vertex-input
+//     stride, which a pipeline without vertex slots leaves static: binding one invalidates the strides the buffers
+//     were bound with, and every slot is bound again after it.
+//   - Set 0 stays bound across pipelines whose layouts are compatible for set 0 (the same set layout, as the set is
+//     the same, and the same push-constant range), and push constants across layouts compatible for push constants
+//     (the same range): both are keyed on push_stages as well as the values.
+//   - Everything else that may bind: a dispatch (it pushes with a compute layout, not compatible for push constants
+//     with the graphics ones; a pipeline, set and push constants of the compute bind point should leave the graphics
+//     ones alone, but nothing is assumed there), a helper the device records (counted dispatch, predicate capture,
+//     predicated copy, depth24 conversion, query resolves and sums, XDXR), and whatever the caller records between
+//     two lists. keeps_draw_state names the commands that bind nothing; any other one makes emit forget everything,
+//     and every emit starts with nothing known.
+struct BoundDrawState {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;  // set 0, bound with a layout whose push-constant stages are set_stages
+    VkShaderStageFlags set_stages = 0;
+    bool pushed = false;
+    VkShaderStageFlags push_stages = 0;
+    ShaderUserData push{};
+    bool dynamic = false;  // the values below are set
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    VkBool32 restart = VK_FALSE;
+    std::uint32_t stencil_front = 0, stencil_back = 0;
+    std::array<float, 4> blend{};
+    std::uint32_t vertex_slots = 0;  // bit per slot whose binding below is bound, stride included
+    std::array<VkBuffer, 32> vertex_buffers{};
+    std::array<VkDeviceSize, 32> vertex_offsets{}, vertex_sizes{}, vertex_strides{};
+    VkBuffer index_buffer = VK_NULL_HANDLE;  // null: none known
+    VkDeviceSize index_offset = 0;
+    VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+
+    void forget() {
+        pipeline = VK_NULL_HANDLE;
+        set = VK_NULL_HANDLE;
+        pushed = false;
+        dynamic = false;
+        vertex_slots = 0;
+        index_buffer = VK_NULL_HANDLE;
+    }
+};
+
+// Whether a command other than a draw leaves BoundDrawState as it is: it records only barriers, transfers, clears
+// (vkCmdClearAttachments neither uses nor sets bound state), resolves, labels, query begins and ends, indirect draws,
+// or the end of conditional rendering. Commands that bind or run a helper do not, nor does any kind not named here.
+inline bool keeps_draw_state(const Command& command, const Prepared& p) {
+    return std::visit(
+        [&](const auto& c) {
+            using T = std::decay_t<decltype(c)>;
+            if constexpr (std::is_same_v<T, TransitionBarrier> || std::is_same_v<T, UavBarrier> ||
+                          std::is_same_v<T, AliasingBarrier> || std::is_same_v<T, GlobalBarrier> ||
+                          std::is_same_v<T, BufferBarrier> || std::is_same_v<T, TextureBarrier> ||
+                          std::is_same_v<T, ClearRenderTarget> || std::is_same_v<T, ClearDepthStencil> ||
+                          std::is_same_v<T, ClearUnorderedAccess> || std::is_same_v<T, ResolveSubresource> ||
+                          std::is_same_v<T, DiscardResource> || std::is_same_v<T, WriteImmediate> ||
+                          std::is_same_v<T, AtomicCopyBuffer> || std::is_same_v<T, BeginQuery> ||
+                          std::is_same_v<T, EndQuery> || std::is_same_v<T, DebugMarker>)
+                return true;
+            else if constexpr (std::is_same_v<T, CopyBuffer> || std::is_same_v<T, CopyTexture> ||
+                               std::is_same_v<T, CopyResource>)
+                return p.predicated_copy.empty() && !p.has_depth24;  // or a helper dispatch runs
+            else if constexpr (std::is_same_v<T, Predication>)
+                return !c.buffer;  // a new predicate is captured by a helper dispatch
+            else if constexpr (std::is_same_v<T, ExecuteIndirect>)
+                return c.kind != IndirectKind::dispatch;
+            else
+                return false;
+        },
+        command);
+}
+
 } // namespace detail
 
 // Destination and source of a copy or resolve command.
@@ -3106,9 +3190,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
 
+    // What earlier draws of this list left bound; the caller may record anything before the list, so nothing yet.
+    detail::BoundDrawState bound;
+
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (!std::holds_alternative<Draw>(command) && !detail::keeps_draw_state(command, p)) bound.forget();
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;
@@ -3772,41 +3860,98 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
             vk.begin_rendering(command_buffer, &rendering);
 
+            // Each bind or set is skipped when its value is still bound (detail::BoundDrawState).
+            if (bound.pipeline != d.pipeline) {
+                vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+                bound.pipeline = d.pipeline;
+                if (!graphics.vertex_slots) bound.vertex_slots = 0;  // its static strides replace the bound ones
+            }
+            if (graphics.bindless_set &&
+                (bound.set != graphics.bindless_set || bound.set_stages != graphics.push_stages)) {
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
+                                        &graphics.bindless_set, 0, nullptr);
+                bound.set = graphics.bindless_set;
+                bound.set_stages = graphics.push_stages;
+            }
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
-            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
-            if (graphics.bindless_set)
-                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
-                                        &graphics.bindless_set, 0, nullptr);
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            if (!bound.pushed || bound.push_stages != graphics.push_stages ||
+                std::memcmp(&bound.push, &data, sizeof(data)) != 0) {
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+                bound.pushed = true;
+                bound.push_stages = graphics.push_stages;
+                bound.push = data;
+            }
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             const Viewport& v = draw->viewport;
             const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            vk.set_viewport(command_buffer, 0, 1, &viewport);
             const Rect& s = draw->scissor;
             const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
             const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
-            vk.set_primitive_topology(command_buffer, topology);
-            const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                 ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
-                                  (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
-            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
-            vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            const VkBool32 restart = draw->indexed && detail::strip_topology(topology) &&
+                                             ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
+                                              (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32))
+                                         ? VK_TRUE
+                                         : VK_FALSE;
+            // Values compare as bytes: a NaN matches itself, and -0 and +0 differ, so a skip never changes a value.
+            const bool known = bound.dynamic;
+            if (!known || std::memcmp(&bound.viewport, &viewport, sizeof(viewport)) != 0) {
+                vk.set_viewport(command_buffer, 0, 1, &viewport);
+                bound.viewport = viewport;
+            }
+            if (!known || std::memcmp(&bound.scissor, &scissor, sizeof(scissor)) != 0) {
+                vk.set_scissor(command_buffer, 0, 1, &scissor);
+                bound.scissor = scissor;
+            }
+            if (!known || bound.topology != topology) {
+                vk.set_primitive_topology(command_buffer, topology);
+                bound.topology = topology;
+            }
+            if (!known || bound.restart != restart) {
+                vk.set_primitive_restart_enable(command_buffer, restart);
+                bound.restart = restart;
+            }
+            if (!known || bound.stencil_front != draw->stencil_front) {
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
+                bound.stencil_front = draw->stencil_front;
+            }
+            if (!known || bound.stencil_back != draw->stencil_back) {
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
+                bound.stencil_back = draw->stencil_back;
+            }
+            if (!known || std::memcmp(bound.blend.data(), draw->blend_factor.data(), sizeof(bound.blend)) != 0) {
+                vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+                bound.blend = draw->blend_factor;
+            }
+            bound.dynamic = true;
             for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
                 if (!d.vertex_buffers[slot]) continue;
+                if ((bound.vertex_slots & (1u << slot)) && bound.vertex_buffers[slot] == d.vertex_buffers[slot] &&
+                    bound.vertex_offsets[slot] == d.vertex_offsets[slot] &&
+                    bound.vertex_sizes[slot] == d.vertex_sizes[slot] &&
+                    bound.vertex_strides[slot] == d.vertex_strides[slot])
+                    continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
+                bound.vertex_slots |= 1u << slot;
+                bound.vertex_buffers[slot] = d.vertex_buffers[slot];
+                bound.vertex_offsets[slot] = d.vertex_offsets[slot];
+                bound.vertex_sizes[slot] = d.vertex_sizes[slot];
+                bound.vertex_strides[slot] = d.vertex_strides[slot];
             }
             if (draw->indexed) {
-                vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+                if (bound.index_buffer != d.index_buffer || bound.index_offset != d.index_offset ||
+                    bound.index_type != d.index_type) {
+                    vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+                    bound.index_buffer = d.index_buffer;
+                    bound.index_offset = d.index_offset;
+                    bound.index_type = d.index_type;
+                }
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);
             } else {
