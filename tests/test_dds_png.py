@@ -8,6 +8,7 @@ import io
 import os
 import struct
 import tempfile
+import tracemalloc
 import unittest
 import zlib
 
@@ -454,6 +455,26 @@ class Packed16Tests(unittest.TestCase):
                         dds.decode_dds(dds_buffer(1, 2, payload[:-1], pitch=4, **header))
                     with self.assertRaisesRegex(dds.DdsError, "pitch"):
                         dds.decode_dds(dds_buffer(1, 2, payload, pitch=1, **header))
+
+    @unittest.skipIf(tracemalloc.is_tracing(), "requires an isolated tracemalloc session")
+    def test_tall_padded_rgb_uses_bounded_temporary_memory(self):
+        height = 16384
+        for dxgi, pixel in ((85, b"\x00\xf8"), (28, b"\xff\x00\x00\xff")):
+            with self.subTest(dxgi=dxgi):
+                row = pixel + b"\xee" * len(pixel)
+                data = dds_buffer(1, height, row * (height - 1) + pixel, flags=DDPF_FOURCC,
+                                  fourcc=b"DX10", dxgi=dxgi, pitch=len(row))
+                # Input construction and expected-pixel allocation are outside the measurement.
+                tracemalloc.start()
+                try:
+                    width, h, rgba = dds.decode_dds(data)
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual((width, h), (1, height))
+                self.assertEqual(rgba, b"\xff\x00\x00\xff" * height)
+                # A generous 1 MiB budget for 64 KiB of output; retaining a view per row exceeds it.
+                self.assertLess(peak, 16 * len(rgba), f"padded RGB decode peaked at {peak} bytes")
 
     def test_zero_or_unflagged_pitch_is_tightly_packed(self):
         for dxgi, _, _, words, expected in self.CASES:

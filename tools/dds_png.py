@@ -320,7 +320,11 @@ def _decode_uncompressed_rgb(
     if pitch == row_bytes:
         src = bytes(payload[:expected])
     else:
-        src = b"".join(payload[start : start + row_bytes] for start in range(0, height * pitch, pitch))
+        src = bytearray(height * row_bytes)
+        for row in range(height):
+            start = row * pitch
+            src[row * row_bytes : (row + 1) * row_bytes] = payload[start : start + row_bytes]
+        src = bytes(src)
 
     if pixel_bytes == 4 and (masks is None or masks in _CANONICAL_MASKS):
         if fmt == "RGBA8":
