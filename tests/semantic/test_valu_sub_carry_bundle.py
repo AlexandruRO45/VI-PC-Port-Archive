@@ -428,5 +428,54 @@ class VSubrevCoU32TranslatorIntegrationTests(unittest.TestCase):
             translate_lines("ps_neg_subrev_co", prog)
 
 
+class VSubCoCiU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_sub_co_ci_u32 with translator execution."""
+
+    def test_subtraction_with_borrow_in_zero(self):
+        out = run_prog([
+            "v_mov_b32 v0, 40",
+            "v_mov_b32 v1, 15",
+            "v_sub_co_u32 v2, vcc, 1, 0",  # sets vcc borrow = 0
+            "v_sub_co_ci_u32 v3, vcc, v0, v1, vcc",
+            "v_mov_b32 v0, v3",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        d, b = ref_sub_co_ci_u32(40, 15, 0)
+        self.assertEqual(out[0], d)
+        self.assertEqual(out[1], b)
+        self.assertEqual(out[0], 25)
+        self.assertEqual(out[1], 0)
+
+    def test_subtraction_with_borrow_in_one(self):
+        out = run_prog([
+            "v_mov_b32 v0, 40",
+            "v_mov_b32 v1, 15",
+            "v_sub_co_u32 v2, vcc, 0, 1",  # sets vcc borrow = 1
+            "v_sub_co_ci_u32 v3, vcc, v0, v1, vcc",
+            "v_mov_b32 v0, v3",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        d, b = ref_sub_co_ci_u32(40, 15, 1)
+        self.assertEqual(out[0], d)
+        self.assertEqual(out[1], b)
+        self.assertEqual(out[0], 24)
+        self.assertEqual(out[1], 0)
+
+    def test_borrow_chain_propagation(self):
+        out = run_prog([
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0",
+            "v_sub_co_u32 v2, vcc, 0, 1",  # borrow in = 1
+            "v_sub_co_ci_u32 v3, vcc, v0, v1, vcc",
+            "v_mov_b32 v0, v3",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        d, b = ref_sub_co_ci_u32(0, 0, 1)
+        self.assertEqual(out[0], d)
+        self.assertEqual(out[1], b)
+        self.assertEqual(out[0], 0xFFFFFFFF)
+        self.assertEqual(out[1], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
