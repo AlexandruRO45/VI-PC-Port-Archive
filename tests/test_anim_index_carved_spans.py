@@ -126,6 +126,40 @@ class CarvedSpansTests(unittest.TestCase):
                 archive, carved, _ = self.carve(payloads, [6] * len(payloads), [0] * len(payloads))
                 self.assert_parity(archive, carved, expected_bytes, entries)
 
+    def test_one_byte_overlap_cannot_bridge_an_archive_gap(self):
+        blob = rig_resource()
+        archive, carved, manifest = self.carve([blob[:CHUNK], blob[CHUNK:]], [0, 6], [32, 0])
+        self.assert_parity(archive, carved, CHUNK, 0)
+        path = carved / "index.json"
+        for next_metadata in ("matching", "missing", "invalid"):
+            with self.subTest(next_metadata=next_metadata):
+                changed = copy.deepcopy(manifest)
+                first, following = changed["files"]
+                first["stored"] = following["off"] - first["off"] + 1
+                if next_metadata == "missing":
+                    changed["files"].pop()
+                elif next_metadata == "invalid":
+                    following["size"] += 1
+                path.write_text(json.dumps(changed), encoding="utf-8", newline="\n")
+                self.assert_parity(archive, carved, CHUNK, 0)
+        path.unlink()
+        self.assertEqual(anim_index.collect_rbf0_dir(carved), blob[:CHUNK])
+
+    def test_overlap_fallback_keeps_other_pages_compressed_spans(self):
+        blob = rig_resource(2 * CHUNK)
+        archive, carved, manifest = self.carve([blob[:CHUNK], blob[CHUNK:2 * CHUNK], blob[2 * CHUNK:]],
+                                             [0, 0, 6], [1, 32, 0])
+        self.assert_parity(archive, carved, 2 * CHUNK, 0)
+        first, second, following = manifest["files"]
+        # The first join needs its valid compressed span: the inflated-length fallback stops too early.
+        self.assertGreater(second["off"], first["off"] + CHUNK + 16)
+        second["stored"] = following["off"] - second["off"] + 1
+        path = carved / "index.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+        self.assert_parity(archive, carved, 2 * CHUNK, 0)
+        path.unlink()
+        self.assertEqual(anim_index.collect_rbf0_dir(carved), blob[:CHUNK])
+
     def test_bare_folders_and_unrelated_reports_keep_the_legacy_fallback(self):
         blob = rig_resource()
         _, carved, _ = self.carve([blob[:CHUNK], blob[CHUNK:]], [6, 6], [32, 0])

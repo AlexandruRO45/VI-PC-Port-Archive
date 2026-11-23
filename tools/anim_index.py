@@ -395,6 +395,11 @@ def collect_rbf0_dir(path):
         stored = span[0] if span is not None and span[1] == len(data) else len(data)
         entries.append((offset, name, data, stored))
     entries.sort(key=lambda e: e[0])
+    for i in range(len(entries) - 1):
+        offset, name, data, stored = entries[i]
+        if offset + stored > entries[i + 1][0]:
+            # Separate carved files cannot overlap in the archive. Ignore only this file's span hint.
+            entries[i] = (offset, name, data, len(data))
     first = next((i for i, (_, _, data, _) in enumerate(entries) if data[:4] == b"RBF0"), None)
     if first is None:
         return None
