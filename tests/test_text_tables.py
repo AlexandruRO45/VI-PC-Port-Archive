@@ -10,6 +10,8 @@ import io
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -225,9 +227,12 @@ class TestChains(unittest.TestCase):
                 report.write_bytes(b"previous report")
                 target = Path(tmp, name)
                 original = target.read_bytes()
-                with contextlib.redirect_stderr(io.StringIO()) as err:
-                    self.assertEqual(T.main([tmp, "--dialogue", str(report), "--strings", str(target)]), 2)
-                self.assertIn("overwrite", err.getvalue())
+                result = subprocess.run(
+                    [sys.executable, "-I", T.__file__, tmp, "--dialogue", str(report), "--strings", str(target)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("overwrite", result.stderr)
                 self.assertEqual(target.read_bytes(), original)
                 self.assertEqual(report.read_bytes(), b"previous report")
 
