@@ -43,29 +43,38 @@ _Thrd_result __stdcall _Cnd_timedwait_for(_Cnd_t cond, _Mtx_t mtx, unsigned int 
     return _Cnd_timedwait_for_unchecked(cond, mtx, ms);
 }
 
-void __cdecl _Smtx_lock_exclusive(_Smtx_t* lock) noexcept {
+// MSVC 14.38's xthreads.h declares the shared-mutex functions without noexcept.
+#if _MSC_VER == 1938 && !defined(__clang__)
+#define LEONIDA_SMTX_NOEXCEPT
+#else
+#define LEONIDA_SMTX_NOEXCEPT noexcept
+#endif
+
+void __cdecl _Smtx_lock_exclusive(_Smtx_t* lock) LEONIDA_SMTX_NOEXCEPT {
     AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(lock));
 }
 
-void __cdecl _Smtx_lock_shared(_Smtx_t* lock) noexcept {
+void __cdecl _Smtx_lock_shared(_Smtx_t* lock) LEONIDA_SMTX_NOEXCEPT {
     AcquireSRWLockShared(reinterpret_cast<PSRWLOCK>(lock));
 }
 
-int __cdecl _Smtx_try_lock_exclusive(_Smtx_t* lock) noexcept {
+int __cdecl _Smtx_try_lock_exclusive(_Smtx_t* lock) LEONIDA_SMTX_NOEXCEPT {
     return TryAcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(lock));
 }
 
-int __cdecl _Smtx_try_lock_shared(_Smtx_t* lock) noexcept {
+int __cdecl _Smtx_try_lock_shared(_Smtx_t* lock) LEONIDA_SMTX_NOEXCEPT {
     return TryAcquireSRWLockShared(reinterpret_cast<PSRWLOCK>(lock));
 }
 
-void __cdecl _Smtx_unlock_exclusive(_Smtx_t* lock) noexcept {
+void __cdecl _Smtx_unlock_exclusive(_Smtx_t* lock) LEONIDA_SMTX_NOEXCEPT {
     ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(lock));
 }
 
-void __cdecl _Smtx_unlock_shared(_Smtx_t* lock) noexcept {
+void __cdecl _Smtx_unlock_shared(_Smtx_t* lock) LEONIDA_SMTX_NOEXCEPT {
     ReleaseSRWLockShared(reinterpret_cast<PSRWLOCK>(lock));
 }
+
+#undef LEONIDA_SMTX_NOEXCEPT
 
 void __stdcall _Thrd_sleep_for(unsigned long ms) noexcept {
     Sleep(ms);
