@@ -88,6 +88,10 @@ on:
       - "tools/wave64_halves.py"
       - "tools/xdxr_bvh.py"
   workflow_dispatch:
+  # Each push to main replaces the push run still waiting in the concurrency group below, so with merges minutes
+  # apart almost none finish. A scheduled run's group is its own run id: it is never replaced and always reports.
+  schedule:
+    - cron: "17 */4 * * *"
 
 permissions:
   contents: read
