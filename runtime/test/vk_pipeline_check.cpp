@@ -905,6 +905,18 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    auto report_peak_commit = [&] {
+#ifdef _WIN32
+        if (commit_budget) {
+            if (const auto peak = commit_job.peak_job_memory_used())
+                std::printf("pipeline compiler Windows PeakJobMemoryUsed: %.1f MiB\n",
+                            static_cast<double>(*peak) / leonida::pipeline_budget::mib);
+            else
+                std::fprintf(stderr, "pipeline compiler Windows PeakJobMemoryUsed unavailable\n");
+        }
+#endif
+    };
+
     const std::string index_path = dir + "/index.json";
     const auto same_file = [](const std::string& a, const std::string& b) {
         std::error_code error;
@@ -1079,6 +1091,7 @@ int main(int argc, char** argv) {
         }
         std::printf("wall time: %.1fs (isolated)\n",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_iso).count());
+        report_peak_commit();
         return failed ? 1 : 0;
     }
 
@@ -2012,14 +2025,6 @@ int main(int argc, char** argv) {
             check_failed = true;
         }
     }
-#ifdef _WIN32
-    if (commit_budget) {
-        if (const auto peak = commit_job.peak_job_memory_used())
-            std::printf("pipeline compiler Windows PeakJobMemoryUsed: %.1f MiB\n",
-                        static_cast<double>(*peak) / leonida::pipeline_budget::mib);
-        else
-            std::fprintf(stderr, "pipeline compiler Windows PeakJobMemoryUsed unavailable\n");
-    }
-#endif
+    report_peak_commit();
     return (check_failed || !cache_saved) ? 1 : 0;
 }
