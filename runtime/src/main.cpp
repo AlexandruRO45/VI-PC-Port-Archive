@@ -28,6 +28,7 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "discord_presence.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -51,14 +52,14 @@ int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [--discord-presence FILE] [-- game arguments...]\n");
     return 2;
 }
 
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::filesystem::path image, game_dir, overlay_dir, mods_dir;
+    std::filesystem::path image, game_dir, overlay_dir, mods_dir, discord_config;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
@@ -79,6 +80,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
         else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
+        else if (a == L"--discord-presence" && i + 1 < argc) discord_config = argv[++i];
         else if (a == L"--view-mode-getter" && i + 1 < argc) {
             wchar_t* end = nullptr;
             const unsigned long rva = std::wcstoul(argv[++i], &end, 16);
@@ -100,6 +102,15 @@ int wmain(int argc, wchar_t** argv) {
     if (image.empty()) return usage();
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
+    if (!discord_config.empty() && !run) return usage();
+    if (run && discord_config.empty()) {
+        std::wstring self(32768, L'\0');
+        const DWORD n = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
+        if (n && n < self.size()) {
+            const auto bundled = std::filesystem::path(self.substr(0, n)).parent_path() / L"discord_presence.json";
+            if (std::filesystem::is_regular_file(bundled)) discord_config = bundled;
+        }
+    }
     // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
     // game folder) has an empty parent path, which left GAME: with no root; and a relative --game-dir or --overlay
     // would follow the title's later SetCurrentDirectory. If absolute() fails the path stays as given.
@@ -155,6 +166,13 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        std::unique_ptr<leonida::discord_presence::Bridge> discord;
+        if (!discord_config.empty()) {
+            discord = std::make_unique<leonida::discord_presence::Bridge>(
+                leonida::discord_presence::load_config(discord_config));
+            discord->install(main_module.base, main_module.size, image);
+            std::fprintf(stderr, "[rt] presence: local Discord bridge enabled\n");
+        }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {
@@ -241,6 +259,7 @@ int wmain(int argc, wchar_t** argv) {
         // Not `return`: a normal host exit runs the CRT's atexit table, which the game shares with gta6rt (its
         // handlers would run against a game that has stopped) and whose last word decides the exit status.
         // ExitProcess also skips atexit, so the TLS clone cleanup registered there is run here instead.
+        if (discord) discord->stop();  // ExitProcess skips destructors.
         rt::cleanup_tls_clones();
         ExitProcess(static_cast<UINT>(code));
     } catch (const std::exception& e) {

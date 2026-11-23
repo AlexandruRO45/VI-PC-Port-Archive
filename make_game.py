@@ -1829,7 +1829,7 @@ def build_pipeline_check(jobs: int) -> None:
 
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
-            *, work: str | None = None) -> None:
+            *, work: str | None = None, discord_presence: str | None = None) -> None:
     if runtime_build:
         log(f"runtime: using the build in {runtime_build}")
         build = runtime_build
@@ -1853,6 +1853,34 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             shutil.copy2(built, out)
     with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(os.path.abspath(game))
+    if discord_presence:
+        # This is private user configuration, including their local presence catalogue; never a repository asset.
+        with open(discord_presence, encoding="utf-8") as f:
+            presence = json.load(f)
+        if not isinstance(presence, dict) or not isinstance(presence.get("application_id"), str) or \
+                not re.fullmatch(r"[0-9]{16,20}", presence["application_id"]) or not presence.get("strings"):
+            fail("runtime: Discord configuration needs an Application ID and a verified local strings catalogue "
+                 "(docs/discord_presence.md)")
+        image_path = os.path.join(game, v["expected_exe"])
+        with open(image_path, "rb") as f:
+            digest = hashlib.file_digest(f, "sha256").hexdigest()
+        if presence.get("image_sha256") != digest:
+            fail("runtime: Discord profile SHA-256 does not match this executable")
+        destination = os.path.join(out, "discord_presence.json")
+        if os.path.abspath(discord_presence) != os.path.abspath(destination):
+            with open(destination, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(presence, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+    if os.name == "nt":
+        executable = "'" + re.sub(r"['\u2018-\u201b]", r"\g<0>\g<0>", v["expected_exe"]) + "'"
+        with open(os.path.join(out, "Play.ps1"), "w", encoding="utf-8", newline="\n") as f:
+            f.write('param([Parameter(ValueFromRemainingArguments=$true)][string[]]$GameArguments)\n'
+                    '$game = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "game_path.txt"))\n'
+                    f'$image = Join-Path $game {executable}\n'
+                    '& (Join-Path $PSScriptRoot "gta6rt.exe") --run $image --overlay '
+                    '(Join-Path $PSScriptRoot "overlay") -- @GameArguments\nexit $LASTEXITCODE\n')
+        with open(os.path.join(out, "Play.cmd"), "w", encoding="utf-8", newline="\n") as f:
+            f.write('@echo off\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Play.ps1" %*\n')
     if work is not None:
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
@@ -2122,6 +2150,9 @@ def main() -> int:
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
                          "on Windows, also use vk_pipeline_check.exe from DIR if present")
+    ap.add_argument("--discord-presence", metavar="FILE",
+                    help="bundle a private local Discord presence configuration for automatic activation at launch "
+                         "(docs/discord_presence.md); requires the runtime stage")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
@@ -2158,6 +2189,8 @@ def main() -> int:
                 ap.error(f"--stages: unknown stage '{s}' (choose from: {','.join(STAGES)})")
     if a.pick and a.game:
         ap.error("--pick and --game both choose the game folder: give one")
+    if a.discord_presence and "runtime" not in stages:
+        ap.error("--discord-presence requires the runtime stage")
     below_normal()
     if a.find:
         containers = []
@@ -2241,7 +2274,7 @@ def main() -> int:
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:
-        runtime(game, out, v, runtime_build, a.jobs, work=work)
+        runtime(game, out, v, runtime_build, a.jobs, work=work, discord_presence=a.discord_presence)
     if "pipelines" in stages:
         pipelines(work, out, a.jobs, runtime_build=runtime_build)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")

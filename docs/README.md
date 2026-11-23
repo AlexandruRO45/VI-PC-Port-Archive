@@ -6,6 +6,8 @@ method, scope and caveats. No game data is included.
 
 ## Start here
 
+[Local Discord Rich Presence](discord_presence.md): configure once before building, then launch with the finished port.
+
 | Document | What it covers |
 |---|---|
 | [design.md](design.md) | Overall project design, asset status, translator contract and open blockers. |

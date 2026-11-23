@@ -103,6 +103,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
+    src/discord_presence.cpp
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -414,6 +415,15 @@ elseif(NOT WIN32)
 endif()
 
 include(CTest)
+
+if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME AND BUILD_TESTING)
+  add_executable(discord_presence_test test/discord_presence_test.cpp src/discord_presence.cpp)
+  target_compile_definitions(discord_presence_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(discord_presence_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  add_test(NAME discord_presence COMMAND discord_presence_test)
+  set_tests_properties(discord_presence PROPERTIES TIMEOUT 30)
+  target_link_libraries(discord_presence_test PRIVATE advapi32)
+endif()
 if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
