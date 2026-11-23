@@ -145,9 +145,13 @@ def main(argv=None):
     for c in report["candidates"]:
         print(f"  {c['rva']:>12}  callers {c['direct_callers']:>6}  led by {', '.join(c['led_by'])}")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
-            f.write("\n")
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 
