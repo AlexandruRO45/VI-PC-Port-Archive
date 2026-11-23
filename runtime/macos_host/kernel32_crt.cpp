@@ -87,7 +87,21 @@ template <typename C> int32_t copy_out(const std::basic_string<C>& s, bool with_
 
 // ---- modules: the image, plus one handle per DLL the host exports from ----------------------------------------
 std::mutex g_modules_lock;
-std::map<std::string, std::string> g_modules;  // lowercase name -> itself; the handle is the value's address
+// A handle to a DLL the host exports from points at a PE header with no directories, so code that walks a module's
+// headers (Leonida's pe_loader redirects RtlPcToFileHeader imports in host DLLs) finds nothing to do.
+struct HostDll {
+    uint8_t header[0x200] = {};
+    std::string name;
+    explicit HostDll(std::string n) : name(std::move(n)) {
+        header[0] = 'M', header[1] = 'Z', header[0x3C] = 0x40;               // e_lfanew
+        header[0x40] = 'P', header[0x41] = 'E';
+        header[0x44] = 0x64, header[0x45] = 0x86;                           // Machine: x64
+        header[0x54] = 0xF0;                                                // SizeOfOptionalHeader
+        header[0x58] = 0x0B, header[0x59] = 0x02;                           // Magic: PE32+
+        header[0x58 + 108] = 16;                                            // NumberOfRvaAndSizes, all empty
+    }
+};
+std::map<std::string, HostDll> g_modules;  // lowercase name -> its handle (the value's address)
 HANDLE load_from_disk(const std::string& name) {  // a real PE DLL: as given, then next to the image
     if (HANDLE h = load_module(to_host_path(name.c_str()))) return h;
     std::string file = name.substr(name.find_last_of("\\/") + 1);
@@ -126,7 +140,7 @@ void* GetProcAddress(HANDLE module, const char* name) {
     void* fn = nullptr;
     if (is_module(module)) fn = module_export(module, name);
     else if (module && reinterpret_cast<uintptr_t>(name) >= 0x10000)
-        fn = find_export(*static_cast<std::string*>(module) + "!" + name);
+        fn = find_export(static_cast<HostDll*>(module)->name + "!" + name);
     if (!fn) set_last_error(127 /* ERROR_PROC_NOT_FOUND */);
     return fn;
 }

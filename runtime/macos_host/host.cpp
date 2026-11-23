@@ -16,6 +16,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+bool fix_illegal(ucontext_t* uc);  // illegal.cpp
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -24,6 +26,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace host {
 
@@ -95,13 +98,38 @@ uint32_t thread_id() {
 std::string g_game_dir;  // absolute folder of the game image, where GAME:\ points
 std::string g_exe_path;
 
-void* find_export(const std::string& key) {
-    auto it = g_exports.find(key);
-    return it == g_exports.end() ? nullptr : it->second;
+// API sets are names for functions that live in one real DLL: api-ms-win-core-* in kernel32, api-ms-win-crt-* in
+// the UCRT, whose functions the host registers under whichever api-ms-win-crt-* set first needed them.
+namespace {
+bool starts(const std::string& s, const char* p) { return s.compare(0, std::strlen(p), p) == 0; }
+std::vector<std::string> api_set_hosts(const std::string& dll) {
+    if (starts(dll, "api-ms-win-core-") || dll == "kernelbase.dll") return {"kernel32.dll"};
+    if (!starts(dll, "api-ms-win-crt-") && dll != "ucrtbase.dll") return {};
+    std::vector<std::string> crt;
+    for (auto it = g_exports.lower_bound("api-ms-win-crt-"); it != g_exports.end() && starts(it->first, "api-ms-win-crt-");
+         ++it)
+        if (std::string d = it->first.substr(0, it->first.find('!')); crt.empty() || crt.back() != d) crt.push_back(d);
+    return crt;
 }
-bool has_dll(const std::string& dll) {
+bool has_exact(const std::string& dll) {
     auto it = g_exports.lower_bound(dll + "!");
     return it != g_exports.end() && it->first.compare(0, dll.size() + 1, dll + "!") == 0;
+}
+}  // namespace
+
+void* find_export(const std::string& key) {
+    if (auto it = g_exports.find(key); it != g_exports.end()) return it->second;
+    size_t bang = key.find('!');
+    if (bang == std::string::npos) return nullptr;
+    for (const auto& dll : api_set_hosts(key.substr(0, bang)))
+        if (auto it = g_exports.find(dll + key.substr(bang)); it != g_exports.end()) return it->second;
+    return nullptr;
+}
+bool has_dll(const std::string& dll) {
+    if (has_exact(dll)) return true;
+    for (const auto& d : api_set_hosts(dll))
+        if (has_exact(d)) return true;
+    return false;
 }
 
 std::string to_host_path(const char* p) {  // ponytail: no drive letters
@@ -180,17 +208,31 @@ void on_fault(int sig, siginfo_t* info, void* uc) {
     uint64_t rip = ss.__rip, base = reinterpret_cast<uint64_t>(g_image);
     uint8_t* teb;  // a fault in guest code, or in host code called without HostGs: libc needs its own gs back
     __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));
+    bool guest = false;
     for (int i = 0, n = std::min(g_teb_count.load(), 1024); i < n; ++i)
-        if (g_tebs[i] == teb) _thread_set_tsd_base(teb_at<uint64_t>(teb, kTebHostGs));
+        if (g_tebs[i] == teb) guest = true, _thread_set_tsd_base(teb_at<uint64_t>(teb, kTebHostGs));
+    if (sig == SIGILL && ::fix_illegal(static_cast<ucontext_t*>(uc))) {  // illegal.cpp: patched, run on
+        if (guest) _thread_set_tsd_base(reinterpret_cast<uint64_t>(teb));
+        return;
+    }
     std::fprintf(stderr, "host: signal %d at rip=0x%llx", sig, rip);
     if (g_image && rip >= base && rip < base + 0x10000000) std::fprintf(stderr, " (image+0x%llx)", rip - base);
     std::fprintf(stderr, " addr=%p rsp=0x%llx [rsp]=0x%llx\n", info->si_addr, ss.__rsp,
                  *reinterpret_cast<uint64_t*>(ss.__rsp));
+    std::fprintf(stderr, "host:   rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx\n", ss.__rax, ss.__rbx,
+                 ss.__rcx, ss.__rdx, ss.__rsi, ss.__rdi, ss.__rbp);
+    std::fprintf(stderr, "host:   r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n", ss.__r8,
+                 ss.__r9, ss.__r10, ss.__r11, ss.__r12, ss.__r13, ss.__r14, ss.__r15);
     Dl_info dl;
     for (uint64_t pc : {rip, *reinterpret_cast<uint64_t*>(ss.__rsp)})
         if (pc && dladdr(reinterpret_cast<void*>(pc), &dl) && dl.dli_sname)
             std::fprintf(stderr, "host:   0x%llx = %s+0x%llx\n", pc, dl.dli_sname,
                          pc - reinterpret_cast<uint64_t>(dl.dli_saddr));
+    // Return addresses on the stack, for a backtrace without unwinding: any word that points into a mapped module.
+    auto* sp = reinterpret_cast<uint64_t*>(ss.__rsp);
+    for (int i = 0, shown = 0; i < 512 && shown < 12; ++i)
+        if (uint64_t m = code_base(sp[i]); m && sp[i] != m)  // modules, and images registered with RtlAddFunctionTable
+            std::fprintf(stderr, "host:   stack[%d] 0x%llx (module 0x%llx +0x%llx)\n", i, sp[i], m, sp[i] - m), ++shown;
     _exit(128 + sig);
 }
 }  // namespace
@@ -395,7 +437,17 @@ Module* load_pe(const char* path, bool dll) {
             mod->callbacks.push_back(reinterpret_cast<void(MSABI*)(void*, uint32_t, void*)>(*cb));
         std::lock_guard<std::mutex> lock(g_mod_lock);
         if (g_tls_count == kMaxTlsModules) fail("too many modules with TLS");
-        mod->tls_index = g_tls_count++;
+        // Game code built as an EXE reads its TLS at index 0 without loading _tls_index (Windows always gives the
+        // EXE index 0). Under gta6rt the game is a mapped image that takes the index of gta6rt_tls_host.dll, so
+        // that DLL gets 0 and gta6rt.exe, which does load its _tls_index, moves to 1.
+        static bool reserve_zero = false;
+        std::string file = path;
+        file.erase(0, file.find_last_of('/') + 1);
+        if (!dll && strcasecmp(file.c_str(), "gta6rt.exe") == 0 && g_tls_count == 0) reserve_zero = true, g_tls_count = 1;
+        if (reserve_zero && dll && strcasecmp(file.c_str(), "gta6rt_tls_host.dll") == 0)
+            mod->tls_index = 0, reserve_zero = false;
+        else
+            mod->tls_index = g_tls_count++;
         if (index) *reinterpret_cast<uint32_t*>(index) = static_cast<uint32_t>(mod->tls_index);
     }
 
@@ -511,7 +563,7 @@ int main(int argc, char** argv) {
     struct sigaction sa = {};
     sa.sa_sigaction = on_fault;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(sig, &sa, nullptr);
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(sig, &sa, nullptr);
     g_peb = static_cast<uint8_t*>(calloc(1, 0x1000));
     Module* exe = load_pe(real, false);
     g_image = exe->base;
