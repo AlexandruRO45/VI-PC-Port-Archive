@@ -169,5 +169,24 @@ class VCvtPkrtzF16F32SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(lane, 0), 0xDEADBEEF)
 
+class VCvtPkrtzF16F32EdgeCasesTests(unittest.TestCase):
+    def test_saturation_above_max_normal(self):
+        self.assertEqual(ref_f32_to_f16_rtz(65504.0), 0x7BFF)
+        self.assertEqual(ref_f32_to_f16_rtz(70000.0), 0x7BFF)
+        self.assertEqual(ref_f32_to_f16_rtz(1000000.0), 0x7BFF)
+        self.assertEqual(ref_f32_to_f16_rtz(-80000.0), 0xFBFF)
+
+    def test_infinities(self):
+        self.assertEqual(ref_f32_to_f16_rtz(float("inf")), 0x7C00)
+        self.assertEqual(ref_f32_to_f16_rtz(float("-inf")), 0xFC00)
+
+    def test_nans(self):
+        nan_bits = ref_f32_to_f16_rtz(float("nan"))
+        self.assertEqual(nan_bits & 0x7E00, 0x7E00)
+
+    def test_subnormals(self):
+        self.assertEqual(ref_f32_to_f16_rtz(0x00000001), 0x0000)
+        self.assertEqual(ref_f32_to_f16_rtz(0.00005) & 0x7C00, 0x0000)
+
 if __name__ == '__main__':
     unittest.main()
