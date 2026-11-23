@@ -320,5 +320,14 @@ class SCbranchScc1OracleTests(unittest.TestCase):
     def test_scc_cleared(self):
         self.assertFalse(ref_oracle_scc1(0))
 
+class SCbranchScc1AstTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = BranchInstructionAST(
+            mnemonic="s_cbranch_scc1",
+            target_offset=12,
+        )
+        self.assertEqual(ast.mnemonic, "s_cbranch_scc1")
+        self.assertEqual(ast.target_offset, 12)
+
 if __name__ == '__main__':
     unittest.main()
