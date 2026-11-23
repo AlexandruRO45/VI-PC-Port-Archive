@@ -5,8 +5,8 @@
 FAILED_LIST is a file with one failed test name per line, EXIT_STATUS the test runner's exit status, and each
 EXPECTED argument one or more whitespace-separated test names (so a workflow can pass one quoted list). Exits 1 when a
 test outside EXPECTED failed, or when the runner failed without naming a test (a crash, a build error); 2 on a usage
-error, including a non-integer EXIT_STATUS or a FAILED_LIST that cannot be read, reported as one line. An expected
-failure that passed gets a GitHub Actions notice, so the list in the workflow can shrink.
+error, including a non-integer EXIT_STATUS or a FAILED_LIST that cannot be read, reported as one line. `--help` prints
+this text. An expected failure that passed gets a GitHub Actions notice, so the list in the workflow can shrink.
 """
 
 import sys
@@ -27,6 +27,9 @@ def judge(failed: list[str], status: int, expected: list[str]) -> tuple[int, lis
 
 
 def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
     if len(argv) < 2:
         print(__doc__.strip(), file=sys.stderr)
         return 2

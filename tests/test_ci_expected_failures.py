@@ -65,6 +65,12 @@ class Main(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cef.main([]), 2)
 
+    def test_help_prints_the_usage_and_succeeds(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cef.main(["--help"]), 0)
+        self.assertIn("FAILED_LIST EXIT_STATUS", out.getvalue())
+
     def test_a_list_that_cannot_be_read_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "absent.txt"
