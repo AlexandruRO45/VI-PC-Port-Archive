@@ -756,6 +756,9 @@ struct DeviceState {
             return {};
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+            leonida::block_format(format.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1)
+            return {};
         format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);

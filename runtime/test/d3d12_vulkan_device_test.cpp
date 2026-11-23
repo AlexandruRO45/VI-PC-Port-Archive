@@ -674,6 +674,8 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"1D 13 full chain", line_desc(13, 4, 1, rgba8), 13 * 4},
         {"1D array 5x3", line_desc(5, 3, 2, rgba8), 5 * 4 * 2},
         {"1D height 2", bad_line, 0},
+        {"1D BC1 (invalid)", line_desc(64, 1, 1, DXGI_FORMAT_BC1_UNORM), 0},
+        {"1D array BC7 (invalid)", line_desc(64, 1, 4, DXGI_FORMAT_BC7_UNORM), 0},
         {"1D render target", line_rt, 8 * 4},
         {"64x64 4x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 4), 64 * 64 * 4 * 4},
         {"64x64 32x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 32), 64 * 64 * 4 * 32},
@@ -3034,6 +3036,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: plain texture in DEPTH_WRITE state", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+         }},
+        // Block-compressed formats have no 1D form: a 4x4 block cannot be one texel tall.
+        {"committed: 1D BC1 texture", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, line_desc(64, 1, 1, DXGI_FORMAT_BC1_UNORM),
+                              D3D12_RESOURCE_STATE_COMMON);
+         }},
+        {"committed: 1D array BC7 texture", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, line_desc(64, 1, 4, DXGI_FORMAT_BC7_UNORM),
+                              D3D12_RESOURCE_STATE_COMMON);
          }},
         {"committed: plain texture in DEPTH_READ state", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_DEPTH_READ);
