@@ -134,8 +134,9 @@ python -I tools/cpu_ref.py <listing.s> --json
 python -I tests/test_cpu_ref.py
 ```
 
-The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`: a separate reference for 87
-SOP1/SOP2/SOPC/SOPK opcodes with SCC kept explicit, seeded programs, the translated SPIR-V run in
+The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`: a separate reference for 99 default-generated
+SOP1/SOP2/SOPC/SOPK opcodes (112 listed; 13 lane-mask opcodes omitted)
+with SCC kept explicit, seeded programs, the translated SPIR-V run in
 `tests/semantic/spirv_mini_interp.py`, and failing programs shrunk to the instructions that matter.
 64-bit mask ops are left out by default (the translator models them as wave masks), and `s_bfe_*` control
 words stay inside offset + width <= 32 unless `--bfe-any`. Its docstring lists the known divergences.
