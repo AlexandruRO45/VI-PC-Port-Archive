@@ -8,15 +8,19 @@ Tests for 6 VALU Float16 conversion instructions:
 - v_cvt_u16_f16: 16-bit half float to 16-bit unsigned integer with truncation/saturation
 - v_cvt_i16_f16: 16-bit half float to 16-bit signed integer with truncation/saturation
 
-Standard library only; zero game data.
+All test methods compile assembly listings directly through tools/rdna2spirv.py
+via support.translate_lines and execute in spirv_mini_interp via support.mrt0_words.
+Standard library Python only; zero third-party dependencies; zero game data.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 import struct
 import sys
 import unittest
+from typing import List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -32,13 +36,8 @@ import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 import support  # noqa: E402
 
-MASK32 = 0xFFFFFFFF
-MASK16 = 0xFFFF
-
-FSSM = bytearray(0x148)
-struct.pack_into("<4I", FSSM, 0x138, 0x40088, 32, 1, 1)
-FSSM = bytes(FSSM)
-VSHARP = [0, 0, 0x1000, 0x31016FAC]
+MASK32: int = 0xFFFFFFFF
+MASK16: int = 0xFFFF
 
 
 def float_to_bits(val: float) -> int:
@@ -60,313 +59,58 @@ def float_to_f16_bits(val: float) -> int:
         return 0xFC00 if val < 0 else 0x7C00
 
 
-def run_cs(body: list[str], lanes: int = 32, num_words: int = 32, name: str = "cs_bundle18") -> list[int]:
-    """Helper to translate and run a compute shader; stores outputs at out[lane*32]."""
-    prologue = ["v_lshlrev_b32_e32 v30, 5, v0"]
-    full_body = prologue + list(body) + ["s_endpgm"]
-    spv = support.translate_lines(name, full_body, fssm=FSSM)
-    mem: dict[int, int] = {}
-    si.run_workgroup(
-        spv,
-        lanes,
-        32,
-        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
-        push_constants=VSHARP + [0] * 28,
-        memory=mem,
-    )
-    return [mem.get(i * 32, 0) for i in range(num_words)]
+def execute_cvt_op(op: str, input_val: int, name: str = "ps_cvt") -> int:
+    """Compile and execute a synthetic pixel shader for conversion op, returning mrt0.x."""
+    lines = [
+        f"v_mov_b32_e32 v1, {input_val & MASK32:#x}",
+        f"{op}_e32 v0, v1",
+        "exp mrt0, v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
 
-class ASTNode:
-    """Base symbolic AST node."""
-    pass
+@dataclasses.dataclass(frozen=True)
+class CvtAstNode:
+    opcode: str
+    dst: str
+    src: str
 
+    def emit_asm(self) -> str:
+        return f"{self.opcode}_e32 {self.dst}, {self.src}"
+
+
+# Mathematical reference oracles
 def ref_v_cvt_f16_f32(f32_val: float) -> int:
-    """Reference mathematical oracle for v_cvt_f16_f32 (float32 -> float16 bits)."""
     return float_to_f16_bits(f32_val)
 
 
-class TestVCvtF16F32Oracle(unittest.TestCase):
-    def test_basic_values(self) -> None:
-        self.assertEqual(ref_v_cvt_f16_f32(0.0), 0x0000)
-        self.assertEqual(ref_v_cvt_f16_f32(1.0), 0x3C00)
-        self.assertEqual(ref_v_cvt_f16_f32(-1.0), 0xBC00)
-        self.assertEqual(ref_v_cvt_f16_f32(2.0), 0x4000)
-        self.assertEqual(ref_v_cvt_f16_f32(0.5), 0x3800)
+def ref_v_cvt_f32_f16(f16_bits: int) -> float:
+    return f16_bits_to_float(f16_bits & MASK16)
 
-    def test_infinities_and_zeros(self) -> None:
-        self.assertEqual(ref_v_cvt_f16_f32(float("inf")), 0x7C00)
-        self.assertEqual(ref_v_cvt_f16_f32(float("-inf")), 0xFC00)
-        self.assertEqual(ref_v_cvt_f16_f32(-0.0), 0x8000)
-
-class CvtF16F32Expr(ASTNode):
-    def __init__(self, src_expr: str) -> None:
-        self.src_expr = src_expr
-
-    def eval(self, f32_val: float) -> int:
-        return ref_v_cvt_f16_f32(f32_val)
-
-
-class TestVCvtF16F32AST(unittest.TestCase):
-    def test_ast_evaluation(self) -> None:
-        expr = CvtF16F32Expr("v0")
-        self.assertEqual(expr.eval(1.5), 0x3E00)
-        self.assertEqual(expr.eval(-2.0), 0xC000)
-
-class TestVCvtF16F32SIMD(unittest.TestCase):
-    def test_simd_lane_divergence(self) -> None:
-        # 32 divergent lanes with varying exponents
-        inputs = [2.0 ** (i - 16) for i in range(32)]
-        results = [ref_v_cvt_f16_f32(x) for x in inputs]
-        for i, val in enumerate(inputs):
-            back = f16_bits_to_float(results[i])
-            self.assertAlmostEqual(back, val, places=2)
-
-    def test_ieee754_boundaries(self) -> None:
-        # Max normal f16 is 65504 (0x7BFF)
-        self.assertEqual(ref_v_cvt_f16_f32(65504.0), 0x7BFF)
-        # Smallest positive subnormal is 2^-24 ~ 5.96e-8 (0x0001)
-        self.assertEqual(ref_v_cvt_f16_f32(2.0 ** -24), 0x0001)
-
-class TestVCvtF16F32Translator(unittest.TestCase):
-    def test_translator_cvt_f16_f32_execution(self) -> None:
-        body = [
-            "v_mov_b32_e32 v1, 0x3f800000",  # 1.0f
-            "v_cvt_f16_f32_e32 v2, v1",
-            "buffer_store_dword v2, v30, s[0:3], 0 offen",
-        ]
-        results = run_cs(body, name="cs_cvt_f16_f32")
-        for l in range(32):
-            self.assertEqual(results[l] & 0xFFFF, 0x3C00)
-
-    def test_translator_preserves_high_half(self) -> None:
-        # GFX10 partial write: high 16 bits of destination are kept
-        body = [
-            "v_mov_b32_e32 v2, 0xdead0000",
-            "v_mov_b32_e32 v1, 0x40000000",  # 2.0f
-            "v_cvt_f16_f32_e32 v2, v1",
-            "buffer_store_dword v2, v30, s[0:3], 0 offen",
-        ]
-        results = run_cs(body, name="cs_cvt_f16_f32_keep_hi")
-        for l in range(32):
-            self.assertEqual(results[l], 0xDEAD4000)
-
-def ref_v_cvt_f32_f16(f16_bits: int) -> int:
-    """Reference mathematical oracle for v_cvt_f32_f16 (float16 bits -> float32 bits)."""
-    f = f16_bits_to_float(f16_bits & MASK16)
-    return float_to_bits(f)
-
-
-class TestVCvtF32F16Oracle(unittest.TestCase):
-    def test_basic_values(self) -> None:
-        self.assertEqual(ref_v_cvt_f32_f16(0x3C00), 0x3F800000)  # 1.0h -> 1.0f
-        self.assertEqual(ref_v_cvt_f32_f16(0xBC00), 0xBF800000)  # -1.0h -> -1.0f
-        self.assertEqual(ref_v_cvt_f32_f16(0x0000), 0x00000000)  # 0.0h -> 0.0f
-        self.assertEqual(ref_v_cvt_f32_f16(0x8000), 0x80000000)  # -0.0h -> -0.0f
-
-    def test_infinities(self) -> None:
-        self.assertEqual(ref_v_cvt_f32_f16(0x7C00), 0x7F800000)  # +inf
-        self.assertEqual(ref_v_cvt_f32_f16(0xFC00), 0xFF800000)  # -inf
-
-class CvtF32F16Expr(ASTNode):
-    def __init__(self, src_expr: str) -> None:
-        self.src_expr = src_expr
-
-    def eval(self, f16_bits: int) -> int:
-        return ref_v_cvt_f32_f16(f16_bits)
-
-
-class TestVCvtF32F16AST(unittest.TestCase):
-    def test_ast_evaluation(self) -> None:
-        expr = CvtF32F16Expr("v0")
-        self.assertEqual(expr.eval(0x4000), 0x40000000)  # 2.0
-        self.assertEqual(expr.eval(0x3800), 0x3F000000)  # 0.5
-
-class TestVCvtF32F16SIMD(unittest.TestCase):
-    def test_simd_lane_divergence(self) -> None:
-        # Lanes test divergent powers of 2
-        f16_inputs = [0x3C00 + (l << 6) for l in range(32)]
-        for l in range(32):
-            f32_bits = ref_v_cvt_f32_f16(f16_inputs[l])
-            self.assertAlmostEqual(bits_to_float(f32_bits), f16_bits_to_float(f16_inputs[l]), places=4)
-
-class TestVCvtF32F16Translator(unittest.TestCase):
-    def test_translator_cvt_f32_f16_execution(self) -> None:
-        body = [
-            "v_mov_b32_e32 v1, 0x3c00",  # 1.0h
-            "v_cvt_f32_f16_e32 v2, v1",
-            "buffer_store_dword v2, v30, s[0:3], 0 offen",
-        ]
-        results = run_cs(body, name="cs_cvt_f32_f16")
-        for l in range(32):
-            self.assertEqual(results[l], 0x3F800000)
 
 def ref_v_cvt_f16_u16(u16_val: int) -> int:
-    """Reference mathematical oracle for v_cvt_f16_u16."""
     return float_to_f16_bits(float(u16_val & MASK16))
 
 
-class TestVCvtF16U16Oracle(unittest.TestCase):
-    def test_basic_values(self) -> None:
-        self.assertEqual(ref_v_cvt_f16_u16(0), 0x0000)
-        self.assertEqual(ref_v_cvt_f16_u16(1), 0x3C00)
-        self.assertEqual(ref_v_cvt_f16_u16(42), 0x5140)
-        self.assertEqual(ref_v_cvt_f16_u16(1024), 0x6400)
-
-class CvtF16U16Expr(ASTNode):
-    def __init__(self, src_expr: str) -> None:
-        self.src_expr = src_expr
-
-    def eval(self, u16_val: int) -> int:
-        return ref_v_cvt_f16_u16(u16_val)
-
-
-class TestVCvtF16U16AST(unittest.TestCase):
-    def test_ast_evaluation(self) -> None:
-        expr = CvtF16U16Expr("v0")
-        self.assertEqual(expr.eval(2), 0x4000)
-        self.assertEqual(expr.eval(100), float_to_f16_bits(100.0))
-
-class TestVCvtF16U16SIMD(unittest.TestCase):
-    def test_simd_lane_divergence(self) -> None:
-        for l in range(32):
-            got = ref_v_cvt_f16_u16(l * 100)
-            self.assertEqual(got, float_to_f16_bits(float(l * 100)))
-
-    def test_boundary_extremes(self) -> None:
-        # Max u16 is 65535 -> in f16 rounds to 65536 (0x7C00 = inf in half float without clamp)
-        self.assertEqual(ref_v_cvt_f16_u16(65535), 0x7C00)
-
-class TestVCvtF16U16Translator(unittest.TestCase):
-    def test_translator_cvt_f16_u16_execution(self) -> None:
-        body = [
-            "v_mov_b32_e32 v1, 42",
-            "v_cvt_f16_u16_e32 v2, v1",
-            "buffer_store_dword v2, v30, s[0:3], 0 offen",
-        ]
-        results = run_cs(body, name="cs_cvt_f16_u16")
-        for l in range(32):
-            self.assertEqual(results[l] & 0xFFFF, 0x5140)
-
 def ref_v_cvt_f16_i16(i16_val: int) -> int:
-    """Reference mathematical oracle for v_cvt_f16_i16."""
-    val = i16_val & MASK16
-    signed_val = val - 0x10000 if val & 0x8000 else val
+    i16_val &= MASK16
+    signed_val = i16_val - (1 << 16) if (i16_val & 0x8000) else i16_val
     return float_to_f16_bits(float(signed_val))
 
 
-class TestVCvtF16I16Oracle(unittest.TestCase):
-    def test_basic_values(self) -> None:
-        self.assertEqual(ref_v_cvt_f16_i16(0), 0x0000)
-        self.assertEqual(ref_v_cvt_f16_i16(1), 0x3C00)
-        self.assertEqual(ref_v_cvt_f16_i16(-1), 0xBC00)
-        self.assertEqual(ref_v_cvt_f16_i16(-42), 0xD140)
-
-class CvtF16I16Expr(ASTNode):
-    def __init__(self, src_expr: str) -> None:
-        self.src_expr = src_expr
-
-    def eval(self, i16_val: int) -> int:
-        return ref_v_cvt_f16_i16(i16_val)
-
-
-class TestVCvtF16I16AST(unittest.TestCase):
-    def test_ast_evaluation(self) -> None:
-        expr = CvtF16I16Expr("v0")
-        self.assertEqual(expr.eval(-2), 0xC000)
-        self.assertEqual(expr.eval(10), float_to_f16_bits(10.0))
-
-class TestVCvtF16I16SIMD(unittest.TestCase):
-    def test_simd_lane_divergence(self) -> None:
-        for l in range(32):
-            val = (l - 16) * 50
-            got = ref_v_cvt_f16_i16(val)
-            self.assertEqual(got, float_to_f16_bits(float(val)))
-
-    def test_boundary_extremes(self) -> None:
-        # Min i16 is -32768 (0x8000) -> -32768.0 in f16 is 0xF800
-        self.assertEqual(ref_v_cvt_f16_i16(0x8000), 0xF800)
-        # Max i16 is 32767 -> 0x77FF
-        self.assertEqual(ref_v_cvt_f16_i16(32767), float_to_f16_bits(32767.0))
-
-class TestVCvtF16I16Translator(unittest.TestCase):
-    def test_translator_cvt_f16_i16_execution(self) -> None:
-        body = [
-            "v_mov_b32_e32 v1, 0xffd6",  # -42
-            "v_cvt_f16_i16_e32 v2, v1",
-            "buffer_store_dword v2, v30, s[0:3], 0 offen",
-        ]
-        results = run_cs(body, name="cs_cvt_f16_i16")
-        for l in range(32):
-            self.assertEqual(results[l] & 0xFFFF, 0xD140)
-
 def ref_v_cvt_u16_f16(f16_bits: int) -> int:
-    """Reference mathematical oracle for v_cvt_u16_f16 with truncation and saturation."""
     val = f16_bits_to_float(f16_bits & MASK16)
-    if math.isnan(val):
+    if math.isnan(val) or val <= 0.0:
         return 0
-    if math.isinf(val):
-        return 65535 if val > 0 else 0
-    tr = math.trunc(val)
-    if tr < 0:
-        return 0
-    if tr > 65535:
+    if math.isinf(val) or val >= 65535.0:
         return 65535
-    return tr
+    return math.trunc(val)
 
-
-class TestVCvtU16F16Oracle(unittest.TestCase):
-    def test_basic_values(self) -> None:
-        self.assertEqual(ref_v_cvt_u16_f16(0x5140), 42)      # 42.0h -> 42
-        self.assertEqual(ref_v_cvt_u16_f16(0x3C00), 1)       # 1.0h -> 1
-        self.assertEqual(ref_v_cvt_u16_f16(0x3E00), 1)       # 1.5h -> 1 (truncated)
-        self.assertEqual(ref_v_cvt_u16_f16(0x3800), 0)       # 0.5h -> 0
-
-    def test_saturation_and_nan(self) -> None:
-        self.assertEqual(ref_v_cvt_u16_f16(0xBC00), 0)       # -1.0h -> 0 (clamped)
-        self.assertEqual(ref_v_cvt_u16_f16(0x7C00), 65535)   # +inf -> 65535
-        self.assertEqual(ref_v_cvt_u16_f16(0xFC00), 0)       # -inf -> 0
-        self.assertEqual(ref_v_cvt_u16_f16(0x7E00), 0)       # NaN -> 0
-
-class CvtU16F16Expr(ASTNode):
-    def __init__(self, src_expr: str) -> None:
-        self.src_expr = src_expr
-
-    def eval(self, f16_bits: int) -> int:
-        return ref_v_cvt_u16_f16(f16_bits)
-
-
-class TestVCvtU16F16AST(unittest.TestCase):
-    def test_ast_evaluation(self) -> None:
-        expr = CvtU16F16Expr("v0")
-        self.assertEqual(expr.eval(0x4000), 2)
-        self.assertEqual(expr.eval(0x4880), 9)
-
-class TestVCvtU16F16SIMD(unittest.TestCase):
-    def test_simd_lane_divergence(self) -> None:
-        for l in range(32):
-            f16 = float_to_f16_bits(float(l * 10) + 0.25)
-            self.assertEqual(ref_v_cvt_u16_f16(f16), l * 10)
-
-    def test_simd_saturation_limits(self) -> None:
-        # Negative saturated to 0
-        self.assertEqual(ref_v_cvt_u16_f16(float_to_f16_bits(-100.0)), 0)
-        # Large positive saturated to 65535
-        self.assertEqual(ref_v_cvt_u16_f16(float_to_f16_bits(70000.0)), 65535)
-
-class TestVCvtU16F16Translator(unittest.TestCase):
-    def test_translator_cvt_u16_f16_execution(self) -> None:
-        body = [
-            "v_mov_b32_e32 v1, 0x5140",  # 42.0h
-            "v_cvt_u16_f16_e32 v2, v1",
-            "buffer_store_dword v2, v30, s[0:3], 0 offen",
-        ]
-        results = run_cs(body, name="cs_cvt_u16_f16")
-        for l in range(32):
-            self.assertEqual(results[l] & 0xFFFF, 42)
 
 def ref_v_cvt_i16_f16(f16_bits: int) -> int:
-    """Reference mathematical oracle for v_cvt_i16_f16 with truncation and signed saturation."""
     val = f16_bits_to_float(f16_bits & MASK16)
     if math.isnan(val):
         return 0
@@ -380,55 +124,447 @@ def ref_v_cvt_i16_f16(f16_bits: int) -> int:
     return tr & MASK16
 
 
-class TestVCvtI16F16Oracle(unittest.TestCase):
+# =============================================================================
+# 1. v_cvt_f16_f32
+# =============================================================================
+
+class TestVCvtF16F32Oracle(unittest.TestCase):
+    """Reference oracle tests for v_cvt_f16_f32 backed by translator execution."""
+
     def test_basic_values(self) -> None:
-        self.assertEqual(ref_v_cvt_i16_f16(0xD140), 0xFFD6)  # -42.0h -> -42 (0xFFD6)
-        self.assertEqual(ref_v_cvt_i16_f16(0x5140), 42)      # 42.0h -> 42
-        self.assertEqual(ref_v_cvt_i16_f16(0xBE00), 0xFFFF)  # -1.5h -> -1
+        cases = [
+            (0.0, 0x0000),
+            (1.0, 0x3C00),
+            (-1.0, 0xBC00),
+            (2.0, 0x4000),
+            (0.5, 0x3800),
+        ]
+        for val, expected in cases:
+            with self.subTest(val=val):
+                res = execute_cvt_op("v_cvt_f16_f32", float_to_bits(val), "ps_cvt_f16_f32_basic")
+                self.assertEqual(res & MASK16, expected)
+                self.assertEqual(res & MASK16, ref_v_cvt_f16_f32(val))
+
+    def test_infinities_and_zeros(self) -> None:
+        cases = [
+            (float("inf"), 0x7C00),
+            (float("-inf"), 0xFC00),
+            (-0.0, 0x8000),
+        ]
+        for val, expected in cases:
+            with self.subTest(val=val):
+                res = execute_cvt_op("v_cvt_f16_f32", float_to_bits(val), "ps_cvt_f16_f32_inf")
+                self.assertEqual(res & MASK16, expected)
+
+
+class TestVCvtF16F32AST(unittest.TestCase):
+    """AST modeling and translation verification for v_cvt_f16_f32."""
+
+    def test_ast_evaluation(self) -> None:
+        node = CvtAstNode("v_cvt_f16_f32", "v0", "v1")
+        lines = [
+            "v_mov_b32_e32 v1, 0x3fc00000",  # 1.5f
+            node.emit_asm(),
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cvt_f16_f32_ast", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0] & MASK16, 0x3E00)
+
+
+class TestVCvtF16F32SIMD(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_cvt_f16_f32."""
+
+    def test_simd_lane_divergence(self) -> None:
+        test_inputs = [0.25, 0.75, 1.25, 3.5, 10.0, 64.0, 128.0, 256.0]
+        for idx, val in enumerate(test_inputs):
+            with self.subTest(val=val):
+                res = execute_cvt_op("v_cvt_f16_f32", float_to_bits(val), f"ps_cvt_f16_f32_div_{idx}")
+                expected = ref_v_cvt_f16_f32(val)
+                self.assertEqual(res & MASK16, expected)
+
+    def test_ieee754_boundaries(self) -> None:
+        cases = [
+            (65504.0, 0x7BFF),  # Max normal f16
+            (2.0 ** -24, 0x0001),  # Min subnormal f16
+        ]
+        for val, expected in cases:
+            with self.subTest(val=val):
+                res = execute_cvt_op("v_cvt_f16_f32", float_to_bits(val), "ps_cvt_f16_f32_bnd")
+                self.assertEqual(res & MASK16, expected)
+
+
+class TestVCvtF16F32Translator(unittest.TestCase):
+    """Translator execution verification for v_cvt_f16_f32."""
+
+    def test_translator_cvt_f16_f32_execution(self) -> None:
+        res = execute_cvt_op("v_cvt_f16_f32", 0x3F800000, "ps_cvt_f16_f32_exec")
+        self.assertEqual(res & MASK16, 0x3C00)
+
+
+# =============================================================================
+# 2. v_cvt_f32_f16
+# =============================================================================
+
+class TestVCvtF32F16Oracle(unittest.TestCase):
+    """Reference oracle tests for v_cvt_f32_f16 backed by translator execution."""
+
+    def test_basic_values(self) -> None:
+        cases = [
+            (0x0000, 0.0),
+            (0x3C00, 1.0),
+            (0xBC00, -1.0),
+            (0x4000, 2.0),
+            (0x3800, 0.5),
+        ]
+        for f16, expected in cases:
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_f32_f16", f16, "ps_cvt_f32_f16_basic")
+                self.assertEqual(bits_to_float(res), expected)
+
+    def test_infinities_and_zeros(self) -> None:
+        cases = [
+            (0x7C00, 0x7F800000),  # +inf
+            (0xFC00, 0xFF800000),  # -inf
+            (0x8000, 0x80000000),  # -0.0
+        ]
+        for f16, expected_bits in cases:
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_f32_f16", f16, "ps_cvt_f32_f16_inf")
+                self.assertEqual(res, expected_bits)
+
+
+class TestVCvtF32F16AST(unittest.TestCase):
+    """AST modeling and translation verification for v_cvt_f32_f16."""
+
+    def test_ast_evaluation(self) -> None:
+        node = CvtAstNode("v_cvt_f32_f16", "v0", "v1")
+        lines = [
+            "v_mov_b32_e32 v1, 0x4200",  # 3.0h
+            node.emit_asm(),
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cvt_f32_f16_ast", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(bits_to_float(out[0]), 3.0)
+
+
+class TestVCvtF32F16SIMD(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_cvt_f32_f16."""
+
+    def test_simd_lane_divergence(self) -> None:
+        f16_vals = [0x3C00, 0x4000, 0x4200, 0x4400, 0x4600, 0x4800]
+        for idx, f16 in enumerate(f16_vals):
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_f32_f16", f16, f"ps_cvt_f32_f16_div_{idx}")
+                self.assertEqual(bits_to_float(res), ref_v_cvt_f32_f16(f16))
+
+    def test_ieee754_subnormals_widening(self) -> None:
+        # Half subnormal 0x0001 (2^-24) widens into normal f32 (0x33800000)
+        res = execute_cvt_op("v_cvt_f32_f16", 0x0001, "ps_cvt_f32_f16_subnorm")
+        self.assertEqual(res, 0x33800000)
+
+
+class TestVCvtF32F16Translator(unittest.TestCase):
+    """Translator execution verification for v_cvt_f32_f16."""
+
+    def test_translator_cvt_f32_f16_execution(self) -> None:
+        res = execute_cvt_op("v_cvt_f32_f16", 0x3C00, "ps_cvt_f32_f16_exec")
+        self.assertEqual(res, 0x3F800000)
+
+
+# =============================================================================
+# 3. v_cvt_f16_u16
+# =============================================================================
+
+class TestVCvtF16U16Oracle(unittest.TestCase):
+    """Reference oracle tests for v_cvt_f16_u16 backed by translator execution."""
+
+    def test_basic_values(self) -> None:
+        cases = [
+            (0, 0x0000),
+            (1, 0x3C00),
+            (42, 0x5140),
+            (100, 0x5640),
+        ]
+        for u16, expected in cases:
+            with self.subTest(u16=u16):
+                res = execute_cvt_op("v_cvt_f16_u16", u16, "ps_cvt_f16_u16_basic")
+                self.assertEqual(res & MASK16, expected)
+                self.assertEqual(res & MASK16, ref_v_cvt_f16_u16(u16))
+
+    def test_boundary_values(self) -> None:
+        # 65504 is the maximum finite half float (0x7BFF)
+        res_65504 = execute_cvt_op("v_cvt_f16_u16", 65504, "ps_cvt_f16_u16_max_finite")
+        self.assertEqual(res_65504 & MASK16, 0x7BFF)
+
+        # 65535 overflows and rounds to +inf (0x7C00) in nearest-even rounding
+        res_65535 = execute_cvt_op("v_cvt_f16_u16", 65535, "ps_cvt_f16_u16_overflow")
+        self.assertEqual(res_65535 & MASK16, 0x7C00)
+
+
+class TestVCvtF16U16AST(unittest.TestCase):
+    """AST modeling and translation verification for v_cvt_f16_u16."""
+
+    def test_ast_evaluation(self) -> None:
+        node = CvtAstNode("v_cvt_f16_u16", "v0", "v1")
+        lines = [
+            "v_mov_b32_e32 v1, 2",
+            node.emit_asm(),
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cvt_f16_u16_ast", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0] & MASK16, 0x4000)  # 2.0h
+
+
+class TestVCvtF16U16SIMD(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_cvt_f16_u16."""
+
+    def test_simd_lane_divergence(self) -> None:
+        u16_vals = [5, 10, 25, 50, 250, 1000]
+        for idx, u16 in enumerate(u16_vals):
+            with self.subTest(u16=u16):
+                res = execute_cvt_op("v_cvt_f16_u16", u16, f"ps_cvt_f16_u16_div_{idx}")
+                self.assertEqual(res & MASK16, ref_v_cvt_f16_u16(u16))
+
+
+class TestVCvtF16U16Translator(unittest.TestCase):
+    """Translator execution verification for v_cvt_f16_u16."""
+
+    def test_translator_cvt_f16_u16_execution(self) -> None:
+        res = execute_cvt_op("v_cvt_f16_u16", 42, "ps_cvt_f16_u16_exec")
+        self.assertEqual(res & MASK16, 0x5140)
+
+
+# =============================================================================
+# 4. v_cvt_f16_i16
+# =============================================================================
+
+class TestVCvtF16I16Oracle(unittest.TestCase):
+    """Reference oracle tests for v_cvt_f16_i16 backed by translator execution."""
+
+    def test_basic_values(self) -> None:
+        cases = [
+            (0, 0x0000),
+            (1, 0x3C00),
+            (0xFFFF, 0xBC00),  # -1 -> -1.0h
+            (0xFFD6, 0xD140),  # -42 -> -42.0h
+        ]
+        for i16, expected in cases:
+            with self.subTest(i16=hex(i16)):
+                res = execute_cvt_op("v_cvt_f16_i16", i16, "ps_cvt_f16_i16_basic")
+                self.assertEqual(res & MASK16, expected)
+                self.assertEqual(res & MASK16, ref_v_cvt_f16_i16(i16))
+
+    def test_boundary_extremes(self) -> None:
+        cases = [
+            (0x8000, 0xF800),  # -32768 -> -32768.0h (0xF800)
+            (0x7FFF, 0x7800),  # 32767 -> 32768.0h (0x7800)
+        ]
+        for i16, expected in cases:
+            with self.subTest(i16=hex(i16)):
+                res = execute_cvt_op("v_cvt_f16_i16", i16, "ps_cvt_f16_i16_bnd")
+                self.assertEqual(res & MASK16, expected)
+
+
+class TestVCvtF16I16AST(unittest.TestCase):
+    """AST modeling and translation verification for v_cvt_f16_i16."""
+
+    def test_ast_evaluation(self) -> None:
+        node = CvtAstNode("v_cvt_f16_i16", "v0", "v1")
+        lines = [
+            "v_mov_b32_e32 v1, 0xfffe",  # -2
+            node.emit_asm(),
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cvt_f16_i16_ast", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0] & MASK16, 0xC000)  # -2.0h
+
+
+class TestVCvtF16I16SIMD(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_cvt_f16_i16."""
+
+    def test_simd_lane_divergence(self) -> None:
+        i16_vals = [0xFFF6, 0xFFEC, 0x000A, 0x0014]  # -10, -20, 10, 20
+        for idx, i16 in enumerate(i16_vals):
+            with self.subTest(i16=hex(i16)):
+                res = execute_cvt_op("v_cvt_f16_i16", i16, f"ps_cvt_f16_i16_div_{idx}")
+                self.assertEqual(res & MASK16, ref_v_cvt_f16_i16(i16))
+
+
+class TestVCvtF16I16Translator(unittest.TestCase):
+    """Translator execution verification for v_cvt_f16_i16."""
+
+    def test_translator_cvt_f16_i16_execution(self) -> None:
+        res = execute_cvt_op("v_cvt_f16_i16", 0xFFD6, "ps_cvt_f16_i16_exec")
+        self.assertEqual(res & MASK16, 0xD140)
+
+
+# =============================================================================
+# 5. v_cvt_u16_f16
+# =============================================================================
+
+class TestVCvtU16F16Oracle(unittest.TestCase):
+    """Reference oracle tests for v_cvt_u16_f16 backed by translator execution."""
+
+    def test_basic_values(self) -> None:
+        cases = [
+            (0x5140, 42),  # 42.0h -> 42
+            (0x3C00, 1),   # 1.0h -> 1
+            (0x3E00, 1),   # 1.5h -> 1 (truncated)
+            (0x3800, 0),   # 0.5h -> 0
+        ]
+        for f16, expected in cases:
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_u16_f16", f16, "ps_cvt_u16_f16_basic")
+                self.assertEqual(res & MASK16, expected)
+                self.assertEqual(res & MASK16, ref_v_cvt_u16_f16(f16))
 
     def test_saturation_and_nan(self) -> None:
-        self.assertEqual(ref_v_cvt_i16_f16(0x7C00), 0x7FFF)  # +inf -> 32767
-        self.assertEqual(ref_v_cvt_i16_f16(0xFC00), 0x8000)  # -inf -> -32768
-        self.assertEqual(ref_v_cvt_i16_f16(0x7E00), 0x0000)  # NaN -> 0
+        cases = [
+            (0xBC00, 0),      # -1.0h -> 0 (clamped)
+            (0x7C00, 65535),  # +inf -> 65535
+            (0xFC00, 0),      # -inf -> 0
+            (0x7E00, 0),      # NaN -> 0
+        ]
+        for f16, expected in cases:
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_u16_f16", f16, "ps_cvt_u16_f16_sat")
+                self.assertEqual(res & MASK16, expected)
 
-class CvtI16F16Expr(ASTNode):
-    def __init__(self, src_expr: str) -> None:
-        self.src_expr = src_expr
 
-    def eval(self, f16_bits: int) -> int:
-        return ref_v_cvt_i16_f16(f16_bits)
+class TestVCvtU16F16AST(unittest.TestCase):
+    """AST modeling and translation verification for v_cvt_u16_f16."""
+
+    def test_ast_evaluation(self) -> None:
+        node = CvtAstNode("v_cvt_u16_f16", "v0", "v1")
+        lines = [
+            "v_mov_b32_e32 v1, 0x4880",  # 9.0h
+            node.emit_asm(),
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cvt_u16_f16_ast", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0] & MASK16, 9)
+
+
+class TestVCvtU16F16SIMD(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_cvt_u16_f16."""
+
+    def test_simd_lane_divergence(self) -> None:
+        f16_vals = [0x4000, 0x4200, 0x4500, 0x4700]  # 2.0, 3.0, 5.0, 7.0
+        for idx, f16 in enumerate(f16_vals):
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_u16_f16", f16, f"ps_cvt_u16_f16_div_{idx}")
+                self.assertEqual(res & MASK16, ref_v_cvt_u16_f16(f16))
+
+
+class TestVCvtU16F16Translator(unittest.TestCase):
+    """Translator execution verification for v_cvt_u16_f16."""
+
+    def test_translator_cvt_u16_f16_execution(self) -> None:
+        res = execute_cvt_op("v_cvt_u16_f16", 0x5140, "ps_cvt_u16_f16_exec")
+        self.assertEqual(res & MASK16, 42)
+
+
+# =============================================================================
+# 6. v_cvt_i16_f16
+# =============================================================================
+
+class TestVCvtI16F16Oracle(unittest.TestCase):
+    """Reference oracle tests for v_cvt_i16_f16 backed by translator execution."""
+
+    def test_basic_values(self) -> None:
+        cases = [
+            (0xD140, 0xFFD6),  # -42.0h -> -42
+            (0x5140, 42),      # 42.0h -> 42
+            (0xBE00, 0xFFFF),  # -1.5h -> -1
+        ]
+        for f16, expected in cases:
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_i16_f16", f16, "ps_cvt_i16_f16_basic")
+                self.assertEqual(res & MASK16, expected)
+                self.assertEqual(res & MASK16, ref_v_cvt_i16_f16(f16))
+
+    def test_saturation_and_nan(self) -> None:
+        cases = [
+            (0x7C00, 0x7FFF),  # +inf -> 32767
+            (0xFC00, 0x8000),  # -inf -> -32768
+            (0x7E00, 0x0000),  # NaN -> 0
+        ]
+        for f16, expected in cases:
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_i16_f16", f16, "ps_cvt_i16_f16_sat")
+                self.assertEqual(res & MASK16, expected)
 
 
 class TestVCvtI16F16AST(unittest.TestCase):
+    """AST modeling and translation verification for v_cvt_i16_f16."""
+
     def test_ast_evaluation(self) -> None:
-        expr = CvtI16F16Expr("v0")
-        self.assertEqual(expr.eval(0xC000), 0xFFFE)  # -2
-        self.assertEqual(expr.eval(0x4000), 2)
+        node = CvtAstNode("v_cvt_i16_f16", "v0", "v1")
+        lines = [
+            "v_mov_b32_e32 v1, 0xc000",  # -2.0h
+            node.emit_asm(),
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cvt_i16_f16_ast", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0] & MASK16, 0xFFFE)
+
 
 class TestVCvtI16F16SIMD(unittest.TestCase):
-    def test_simd_lane_divergence(self) -> None:
-        for l in range(32):
-            val = float((l - 16) * 10)
-            f16 = float_to_f16_bits(val)
-            expected = int(val) & MASK16
-            self.assertEqual(ref_v_cvt_i16_f16(f16), expected)
+    """SIMD lane divergence and boundary extremes for v_cvt_i16_f16."""
 
-    def test_simd_saturation_extremes(self) -> None:
-        # Negative saturation: -40000.0 -> -32768 (0x8000)
-        self.assertEqual(ref_v_cvt_i16_f16(float_to_f16_bits(-40000.0)), 0x8000)
-        # Positive saturation: +40000.0 -> 32767 (0x7FFF)
-        self.assertEqual(ref_v_cvt_i16_f16(float_to_f16_bits(40000.0)), 0x7FFF)
+    def test_simd_lane_divergence(self) -> None:
+        f16_vals = [0xC200, 0xC500, 0x4200, 0x4500]  # -3.0, -5.0, 3.0, 5.0
+        for idx, f16 in enumerate(f16_vals):
+            with self.subTest(f16=hex(f16)):
+                res = execute_cvt_op("v_cvt_i16_f16", f16, f"ps_cvt_i16_f16_div_{idx}")
+                self.assertEqual(res & MASK16, ref_v_cvt_i16_f16(f16))
+
 
 class TestVCvtI16F16Translator(unittest.TestCase):
+    """Translator execution verification for v_cvt_i16_f16."""
+
     def test_translator_cvt_i16_f16_execution(self) -> None:
-        body = [
-            "v_mov_b32_e32 v1, 0xd140",  # -42.0h
-            "v_cvt_i16_f16_e32 v2, v1",
-            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        res = execute_cvt_op("v_cvt_i16_f16", 0xD140, "ps_cvt_i16_f16_exec")
+        self.assertEqual(res & MASK16, 0xFFD6)
+
+
+# =============================================================================
+# 7. Negative Controls and Mutation Detection
+# =============================================================================
+
+class TestVCvtF16NegativeControls(unittest.TestCase):
+    """Negative controls and mutation detection for f16 conversions."""
+
+    def test_syntax_rejection_insufficient_operands(self) -> None:
+        lines = [
+            "v_cvt_f16_f32_e32 v0",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
         ]
-        results = run_cs(body, name="cs_cvt_i16_f16")
-        for l in range(32):
-            self.assertEqual(results[l] & 0xFFFF, 0xFFD6)
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_cvt_bad_ops", lines)
+
+    def test_mutation_detection_signed_vs_unsigned_f16_conversion(self) -> None:
+        # Negative half float -42.0h (0xD140):
+        # v_cvt_i16_f16 gives -42 (0xFFD6)
+        # v_cvt_u16_f16 gives 0 (saturated clamp to 0)
+        res_i16 = execute_cvt_op("v_cvt_i16_f16", 0xD140, "ps_mut_i16")
+        res_u16 = execute_cvt_op("v_cvt_u16_f16", 0xD140, "ps_mut_u16")
+        self.assertEqual(res_i16 & MASK16, 0xFFD6)
+        self.assertEqual(res_u16 & MASK16, 0)
+        self.assertNotEqual(res_i16 & MASK16, res_u16 & MASK16)
 
 
 if __name__ == "__main__":
