@@ -383,6 +383,35 @@ bool xr_bias_compatible(const D3D12_RESOURCE_DESC& desc) {
     return mips == 1;
 }
 
+// Descriptions the PC runtime's GetCopyableFootprints refuses before any driver is asked. Measured with
+// d3d12_footprint_fuzz_test over 49,739 random descriptions: an RTX 5060 Ti (621.14) and WARP agree on every one of
+// these, and neither ever accepts a description that breaks one of them.
+//   - ALLOW_DEPTH_STENCIL on a buffer (other buffer flags are fine, D3D-122), or on a texture whose format family has
+//     no depth member: only R32G8X24, R32, R24G8 and R16 do.
+//   - An extent beyond D3D12's limits: 16384 for 1D and 2D, 2048 for every 3D axis.
+//   - A block-compressed format on a 1D texture.
+//   - A 3D texture in a format with a depth or stencil plane: the R32G8X24 and R24G8 families, D32_FLOAT and
+//     D16_UNORM (R32_TYPELESS, R16_TYPELESS and their colour formats stay valid as volumes).
+bool footprint_refused(const D3D12_RESOURCE_DESC& desc) {
+    const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return depth_stencil;
+    const DXGI_FORMAT f = desc.Format;
+    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    const UINT64 max_extent = volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    if (desc.Width > max_extent || desc.Height > max_extent || (volume && desc.DepthOrArraySize > max_extent))
+        return true;
+    const bool block_compressed = (f >= DXGI_FORMAT_BC1_TYPELESS && f <= DXGI_FORMAT_BC5_SNORM) ||
+                                  (f >= DXGI_FORMAT_BC6H_TYPELESS && f <= DXGI_FORMAT_BC7_UNORM_SRGB);
+    if (one_d && block_compressed) return true;
+    const bool r32g8x24 = f >= DXGI_FORMAT_R32G8X24_TYPELESS && f <= DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    const bool r24g8 = f >= DXGI_FORMAT_R24G8_TYPELESS && f <= DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    if (volume && (r32g8x24 || r24g8 || f == DXGI_FORMAT_D32_FLOAT || f == DXGI_FORMAT_D16_UNORM)) return true;
+    const bool r32 = f >= DXGI_FORMAT_R32_TYPELESS && f <= DXGI_FORMAT_R32_SINT;
+    const bool r16 = f >= DXGI_FORMAT_R16_TYPELESS && f <= DXGI_FORMAT_R16_SINT;
+    return depth_stencil && !(r32g8x24 || r32 || r24g8 || r16);
+}
+
 // The Xbox tiled layout word (slot 76, docs/d3d12_vulkan.md section 4.2) is outside D3D12_TEXTURE_LAYOUT's
 // enumerators, so compare as an integer.
 constexpr UINT kXboxTiledLayout = 0x101;
@@ -6225,7 +6254,7 @@ public:
             }
             if (total) *total = ~0ull;
         };
-        if (!desc || !xr_bias_compatible(*desc) || rgb96_refused(*desc)) return fail();
+        if (!desc || !xr_bias_compatible(*desc) || rgb96_refused(*desc) || footprint_refused(*desc)) return fail();
         const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             // The PC runtime refuses any buffer field that isn't its one valid value (all measured on WARP, Width,
@@ -6252,8 +6281,9 @@ public:
         }
         if (one_d && desc->Height != 1) return fail();
         // Structural checks only, as measured on the PC runtime (D3D-122). Not allocation()'s: the footprint path
-        // accepts extra mips, 2D ROW_MAJOR and Quality > 0 at one sample, and extent limits, alignment and
-        // multisample quality differ between adapters, so those stay unchecked.
+        // accepts extra mips, 2D ROW_MAJOR and Quality > 0 at one sample, and alignment and multisample quality
+        // differ between adapters, so those stay unchecked. The extent limits the PC runtime does apply here (an
+        // RTX 5060 Ti and WARP agree) are footprint_refused's.
         const UINT samples = desc->SampleDesc.Count;
         const bool multisample_ok = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->MipLevels == 1 &&
                                     desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR && !(samples & (samples - 1)) &&

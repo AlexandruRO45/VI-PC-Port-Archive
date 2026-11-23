@@ -1291,6 +1291,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_vulkan_device COMMAND d3d12_vulkan_device_test)
 
+    # GetCopyableFootprints on random descriptions, against the host adapter and WARP where they agree.
+    add_executable(d3d12_footprint_fuzz_test test/d3d12_footprint_fuzz_test.cpp)
+    target_link_libraries(d3d12_footprint_fuzz_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_footprint_fuzz_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_footprint_fuzz_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_footprint_fuzz COMMAND d3d12_footprint_fuzz_test)
+    set_tests_properties(d3d12_footprint_fuzz PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(d3d12_buffer_tiles_test test/d3d12_buffer_tiles_test.cpp)
     target_link_libraries(d3d12_buffer_tiles_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_buffer_tiles_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
