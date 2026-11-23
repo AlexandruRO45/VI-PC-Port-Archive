@@ -284,5 +284,27 @@ class TestErrorsAndCli(unittest.TestCase):
             self.assertIn("rehydrated", text.getvalue())
 
 
+@unittest.skipIf(os.name == "nt", "POSIX permission bits")
+class PublishModeTests(unittest.TestCase):
+    """The output is staged through a private temporary file (0600): the published file gets the bits a plain
+    open() would give it, or those of the file it replaces, as every other staged writer does through file_mode."""
+
+    def test_a_new_output_gets_the_bits_of_a_plain_open(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.bin")
+            R._publish(out, b"new")
+            self.assertEqual(os.stat(out).st_mode & 0o777, file_mode.new_file_mode(tmp))
+
+    def test_a_replaced_output_keeps_its_bits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.bin")
+            with open(out, "wb") as f:
+                f.write(b"old")
+            os.chmod(out, 0o640)
+            R._publish(out, b"new")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+
+
 if __name__ == "__main__":
     unittest.main()
