@@ -4,11 +4,13 @@
 ; colours are "data-at" 0x100 bytes after the first instruction, so the offset added is 0x100 - 4 = 0xfc.
 ;   parity = (floor(world.x) + floor(world.z)) & 1
 ;   mrt0   = (parity == 0 ? A : B) * tint        A = (0.4375, 0.4375, 0.5, 1), B = (0.125, 0.1875, 0.25, 1)
-; The same values are kFloorA and kFloorB in lanterns_scene.h.
+; The same values are kFloorA and kFloorB in lanterns_scene.h. The input records' slot bytes (6 and 3) are not
+; position + 1: the attr number is the table position (tools/fssm_header.py), so a reader that took the slot would
+; feed this shader the wrong parameters.
 ; stage: ps
 ; wave: 32
-; input: flat
-; input: interp
+; input: flat slot=6
+; input: interp slot=3
 ; data-at: 0x100
 ; data: 0x3ee00000 0x3ee00000 0x3f000000 0x3f800000
 ; data: 0x3e000000 0x3e400000 0x3e800000 0x3f800000

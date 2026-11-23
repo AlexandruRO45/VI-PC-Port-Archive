@@ -36,6 +36,24 @@ inline std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
 
 inline std::uint64_t align(std::uint64_t v, std::uint64_t a) { return (v + a - 1) / a * a; }
 
+// Waits until the fence reaches value, for at most kFenceWaitMs: a lost signal or a hung GPU fails the check with a
+// line saying so, instead of blocking the guest until run_lanterns.py's timeout kills it. It polls
+// GetCompletedValue, so it needs no event object.
+constexpr ULONGLONG kFenceWaitMs = 30000;
+template <class Fence>
+bool wait_fence(Fence& fence, UINT64 value) {
+    const ULONGLONG deadline = GetTickCount64() + kFenceWaitMs;
+    for (UINT64 now = fence->GetCompletedValue(); now < value; now = fence->GetCompletedValue()) {
+        if (GetTickCount64() > deadline) {
+            std::fprintf(stderr, "lanterns: a fence stayed at %llu for %llu ms, waiting for %llu\n",
+                         static_cast<unsigned long long>(now), kFenceWaitMs, static_cast<unsigned long long>(value));
+            return false;
+        }
+        Sleep(1);
+    }
+    return true;
+}
+
 // A V# over records of 'stride' bytes, format 32_32_32_32_FLOAT, structured out-of-range checks (an idxen access).
 inline std::array<std::uint32_t, 4> make_vsharp(std::uint64_t base, std::uint32_t stride, std::uint32_t records) {
     leonida::gfx10::Buffer buffer;

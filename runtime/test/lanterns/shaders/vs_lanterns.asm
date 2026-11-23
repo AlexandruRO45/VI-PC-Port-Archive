@@ -1,8 +1,11 @@
 ; Lanterns vertex shader (stage 1). Hand-written RDNA2 (gfx1013), packed by ../fssm_pack.py into a synthetic
 ; FSSM program in a DXBC/XDAT/XBCH container, then unpacked, disassembled and translated by the project's own tools.
 ; It fetches its vertex and its instance through two V#s, as the title's vertex shaders that have no fetch program do.
+; Its container has two XDAT 0x0D payloads, as 195 of the title's do: first this code under another name (another
+; FSSM hash, which nothing translates), then this program. The tools and the runtime both take the last one.
 ; stage: vs
 ; wave: 32
+; first-payload: vs_lanterns_first
 ;
 ; User SGPRs (root signature order, docs/d3d12_vulkan.md 3.5):
 ;   s[0:1]   table 0: console VA of the mesh's V#      (stride 16: position xyz, face shade)

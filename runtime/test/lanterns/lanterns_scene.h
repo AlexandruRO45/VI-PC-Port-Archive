@@ -145,6 +145,7 @@ struct Draw {
     std::vector<Instance> instances;
     std::array<float, 12> model;    // rows: local = M * (x, y, z, 1)
     std::array<float, 4> tint;
+    bool wave64 = false;            // drawn with the wave64 pair (vs_lanterns_w64, ps_lanterns_lit_w64)
 };
 
 inline std::array<float, 12> rotation_y(double degrees) {
@@ -216,6 +217,7 @@ inline Scene stage1() {
         pyramids.instances.push_back(instance(-4.0f + 8.0f * float(i), 0.0f, 5.5f, 1.5f, {7, 3, 2}, i));
     Draw floor{4, true, {}, rotation_y(0), {1.0f, 0.875f, 0.75f, 1.0f}};
     floor.instances.push_back({{0.0f, 0.0f, 0.0f}, 1.0f, {1.0f, 1.0f, 1.0f, 1.0f}});
+    octahedra.wave64 = true;
     s.draws = {lanterns, cubes, octahedra, pyramids, floor};
 
     const double eye[3] = {0.5, 3.25, -6.5}, target[3] = {0.0, 0.6, 2.5};

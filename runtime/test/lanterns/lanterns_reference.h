@@ -4,7 +4,9 @@
 // tiny change in where the GPU puts a vertex could change it: its centre lies within kMargin pixels of a face edge,
 // two faces with different colours are within their depth tolerance of each other, or (on the floor) the centre is
 // within kMargin pixels of a checker border. kMargin is 1/32 pixel, eight times the vertex snapping of an 8-bit
-// sub-pixel rasterizer. Every other pixel must match bit for bit: its colour is a product of short binary fractions
+// sub-pixel rasterizer. Background is a candidate only where no surface certainly covers the centre: a centre near
+// an edge that two faces of one solid share (and no other edge of either) is covered by one of the two, since both
+// get the same vertex positions and the rasterizer leaves no gap between them; a crack there fails. Every other pixel must match bit for bit: its colour is a product of short binary fractions
 // (lanterns_scene.h), which float arithmetic computes exactly, and nothing near it is in doubt. The uncertain pixels
 // are counted apart, as d3d12_translated_draw_test counts its diagonal, and each must still be one of its candidates.
 #pragma once
@@ -28,6 +30,7 @@ struct Reference {
     std::vector<Color> color;                    // the expected colour (the most likely one where uncertain)
     std::vector<std::vector<Color>> candidates;  // empty: certain; else every colour the pixel may have
     unsigned degenerate_faces = 0;               // faces seen edge-on, which cover nothing for certain
+    unsigned shared_edge_pixels = 0;             // pixels a pair of faces covers (detail::covers)
 };
 
 namespace detail {
@@ -43,7 +46,40 @@ struct Fragment {
     bool certain_cover;    // the centre is more than kMargin inside every edge
     unsigned count;        // 1 or 2 colours (2: a floor pixel on a checker border)
     Color colors[2];
+    unsigned group = 0;    // the draw instance (one solid) the face belongs to
+    bool on_edge = false;  // the centre is within kMargin of exactly one edge of the face, this one:
+    std::array<double, 4> edge{};   // its screen end points, ordered, so the face across it has the same four
+    int side = 0;          // which side of that edge the face lies on
 };
+
+// Whether two fragments of one solid share the one edge each is near, from opposite sides: then the centre is inside
+// one of the two faces (both get the same vertex positions, and a rasterizer leaves no gap along a shared edge).
+inline bool share_edge(const Fragment& a, const Fragment& b) {
+    return a.on_edge && b.on_edge && a.group == b.group && a.edge == b.edge && a.side == -b.side;
+}
+
+// What certainly covers a pixel centre: a fragment more than kMargin inside its face, or two faces of one solid that
+// share the one edge the centre is near (share_edge), one of which covers it; the pair's depth spans both.
+struct Cover {
+    const Fragment* a;
+    const Fragment* b;   // the pair's other face, or null
+    double depth, tol;
+    unsigned seq;
+};
+
+inline std::vector<Cover> covers(const std::vector<Fragment>& list) {
+    std::vector<Cover> out;
+    for (const Fragment& f : list)
+        if (f.certain_cover) out.push_back({&f, nullptr, f.depth, f.tol, f.seq});
+    for (const Fragment& f : list)
+        for (const Fragment& g : list)
+            if (&f < &g && share_edge(f, g)) {
+                const double lo = std::min(f.depth - f.tol, g.depth - g.tol);
+                const double hi = std::max(f.depth + f.tol, g.depth + g.tol);
+                out.push_back({&f, &g, (lo + hi) / 2, (hi - lo) / 2, std::max(f.seq, g.seq)});
+            }
+    return out;
+}
 
 inline bool same(const Color& a, const Color& b) { return std::memcmp(a.data(), b.data(), sizeof(Color)) == 0; }
 
@@ -90,10 +126,11 @@ inline Reference reference_frame(const Scene& scene, bool depth_test) {
     using namespace detail;
     std::vector<std::vector<Fragment>> frags(std::size_t(kWidth) * kHeight);
     Reference ref;
-    unsigned seq = 0;
+    unsigned seq = 0, groups = 0;
     for (const Draw& draw : scene.draws) {
         const Mesh& mesh = scene.meshes[draw.mesh];
         for (const Instance& inst : draw.instances) {
+            const unsigned group = groups++;
             for (const Face& face : mesh.faces) {
                 const unsigned self = seq++;
                 ScreenVertex s[6];
@@ -110,6 +147,8 @@ inline Reference reference_frame(const Scene& scene, bool depth_test) {
                     continue;
                 }
                 const double orient = area > 0 ? 1.0 : -1.0;
+                double cx = 0, cy = 0;   // the face's centre, to tell which side of an edge it lies on
+                for (unsigned k = 0; k < face.count; ++k) cx += s[k].x / face.count, cy += s[k].y / face.count;
                 // Barycentrics of the plane through s0, s1, s2 (the whole face lies in it).
                 const auto bary = [&](double px, double py, double l[3]) {
                     l[1] = cross(px - s[0].x, py - s[0].y, s[2].x - s[0].x, s[2].y - s[0].y) / a012;
@@ -143,15 +182,28 @@ inline Reference reference_frame(const Scene& scene, bool depth_test) {
                     for (int x = x0; x <= x1; ++x) {
                         const double px = x + 0.5, py = y + 0.5;
                         double inside = 1e30;
+                        unsigned near_count = 0, near_edge = 0;
                         for (unsigned k = 0; k < face.count; ++k) {
                             const auto& a = s[k];
                             const auto& b = s[(k + 1) % face.count];
                             const double ex = b.x - a.x, ey = b.y - a.y;
                             const double d = orient * cross(ex, ey, px - a.x, py - a.y) / std::sqrt(ex * ex + ey * ey);
                             inside = std::min(inside, d);
+                            if (d <= kMargin) ++near_count, near_edge = k;
                         }
                         if (inside < -kMargin) continue;
                         Fragment f{self, depth_at(px, py), tol, inside > kMargin, 1, {lit, lit}};
+                        f.group = group;
+                        if (near_count == 1) {
+                            const auto& a = s[near_edge];
+                            const auto& b = s[(near_edge + 1) % face.count];
+                            const bool swap = b.x < a.x || (b.x == a.x && b.y < a.y);
+                            const auto& p = swap ? b : a;
+                            const auto& q = swap ? a : b;
+                            f.on_edge = true;
+                            f.edge = {p.x, p.y, q.x, q.y};
+                            f.side = cross(q.x - p.x, q.y - p.y, cx - p.x, cy - p.y) > 0 ? 1 : -1;
+                        }
                         if (draw.floor) {
                             double wx, wz, wx1, wz1, wx2, wz2;
                             world_at(px, py, wx, wz);
@@ -177,20 +229,28 @@ inline Reference reference_frame(const Scene& scene, bool depth_test) {
     ref.candidates.resize(frags.size());
     for (std::size_t i = 0; i < frags.size(); ++i) {
         const auto& list = frags[i];
-        const Fragment* winner = nullptr;   // among the certain fragments
-        for (const Fragment& f : list) {
-            if (!f.certain_cover) continue;
-            if (!winner || (depth_test ? f.depth < winner->depth : f.seq > winner->seq)) winner = &f;
+        const std::vector<Cover> found = covers(list);
+        // Without the depth test the order inside a pair decides which face shows, so a pair is no cover there; it
+        // still rules out the background.
+        const Cover* winner = nullptr;
+        bool paired = false;
+        for (const Cover& c : found) {
+            paired = paired || c.b;
+            if (c.b && !depth_test) continue;
+            if (!winner || (depth_test ? c.depth < winner->depth : c.seq > winner->seq)) winner = &c;
         }
         std::vector<Color> cand;
         if (winner) {
-            ref.color[i] = winner->colors[0];
-            for (unsigned k = 0; k < winner->count; ++k) add_unique(cand, winner->colors[k]);
-        } else {
+            ref.color[i] = winner->a->colors[0];
+            for (const Fragment* m : {winner->a, winner->b})
+                if (m)
+                    for (unsigned k = 0; k < m->count; ++k) add_unique(cand, m->colors[k]);
+            ref.shared_edge_pixels += winner->b != nullptr;
+        } else if (!paired) {
             add_unique(cand, ref.color[i]);
         }
         for (const Fragment& f : list) {
-            if (&f == winner) continue;
+            if (winner && (&f == winner->a || &f == winner->b)) continue;
             // Could f be what the GPU shows instead? With the depth test, if it may be nearer; without, if it comes
             // later. An uncertain fragment counts wherever it might be covered.
             const bool may_win = !winner ? true

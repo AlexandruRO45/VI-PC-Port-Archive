@@ -45,13 +45,23 @@ bool load_shaders(const std::filesystem::path& dir, Shaders& out) {
     out.vs = read_file(dir / "vs_lanterns.dxbc");
     out.ps_lit = read_file(dir / "ps_lanterns_lit.dxbc");
     out.ps_floor = read_file(dir / "ps_lanterns_floor.dxbc");
+    out.vs_w64 = read_file(dir / "vs_lanterns_w64.dxbc");
+    out.ps_lit_w64 = read_file(dir / "ps_lanterns_lit_w64.dxbc");
     CHECK(out.vs.size() > 64 && out.ps_lit.size() > 64 && out.ps_floor.size() > 64);
-    // The negative control of the lookup: the VS's FSSM program (fssm_unpack.py's copy) with its last byte, in the
-    // tail's name, changed. The layer must refuse a container whose program the index does not know.
-    auto program = read_file(dir / "fssm" / "vs_lanterns.fssm");
+    CHECK(out.vs_w64.size() > 64 && out.ps_lit_w64.size() > 64);
+    // The lookup control (create_pipelines): the VS's FSSM program (fssm_unpack.py's copy) in a container the guest
+    // writes itself (d3d12_test_shaders.h), once as it is and once with one byte of the program's name changed (so
+    // another FSSM hash). One writer for both, so the hash is the only difference between them.
+    const auto program = read_file(dir / "fssm" / "vs_lanterns.fssm");
     CHECK(program.size() > 0x200 && std::memcmp(program.data(), "FSSM", 4) == 0);
-    program.back() ^= 0x20;
-    out.unknown_vs = shader_container(program);
+    out.rebuilt_vs = shader_container(program);
+    static constexpr char kName[] = "vs_lanterns";
+    const auto name_end = kName + sizeof(kName) - 1;
+    auto renamed = program;
+    const auto at = std::search(renamed.begin(), renamed.end(), kName, name_end);
+    CHECK(at != renamed.end() && std::search(at + 1, renamed.end(), kName, name_end) == renamed.end());
+    at[sizeof(kName) - 2] ^= 0x20;   // "vs_lanternS": the tail's name, not padding
+    out.unknown_vs = shader_container(renamed);
     return true;
 }
 
@@ -123,10 +133,23 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
             desc.PS = {ps.data(), ps.size()};
             desc.DepthStencilState.DepthEnable = depth ? TRUE : FALSE;
             CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso_[floor][depth].p))));
+            if (floor) continue;
+            // The wave64 pair, for the draws marked wave64: vs_lanterns_w64, and ps_lanterns_lit_w64 where the solids
+            // use ps_lanterns_lit (another stage's pixel shader stays as it is).
+            const auto& ps64 = &ps == &shaders.ps_lit ? shaders.ps_lit_w64 : ps;
+            desc.VS = {shaders.vs_w64.data(), shaders.vs_w64.size()};
+            desc.PS = {ps64.data(), ps64.size()};
+            CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso_w64_[depth].p))));
+            desc.VS = {shaders.vs.data(), shaders.vs.size()};
         }
-    std::printf("lanterns: 4 graphics pipelines from 3 FSSM containers; next, a VS the index does not know, which the "
-                "layer must refuse (its 'no translated vs' line is expected)\n");
-    Ref<ID3D12PipelineState> unknown;
+    // The lookup control: the guest's own container of the VS program must give a pipeline, and the same writer's
+    // container with one name byte changed must be refused, so the refusal can only come from the lookup.
+    Ref<ID3D12PipelineState> rebuilt, unknown;
+    desc.VS = {shaders.rebuilt_vs.data(), shaders.rebuilt_vs.size()};
+    CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&rebuilt.p))) && rebuilt.p);
+    std::printf("lanterns: pipelines made (wave32 and wave64), and one from the guest's own container of vs_lanterns; "
+                "next, that container with one name byte changed, which the layer must refuse (its 'no translated vs' "
+                "line is expected)\n");
     desc.VS = {shaders.unknown_vs.data(), shaders.unknown_vs.size()};
     CHECK(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
     return true;
@@ -250,7 +273,7 @@ bool Gpu::initialize(const Scene& scene) {
     ID3D12CommandList* lists[] = {list_.p};
     queue_->ExecuteCommandLists(1, lists);
     CHECK(SUCCEEDED(queue_->Signal(fence_.p, ++fence_value_)));
-    CHECK(SUCCEEDED(fence_->SetEventOnCompletion(fence_value_, nullptr)));
+    CHECK(wait_fence(fence_, fence_value_));
     return true;
 }
 
@@ -278,7 +301,8 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test) {
     list_->SetGraphicsRootConstantBufferView(3, upload_->GetGPUVirtualAddress() + upload_cbv_);
     for (std::size_t d = 0; d < scene.draws.size(); ++d) {
         const Draw& draw = scene.draws[d];
-        list_->SetPipelineState(pso_[draw.floor ? 1 : 0][depth_test ? 1 : 0].p);
+        list_->SetPipelineState(draw.wave64 && !draw.floor ? pso_w64_[depth_test ? 1 : 0].p
+                                                          : pso_[draw.floor ? 1 : 0][depth_test ? 1 : 0].p);
         bind_draw(scene, d);
         list_->DrawIndexedInstanced(geometry_.index_count[draw.mesh], UINT(draw.instances.size()),
                                     geometry_.first_index[draw.mesh], 0, 0);
@@ -302,7 +326,7 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test) {
 }
 
 bool Gpu::finish_frame(std::vector<Color>& pixels) {
-    CHECK(SUCCEEDED(fence_->SetEventOnCompletion(fence_value_, nullptr)));
+    CHECK(wait_fence(fence_, fence_value_));
     void* mapped = nullptr;
     CHECK(SUCCEEDED(readback_->Map(0, nullptr, &mapped)));
     const auto* bytes = static_cast<const std::uint8_t*>(mapped);
@@ -314,7 +338,7 @@ bool Gpu::finish_frame(std::vector<Color>& pixels) {
 }
 
 bool Gpu::idle() {
-    CHECK(SUCCEEDED(fence_->SetEventOnCompletion(fence_value_, nullptr)));
+    CHECK(wait_fence(fence_, fence_value_));
     return true;
 }
 

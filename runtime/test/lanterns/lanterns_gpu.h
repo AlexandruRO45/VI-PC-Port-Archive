@@ -18,7 +18,7 @@ using d3d12test::Ref;
 
 // The containers the guest hands to the pipelines, read from the folder fssm_pack.py wrote.
 struct Shaders {
-    std::vector<std::uint8_t> vs, ps_lit, ps_floor, unknown_vs;
+    std::vector<std::uint8_t> vs, ps_lit, ps_floor, unknown_vs, rebuilt_vs, vs_w64, ps_lit_w64;
 };
 bool load_shaders(const std::filesystem::path& dir, Shaders& out);
 
@@ -55,6 +55,7 @@ private:
     Ref<ID3D12Device> device_;
     Ref<ID3D12RootSignature> root_;
     Ref<ID3D12PipelineState> pso_[2][2];   // [floor][depth test]
+    Ref<ID3D12PipelineState> pso_w64_[2];  // [depth test]: the wave64 pair, for the draws marked wave64
     Ref<ID3D12Resource> vertex_buffer_, index_buffer_, instance_buffer_, upload_, readback_, target_, depth_;
     Ref<ID3D12DescriptorHeap> srv_heap_, rtv_heap_, dsv_heap_;
     Ref<ID3D12CommandQueue> queue_;

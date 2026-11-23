@@ -52,8 +52,7 @@ bool dump(const std::filesystem::path& out, const char* name, const std::vector<
     const bool ok = write_file(base + ".gpu.rgba32f", gpu.data(), gpu.size() * sizeof(Color)) &&
                     write_file(base + ".ref.rgba32f", ref.color.data(), ref.color.size() * sizeof(Color)) &&
                     write_file(base + ".uncertain.u8", uncertain.data(), uncertain.size());
-    if (!ok) std::fprintf(stderr, "lanterns: cannot write %s.*
-", base.c_str());
+    if (!ok) std::fprintf(stderr, "lanterns: cannot write %s.*\n", base.c_str());
     return ok;
 }
 
@@ -102,6 +101,8 @@ int stage1(const std::filesystem::path& shader_dir, const std::filesystem::path&
     const Change control = changes(with_depth, ref_on, without_depth, ref_off);
     std::printf("lanterns: the depth test changes %u certain pixels (the reference expects %u); %u faces edge-on\n",
                 control.changed, control.expected, ref_on.degenerate_faces);
+    std::printf("lanterns: %u pixels lie on an edge two faces of one solid share: one of the two must show there, not "
+                "what is behind them\n", ref_on.shared_edge_pixels);
     if (!dump(out_dir, "stage1-depth", with_depth, ref_on) || !dump(out_dir, "stage1-nodepth", without_depth, ref_off))
         return 1;
     if (!on.pass() || !off.pass() || control.expected < 1000 || control.changed != control.expected) {
