@@ -547,12 +547,12 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
 - **Negative controls.** `--perturb NAME` judges the hardware against a deliberately wrong model (mismatches must
   appear); `--negative-control` re-judges the words of the run with all 18 (`max_i32` unsigned, `min_u32` signed,
   swapped `cmpst`, zero-extended `i8`/`i16`, d16 reads clearing the other half, `b16_d16_hi` shift, swapped
-  `write2`, `st64` unit, swapped `wrxchg2`, bpermute reading off lanes or crossing the wave64 halves, reversed quad permute, swapped
-  swizzle or/xor, permute writing no zero, permute lowest source winning a collision, permute crossing the wave64
-  halves) and exits 1 if one goes unnoticed. The two that cross the wave64 halves change no wave32 program, so they
-  are judged on the wave64 programs only; where none with the op ran (`--wave 32`, or GFX12, which skips them) they
-  are listed as not exercised. `--minimize` drops ops while a program still differs, `--keep DIR` writes the native kernel of each
-  mismatch, `--only I,J` runs chosen indices.
+  `write2`, `st64` unit, swapped `wrxchg2`, bpermute reading off lanes or crossing the wave64 halves, reversed quad
+  permute, swapped swizzle or/xor, permute writing no zero, permute lowest source winning a collision, permute
+  crossing the wave64 halves) and exits 1 if one goes unnoticed. The two that cross the wave64 halves change no
+  wave32 program, so they are judged on the wave64 programs only; where none with the op ran (`--wave 32`, or GFX12,
+  which skips them) they are listed as not exercised. `--minimize` drops ops while a program still differs,
+  `--keep DIR` writes the native kernel of each mismatch, `--only I,J` runs chosen indices.
 
 RDNA2 `ds_permute_b32` verification (`FUZZ-10`, `SHADER-133`): raw kernels on an AMD Radeon RX 6800 (`gfx1030`, wave32
 and wave64) confirm that only active lanes send, the highest active source lane wins a collision, active destination
