@@ -160,6 +160,17 @@ class RepositoryLinksTest(unittest.TestCase):
                 ("bad.md", "other.md#nope", "anchor not found"),
             ])
 
+    def test_docs_index_names_every_page(self):
+        """Each top-level docs/*.md page is named by docs/README.md; modding.md was added without a row."""
+        with open(os.path.join(ROOT, "docs", "README.md"), encoding="utf-8") as f:
+            named = {link.partition("#")[0] for link in links(f.read())
+                     if link.endswith(".md") and "/" not in link and not link.startswith(EXTERNAL)}
+        pages = sorted(name for name in os.listdir(os.path.join(ROOT, "docs"))
+                       if name.endswith(".md") and name != "README.md")
+        self.assertGreaterEqual(len(pages), 40, "expected the top-level docs pages to be found")
+        self.assertEqual([name for name in pages if name not in named], [],
+                         "docs/README.md does not name every docs/*.md page")
+
 
 if __name__ == "__main__":
     unittest.main()

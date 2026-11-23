@@ -83,6 +83,12 @@ method, scope and caveats. No game data is included.
 | [mission_logic.md](mission_logic.md) | Mission state tables: 0x20 record layout (band counter, byte offsets), the 64-byte pool element with world transforms, case-folding joaat keys, 53.5 % of states named, 113 state-set clusters covering 82.4 % of files. |
 | [gbuffer.md](gbuffer.md) | Deferred G-buffer targets (`PS_DeferredTextured` and all 2,989 `*Deferred*` pixel shaders, `PROC-146`): 5- and 6-target `OSG1`/`PSV0` signatures (`float32` + `exp ... compr` on all outputs), the 24-bit octahedral normal split across `mrt1.gba` (`2047.5` scale, `1/255` byte packing), sqrt-encoded `mrt2`, byte IDs in `mrt3.zw`, float motion in `mrt4`, and why binding `f16` targets mangles the normal bytes. |
 
+## Mods
+
+| Document | What it covers |
+|---|---|
+| [modding.md](modding.md) | The mod format and loader: `mods/<folder>/mod.json` archetype swaps and the first-person camera view the runtime reads, the archetype-lookup hook (`--archetype-lookup`) a swap still needs and the executable addresses it waits on, and the two bundled mods (`mods/mandy_prison_intro`, `mods/first_person`); a mod names models the game already has and holds no game data. |
+
 ## Other languages
 
 Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`fr`, `pt-BR`, `zh-CN`, `pl-PL`, `tr`, `ru`, `ja`, `es`, `it`, `de`, `ar`).
