@@ -105,6 +105,17 @@ def sample():
     return build(graphics, compute, blobs, programs)
 
 
+def sample_with_unused():
+    """sample() plus a fifth program that no pipeline references (stage label "unused")."""
+    blobs = [kind0(), b"\x01" * 20, layout_blob(3, D_CS, 3), b"\x03" * 388, b"POSITION\0",
+             layout_blob(2, D_PS), layout_blob(2, D_VS, 2), layout_blob(2, D_MS, 0)]
+    programs = [prog(0x11112222), prog(0x33334444, 5), prog(0x55556666), prog(0x77778888, 3), prog(0x9999AAAA)]
+    graphics = [(3, 4, {0: (0, 5), 1: (1, 6)}),
+                (3, 4, {0: (0, 5), 2: (2, 7)})]
+    compute = [(0, 1, 3, 2)]
+    return build(graphics, compute, blobs, programs)
+
+
 def archive(lib, junk=b"\x78\x9c not a stream " * 50):
     """An archive-like file: unrelated bytes (with false zlib headers), then the library as 64 KiB zlib blocks with
     small gaps between them, as in shaders.rpf."""
@@ -249,7 +260,7 @@ class Main(unittest.TestCase):
     def test_unknown_stage_is_a_usage_error(self):
         # A typo used to write zero programs and exit 0; now it is a usage error (exit 2) before the input is read
         # or the output folder is made.
-        for stages in ("px", "cs,", "cs,,ps", "unused", "slot7", "all,cs"):
+        for stages in ("px", "cs,", "cs,,ps", "slot7", "all,cs", "Unused"):
             with self.subTest(stages=stages), tempfile.TemporaryDirectory() as tmp:
                 out = os.path.join(tmp, "out")
                 err = io.StringIO()
@@ -269,6 +280,42 @@ class Main(unittest.TestCase):
             rc, text = self.run_main(src, "--out", os.path.join(tmp, "all"), "--stages", " all ")
             self.assertEqual(rc, 0)
             self.assertIn("4 written", text)
+
+    def test_unused_is_a_stage_that_can_be_selected(self):
+        # "unused" is a label the tool gives (lib_unused_NNNNN): --stages takes it, and 'all' includes those programs.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample_with_unused())
+            rc, text = self.run_main(src, "--out", os.path.join(tmp, "unused"), "--stages", "unused")
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(os.path.join(tmp, "unused", "fspx"))),
+                             ["lib_unused_00004.code", "lib_unused_00004.json"])
+            rc, text = self.run_main(src, "--out", os.path.join(tmp, "both"), "--stages", "cs, unused")
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(os.path.join(tmp, "both", "fspx"))),
+                             ["lib_cs_00003.code", "lib_cs_00003.json",
+                              "lib_unused_00004.code", "lib_unused_00004.json"])
+            rc, text = self.run_main(src, "--out", os.path.join(tmp, "default"))
+            self.assertEqual(rc, 0)
+            self.assertIn("4 written", text)
+            self.assertNotIn("lib_unused_00004.code", os.listdir(os.path.join(tmp, "default", "fspx")))
+            rc, text = self.run_main(src, "--out", os.path.join(tmp, "all"), "--stages", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("5 written", text)
+            self.assertIn("lib_unused_00004.code", os.listdir(os.path.join(tmp, "all", "fspx")))
+
+    def test_save_only_checks_stages_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            save = os.path.join(tmp, "saved.bin")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                self.run_main(src, "--save", save, "--stages", "px")
+            self.assertEqual(cm.exception.code, 2)
+            self.assertFalse(os.path.exists(save))
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:

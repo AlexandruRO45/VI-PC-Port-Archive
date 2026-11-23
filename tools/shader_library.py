@@ -46,6 +46,9 @@ GFX_SIZE = 0x70
 CS_SIZE = 24
 NONE = 0xFFFFFFFF
 SLOTS = {0: "ps", 1: "vs", 2: "ms", 6: "slot6"}
+GFX_SLOTS = 7      # program slots per graphics record
+# Every stage label a program can get: --stages takes these (or "all"). "unused" is a program no pipeline references.
+STAGES = frozenset({"cs", "unused"} | {SLOTS.get(slot, f"slot{slot}") for slot in range(GFX_SLOTS)})
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 BLOCK = 1 << 16
 
@@ -143,7 +146,7 @@ def parse(b: bytes) -> dict:
         pairs = struct.unpack_from("<14I", r, 56)
         rec = {"hash": f"{hsh:016x}", "state": ref(state, "blob"), "input_layout": ref(layout_blob, "blob"),
                "digest": r[16:56].hex(), "stages": {}}
-        for slot in range(7):
+        for slot in range(GFX_SLOTS):
             p, blob = ref(pairs[2 * slot], "program"), ref(pairs[2 * slot + 1], "blob")
             if p is None:
                 continue
@@ -251,7 +254,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="output folder (library.json, index.json, fspx/, disasm/)")
     ap.add_argument("--save", help="write the reassembled library file here")
     ap.add_argument("--stages", default="cs,ps,vs,ms",
-                    help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
+                    help="stages whose programs to write (default cs,ps,vs,ms; 'unused' is the programs no pipeline "
+                         "references; 'all' writes every program)")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
@@ -267,10 +271,9 @@ def main(argv=None) -> int:
     want = None
     if a.stages.strip() != "all":
         want = {s.strip() for s in a.stages.split(",")}
-        known = {"cs"} | {SLOTS.get(slot, f"slot{slot}") for slot in range(7)}
-        if not want <= known:
-            ap.error(f"--stages: unknown stage {', '.join(repr(s) for s in sorted(want - known))} "
-                     f"(give 'all' alone, or some of {','.join(sorted(known))})")
+        if not want <= STAGES:
+            ap.error(f"--stages: unknown stage {', '.join(repr(s) for s in sorted(want - STAGES))} "
+                     f"(give 'all' alone, or some of {','.join(sorted(STAGES))})")
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
@@ -304,7 +307,7 @@ def main(argv=None) -> int:
     for i in range(lib["header"]["programs"]):
         stages = lib["stage"].get(i, set())
         st = "+".join(sorted(stages)) if stages else "unused"
-        if want is not None and not stages & want:
+        if want is not None and not (stages & want or (not stages and "unused" in want)):
             continue
         code = program(b, lib, i)
         start, end = code_range(code)
