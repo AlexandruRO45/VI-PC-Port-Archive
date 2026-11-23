@@ -480,6 +480,8 @@ def prepare_gpu(exe, tmpdir):
     except subprocess.TimeoutExpired:
         raise HarnessError("spirv-as timed out while assembling the full-screen vertex shader") from None
     if r.returncode: raise HarnessError(f"spirv-as failed: {(r.stdout + r.stderr).strip()}")
+    if not os.path.isfile(vs_spv) or os.path.getsize(vs_spv) == 0:
+        raise HarnessError("spirv-as exited 0 without writing a non-empty full-screen vertex shader")
     return {"exe": exe, "spirv_as": spirv_as, "vs_spv": vs_spv}
 
 

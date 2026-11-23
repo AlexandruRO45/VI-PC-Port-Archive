@@ -126,6 +126,9 @@ class F64DiffTests(unittest.TestCase):
             return "/fake/spirv-as" if name == "spirv-as" else None
         def fake_run(cmd, **kw):
             commands.append(cmd)
+            out_path = cmd[cmd.index("-o") + 1]
+            with open(out_path, "wb") as out:
+                out.write((0x07230203).to_bytes(4, "little"))
             return subprocess.CompletedProcess(cmd, 0, "", "")
         with tempfile.TemporaryDirectory() as tmp:
             exe = os.path.join(tmp, "vk_harness")
@@ -141,7 +144,26 @@ class F64DiffTests(unittest.TestCase):
             self.assertNotIn("glslc", ctx)
             vs_asm = os.path.join(tmp, "f64_diff_vs.spvasm")
             self.assertTrue(os.path.isfile(vs_asm))
+            self.assertTrue(os.path.isfile(ctx["vs_spv"]))
+            self.assertGreater(os.path.getsize(ctx["vs_spv"]), 0)
             self.assertEqual(commands, [["/fake/spirv-as", "--target-env", "vulkan1.2", vs_asm, "-o", ctx["vs_spv"]]])
+
+    def test_prepare_gpu_rejects_missing_or_empty_vs_spv(self):
+        for create_empty in (False, True):
+            with self.subTest(create_empty=create_empty), tempfile.TemporaryDirectory() as tmp:
+                exe = os.path.join(tmp, "vk_harness")
+                with open(exe, "wb") as f:
+                    f.write(b"")
+                def fake_run(cmd, **kw):
+                    if create_empty:
+                        with open(cmd[cmd.index("-o") + 1], "wb") as out:
+                            out.write(b"")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                with mock.patch.object(fd, "sdk_tool", return_value="/fake/spirv-as"), \
+                        mock.patch.object(fd.subprocess, "run", side_effect=fake_run), \
+                        self.assertRaises(fd.HarnessError) as err:
+                    fd.prepare_gpu(exe, tmp)
+                self.assertIn("spirv-as", str(err.exception))
 
     def test_prepare_gpu_unavailable_without_spirv_as(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,6 +194,22 @@ class F64DiffTests(unittest.TestCase):
                     self.assertRaises(fd.HarnessError) as to_ctx:
                 fd.prepare_gpu(exe, tmp)
             self.assertIn("timed out", str(to_ctx.exception))
+
+    def test_inline_fullscreen_vs_assembles_with_spirv_as_only(self):
+        spirv_as = fd.sdk_tool("spirv-as")
+        if not spirv_as:
+            self.skipTest("spirv-as is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "vk_harness")
+            with open(exe, "wb") as f:
+                f.write(b"")
+            ctx = fd.prepare_gpu(exe, tmp)
+            self.assertTrue(os.path.isfile(ctx["vs_spv"]))
+            with open(ctx["vs_spv"], "rb") as f:
+                data = f.read()
+            self.assertGreaterEqual(len(data), 20)
+            self.assertEqual(len(data) % 4, 0)
+            self.assertEqual(int.from_bytes(data[:4], "little"), 0x07230203)
 
     def test_inline_fullscreen_vs_validates_under_vulkan12(self):
         spirv_as = fd.sdk_tool("spirv-as")

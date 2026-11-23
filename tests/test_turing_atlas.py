@@ -163,13 +163,20 @@ class VulkanMatrixTests(unittest.TestCase):
             "required_subgroup_size_stages": 32,
         }
         calls = []
+        real_which = turing_atlas.shutil.which
+        real_run = turing_atlas.run
+
+        def which_without_vulkaninfo(name, *args, **kw):
+            return None if name == "vulkaninfo" else real_which(name, *args, **kw)
 
         def fake_run(cmd, **kw):
-            calls.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload) + "\n", "")
+            if len(cmd) >= 3 and cmd[:2] == [sys.executable, "-I"] and cmd[2].endswith("vk_subgroup_info.py"):
+                calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(payload) + "\n", "")
+            return real_run(cmd, **kw)
 
-        with patch.object(turing_atlas.shutil, "which", return_value=None), \
-                patch.object(turing_atlas, "run", fake_run):
+        with patch.object(turing_atlas.shutil, "which", side_effect=which_without_vulkaninfo), \
+                patch.object(turing_atlas, "run", side_effect=fake_run):
             matrix = turing_atlas.vulkan_matrix()
 
         self.assertEqual(tuple(matrix), MATRIX_KEYS)
@@ -191,28 +198,51 @@ class VulkanMatrixTests(unittest.TestCase):
         self.assertIsNone(matrix["descriptor_heap"])
         self.assertIsNone(matrix["storageInputOutput16"])
 
+        has_spirv_tools = bool(real_which("spirv-as") and real_which("spirv-val"))
         out = io.StringIO()
         with patch.object(sys, "argv", ["turing_atlas.py"]), \
-                patch.object(turing_atlas.shutil, "which", return_value=None), \
-                patch.object(turing_atlas, "run", fake_run), \
+                patch.object(turing_atlas.shutil, "which", side_effect=which_without_vulkaninfo), \
+                patch.object(turing_atlas, "run", side_effect=fake_run), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = turing_atlas.main()
         self.assertEqual(code, 0)
         atlas = json.loads(out.getvalue())
         self.assertEqual(atlas["gpu"], "NVIDIA GeForce GTX 1070")
         self.assertEqual(atlas["features"]["vulkaninfo"], "fallback:vk_subgroup_info")
+        if has_spirv_tools:
+            self.assertNotIn("skipped", atlas["cases"])
+            self.assertEqual(set(atlas["cases"]), set(turing_atlas.CASES))
+            self.assertTrue(atlas["cases"]["compute32"]["valid"])
+            self.assertTrue(atlas["cases"]["compute32"]["control_ok"])
+            self.assertTrue(atlas["cases"]["broken_negative"]["control_ok"])
+        else:
+            self.assertIn("skipped", atlas["cases"])
 
-    def test_fallback_uses_optional_feature_booleans_and_guards_moltenvk_barycentric(self):
+    def test_fallback_guards_moltenvk_barycentric_with_real_schema(self):
+        # Matches the exact fields emitted by tools/vk_subgroup_info.py --stage-caps on main.
         moltenvk = {
             "device": "Apple M2",
             "subgroup_size": 32,
             "min_subgroup_size": 32,
             "max_subgroup_size": 32,
             "subgroup_size_control": False,
+            "compute_in_required_stages": False,
+            "mesh_in_required_stages": False,
+            "compute_in_supported_stages": True,
+            "mesh_in_supported_stages": False,
+            "native64_compute": False,
+            "native64": False,
             "per_vertex_inputs": False,
+            "barycentric_fallback": False,
+            "max_push_constants_size": 4096,
+            "vendor_id": 0x106B,
+            "device_id": 0,
             "driver_id": 14,
-            "mesh_shader": False,
-            "maintenance8": True,
+            "rdna1_amd_windows": False,
+            "rdna2_amd_windows": False,
+            "supported_subgroup_stages": 63,
+            "required_subgroup_size_stages": 0,
+            "max_compute_workgroup_subgroups": 32,
         }
         with patch.object(turing_atlas.shutil, "which", return_value=None), \
                 patch.object(turing_atlas, "run",
@@ -220,8 +250,31 @@ class VulkanMatrixTests(unittest.TestCase):
             matrix = turing_atlas.vulkan_matrix()
         self.assertEqual(matrix["device"]["name"], "Apple M2")
         self.assertIsNone(matrix["barycentric"])
+        self.assertIsNone(matrix["mesh"])
+        self.assertIsNone(matrix["maintenance8"])
+        self.assertIsNone(matrix["descriptor_heap"])
+        self.assertIsNone(matrix["storageInputOutput16"])
+
+    def test_fallback_forward_compat_optional_feature_booleans(self):
+        # Forward-compat: if a newer vk_subgroup_info.py emits optional boolean feature probes, surface them.
+        extended = {
+            "device": "Future GPU",
+            "subgroup_size": 32,
+            "min_subgroup_size": 32,
+            "max_subgroup_size": 64,
+            "subgroup_size_control": True,
+            "per_vertex_inputs": True,
+            "driver_id": 4,
+            "mesh_shader": False,
+            "maintenance8": True,
+        }
+        with patch.object(turing_atlas.shutil, "which", return_value=None), \
+                patch.object(turing_atlas, "run",
+                             return_value=subprocess.CompletedProcess(["python"], 0, json.dumps(extended) + "\n", "")):
+            matrix = turing_atlas.vulkan_matrix()
         self.assertIs(matrix["mesh"], False)
         self.assertIs(matrix["maintenance8"], True)
+        self.assertIs(matrix["barycentric"], True)
 
     def test_fallback_failures_leave_the_matrix_unknown(self):
         cases = [
