@@ -22,7 +22,9 @@ import argparse
 import json
 import os
 import re
+import struct
 import sys
+import zlib
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,7 +82,7 @@ def payloads_of(dxbc_path):
         data = f.read()
     try:
         blobs = fssm_unpack.unpack_all(data)
-    except (ValueError, OSError):
+    except (ValueError, OSError, struct.error, zlib.error):  # a damaged XBCH raises the last two
         return []
     listed = len(blobs) - 1
     return [(os.path.splitext(os.path.basename(dxbc_path))[0], i, blob, i == listed)

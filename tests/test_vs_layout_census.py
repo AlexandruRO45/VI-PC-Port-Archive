@@ -190,5 +190,39 @@ class TestSurvey(unittest.TestCase):
         self.assertIn("vs|0|2", document["by_stage_hw"])
 
 
+class TestUndecodableXbch(unittest.TestCase):
+    """A damaged XBCH payload skips its container (fssm_unpack raises zlib.error or struct.error)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def census_with(self, bad_payload):
+        dx = os.path.join(self._tmp.name, "dxbc")
+        os.makedirs(dx)
+        with open(os.path.join(dx, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"name": n, "file": n + ".dxbc", "stage": "vs"} for n in ("a_bad", "b_good")], f)
+        with open(os.path.join(dx, "a_bad.dxbc"), "wb") as f:
+            f.write(dxbc([bad_payload]))
+        with open(os.path.join(dx, "b_good.dxbc"), "wb") as f:
+            f.write(dxbc([xbch(fssm(0, 4))]))
+        return V.survey(dx)
+
+    def assert_only_good_counted(self, r):
+        self.assertEqual(r["containers"], 2)
+        self.assertEqual(r["payloads"], 1)
+        self.assertEqual(r["by_stage_hw"], {"vs|0|4": 1})
+
+    def test_corrupt_xbch_stream_is_skipped(self):
+        good = xbch(fssm(0, 4))
+        bad = good[:-4] + b"\x00\x00\x00\x00"   # zeroed Adler-32: zlib.error, not ValueError
+        self.assert_only_good_counted(self.census_with(bad))
+
+    def test_truncated_xbch_header_is_skipped(self):
+        self.assert_only_good_counted(self.census_with(b"XBCH" + bytes(8)))   # struct.error
+
+
 if __name__ == "__main__":
     unittest.main()
