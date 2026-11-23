@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +98,21 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["verdict"], "clean")
         self.assertEqual(r["merges"], [])
         self.assertEqual(r["commits"], {"total": 1, "on_main": 0})
+
+    def test_depth_and_min_length_below_one_are_refused(self):
+        # `git log -n0` lists no commit, so no earlier merge is found and a PR merged before reads `clean`; a length
+        # floor of 0 counts every short line as a duplicate line. Both are usage errors (exit 2), not settings.
+        for flag in ("--depth", "--min-length"):
+            for value in ("0", "-5"):
+                with self.subTest(flag=flag, value=value), redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(SystemExit) as exited:
+                        mc.main(["--repo", self.repo, "--main", "main", flag, value, "1=main"])
+                    self.assertEqual(exited.exception.code, 2)
+                self.assertIn("must be at least 1", err.getvalue())
+
+    def test_depth_and_min_length_of_one_still_run(self):
+        code, [r] = self.run_check("--depth", "1", "--min-length", "1", "1=main")
+        self.assertEqual((code, r["verdict"]), (0, "clean"))
 
     def test_a_rebased_copy_of_a_merged_pr_is_already_merged_and_would_duplicate(self):
         base = self.git("rev-parse", "main")
