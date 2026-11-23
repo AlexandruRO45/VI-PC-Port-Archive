@@ -7947,6 +7947,11 @@ bool is_sparse_image(ID3D12Resource* resource) {
     return object && object->sparse_image();
 }
 
+bool resource_lists_castable_format(ID3D12Resource* resource, DXGI_FORMAT format) {
+    const auto* object = Resource::from<Resource>(resource);
+    return object && object->lists_castable_format(format);
+}
+
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     Device* d = Device::from<Device>(device);
     if (!d) return;

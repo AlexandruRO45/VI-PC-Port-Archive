@@ -67,6 +67,7 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
 std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context,
                                                            bool image, std::uint32_t memory_types);
 bool is_sparse_image(ID3D12Resource* resource);
+bool resource_lists_castable_format(ID3D12Resource* resource, DXGI_FORMAT format);
 
 // The Vulkan objects a D3D12 device runs on. Vulkan 1.3 with dynamicRendering, synchronization2, timelineSemaphore
 // and (when separate_depth_stencil_layouts is set) separateDepthStencilLayouts enabled.

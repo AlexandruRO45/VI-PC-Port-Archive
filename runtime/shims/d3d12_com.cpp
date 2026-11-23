@@ -80,6 +80,196 @@ void note_once(const char* what) {
     if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
 }
 
+// The typeless family a DXGI format belongs to, or the format itself when it has no such family.
+DXGI_FORMAT copy_format_family(DXGI_FORMAT format) {
+    const int f = int(format);
+    const auto in = [f](int first, int last) { return f >= first && f <= last; };
+    if (in(1, 4)) return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+    if (in(5, 8)) return DXGI_FORMAT_R32G32B32_TYPELESS;
+    if (in(9, 14)) return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    if (in(15, 18)) return DXGI_FORMAT_R32G32_TYPELESS;
+    if (in(19, 22)) return DXGI_FORMAT_R32G8X24_TYPELESS;
+    if (in(23, 25)) return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    if (in(27, 32)) return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    if (in(33, 38)) return DXGI_FORMAT_R16G16_TYPELESS;
+    if (in(39, 43)) return DXGI_FORMAT_R32_TYPELESS;
+    if (in(44, 47)) return DXGI_FORMAT_R24G8_TYPELESS;
+    if (in(48, 52)) return DXGI_FORMAT_R8G8_TYPELESS;
+    if (in(53, 59)) return DXGI_FORMAT_R16_TYPELESS;
+    if (in(60, 64)) return DXGI_FORMAT_R8_TYPELESS;
+    if (in(70, 72)) return DXGI_FORMAT_BC1_TYPELESS;
+    if (in(73, 75)) return DXGI_FORMAT_BC2_TYPELESS;
+    if (in(76, 78)) return DXGI_FORMAT_BC3_TYPELESS;
+    if (in(79, 81)) return DXGI_FORMAT_BC4_TYPELESS;
+    if (in(82, 84)) return DXGI_FORMAT_BC5_TYPELESS;
+    if (f == 87 || in(90, 91)) return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    if (f == 88 || in(92, 93)) return DXGI_FORMAT_B8G8R8X8_TYPELESS;
+    if (in(94, 96)) return DXGI_FORMAT_BC6H_TYPELESS;
+    if (in(97, 99)) return DXGI_FORMAT_BC7_TYPELESS;
+    return format;
+}
+
+bool is_bc_format(DXGI_FORMAT format) {
+    const int f = int(format);
+    return (f >= 70 && f <= 84) || (f >= 94 && f <= 99);
+}
+
+UINT format_plane_count(DXGI_FORMAT format) {
+    switch (copy_format_family(format)) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_NV12:
+    case DXGI_FORMAT_420_OPAQUE:
+    case DXGI_FORMAT_NV11:
+    case DXGI_FORMAT_P010:
+    case DXGI_FORMAT_P016:
+    case DXGI_FORMAT_P208:
+        return 2;
+    default:
+        return 1;
+    }
+}
+
+bool footprint_format_compatible(ID3D12Resource* texture, DXGI_FORMAT texture_format, UINT plane,
+                                 DXGI_FORMAT footprint_format) {
+    if (footprint_format == DXGI_FORMAT_UNKNOWN) return false;
+    const DXGI_FORMAT tex_family = copy_format_family(texture_format);
+    const DXGI_FORMAT fp_family = copy_format_family(footprint_format);
+    if (fp_family == tex_family) return true;
+    if (resource_lists_castable_format(texture, footprint_format)) return true;
+    switch (tex_family) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        return plane == 0 ? (fp_family == DXGI_FORMAT_R32_TYPELESS ||
+                             footprint_format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)
+                          : (fp_family == DXGI_FORMAT_R8_TYPELESS ||
+                             footprint_format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT);
+    case DXGI_FORMAT_R24G8_TYPELESS:
+        return plane == 0 ? (fp_family == DXGI_FORMAT_R32_TYPELESS ||
+                             footprint_format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS)
+                          : (fp_family == DXGI_FORMAT_R8_TYPELESS ||
+                             footprint_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT);
+    case DXGI_FORMAT_NV12:
+    case DXGI_FORMAT_420_OPAQUE:
+    case DXGI_FORMAT_NV11:
+    case DXGI_FORMAT_P208:
+        return plane == 0 ? fp_family == DXGI_FORMAT_R8_TYPELESS : fp_family == DXGI_FORMAT_R8G8_TYPELESS;
+    case DXGI_FORMAT_P010:
+    case DXGI_FORMAT_P016:
+        return plane == 0 ? fp_family == DXGI_FORMAT_R16_TYPELESS : fp_family == DXGI_FORMAT_R16G16_TYPELESS;
+    default:
+        return false;
+    }
+}
+
+struct TextureSubresourceInfo {
+    D3D12_RESOURCE_DESC desc{};
+    UINT mip = 0;
+    UINT plane = 0;
+    UINT64 width = 0;
+    UINT height = 0;
+    UINT depth = 0;
+    UINT block = 1;
+};
+
+bool decode_texture_subresource(ID3D12Resource* resource, UINT subresource, TextureSubresourceInfo& out) {
+    if (!resource) return false;
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        return false;
+    const UINT mips = std::max<UINT>(1, desc.MipLevels);
+    const UINT array_size = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                ? 1u
+                                : std::max<UINT>(1, desc.DepthOrArraySize);
+    const UINT planes = format_plane_count(desc.Format);
+    const UINT64 per_plane = UINT64(mips) * array_size;
+    if (UINT64(subresource) >= per_plane * planes) return false;
+    const UINT mip = subresource % mips;
+    const UINT plane = UINT(subresource / per_plane);
+    out.desc = desc;
+    out.mip = mip;
+    out.plane = plane;
+    out.width = std::max<UINT64>(1, desc.Width >> (mip & 63));
+    out.height = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1u : std::max<UINT>(1, desc.Height >> (mip & 31));
+    out.depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                    ? std::max<UINT>(1, UINT(desc.DepthOrArraySize) >> (mip & 31))
+                    : 1u;
+    out.block = is_bc_format(desc.Format) ? 4u : 1u;
+    return true;
+}
+
+bool valid_copy_buffer_region(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src, UINT64 src_offset,
+                              UINT64 bytes) {
+    if (!dst || !src) return false;
+    const D3D12_RESOURCE_DESC dst_desc = dst->GetDesc();
+    const D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+    if (dst_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        src_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return false;
+    if (!bytes) return true;
+    return dst_offset <= dst_desc.Width && bytes <= dst_desc.Width - dst_offset &&
+           src_offset <= src_desc.Width && bytes <= src_desc.Width - src_offset;
+}
+
+bool valid_copy_texture_region(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
+                               const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
+    if (!dst || !src || !dst->pResource || !src->pResource) return false;
+    const bool dst_sub = dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const bool dst_fp = dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    const bool src_sub = src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const bool src_fp = src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    if ((!dst_sub && !dst_fp) || (!src_sub && !src_fp)) return false;
+
+    TextureSubresourceInfo dst_info{}, src_info{};
+    if (dst_sub && !decode_texture_subresource(dst->pResource, dst->SubresourceIndex, dst_info)) return false;
+    if (src_sub && !decode_texture_subresource(src->pResource, src->SubresourceIndex, src_info)) return false;
+
+    if (dst_sub && src_fp &&
+        !footprint_format_compatible(dst->pResource, dst_info.desc.Format, dst_info.plane,
+                                     src->PlacedFootprint.Footprint.Format))
+        return false;
+    if (src_sub && dst_fp &&
+        !footprint_format_compatible(src->pResource, src_info.desc.Format, src_info.plane,
+                                     dst->PlacedFootprint.Footprint.Format))
+        return false;
+    if (dst_fp && dst->PlacedFootprint.Footprint.Format == DXGI_FORMAT_UNKNOWN) return false;
+    if (src_fp && src->PlacedFootprint.Footprint.Format == DXGI_FORMAT_UNKNOWN) return false;
+
+    // Empty or inverted source box is a legal no-op in D3D12.
+    if (box && (box->right <= box->left || box->bottom <= box->top || box->back <= box->front)) return true;
+
+    if (dst_sub) {
+        const UINT64 dst_limit_w = (dst_info.width + dst_info.block - 1) / dst_info.block * dst_info.block;
+        const UINT64 dst_limit_h = (UINT64(dst_info.height) + dst_info.block - 1) / dst_info.block * dst_info.block;
+        UINT64 copy_w = 0, copy_h = 0, copy_d = 0;
+        if (src_fp) {
+            const auto& fp = src->PlacedFootprint.Footprint;
+            copy_w = box ? UINT64(box->right - box->left) : UINT64(fp.Width);
+            copy_h = box ? UINT64(box->bottom - box->top) : UINT64(fp.Height);
+            copy_d = box ? UINT64(box->back - box->front) : UINT64(fp.Depth);
+        } else {
+            const UINT64 raw_w = box ? UINT64(box->right - box->left) : src_info.width;
+            const UINT64 raw_h = box ? UINT64(box->bottom - box->top) : UINT64(src_info.height);
+            copy_d = box ? UINT64(box->back - box->front) : UINT64(src_info.depth);
+            if (src_info.block != dst_info.block) {
+                copy_w = dst_info.block > src_info.block ? raw_w * dst_info.block
+                                                         : (raw_w + src_info.block - 1) / src_info.block;
+                copy_h = dst_info.block > src_info.block ? raw_h * dst_info.block
+                                                         : (raw_h + src_info.block - 1) / src_info.block;
+            } else {
+                copy_w = raw_w;
+                copy_h = raw_h;
+            }
+        }
+        if (x > dst_limit_w || copy_w > dst_limit_w - x ||
+            y > dst_limit_h || copy_h > dst_limit_h - y ||
+            z > dst_info.depth || copy_d > dst_info.depth - z)
+            return false;
+    }
+    return true;
+}
+
 const char* name(leonida::ReplayResult result) {
     switch (result) {
     case leonida::ReplayResult::success: return "success";
@@ -498,6 +688,7 @@ public:
                                             UINT64 src_offset, UINT64 bytes) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyBufferRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!valid_copy_buffer_region(dst, dst_offset, src, src_offset, bytes)) return check(false);
         check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
     }
 
@@ -553,7 +744,7 @@ public:
                                              const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTextureRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        if (!dst || !src) return check(false);
+        if (!valid_copy_texture_region(dst, x, y, z, src, box)) return check(false);
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
         check(list_.copy_texture(copy));
@@ -569,6 +760,13 @@ public:
             D3D12_HEAP_PROPERTIES properties{};
             if (FAILED(dst->GetHeapProperties(&properties, nullptr)) ||
                 properties.Type != D3D12_HEAP_TYPE_DEFAULT) return check(false);
+        } else if (dst && src) {
+            const D3D12_RESOURCE_DESC dst_desc = dst->GetDesc();
+            const D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+            if (dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                src_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                dst_desc.Width != src_desc.Width)
+                return check(false);
         }
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
