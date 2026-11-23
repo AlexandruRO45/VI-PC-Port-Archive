@@ -499,5 +499,25 @@ class TestVDivFixupF16ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.vgprs[0], 0x4000)
 
 
+class TestVDivFixupF16SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence for v_div_fixup_f16."""
+
+    def test_simd_half_lane_execution(self):
+        wave = WaveDivState(wave_size=32)
+        wave.exec_mask = 0x000000FF
+        for lane in range(32):
+            if (wave.exec_mask >> lane) & 1:
+                res = ref_div_fixup_f16(0x4000, 0x3C00, 0x4000)
+                wave.vgprs[lane][0] = res
+            else:
+                wave.vgprs[lane][0] = 0
+
+        for lane in range(32):
+            if lane < 8:
+                self.assertEqual(wave.vgprs[lane][0], 0x4000)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
