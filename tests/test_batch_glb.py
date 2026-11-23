@@ -62,6 +62,32 @@ class TestBatchGlb(unittest.TestCase):
                     self.assertIn(error, result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
 
+    def test_cli_rejects_a_textures_path_that_is_not_a_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            in_dir = os.path.join(root, "obj")
+            out_dir = os.path.join(root, "glb")
+            os.makedirs(in_dir)
+            with open(os.path.join(in_dir, "tri.obj"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            a_file = os.path.join(root, "textures.dds")
+            with open(a_file, "wb"):
+                pass
+
+            for textures, error in [(os.path.join(root, "gone"), "does not exist"),
+                                    (a_file, "is not a folder")]:
+                with self.subTest(textures=textures):
+                    result = subprocess.run(
+                        [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"), in_dir, out_dir,
+                         "--textures", textures],
+                        capture_output=True, text=True, errors="replace", check=False,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)
+                    self.assertIn(error, result.stderr)
+                    self.assertIn(textures, result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertFalse(os.path.exists(os.path.join(out_dir, "tri.glb")))
+
     def test_cli_rejects_invalid_jobs_and_max_tex_size(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             for flag, value, error in [
