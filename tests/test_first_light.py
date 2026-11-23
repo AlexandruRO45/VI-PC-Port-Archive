@@ -237,6 +237,32 @@ class PpmTests(unittest.TestCase):
 
 
 class ShaderPreparationTests(unittest.TestCase):
+    def test_invalid_translator_index_names_the_file(self) -> None:
+        picked = [{"name": "fixture", "file": "fixture.dxbc", "stage": "vs"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            dxbc = work / "shaders" / "dxbc"
+            dxbc.mkdir(parents=True)
+            (dxbc / "fixture.dxbc").write_bytes(b"synthetic")
+            index = work / "first_light" / "spirv" / "index.json"
+
+            for data, reason in (
+                (b'{"fixture":', "not valid JSON"),
+                (b"[]", "expected an object"),
+                (b'{"fixture": []}', "entry 'fixture' is a list, expected an object"),
+            ):
+                with self.subTest(data=data):
+                    def write_translation(argv: list[str]) -> None:
+                        if Path(argv[0]).name == "rdna2spirv.py":
+                            index.parent.mkdir()
+                            index.write_bytes(data)
+
+                    with patch.object(fl, "run", side_effect=write_translation):
+                        with self.assertRaises(SystemExit) as caught:
+                            fl.translate(str(work), picked)
+                    self.assertIn(str(index), str(caught.exception))
+                    self.assertIn(reason, str(caught.exception))
+
     def test_same_display_name_keeps_both_stage_files(self) -> None:
         modules = {"vs": build_vs_stub([0]), "ps": build_ps_stub([0])}
         entries = [

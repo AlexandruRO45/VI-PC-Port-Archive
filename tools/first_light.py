@@ -192,12 +192,16 @@ def translate(work: str, picked: list[dict]) -> dict:
             spirv,
         ]
     )
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
-        meta = json.load(f)
+    index_path = os.path.join(spirv, "index.json")
+    meta = load_json(index_path, "translator index", dict)
     result = {}
     for entry in picked:
         stem = os.path.splitext(entry["file"])[0]
         item = meta.get(stem)
+        if item is not None and not isinstance(item, dict):
+            raise SystemExit(
+                f"the translator index {index_path} entry {stem!r} is a {type(item).__name__}, expected an object"
+            )
         if item is None or item.get("stage") != entry["stage"]:
             raise SystemExit(f"translator has no {entry['stage']} result for {stem}")
         result[entry["stage"]] = item
