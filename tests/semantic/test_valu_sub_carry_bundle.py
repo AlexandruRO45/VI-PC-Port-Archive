@@ -166,5 +166,43 @@ class VSubCoU32OracleTests(unittest.TestCase):
         self.assertEqual(out2[1], 0)
 
 
+class VSubCoU32AstInterpreterTests(unittest.TestCase):
+    """AST modeling, scalar simulation, and register aliasing for v_sub_co_u32."""
+
+    def test_ast_emission_and_execution(self):
+        node = ValuSubAstNode("v_sub_co_u32", "v2", "vcc", "v0", "v1")
+        self.assertEqual(node.emit_asm(), "v_sub_co_u32 v2, vcc, v0, v1")
+        out = run_prog([
+            "v_mov_b32 v0, 50",
+            "v_mov_b32 v1, 20",
+            node.emit_asm(),
+            "v_mov_b32 v0, v2",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 30)
+        self.assertEqual(out[1], 0)
+
+    def test_register_aliasing_dst_equals_src0(self):
+        out = run_prog([
+            "v_mov_b32 v0, 75",
+            "v_mov_b32 v1, 25",
+            "v_sub_co_u32 v0, vcc, v0, v1",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 50)
+        self.assertEqual(out[1], 0)
+
+    def test_register_aliasing_dst_equals_src1(self):
+        out = run_prog([
+            "v_mov_b32 v0, 80",
+            "v_mov_b32 v1, 30",
+            "v_sub_co_u32 v1, vcc, v0, v1",
+            "v_mov_b32 v0, v1",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 50)
+        self.assertEqual(out[1], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
