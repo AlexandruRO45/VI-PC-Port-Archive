@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace rt::dxgi {
@@ -23,12 +24,13 @@ namespace {
 // Native DXGI accepts up to 40 queued frames on a waitable swapchain.
 constexpr UINT max_waitable_frame_latency = 40;
 
-std::set<std::string> g_seen_stubs;
+constinit std::set<std::string>* g_seen_stubs = nullptr;
 
 void stub(const char* method) {
     static std::mutex mutex;
     std::lock_guard lock(mutex);
-    if (g_seen_stubs.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
+    if (!g_seen_stubs) g_seen_stubs = new std::remove_pointer_t<decltype(g_seen_stubs)>;
+    if (g_seen_stubs->insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
 }
 
 // IDXGIObject private data, shared by the factory, adapter and swapchain. SetPrivateData keeps a copy of the bytes;
@@ -635,7 +637,7 @@ struct ReservationState {
     std::atomic<UINT64> non_local{0};
 };
 
-std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> g_reservations;
+constinit std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>>* g_reservations = nullptr;
 
 // Video-memory reservations are scoped per physical adapter in the process (matching native DXGI,
 // where separate IDXGIAdapter3 handles opened for the same LUID observe each other's reservations).
@@ -646,7 +648,8 @@ std::shared_ptr<ReservationState> adapter_reservation_state(LUID luid, VkPhysica
         has_luid ? std::make_tuple(std::uint32_t(luid.LowPart), std::int32_t(luid.HighPart), std::uintptr_t(0))
                  : std::make_tuple(std::uint32_t(0), std::int32_t(0), reinterpret_cast<std::uintptr_t>(physical));
     std::lock_guard lock(mutex);
-    auto& entry = g_reservations[key];
+    if (!g_reservations) g_reservations = new std::remove_pointer_t<decltype(g_reservations)>;
+    auto& entry = (*g_reservations)[key];
     if (!entry) entry = std::make_shared<ReservationState>();
     return entry;
 }
