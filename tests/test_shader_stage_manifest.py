@@ -65,6 +65,19 @@ class ShaderStemsTests(unittest.TestCase):
             {"cs_bloom_0", "gs-pass.v2"},
         )
 
+    def test_reads_an_index_saved_with_a_utf8_bom(self):
+        # Notepad and PowerShell's ">" write a BOM, and json.load refuses it as an invalid first character.
+        bom = b"\xef\xbb\xbf"
+        carve = self.write_bytes("carve_bom.json", bom + json.dumps([{"file": "ps_water.dxbc"}]).encode("utf-8"))
+        unpack = self.write_bytes("unpack_bom.json", bom + json.dumps([{"name": "cs_bloom_0"}]).encode("utf-8"))
+        self.assertEqual(shader_stems(carve, "file", ".dxbc"), {"ps_water"})
+        self.assertEqual(shader_stems(unpack, "name"), {"cs_bloom_0"})
+        # The BOM is the only thing tolerated: a malformed index behind it is still an error.
+        broken = self.write_bytes("broken_bom.json", bom + b"[{bad")
+        with self.assertRaises(ValueError) as ctx:
+            shader_stems(broken, "file", ".dxbc")
+        self.assertIn("invalid JSON", str(ctx.exception))
+
     def test_empty_list_returns_empty_set(self):
         path = self.write_json("empty.json", [])
         self.assertEqual(shader_stems(path, "file", ".dxbc"), set())
