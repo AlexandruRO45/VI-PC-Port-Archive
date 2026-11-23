@@ -27,10 +27,13 @@ PFN_vkGetInstanceProcAddr real_instance = nullptr;
 PFN_vkGetDeviceProcAddr real_device = nullptr;
 PFN_vkGetSemaphoreCounterValue real_counter = nullptr;
 PFN_vkWaitSemaphores real_wait = nullptr;
+PFN_vkSignalSemaphore real_signal = nullptr;
 std::atomic<VkResult> fail_next_counter{VK_SUCCESS};
 std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
+std::atomic<VkResult> fail_next_signal{VK_SUCCESS};
 std::atomic<unsigned> failed_count{0};
 std::atomic<unsigned> failed_wait_count{0};
+std::atomic<unsigned> foreground_signals{0};
 DWORD test_thread = 0;
 
 VKAPI_ATTR VkResult VKAPI_CALL get_counter(VkDevice device, VkSemaphore semaphore, std::uint64_t* value) {
@@ -60,11 +63,22 @@ VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphor
     return real_wait(device, info, timeout);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL signal_semaphore(VkDevice device, const VkSemaphoreSignalInfo* info) {
+    if (GetCurrentThreadId() == test_thread) {
+        foreground_signals.fetch_add(1);
+        const VkResult injected = fail_next_signal.exchange(VK_SUCCESS);
+        if (injected != VK_SUCCESS) return injected;
+    }
+    return real_signal(device, info);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     if (std::strcmp(name, "vkGetSemaphoreCounterValue") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(get_counter);
     if (std::strcmp(name, "vkWaitSemaphores") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(wait_semaphores);
+    if (std::strcmp(name, "vkSignalSemaphore") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(signal_semaphore);
     return real_device(device, name);
 }
 
@@ -77,7 +91,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const
 
 // RemoveDevice is a logical removal, not a physical GPU failure. Both fences and every registered
 // event must complete, including waits registered after removal; a second removal is harmless.
-bool remove_device_notifies(ID3D12Device* device, const char* label) {
+bool remove_device_notifies(ID3D12Device* device, const char* label, bool instrument_signal = false) {
     Ref<ID3D12Device1> device1;
     Ref<ID3D12Device5> device5;
     Event before[3], after[3];  // outlive the fences and their pending callbacks on every exit path
@@ -108,11 +122,29 @@ bool remove_device_notifies(ID3D12Device* device, const char* label) {
     const DWORD pre_status = WaitForMultipleObjects(3, pre, TRUE, 1000);
     const bool post_registered = subscribe(post);
     const DWORD post_status = WaitForMultipleObjects(3, post, TRUE, 1000);
+    // WARP accepts signals after removal without lowering the completed value. The calling thread must not
+    // signal the Vulkan semaphore once its logical device is lost, even for an increasing value.
+    const unsigned signals_before = driver::foreground_signals.load();
+    const HRESULT signal1 = a->Signal(1);
+    const UINT64 after_signal1 = a->GetCompletedValue();
+    const HRESULT signal0 = a->Signal(0);
+    const UINT64 after_signal0 = a->GetCompletedValue();
+    const HRESULT signal_again = a->Signal(42);
+    const UINT64 after_signal_again = a->GetCompletedValue();
+    const bool signal_ok = signal1 == S_OK && signal0 == S_OK && signal_again == S_OK &&
+                           after_signal1 == UINT64_MAX && after_signal0 == UINT64_MAX &&
+                           after_signal_again == UINT64_MAX &&
+                           (!instrument_signal || driver::foreground_signals.load() == signals_before);
+    std::printf("%s after removal Signal(1/0/42): %08lx/%08lx/%08lx, no foreground Vulkan signal=%s: %s\n", label,
+                static_cast<unsigned long>(signal1), static_cast<unsigned long>(signal0),
+                static_cast<unsigned long>(signal_again),
+                !instrument_signal ? "not checked" : driver::foreground_signals.load() == signals_before ? "yes" : "no",
+                signal_ok ? "PASS" : "FAIL");
     device5->RemoveDevice();
     const bool repeated = device->GetDeviceRemovedReason() == DXGI_ERROR_DEVICE_REMOVED &&
                           a->GetCompletedValue() == UINT64_MAX && b->GetCompletedValue() == UINT64_MAX;
     const bool ok = reason == DXGI_ERROR_DEVICE_REMOVED && first == UINT64_MAX && second == UINT64_MAX &&
-                    pre_status == WAIT_OBJECT_0 && post_registered && post_status == WAIT_OBJECT_0 && repeated;
+                    pre_status == WAIT_OBJECT_0 && post_registered && post_status == WAIT_OBJECT_0 && repeated && signal_ok;
     std::printf("%s RemoveDevice: reason=%08lx fences=%llu/%llu before=%lu after=%lu repeated=%d: %s\n", label,
                 static_cast<unsigned long>(reason), static_cast<unsigned long long>(first),
                 static_cast<unsigned long long>(second), pre_status, post_status, int(repeated), ok ? "PASS" : "FAIL");
@@ -173,6 +205,9 @@ int main() {
     driver::real_wait = reinterpret_cast<PFN_vkWaitSemaphores>(
         driver::real_device(vk.device, "vkWaitSemaphores"));
     if (!driver::real_wait) return 1;
+    driver::real_signal = reinterpret_cast<PFN_vkSignalSemaphore>(
+        driver::real_device(vk.device, "vkSignalSemaphore"));
+    if (!driver::real_signal) return 1;
     driver::test_thread = GetCurrentThreadId();
 
     Event pending;
@@ -283,10 +318,48 @@ int main() {
             driver::fail_next_wait.load() != VK_SUCCESS)
             ++failures;
     }
+    // Errors on a healthy Vulkan signal must not be hidden by the already-lost fast path.
+    for (const VkResult injected : {VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_DEVICE_LOST}) {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = driver::get_instance;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        Ref<ID3D12Device> device;
+        Ref<ID3D12Fence> fence;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)))) return 1;
+        const unsigned before = driver::foreground_signals.load();
+        driver::fail_next_signal.store(injected);
+        const HRESULT result = fence->Signal(1);
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        const UINT64 completed = fence->GetCompletedValue();
+        const HRESULT wanted_reason = injected == VK_ERROR_DEVICE_LOST ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+        const UINT64 wanted_value = injected == VK_ERROR_DEVICE_LOST ? UINT64_MAX : 0;
+        std::printf("injected signal %d: hr=%08lx reason=%08lx value=%llu calls=%u\n", int(injected),
+                    static_cast<unsigned long>(result), static_cast<unsigned long>(removed),
+                    static_cast<unsigned long long>(completed), driver::foreground_signals.load() - before);
+        if (result != E_FAIL || removed != wanted_reason || completed != wanted_value ||
+            driver::foreground_signals.load() != before + 1 || driver::fail_next_signal.load() != VK_SUCCESS)
+            ++failures;
+        if (injected == VK_ERROR_DEVICE_LOST) {
+            // Synthetic logical-loss policy: subsequent calls complete without another Vulkan signal.
+            const unsigned after_failure = driver::foreground_signals.load();
+            const HRESULT after_loss = fence->Signal(2);
+            const UINT64 after_value = fence->GetCompletedValue();
+            std::printf("signal after injected device loss: hr=%08lx value=%llu additional foreground calls=%u\n",
+                        static_cast<unsigned long>(after_loss), static_cast<unsigned long long>(after_value),
+                        driver::foreground_signals.load() - after_failure);
+            if (after_loss != S_OK || after_value != UINT64_MAX ||
+                driver::foreground_signals.load() != after_failure) ++failures;
+        }
+    }
     // Separate logical device: RemoveDevice must mark this device's context lost, as an observed Vulkan loss does.
     {
         rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = vk.instance_proc;
+        info.get_instance_proc = driver::get_instance;
         info.instance = vk.instance;
         info.physical = vk.physical;
         info.device = vk.device;
@@ -294,7 +367,7 @@ int main() {
         info.queue_family = vk.family;
         Ref<ID3D12Device> device;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p)))) return 1;
-        if (!remove_device_notifies(device.p, "Leonida Vulkan")) ++failures;
+        if (!remove_device_notifies(device.p, "Leonida Vulkan", true)) ++failures;
     }
     const unsigned errors = vk.validation_errors();
     std::printf("Vulkan validation errors: %u\n", errors);

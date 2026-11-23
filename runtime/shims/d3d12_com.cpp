@@ -1453,6 +1453,7 @@ public:
     // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
         std::lock_guard lock(claim_mutex_);
+        if (context_.is_device_lost()) return S_OK;  // a removed fence stays completed at UINT64_MAX
         if (!claim_locked(value, false)) return S_OK;
         const UINT64 queued = queued_;
         if (held_->load() == 0 && fence_.completed() >= queued) return fence_.signal(value) ? S_OK : E_FAIL;
