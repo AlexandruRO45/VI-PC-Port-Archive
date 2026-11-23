@@ -1885,6 +1885,47 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
                  "if it happens again, the disassembly logged above is why." + left)
 
 
+# Under --f16-interp-fallback / --bary-fallback the translator refuses computed I/J pairs by design
+# (no PerVertexKHR inputs). Those expected gaps must not fail the shaders stage.
+EXPECTED_IJ_REFUSALS = {
+    "--f16-interp-fallback": "computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs",
+    "--bary-fallback": "computed I/J pair under --bary-fallback: no PerVertexKHR inputs",
+}
+
+
+def carved_shader_keys(carved: list) -> list[str]:
+    """Translation-index keys for carve entries: the .dxbc / listing stem (file, else name)."""
+    keys = []
+    for entry in carved:
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("file") or entry.get("name")
+        if isinstance(raw, str) and raw:
+            keys.append(os.path.splitext(raw)[0])
+    return keys
+
+
+def expected_ij_gap(spirv: str, carved: list, index: dict) -> list[str] | None:
+    """The missing carved stems if every one was refused for a computed I/J pair under an active fallback."""
+    missing = [key for key in carved_shader_keys(carved) if key not in index]
+    if len(missing) != len(carved) - len(index) or not missing:
+        return None
+    flags = set(read_shader_setting(os.path.join(spirv, "translator_flags.txt")).split())
+    allowed = {msg for flag, msg in EXPECTED_IJ_REFUSALS.items() if flag in flags}
+    if not allowed:
+        return None
+    try:
+        with open(os.path.join(spirv, "refusals.json"), encoding="utf-8") as f:
+            refusals = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(refusals, dict):
+        return None
+    if all(isinstance(refusals.get(key), str) and refusals[key] in allowed for key in missing):
+        return missing
+    return None
+
+
 def verify_translation_completeness(dxbc: str, spirv: str) -> None:
     """Every carved shader must be in the merged translation index before the stage may call itself done.
 
@@ -1892,7 +1933,9 @@ def verify_translation_completeness(dxbc: str, spirv: str) -> None:
     final path) and still exits 0, and nothing later in the build compares the counts: the merge already refuses
     an empty index, and a translation that did not run fails the stage before this point, so those cases are left
     to the paths that own them. What this adds is the silent one, a readable index naming fewer shaders than the
-    carve: a port assembled from it would lack the difference."""
+    carve: a port assembled from it would lack the difference. An exception is a computed I/J pair refused under
+    --f16-interp-fallback or --bary-fallback: those shaders cannot run on that device, and the gap is recorded in
+    refusals.json rather than treated as a translator failure."""
     try:
         with open(os.path.join(dxbc, "index.json"), encoding="utf-8") as f:
             carved = json.load(f)
@@ -1906,6 +1949,11 @@ def verify_translation_completeness(dxbc: str, spirv: str) -> None:
     if not index:
         return   # an empty index is #3328's to refuse or translate again, not a partial one to compare
     if len(index) != len(carved):
+        expected = expected_ij_gap(spirv, carved, index)
+        if expected is not None:
+            log(f"shaders: {len(expected)} shaders were refused under the fallback flags "
+                "(computed I/J pairs need PerVertexKHR inputs), as expected")
+            return
         fail(f"shaders: the translation index holds {len(index)} of the {len(carved)} carved shaders "
              f"({len(carved) - len(index)} were refused or failed spirv-val, listed in this stage's output): "
              "a port built from it would lack them. Fix the translator for that class and translate again")

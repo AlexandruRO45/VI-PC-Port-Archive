@@ -17716,6 +17716,39 @@ def write_index(path, index):
     replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
 
 
+def refusals_beside(index_path):
+    """refusals.json next to index.json, or refusals.part<i>.json next to that shard's index part."""
+    folder, base = os.path.dirname(index_path), os.path.basename(index_path)
+    if base == "index.json":
+        return os.path.join(folder, "refusals.json")
+    m = re.fullmatch(r"index\.part(\d+)\.json", base)
+    if m:
+        return os.path.join(folder, f"refusals.part{m.group(1)}.json")
+    return None
+
+
+def write_refusals(index_path, refusals):
+    """Atomic write of the refusal map that belongs to this index file; no-op for shard markers."""
+    path = refusals_beside(index_path)
+    if path:
+        write_index(path, refusals)
+
+
+def merge_refusal_parts(out):
+    """Union of refusals.part*.json into refusals.json. A missing part means that shard refused none."""
+    import glob as _gl, json as _js
+    refusals = {}
+    for path in sorted(_gl.glob(os.path.join(out, "refusals.part*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = _js.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict):
+            refusals.update(doc)
+    write_index(os.path.join(out, "refusals.json"), refusals)
+
+
 class ShardSetError(Exception):
     """The index parts on disk are not one complete shard set: merging them would publish a partial index."""
 
@@ -18072,11 +18105,18 @@ def main():
                 pass
             except OSError as remove_error:
                 print(f"WARNING: cannot remove the stale {index}: {remove_error}", file=sys.stderr)
+            try:
+                os.remove(os.path.join(a.out, "refusals.json"))
+            except FileNotFoundError:
+                pass
+            except OSError as remove_error:
+                print(f"WARNING: cannot remove the stale refusals.json: {remove_error}", file=sys.stderr)
             return 2
         # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
         write_index(os.path.join(a.out, "index.json"), merged)
+        merge_refusal_parts(a.out)
         print(f"merged {len(merged)} entries")
         return 0
     single_file = os.path.isfile(a.src) and a.src.endswith(".s")
@@ -18102,6 +18142,8 @@ def main():
         # before scanning or modifying outputs, even if a retry is killed mid-shader.
         Path(part).unlink(missing_ok=True)
         Path(idx_path).unlink(missing_ok=True)
+        Path(refusals_beside(part)).unlink(missing_ok=True)
+        Path(os.path.join(a.out, "refusals.json")).unlink(missing_ok=True)
         write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
         idx_path = part
     if single_file:
@@ -18116,6 +18158,7 @@ def main():
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
+    refusals = {}
     total = len(files)
     t0 = time.time()
     last_progress = 0.0
@@ -18142,6 +18185,7 @@ def main():
             continue
         except Unsupported as e:
             why[str(e)] += 1
+            refusals[name] = str(e)
             drop_stale(name)
             continue
         except (IndexError, KeyError, ValueError) as e:
@@ -18198,14 +18242,30 @@ def main():
             print(f"  {label}: {i}/{total} ({pct}%){eta}", flush=True)
     import json as _js
     old = {}
+    old_refusals = {}
     if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
         with open(idx_path, encoding="utf-8") as f:
             old = _js.load(f)  # partial runs merge into an existing index
         for name in invalid:
             old.pop(name, None)
+        ref_path = refusals_beside(idx_path)
+        if ref_path and os.path.isfile(ref_path):
+            try:
+                with open(ref_path, encoding="utf-8") as f:
+                    doc = _js.load(f)
+                if isinstance(doc, dict):
+                    old_refusals = doc
+            except (OSError, ValueError):
+                old_refusals = {}
+        for name in invalid:
+            old_refusals.pop(name, None)
+        for name in meta:
+            old_refusals.pop(name, None)
     old.update(meta)
+    old_refusals.update(refusals)
     if shard is None or not missing_inputs:
         write_index(idx_path, old)
+        write_refusals(idx_path, old_refusals)
     if shard is None:
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)

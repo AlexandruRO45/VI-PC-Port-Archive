@@ -3,7 +3,8 @@
 rdna2spirv.py drops a shader that is refused or whose module fails spirv-val and still exits 0, so a full run can
 carve 26,503 shaders and finish "done" with an index of fewer: a port built from it silently lacks the rest
 (measured end to end at aa2988cc: 26,503 carved, 26,473 indexed, exit 0). verify_translation_completeness()
-compares the counts and fails; an empty merge is already refused inside rdna2spirv.py.
+compares the counts and fails; an empty merge is already refused inside rdna2spirv.py. A computed I/J pair
+refused under --f16-interp-fallback or --bary-fallback is recorded in refusals.json and is not a stage error.
 
 python -I tests/test_make_game_translation_completeness.py
 """
@@ -20,6 +21,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import make_game  # noqa: E402
+
+# Exact translator messages; kept here so this file can be run against an unpatched make_game.py.
+F16_IJ = "computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs"
+BARY_IJ = "computed I/J pair under --bary-fallback: no PerVertexKHR inputs"
 
 
 def workdir(dxbc_count, index_names):
@@ -38,7 +43,7 @@ def workdir(dxbc_count, index_names):
 
 class TranslationCompletenessTests(unittest.TestCase):
     def run_check(self, dxbc, spirv):
-        """(exit code, stderr) of verify_translation_completeness, with fail() allowed to exit."""
+        """(exit code, stdout, stderr) of verify_translation_completeness, with fail() allowed to exit."""
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
@@ -46,12 +51,12 @@ class TranslationCompletenessTests(unittest.TestCase):
                 code = 0
             except SystemExit as e:
                 code = e.code
-        return code, err.getvalue()
+        return code, out.getvalue(), err.getvalue()
 
     def test_index_with_every_carved_shader_passes_quietly(self):
         tmp, dxbc, spirv = workdir(3, ["s0", "s1", "s2"])
         with tmp:
-            code, err = self.run_check(dxbc, spirv)
+            code, _out, err = self.run_check(dxbc, spirv)
             self.assertEqual(code, 0)
             self.assertEqual(err, "")
 
@@ -59,7 +64,7 @@ class TranslationCompletenessTests(unittest.TestCase):
         # The shape measured at aa2988cc: 26,503 carved, 26,473 reached the index.
         tmp, dxbc, spirv = workdir(26503, [f"s{i}" for i in range(26473)])
         with tmp:
-            code, err = self.run_check(dxbc, spirv)
+            code, _out, err = self.run_check(dxbc, spirv)
             self.assertEqual(code, 1)
             self.assertIn("26503", err)
             self.assertIn("26473", err)
@@ -76,7 +81,7 @@ class TranslationCompletenessTests(unittest.TestCase):
                 json.dump([], f)
             with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump([], f)          # a list where the merged index should be an object
-            code, err = self.run_check(dxbc, spirv)
+            code, _out, err = self.run_check(dxbc, spirv)
             self.assertEqual(code, 1)
 
     def test_a_missing_translation_index_is_left_to_the_paths_that_own_it(self):
@@ -91,7 +96,7 @@ class TranslationCompletenessTests(unittest.TestCase):
             os.makedirs(spirv)
             with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump([{"name": "s0"}], f)
-            code, err = self.run_check(dxbc, spirv)
+            code, _out, err = self.run_check(dxbc, spirv)
             self.assertEqual(code, 0)
             self.assertEqual(err, "")
 
@@ -100,9 +105,87 @@ class TranslationCompletenessTests(unittest.TestCase):
         # the carve here would race that fix, so a nonempty-but-short index is the partial translation to catch.
         tmp, dxbc, spirv = workdir(2, [])
         with tmp:
-            code, err = self.run_check(dxbc, spirv)
+            code, _out, err = self.run_check(dxbc, spirv)
             self.assertEqual(code, 0)
             self.assertEqual(err, "")
+
+    def test_expected_f16_interp_fallback_refusals_pass(self):
+        # Devices without fragmentShaderBarycentric select --f16-interp-fallback; those computed I/J
+        # shaders cannot run there, so a gap listed in refusals.json with the exact reason is expected.
+        tmp, dxbc, spirv = workdir(3, ["s0", "s1"])
+        with tmp:
+            with open(os.path.join(spirv, "translator_flags.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("--f16-interp-fallback")
+            with open(os.path.join(spirv, "refusals.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"s2": F16_IJ}, f)
+            code, out, err = self.run_check(dxbc, spirv)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertIn("1 shaders were refused under the fallback flags", out)
+            self.assertIn("as expected", out)
+
+    def test_expected_bary_fallback_refusals_pass(self):
+        tmp, dxbc, spirv = workdir(3, ["s0", "s1"])
+        with tmp:
+            with open(os.path.join(spirv, "translator_flags.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("--bary-fallback")
+            with open(os.path.join(spirv, "refusals.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"s2": BARY_IJ}, f)
+            code, out, err = self.run_check(dxbc, spirv)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertIn("as expected", out)
+
+    def test_fallback_gap_without_refusals_still_fails(self):
+        tmp, dxbc, spirv = workdir(3, ["s0", "s1"])
+        with tmp:
+            with open(os.path.join(spirv, "translator_flags.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("--f16-interp-fallback")
+            code, _out, err = self.run_check(dxbc, spirv)
+            self.assertEqual(code, 1)
+            self.assertIn("holds 2 of the 3 carved shaders", err)
+
+    def test_fallback_gap_with_the_wrong_reason_still_fails(self):
+        tmp, dxbc, spirv = workdir(3, ["s0", "s1"])
+        with tmp:
+            with open(os.path.join(spirv, "translator_flags.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("--f16-interp-fallback")
+            with open(os.path.join(spirv, "refusals.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"s2": "some other Unsupported"}, f)
+            code, _out, err = self.run_check(dxbc, spirv)
+            self.assertEqual(code, 1)
+            self.assertIn("holds 2 of the 3 carved shaders", err)
+
+    def test_refusals_without_the_fallback_flag_still_fail(self):
+        tmp, dxbc, spirv = workdir(3, ["s0", "s1"])
+        with tmp:
+            with open(os.path.join(spirv, "refusals.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"s2": F16_IJ}, f)
+            code, _out, err = self.run_check(dxbc, spirv)
+            self.assertEqual(code, 1)
+            self.assertIn("holds 2 of the 3 carved shaders", err)
+
+    def test_carve_file_stem_matches_the_refusal_key(self):
+        tmp = tempfile.TemporaryDirectory()
+        with tmp:
+            dxbc = os.path.join(tmp.name, "dxbc")
+            spirv = os.path.join(tmp.name, "spirv")
+            os.makedirs(dxbc)
+            os.makedirs(spirv)
+            with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"name": "PS_ij", "file": "ps_ij.s"}, {"name": "PS_ok", "file": "ps_ok.s"}], f)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"ps_ok": {}}, f)
+            with open(os.path.join(spirv, "translator_flags.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("--f16-interp-fallback")
+            with open(os.path.join(spirv, "refusals.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"ps_ij": F16_IJ}, f)
+            code, out, err = self.run_check(dxbc, spirv)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertIn("as expected", out)
+
+
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
     python -I tests/test_rdna2spirv_merge.py
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -310,6 +311,7 @@ class ShardRoundTripTest(unittest.TestCase):
         first = self.run_tool("--shard", "0/2")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertTrue((self.out / "index.part0.json").is_file())
+        self.assertEqual(json.loads((self.out / "refusals.part0.json").read_text(encoding="utf-8")), {})
         marker = json.loads((self.out / "shard0.json").read_text(encoding="utf-8"))
         self.assertEqual(marker, {"index": 0, "count": 2})
 
@@ -328,6 +330,28 @@ class ShardRoundTripTest(unittest.TestCase):
         self.assertEqual(full.returncode, 2, full.stdout + full.stderr)
         self.assertIn("holds no shaders", full.stderr)
         self.assertFalse((self.out / "index.json").exists())
+
+class RefusalSidecarTest(unittest.TestCase):
+    def test_refusals_beside_index_and_part(self):
+        self.assertTrue(R.refusals_beside("/tmp/out/index.json").endswith("refusals.json"))
+        self.assertEqual(os.path.basename(R.refusals_beside("/tmp/out/index.part3.json")), "refusals.part3.json")
+        self.assertIsNone(R.refusals_beside("/tmp/out/shard0.json"))
+
+    def test_merge_refusal_parts_unions_and_writes_empty_when_none(self):
+        tmp = tempfile.TemporaryDirectory()
+        with tmp:
+            out = tmp.name
+            R.merge_refusal_parts(out)
+            self.assertEqual(json.loads(Path(out, "refusals.json").read_text(encoding="utf-8")), {})
+            Path(out, "refusals.part0.json").write_text(json.dumps({"a": "reason A"}), encoding="utf-8")
+            Path(out, "refusals.part2.json").write_text(json.dumps({"b": "reason B"}), encoding="utf-8")
+            R.merge_refusal_parts(out)
+            self.assertEqual(
+                json.loads(Path(out, "refusals.json").read_text(encoding="utf-8")),
+                {"a": "reason A", "b": "reason B"},
+            )
+
+
 
 
 if __name__ == "__main__":
