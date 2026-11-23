@@ -52,6 +52,20 @@ _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
 }
 
+# OpSpecConstantOp uses a restricted opcode grammar with names that omit "Op".
+# Reference: Khronos SPIRV-Tools v2026.1, source/assembly_grammar.cpp.
+_SPEC_CONSTANT_OPS = frozenset("""
+    AccessChain Bitcast BitwiseAnd BitwiseOr BitwiseXor CompositeExtract CompositeInsert
+    ConvertFToS ConvertFToU ConvertPtrToU ConvertSToF ConvertUToF ConvertUToPtr
+    CooperativeMatrixLengthKHR CooperativeMatrixLengthNV FAdd FConvert FDiv FMod FMul
+    FNegate FRem FSub GenericCastToPtr IAdd IEqual IMul INotEqual ISub InBoundsAccessChain
+    InBoundsPtrAccessChain LogicalAnd LogicalEqual LogicalNot LogicalNotEqual LogicalOr Not
+    PtrAccessChain PtrCastToGeneric QuantizeToF16 SConvert SDiv SGreaterThan SGreaterThanEqual
+    SLessThan SLessThanEqual SMod SNegate SRem Select ShiftLeftLogical ShiftRightArithmetic
+    ShiftRightLogical UConvert UDiv UGreaterThan UGreaterThanEqual ULessThan ULessThanEqual UMod
+    VectorShuffle
+""".split())
+
 # OpTypeForwardPointer takes an ID reference. Its matching OpTypePointer defines the type.
 _TYPE_DEFINITIONS = frozenset(
     name for name, (_, _, has_result, _) in INSTRUCTIONS.items()
@@ -345,9 +359,9 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             return idx + 2
         if kind == "LiteralSpecConstantOpInteger":
             opname = toks[idx]
-            sub = INSTRUCTIONS.get(opname) or INSTRUCTIONS.get("Op" + opname)
-            if sub is None:
-                raise SpirvAsmError(f"line {lineno}: unknown OpSpecConstantOp opcode {opname!r}")
+            if opname not in _SPEC_CONSTANT_OPS:
+                raise SpirvAsmError(f"line {lineno}: invalid OpSpecConstantOp opcode {opname!r}")
+            sub = INSTRUCTIONS["Op" + opname]
             out.append(sub[0])
             idx += 1
             # Encode remaining operands of the nested opcode

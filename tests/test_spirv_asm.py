@@ -635,5 +635,23 @@ class SelectorMustBeDefinedBeforeTests(unittest.TestCase):
         self.assertEqual(len(_switch_instruction(spirv_asm.assemble(load))), 6)
 
 
+class SpecConstantOpcodeTests(unittest.TestCase):
+    def test_disallowed_opcode_is_refused_at_assembly_time(self):
+        head = "%uint = OpTypeInt 32 0\n%one = OpSpecConstant %uint 1\n"
+        for invocation in ("Store %one %one", "ImageSampleImplicitLod %one %one", "OpIAdd %one %one"):
+            with self.subTest(invocation=invocation):
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "line 3: invalid OpSpecConstantOp opcode"):
+                    spirv_asm.assemble(head + f"%result = OpSpecConstantOp %uint {invocation}\n")
+
+    def test_allowed_opcodes_keep_nested_operands(self):
+        head = ("%uint = OpTypeInt 32 0\n%one = OpSpecConstant %uint 1\n"
+                "%v2 = OpTypeVector %uint 2\n%pair = OpSpecConstantComposite %v2 %one %one\n")
+        for invocation, expected in (("IAdd %one %one", [128, 2, 2]),
+                                     ("CompositeExtract %pair 1", [81, 4, 1])):
+            with self.subTest(invocation=invocation):
+                result = spirv_asm.assemble(head + f"%result = OpSpecConstantOp %uint {invocation}\n")
+                self.assertEqual(_literal_words(result, 52, 2), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
