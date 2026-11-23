@@ -242,7 +242,8 @@ int main(int argc, char** argv) {
                     props.properties.limits.maxPushConstantsSize);
         return unsupported;
     }
-    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &have11};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
     // Name the missing feature(s): one message per run is not enough to tell which one stopped it.
@@ -267,7 +268,11 @@ int main(int argc, char** argv) {
         have12.descriptorBindingSampledImageUpdateAfterBind && have12.descriptorBindingStorageImageUpdateAfterBind &&
             have12.descriptorBindingStorageBufferUpdateAfterBind,
         have12.descriptorBindingPartiallyBound == VK_TRUE};
+    // The translated vs_ids reads BaseVertex / BaseInstance (DrawParameters) for zero-based v0 / v3 (vk_harness too).
+    VkPhysicalDeviceVulkan11Features enable11{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                              .shaderDrawParameters = have11.shaderDrawParameters};
     VkPhysicalDeviceVulkan12Features enable12{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                              .pNext = &enable11,
                                               .descriptorIndexing = have12.descriptorIndexing,
                                               .descriptorBindingSampledImageUpdateAfterBind = device_flags.update_after_bind,
                                               .descriptorBindingStorageImageUpdateAfterBind = device_flags.update_after_bind,
