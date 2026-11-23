@@ -636,8 +636,12 @@ def check(lines, backends=("translator",), hw=None):
             skips.append(e)
     if "hw" in backends:
         got = hw(lines) if callable(hw) else hw
+        if got is None:
+            raise RuntimeError("no result from the hardware runner")
         if isinstance(got, str):
             skips.append(Skip(f"hardware: {got}"))
+        elif len(got) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(got)} words (expected 4)")
         else:
             problems.append(_diff(lines, want, got, "hardware", False))
     if skips and len(skips) == len(backends):
@@ -688,7 +692,10 @@ def hw_prepare(oracle, programs):
             out[i] = why
         else:
             todo.append(i)
-    for i, r in zip(todo, oracle.run([programs[i] for i in todo])):
+    raw = oracle.run([programs[i] for i in todo])
+    if len(raw) != len(todo):
+        raise RuntimeError(f"the hardware runner returned {len(raw)} results for {len(todo)} programs")
+    for i, r in zip(todo, raw):
         out[i] = r
     return out
 
@@ -791,12 +798,20 @@ def main(argv=None):
             print(f"  skip x{n}: {reason}")
 
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([l])[0]) if oracle else None)
+            def run_hw_one(l):
+                res = oracle.run([l])
+                if not res:
+                    raise RuntimeError("the hardware runner returned no result for shrunk program")
+                return res[0]
+            return check(lines, backends, run_hw_one if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
             shown = [text for text, _ in listing(small)] if has_branches(small) else small
             print("\n".join("\t" + line for line in shown))
+    except (RefError, RuntimeError) as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         if oracle:
             oracle.close()

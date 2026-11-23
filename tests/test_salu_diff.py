@@ -239,5 +239,52 @@ class EverythingSkipped(unittest.TestCase):
         self.assertIn("no program ran: every one was skipped", out.getvalue())
 
 
+class OracleGuards(unittest.TestCase):
+    def test_hw_prepare_refuses_short_oracle_results(self):
+        mock_oracle = unittest.mock.MagicMock()
+        mock_oracle.arch = "gfx1030"
+        mock_oracle.run.return_value = [[1, 2, 3, 4]]
+        programs = [["s_mov_b32 s4, 0"], ["s_mov_b32 s5, 1"]]
+        with self.assertRaises(RuntimeError) as ctx:
+            d.hw_prepare(mock_oracle, programs)
+        self.assertIn("the hardware runner returned 1 results for 2 programs", str(ctx.exception))
+
+    def test_check_refuses_none_or_short_hw_results(self):
+        lines = ["s_mov_b32 s4, 0"] + d.observe([4, 5, 6])
+        with self.assertRaises(RuntimeError) as ctx:
+            d.check(lines, backends=("hw",), hw=None)
+        self.assertIn("no result from the hardware runner", str(ctx.exception))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            d.check(lines, backends=("hw",), hw=[1, 2])
+        self.assertIn("the hardware runner returned 2 words (expected 4)", str(ctx.exception))
+
+    def test_main_exits_2_on_oracle_count_mismatch(self):
+        mock_oracle = unittest.mock.MagicMock()
+        mock_oracle.arch = "gfx1030"
+        mock_oracle.device = "mock device"
+        mock_oracle.run.return_value = [[1, 2, 3, 4]]
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("hw_oracle.runner.open_oracle", return_value=mock_oracle):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = d.main(["--oracle", "hw", "--programs", "2", "--seed", "1"])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: the hardware runner returned 1 results for 2 programs", out.getvalue())
+        mock_oracle.close.assert_called_once()
+
+    def test_main_shrink_refuses_empty_oracle_result(self):
+        mock_oracle = unittest.mock.MagicMock()
+        mock_oracle.arch = "gfx1030"
+        mock_oracle.device = "mock device"
+        mock_oracle.run.side_effect = [[[0x11111111, 0x22222222, 0x33333333, 0x44444444]], []]
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("hw_oracle.runner.open_oracle", return_value=mock_oracle):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = d.main(["--oracle", "hw", "--programs", "1", "--seed", "1"])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: the hardware runner returned no result for shrunk program", out.getvalue())
+        mock_oracle.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
