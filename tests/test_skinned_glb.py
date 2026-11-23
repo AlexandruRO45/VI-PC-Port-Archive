@@ -692,6 +692,12 @@ class SkinnedGlbTest(unittest.TestCase):
                     handle.write(data)
                 self._assert_one_line_error(self._run_cli(skeleton, component), path)
 
+    def test_load_json_accepts_utf8_bom(self):
+        path = os.path.join(self.root, "bom_model.json")
+        with open(path, "wb") as handle:
+            handle.write(b"\xef\xbb\xbf" + json.dumps({"Name": "synth"}).encode("utf-8"))
+        self.assertEqual(skinned_glb._load_json(path), {"Name": "synth"})
+
 
 if __name__ == "__main__":
     unittest.main()
