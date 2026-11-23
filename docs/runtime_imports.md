@@ -123,6 +123,7 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
   console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
 - `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
   on an out-of-memory path, after an allocation has already failed.
+
 ## The retail executable (RT-5)
 
 `game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
@@ -186,9 +187,12 @@ The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `
 `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
 read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
 a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
-Commands are accepted and dropped, the result count is always 0 and dequeuing fails, so the audio stays silent. The
-buffer size (128 stream slots) and the empty result queue are hypotheses, explained in the file. `xapu_chad_test`
-calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
+Commands are accepted and not processed, so the audio stays silent. A stream open (type 1) and a stream close
+(type 2) each queue one result of the same type and slot, because the title frees a stream id only when the close
+result arrives. `XDspActivate` writes its two outputs as pointers to zeroed memory, which the title reads as "command
+done" after each `XDspSubmitCommand`. `XApuConnect` leaves its first argument, a global of the title, untouched. The
+buffer size (128 stream slots), the two results and the zeroed DSP status are hypotheses, explained in the file.
+`xapu_chad_test` calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
 `audio_queue` event.
 The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
 
