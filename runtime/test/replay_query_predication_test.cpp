@@ -661,7 +661,7 @@ int main() {
             const bool begin = std::holds_alternative<BeginQuery>(list.commands()[i]);
             prepared.queries.push_back({i, &statistics_heap, begin});  // as prepare() records statistics_active
         }
-        plan_statistics_segments(prepared);
+        plan_statistics_segments(prepared, false);
         expect(prepared.statistics_segment_count == 4, "mixed list: three segments and one for the mesh-only query");
         expect(prepared.statistics_mesh == std::vector<std::uint8_t>({0, 1, 0, 1}),
                "mixed list: vertex, mesh, vertex, then the mesh-only query's mesh segment");
@@ -739,7 +739,7 @@ int main() {
             const bool begin = std::holds_alternative<BeginQuery>(list.commands()[i]);
             prepared.queries.push_back({i, &statistics_heap, begin});
         }
-        expect(plan_overlapping_statistics_segments(prepared) == ReplayResult::success, "plan overlap-mesh list");
+        expect(plan_overlapping_statistics_segments(prepared, false) == ReplayResult::success, "plan overlap-mesh list");
         expect(prepared.statistics_segment_count == 4, "overlap-mesh: four segments");
         expect(prepared.statistics_mesh == std::vector<std::uint8_t>({0, 1, 1, 0}),
                "overlap-mesh: vertex, mesh, mesh, vertex");
