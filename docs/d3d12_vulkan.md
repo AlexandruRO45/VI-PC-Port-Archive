@@ -2021,6 +2021,15 @@ Pipeline creation:
 - Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
   the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
+  When the device is destroyed, the runtime saves the cache, with the pipelines the session added, to
+  `pipeline_cache.user.bin` beside the executable (`LEONIDA_PIPELINE_CACHE` names another file; the build's
+  `pipeline_cache.bin` is never written, and the variable naming it is refused). It writes a staging file and renames it
+  over the old one, so an interrupted or failed save (a read-only folder, a full disk) leaves the previous file and
+  never fails the run. A cache that did not grow, or is over 8 GiB, is not saved. The next session starts from that file
+  when its Vulkan header matches the device and it is at least as new as `pipeline_cache.bin` (a rebuilt seed wins), else
+  from the seed. At teardown the log says how many pipelines were created, how long they took and how many the cache
+  already had (VK_EXT_pipeline_creation_feedback); `d3d12_pipeline_cache_persist_test` checks the second session finds
+  every pipeline of the first.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description

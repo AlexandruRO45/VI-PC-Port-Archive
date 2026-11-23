@@ -2338,6 +2338,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_swapchain_count_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_swapchain_count COMMAND dxgi_swapchain_count_test)
 
+    # The device saves its VkPipelineCache when it is destroyed and the next one starts from it (no GPU shader compiler
+    # needed: its shaders are hand-written SPIR-V).
+    add_executable(d3d12_pipeline_cache_persist_test test/d3d12_pipeline_cache_persist_test.cpp)
+    target_link_libraries(d3d12_pipeline_cache_persist_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_pipeline_cache_persist_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_pipeline_cache_persist_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_pipeline_cache_persist COMMAND d3d12_pipeline_cache_persist_test)
+    set_tests_properties(d3d12_pipeline_cache_persist PROPERTIES SKIP_RETURN_CODE 77)
+
     # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
     add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
     target_link_libraries(d3d12_indirect_rt_test PRIVATE gta6rt_d3d12_com)

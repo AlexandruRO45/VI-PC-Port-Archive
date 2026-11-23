@@ -23,6 +23,9 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/pipeline_cache_file.h"
+#include "../src/pipeline_cache_snapshot.h"
+#include "../src/pipeline_cache_store.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
@@ -40,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cctype>
 #include <climits>
 #include <cstdlib>
@@ -124,7 +128,8 @@ std::uint32_t max_queues_per_family(rt::d3d12::QueueTestSettings settings) {
     return std::uint32_t(value);
 }
 
-// The pipelines build stage writes its cache beside gta6rt.exe, independently of the working directory.
+// The pipelines build stage writes its cache beside gta6rt.exe, independently of the working directory. It is a
+// seed: this file is only ever read.
 std::filesystem::path pipeline_cache_path() {
     std::wstring path(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -133,18 +138,38 @@ std::filesystem::path pipeline_cache_path() {
     return std::filesystem::path(path).parent_path() / L"pipeline_cache.bin";
 }
 
+// Where a session saves the pipelines it learned, and where the next one starts: LEONIDA_PIPELINE_CACHE, else a file
+// beside the seed. Empty without either; never the seed itself.
+std::filesystem::path session_cache_path(const std::filesystem::path& seed) {
+    std::wstring named(32768, L'\0');
+    const DWORD length = GetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE", named.data(), static_cast<DWORD>(named.size()));
+    std::filesystem::path path;
+    if (length && length < named.size()) {
+        named.resize(length);
+        path = named;
+    } else if (!seed.empty()) {
+        path = seed.parent_path() / leonida::pipeline_cache_store::kSessionFileName;
+    }
+    if (!path.empty() && !seed.empty() && leonida::pipeline_cache_store::same_file(path, seed)) {
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_CACHE is the build's pipeline_cache.bin: not saving to it\n");
+        return {};
+    }
+    return path;
+}
+
 // A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
 // and deny writers while the view is in use.
 class PipelineCacheSeed {
 public:
-    explicit PipelineCacheSeed(const std::filesystem::path& path) {
+    explicit PipelineCacheSeed(const std::filesystem::path& path, std::uint64_t max_size = UINT64_MAX) {
         if (path.empty()) return;
         file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file_ == INVALID_HANDLE_VALUE) return;
         LARGE_INTEGER length{};
         constexpr auto header_size = static_cast<LONGLONG>(sizeof(VkPipelineCacheHeaderVersionOne));
-        if (!GetFileSizeEx(file_, &length) || length.QuadPart < header_size)
+        if (!GetFileSizeEx(file_, &length) || length.QuadPart < header_size ||
+            static_cast<std::uint64_t>(length.QuadPart) > max_size)
             return;
         const HANDLE mapping = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
         if (!mapping) return;
@@ -165,13 +190,7 @@ public:
     std::size_t size() const { return size_; }
 
     bool compatible(const leonida::cached_pso::Identity& identity) const {
-        static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == 32);
-        VkPipelineCacheHeaderVersionOne header{};
-        // The header is little-endian, like the host. The driver interprets the opaque payload.
-        std::memcpy(&header, data_, sizeof(header));
-        return header.headerSize == sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
-               header.vendorID == identity.vendor && header.deviceID == identity.device &&
-               std::memcmp(header.pipelineCacheUUID, identity.cache_uuid, VK_UUID_SIZE) == 0;
+        return leonida::pipeline_cache_store::header_matches(data_, size_, identity);
     }
 
 private:
@@ -180,23 +199,43 @@ private:
     std::size_t size_ = 0;
 };
 
-VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
-                                             const leonida::cached_pso::Identity& identity) {
-    const PipelineCacheSeed seed(pipeline_cache_path());
+// A VkPipelineCache holding the file's contents, or null if there is no such file, it is not this GPU's and driver's
+// cache, or Vulkan declines it.
+VkPipelineCache create_cache_from_file(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                       const leonida::cached_pso::Identity& identity,
+                                       const std::filesystem::path& path, std::uint64_t max_size,
+                                       std::size_t& loaded_bytes) {
+    const PipelineCacheSeed seed(path, max_size);
     if (!seed.data()) return VK_NULL_HANDLE;
+    const std::string name = path.filename().string();
     if (!seed.compatible(identity)) {
-        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.bin does not match this Vulkan device\n");
+        std::fprintf(stderr, "[rt] d3d12: %s does not match this Vulkan device\n", name.c_str());
         return VK_NULL_HANDLE;
     }
     const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
                                            nullptr, 0, seed.size(), seed.data()};
     VkPipelineCache cache = VK_NULL_HANDLE;
     if (create_cache(device, &create, nullptr, &cache) != VK_SUCCESS) {
-        std::fprintf(stderr, "[rt] d3d12: Vulkan declined the pipeline cache seed\n");
+        std::fprintf(stderr, "[rt] d3d12: Vulkan declined %s\n", name.c_str());
         return VK_NULL_HANDLE;
     }
-    std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from pipeline_cache.bin\n", seed.size());
+    std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from %s\n", seed.size(), name.c_str());
+    loaded_bytes = seed.size();
     return cache;
+}
+
+// The session file when there is one at least as new as the seed (it holds the seed and what later sessions learned),
+// else the seed.
+VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                             const leonida::cached_pso::Identity& identity,
+                                             const std::filesystem::path& seed,
+                                             const std::filesystem::path& session, std::size_t& loaded_bytes) {
+    namespace store = leonida::pipeline_cache_store;
+    if (!session.empty() && store::session_file_is_current(session, seed))
+        if (const VkPipelineCache cache = create_cache_from_file(create_cache, device, identity, session,
+                                                                 store::kMaxSessionBytes, loaded_bytes))
+            return cache;
+    return create_cache_from_file(create_cache, device, identity, seed, UINT64_MAX, loaded_bytes);
 }
 
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
@@ -603,12 +642,19 @@ struct DeviceState {
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
+    std::size_t pipeline_cache_loaded_bytes = 0;  // what the cache started the session with
+    std::filesystem::path pipeline_cache_session_path;  // where save_pipeline_cache writes; empty: nowhere
+    leonida::pipeline_cache_store::Stats pipeline_stats;
 
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
             const auto& vk = context->vk;
             if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
-            pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
+            const std::filesystem::path seed = pipeline_cache_path();
+            pipeline_cache_session_path = session_cache_path(seed);
+            pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity,
+                                                                 seed, pipeline_cache_session_path,
+                                                                 pipeline_cache_loaded_bytes);
             if (pipeline_cache_handle) return;
             const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
             if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
@@ -616,6 +662,44 @@ struct DeviceState {
         });
         // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
         return pipeline_cache_handle;
+    }
+
+    // Saves what this session's pipelines added to the cache, for the next session to start from. The write replaces the
+    // session file in one step (a crash or a full disk leaves the old file), and never touches the build's seed. A save
+    // that cannot happen (a read-only folder, a full disk) is logged and costs nothing else.
+    void save_pipeline_cache() noexcept {
+        namespace store = leonida::pipeline_cache_store;
+        if (!pipeline_cache_handle || pipeline_cache_session_path.empty() || !context ||
+            !context->vk.vkGetPipelineCacheData)
+            return;
+        const auto& vk = context->vk;
+        const auto name = pipeline_cache_session_path.filename().string();
+        try {
+            std::size_t size = 0;
+            if (vk.vkGetPipelineCacheData(info.device, pipeline_cache_handle, &size, nullptr) != VK_SUCCESS) return;
+            if (size <= pipeline_cache_loaded_bytes) return;  // nothing learned since the file it started from
+            if (size > store::kMaxSessionBytes) {
+                std::fprintf(stderr, "[rt] d3d12: the pipeline cache (%zu bytes) is too big to save to %s\n", size,
+                             name.c_str());
+                return;
+            }
+            const auto begin = std::chrono::steady_clock::now();
+            const std::vector<char> data = pipeline_cache_snapshot([&](std::size_t* bytes, void* out) {
+                return vk.vkGetPipelineCacheData(info.device, pipeline_cache_handle, bytes, out);
+            });
+            if (const std::error_code error =
+                    write_pipeline_cache_file(pipeline_cache_session_path, data.data(), data.size())) {
+                std::fprintf(stderr, "[rt] d3d12: could not save the pipeline cache to %s: %s\n", name.c_str(),
+                             error.message().c_str());
+                return;
+            }
+            std::fprintf(stderr, "[rt] d3d12: saved %zu bytes to %s in %.0f ms\n", data.size(), name.c_str(),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] d3d12: could not save the pipeline cache to %s: %s\n", name.c_str(), e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[rt] d3d12: could not save the pipeline cache to %s\n", name.c_str());
+        }
     }
 
     QueueClock clock;  // what every queue's GetClockCalibration uses
@@ -3799,9 +3883,12 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
+        leonida::pipeline_cache_store::CreationFeedback feedback(device_.info.pipeline_creation_feedback, 1);
+        pipeline_info.pNext = feedback.link(nullptr);
         if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
             return E_FAIL;
+        feedback.record(device_.pipeline_stats);
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -3903,7 +3990,9 @@ private:
             dynamic.pDynamicStates = dynamic_states;
         }
 
-        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
+        leonida::pipeline_cache_store::CreationFeedback feedback(device_.info.pipeline_creation_feedback,
+                                                                 std::uint32_t(r.stages.size()));
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, feedback.link(&rendering)};
         info.stageCount = std::uint32_t(r.stages.size());
         info.pStages = r.stages.data();
         info.pVertexInputState = r.mesh ? nullptr : &vertex_input;  // ignored with a mesh stage; null for clarity
@@ -3919,6 +4008,7 @@ private:
         if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
                                                           &info, nullptr, &pipeline) != VK_SUCCESS)
             return VK_NULL_HANDLE;
+        feedback.record(device_.pipeline_stats);
         return pipeline;
     }
 
@@ -5208,6 +5298,11 @@ public:
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
+        if (const auto pipelines = state_.pipeline_stats.pipelines.load())
+            std::fprintf(stderr, "[rt] d3d12: %u pipelines created in %.2f ms, %u of them from the pipeline cache\n",
+                         pipelines, double(state_.pipeline_stats.nanoseconds.load()) / 1e6,
+                         state_.pipeline_stats.cache_hits.load());
+        state_.save_pipeline_cache();
         if (state_.pipeline_cache_handle)
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
@@ -8343,6 +8438,20 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     return nullptr;
 }
 
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device) {
+    PipelineCacheStats out;
+    if (!device) return out;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (const auto* d = Device::from<Device>(real ? real : device)) {
+        const auto& state = d->state();
+        out.pipelines = state.pipeline_stats.pipelines;
+        out.cache_hits = state.pipeline_stats.cache_hits;
+        out.create_nanoseconds = state.pipeline_stats.nanoseconds;
+        out.loaded_bytes = state.pipeline_cache_loaded_bytes;
+    }
+    return out;
+}
+
 bool device_supports_ray_tracing(ID3D12Device* device) {
     if (!device) return false;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -8978,6 +9087,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // Subgroup size control: a pipeline stage asks for the size its shader was translated for (src/subgroup_size.h).
     leonida::query_subgroup_size_caps(vkGetPhysicalDeviceProperties2, info.physical, v13.subgroup_size_control,
                                       v13.compute_full_subgroups, info.subgroup);
+    info.pipeline_creation_feedback = v13.core;  // core in 1.3; the 1.2 path does not enable the extension
     // Translated vertex shaders read BaseVertex / BaseInstance (SPIR-V DrawParameters) to give v0 / v3 the
     // hardware's zero-based vertex and instance ids (docs/design.md, Inputs and outputs).
     VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
