@@ -1732,8 +1732,9 @@ pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2s
 the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
 contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
 created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
-`s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
-42 `s3`; their meaning is open).
+`s0..s3` of a compute dispatch are the driver's block; when a signature spills, the layer places the spill array's
+console VA in `s[0:1]` and leaves `s2..s3` zero, whereas non-spilling dispatches leave `s0..s3` zero (109 CS read
+`s1` as a constant, 42 `s3`; their non-spill meaning is open).
 
 **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
 each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the

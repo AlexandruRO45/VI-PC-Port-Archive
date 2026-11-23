@@ -1011,6 +1011,13 @@ int main() {
             EXPECT(SUCCEEDED(spill_readback->Map(0, nullptr, &spill_res)));
             std::memcpy(spill_first.data(), spill_res, bytes);
             std::memcpy(spill_second.data(), static_cast<const std::uint8_t*>(spill_res) + bytes, bytes);
+
+            // Binding the compute-only spilling signature on graphics must still invalidate the list without
+            // wrapping unplaced parameter offsets (UINT32_MAX) into s0..s31.
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->SetGraphicsRootSignature(spill_root.p);
+            list->SetGraphicsRoot32BitConstants(3, 2, spill_c1, 0);
+            EXPECT(list->Close() == E_INVALIDARG);
         }
 
         for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
