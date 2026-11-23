@@ -14,7 +14,7 @@ back to the previous store-back of the same list, and sorts the site into:
     checked    a compare of the cursor against `[list+X]` (X != 18h), or against a register, followed by an
                unsigned branch; the branch target's vtable call is reported as the fallback slot
     UNCHECKED  no compare, but the cursor was loaded from the list and the list's own fields are touched
-               (+140h..+143h, +344h, +544h): an inline write that a cursor-at-limit layer never sees
+               (+140h, +141h, +143h, +344h, +544h): an inline write that a cursor-at-limit layer never sees
     unrelated  no compare and no list field: another structure with a pointer at +18h
 
 A PE is disassembled with MSVC `dumpbin /disasm:nobytes` (it comes with the build tools the runtime needs) and
@@ -22,9 +22,10 @@ streamed, so an image of any size works in one pass; a saved dumpbin listing (wi
 works too, on any OS. Nothing is executed. The output is RVAs, counts and constants, no code bytes.
 An input with no instructions in it (an empty or other text file, a PE dumpbin prints no code for) exits 2
 instead of reporting zero sites, so "UNCHECKED 0" always means something was scanned.
-A `checked` site whose stores reach one of the list-only fields (`+140h`..`+143h`, `+344h`, `+544h`) is a
+A `checked` site whose stores reach one of the list-only fields (`+140h`, `+141h`, `+143h`, `+344h`, `+544h`) is a
 command-list write (`fields`); one that stores only the list's common header is another bump allocator
-(`no-fields`). `--sites` prints `fields` or `no-fields` for each checked site, and the summary counts the two
+(`no-fields`). `--sites` prints `fields` or `no-fields` for each checked site (an `unrelated` site can show
+`fields` too, because the label only records a field inside its window), and the summary counts the two
 groups separately.
 
 The matcher knows the instruction shapes MSVC emits for these writes (see tests/test_inline_scan.py); a shape it
@@ -160,8 +161,9 @@ def scan(lines, stats=None):
         for item in tail[:]:  # list fields written right after the store-back (e.g. clearing +140h) count too
             site, left = item
             tail.remove(item)
-            if (lf := LIST_FIELDS.search(ops)) and lf.group(1) in site["bases"] and site["load_traced"]:
-                site["list"] = True
+            if (lf := LIST_FIELDS.search(ops)) and lf.group(1) in site["bases"]:
+                site["fields"] = True
+                site["list"] = site["list"] or site["load_traced"]
             elif left > 1:
                 tail.append((site, left - 1))
         for item in watching[:]:
@@ -184,8 +186,7 @@ def scan(lines, stats=None):
                 site["store_back"] = addr
                 if site["target"] is not None:
                     pending.append((site, idx))
-                if not site["list"]:
-                    tail.append((site, TAIL_WINDOW))
+                tail.append((site, TAIL_WINDOW))
                 yield site
         window.append((addr, mnem, ops))
 

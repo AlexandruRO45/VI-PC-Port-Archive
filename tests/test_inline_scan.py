@@ -64,6 +64,12 @@ class InlineScanTests(unittest.TestCase):
         self.assertEqual(site["header"], 0x4002C400)
         self.assertEqual(site["fallback_slot"], 14)
 
+    def test_a_list_field_written_after_the_store_back_still_marks_the_site(self):
+        # GUARDED clears +140h right after the store-back; classify() cannot see it in the span before it.
+        (site,) = sites(GUARDED)
+        self.assertTrue(site["fields"])
+        self.assertTrue(site["list"])
+
     def test_the_same_write_without_its_compare_is_unchecked(self):
         # The only list field (+140h) is written after the store-back.
         (site,) = sites(UNGUARDED)
@@ -211,12 +217,12 @@ class InlineScanTests(unittest.TestCase):
 class InlineScanCliTests(unittest.TestCase):
     """An input with no instructions must not read as a clean image ("UNCHECKED 0")."""
 
-    def run_cli(self, text):
+    def run_cli(self, text, *args):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "listing.txt")
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(text)
-            return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "inline_scan.py"), path],
+            return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "inline_scan.py"), path, *args],
                                   capture_output=True, text=True)
 
     def test_empty_input_exits_2_without_a_summary(self):
@@ -235,6 +241,39 @@ class InlineScanCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("instructions scanned: 2", proc.stdout)
         self.assertIn("checked 0, UNCHECKED 0", proc.stdout)
+
+    def test_sites_labels_each_checked_and_unrelated_row(self):
+        # One checked site with its field before the store-back, one checked site with the cursor load outside
+        # the window, and a plain structure bump with a list field after the store-back (unrelated).
+        rows = (
+            "mov rax,qword ptr [rbx+18h]",
+            "cmp rax,qword ptr [rbx+28h]",
+            "jae 0000000140002000",
+            "mov edx,dword ptr [rbx+0000000000000344h]",
+            "mov dword ptr [rax],edx",
+            "add rax,4",
+            "mov qword ptr [rbx+18h],rax",
+            "cmp rsi,qword ptr [rbx+8]",
+            "jae 0000000140002100",
+            "mov dword ptr [rsi],1",
+            "mov qword ptr [rbx+18h],rsi",
+            "ret",
+            "mov qword ptr [rax],edx",
+            "add rax,8",
+            "mov qword ptr [rdi+18h],rax",
+            "mov dword ptr [rdi+0000000000000140h],0",
+        )
+        proc = self.run_cli("".join(listing(*rows)), "--sites")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("checked 2, UNCHECKED 0 (plus 1 cursor-like", proc.stdout)
+        self.assertIn("cursor loaded from the list: 1, checked with the cursor load outside", proc.stdout)
+        self.assertIn("with a D3D12.X list field in the window: 1, without one: 1", proc.stdout)
+        self.assertIn("[rbx] checked +0x28 size 4 stores 1", proc.stdout)
+        self.assertIn("[rbx] checked +0x8 size 0 stores 1", proc.stdout)
+        self.assertIn("[rdi] unrelated size 8 stores 1", proc.stdout)
+        self.assertIn("cursor loaded fields", proc.stdout)
+        self.assertIn("cursor outside no-fields", proc.stdout)
+        self.assertIn("cursor outside fields", proc.stdout)
 
 
 if __name__ == "__main__":

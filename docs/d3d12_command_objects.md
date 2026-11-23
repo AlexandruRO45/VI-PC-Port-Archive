@@ -605,7 +605,7 @@ DLLs (dumpbin 14.44 listings):
 |---|---:|---:|---:|---|---|
 | `XboxBvhBuilder.dll` | 196 | 196 | 0 | `+0x30` ×165, `+0x28` ×30, a register loaded in another block ×1 | 45 ×71, 37 ×35, 25 ×34, 14 ×24, 39 ×16, 43 ×9, 80 ×4; 3 reach theirs through a shared jump the tool does not follow |
 | `amd_fidelityfx_upscaler_xbox.dll` | 9 | 9 | 0 | `+0x30` ×8, `+0x28` ×1 | 35 ×6, 25, 41, 14 |
-| `game_scarlett_master.exe` | 110 | 110 | 0 | `+0x8` ×51, `+0x20` ×33, `+0x30` ×12, `+0x10` ×9, `+0x28` ×2, `+0x40` ×2, `+0xd0` ×1 | 6 sites name one (35, 43, 45 ×2 each; 20, 47, 24 ×1); the other 101 reach theirs by a tail jump, which the tool does not follow |
+| `game_scarlett_master.exe` | 110 | 110 | 0 | `+0x8` ×51, `+0x20` ×33, `+0x30` ×12, `+0x10` ×9, `+0x28` ×2, `+0x40` ×2, `+0xd0` ×1 | 9 sites name one of 6 slots (35, 43, 45 ×2 each; 20, 47, 24 ×1); the other 101 reach theirs by a tail jump, which the tool does not follow |
 
 **Measured.** The packet headers it reads back are the two dispatch forms above: `0x4002c400` (26 four-word
 dispatches in the builder, one in FSR) and `0x4003cc00` (the builder's four five-word ones). The other 14 DLLs have
@@ -619,7 +619,7 @@ list in `docs/design.md`). It was run on the retail 1.0.2.1 `game_scarlett_maste
 stores with neither a guard nor a list field.
 
 **At least 12 of those 110 are command-list writes.** They are the whole `+0x28` (2) and `+0x30` (10) families, and each
-touches one of the fields only a D3D12.X list has (`+0x140`..`+0x143`, `+0x344`, `+0x544`) inside the window. So the
+touches one of the fields only a D3D12.X list has (`+0x140`, `+0x141`, `+0x143`, `+0x344`, `+0x544`) inside the window. So the
 executable's inline command writes are at least 12 recognised sites, not 110, and at those 12 it checks first: a
 cursor-at-limit layer sees every one, on the same evidence as the DLLs. The other 98 are guarded stores to `+0x18` of some other bump
 allocator — limits at `+0x8` (51), `+0x20` (33), `+0x10` (9), `+0x40` (2), `+0xd0` (1), and 2 at `+0x30` whose field is
@@ -631,7 +631,7 @@ Cursor loads are separate again: 31 of the 110 load `[list+18h]` inside the wind
 the load in another block or a shared prologue (`cursor loaded` / `cursor outside`). 12 sites touch a list field
 without a guard at all; they are not cursor writes and the summary's last count excludes them.
 
-The builder shows both splits in miniature — 187 of its 196 guarded sites load the cursor in the window and 194 touch
+The builder shows both splits in miniature — 187 of its 196 guarded sites load the cursor in the window and 196 touch
 a list field — so the new summary lines are not executable-specific, and the FSR DLL's 9 sites have both on all 9.
 The table above is unchanged by either line.
 
