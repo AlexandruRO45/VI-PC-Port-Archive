@@ -136,5 +136,23 @@ class SMinI32AstInterpreterTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr(2), u32(-50))
         self.assertEqual(state.scc, 1)
 
+class SMinI32SimdDivergenceTests(unittest.TestCase):
+    def test_min_i32_uniform_scalar_execution(self):
+        # Scalar instructions execute uniformly for the whole wave
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 5)
+        state.set_sgpr(1, 10)
+        res, scc = oracle_min_i32(state.get_sgpr(0), state.get_sgpr(1))
+        state.set_sgpr(2, res)
+        state.scc = scc
+        self.assertEqual(state.get_sgpr(2), 5)
+        self.assertEqual(state.scc, 1)
+
+    def test_min_i32_scc_extrema(self):
+        # Extreme signed limits: -2147483648 (0x80000000) vs 2147483647 (0x7FFFFFFF)
+        res, scc = oracle_min_i32(0x80000000, 0x7FFFFFFF)
+        self.assertEqual(res, 0x80000000)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
