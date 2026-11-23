@@ -783,6 +783,18 @@ if(BUILD_TESTING)
     target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
     add_dependencies(startup_trace_test gta6rt_tls_host)
     add_test(NAME startup_trace COMMAND startup_trace_test)
+
+    if(NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_library(tiny_no_entry MODULE test/fixtures/tiny_no_entry.cpp)
+        target_link_options(tiny_no_entry PRIVATE /NOENTRY /NODEFAULTLIB)
+        set_target_properties(tiny_no_entry PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
+        add_test(NAME run_no_entry_trace COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_no_entry_trace.py"
+          "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_no_entry>")
+      endif()
+    endif()
   endif()
 
   if(TARGET device_proxy_test)

@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -209,10 +210,8 @@ int wmain(int argc, wchar_t** argv) {
             rt::startup_trace::event("exit", "\"code\":0");
             return 0;
         }
-        if (!main_module.entry_rva) {
-            std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
-            return 1;
-        }
+        if (!main_module.entry_rva)
+            throw std::runtime_error(main_module.name + " has no entry point");
         const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " + overlay_dir.native();
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode;
