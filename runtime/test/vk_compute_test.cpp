@@ -30,6 +30,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <numeric>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -357,7 +358,8 @@ int main(int argc, char** argv) {
         }
         if (!ms.empty()) {
             std::sort(ms.begin(), ms.end());
-            std::printf("bench ms: median=%.3f min=%.3f max=%.3f n=%zu\n", ms[ms.size() / 2], ms.front(), ms.back(), ms.size());
+            const double median = std::midpoint(ms[(ms.size() - 1) / 2], ms[ms.size() / 2]);
+            std::printf("bench ms: median=%.3f min=%.3f max=%.3f n=%zu\n", median, ms.front(), ms.back(), ms.size());
         }
         uint32_t h = 2166136261u;   // FNV-1a of the whole output buffer, to compare configurations
         for (VkDeviceSize i = 0; i < bytes; i++) h = (h ^ static_cast<const unsigned char*>(map)[i]) * 16777619u;

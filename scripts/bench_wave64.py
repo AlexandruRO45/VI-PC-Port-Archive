@@ -4,8 +4,8 @@
 
 Three configurations: AMD with its native 64-wide subgroup (no flag), AMD with --wave64-emulate, NVIDIA with
 --wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*,*radeon*' / '*nv*'). Each runs `procs` processes of
-vk_compute_test with VKC_BENCH=`reps` timed dispatches of `groups` workgroups; the table gives the median over all
-dispatches, the spread of the per-process medians (other programs share the GPU, so look at it), the number of
+vk_compute_test with VKC_BENCH=`reps` timed dispatches of `groups` workgroups; the table gives the median of the
+per-process medians, the spread of those medians (other programs share the GPU, so look at it), the number of
 translated segments (static: blocks + continuation segments; every continuation segment is one more workgroup barrier
 on the path through it) and whether the output bytes of the emulated runs equal the native AMD run, which is the reference (they must).
 """
@@ -74,7 +74,8 @@ def positive_int(text):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Compare Wave64 results and report the median of each configuration's process medians.")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
     ap.add_argument("--groups", type=positive_int, default=65536)
