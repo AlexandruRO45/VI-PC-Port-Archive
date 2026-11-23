@@ -368,6 +368,10 @@ CVT_F32_SAT_CASES = (
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # v_pk_mul_lo_u16 with a constant operand (cs_pk_mul_lo_const.asm), measured natively on RDNA2 (gfx1036); lanes 0 and 1.
 PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
+# Its 32 lanes store four words each. vk_compute_test's buffer is 64 words for one group, and the V#'s num_records is
+# the maximum, so without this lanes 16..31 store through device addresses past the buffer (GPU-assisted validation:
+# VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
+PK_MUL_LO_ENV = {"VKC_OUT_WORDS": str(32 * 4)}
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -1801,7 +1805,7 @@ def main():
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
     results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",
-                                                       expected_words=PK_MUL_LO_WORDS)))
+                                                       expected_words=PK_MUL_LO_WORDS, env=PK_MUL_LO_ENV)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
