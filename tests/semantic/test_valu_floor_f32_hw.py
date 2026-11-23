@@ -283,5 +283,74 @@ class TestVFloorF32ScalarInterpreter(unittest.TestCase):
         ScalarInterpreter.step(instr, self.state)
         self.assertEqual(self.state.vgprs[4], 0xBF80_0000)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# -----------------------------------------------------------------------------
+
+class SIMDMultiLaneModel:
+    """Models SIMD multi-lane execution of v_floor_f32 under EXEC masking."""
+
+    @staticmethod
+    def execute_wave(
+        instr: VFloorF32Instruction,
+        exec_mask: int,
+        lane_states: List[LaneRegisterState],
+        wave_size: int = 64
+    ) -> None:
+        instr.validate()
+        for lane in range(wave_size):
+            if (exec_mask & (1 << lane)) != 0:
+                s0 = lane_states[lane].read_operand(instr.src0)
+                res = v_floor_f32_oracle(s0)
+                lane_states[lane].write_vgpr(instr.dst.index, res)
+
+
+class TestVFloorF32SIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD divergence under Wave64 / Wave32 EXEC masking."""
+
+    def test_divergent_lanes_preserve_inactive_state(self):
+        # Only even lanes active
+        exec_mask = 0x5555_5555_5555_5555
+        lanes = [LaneRegisterState() for _ in range(64)]
+
+        for i, lane in enumerate(lanes):
+            # float value: i + 0.75
+            f_val = float(i) + 0.75
+            lane.vgprs[1] = to_u32(f_val)
+            lane.vgprs[2] = 0xCAFE_BABE  # sentinel
+
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=2),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        SIMDMultiLaneModel.execute_wave(instr, exec_mask, lanes)
+
+        for i, lane in enumerate(lanes):
+            if i % 2 == 0:
+                # Active: floor(i + 0.75) = float(i)
+                expected_u = to_u32(float(i))
+                self.assertEqual(lane.vgprs[2], expected_u)
+            else:
+                # Inactive: untouched sentinel
+                self.assertEqual(lane.vgprs[2], 0xCAFE_BABE)
+
+    def test_all_lanes_active(self):
+        exec_mask = 0xFFFF_FFFF_FFFF_FFFF
+        lanes = [LaneRegisterState() for _ in range(64)]
+        for i, lane in enumerate(lanes):
+            f_val = -float(i) - 0.25
+            lane.vgprs[1] = to_u32(f_val)
+
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=2),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        SIMDMultiLaneModel.execute_wave(instr, exec_mask, lanes)
+
+        for i, lane in enumerate(lanes):
+            # floor(-i - 0.25) = -i - 1.0
+            expected = to_u32(-float(i) - 1.0)
+            self.assertEqual(lane.vgprs[2], expected)
+
 if __name__ == "__main__":
     unittest.main()
