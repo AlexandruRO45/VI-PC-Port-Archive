@@ -7,6 +7,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
 | AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](gpu-test-results/RX9070GRE.txt) |
+| AMD Radeon RX 9060 XT (RDNA4, Navi 44), subgroup 32..64 | AMD 25.6.1 (LLPC), Vulkan 1.4.308, Windows 10 | `867d922` | 270/270 translated and valid | 205/211, 4 skipped, 2 failed | 223/241 passed, 17 skipped (native and emulated) | `ms_wave_info_s3`; `check.py`: `cs_fmt_all`, `cs_tbuffer_store` (see below) | [below](#amd-radeon-rx-9060-xt--2026-11-23) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -31,3 +32,23 @@ Every pixel test other than the flaky mesh fixture was exact (4096/4096).
 
 AI-assisted (Hermes Agent): built `main` at `05961f0`, ran `build.py`, `check.py` and
 `run_gpu_tests.py` (native and emulated) on this GPU, and verified the isolated reruns of the one failure.
+
+## AMD Radeon RX 9060 XT — 2026-11-23
+
+```
+GPU:        AMD Radeon RX 9060 XT (RDNA4, Navi 44, PCI 1002:7590), subgroup 32..64
+Driver:     AMD 25.6.1 (LLPC), Windows driver 32.0.21013.1000, Vulkan driverVersion 2.0.342, API 1.4.308
+OS:         Windows 10 Pro 22H2 (build 19045)
+Commit:     867d922f09b86583859796a174df89555fb32da8 (main, 2026-11-23)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools), Vulkan SDK 1.4.363.1, MSVC (VS 18, scripts/build_runtime.ps1), Python 3.14.4
+build.py:   270 shaders: 270 translated, 270 pass spirv-val (6 mesh fixtures not built, as above)
+check.py:   205 of 211 pass, 4 skipped, 2 failed
+              cs_fmt_all        word 284: expected 0x7fd00401, got 0x7fee0c01
+              cs_tbuffer_store  word 20:  expected 0xd00003ff, got 0xce1003ff
+run_gpu_tests.py: 223/241 passed, 17 skipped, 1 failed (native and LEONIDA_W64_EMULATE=1 alike)
+Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0), the same signature as on the RX 9070 GRE above.
+Skipped:    16 "run by d3d12_*_test / w64_graphics.py" cases, and ps_w64x_readlane (no required 64-wide fragment subgroup).
+```
+
+The two `check.py` failures are not in `run_gpu_tests.py`'s list, so they show only there. Their expected words
+come from gfx1035, gfx1036 and gfx1150. This driver is from June 2025, so a newer one may differ.
