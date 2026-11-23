@@ -1370,9 +1370,9 @@ differs in the low bits of the result.
 `tools/f64_diff.py` covers the 47 binary64 instruction forms `tools/rdna2spirv.py` translates on main: four rounding
 ops, add, f64-to-f32 conversion, reciprocal/reciprocal-square-root/square-root, division fixup and scaled FMA, both
 frexp results, all 16 `v_cmp_*_f64` and 16 `v_cmpx_*_f64` predicates, and both class compares. It generates one-lane
-programs with VGPR and SGPR pairs, float immediates, inline constants, 32-bit literals where the translator marks
-them as upper-half f64 literals, and full-width literals in other instruction forms; it compares the four exported
-dwords. Compare predicates are read through a mask-to-word operation, and `v_cmpx` cases also export the resulting
+programs with VGPR and SGPR pairs, float immediates, inline constants and 32-bit literals (an f64 ISA literal
+supplies bits 63:32 in every form, docs/design.md, "f64 literal sources"); it compares the four exported dwords.
+Compare predicates are read through a mask-to-word operation, and `v_cmpx` cases also export the resulting
 `EXEC` mask. Its reference decodes IEEE binary64 words and uses exact
 `Fraction` arithmetic for finite addition and fused multiply-add; it does not import code from the translator or the
 other fuzzer references. It models all four `MODE.FP_ROUND[3:2]` encodings for addition; the translator currently
