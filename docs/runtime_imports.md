@@ -565,8 +565,13 @@ end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMem
 - A status callback is inherited by child handles, and so is the parent's `WINHTTP_OPTION_CONTEXT_VALUE` as it is
   when the child is made (measured on the host's `winhttp.dll`). Child handles report `HANDLE_CREATED`; every
   handle reports `HANDLE_CLOSING` once, last. `WinHttpCrackUrl` only parses, so it is the host's.
+- The six `WinHttpWebSocket*` calls (`CompleteUpgrade`, `Send`, `Receive`, `Shutdown`, `Close`, `QueryCloseStatus`) fail at
+  once, never block: no request gets a 101 response, so `CompleteUpgrade` fails with
+  `ERROR_WINHTTP_INCORRECT_HANDLE_STATE` and returns `NULL`, and the data calls return `ERROR_WINHTTP_INCORRECT_HANDLE_TYPE`
+  (`ERROR_INVALID_HANDLE` for a handle that is not open). `WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET` is accepted on a request only.
+  The title's own imports are still the 16 above; these six are for a title that opens `wss://` itself.
 - Because the shims own the module, a title's `LoadLibrary("winhttp.dll")` gets a pseudo-handle too, and a WinHTTP
-  function outside these 16 resolves to `NULL` (logged), never to the host.
+  function outside these 16 and the six WebSocket calls resolves to `NULL` (logged), never to the host.
 
 Each refused server is logged once (`[rt] winhttp: offline, refused <host>:<port>`), which records what a title
 tried to reach. `runtime/test/winhttp_offline_test.cpp` (ctest `winhttp_offline`) covers the synchronous and

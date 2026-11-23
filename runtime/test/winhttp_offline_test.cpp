@@ -33,6 +33,11 @@ using QueryOptionFn = BOOL(WINAPI*)(HINTERNET, DWORD, LPVOID, LPDWORD);
 using SetStatusCallbackFn = WINHTTP_STATUS_CALLBACK(WINAPI*)(HINTERNET, WINHTTP_STATUS_CALLBACK, DWORD, DWORD_PTR);
 using CloseHandleFn = BOOL(WINAPI*)(HINTERNET);
 using CrackUrlFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
+using CompleteUpgradeFn = HINTERNET(WINAPI*)(HINTERNET, DWORD_PTR);
+using WsSendFn = DWORD(WINAPI*)(HINTERNET, WINHTTP_WEB_SOCKET_BUFFER_TYPE, PVOID, DWORD);
+using WsReceiveFn = DWORD(WINAPI*)(HINTERNET, PVOID, DWORD, DWORD*, WINHTTP_WEB_SOCKET_BUFFER_TYPE*);
+using WsCloseFn = DWORD(WINAPI*)(HINTERNET, USHORT, PVOID, DWORD);
+using WsQueryCloseStatusFn = DWORD(WINAPI*)(HINTERNET, USHORT*, PVOID, DWORD, DWORD*);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -646,6 +651,78 @@ int main() {
         g_close_probe = nullptr;
         check(session_closed != FALSE && probe.closing_calls == 2 && probe.closing_handle == session,
               "closing session afterwards drops the last reference and reports HANDLE_CLOSING once");
+    }
+
+    // WebSocket: no request gets a 101 response offline, so every call fails at once and none blocks.
+    {
+        const auto complete = resolve<CompleteUpgradeFn>("WinHttpWebSocketCompleteUpgrade");
+        const auto ws_send = resolve<WsSendFn>("WinHttpWebSocketSend");
+        const auto ws_receive = resolve<WsReceiveFn>("WinHttpWebSocketReceive");
+        const auto ws_shutdown = resolve<WsCloseFn>("WinHttpWebSocketShutdown");
+        const auto ws_close = resolve<WsCloseFn>("WinHttpWebSocketClose");
+        const auto ws_status = resolve<WsQueryCloseStatusFn>("WinHttpWebSocketQueryCloseStatus");
+        check(complete && ws_send && ws_receive && ws_shutdown && ws_close && ws_status,
+              "the six WinHttpWebSocket functions resolve through the registry");
+        if (complete && ws_send && ws_receive && ws_shutdown && ws_close && ws_status) {
+            const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+            const HINTERNET connection = connect(session, L"ws.invalid", 443, 0);
+            const HINTERNET request = open_request(connection, L"GET", L"/connect", nullptr, WINHTTP_NO_REFERER,
+                                                   WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+            const HINTERNET gone = connect(session, L"gone.invalid", 443, 0);
+            close(gone);
+
+            SetLastError(0);
+            check(set_option(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) != FALSE,
+                  "WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET is accepted on a request");
+            SetLastError(0);
+            check(set_option(session, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) == FALSE &&
+                      GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE &&
+                      set_option(connection, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) == FALSE &&
+                      GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+                  "WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET is refused on a session and on a connection");
+
+            // The request was never sent, so there is no 101 to complete.
+            SetLastError(0);
+            check(complete(request, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_STATE,
+                  "WinHttpWebSocketCompleteUpgrade on an unsent request fails with ERROR_WINHTTP_INCORRECT_HANDLE_STATE");
+            SetLastError(0);
+            check(complete(connection, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+                  "WinHttpWebSocketCompleteUpgrade on a connection fails with ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
+            SetLastError(0);
+            check(complete(gone, 0) == nullptr && GetLastError() == ERROR_INVALID_HANDLE &&
+                      complete(nullptr, 0) == nullptr && GetLastError() == ERROR_INVALID_HANDLE,
+                  "WinHttpWebSocketCompleteUpgrade on a closed or null handle fails with ERROR_INVALID_HANDLE");
+
+            // The data calls return the error, and no handle here is a WebSocket.
+            char data[8] = {};
+            DWORD read = 0x1234;
+            WINHTTP_WEB_SOCKET_BUFFER_TYPE type{};
+            USHORT status = 0;
+            DWORD reason_length = 0;
+            const HINTERNET not_sockets[] = {session, connection, request};
+            bool type_errors = true;
+            for (const HINTERNET h : not_sockets) {
+                type_errors = type_errors &&
+                              ws_send(h, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, data, sizeof(data)) ==
+                                  ERROR_WINHTTP_INCORRECT_HANDLE_TYPE &&
+                              ws_receive(h, data, sizeof(data), &read, &type) == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE &&
+                              ws_shutdown(h, 1000, nullptr, 0) == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE &&
+                              ws_close(h, 1000, nullptr, 0) == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE &&
+                              ws_status(h, &status, data, sizeof(data), &reason_length) ==
+                                  ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+            }
+            check(type_errors && read == 0x1234, "Send, Receive, Shutdown, Close and QueryCloseStatus on a non-WebSocket handle return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
+            check(ws_send(gone, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, data, sizeof(data)) == ERROR_INVALID_HANDLE &&
+                      ws_receive(nullptr, data, sizeof(data), &read, &type) == ERROR_INVALID_HANDLE &&
+                      ws_shutdown(gone, 1000, nullptr, 0) == ERROR_INVALID_HANDLE &&
+                      ws_close(nullptr, 1000, nullptr, 0) == ERROR_INVALID_HANDLE &&
+                      ws_status(gone, &status, data, sizeof(data), &reason_length) == ERROR_INVALID_HANDLE,
+                  "the WebSocket data calls on a closed or null handle return ERROR_INVALID_HANDLE");
+
+            close(request);
+            close(connection);
+            close(session);
+        }
     }
 
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);

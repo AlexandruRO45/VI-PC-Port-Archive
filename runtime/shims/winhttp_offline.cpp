@@ -22,6 +22,12 @@
 //     WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING once per handle, last, after WinHttpCloseHandle and any callback still
 //     running for it.
 //   - WinHttpCrackUrl only parses a string, so it is the host's.
+//   - WebSocket: no request ever gets a 101 response, so no WebSocket handle exists. WinHttpWebSocketCompleteUpgrade
+//     fails with ERROR_WINHTTP_INCORRECT_HANDLE_STATE (ERROR_INVALID_HANDLE / ERROR_WINHTTP_INCORRECT_HANDLE_TYPE for
+//     a handle that is not a request) and returns NULL. WinHttpWebSocketSend, Receive, Shutdown, Close and
+//     QueryCloseStatus return their error as the DWORD result, as the API does: ERROR_INVALID_HANDLE for a handle
+//     that is not open, ERROR_WINHTTP_INCORRECT_HANDLE_TYPE for any open handle, since none is a WebSocket. None blocks.
+//     WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET is accepted on a request and refused on a session or connection.
 // Each refused server is logged once ("[rt] winhttp: offline, refused <host>:<port>"), which says what a title tried
 // to reach. Only images mapped by the loader see these: they are bound through the registry, the runtime's own code
 // calls the host directly.
@@ -337,6 +343,10 @@ BOOL WINAPI set_option(HINTERNET handle, DWORD option, LPVOID buffer, DWORD leng
     DWORD error = 0;
     Handle* h = acquire(handle, true, true, true, error);
     if (!h) return fail(error);
+    if (option == WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET && h->kind != Kind::Request) {
+        release(h);
+        return fail(ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+    }
     if (option == WINHTTP_OPTION_CONTEXT_VALUE) {
         if (!buffer) {
             release(h);
@@ -419,6 +429,41 @@ BOOL WINAPI close_handle(HINTERNET handle) {
     return TRUE;
 }
 
+// No request ever got a 101 response, so there is no upgrade to complete and no WebSocket handle to use.
+HINTERNET WINAPI websocket_complete_upgrade(HINTERNET request, DWORD_PTR) {
+    DWORD error = 0;
+    Handle* r = acquire(request, false, false, true, error);
+    if (!r) {
+        SetLastError(error);
+        return nullptr;
+    }
+    release(r);
+    SetLastError(ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
+    return nullptr;
+}
+
+// The WebSocket calls return their error code, they do not set the last error. Every open handle here is a session,
+// a connection or a request, never a WebSocket.
+DWORD websocket_refused(HINTERNET handle) {
+    DWORD error = 0;
+    Handle* h = acquire(handle, true, true, true, error);
+    if (!h) return error;
+    release(h);
+    return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+}
+
+DWORD WINAPI websocket_send(HINTERNET socket, WINHTTP_WEB_SOCKET_BUFFER_TYPE, PVOID, DWORD) {
+    return websocket_refused(socket);
+}
+DWORD WINAPI websocket_receive(HINTERNET socket, PVOID, DWORD, DWORD*, WINHTTP_WEB_SOCKET_BUFFER_TYPE*) {
+    return websocket_refused(socket);
+}
+DWORD WINAPI websocket_shutdown(HINTERNET socket, USHORT, PVOID, DWORD) { return websocket_refused(socket); }
+DWORD WINAPI websocket_close(HINTERNET socket, USHORT, PVOID, DWORD) { return websocket_refused(socket); }
+DWORD WINAPI websocket_query_close_status(HINTERNET socket, USHORT*, PVOID, DWORD, DWORD*) {
+    return websocket_refused(socket);
+}
+
 BOOL WINAPI crack_url(LPCWSTR url, DWORD length, DWORD flags, LPURL_COMPONENTS components) {
     // Parsing only: the host's, loaded on first use so the runtime does not depend on winhttp.dll otherwise.
     using CrackUrlFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
@@ -453,4 +498,10 @@ SHIM_TABLE(winhttp_offline,
     {"winhttp.dll", "WinHttpSetStatusCallback", reinterpret_cast<void*>(&set_status_callback)},
     {"winhttp.dll", "WinHttpCloseHandle", reinterpret_cast<void*>(&close_handle)},
     {"winhttp.dll", "WinHttpCrackUrl", reinterpret_cast<void*>(&crack_url)},
+    {"winhttp.dll", "WinHttpWebSocketCompleteUpgrade", reinterpret_cast<void*>(&websocket_complete_upgrade)},
+    {"winhttp.dll", "WinHttpWebSocketSend", reinterpret_cast<void*>(&websocket_send)},
+    {"winhttp.dll", "WinHttpWebSocketReceive", reinterpret_cast<void*>(&websocket_receive)},
+    {"winhttp.dll", "WinHttpWebSocketShutdown", reinterpret_cast<void*>(&websocket_shutdown)},
+    {"winhttp.dll", "WinHttpWebSocketClose", reinterpret_cast<void*>(&websocket_close)},
+    {"winhttp.dll", "WinHttpWebSocketQueryCloseStatus", reinterpret_cast<void*>(&websocket_query_close_status)},
 );
