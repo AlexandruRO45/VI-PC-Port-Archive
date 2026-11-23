@@ -45,7 +45,7 @@ if _TOOLS_DIR not in sys.path:
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
-from report_paths import same_report_path  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
 
 J = WA.joaat_cs
@@ -361,14 +361,14 @@ def resolve(names, found, duplicate_keys=0, malformed_positions=0):
 
 
 def _inside(folder, path):
-    """True when ``folder`` is a folder and ``path`` lies in it (a report there would be read as a carved file)."""
+    """True when ``path`` is located in or resolves inside the scanned folder."""
     if not os.path.isdir(folder):
         return False
-    root = os.path.normcase(os.path.realpath(folder))
-    try:
-        return os.path.commonpath([root, os.path.normcase(os.path.realpath(path))]) == root
-    except ValueError:  # different drives on Windows
-        return False
+    folder = path_key(folder)
+    parent = path_key(os.path.dirname(os.path.abspath(path)))
+    target = path_key(path)
+    prefix = folder.rstrip(os.sep) + os.sep
+    return any(p == folder or p.startswith(prefix) for p in (parent, target))
 
 
 def main(argv=None):
@@ -390,22 +390,27 @@ def main(argv=None):
     if a.limit is not None and a.limit < 1:
         ap.error("--limit must be at least 1 byte")  # 0 would scan nothing and report every count as 0
     out_abs = os.path.abspath(a.out)
-    if same_report_path(a.out, a.path) or same_report_path(a.out, a.names) or _inside(a.path, out_abs):
+    if same_report_path(a.out, a.path) or same_report_path(a.out, a.names):
         print("world_interior_names.py: --out would overwrite an input: %s" % a.out, file=sys.stderr)
+        return 2
+    if _inside(a.path, out_abs):
+        print("world_interior_names.py: --out %s is inside the scanned folder %s" % (a.out, a.path), file=sys.stderr)
         return 2
     if os.path.isdir(a.out):
         print("world_interior_names.py: --out is a directory: %s" % a.out, file=sys.stderr)
         return 2
     if os.path.isdir(a.path) and os.path.isfile(a.out):
         # An outside name can still be a hard link to a scanned member. Check identity before opening the
-        # report for writing; the parent-chain check above only protects names located inside the folder.
+        # report for writing; the containment check above cannot see shared file identity.
         try:
             report_stat = os.stat(a.out)
             for source in WI._directory_files(a.path):
                 if os.path.samestat(report_stat, os.stat(source)):
-                    ap.error("--out would overwrite the input %s" % source)
+                    print("world_interior_names.py: --out would overwrite the input %s" % source, file=sys.stderr)
+                    return 2
         except OSError as exc:
-            ap.error("cannot check --out %s: %s" % (a.out, exc))
+            print("world_interior_names.py: cannot check --out %s: %s" % (a.out, exc), file=sys.stderr)
+            return 2
     try:
         names, duplicate_keys, malformed = load_names(a.names)
     except (OSError, ValueError) as exc:  # json.JSONDecodeError is a ValueError

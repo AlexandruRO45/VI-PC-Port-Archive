@@ -50,6 +50,12 @@ class DirectoryReportPathTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), data)
         self.assertEqual(self.names.read_bytes(), self.names_before)
 
+    def symlink(self, link, target):
+        try:
+            link.symlink_to(os.path.relpath(target, link.parent))
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest("symlinks are not available: %s" % exc)
+
     def test_cli_refuses_external_hard_links_to_flat_and_nested_inputs(self):
         for index, (source, data) in enumerate(self.inputs.items()):
             with self.subTest(source=source.relative_to(self.folder)):
@@ -69,10 +75,77 @@ class DirectoryReportPathTest(unittest.TestCase):
         os.link(source, report)
         err = io.StringIO()
         with mock.patch.object(T, "scan", side_effect=AssertionError("scan ran before the refusal")), \
-                redirect_stderr(err), self.assertRaises(SystemExit) as raised:
-            T.main(self.args(report))
-        self.assertEqual(raised.exception.code, 2)
+                redirect_stderr(err):
+            result = T.main(self.args(report))
+        self.assertEqual(result, 2)
         self.assertIn("overwrite the input", err.getvalue())
+        self.assert_inputs_unchanged()
+
+    def test_cli_refuses_external_symlinks_to_flat_and_nested_inputs(self):
+        for index, (source, data) in enumerate(self.inputs.items()):
+            report = self.root / f"symlink-{index}.json"
+            self.symlink(report, source)
+            with self.subTest(source=source.relative_to(self.folder)):
+                result = self.cli(report)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertTrue(report.is_symlink())
+                self.assertEqual(report.read_bytes(), data)
+                self.assert_inputs_unchanged()
+
+    def test_report_target_of_a_scanned_symlink_is_preserved(self):
+        report = self.root / "outside-resource.bin"
+        data = F.interiors()
+        report.write_bytes(data)
+        link = self.folder / "linked-resource.bin"
+        self.symlink(link, report)
+        result = self.cli(report)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("overwrite the input", result.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(report.read_bytes(), data)
+        self.assert_inputs_unchanged()
+
+    def test_cli_refuses_dangling_report_symlinks_into_scanned_folder(self):
+        for index, parent in enumerate((self.folder, self.folder / "nested")):
+            target = parent / "new-report.json"
+            report = self.root / f"dangling-{index}.json"
+            self.symlink(report, target)
+            with self.subTest(parent=parent.relative_to(self.folder)):
+                result = self.cli(report)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("inside the scanned folder", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertTrue(report.is_symlink())
+                self.assertFalse(target.exists())
+                self.assert_inputs_unchanged()
+
+    def test_dangling_symlink_located_inside_input_is_refused_before_scan(self):
+        # Keep the existing containment rule when the leaf points outside the input.
+        target = self.root / "new-report.json"
+        report = self.folder / "outward-link.json"
+        self.symlink(report, target)
+        err = io.StringIO()
+        with mock.patch.object(T, "scan", side_effect=AssertionError("scan ran before the refusal")), \
+                redirect_stderr(err):
+            result = T.main(self.args(report))
+        self.assertEqual(result, 2)
+        self.assertIn("inside the scanned folder", err.getvalue())
+        self.assertTrue(report.is_symlink())
+        self.assertFalse(target.exists())
+        self.assert_inputs_unchanged()
+
+    def test_dangling_symlink_between_outside_paths_is_allowed(self):
+        target = self.root / "new-report.json"
+        report = self.root / "outside-link.json"
+        self.symlink(report, target)
+        result = self.cli(report)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(report.is_symlink())
+        doc = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual((doc["summary"]["interior_names"], doc["summary"]["placements"]), (2, 3))
         self.assert_inputs_unchanged()
 
     def test_existing_independent_report_with_identical_bytes_is_allowed(self):
@@ -99,9 +172,9 @@ class DirectoryReportPathTest(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.object(T.WI, "_directory_files", side_effect=OSError(errno.EACCES, "denied", str(self.folder))), \
                 mock.patch.object(T, "scan", side_effect=AssertionError("scan ran before the refusal")), \
-                redirect_stderr(err), redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
-            T.main(self.args(report))
-        self.assertEqual(raised.exception.code, 2)
+                redirect_stderr(err), redirect_stdout(io.StringIO()):
+            result = T.main(self.args(report))
+        self.assertEqual(result, 2)
         self.assertIn("cannot check --out", err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
         self.assertEqual(report.read_bytes(), previous)
