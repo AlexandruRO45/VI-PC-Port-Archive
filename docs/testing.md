@@ -511,8 +511,8 @@ On RDNA4 (gfx12xx) only part of this runs, and a tool that cannot run there exit
 - **Exit 77, fixed MODE:** `f16_trans_sweep.py`, `fmisc_diff.py`, `pknorm_probe.py`, `fma_mix_probe.py` and
   `vinterp_hw_probe.py`. Every kernel of theirs sets IEEE and DX10_CLAMP, which gfx1170+ fixes,
   so the game's MODE cannot be set there.
-- **Exit 77, kernel text of an older family:** `buffer_swizzle_probe.py` and `smem_neg_probe.py` (GFX12 has no
-  MUBUF/MTBUF forms; gfx1150 still assembles them), `vcmp16_opsel_probe.py` (raw GFX10 compare opcodes, which GFX11
+- **Exit 77, kernel text of an older family:** `buffer_swizzle_probe.py` and `smem_neg_probe.py` (GFX12's
+  assembler rejects their MUBUF/MTBUF lines as written; gfx1150 still assembles them), `vcmp16_opsel_probe.py` (raw GFX10 compare opcodes, which GFX11
   renumbered), `sampler_lod_probe.py` (GFX10 mip fields) and `texoff_probe.py` (GFX12 rejects its
   `image_sample_lz_o` operands); `sdwa_diff.py` (no SDWA after GFX10) and `mad_denorm_probe.py` (`v_mad_f32` is
   GFX10.1 only).

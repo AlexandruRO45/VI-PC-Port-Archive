@@ -114,8 +114,9 @@ def main(argv=None):
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    # GFX12 has no MUBUF forms and no s_waitcnt_vscnt: its assembler rejects the buffer_store_* lines that seed and
-    # read back the rows ("operands are not valid for this GPU or mode"; gfx1150 still takes them).
+    # GFX12 has no s_waitcnt_vscnt, and its assembler rejects the buffer_store_* lines that seed and read back the rows
+    # as written for GFX10/GFX11 ("operands are not valid for this GPU or mode"; gfx1150 still takes them). The forms
+    # exist on GFX12 (#9496 respells valu_fuzz's); this probe is not ported.
     why = asm.family_skip_reason(oracle.arch, ("gfx10", "gfx11"), "the MUBUF kernel text of this probe")
     if why:
         oracle.close()

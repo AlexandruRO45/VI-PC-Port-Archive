@@ -499,8 +499,9 @@ def run_hw(cases, arch=None, waves=(32, 64)):
     from hw_oracle import asm, runner  # noqa: E402
     oracle = runner.open_oracle(arch=arch)
     try:
-        # GFX12 has no MUBUF/MTBUF forms: its assembler answers the buffer_* lines here with "operands are not valid
-        # for this GPU or mode" (gfx1150 still takes them), so every kernel of a chunk would be rejected.
+        # GFX12's assembler answers the buffer_* lines here, as written for GFX10/GFX11, with "operands are not valid
+        # for this GPU or mode" (gfx1150 still takes them), so every kernel of a chunk would be rejected. The forms
+        # exist on GFX12 (#9496 respells valu_fuzz's, a literal 0 soffset among them); this probe is not ported.
         why = asm.family_skip_reason(oracle.arch, ("gfx10", "gfx11"), "the MUBUF/MTBUF kernel text of this probe")
         if why:
             raise runner.Unavailable(why)
