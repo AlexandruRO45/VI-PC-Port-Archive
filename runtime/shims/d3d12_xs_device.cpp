@@ -2211,7 +2211,6 @@ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, s
     handle.ptr = static_cast<SIZE_T>(dest);
     self->real->CreateSampler(desc, handle);
 }
-}
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
 // DeserializeComputePipelineStateX in amd_fidelityfx_upscaler_xbox.dll's messages (call at RVA 0x56d9). The desc
@@ -3162,9 +3161,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 13 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
-        slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 ||
-        slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 ||
-        slot == kCreateCommittedResource3X || slot == 133)
+        slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 ||
+        slot == 50 || slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 ||
+        slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == kCreateCommittedResource3X || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
