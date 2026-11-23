@@ -38,6 +38,7 @@ synthetic resources.
 import argparse
 import collections
 import csv
+import inspect
 import json
 import os
 import re
@@ -363,9 +364,9 @@ class VariantScan(Scan):
     def add(self, *args, **kwargs):
         source, offset, data = args[0], args[1], args[2]
         archive = args[3] if len(args) > 3 else kwargs.get("archive")
-        try:
+        if "archive" in inspect.signature(Scan.add).parameters:
             super().add(*args, **kwargs)
-        except TypeError:  # 16282101 base Scan.add takes (source, offset, data) without `archive`
+        else:  # 16282101 base Scan.add takes (source, offset, data) without `archive`
             super().add(source, offset, data)
         if _is_resource(data) and b"\x01\x01\x00\x00" in data:
             for table in variant_tables(data):

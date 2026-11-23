@@ -258,9 +258,14 @@ class TestVariants(unittest.TestCase):
 
     def test_variants_uses_resolved_archive_language(self):
         # Short variant tables ("Bonjour") guess "xx" alone; when Scan provides archive_lang, variants inherit it.
+        # Subclass instead of assigning scan.archive_lang because on main Scan.archive_lang is a read-only @property.
+        class _ScanWithArchiveLang(T.VariantScan):
+            @property
+            def archive_lang(self):
+                return {("arc", 0x1000): "fr"}
+
         res = make_variant_resource([("ZZ_GREET", 10, 11, [("Bonjour", 0, 1, 0)])])
-        scan = T.VariantScan()
-        scan.archive_lang = {("arc", 0x1000): "fr"}
+        scan = _ScanWithArchiveLang()
         scan.add("src", 0x1100, res, archive=("arc", 0x1000))
         self.assertEqual([(s, o, lang) for s, o, lang, _vt in scan.variants], [("src", 0x1100, "fr")])
 
