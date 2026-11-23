@@ -441,18 +441,23 @@ UINT view_slices(const D3D12_RESOURCE_DESC& resource, UINT first_layer, UINT lay
     return remaining ? resource.DepthOrArraySize - first_layer : layer_count;
 }
 
+namespace {
+std::atomic<int> s_texture_mip_drop{-1};
+}
+
 // Returns 0, 1, 2, or 3 from LEONIDA_TEXTURE_MIP_DROP (default 0).
+// Uses a constant-initialized atomic to avoid function-local static init guards on guest threads (RT-488).
 inline UINT configured_texture_mip_drop() {
-    static const UINT drop = []() -> UINT {
-        char text[16]{};
-        size_t length = 0;
-        if (getenv_s(&length, text, "LEONIDA_TEXTURE_MIP_DROP") == 0 && length > 1) {
-            const int val = std::atoi(text);
-            return static_cast<UINT>(std::clamp(val, 0, 3));
-        }
-        return 0;
-    }();
-    return drop;
+    int drop = s_texture_mip_drop.load(std::memory_order_relaxed);
+    if (drop >= 0) return static_cast<UINT>(drop);
+    char text[16]{};
+    size_t length = 0;
+    int parsed = 0;
+    if (getenv_s(&length, text, "LEONIDA_TEXTURE_MIP_DROP") == 0 && length > 1) {
+        parsed = std::clamp(std::atoi(text), 0, 3);
+    }
+    s_texture_mip_drop.store(parsed, std::memory_order_relaxed);
+    return static_cast<UINT>(parsed);
 }
 
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
@@ -488,8 +493,9 @@ struct TextureCreateInfo {
 
         const uint32_t width  = std::max(1u, static_cast<uint32_t>(desc.Width >> mips_dropped));
         const uint32_t height = one_d ? 1u : std::max(1u, desc.Height >> mips_dropped);
+        const uint32_t depth  = volume ? std::max(1u, UINT(desc.DepthOrArraySize) >> mips_dropped) : 1u;
 
-        info.extent = {width, height, volume ? UINT(desc.DepthOrArraySize) : 1u};
+        info.extent = {width, height, depth};
         info.mipLevels = desc.MipLevels - mips_dropped;
         info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
         info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
@@ -6031,7 +6037,15 @@ public:
         }
         if (r->mips_dropped() > 0) {
             const UINT drop = r->mips_dropped();
-            view.first_mip = (view.first_mip >= drop) ? (view.first_mip - drop) : 0;
+            if (view.first_mip >= drop) {
+                view.first_mip -= drop;
+            } else {
+                const UINT dropped_from_view = drop - view.first_mip;
+                view.first_mip = 0;
+                if (view.mip_count != UINT_MAX) {
+                    view.mip_count = (view.mip_count > dropped_from_view) ? (view.mip_count - dropped_from_view) : 1;
+                }
+            }
             const UINT avail_mips = r->image_mip_levels() > view.first_mip ? (r->image_mip_levels() - view.first_mip) : 1;
             if (view.mip_count != UINT_MAX && view.mip_count > 0) {
                 view.mip_count = std::min(view.mip_count, avail_mips);

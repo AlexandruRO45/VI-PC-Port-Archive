@@ -1851,6 +1851,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_subresource_copy COMMAND d3d12_subresource_copy_test)
     set_tests_properties(d3d12_subresource_copy PROPERTIES SKIP_RETURN_CODE 77)
 
+    # LEONIDA_TEXTURE_MIP_DROP quality switch: multi-mip creation, copies, barriers, SRVs (#6043).
+    add_executable(d3d12_texture_mip_drop_test test/d3d12_texture_mip_drop_test.cpp)
+    target_link_libraries(d3d12_texture_mip_drop_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_texture_mip_drop_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_texture_mip_drop_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_texture_mip_drop COMMAND d3d12_texture_mip_drop_test)
+    set_tests_properties(d3d12_texture_mip_drop PROPERTIES SKIP_RETURN_CODE 77)
+
     # MakeResident, Evict, SetResidencyPriority and EnqueueMakeResident, compared with the host runtime.
     add_executable(d3d12_residency_test test/d3d12_residency_test.cpp)
     target_link_libraries(d3d12_residency_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

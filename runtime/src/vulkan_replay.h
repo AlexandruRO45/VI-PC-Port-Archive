@@ -2570,8 +2570,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (p.binding.image == VK_NULL_HANDLE) {
                 if (transition->subresource != 0 && transition->subresource != all_subresources)
                     return ReplayResult::invalid_subresource;
-            } else if (!image_range(p.binding, transition->subresource, p.range)) {
-                return ReplayResult::invalid_subresource;
+            } else {
+                std::uint32_t sub = transition->subresource;
+                if (p.binding.mips_dropped > 0 && sub != all_subresources) {
+                    const std::uint32_t orig_mips = p.binding.mip_levels + p.binding.mips_dropped;
+                    const std::uint32_t total = orig_mips * p.binding.array_layers;
+                    if (sub >= total) return ReplayResult::invalid_subresource;
+                    const std::uint32_t mip = sub % orig_mips;
+                    const std::uint32_t slice = sub / orig_mips;
+                    if (mip < p.binding.mips_dropped) {
+                        p.skip = true;
+                        return ReplayResult::success;
+                    }
+                    sub = slice * p.binding.mip_levels + (mip - p.binding.mips_dropped);
+                }
+                if (!image_range(p.binding, sub, p.range)) {
+                    return ReplayResult::invalid_subresource;
+                }
             }
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
@@ -2580,7 +2595,20 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
-            if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
+            BarrierSubresourceRange range = texture->range;
+            if (p.binding.mips_dropped > 0 && range.mip_count == 0 && range.index_or_first_mip != all_subresources) {
+                const std::uint32_t orig_mips = p.binding.mip_levels + p.binding.mips_dropped;
+                const std::uint32_t total = orig_mips * p.binding.array_layers;
+                if (range.index_or_first_mip >= total) return ReplayResult::invalid_subresource;
+                const std::uint32_t mip = range.index_or_first_mip % orig_mips;
+                const std::uint32_t slice = range.index_or_first_mip / orig_mips;
+                if (mip < p.binding.mips_dropped) {
+                    p.skip = true;
+                    return ReplayResult::success;
+                }
+                range.index_or_first_mip = slice * p.binding.mip_levels + (mip - p.binding.mips_dropped);
+            }
+            if (!p.binding.image || !barrier_range(p.binding, range, p.range))
                 return ReplayResult::invalid_subresource;
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (!bind(color_clear->target.resource)) return ReplayResult::unresolved_resource;
@@ -3347,6 +3375,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             command);
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
+            if (p.skip) continue;
             const VulkanAccess from = vulkan_access(transition->before, p.binding.presentable, predicates);
             const VulkanAccess to = vulkan_access(transition->after, p.binding.presentable, predicates);
             if (!p.binding.image) {
@@ -3400,6 +3429,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             dependency.pMemoryBarriers = &barrier;
             vk.pipeline_barrier2(command_buffer, &dependency);
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
+            if (p.skip) continue;
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const bool discard = (texture->flags & texture_barrier_discard) ||
                                  texture->layout_before == d3d12_layout::undefined;

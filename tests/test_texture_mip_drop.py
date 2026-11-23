@@ -21,11 +21,13 @@ class TextureCreateInfoModel:
     """Python reference model of TextureCreateInfo in runtime/shims/d3d12_vulkan_device.cpp."""
 
     def __init__(self, width: int, height: int, depth_or_array: int, mip_levels: int,
-                 flags: int = D3D12ResourceFlags.NONE, mip_drop_env: int = 0):
+                 flags: int = D3D12ResourceFlags.NONE, mip_drop_env: int = 0, is_volume: bool = False):
         self.original_width = width
         self.original_height = height
+        self.original_depth_or_array = depth_or_array
         self.original_mips = mip_levels
         self.flags = flags
+        self.is_volume = is_volume
 
         # Guards: Only pure sampled textures can drop mips
         is_render_target = bool(flags & D3D12ResourceFlags.ALLOW_RENDER_TARGET)
@@ -43,8 +45,9 @@ class TextureCreateInfoModel:
         # Output extent and mip levels
         self.width = max(1, width >> self.mips_dropped)
         self.height = max(1, height >> self.mips_dropped)
+        self.depth = max(1, depth_or_array >> self.mips_dropped) if is_volume else 1
         self.mip_levels = mip_levels - self.mips_dropped
-        self.array_layers = depth_or_array
+        self.array_layers = 1 if is_volume else depth_or_array
 
     def map_subresource(self, subresource_index: int) -> int | None:
         """Maps an incoming D3D12 subresource index to the shrunken Vulkan image subresource.
@@ -71,7 +74,28 @@ class TextureCreateInfoModel:
     def map_srv_view(self, most_detailed_mip: int, mip_count: int) -> tuple[int, int]:
         """Maps an incoming SRV view to the shrunken Vulkan image."""
         if self.mips_dropped == 0:
-            return most_detailed_mip, min(mip_count, self.mip_levels - most_detailed_mip)
+            avail = max(1, self.mip_levels - most_detailed_mip) if self.mip_levels > most_detailed_mip else 1
+            count = min(mip_count, avail) if mip_count != 0xFFFFFFFF else self.mip_levels
+            return most_detailed_mip, count
+
+        drop = self.mips_dropped
+        if most_detailed_mip >= drop:
+            first_mip = most_detailed_mip - drop
+            clamped_count = mip_count
+        else:
+            dropped_from_view = drop - most_detailed_mip
+            first_mip = 0
+            if mip_count != 0xFFFFFFFF:
+                clamped_count = (mip_count - dropped_from_view) if mip_count > dropped_from_view else 1
+            else:
+                clamped_count = 0xFFFFFFFF
+
+        avail = (self.mip_levels - first_mip) if self.mip_levels > first_mip else 1
+        if clamped_count != 0xFFFFFFFF and clamped_count > 0:
+            clamped_count = min(clamped_count, avail)
+        elif clamped_count == 0xFFFFFFFF:
+            clamped_count = avail
+        return first_mip, clamped_count
 
         if most_detailed_mip < self.mips_dropped:
             first_mip = 0
@@ -298,6 +322,84 @@ class TestTextureMipDrop(unittest.TestCase):
             t_dropped.mip_levels != t_native.mip_levels
         )
         self.assertTrue(mismatch_due_to_drop)
+
+    def test_3d_volume_texture_depth_shifted_by_mips_dropped(self):
+        """3D volume textures must right-shift extent depth by mips_dropped (#6043)."""
+        # 8x8x4 volume with 3 mips, drop 1 -> physical 4x4x2, 2 mips
+        vol = TextureCreateInfoModel(8, 8, 4, 3, flags=D3D12ResourceFlags.NONE, mip_drop_env=1, is_volume=True)
+        self.assertEqual(vol.width, 4)
+        self.assertEqual(vol.height, 4)
+        self.assertEqual(vol.depth, 2)
+        self.assertEqual(vol.mip_levels, 2)
+        self.assertEqual(vol.array_layers, 1)
+
+    def test_srv_view_first_mip_less_than_drop_no_bleed(self):
+        """SRV with first_mip < drop must reduce mip_count by (drop - first_mip) to prevent bleeding into lower mips."""
+        # 6 mips (0, 1, 2, 3, 4, 5), drop 2 -> physical 4 mips (0, 1, 2, 3 corresponding to original 2, 3, 4, 5)
+        t = TextureCreateInfoModel(64, 64, 1, 6, flags=D3D12ResourceFlags.NONE, mip_drop_env=2)
+        self.assertEqual(t.mip_levels, 4)
+        self.assertEqual(t.mips_dropped, 2)
+
+        # SRV requested original MostDetailedMip=0, MipLevels=3 (original mips 0, 1, 2)
+        # Original 0 and 1 were dropped; original 2 exists as physical mip 0.
+        # Exactly 1 requested mip was retained, so mip_count must clamp to 1 (not 3!).
+        first_mip, count = t.map_srv_view(most_detailed_mip=0, mip_count=3)
+        self.assertEqual(first_mip, 0)
+        self.assertEqual(count, 1)
+
+        # SRV requested original MostDetailedMip=1, MipLevels=4 (original mips 1, 2, 3, 4)
+        # Original 1 was dropped; original 2, 3, 4 exist as physical mips 0, 1, 2.
+        # Exactly 3 requested mips were retained, so count must clamp to 3.
+        first_mip, count = t.map_srv_view(most_detailed_mip=1, mip_count=4)
+        self.assertEqual(first_mip, 0)
+        self.assertEqual(count, 3)
+
+        # SRV requested full mip chain (MipLevels=UINT_MAX)
+        first_mip, count = t.map_srv_view(most_detailed_mip=0, mip_count=0xFFFFFFFF)
+        self.assertEqual(first_mip, 0)
+        self.assertEqual(count, 4)
+
+    def test_resource_barrier_transition_subresource_remapping_and_skip(self):
+        """ResourceBarrier transitions must skip dropped mips and remap retained mips."""
+        # 8x8 texture, 3 mips (0, 1, 2), drop=1 -> physical 4x4, 2 mips (0, 1)
+        t = TextureCreateInfoModel(8, 8, 1, 3, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+
+        def prepare_transition(subres: int) -> tuple[str, int | None]:
+            all_subresources = 0xFFFFFFFF
+            if subres == all_subresources:
+                return "all", None
+            total = t.original_mips * t.array_layers
+            if subres >= total:
+                return "error", None
+            mip = subres % t.original_mips
+            slice_idx = subres // t.original_mips
+            if mip < t.mips_dropped:
+                return "skip", None
+            phys_sub = slice_idx * t.mip_levels + (mip - t.mips_dropped)
+            return "remap", phys_sub
+
+        # Subresource 0 (mip 0, dropped) -> skipped gracefully
+        act0, sub0 = prepare_transition(0)
+        self.assertEqual(act0, "skip")
+        self.assertIsNone(sub0)
+
+        # Subresource 1 (mip 1, retained) -> remapped to physical 0
+        act1, sub1 = prepare_transition(1)
+        self.assertEqual(act1, "remap")
+        self.assertEqual(sub1, 0)
+
+        # Subresource 2 (mip 2, retained) -> remapped to physical 1
+        act2, sub2 = prepare_transition(2)
+        self.assertEqual(act2, "remap")
+        self.assertEqual(sub2, 1)
+
+        # Subresource 3 (out of bounds) -> error
+        act3, sub3 = prepare_transition(3)
+        self.assertEqual(act3, "error")
+
+        # Subresource ALL_SUBRESOURCES -> handled as whole-image transition
+        act_all, sub_all = prepare_transition(0xFFFFFFFF)
+        self.assertEqual(act_all, "all")
 
 
 if __name__ == "__main__":
