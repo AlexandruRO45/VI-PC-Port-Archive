@@ -60,6 +60,24 @@ const std::vector<std::uint8_t> dynamic = {
     0xf2, 0x81, 0x64, 0xff, 0xfb, 0x27, 0x60, 0xbf, 0xd1, 0x31, 0x02, 0xfe, 0x78, 0x7c, 0x3d, 0x44, 0x17, 0x72, 0x10,
     0xd3, 0xe8, 0xe7, 0x36, 0xe7, 0x77, 0x1f, 0x7a, 0xbd, 0xf9, 0x80};
 
+// Hand-built one-block dynamic-Huffman streams around the literal 'a' (or nothing) and the end of the block, each
+// with the verdict Python's zlib gives (zlib.decompressobj, the same as puff.c). They differ in one code set only.
+// RFC 1951 3.2.7 lets a literal/length or distance code be incomplete only as a single code of length 1; any other
+// incomplete set is "invalid distances set", "invalid literal/lengths set" or, for the code-length code, "invalid
+// code lengths set", whether or not the block uses the missing codes.
+const std::vector<std::uint8_t> huffman_zero_distances = {  // zlib: accepted, "a"; no distance code at all
+    0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0xad, 0xfe, 0x3f, 0x21, 0x02, 0x00, 0x62, 0x00, 0x62};
+const std::vector<std::uint8_t> huffman_one_distance = {  // zlib: accepted, "a"; one distance code of length 1
+    0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0xad, 0xfe, 0x3f, 0xa1, 0x02, 0x00, 0x62, 0x00, 0x62};
+const std::vector<std::uint8_t> huffman_only_end_of_block = {  // zlib: accepted, empty; one literal code of length 1
+    0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0xff, 0xaf, 0x05, 0x00, 0x00, 0x00, 0x01};
+const std::vector<std::uint8_t> huffman_incomplete_distance = {  // zlib: invalid distances set (one code of length 2)
+    0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0xad, 0xfe, 0x3f, 0x61, 0x02, 0x00, 0x62, 0x00, 0x62};
+const std::vector<std::uint8_t> huffman_incomplete_literal = {  // zlib: invalid literal/lengths set (lengths 1 and 2)
+    0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0xad, 0xfe, 0x3f, 0x11, 0x02, 0x00, 0x62, 0x00, 0x62};
+const std::vector<std::uint8_t> huffman_incomplete_code_lengths = {  // zlib: invalid code lengths set (1, 2 and 3 bits)
+    0x78, 0x01, 0x05, 0xc0, 0x81, 0x05, 0x00, 0x00, 0x00, 0x00, 0xa0, 0x59, 0xdb, 0x7f, 0x89, 0x08, 0x00, 0x62, 0x00, 0x62};
+
 void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
 }
@@ -292,6 +310,13 @@ int main() {
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
     CHECK(!zlib_inflate(bytes("not zlib"), out));
+    // The incomplete code sets zlib accepts are still accepted, and the others are refused as zlib refuses them.
+    CHECK(zlib_inflate(huffman_zero_distances, out) && out == bytes("a"));
+    CHECK(zlib_inflate(huffman_one_distance, out) && out == bytes("a"));
+    CHECK(zlib_inflate(huffman_only_end_of_block, out) && out.empty());
+    CHECK(!zlib_inflate(huffman_incomplete_distance, out));
+    CHECK(!zlib_inflate(huffman_incomplete_literal, out));
+    CHECK(!zlib_inflate(huffman_incomplete_code_lengths, out));
 
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.

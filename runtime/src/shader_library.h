@@ -79,22 +79,33 @@ struct Huffman {
     std::array<std::int16_t, 288> symbol{};
 };
 
-// Canonical Huffman table from code lengths. Returns false for an over-subscribed set.
-inline bool build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
+// Canonical Huffman table from code lengths (RFC 1951 3.2.2). Returns 0 for a complete set (or one with no codes at
+// all, valid only if never used), a negative number for an over-subscribed set, and a positive one for an incomplete
+// set: codes that no symbol owns. The table is built for an incomplete set too; whether that is acceptable is the
+// caller's to say (see `single_code_or_complete`).
+inline int build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
     h.count.fill(0);
     for (int i = 0; i < n; ++i) ++h.count[lengths[i]];
-    if (h.count[0] == n) return true;  // no codes: valid only if never used
+    if (h.count[0] == n) return 0;
     int left = 1;
     for (int len = 1; len < 16; ++len) {
         left <<= 1;
         left -= h.count[len];
-        if (left < 0) return false;
+        if (left < 0) return left;
     }
     std::array<std::int16_t, 16> offsets{};
     for (int len = 1; len < 15; ++len) offsets[len + 1] = std::int16_t(offsets[len] + h.count[len]);
     for (int i = 0; i < n; ++i)
         if (lengths[i]) h.symbol[offsets[lengths[i]]++] = std::int16_t(i);
-    return true;
+    return left;
+}
+
+// What zlib and puff accept of a literal/length or distance code: a complete set, or the one incomplete set RFC 1951
+// 3.2.7 allows, a single code of length 1 (a block with one distance code, or only the end-of-block code). Any other
+// incomplete set is a malformed stream, also when no symbol of the block happens to use the missing codes. `n` is the
+// number of lengths the set was built from.
+inline bool single_code_or_complete(const Huffman& h, int built, int n) {
+    return built == 0 || (built > 0 && n == h.count[0] + h.count[1]);
 }
 
 inline int decode(BitReader& in, const Huffman& h) {
@@ -193,7 +204,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
             std::int16_t lengths[320] = {};
             for (int i = 0; i < code_count; ++i) lengths[order[i]] = std::int16_t(reader.bits(3));
             detail::Huffman code_lengths;
-            if (!detail::build_huffman(code_lengths, lengths, 19)) return false;
+            if (detail::build_huffman(code_lengths, lengths, 19) != 0) return false;  // complete, as zlib requires
             for (int i = 0; i < literal_count + distance_count;) {
                 const int symbol = detail::decode(reader, code_lengths);
                 if (symbol < 0) return false;
@@ -217,8 +228,10 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
             }
             if (lengths[256] == 0) return false;  // no end-of-block code
             detail::Huffman literal, distance;
-            if (!detail::build_huffman(literal, lengths, literal_count) ||
-                !detail::build_huffman(distance, lengths + literal_count, distance_count))
+            const int literal_built = detail::build_huffman(literal, lengths, literal_count);
+            const int distance_built = detail::build_huffman(distance, lengths + literal_count, distance_count);
+            if (!detail::single_code_or_complete(literal, literal_built, literal_count) ||
+                !detail::single_code_or_complete(distance, distance_built, distance_count))
                 return false;
             if (!detail::inflate_codes(reader, out, literal, distance, limit)) return false;
         } else {
