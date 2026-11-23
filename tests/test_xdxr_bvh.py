@@ -430,6 +430,32 @@ class CheckBuild(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(X.check_build(d), [f"no cases in {d}"])
 
+    def test_tlas_near_origin_hit_allows_float32_inverse_rounding(self):
+        # A ray originating ~5e-5 units from an instanced triangle (as seen on tlas_refit ray 21 under
+        # check-build --rays 200) shifts t by ~1.85e-8 due to the stored float32 world-to-object inverse
+        # matrix, which is below float32 translation ULP error but exceeds rel_tol=1e-4 * t when abs_tol=0.
+        import json
+        tri = [[11.3948653, 9.4292154, 2.9817256],
+               [11.0715757, 9.4292154, 3.9280257],
+               [11.2332205, 10.4292154, 3.4548757]]
+        blas, info = X.build_blas([tri])
+        m = [[-0.323289543, 0.0, 0.946300089, 4.0],
+             [0.0, 1.0, 0.0, -3.0],
+             [-0.946300089, 0.0, -0.323289543, 2.0]]
+        tlas, _ = X.build_tlas([X.Instance(m, 0x10000, info["root"], info["bounds"])])
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "blas_near.bin"), "wb") as f:
+                f.write(blas)
+            with open(os.path.join(d, "blas_near.json"), "w") as f:
+                json.dump({"kind": "blas", "address": 0x10000, "rays": 1, "triangles": [tri + [0, 0]]}, f)
+            with open(os.path.join(d, "tlas.bin"), "wb") as f:
+                f.write(tlas)
+            with open(os.path.join(d, "tlas.json"), "w") as f:
+                json.dump({"kind": "tlas", "address": 0x20000, "blas": ["blas_near"],
+                           "instances": [{"transform": sum(m, []), "mask": 255, "blas": 0}]}, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(X.check_build(d, rays=1, seed=1), [])
+
 
 class Cli(unittest.TestCase):
     def test_validate_file(self):

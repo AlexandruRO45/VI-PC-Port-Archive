@@ -801,7 +801,7 @@ def check_build(directory, rays=300, seed=1):
                 # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
                 want_id = inst_ids[want["instance"]][want["primitive"]]
                 same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
-                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
+                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4, abs_tol=1e-6)
             bad += not same
         print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
         if bad:
