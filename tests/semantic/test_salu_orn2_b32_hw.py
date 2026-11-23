@@ -165,5 +165,50 @@ class TestSOrn2B32AST(unittest.TestCase):
             inst.dst = Operand(RegType.SGPR, 5)  # type: ignore
 
 
+class ScalarMachine:
+    def __init__(self):
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+        self.scc: int = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs.get(op.index, 0)
+        return op.val & MASK32
+
+    def write_sgpr(self, op: Operand, val: int):
+        if op.reg_type == RegType.SGPR:
+            self.sgprs[op.index] = val & MASK32
+
+    def step(self, inst: SOrn2B32Inst):
+        s0 = self.read_operand(inst.src0)
+        s1 = self.read_operand(inst.src1)
+        d, scc = ref_orn2_b32(s0, s1)
+        self.write_sgpr(inst.dst, d)
+        self.scc = scc
+
+
+class TestSOrn2B32ScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter."""
+
+    def test_scalar_execution_and_scc_tracking(self):
+        mach = ScalarMachine()
+        mach.sgprs[2] = 0x10101010
+        mach.sgprs[3] = 0x01010101
+        inst = SOrn2B32Inst(Operand(RegType.SGPR, 4), Operand(RegType.SGPR, 2), Operand(RegType.SGPR, 3))
+        mach.step(inst)
+        exp_d, exp_scc = ref_orn2_b32(0x10101010, 0x01010101)
+        self.assertEqual(mach.sgprs[4], exp_d)
+        self.assertEqual(mach.scc, exp_scc)
+
+    def test_scalar_pipeline_zero_clear(self):
+        mach = ScalarMachine()
+        mach.sgprs[1] = 0
+        mach.sgprs[2] = MASK32
+        # s_orn2_b32 s0, s1, s2 -> s0 = 0 | ~0xFFFFFFFF = 0, SCC = 0
+        mach.step(SOrn2B32Inst(Operand(RegType.SGPR, 0), Operand(RegType.SGPR, 1), Operand(RegType.SGPR, 2)))
+        self.assertEqual(mach.sgprs[0], 0)
+        self.assertEqual(mach.scc, 0)
+
+
 if __name__ == '__main__':
     unittest.main()
