@@ -87,6 +87,8 @@ struct HapticApi {
 // Where the haptics come from (tests). nullptr restores SDL. Applies to pads opened after the call: a pad keeps the
 // haptic device it was opened with.
 void set_haptic_source(const HapticApi* api);
+// How often the poll thread re-runs an effect with no duration of its own, in microseconds (tests). 0 restores 20 s.
+void set_effect_refresh_us(uint64_t us);
 
 // What the shim last sent to SDL for the device that is index `i` in connection order. Test seam.
 struct OutputState {

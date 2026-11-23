@@ -1524,6 +1524,13 @@ void test_force_feedback(IGameInput* input) {
         Sleep(80);
         rt::gameinput::poll();
         check(held->GetState() == GameInputFeedbackRunning, "force feedback: and it is still running once the attack is over");
+        const int runs = g_fake.runs;
+        const Sint16 level = g_fake.last.constant.level;
+        rt::gameinput::set_effect_refresh_us(1);
+        rt::gameinput::poll();
+        rt::gameinput::set_effect_refresh_us(0);
+        check(g_fake.runs == runs + 1 && g_fake.last.constant.attack_length == 0 && g_fake.last.constant.level == level,
+              "force feedback: the refresh that keeps it going re-runs it at its level, without its attack");
         held->Release();
         rt::gameinput::poll();
     }

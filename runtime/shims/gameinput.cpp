@@ -126,6 +126,7 @@ const rt::gameinput::HapticApi kSdlHaptic{sdl_open_haptic,     sdl_close_haptic,
                                           sdl_haptic_run,      sdl_haptic_stop,  sdl_haptic_destroy,
                                           sdl_haptic_gain};
 std::atomic<const rt::gameinput::HapticApi*> g_haptic_api{&kSdlHaptic};
+std::atomic<uint64_t> g_effect_refresh_us{kRumbleRefreshUs};
 const rt::gameinput::HapticApi& haptics() { return *g_haptic_api.load(); }
 
 // ---- configuration ----------------------------------------------------------------------------------------------
@@ -341,7 +342,7 @@ uint32_t play_count(const GameInputForceFeedbackParams& p) {
 // false for a kind the shim does not map. `endless` says the effect has no duration of its own (GameInput left the
 // envelope empty, or gave UINT64_MAX, its "run forever", as sustainDuration), which is what the poll thread re-runs
 // before the SDL length runs out.
-bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endless, uint32_t* length_ms,
+bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool attack, bool* endless, uint32_t* length_ms,
                   SDL_HapticEffect* out) {
     std::memset(out, 0, sizeof *out);
     if (!valid_kind(p.kind)) return false;
@@ -350,6 +351,7 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
     const bool used = envelope_kind && envelope_used(env);
     const float level = gain * (used ? env.sustainGain : 1.0f);  // GameInput's sustainGain is the effect's level
     const bool forever = used && env.sustainDuration == UINT64_MAX;
+    const uint64_t attack_us = attack ? env.attackDuration : 0;
     const uint64_t total_us = used && !forever ? env.attackDuration + env.sustainDuration + env.releaseDuration : 0;
     *endless = total_us == 0;
     *length_ms = total_us == 0 ? kHapticHoldMs
@@ -358,7 +360,7 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
     // fade_level is set, so a zero-gain envelope is left alone rather than muting the effect.
     auto envelope = [&](SDL_HapticConstant& e) {
         if (!used || (!env.attackDuration && !env.releaseDuration)) return;
-        e.attack_length = ms_from_us(env.attackDuration);
+        e.attack_length = ms_from_us(attack_us);
         e.attack_level = hsat(env.attackGain);
         e.fade_length = ms_from_us(env.releaseDuration);
         e.fade_level = hsat(env.releaseGain);
@@ -386,7 +388,7 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
             e.start = hlevel(p.data.ramp.startMagnitude.linearX * level);
             e.end = hlevel(p.data.ramp.endMagnitude.linearX * level);
             if (used) {
-                e.attack_length = ms_from_us(env.attackDuration);
+                e.attack_length = ms_from_us(attack_us);
                 e.attack_level = hsat(env.attackGain);
                 e.fade_length = ms_from_us(env.releaseDuration);
                 e.fade_level = hsat(env.releaseGain);
@@ -414,7 +416,7 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
             e.offset = hlevel(pp.bias * level);
             e.phase = static_cast<Uint16>(std::clamp(std::lround(pp.phase * 100.0f), 0L, 35999L));
             if (used) {
-                e.attack_length = ms_from_us(env.attackDuration);
+                e.attack_length = ms_from_us(attack_us);
                 e.attack_level = hsat(env.attackGain);
                 e.fade_length = ms_from_us(env.releaseDuration);
                 e.fade_level = hsat(env.releaseGain);
@@ -2173,13 +2175,15 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
         state_ = GameInputFeedbackStopped;
         return;
     }
-    const bool stale = sdl_running_ && endless_ && now - run_at_ > kRumbleRefreshUs;
+    const bool stale = sdl_running_ && endless_ && now - run_at_ > g_effect_refresh_us;
     if (sdl_running_ && version == applied_ && !stale) return;
+    // A refresh re-runs an effect that is past its attack, and SDL_RunHapticEffect would play the attack again.
+    const bool refresh = stale && version == applied_;
 
     SDL_HapticEffect fx;
     bool endless = true;
     uint32_t length_ms = kHapticHoldMs;
-    if (!build_effect(params, gain, &endless, &length_ms, &fx)) {
+    if (!build_effect(params, gain, !refresh, &endless, &length_ms, &fx)) {
         if (sdl_running_) haptics().stop_effect(d->haptic, sdl_effect_);
         sdl_running_ = false;
         return;
@@ -2595,6 +2599,8 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
 void set_cursor_source(CursorPosFn cursor_pos) { g_cursor_pos = cursor_pos ? cursor_pos : system_cursor_pos; }
 
 void set_haptic_source(const HapticApi* api) { g_haptic_api = api ? api : &kSdlHaptic; }
+
+void set_effect_refresh_us(uint64_t us) { g_effect_refresh_us = us ? us : kRumbleRefreshUs; }
 
 const KeyBinding* keyboard_bindings(int* count) {
     if (count) *count = static_cast<int>(std::size(kKeyBindings));
