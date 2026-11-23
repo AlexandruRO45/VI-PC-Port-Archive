@@ -25,6 +25,8 @@ except ImportError:  # pragma: no cover - direct script execution
     import navmesh_decode as nd
     from report_paths import same_report_path
 
+from report_paths import same_report_path  # noqa: E402
+
 
 CHECK_NAMES = (
     "edges_valid",
