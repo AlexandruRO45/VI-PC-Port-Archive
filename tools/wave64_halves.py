@@ -115,7 +115,7 @@ def partial_write(ins, op):
     results" and "16-bit SDWA result"): SDWA with a byte or word dst_sel and UNUSED_PRESERVE; otherwise a 16-bit
     result, the first type in the name (v_add_f16, v_cvt_f16_f32, v_mad_u16, v_add_u16_e64), except the VOP2 16-bit
     integer ops in _e32 form, which define the whole register. Packed and 32-bit results are whole: v_pk_*,
-    v_cvt_pk*, v_sad_*, v_cvt_f32_f16, v_mad_u32_u16. When unsure it says partial, which only costs tier A."""
+    v_cvt_pk*, v_sad_*, v_cvt_f32_f16, v_mad_u32_u16. The analysis is conservative about preserved bits."""
     mods = ins.get("mods") or []
     op = ins.get("op", op)   # the printed name: base_op drops _e32/_e64/_sdwa, which decide it here
     if "_sdwa" in op or any(m.startswith("dst_sel:") for m in mods):
@@ -1023,6 +1023,7 @@ class Analysis:
 
         if op in ("v_cndmask_b32", "v_cndmask_b16") or op.startswith("v_"):
             tj = t_src
+            preserve = partial_write(ins, op)
             uniform = False
             uniform_active = False
             if op.startswith("v_") and not op.startswith(("v_interp", "v_mbcnt", "v_readlane", "v_writelane", "v_permlane",
@@ -1035,7 +1036,7 @@ class Analysis:
                     (x.get("k") == "vgpr" and all(r[1] in st["ua"] for r in _regs(x))) for x in srcs) and not uses
                 # a write of part of the VGPR (SDWA byte/word with UNUSED_PRESERVE, a 16-bit result) keeps the rest
                 # of it: uniform only if the whole register already was
-                if partial_write(ins, op):
+                if preserve:
                     if uniform:
                         uniform = all(r[1] in st["u"] for d in dests for r in _regs(d) if isinstance(r, tuple))
                     if uniform_active:
@@ -1059,18 +1060,24 @@ class Analysis:
                         if T.get(r, 0) & ACT_RFL and not (g and g[0] == "act_rfl" and self.ancestor(g[1], st["x"])):
                             good = False
                 tj = tj & ~ACT_RFL if good else tj | X
+            if preserve:
+                # The unwritten bits still carry the destination's old dependency.
+                for d in dests:
+                    tj |= self.rd(st, ins, d)
+                    if self.is_mask(ins, d):
+                        tj |= MASKD | X
             if tj & X:
                 uniform = False
                 uniform_active = False
             tag = None
             ctok = None
-            if op in ("v_mov_b32", "v_mov_b32_e32") and len(srcs) == 1 and tj & CNT and _regs(srcs[0]):
+            if not preserve and op in ("v_mov_b32", "v_mov_b32_e32") and len(srcs) == 1 and tj & CNT and _regs(srcs[0]):
                 ctok = self.cnt_token(st, _regs(srcs[0])[0])
                 tag = ("cnt", ctok) if ctok is not None else None
-            elif tj & CNT:
+            elif not preserve and tj & CNT:
                 ctok = scaled_cnt_token()
                 tag = ("cnt", ctok) if ctok is not None else None
-            if tag is None and tj == LANE and len(dests) == 1:
+            if not preserve and tag is None and tj == LANE and len(dests) == 1:
                 k = self.lmod_result(st, ins, op, a)
                 if k is not None:
                     tag = ("lmod", k)
