@@ -41,14 +41,27 @@ def run_module(directory, module, verbose):
     return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
 
 
+def jobs_value(text):
+    """-j/--jobs: at least 1. Zero and negative values used to fall into the sequential discover path, so a run that
+    asked for no workers looked like the suite had passed."""
+    try:
+        value = int(text, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("directory", help="the suite's folder, tests/semantic")
-    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="files at a time (default: cores)")
+    ap.add_argument("-j", "--jobs", type=jobs_value, default=os.cpu_count() or 1,
+                    help="files at a time (default: cores)")
     ap.add_argument("-v", "--verbose", action="store_true", help="unittest -v, and print passing files' output")
     a = ap.parse_args(argv)
     directory = os.path.abspath(a.directory)
-    if a.jobs <= 1:
+    if a.jobs == 1:
         return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
                                 *(["-v"] if a.verbose else [])])
     modules = test_modules(directory)
