@@ -220,7 +220,7 @@ def operands(ins):
             defs.append("vcc")
         else:
             dests, srcs = [a[0]], list(a[1:])
-    elif op.startswith("buffer_atomic") or op.startswith(("global_atomic", "flat_atomic")):
+    elif op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic")):
         dests = [a[0]] if "glc" in mods and a else []
         srcs = list(a)
     elif op.startswith("ds_"):
@@ -649,7 +649,7 @@ class Analysis:
             if op == "exp" and a and a[0].get("t", "").startswith(("pos", "param", "mrt", "z", "null")):
                 pass
             return
-        if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "ds_add", "ds_sub", "ds_inc", "ds_dec",
+        if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic", "ds_add", "ds_sub", "ds_inc", "ds_dec",
                           "ds_min", "ds_max", "ds_and", "ds_or", "ds_xor", "ds_cmpst", "ds_wrxchg", "ds_mskor")):
             if op.startswith(("global_atomic", "flat_atomic")):
                 if "glc" in mods:
@@ -1653,7 +1653,7 @@ class Analysis:
             for i, ins in enumerate(self.blocks[b]):
                 dests, srcs, d2, uses = operands(ins)
                 read = {r for x in srcs for r in sregs(x)} | {r for r in uses if r != "exec"}
-                if base_op(ins["op"]).startswith(("buffer_atomic", "global_atomic")) or dests and False:
+                if base_op(ins["op"]).startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic")) or dests and False:
                     read |= {r for x in ins["args"] for r in sregs(x)}
                 if base_op(ins["op"]) == "v_readlane_b32" and len(ins["args"]) == 3 \
                         and ins["args"][1].get("k") == "vgpr" and ins["args"][1]["r"] in self.pure_spill_vgprs \

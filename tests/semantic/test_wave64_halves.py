@@ -279,6 +279,49 @@ class Classification(unittest.TestCase):
             "global_store_dword v13, v0, s[4:5]", "s_mov_b64 exec, s[10:11]"]), "B", [],
             ["aggregated-atomic", "elected-lane"])
 
+    def test_image_atomic_classification(self):
+        # Clean image_atomic_add with untainted data and coords stays Tier A.
+        self.tier("ps_a_image_atomic", ps([
+            "v_mov_b32_e32 v11, 1", "v_mov_b32_e32 v12, 0", "v_mov_b32_e32 v13, 0",
+            "image_atomic_add v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]), "A", [], [])
+        # Tainted data (lane-id in a[0]) is a Tier C violation, not ignored or clobbered.
+        self.tier("ps_c_image_atomic_data", ps([
+            *LANE_ID, "v_mov_b32_e32 v12, 0", "v_mov_b32_e32 v13, 0",
+            "image_atomic_add v10, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]), "C", ["lane-id"])
+        # Tainted image coordinates (lane-id in a[1]) is a Tier C violation.
+        self.tier("ps_c_image_atomic_coord", ps([
+            *LANE_ID, "v_mov_b32_e32 v11, 0", "v_mov_b32_e32 v12, 1",
+            "image_atomic_add v12, v[10:11], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"]), "C", ["lane-id"])
+        # Non-aggregated image atomic under an elected lane is elected-side-effect.
+        self.tier("ps_c_image_atomic_elected", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc",
+            "v_mov_b32_e32 v11, 1", "v_mov_b32_e32 v12, 0", "v_mov_b32_e32 v13, 0",
+            "image_atomic_or v11, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+            "s_or_b64 exec, exec, s[14:15]", "s_mov_b64 exec, s[10:11]"]), "C", ["elected-side-effect"])
+        # Elected aggregated image_atomic_add with glc follows the same Tier B idiom as buffer_atomic_add.
+        self.tier("ps_b_image_atomic_agg", ps([
+            "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_bcnt1_i32_b64 s6, exec", "v_mbcnt_lo_u32_b32 v10, exec_lo, 0", "v_mbcnt_hi_u32_b32 v10, exec_hi, v10",
+            "v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc", "v_mov_b32_e32 v11, s6",
+            "v_mov_b32_e32 v12, 0", "v_mov_b32_e32 v13, 0",
+            "image_atomic_add v11, v[12:13], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc",
+            "s_or_b64 exec, exec, s[14:15]", "v_readfirstlane_b32 s7, v11", "v_add_nc_u32_e32 v14, s7, v10",
+            "v_lshlrev_b32_e32 v14, 2, v14", "buffer_store_dword v0, v14, s[0:3], 0 offen offset:256",
+            "s_mov_b64 exec, s[10:11]"]), "B", [], ["aggregated-atomic", "elected-lane"])
+        # operands(): a[0] is always read, and only written when glc is set.
+        import shader_ir
+        import wave64_halves
+        no_glc = shader_ir.parse_line("\timage_atomic_add v10, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm")
+        dests, srcs, _, _ = wave64_halves.operands(no_glc)
+        self.assertEqual(dests, [])
+        self.assertEqual([wave64_halves._regs(s) for s in srcs[:2]], [[("v", 10)], [("v", 12), ("v", 13)]])
+        with_glc = shader_ir.parse_line("\timage_atomic_add v10, v[12:13], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc")
+        dests, srcs, _, _ = wave64_halves.operands(with_glc)
+        self.assertEqual([wave64_halves._regs(d) for d in dests], [[("v", 10)]])
+        self.assertEqual([wave64_halves._regs(s) for s in srcs[:2]], [[("v", 10)], [("v", 12), ("v", 13)]])
+
     # -- tier C: each near miss of the idioms above
     def test_c_lane_count_exported(self):
         self.tier("ps_c_cnt", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "v_mov_b32_e32 v6, s6"]),
