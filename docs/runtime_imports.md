@@ -301,6 +301,14 @@ The executable's first boot confirms them, or names the slots that differ.
 
 `xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 
+`XPackageImpl`'s identity slots (`runtime/shims/xgameruntime.cpp`) are set by two variables, so a boot can be
+told what a retail package would report without a rebuild:
+- **`LEONIDA_PACKAGE_ID`** is the string `XPackageGetCurrentProcessPackageIdentifier` answers (32 characters at
+  most, `LeonidaPackageIdentifier00000000` otherwise) and the id `XPackageMount` refuses as the running game
+  (`E_ACCESSDENIED`).
+- **`LEONIDA_CONTENT_PACKAGES`** (`id1=path1;id2=path2`) maps other installed package ids to their folders, which
+  is what `XPackageMount` resolves; an id in neither is `ERROR_NOT_FOUND`.
+
 `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl`
 (`runtime/shims/xgameruntime_offline.cpp`), from the same layout, also **not measured**:
 - **`XGameEventWrite`** succeeds; the events are dropped. The first one's name is logged, and
