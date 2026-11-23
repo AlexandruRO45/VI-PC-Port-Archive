@@ -498,5 +498,21 @@ class VPackB32F16ScalarInterpreterTests(unittest.TestCase):
         res = interpret_pack_b32_f16(0xAAAA3C00, 0xBBBB4000)
         self.assertEqual(res, 0x40003C00)
 
+class VPackB32F16SimdDivergenceTests(unittest.TestCase):
+    def test_exec_masking(self):
+        wave = WavefrontSimdState(32)
+        wave.exec_mask = 0xAAAAAAAA
+        for lane in range(32):
+            wave.set_vgpr(lane, 0, 0x0)
+            if (wave.exec_mask >> lane) & 1:
+                val = interpret_pack_b32_f16(lane, lane << 8)
+                wave.set_vgpr(lane, 0, val)
+        for lane in range(32):
+            if (wave.exec_mask >> lane) & 1:
+                exp = ((lane << 8) << 16) | lane
+                self.assertEqual(wave.get_vgpr(lane, 0), exp)
+            else:
+                self.assertEqual(wave.get_vgpr(lane, 0), 0x0)
+
 if __name__ == '__main__':
     unittest.main()
