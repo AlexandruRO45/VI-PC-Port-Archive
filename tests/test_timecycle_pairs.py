@@ -122,6 +122,29 @@ class TimecyclePairsTests(unittest.TestCase):
             docs = tp.load_documents([tmp])
             self.assertEqual([r for r, _ in docs], ["timecycle_modifier_data"])
 
+    def test_carve_and_file_agree_on_a_document_with_content_after_the_root(self):
+        # A document is complete once its root is closed, whatever trails it: a trailing
+        # comment or 600 newlines put the closing tag outside gi.standalone_xml()'s 512-byte
+        # tail window, so the carve path dropped a document the .xml file path reads.
+        body = SYNTH_MOD.split(b"\n", 1)[1]
+        for suffix in (b"", b"<!-- end -->", b"\n" * 600):
+            with self.subTest(trailing=suffix[:12]):
+                data = body + b"\n" + suffix
+                with tempfile.TemporaryDirectory() as tmp:
+                    file_path = os.path.join(tmp, "doc.xml")
+                    with open(file_path, "wb") as f:
+                        f.write(data)
+                    as_file = tp.load_documents([file_path])
+                    carve = os.path.join(tmp, "carve")
+                    os.makedirs(carve)
+                    self.write_carve(carve, [("000000001000.bin", data)])
+                    as_carve = tp.load_documents([carve])
+                    self.assertEqual([r for r, _ in as_file], ["timecycle_modifier_data"])
+                    self.assertEqual([r for r, _ in as_carve], [r for r, _ in as_file])
+                    self.assertEqual(tp.summarize_documents(as_carve),
+                                     tp.summarize_documents(as_file))
+                    self.assertEqual(tp.summarize_documents(as_file)["modifier_docs"], 1)
+
     def test_cli_validation_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
             in_xml = os.path.join(tmp, "mod.xml")
