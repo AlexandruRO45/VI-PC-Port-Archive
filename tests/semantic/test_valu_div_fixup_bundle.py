@@ -519,5 +519,25 @@ class TestVDivFixupF16SIMD(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0)
 
 
+def run_hw_div_fixup_f16(s0: int, s1: int, s2: int) -> int:
+    lines = [
+        f"v_mov_b32 v0, {s0 & MASK16:#x}",
+        f"v_mov_b32 v1, {s1 & MASK16:#x}",
+        f"v_mov_b32 v2, {s2 & MASK16:#x}",
+        "v_div_fixup_f16 v0, v0, v1, v2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_div_fixup_f16_hw", lines)
+    return support.mrt0_words(spv)[0] & MASK16
+
+
+class TestVDivFixupF16HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for v_div_fixup_f16."""
+
+    def test_translator_hardware_cases(self):
+        self.assertEqual(run_hw_div_fixup_f16(0x4000, 0x3C00, 0x4000), 0x4000)
+
+
 if __name__ == "__main__":
     unittest.main()
