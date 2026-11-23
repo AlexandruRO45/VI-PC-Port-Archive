@@ -33,11 +33,15 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - name: Install SPIRV-Tools
+          cache: "pip"
+          cache-dependency-path: tests/requirements.txt
+      # The same packages as ci.yml's semantic-tests and stdlib-tests-linux jobs.
+      - name: Install SPIRV-Tools and the test requirements
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends spirv-tools
+          pip install -r tests/requirements.txt
       - name: Run the CPU suites
         shell: bash
         env:
@@ -52,7 +56,10 @@ jobs:
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
             fi
-            python -I "$t" > /dev/null 2>&1 || echo "$t" >> failed.txt
+            if ! python -I "$t" > out.log 2>&1; then
+              echo "$t" >> failed.txt
+              echo "::group::$t"; tail -n 40 out.log; echo "::endgroup::"
+            fi
           done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
           cat failed.txt
       - name: Open, update or close the issue
