@@ -149,6 +149,43 @@ class CarveAllGamePathTest(unittest.TestCase):
             self.assertNotIn("second.rpf", result.stdout + result.stderr)
             self.assertEqual(coverage.read_bytes(), b"[]\n")
 
+    def run_with_old_python(self, launcher_version):
+        """carve_all with a `python` that reports 2.7 first on PATH and a fake py launcher that reports
+        launcher_version for `py -3` (None: no launcher) and exits 9 when it would carve."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        game, out, tools = root / "game", root / "out", root / "tools"
+        for folder in (game, out, tools):
+            folder.mkdir()
+        (game / "first.rpf").write_bytes(b"x")
+        # Like Python 2.7: answers the version probe, and would stop at -I with exit 2.
+        (tools / "python.cmd").write_bytes(b'@if "%1"=="-c" (echo 207& exit /b 0)\r\n@exit /b 2\r\n')
+        if launcher_version is not None:
+            (tools / "py.cmd").write_bytes(
+                b'@if "%2"=="-c" (echo ' + str(launcher_version).encode() + b'& exit /b 0)\r\n@exit /b 9\r\n')
+        path = [str(tools)] + [p for p in os.environ["PATH"].split(os.pathsep)
+                               if p and not Path(p, "py.exe").is_file()]
+        return subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+             "-Game", str(game), "-Out", str(out)],
+            env={**os.environ, "PATH": os.pathsep.join(path)},
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def test_an_older_python_on_path_hands_the_carve_to_the_py_launcher(self):
+        result = self.run_with_old_python(312)
+        # exit 9 is the fake launcher's: the carve went to `py -3`, not to the 2.7 `python` (exit 2).
+        self.assertIn("Carving first.rpf failed (exit 9)", result.stderr, result.stdout + result.stderr)
+
+    def test_an_older_python_without_a_python_3_12_launcher_says_what_is_missing(self):
+        for launcher in (311, None):
+            with self.subTest(launcher=launcher):
+                result = self.run_with_old_python(launcher)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Python 3.12 or newer is needed, but python on PATH is 2.7", result.stderr)
+                self.assertNotIn("carving", result.stdout)
+
     def test_relative_and_trailing_separator_game_paths_find_existing_carves(self):
         with tempfile.TemporaryDirectory() as tmp:
             game, out = Path(tmp, "game"), Path(tmp, "out")

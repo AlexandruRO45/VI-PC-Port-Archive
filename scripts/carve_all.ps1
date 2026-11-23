@@ -3,6 +3,31 @@
 param([Parameter(Mandatory)][string]$Game, [Parameter(Mandatory)][string]$Out)
 $root = Split-Path $PSScriptRoot -Parent
 $tool = Join-Path $root "tools\rpf9_carve.py"
+
+# The carver needs Python 3.12+, but `python` can be an older install first on PATH (Python 2.7 puts C:\Python27
+# there), which stops at `-I` with "Unknown option". Keep `python` unless it reports an older version; then take the
+# py launcher's newest Python 3, as Build.bat does.
+function Get-PythonVersion([string]$Exe, [string[]]$Prefix) {
+    try {
+        $v = & $Exe @Prefix -c "import sys; print(sys.version_info[0] * 100 + sys.version_info[1])" 2>$null |
+            Select-Object -Last 1
+    } catch {
+        return $null
+    }
+    if ($LASTEXITCODE -eq 0 -and "$v" -match '^\d+$') { return [int]"$v" }
+    return $null
+}
+$pythonExe, $pythonPrefix = "python", @()
+$found = Get-PythonVersion $pythonExe $pythonPrefix
+if ($null -ne $found -and $found -lt 312) {
+    $launcher = $null
+    if (Get-Command py -CommandType Application -ErrorAction SilentlyContinue) { $launcher = Get-PythonVersion "py" @("-3") }
+    if ($null -eq $launcher -or $launcher -lt 312) {
+        throw ("Python 3.12 or newer is needed, but python on PATH is {0}.{1} and the py launcher has no Python 3.12+. " +
+               "Install it from https://www.python.org/downloads/ and run this again.") -f [math]::Floor($found / 100), ($found % 100)
+    }
+    $pythonExe, $pythonPrefix = "py", @("-3")
+}
 # -Game may be relative or end in a separator; archive names are cut from a separator-ended prefix.
 $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 # Resolve-Path preserves 8.3 short components (e.g. RUNNER~1), while Get-ChildItem emits canonical
@@ -29,7 +54,7 @@ foreach ($archive in $archives) {
     $index = Join-Path $dest "index.json"
     if (-not (Test-Path -LiteralPath $index)) {
         Write-Host ("{0:HH:mm:ss} carving {1} ({2:N1} GiB)" -f (Get-Date), $rel, ($f.Length / 1GB))
-        python -I $tool $f.FullName $dest | Select-Object -Last 1
+        & $pythonExe @pythonPrefix -I $tool $f.FullName $dest | Select-Object -Last 1
         if ($LASTEXITCODE -ne 0) { throw "Carving $rel failed (exit $LASTEXITCODE)" }
     }
     try {
