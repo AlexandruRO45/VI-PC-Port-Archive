@@ -52,6 +52,12 @@ argument is null (explicit unload). A map-only load receives no detach notificat
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
 print the usage and exit 2 before anything is mapped.
 
+Use `--affinity MASK|physical` before the `--` separator to set the runtime's CPU affinity.
+`MASK` is a nonzero hexadecimal bitmask, with or without a `0x` prefix. `physical` selects
+one eligible logical processor per physical core on systems with one Windows processor group.
+`LEONIDA_CPU_AFFINITY` supplies the same option when it is absent from the command line. The
+runtime keeps its current affinity if the option is unset or the requested mask cannot be applied.
+
 The report line is:
 
 ```

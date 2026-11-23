@@ -66,7 +66,8 @@ int wmain(int argc, wchar_t** argv) {
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
-    std::wstring trace_file, affinity_arg;
+    std::wstring trace_file;
+    const wchar_t* affinity_arg = nullptr;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
