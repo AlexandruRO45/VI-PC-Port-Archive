@@ -318,5 +318,33 @@ class TestVFmamkF16Oracle(unittest.TestCase):
         self.assertEqual(res & 0xFFFF, 0x3C00)
         self.assertEqual(res >> 16, 0x4321)
 
+class TestVFmamkF16ASTAndInterpreter(unittest.TestCase):
+    def test_ast_disassembly(self) -> None:
+        inst = ASTInstruction(
+            Opcode.V_FMAMK_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.imm(0x4000),
+            ASTOperand.vgpr(1),
+        )
+        self.assertEqual(inst.disasm(), "v_fmamk_f16 v2, v0, 0x4000, v1")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x3C00)
+        state.write_vgpr(1, 0x3800)
+        state.write_vgpr(2, 0xFEED0000)
+        inst = ASTInstruction(
+            Opcode.V_FMAMK_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.imm(0x4000),
+            ASTOperand.vgpr(1),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res & 0xFFFF, 0x4100)
+        self.assertEqual(res >> 16, 0xFEED)
+        self.assertEqual(state.vgprs[2], res)
+
 if __name__ == "__main__":
     unittest.main()
