@@ -77,6 +77,9 @@ instruction family per file; the list below describes some of them, not every fi
   the `wave64_graphics_why` lines (where each reason comes from, instruction families only) with the lines derived
   by hand; it also checks that the second analysis run behind them finds the same tier and reasons, that the
   index is unchanged without the option, and that `wave64_halves.py --census --why` prints counts and no name.
+- `test_wave64_halves_vote_why.py` does the same for `wave64_graphics_vote_why`: 9 hand-written listings with a
+  vote that the tier analysis refuses, and the line that says which condition failed (no narrowing on the run
+  side, an if/else, an early exit) with the instruction family at the start of each side.
 - `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
   evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
   accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.

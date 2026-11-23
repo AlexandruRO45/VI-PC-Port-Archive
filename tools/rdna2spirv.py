@@ -16842,6 +16842,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["wave64_graphics_reasons"] = g.w64g["reasons"]
         if g.w64g.get("why"):            # instruction families only: wave64_halves.py --census --why counts them
             m["wave64_graphics_why"] = g.w64g["why"]
+        if g.w64g.get("vote_why"):       # the refused votes: which condition of wave64_halves.vote() failed
+            m["wave64_graphics_vote_why"] = g.w64g["vote_why"]
         if g.w64g["idioms"]:
             m["wave64_graphics_idioms"] = g.w64g["idioms"]
     if g.emulate:

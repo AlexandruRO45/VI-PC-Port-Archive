@@ -29,8 +29,9 @@ runs when a wave-wide vote says some lane is on (an s_cbranch_vccz, execz, ...) 
 one half votes yes and the other no, so a read that may see that def or another one is tainted (CTRL).
 
 `analyse(..., why=True)` also gives, for a tier C program, where each reason comes from (WhyAnalysis, the key
-`why`); with --wave64-why the translator writes it to the index as `wave64_graphics_why`, and
-`--census <index> --why` counts it.
+`why`) and, for each vote it refuses, which condition of vote() failed (the key `vote_why`); with --wave64-why
+the translator writes them to the index as `wave64_graphics_why` and `wave64_graphics_vote_why`, and
+`--census <index> --why` counts them.
 
 The pre-translation opcode scan over a disassembly folder is tools/wave64_graphics_scan.py (#1132): it counts
 candidate cross-half opcodes and decides nothing. This module decides per shader (tier); its --census only totals
@@ -1770,6 +1771,59 @@ class WhyAnalysis(Analysis):
                 ev.setdefault("why", []).append((pc if pc is not None else 1 << 62, why_line(code, family, origin)))
 
 
+    def side_family(self, blk):
+        """Family of the first instruction of a block that is not a wait or a no-op ("empty" for a block of those)."""
+        if blk is None:
+            return "none"
+        for ins in self.blocks[blk]:
+            if base_op(ins["op"]) not in ("s_waitcnt", "s_nop"):
+                return why_family(ins)
+        return "empty"
+
+    def vote(self, n, ins, op, reg, on_taken, ev, *rest):
+        """The base class decides. When it refuses the vote, say which of its conditions failed (vote_line)."""
+        seen = len(ev["viol"]) if ev is not None else 0
+        super().vote(n, ins, op, reg, on_taken, ev, *rest)
+        if ev is None:
+            return
+        for code, pc, _ in ev["viol"][seen:]:
+            if code in ("unsafe-vote-branch", "unsafe-execz-branch"):
+                ev.setdefault("vote_why", []).append((pc if pc is not None else 1 << 62,
+                                                      self.vote_line(code, n, reg, on_taken)))
+
+    def vote_line(self, code, n, reg, on_taken):
+        """One refused vote as text, families only: reason|condition|run:family|other:family.
+        `run` is the side that runs when some lane votes yes, `other` the side a half takes when none of its lanes
+        does; `family` is the instruction family at the start of that side. The conditions, for a vote on a mask:
+            no-narrowing              the run side does not start by narrowing EXEC to the voted mask, and the other
+                                      side is the join
+            other-side-joins          the run side narrows, but the other side has code of its own and then meets the
+                                      run side again (an if/else)
+            other-side-exits          the same, but the other side never meets the run side (an early exit)
+            no-narrowing+other-side-joins, no-narrowing+other-side-exits   the two together
+            one-way                   the branch has one successor
+        For a vote on EXEC itself (unsafe-execz-branch) the run side needs no narrowing, so the condition is
+        other-side-joins or other-side-exits: the side that runs with no lane on has code of its own."""
+        targets = self.succ[n]
+        run = targets[0] if on_taken else (targets[1] if len(targets) > 1 else None)
+        skip = targets[1] if on_taken and len(targets) > 1 else (targets[0] if not on_taken else None)
+        if run is None or skip is None:
+            cond = "one-way"
+        else:
+            is_join = self.reaches(run, self.past_jumps(skip), n)
+            if is_join:
+                other = ""
+            else:
+                from_run = {b for b in range(self.n) if self.reaches(run, b, n)}
+                meets = any(self.reaches(skip, b, n) for b in from_run)
+                other = "other-side-joins" if meets else "other-side-exits"
+            narrows = reg == "exec" or self.narrows(run, reg)
+            cond = "+".join(x for x in ("" if narrows else "no-narrowing", other) if x) or "other"
+            if is_join:
+                return "|".join((code, cond, "run:" + self.side_family(run), "other:join"))
+        return "|".join((code, cond, "run:" + self.side_family(run), "other:" + self.side_family(skip)))
+
+
 def why_line(code, sink, origin):
     """One violation as text, families only: reason|sink|producer@exec|source@exec|source of the source.
     `sink` is the family of the instruction where the reason was found, `producer` the family of the instruction that
@@ -1781,6 +1835,9 @@ def why_line(code, sink, origin):
     state = {(): "", (False,): "@narrowed", (True,): "@launch", (False, True): "@both"}[tuple(src_exec)]
     return "|".join((code, sink, family + ("@launch" if launch else "@narrowed"), "+".join(src) + state,
                      "+".join(src2) or "-"))
+
+
+VOTE_WHY_MAX = 8        # distinct refused-vote lines kept per program, in program order
 
 
 def _fixpoint(an):
@@ -1797,7 +1854,8 @@ def _fixpoint(an):
 
 def analyse(blocks, succ, masks, stage, why=False):
     """Tier of one wave64 VS/PS/GS program (see the module docstring). With `why`, a tier C result also has the key
-    "why": the first why_line of each reason, in program order (so the first entry is the program's first reason).
+    "why": the first why_line of each reason, in program order (so the first entry is the program's first reason),
+    and, when a vote was refused, "vote_why": the distinct vote_line texts in program order (at most VOTE_WHY_MAX).
     It comes from a second run (WhyAnalysis) that cannot change the tier; if that run fails or does not find the
     same reasons, the key is absent."""
     an = Analysis(blocks, succ, masks, stage)
@@ -1817,6 +1875,12 @@ def analyse(blocks, succ, masks, stage, why=False):
             for _, line in sorted(ev2.get("why", []), key=lambda x: x[0]):
                 first.setdefault(line.split("|", 1)[0], line)
             result["why"] = list(first.values())
+            votes = []
+            for _, line in sorted(ev2.get("vote_why", []), key=lambda x: x[0]):
+                if line not in votes:
+                    votes.append(line)
+            if votes:
+                result["vote_why"] = votes[:VOTE_WHY_MAX]
     return result
 
 
@@ -1825,6 +1889,7 @@ def census(index):
     """Counts only: {stage: {tier: n}} and the reason / idiom counts of the wave64 VS/PS/GS entries of an index.json."""
     tiers, reasons, idioms, unmarked = {}, Counter(), Counter(), 0
     first, by_reason, tier_c, with_why = Counter(), {}, 0, 0
+    vote_first, vote_any, vote_cond, with_votes = Counter(), Counter(), Counter(), 0
     for name, m in index.items():
         if not isinstance(m, dict) or not m.get("wave64") or m.get("stage") not in ("vs", "ps", "gs"):
             continue
@@ -1843,10 +1908,18 @@ def census(index):
                 first[lines[0]] += 1
                 for line in lines:
                     by_reason.setdefault(line.split("|", 1)[0], Counter())[line] += 1
+            votes = [x for x in m.get("wave64_graphics_vote_why", []) if isinstance(x, str) and x.count("|") == 3]
+            if votes:
+                with_votes += 1
+                vote_first[votes[0]] += 1
+                vote_any.update(set(votes))
+                vote_cond.update({"|".join(x.split("|")[:2]) for x in votes})
     return {"tiers": {s: dict(sorted(c.items())) for s, c in sorted(tiers.items())},
             "reasons": dict(reasons.most_common()), "idioms": dict(idioms.most_common()), "no_analysis": unmarked,
             "why": {"tier_c": tier_c, "with_why": with_why, "first": dict(first.most_common()),
-                    "by_reason": {r: dict(c.most_common()) for r, c in sorted(by_reason.items())}}}
+                    "by_reason": {r: dict(c.most_common()) for r, c in sorted(by_reason.items())},
+                    "with_votes": with_votes, "vote_first": dict(vote_first.most_common()),
+                    "vote_any": dict(vote_any.most_common()), "vote_condition": dict(vote_cond.most_common())}}
 
 
 WHY_FIELDS = ("reason", "sink", "producer", "source", "source of the source")
@@ -1871,6 +1944,18 @@ def print_why(why, top):
         print(f"{reason} (first site in each shader that has it, {sum(lines.values())} shaders, top {top}):")
         for line, n in list(lines.items())[:top]:
             print(f"  {n:6d}  {line.split('|', 1)[1]}")
+    print(f"refused votes: {why['with_votes']} of {why['tier_c']} tier C entries have wave64_graphics_vote_why")
+    if not why["with_votes"]:
+        return
+    print("fields: reason | condition | run:family at the start of the side that runs on a yes vote | "
+          "other:family at the start of the other side (join = no code of its own)")
+    print("refused votes by condition (a shader counts once for each condition it has): "
+          + ", ".join(f"{x} x{n}" for x, n in why["vote_condition"].items()))
+    for title, table in (("first refused vote of a shader", why["vote_first"]),
+                         ("refused votes, a shader counts once for each line it has", why["vote_any"])):
+        print(f"{title} (top {top}):")
+        for line, n in list(table.items())[:top]:
+            print(f"  {n:6d}  {line}")
 
 
 def main(argv=None):

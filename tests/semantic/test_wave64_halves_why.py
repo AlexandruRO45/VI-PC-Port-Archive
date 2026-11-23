@@ -144,6 +144,8 @@ class WhyLines(unittest.TestCase):
             with_lines, without = translated(name, lines)[1], translated(name, lines, why=False)[1]
             self.assertNotIn("wave64_graphics_why", without, name)
             with_lines.pop("wave64_graphics_why")
+            with_lines.pop("wave64_graphics_vote_why", None)        # the refused-vote lines, same option
+            self.assertNotIn("wave64_graphics_vote_why", without, name)
             self.assertEqual(with_lines, without, name)
 
     def test_the_translator_has_the_option(self):
@@ -199,6 +201,7 @@ class SecondRun(unittest.TestCase):
             args = self.recorded(name, lines)
             plain, why = wave64_halves.analyse(*args), wave64_halves.analyse(*args, why=True)
             why.pop("why", None)
+            why.pop("vote_why", None)
             self.assertEqual(plain, why, name)
             # the second run alone reports the same violations as the first, in the same order
             base = wave64_halves._fixpoint(wave64_halves.Analysis(*args))
