@@ -9,7 +9,8 @@
 // Last, the BLAS again with MINIMIZE_MEMORY (BOX16 nodes: a smaller prebuild size and postbuild size), written as
 // d3d12_blas_box16, then updated in place with the same flags (d3d12_blas_box16_update); and once more without
 // ALLOW_UPDATE, so that its triangles are paired into TRI0/TRI1 leaves (d3d12_blas_paired; the ALLOW_UPDATE builds
-// must have no pairs, since a refit rewrites the leaves one triangle each).
+// must have no pairs, since a refit rewrites the leaves one triangle each). Its COMPACTED_SIZE must be a leaf smaller
+// per pair than the unpaired build's, and its COMPACT copy is written as d3d12_blas_paired_compacted.
 // `python -I tools/xdxr_bvh.py check-build <out dir>` validates them and traces rays against brute force (ctest:
 // d3d12_xdxr_rt + d3d12_xdxr_rt_check). Exit 77 without a Vulkan device, or with LEONIDA_RT_AS=khr. No game files.
 #include "../shims/d3d12_com.h"
@@ -470,32 +471,75 @@ int main(int argc, char** argv) {
     std::printf("d3d12_xdxr_rt: MINIMIZE_MEMORY BLAS %llu bytes (BOX16)\n", static_cast<unsigned long long>(box16_size));
 
     // ---- a BLAS that will not be updated (no ALLOW_UPDATE): sibling triangles that share an edge are paired into
-    // TRI0/TRI1 leaves. Pairing changes neither the layout nor the size ----
+    // TRI0/TRI1 leaves. Pairing keeps the tree and the prebuild result size, takes more scratch, and packs the leaves:
+    // the build ends a leaf (64 bytes) earlier per pair, which COMPACTED_SIZE reports and COMPACT keeps ----
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS static_inputs = blas_inputs;
     static_inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO static_info{};
     device->GetRaytracingAccelerationStructurePrebuildInfo(&static_inputs, &static_info);
     if (static_info.ResultDataMaxSizeInBytes != blas_info.ResultDataMaxSizeInBytes)
         return fail("a BLAS without ALLOW_UPDATE has another prebuild size");
-    Ref<ID3D12Resource> static_blas, static_rb;
+    if (static_info.ScratchDataSizeInBytes <= blas_info.ScratchDataSizeInBytes)
+        return fail("a BLAS without ALLOW_UPDATE asks for no pairing scratch");
+    Ref<ID3D12Resource> static_blas, static_rb, static_scratch;
     if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, static_info.ResultDataMaxSizeInBytes, as_state, uav,
                            static_blas.put())) ||
         FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, static_info.ResultDataMaxSizeInBytes,
-                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, static_rb.put())))
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, static_rb.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, static_info.ScratchDataSizeInBytes,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, uav, static_scratch.put())))
         return fail("static BLAS buffers", hr);
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for the static BLAS");
     build = {};
     build.Inputs = static_inputs;
     build.DestAccelerationStructureData = static_blas->GetGPUVirtualAddress();
-    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
-    list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+    build.ScratchAccelerationStructureData = static_scratch->GetGPUVirtualAddress();
+    list->BuildRaytracingAccelerationStructure(&build, 1, &compacted_desc);   // its COMPACTED_SIZE, at info + 0
     list->ResourceBarrier(1, &barrier);
     list->CopyBufferRegion(static_rb.p, 0, static_blas.p, 0, static_info.ResultDataMaxSizeInBytes);
+    list->CopyBufferRegion(info_rb.p, 0, info.p, 0, 8);
     if (!submit(7)) return fail("static BLAS submission");
+    UINT64 paired_size = 0;
+    {
+        void* p = nullptr;
+        if (FAILED(info_rb->Map(0, nullptr, &p))) return fail("Map postbuild (static BLAS)");
+        std::memcpy(&paired_size, p, 8);
+        info_rb->Unmap(0, nullptr);
+    }
+    // The same positions and flags but ALLOW_UPDATE built the tree whose COMPACTED_SIZE is sizes[0] (the update kept
+    // it), so the paired build is that less 64 bytes per pair, at most one pair per two triangles. xdxr_bvh.py
+    // check-build checks that the leaves are packed and each one is referenced.
+    const UINT64 all_tris = soup_tris + 2 * n * n;
+    if (!paired_size || paired_size % 64 || paired_size >= sizes[0] || paired_size + 64 * (all_tris / 2) < sizes[0]) {
+        std::fprintf(stderr, "paired BLAS %llu bytes, unpaired %llu\n", static_cast<unsigned long long>(paired_size),
+                     static_cast<unsigned long long>(sizes[0]));
+        return fail("a paired BLAS is not smaller by a leaf per pair");
+    }
     if (!dump(static_rb.p, static_info.ResultDataMaxSizeInBytes, "d3d12_blas_paired",
               "{\"kind\": \"blas\", \"pairs\": true, \"address\": " +
                   std::to_string(static_blas->GetGPUVirtualAddress()) + ", \"triangles\": " + tris + "}\n"))
         return fail("static BLAS readback");
+    // COMPACT into a buffer of exactly COMPACTED_SIZE: the packed leaves and the nodes after them, nothing else
+    Ref<ID3D12Resource> paired_compacted, paired_compacted_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, paired_size, as_state, uav, paired_compacted.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, paired_size, D3D12_RESOURCE_STATE_COPY_DEST,
+                           D3D12_RESOURCE_FLAG_NONE, paired_compacted_rb.put())))
+        return fail("compacted paired BLAS buffers", hr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr)))
+        return fail("Reset for the paired compaction");
+    list->CopyRaytracingAccelerationStructure(paired_compacted->GetGPUVirtualAddress(),
+                                              static_blas->GetGPUVirtualAddress(),
+                                              D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(paired_compacted_rb.p, 0, paired_compacted.p, 0, paired_size);
+    if (!submit(8)) return fail("paired compaction submission");
+    if (!dump(paired_compacted_rb.p, paired_size, "d3d12_blas_paired_compacted",
+              "{\"kind\": \"blas\", \"pairs\": true, \"address\": " +
+                  std::to_string(paired_compacted->GetGPUVirtualAddress()) + ", \"triangles\": " + tris + "}\n"))
+        return fail("compacted paired BLAS readback");
+    std::printf("d3d12_xdxr_rt: paired BLAS %llu bytes, %llu without pairing (%llu leaves fewer)\n",
+                static_cast<unsigned long long>(paired_size), static_cast<unsigned long long>(sizes[0]),
+                static_cast<unsigned long long>((sizes[0] - paired_size) / 64));
     std::printf("d3d12_xdxr_rt: BLAS %llu bytes (prebuild %llu), TLAS (prebuild %llu), written to %s\n",
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),

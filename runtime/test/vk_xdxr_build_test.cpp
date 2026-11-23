@@ -181,7 +181,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         total += geo.triangle_count;
     }
     XdxrLayout layout;
-    EXPECT(layout.compute(total, false, box16));
+    EXPECT(layout.compute(total, false, box16, pair));
     Buffer dst = make(gpu, layout.size + 256), scratch = make(gpu, std::size_t(layout.scratch));
     EXPECT(dst.buffer && scratch.buffer);
     const std::uint64_t base = (dst.address + 255) & ~std::uint64_t(255);   // 256-byte aligned, as D3D12 requires

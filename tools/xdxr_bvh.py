@@ -819,6 +819,41 @@ def count_pairs(data):
     return node_census(data).get(TRI1, 0)
 
 
+def leaf_packing(data):
+    """Checks that the leaves of a valid bottom-level BVH fill offsetToElements .. offsetToNodes with no gap, as the
+    GPU builder writes them (runtime/src/xdxr_build.comp, MODE_LEAF_*): every 64-byte unit there is the leaf of one
+    reachable TRI0 pointer, a TRI1 pointer only shares a TRI0's leaf, and no leaf lies outside. A paired build then
+    ends a leaf (64 bytes) earlier per pair; a sibling's leaf left unused would show here as a unit nothing
+    references. Returns a list of problems (empty = packed)."""
+    nodes_off = struct.unpack_from("<I", data, 40)[0]
+    elements_off = struct.unpack_from("<I", data, 52)[0]
+    tri0, tri1 = {}, {}
+    stack = [struct.unpack_from("<I", data, 48)[0]]
+    while stack:
+        p = stack.pop()
+        if p == INVALID:
+            continue
+        kind = ptr_type(p)
+        if kind in (BOX16, BOX32):
+            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+        elif kind in (TRI0, TRI1):
+            seen = tri0 if kind == TRI0 else tri1
+            seen[ptr_offset(p)] = seen.get(ptr_offset(p), 0) + 1
+    errs = []
+    if nodes_off < elements_off or (nodes_off - elements_off) % UNIT:
+        return [f"offsetToNodes {nodes_off:#x} is not a whole number of leaves past offsetToElements {elements_off:#x}"]
+    for off in range(elements_off, nodes_off, UNIT):
+        if tri0.get(off, 0) != 1:
+            errs.append(f"leaf at {off:#x} has {tri0.get(off, 0)} TRI0 pointers, not 1")
+    for off, k in sorted(tri1.items()):
+        if k != 1 or off not in tri0:
+            errs.append(f"leaf at {off:#x} has {k} TRI1 pointers and {tri0.get(off, 0)} TRI0")
+    for off in sorted(set(tri0) | set(tri1)):
+        if not elements_off <= off < nodes_off:
+            errs.append(f"leaf at {off:#x} is outside offsetToElements .. offsetToNodes")
+    return errs[:8] + ([f"... and {len(errs) - 8} more"] if len(errs) > 8 else [])
+
+
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
@@ -905,6 +940,8 @@ def check_build(directory, rays=300, seed=1):
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
         if desc["kind"] == "blas" and not errs:
             errs += box16_rounding(data)
+        if desc["kind"] == "blas" and not errs:
+            errs += leaf_packing(data)
         pairs = count_pairs(data) if desc["kind"] == "blas" and not errs else 0
         if desc.get("pairs") is True and not pairs:
             errs.append("built with pairing, but no TRI1 node is reachable")

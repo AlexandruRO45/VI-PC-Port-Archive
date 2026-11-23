@@ -1070,20 +1070,31 @@ when four things hold. The two must share an edge in opposite directions, with t
 the same geometry, since a leaf holds one `GeometryIndexAndFlags`. And both must be active. The first triangle is
 rotated so the shared edge is slots 1 -> 2, the sibling's third vertex goes in slot 3, its primitive index in
 `PrimitiveIndex2`, and each node type's remap byte returns D3D12's barycentrics for its own vertex order. The node
-still has one child per triangle, each with its own box: the TRI1 child points at the first triangle's leaf, and the
-sibling's own leaf is left unused. The tree, the layout and the sizes are therefore the same as without pairing.
-Nothing is saved yet: reclaiming the unused leaves would need a compaction that moves records and rewrites pointers,
-and compaction here copies bytes. What pairing gives is the console's leaf format, with a pair's two triangles in
-one 64-byte record. Because pairs never cross nodes, one thread owns each leaf it rewrites, and both pointers of a
-pair have the same parent, so the parent table has one writer per entry. The pass records each triangle's pointer
-(TRI0, or TRI1 for the sibling) in scratch, so the bottom-up box pass finds the sibling's slot through the first
-triangle's leaf. On a sorted grid of 7,200 triangles, 2,208 of the 3,600 possible pairs form (2,625 with the tree of four
-consecutive elements: a radix-tree node often has an inner node among its children, and only triangle children
-pair). A refit rewrites every leaf as one triangle, so a structure that may be updated is
-not paired. **ASSUMPTION:** that pairing only siblings is close enough. The console builder's pairing rule is not
-traced; `tools/xdxr_bvh.py` `build_blas(pair=True)` pairs greedily over the whole mesh instead, and both traverse
-the same way. `check-build` compares barycentrics as well as hits, and checks that a paired case has TRI1 nodes and
-that cases that must not pair (other geometry, same direction) have none.
+still has one child per triangle, each with its own box: the TRI1 child points at the first triangle's leaf, so the
+tree is the same as without pairing. Because pairs never cross nodes, both pointers of a pair have the same parent,
+and the leaf's one parent table entry is right for both.
+
+The sibling gets no leaf of its own: the leaves are written after the pairs are known, packed. `MODE_TRIANGLES` stages
+each triangle in scratch instead of writing its leaf, `MODE_PAIR` decides the pairs (one thread per kept node),
+`MODE_LEAF_COUNT`, `MODE_LEAF_SCAN` and `MODE_LEAF_INDEX` number the leaves (one per unpaired triangle or pair, in
+element order: a count per tile of 256 elements, one scan, then an index per tile), and `MODE_LEAF_WRITE` writes them
+from `offsetToElements` on. The nodes start right after the last leaf, so a paired build ends 64 bytes earlier per
+pair: its header's size, which `COMPACTED_SIZE` and `CURRENT_SIZE` report and `COMPACT` copies. Prebuild info keeps
+the unpaired size as the bound, and asks for 56 more bytes of scratch per triangle (the staged triangle, its pair and
+its leaf index) when the build may pair, that is a bottom-level build without `ALLOW_UPDATE`. Measured on an RX 7900
+XTX: `blas_paired_sort_tiles` (a 7,200-triangle grid) is 846,848 bytes instead of 988,160 (2,208 pairs, 14 % smaller),
+and the D3D12 test's BLAS (300 unindexed triangles and an 8 x 8 grid) 54,464 instead of 58,368 after COMPACT (61
+pairs). `xdxr_bvh.py check-build` (`leaf_packing`) checks every built BLAS: each 64-byte unit from `offsetToElements`
+to `offsetToNodes` is the leaf of exactly one reachable TRI0 pointer, and a TRI1 pointer only shares one. A build that
+left the sibling's leaf unused fails it. The pass records each triangle's pointer (TRI0, or TRI1 for the sibling) in
+scratch, so the bottom-up box pass finds the sibling's slot through the first triangle's leaf. On a sorted grid of
+7,200 triangles, 2,208 of the 3,600 possible pairs form (2,625 with the tree of four consecutive elements: a
+radix-tree node often has an inner node among its children, and only triangle children pair). A refit rewrites every
+leaf as one triangle, so a structure that may be updated is not paired. **ASSUMPTION:** that pairing only siblings is
+close enough. The console builder's pairing rule is not traced; `tools/xdxr_bvh.py` `build_blas(pair=True)` pairs
+greedily over the whole mesh instead, and both traverse the same way. `check-build` compares barycentrics as well as
+hits, and checks that a paired case has TRI1 nodes and that cases that must not pair (other geometry, same direction)
+have none.
 
 The node count depends on the keys. A kept node has two children only when both of its binary children are
 elements, so with N elements there are at most (3N - 2) / 4 nodes. `XdxrLayout` computes the result and scratch
@@ -1115,13 +1126,14 @@ slowly as the geometry moves away from where it was built.
 structure's bytes. The records are position-independent: node pointers count from the structure's start, and a TLAS
 names its BLASes by address, which a clone keeps. The size comes from the source header (`totalSizeIn64BNodes`), so
 a copy can follow a build in the same command list, and it is bounded by the destination resource. A build's size
-is the nodes it wrote, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
+is the leaves and nodes it wrote, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
 `EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
-`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes. Serialization, deserialization and the tools-visualization
+`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes, and with TRI1
+pairing a leaf per pair. Serialization, deserialization and the tools-visualization
 mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
 as before.
 
-Not done yet: serialization; a compaction that reclaims the leaves that pairing leaves unused. A surface-area
+Not done yet: serialization. A surface-area
 collapse of the radix tree, or treelet restructuring, would trim a few more steps.
 
 ```powershell

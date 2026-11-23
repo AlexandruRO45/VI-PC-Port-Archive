@@ -223,6 +223,26 @@ class ClosestHit(unittest.TestCase):
             hits += a is not None
         self.assertGreater(hits, 30)
 
+    def test_leaf_packing(self):
+        # the encoder writes one leaf per unpaired triangle or pair, packed: nothing to report
+        for pair in (False, True):
+            data, _ = X.build_blas(X.grid_mesh(), pair=pair)
+            self.assertEqual(X.leaf_packing(data), [], pair)
+        # two triangles in two leaves; the second child made a TRI1 into the first's leaf leaves the second leaf
+        # unreferenced, as a sibling's leaf left unused would be
+        data, _ = X.build_blas([TRI, [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]]])
+        self.assertEqual(X.leaf_packing(data), [])
+        buf = bytearray(data)
+        root = X.ptr_offset(struct.unpack_from("<I", buf, 48)[0])
+        kids = struct.unpack_from("<4I", buf, root)
+        leaves = [k for k in kids if k != X.INVALID]
+        self.assertEqual([X.ptr_type(k) for k in leaves], [X.TRI0, X.TRI0])
+        slot = kids.index(leaves[1])
+        struct.pack_into("<I", buf, root + 4 * slot, (leaves[0] & ~7) | X.TRI1)
+        errs = X.leaf_packing(bytes(buf))
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn(f"{X.ptr_offset(leaves[1]):#x} has 0 TRI0", errs[0])
+
     def test_random_box32(self):
         self.check_blas(X.random_scene(random.Random(1), 80))
 

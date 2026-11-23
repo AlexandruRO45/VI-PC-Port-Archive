@@ -3355,7 +3355,8 @@ Vulkan AS would be invisible to them. Two paths:
    the source structure instead of rebuilding it, `CopyRaytracingAccelerationStructure` clones and compacts, and the
    postbuild compacted and current sizes are written ([bvh.md](bvh.md) §7a). A bottom-level build with
    `MINIMIZE_MEMORY` gets BOX16 nodes (half boxes, about a fifth smaller; top-level builds stay BOX32), and one
-   without `ALLOW_UPDATE` pairs sibling triangles that share an edge into TRI0/TRI1 leaves. Serialization and the Xbox
+   without `ALLOW_UPDATE` pairs sibling triangles that share an edge into TRI0/TRI1 leaves, packed, so it ends a
+   64-byte leaf earlier per pair (its prebuild scratch is larger for that). Serialization and the Xbox
    #743's `VkAccelerationStructureKHR` builds (for `RayQueryKHR`), which the game's shaders can't read. A top-level
    build with `D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS` is supported there: the console VAs in the pointer list are
    translated to Vulkan device addresses in a staged copy, without changing the guest's input. The list must be in

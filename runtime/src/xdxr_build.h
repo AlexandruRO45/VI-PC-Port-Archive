@@ -33,6 +33,7 @@ struct XdxrLayout {
 
     bool tlas = false;
     bool box16 = false;                // inner nodes are BOX16
+    bool pairs = false;                // the scratch has room for TRI1 pairing (xdxr_build.comp FLAG_PAIR)
     std::uint32_t node_size = 128;     // BOX32 128 bytes, BOX16 64
     std::uint32_t elements = 0;        // triangles (BLAS) or instances (TLAS)
     std::uint32_t element_size = 64;   // a leaf, or a 128-byte instance record
@@ -50,10 +51,13 @@ struct XdxrLayout {
     std::uint64_t scratch = 0;         // scratch bytes
 
     // False when the count would overflow the 32-bit offsets of the format. `half_boxes`: BOX16 inner nodes.
-    bool compute(std::uint32_t count, bool top_level, bool half_boxes = false) {
+    // `pair`: a bottom-level build that may pair triangles into TRI0/TRI1 leaves (XdxrBuilder::record_blas `pair`);
+    // the result size is the same (pairing only ever makes a build smaller), the scratch is larger.
+    bool compute(std::uint32_t count, bool top_level, bool half_boxes = false, bool pair = false) {
         *this = XdxrLayout{};
         tlas = top_level;
         box16 = half_boxes;
+        pairs = pair && !top_level && count > 1;
         node_size = box16 ? 64u : 128u;
         elements = count;
         element_size = tlas ? 128u : 64u;
@@ -81,11 +85,13 @@ struct XdxrLayout {
         parent_entries = std::uint32_t(body_units);
         sort_size = count;
         // centroid bounds and the node count, keys and element indices twice, digit counts per tile and their prefix
-        // sums, a box per element, a box accumulator per node, then per inner node of the binary tree its two
-        // children, its parent, its kept flag and its node index, a kept count per tile with its prefix sum, and
-        // each element's pointer in the tree
+        // sums, a box per element (with `pairs`, then per element its role in a pair, the other triangle, its leaf
+        // index and its staged triangle, 11 words, and a leaf count per tile with its prefix sum), a box accumulator
+        // per node, then per inner node of the binary tree its two children, its parent, its kept flag and its node
+        // index, a kept count per tile with its prefix sum, and each element's pointer in the tree
         scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * count + 32ull * nodes +
                   20ull * inner() + 8ull * kept_tiles() + 4ull * count;
+        if (pairs) scratch += 56ull * count + 8ull * tiles();
         return true;
     }
     std::uint32_t tiles() const { return (sort_size + radix_tile - 1) / radix_tile; }
@@ -127,15 +133,16 @@ public:
     // to the new positions. Its tree is kept and only its boxes change, which is valid for any motion and costs no
     // sort, though a refitted tree traverses more slowly as the geometry moves away from where it was built.
     //
-    // `pair`: sibling triangles that share an edge go into one leaf as TRI0 and TRI1 (xdxr_build.comp MODE_NODES).
-    // The layout and the tree are the same either way. A refit rewrites every leaf as one triangle, so a structure
-    // that will be updated must be built without pairing (the layer pairs only builds without ALLOW_UPDATE), and an
-    // update ignores `pair`.
+    // `pair`: sibling triangles that share an edge go into one leaf as TRI0 and TRI1 (xdxr_build.comp MODE_PAIR),
+    // when the layout was computed with `pair` (its scratch has room). The tree is the same either way; the leaves
+    // are packed, so the structure ends 64 bytes earlier per pair (its header's size, which COMPACTED_SIZE gives).
+    // A refit rewrites every leaf as one triangle, so a structure that will be updated must be built without pairing
+    // (the layer pairs only builds without ALLOW_UPDATE), and an update ignores `pair`.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
                      std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0, bool pair = false) {
         if (!loaded_ || layout.tlas) return false;
         Push p = base(layout, dst, scratch);
-        if (pair && !update_from) p.flags |= flag_pair;
+        if (pair && !update_from && layout.pairs) p.flags |= flag_pair;
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         std::uint32_t first = 0;
         for (std::size_t g = 0; g < geometries.size(); ++g) {
@@ -217,7 +224,8 @@ private:
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_karras = 4, mode_nodes = 5,
         mode_header = 6, mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10,
         mode_copy_as = 12, mode_postbuild = 13, mode_kept = 14, mode_kept_scan = 15,
-        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18
+        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18, mode_pair = 19, mode_leaf_count = 20,
+        mode_leaf_scan = 21, mode_leaf_index = 22, mode_leaf_write = 23
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
@@ -325,6 +333,23 @@ private:
             dispatch(cb, t, 64);                       // one workgroup
             t.mode = mode_kept_index;
             dispatch(cb, t, 64 * l.kept_tiles());
+        }
+        // TRI1 pairing: the pairs, the leaves numbered without the paired siblings', and the leaves themselves
+        // (MODE_TRIANGLES staged the triangles); the nodes then start after the last leaf
+        if (p.flags & flag_pair) {
+            Push q = p;
+            q.mode = mode_pair;
+            q.count = l.inner();
+            dispatch(cb, q, q.count);
+            q.mode = mode_leaf_count;
+            dispatch(cb, q, 64 * l.tiles());           // one workgroup of 64 per tile of elements
+            q.mode = mode_leaf_scan;
+            dispatch(cb, q, 64);                       // one workgroup
+            q.mode = mode_leaf_index;
+            dispatch(cb, q, 64 * l.tiles());
+            q.mode = mode_leaf_write;
+            q.count = l.elements;
+            dispatch(cb, q, q.count);
         }
         Push n = p;
         n.mode = mode_nodes;
