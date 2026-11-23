@@ -137,6 +137,29 @@ class BootTraceTests(unittest.TestCase):
         self.assertIs(trace["exceptions"][1]["cpp"], True)
         self.assertEqual(trace["exit"], 0)
 
+    def test_text_reports_module_relocation_status(self):
+        modules = [event for event in STARTUP if event["kind"] == "map"]
+        unknown = dict(modules[0], module="unknown.dll")
+        del unknown["relocated"]
+        self.write(self.startup, [STARTUP[0], *modules, unknown])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(bt.main([self.startup, "--json"]), 0)
+        summary = json.loads(output.getvalue())
+        self.assertEqual(
+            [module["relocated"] for module in summary["startup"]["modules"]],
+            [False, True, None],
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(bt.main([self.startup]), 0)
+        self.assertIn(
+            "modules (3): game.exe, x.dll (relocated), unknown.dll (relocation unknown)",
+            output.getvalue(),
+        )
+
     def test_debug_text_is_not_printed(self):
         self.write(self.startup, STARTUP)
         text = bt.format_text(bt.summarize(bt.parse_startup(self.startup), None), 10)

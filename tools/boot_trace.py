@@ -213,7 +213,15 @@ def format_text(summary: dict, limit: int) -> str:
             kinds = ", ".join(f"{k} {v}" for k, v in sorted(startup["kinds"].items()))
             out.append(f"  kinds: {kinds}")
         if startup["modules"]:
-            names = [m["module"] for m in startup["modules"]]
+            names = []
+            for module in startup["modules"]:
+                name = str(module["module"])
+                relocated = module.get("relocated")
+                if relocated is True:
+                    name += " (relocated)"
+                elif relocated is not False:
+                    name += " (relocation unknown)"
+                names.append(name)
             out.append(f"  modules ({len(names)}): {_tail(names, limit)}")
         out.append(f"  tls callbacks: {startup['tls_callbacks']}")
         dm = startup["dllmain"]
