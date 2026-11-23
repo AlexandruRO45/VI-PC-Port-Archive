@@ -11185,11 +11185,73 @@ class Gen:
             self.emit(f"{half} = OpExtInst %uint %glsl UMin {bits} {self.cu(0xFFFF)}")
         return half
 
+    def bitcast_u(self, i):
+        """The uint with the bits of the int id `i`."""
+        u = self.tmp()
+        self.emit(f"{u} = OpBitcast %uint {i}")
+        return u
+
+    def guarded_image_read(self, emit_read, image, cls, ty, iv, idx, dim, lod):
+        """A texel read that returns 0 in all four components when the coordinate is outside the image (or `lod` is
+        past its last level): RDNA2 gives 0 there (gfx1036, tools/hw_oracle on a linear 4x4 R32_UINT T#: image_load at
+        x = width, x = -1, y = height and x = the row pitch returned 0), while OpImageFetch and OpImageRead out of range
+        are undefined in Vulkan (the runtime does not enable robustImageAccess). Unsigned per axis, so -1 is out. An
+        index of 0 is the fallback image of a descriptor lookup miss: read as before, unguarded. `lod` None is a
+        storage view (one level)."""
+        nc = self.STORE_DIMS[dim][3]
+        self.uses_query = True
+        hit, safe_lod, lv, sz = self.tmp(), None, None, self.tmp()
+        self.emit(f"{hit} = OpINotEqual %bool {idx} {self.cu(0)}")
+        cond = hit
+        if lod is None:
+            self.emit(f"{sz} = OpImageQuerySize {'%int' if nc == 1 else '%v2int' if nc == 2 else '%v3int'} {image}")
+        else:
+            lv, last, safe_lod, lt = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{lv} = OpImageQueryLevels %int {image}")
+            self.emit(f"{last} = OpISub %int {lv} {self.as_int(self.cu(1))}")
+            self.emit(f"{safe_lod} = OpExtInst %uint %glsl UMin {lod} {self.bitcast_u(last)}")
+            self.emit(f"{sz} = OpImageQuerySizeLod {'%int' if nc == 1 else '%v2int' if nc == 2 else '%v3int'} {image} {safe_lod}")
+            self.emit(f"{lt} = OpULessThan %bool {lod} {self.bitcast_u(lv)}")
+            ok = self.tmp()
+            self.emit(f"{ok} = OpLogicalAnd %bool {lt} {hit}")
+            cond = ok
+        for ax in range(nc):
+            if nc == 1:
+                c, z = iv, sz
+            else:
+                c, z = self.tmp(), self.tmp()
+                self.emit(f"{c} = OpCompositeExtract %int {iv} {ax}")
+                self.emit(f"{z} = OpCompositeExtract %int {sz} {ax}")
+            lt2, both = self.tmp(), self.tmp()
+            self.emit(f"{lt2} = OpULessThan %bool {c} {z}")
+            self.emit(f"{both} = OpLogicalAnd %bool {cond} {lt2}")
+            cond = both
+        guard = self.tmp()
+        nh = self.tmp()
+        self.emit(f"{nh} = OpLogicalNot %bool {hit}")
+        self.emit(f"{guard} = OpLogicalOr %bool {cond} {nh}")
+        zero = (self.fconst(0.0), self.cu(0), self.as_int(self.cu(0)))[cls]
+        zv, out = self.tmp(), self.tmp()
+        self.emit(f"{zv} = OpCompositeConstruct {ty} {zero} {zero} {zero} {zero}")
+        pre = self.current_label_placeholder()
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {guard} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        res = emit_read()
+        last = self.current_label_placeholder()
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        self.emit(f"{out} = OpPhi {ty} {res} {last} {zv} {pre}")
+        return out
+
     def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, lod, d16=False):
-        def fetch(image, _cls, ty):
-            res = self.tmp()
-            self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Lod {lod}")
-            return res
+        def fetch(image, cls, ty):
+            def read():
+                res = self.tmp()
+                self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Lod {lod}")
+                return res
+            return self.guarded_image_read(read, image, cls, ty, iv, idx, dim, lod)
         self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
 
     def image_load_coherent(self, dim, t1, iv, idx, dmask, vdata, d16):
@@ -11211,10 +11273,12 @@ class Gen:
             self.emit(f"{im} = OpLoad %stimg{cls}_{di} {ip}")
             return im
 
-        def read(image, _cls, ty):
-            res = self.tmp()
-            self.emit(f"{res} = OpImageRead {ty} {image} {iv}")
-            return res
+        def read(image, cls, ty):
+            def do_read():
+                res = self.tmp()
+                self.emit(f"{res} = OpImageRead {ty} {image} {iv}")
+                return res
+            return self.guarded_image_read(do_read, image, cls, ty, iv, idx, dim, None)
         self.image_read_typed(dim, t1, None, idx, dmask, vdata, d16, read, view)
 
     def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None):

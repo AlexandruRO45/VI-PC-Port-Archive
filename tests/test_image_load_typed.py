@@ -90,6 +90,12 @@ class Module:
             out.append((rid, chain[1], self.defs[load[0]][1]))
         return out
 
+    def texel(self, rid):
+        """The id that carries an OpImageFetch result onward: the OpPhi merging it with the zero of a lane outside the
+        image (the out-of-range guard of image_load), else the fetch itself."""
+        phi = [r for r, op, args in self.order if op == "OpPhi" and args[1] == rid]
+        return phi[0] if phi else rid
+
     def integer_coord_vgpr(self, operand):
         op, cast = self.defs[operand]
         assert op == "OpBitcast", op
@@ -218,7 +224,7 @@ class LoadOnlyShaders(unittest.TestCase):
         m = Module(translate(listing))
         self.assertEqual({image[0] for _, _, image in m.fetches()}, {"%float", "%uint", "%int"})
         for rid, _, _ in m.fetches():
-            bits, = (r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
+            bits, = (r for r, op, args in m.order if op == "OpBitcast" and args[1] == m.texel(rid))
             components = [int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits]
             self.assertEqual(components, [0, 3])
         # All three branches write just v0: R in the low half and A in the high half.
@@ -266,9 +272,9 @@ class LoadOnlyShaders(unittest.TestCase):
     def test_only_the_dmask_components_are_written(self):
         m = Module(load_shader("2D", dmask=0x9))
         for rid, _, _ in m.fetches():
-            uses = [args for _, op, args in m.order if op == "OpBitcast" and rid in args]
+            uses = [args for _, op, args in m.order if op == "OpBitcast" and m.texel(rid) in args]
             self.assertEqual(len(uses), 1)
-            bits = next(r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
+            bits = next(r for r, op, args in m.order if op == "OpBitcast" and args[1] == m.texel(rid))
             comps = sorted(int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits)
             self.assertEqual(comps, [0, 3], "dmask 0x9: R into v0, A into v1")
 
