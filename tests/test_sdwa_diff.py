@@ -95,11 +95,21 @@ class Reference(unittest.TestCase):
                              "src0_sel:WORD_1 src1_sel:DWORD", v={2: 1}, s={4: 0x40001})[0], 0x10)
 
     def test_nan_operands_are_skipped_not_guessed(self):
-        with self.assertRaises(d.Skip):
-            run("v_max_f16_sdwa v1, v2, v3 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
-                v={2: 0x7E00})
-        # a compare is defined for NaN: unordered
-        self.assertEqual(run("v_cmp_u_f16_sdwa vcc_lo, v2, v3 src0_sel:WORD_0 src1_sel:WORD_0", v={2: 0x7E00})[3], 1)
+        for nan in (0x7E00, 0x7C01):
+            with self.subTest(nan=hex(nan)):
+                with self.assertRaises(d.Skip):
+                    run("v_max_f16_sdwa v1, v2, v3 dst_sel:WORD_0 dst_unused:UNUSED_PAD "
+                        "src0_sel:WORD_0 src1_sel:WORD_0", v={2: nan})
+                # an unordered compare is defined for both quiet and signaling NaNs
+                self.assertEqual(run("v_cmp_u_f16_sdwa vcc_lo, v2, v3 src0_sel:WORD_0 src1_sel:WORD_0",
+                                     v={2: nan})[3], 1)
+
+    def test_nan_class_distinguishes_quiet_and_signaling(self):
+        cmp = "v_cmp_class_f16_sdwa vcc_lo, v2, {} src0_sel:WORD_0 src1_sel:DWORD"
+        for nan, matching, nonmatching in ((0x7C01, 1, 2), (0x7E00, 2, 1), (0xFC01, 1, 2), (0xFE00, 2, 1)):
+            with self.subTest(nan=hex(nan)):
+                self.assertEqual(run(cmp.format(matching), v={2: nan})[3], 1)
+                self.assertEqual(run(cmp.format(nonmatching), v={2: nan})[3], 0)
 
 
 class Generator(unittest.TestCase):
@@ -187,6 +197,21 @@ class Translated(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertIsNone(d.check(prefix + [case, "v_cmp_lt_u16_sdwa vcc_lo, v1, v2 src0_sel:BYTE_2 "
                                                     "src1_sel:BYTE_0"] + d.observe([1, 2, 3])))
+
+    def test_nan_float_comparisons_match_the_translator(self):
+        prefix = ([f"v_mov_b32 v{r}, 0" for r in d.VREGS]
+                  + [f"s_mov_b32 s{r}, 0" for r in d.SREGS] + ["s_mov_b32 vcc_lo, 0"])
+        cmps = [op for op, spec in d.OPS.items() if op.startswith("v_cmp_") and spec[0] == "f16"
+                and op != "v_cmp_class_f16"]
+        for nan in (0x7E00, 0x7C01):
+            for nan_left in (True, False):
+                for op in cmps:
+                    values = (nan, 0x3C00) if nan_left else (0x3C00, nan)
+                    lines = (prefix + [f"v_mov_b32 v2, {values[0]}", f"v_mov_b32 v3, {values[1]}",
+                                       f"{op}_sdwa vcc_lo, v2, v3 src0_sel:WORD_0 src1_sel:WORD_0"]
+                             + d.observe([1, 2, 3]))
+                    with self.subTest(nan=hex(nan), nan_left=nan_left, op=op):
+                        self.assertIsNone(d.check(lines))
 
     def test_a_wrong_translation_is_caught(self):
         lines = (["v_mov_b32 v2, 0x8000", "s_mov_b32 vcc_lo, 0",

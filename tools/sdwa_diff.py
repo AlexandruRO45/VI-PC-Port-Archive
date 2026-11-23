@@ -10,7 +10,9 @@ not share code with the translator or with tools/cpu_ref.py.
 
 What is modelled, per instruction:
   * sources: VGPRs v1..v7, SGPRs s4..s7 (seeded with s_mov_b32, so the translator knows them as constants), integer
-    inline constants -16..64 and float inline constants (0.5, 1.0, 2.0, 4.0 and their negatives). A float constant
+    inline constants -16..64 and float inline constants (0.5, 1.0, 2.0, 4.0 and their negatives). The f16
+    interesting-value corpus includes quiet and signaling NaNs so the defined compare/class cases are generated;
+    other NaN-sensitive f16 operations remain explicit skips. A float constant
     in an f16 op (v_cmp_class_f16's mask included) is the f16 value over a zero high half, in any other op
     (v_cvt_f16_{u16,i16} included) its f32 bits. A source is narrowed to src0_sel/src1_sel (BYTE_0..3, WORD_0/1,
     DWORD), constants too, zero-extended, or sign-extended under sext() (integer ops); then neg/abs (f16 ops, on
@@ -101,7 +103,8 @@ FLOAT_CONSTS_F16 = {"0.5": 0x3800, "-0.5": 0xB800, "1.0": 0x3C00, "-1.0": 0xBC00
 INTERESTING = (0, 1, 2, 0x7F, 0x80, 0xFF, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, M32,
                0x00FF00FF, 0x80808080, 0x8000FFFF, 0x12345678, 0xDEADBEEF, 31, 32, 33)
 F16_INTERESTING = (0x0000, 0x8000, 0x3C00, 0xBC00, 0x3800, 0x3E00, 0xC100, 0x4200, 0x4400, 0x5640, 0xB400,
-                   0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x0001, 0x83FF, 0x0400, 0x3BFF, 0x3C01, 0xC500, 0x4900)
+                   0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x0001, 0x83FF, 0x0400, 0x3BFF, 0x3C01, 0xC500, 0x4900,
+                   0x7C01, 0x7E00)
 
 
 class Skip(Exception):
