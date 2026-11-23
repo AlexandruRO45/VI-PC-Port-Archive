@@ -67,15 +67,19 @@ def test_rejects_non_geometry(make_shader):
 @requires_tools
 def test_cli_writes_module_and_layout(gs_tri, tmp_path):
     shader, spvasm = gs_tri
-    sa, sv = tmp_path / "gs.spvasm", tmp_path / "gs.spv"
+    work = tmp_path / "tmp_測試"
+    work.mkdir()
+    sa, sv = work / "gs.spvasm", work / "gs.spv"
     sa.write_text(spvasm)
-    subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"], check=True)
-    out = tmp_path / "cs.spv"
-    r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"), str(sv),
-                        str(out), "--layout", str(tmp_path / "lay.json")], capture_output=True, text=True)
+    subprocess.run(["spirv-as", sa.name, "-o", sv.name, "--target-env", "vulkan1.2"],
+                   cwd=work, check=True)
+    out = work / "cs.spv"
+    r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"), sv.name,
+                        out.name, "--layout", "lay.json"], cwd=work, capture_output=True, text=True,
+                       errors="replace")
     assert r.returncode == 0, r.stderr
-    assert out.exists() and (tmp_path / "lay.json").exists()
-    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(out)], check=True)
+    assert out.exists() and (work / "lay.json").exists()
+    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", out.name], cwd=work, check=True)
 
 
 # A hand-built GS whose entry block branches, with an OpPhi naming the entry label as a predecessor (the translator
@@ -134,8 +138,10 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
     assert "%x = OpPhi %uint %u1 %t %u0 %gsc_body" in out
     sa, sv = tmp_path / "cs.spvasm", tmp_path / "cs.spv"
     sa.write_text(out)
-    subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"], check=True)
-    r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(sv)], capture_output=True, text=True)
+    subprocess.run(["spirv-as", sa.name, "-o", sv.name, "--target-env", "vulkan1.2"],
+                   cwd=tmp_path, check=True)
+    r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", sv.name], cwd=tmp_path,
+                       capture_output=True, text=True, errors="replace")
     assert r.returncode == 0, r.stderr
 
 
@@ -143,12 +149,15 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
 @pytest.mark.parametrize("target", ["vulkan1.0", "vulkan1.1", "vulkan1.2"])
 def test_cli_preserves_valid_capture_across_spirv_versions(tmp_path: Path, target: str) -> None:
     source, output = tmp_path / "gs.spv", tmp_path / "cs.spv"
-    subprocess.run(["spirv-as", "--target-env", target, "-", "-o", source], input=PHI_GS, text=True, check=True)
-    subprocess.run(["spirv-val", "--target-env", target, source], check=True)
+    subprocess.run(["spirv-as", "--target-env", target, "-", "-o", source.name], cwd=tmp_path,
+                   input=PHI_GS, text=True, check=True)
+    subprocess.run(["spirv-val", "--target-env", target, source.name], cwd=tmp_path, check=True)
     tool = os.path.join(ROOT, "tools", "spirv_gs_to_compute.py")
-    result = subprocess.run([sys.executable, "-I", tool, source, output], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-I", tool, source.name, output.name], cwd=tmp_path,
+                            capture_output=True, text=True, errors="replace")
     assert result.returncode == 0, result.stderr
-    result = subprocess.run(["spirv-val", "--target-env", target, output], capture_output=True, text=True)
+    result = subprocess.run(["spirv-val", "--target-env", target, output.name], cwd=tmp_path,
+                            capture_output=True, text=True, errors="replace")
     assert result.returncode == 0, result.stderr
     assert output.read_bytes()[4:8] == source.read_bytes()[4:8]
 
@@ -171,10 +180,10 @@ def test_lowers_in_bounds_geometry_interface_access_chains(tmp_path: Path) -> No
 
     def validate(name: str, assembly: str) -> None:
         module = tmp_path / f"{name}.spv"
-        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
-                       input=assembly, text=True, check=True)
-        result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)],
-                                capture_output=True, text=True)
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", module.name],
+                       cwd=tmp_path, input=assembly, text=True, check=True)
+        result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", module.name], cwd=tmp_path,
+                                capture_output=True, text=True, errors="replace")
         assert result.returncode == 0, result.stderr
 
     validate("geometry", geometry)
@@ -189,7 +198,7 @@ def gs_module(tmp_path):
     if not (HAVE_SPIRV and shutil.which("spirv-dis")):
         pytest.skip("needs SPIRV-Tools on PATH")
     source = tmp_path / "gs.spv"
-    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(source)],
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", source.name], cwd=tmp_path,
                    input=PHI_GS, text=True, check=True)
     return source
 
@@ -215,7 +224,9 @@ def test_cli_rejects_overlapping_paths_without_writing(tmp_path, gs_module, over
             pytest.skip(f"hard links unavailable: {e}")
 
     result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
-                             str(source), str(output), "--layout", str(layout)], capture_output=True, text=True)
+                             os.path.relpath(source, tmp_path), os.path.relpath(output, tmp_path),
+                             "--layout", os.path.relpath(layout, tmp_path)], cwd=tmp_path,
+                            capture_output=True, text=True, errors="replace")
     assert result.returncode == 2, result.stderr
     assert "same file" in result.stderr
     assert source.read_bytes() == original
@@ -229,11 +240,12 @@ def test_cli_accepts_distinct_module_and_layout_paths(tmp_path, gs_module):
     layout = tmp_path / "layout.json"
     original = gs_module.read_bytes()
     result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
-                             str(gs_module), str(output), "--layout", str(layout)], capture_output=True, text=True)
+                             gs_module.name, output.name, "--layout", layout.name], cwd=tmp_path,
+                            capture_output=True, text=True, errors="replace")
     assert result.returncode == 0, result.stderr
     assert gs_module.read_bytes() == original
     assert json.loads(layout.read_text(encoding="utf-8"))["topology"] == "triangle_strip"
-    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(output)], check=True)
+    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", output.name], cwd=tmp_path, check=True)
 
 
 def test_help_is_a_clean_exit_zero(capsys):

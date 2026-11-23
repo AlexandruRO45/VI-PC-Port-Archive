@@ -125,12 +125,14 @@ def test_vertex_shader_text():
 @pytest.mark.parametrize("clip,cull,params", [(0, 0, ()), (0, 0, (0,)), (1, 0, (0, 1)), (5, 2, (0, 2, 7)),
                                               (0, 0, tuple(range(18)))])
 def test_vertex_shader_validates(tmp_path, clip, cull, params):
-    asm = tmp_path / "vs.spvasm"
+    work = tmp_path / "tmp_測試"
+    work.mkdir()
+    asm = work / "vs.spvasm"
     asm.write_text(mesh_compute_vs.vs_spvasm(_vs_layout(clip, cull, params)), encoding="utf-8")
-    spv = tmp_path / "vs.spv"
-    for cmd in (["spirv-as", "--target-env", "vulkan1.2", str(asm), "-o", str(spv)],
-                ["spirv-val", "--target-env", "vulkan1.2", str(spv)]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
+    spv = work / "vs.spv"
+    for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm.name, "-o", spv.name],
+                ["spirv-val", "--target-env", "vulkan1.2", spv.name]):
+        r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, errors="replace")
         assert r.returncode == 0, r.stdout + r.stderr
 
 
