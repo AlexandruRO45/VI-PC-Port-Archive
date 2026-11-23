@@ -2,6 +2,7 @@
 
     python -I tests/test_shader_stats.py
 """
+import io
 import os
 import runpy
 import subprocess
@@ -260,6 +261,23 @@ class ShaderStats(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertNotIn("missing required", r.stderr)
         self.assertIn("no shader is in both", r.stderr)
+
+
+class ShaderStatsKeyTests(unittest.TestCase):
+    def test_blank_keys_are_rejected_but_blank_values_remain_valid(self):
+        load_stats = runpy.run_path(SCRIPT)["load_stats"]
+        header = "name,stage,statistic,value\n"
+        for row, field in ((",ps,Instructions,8", "name"), ("sample, ,Instructions,8", "stage"),
+                           ("sample,ps,,8", "statistic")):
+            with self.subTest(field=field), mock.patch.dict(load_stats.__globals__, {
+                "open": mock.Mock(return_value=io.StringIO(header + "sample,ps,VGPRs,4\n" + row + "\n"))
+            }):
+                with self.assertRaisesRegex(ValueError, f"line 3: blank identifying column\\(s\\): {field}"):
+                    load_stats("stats.csv")
+        with mock.patch.dict(load_stats.__globals__, {
+            "open": mock.Mock(return_value=io.StringIO(header + "sample,ps,Instructions,\n"))
+        }):
+            self.assertEqual(load_stats("stats.csv"), {("sample", "ps"): {"Instructions": ""}})
 
 
 if __name__ == "__main__":

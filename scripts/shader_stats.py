@@ -53,7 +53,8 @@ def original(path: str) -> tuple[int, int]:
     return len(insns), top
 
 
-REQUIRED = ("name", "stage", "statistic", "value")
+KEY_FIELDS = ("name", "stage", "statistic")
+REQUIRED = KEY_FIELDS + ("value",)
 
 
 def load_stats(path):
@@ -75,6 +76,9 @@ def load_stats(path):
             absent = [c for c in REQUIRED if row[c] is None]
             if absent:
                 raise ValueError(f"line {line}: row missing required column(s): {', '.join(absent)}")
+            blank = [c for c in KEY_FIELDS if not row[c].strip()]
+            if blank:
+                raise ValueError(f"line {line}: blank identifying column(s): {', '.join(blank)}")
             out[row["name"], row["stage"]][row["statistic"]] = row["value"]
     return out
 
