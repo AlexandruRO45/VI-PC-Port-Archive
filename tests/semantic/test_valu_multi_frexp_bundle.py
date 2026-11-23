@@ -243,5 +243,25 @@ class VFrexpExpI16F16TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_frexp_exp_f16", ["v_frexp_exp_i16_f16"])
 
+# -----------------------------------------------------------------------------
+# Opcode 2: v_frexp_mant_f16
+# -----------------------------------------------------------------------------
+class VFrexpMantF16OracleTests(unittest.TestCase):
+    def test_frexp_mant_f16_basic(self):
+        # 1.0 (0x3C00) -> 0.5 (0x3800)
+        self.assertEqual(oracle_frexp_mant_f16(0x3C00), 0x3800)
+        # -1.0 (0xBC00) -> -0.5 (0xB800)
+        self.assertEqual(oracle_frexp_mant_f16(0xBC00), 0xB800)
+
+    def test_frexp_mant_f16_special_values(self):
+        # +/-0.0 preserved
+        self.assertEqual(oracle_frexp_mant_f16(0x0000), 0x0000)
+        self.assertEqual(oracle_frexp_mant_f16(0x8000), 0x8000)
+        # +/-INF preserved
+        self.assertEqual(oracle_frexp_mant_f16(0x7C00), 0x7C00)
+        self.assertEqual(oracle_frexp_mant_f16(0xFC00), 0xFC00)
+        # NaN preserved
+        self.assertEqual(oracle_frexp_mant_f16(0x7E00), 0x7E00)
+
 if __name__ == "__main__":
     unittest.main()
