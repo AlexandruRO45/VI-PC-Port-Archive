@@ -254,5 +254,34 @@ class TestCeilSimdInteraction(unittest.TestCase):
         self.assertEqual(words[1], 0xC0000000)
 
 
+class TestCeilRegisterPreservation(unittest.TestCase):
+    """Commit 5: register aliasing and in-place operand preservation for v_ceil_f32."""
+
+    def test_in_place_aliasing_destination_equals_source(self):
+        lines = [
+            "v_mov_b32 v0, 0x40133333",  # 2.3 -> ceil = 3.0 (0x40400000)
+            "v_ceil_f32 v0, v0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_ceil_ps(lines, "ps_ceil_alias")
+        self.assertEqual(words[0], 0x40400000)
+
+    def test_preservation_of_adjacent_registers(self):
+        lines = [
+            "v_mov_b32 v0, 0x1111",
+            "v_mov_b32 v1, 0x40900000",  # 4.5 -> ceil = 5.0 (0x40A00000)
+            "v_mov_b32 v2, 0x2222",
+            "v_mov_b32 v3, 0x3333",
+            "v_ceil_f32 v1, v1",
+        ]
+        words = run_ceil_ps(lines, "ps_ceil_preserve")
+        self.assertEqual(words[0], 0x1111)
+        self.assertEqual(words[1], 0x40A00000)
+        self.assertEqual(words[2], 0x2222)
+        self.assertEqual(words[3], 0x3333)
+
+
 if __name__ == '__main__':
     unittest.main()
