@@ -966,8 +966,117 @@ def _parse_joint_names(raw: object, *, part_name: str) -> list[str] | None:
     return out
 
 
+_F32_MAX = 3.4028234663852886e38
+
+
+def _check_numbers(value: object, least: int, what: str, *, whole: bool = False) -> None:
+    """`value` is a list of at least `least` values the reader can take through float() (or int())."""
+    if not isinstance(value, (list, tuple)) or len(value) < least:
+        raise PedAssembleError(f"{what} must be a list of at least {least} numbers, got {value!r}")
+    for item in value:
+        try:
+            number = int(item) if whole else float(item)
+        except (TypeError, ValueError, OverflowError):
+            raise PedAssembleError(f"{what} must hold numbers, got {item!r}") from None
+        if not whole and not abs(number) <= _F32_MAX:       # NaN, an infinity, or past what the GLB's f32 holds
+            raise PedAssembleError(f"{what} must hold finite 32-bit floats, got {item!r}")
+
+
+def _check_rows(value: object, least: int, what: str, *, whole: bool = False) -> None:
+    """`value` is a list of rows, each a list of at least `least` numbers."""
+    if not isinstance(value, (list, tuple)):
+        raise PedAssembleError(f"{what} must be a list, got {value!r}")
+    for index, row in enumerate(value):
+        _check_numbers(row, least, f"{what}[{index}]", whole=whole)
+
+
+def _check_material_dict(raw: object, where: str) -> None:
+    """Refuse the material fields `_parse_material_dict` would trip over."""
+    if not isinstance(raw, dict):
+        return                                              # None, or the reader's own "must be a JSON object"
+    factor = raw.get("base_color_factor", raw.get("baseColorFactor", (0.8, 0.8, 0.8, 1.0)))
+    if not isinstance(factor, (list, tuple)):
+        raise PedAssembleError(f"{where}: base_color_factor must be a list of 3 or 4 numbers, got {factor!r}")
+    if len(factor) in (3, 4):                               # another length is the reader's own error
+        _check_numbers(factor, 3, f"{where}: base_color_factor")
+    for key, other in (("metallic_factor", "metallicFactor"), ("roughness_factor", "roughnessFactor")):
+        used = key if key in raw else other                 # the reader looks at the snake_case key first
+        if used in raw:
+            _check_numbers([raw[used]], 1, f"{where}: {used}")
+    if raw.get("alpha_cutoff") is not None:
+        _check_numbers([raw["alpha_cutoff"]], 1, f"{where}: alpha_cutoff")
+    for key in ("base_color_png", "baseColorPng", "normal_png", "normalPng",
+                "metallic_roughness_png", "metallicRoughnessPng"):
+        spec = raw.get(key)
+        if isinstance(spec, str) and spec.startswith("base64:"):
+            try:
+                decoded = base64.b64decode(spec[len("base64:"):])
+            except ValueError:                              # binascii.Error
+                decoded = b""
+            if not decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise PedAssembleError(f"{where}: {key} is not base64 of a PNG file")
+
+
+def _check_part_dict(raw: dict, name: str) -> None:
+    """Refuse a JSON part `_part_from_dict` cannot convert, with one message instead of a traceback."""
+    positions = raw.get("positions", [])
+    _check_rows(positions, 3, f"{name}: positions")
+    triangles = raw.get("triangles", raw.get("indices", [])) or []     # the reader takes a falsy value as none
+    if not isinstance(triangles, (list, tuple)):
+        raise PedAssembleError(f"{name}: triangles must be a list, got {triangles!r}")
+    if triangles and isinstance(triangles[0], (list, tuple)):
+        _check_rows(triangles, 3, f"{name}: triangles", whole=True)
+        indices = [int(v) for row in triangles for v in row[:3]]
+    else:
+        _check_numbers(triangles, 0, f"{name}: triangles", whole=True)
+        indices = [int(v) for v in triangles]
+    for index in indices:
+        if not 0 <= index < len(positions):
+            raise PedAssembleError(
+                f"{name}: triangle index {index} is outside the part's {len(positions)} positions")
+    for key, least in (("normals", 3), ("uvs", 2), ("colors", 3)):
+        if raw.get(key):
+            _check_rows(raw[key], least, f"{name}: {key}")
+    for key, whole in (("joints_0", True), ("weights_0", False), ("joints_1", True), ("weights_1", False)):
+        if not raw.get(key):
+            continue
+        _check_rows(raw[key], 4, f"{name}: {key}", whole=whole)
+        for index, row in enumerate(raw[key]):
+            if len(row) != 4:                               # the writer packs each as a VEC4
+                raise PedAssembleError(f"{name}: {key}[{index}] must hold 4 values, got {len(row)}")
+            if whole and not all(0 <= int(v) <= 0xFFFF for v in row):
+                raise PedAssembleError(f"{name}: {key}[{index}] must hold joint indices from 0 to 65535, got {row!r}")
+    _check_numbers(raw.get("translation", (0.0, 0.0, 0.0)), 3, f"{name}: translation")
+    _check_material_dict(raw.get("material"), f"{name}: material")
+
+
+def _check_skeleton_dict(raw: object) -> None:
+    """Refuse a manifest skeleton `_skeleton_from_dict` cannot convert."""
+    if not isinstance(raw, dict):
+        raise PedAssembleError(f"skeleton must be a JSON object, got {raw!r}")
+    joints = raw.get("joints", [])
+    if not isinstance(joints, list):
+        raise PedAssembleError(f"skeleton: joints must be a list, got {joints!r}")
+    for index, joint in enumerate(joints):
+        where = f"skeleton: joints[{index}]"
+        if not isinstance(joint, dict):
+            raise PedAssembleError(f"{where} must be a JSON object, got {joint!r}")
+        if "name" not in joint:
+            raise PedAssembleError(f"{where} has no name")
+        _check_numbers([joint.get("parent", -1)], 1, f"{where}: parent", whole=True)
+        _check_numbers(joint.get("translation", (0.0, 0.0, 0.0)), 3, f"{where}: translation")
+        _check_numbers(joint.get("rotation", (0.0, 0.0, 0.0, 1.0)), 4, f"{where}: rotation")
+        _check_numbers(joint.get("scale", (1.0, 1.0, 1.0)), 3, f"{where}: scale")
+        matrix = joint.get("inverse_bind_matrix", joint.get("inverseBindMatrix"))
+        if matrix is not None:
+            _check_numbers(matrix, 0, f"{where}: inverse_bind_matrix")
+    if raw.get("standing_offset") is not None:
+        _check_numbers([raw["standing_offset"]], 1, "skeleton: standing_offset")
+
+
 def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_dir: str) -> MeshPart:
     name = str(raw.get("name", default_name))
+    _check_part_dict(raw, name)
     positions = [(float(p[0]), float(p[1]), float(p[2])) for p in raw.get("positions", [])]
     triangles = _normalize_triangles(raw.get("triangles", raw.get("indices", [])))
     normals = [(float(n[0]), float(n[1]), float(n[2])) for n in raw["normals"]] if raw.get("normals") else None
@@ -1006,6 +1115,7 @@ def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_di
 def _skeleton_from_dict(raw: dict | None, default_space: str) -> SkeletonSpec | None:
     if raw is None:
         return None
+    _check_skeleton_dict(raw)
     joints = []
     for j in raw.get("joints", []):
         t = j.get("translation", (0.0, 0.0, 0.0))
@@ -1328,7 +1438,11 @@ def load_parts_from_path(
             skel = _skeleton_from_dict(data.get("skeleton"), default_space=data.get("coord_space", source_space))
             default_sp = str(data.get("coord_space", source_space))
             parts = []
+            if not isinstance(data["parts"], list):
+                raise PedAssembleError(f"{path}: parts must be a list")
             for idx, entry in enumerate(data["parts"]):
+                if isinstance(entry, dict) and "positions" not in entry and not isinstance(entry.get("path", ""), str):
+                    raise PedAssembleError(f"{path}: parts[{idx}].path must be a string, got {entry['path']!r}")
                 if isinstance(entry, str):
                     sub_path = entry if os.path.isabs(entry) else os.path.join(base_dir, entry)
                     sub_parts, _ = load_parts_from_path(sub_path, source_space=default_sp)
