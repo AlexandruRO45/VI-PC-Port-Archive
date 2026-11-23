@@ -443,6 +443,30 @@ class TestVAshrrevI16ConditionCodesAndStatusFlags(unittest.TestCase):
         # -32768 >> 1 = -16384 (0xC000)
         self.assertEqual(res, 0xC000)
 
+class TestVAshrrevI16BoundaryExtremes(unittest.TestCase):
+    """Part 7: Boundary extremes, negative sign extensions, and zero shifts."""
+
+    def test_exhaustive_shift_counts_on_negative_extrema(self) -> None:
+        # INT16_MIN = 0x8000 (-32768)
+        # Shift amounts from 0 to 15
+        for sh in range(16):
+            expected = ((-32768) >> sh) & MASK16
+            with self.subTest(shift=sh):
+                self.assertEqual(ref_v_ashrrev_i16(sh, 0x8000), expected)
+
+    def test_exhaustive_shift_counts_on_int16_max(self) -> None:
+        # INT16_MAX = 0x7FFF (+32767)
+        for sh in range(16):
+            expected = (32767 >> sh) & MASK16
+            with self.subTest(shift=sh):
+                self.assertEqual(ref_v_ashrrev_i16(sh, 0x7FFF), expected)
+
+    def test_minus_one_invariance(self) -> None:
+        # -1 (0xFFFF) shifted arithmetically by any amount remains -1 (0xFFFF)
+        for sh in range(16):
+            with self.subTest(shift=sh):
+                self.assertEqual(ref_v_ashrrev_i16(sh, 0xFFFF), 0xFFFF)
+
 
 if __name__ == '__main__':
     unittest.main()
