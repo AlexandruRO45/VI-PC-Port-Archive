@@ -81,6 +81,7 @@ const char* slot_name(unsigned slot) {
         case 9: return "CreateCommandAllocator (PC slot 9)";
         case 10: return "CreateGraphicsPipelineState (PC slot 10)";
         case 11: return "CreateComputePipelineState (PC slot 11)";
+        case 13: return "CheckFeatureSupport (answer logged)";
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
@@ -1005,6 +1006,36 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+// Device slot 13: CheckFeatureSupport(feature, data, size), answered by the real device unchanged. Its answers are
+// what a title decides on at start-up (docs/boot.md, questions 11 and 22), so the first call per feature id is logged
+// with the size, the HRESULT and the first 64 bytes of the structure after the call, and every call with XS_TRACE. A
+// few structures carry a caller's pointer (FEATURE_LEVELS' requested list), so such a line can hold an address.
+HRESULT proxy_check_feature_support(DeviceProxy* self, std::uint64_t feature, std::uint64_t data,
+                                    std::uint64_t size) {
+    note_slot(13);
+    const auto id = static_cast<std::uint32_t>(feature);
+    const auto bytes = static_cast<UINT>(size);
+    const HRESULT hr =
+        self->real->CheckFeatureSupport(static_cast<D3D12_FEATURE>(id), reinterpret_cast<void*>(data), bytes);
+    static std::atomic<bool> logged[256];
+    const bool first = id < std::size(logged) ? !logged[id].exchange(true, std::memory_order_relaxed) : true;
+    if (first || trace_enabled()) {
+        char answer[64 * 3 + 1] = {};
+        std::size_t used = 0;
+        if (SUCCEEDED(hr) && data) {
+            const auto* p = reinterpret_cast<const unsigned char*>(data);
+            for (UINT i = 0; i < bytes && i < 64; ++i) {
+                const int n = std::snprintf(answer + used, sizeof(answer) - used, " %02x", p[i]);
+                if (n < 0) break;
+                used += static_cast<std::size_t>(n);
+            }
+        }
+        std::fprintf(stderr, "[rt] d3d12_xs: CheckFeatureSupport feature %u size %u -> 0x%08lx%s%s%s\n", id, bytes,
+                     static_cast<unsigned long>(hr), used ? ":" : "", answer, bytes > 64 && used ? " ..." : "");
+    }
+    return hr;
+}
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1153,6 +1184,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                                      reinterpret_cast<void**>(a4)));
+    } else if constexpr (Slot == 13) {
+        return hr_to_u64(proxy_check_feature_support(self, a1, a2, a3));
     } else if constexpr (Slot == 14) {
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
@@ -1295,7 +1328,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    return slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+    return slot <= 2 || slot == 8 || slot == 9 || slot == 13 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
            slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
            slot == 75 || slot == 76;
 }
