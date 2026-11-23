@@ -128,6 +128,34 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertIn("ERROR: cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_window_and_top_below_one_are_usage_errors(self):
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            for flag, value in (("--window", "0"), ("--window", "-1"), ("--top", "0"), ("--top", "-1")):
+                with self.subTest(flag=flag, value=value):
+                    r = subprocess.run([sys.executable, "-I", TOOL, exe, flag, value],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn(f"argument {flag}: must be at least 1", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertNotIn("no direct call follows", r.stdout)
+
+    def test_explicit_window_and_top_still_find_the_caller(self):
+        data, lookup, decoy = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--window", "8", "--top", "2"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(f"0x{lookup:X}", r.stdout)
+            self.assertIn(f"0x{decoy:X}", r.stdout)
+            self.assertNotIn("no direct call follows", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

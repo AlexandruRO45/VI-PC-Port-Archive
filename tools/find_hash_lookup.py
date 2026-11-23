@@ -115,13 +115,24 @@ def rank(data, hashes, window=48, top=15):
     }
 
 
+def positive_int(text):
+    """--window 0 searched no bytes after a hash and --top 0 ranked nobody; the report blamed the window."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("exe")
     ap.add_argument("--hash", action="append", default=None,
                     help="model name or 0x hash (repeatable; default player_story000_00 and cs_mandy)")
-    ap.add_argument("--window", type=int, default=48, help="bytes after a hash searched for calls (default 48)")
-    ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--window", type=positive_int, default=48, help="bytes after a hash searched for calls (default 48)")
+    ap.add_argument("--top", type=positive_int, default=15)
     ap.add_argument("--json", help="also write the report here")
     a = ap.parse_args(argv)
     if a.json:
