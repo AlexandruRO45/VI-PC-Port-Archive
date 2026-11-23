@@ -11,69 +11,16 @@ if HERE not in sys.path:
 import support
 from support import rdna2spirv
 
-MASK32 = 0xFFFFFFFF
-NUM_VGPRS = 256
-NUM_SGPRS = 128
-
-
-def oracle_s_movrels_b32(dst: int, src: int, m0: int, sgprs: list[int]) -> list[int]:
-    out = list(sgprs)
-    idx = (src + m0) & (NUM_SGPRS - 1)
-    out[dst] = out[idx] & MASK32
-    return out
-
-
-def oracle_s_movrels_b64(dst: int, src: int, m0: int, sgprs: list[int]) -> list[int]:
-    out = list(sgprs)
-    idx0 = (src + m0) & (NUM_SGPRS - 1)
-    idx1 = (src + m0 + 1) & (NUM_SGPRS - 1)
-    out[dst] = out[idx0] & MASK32
-    out[dst + 1] = out[idx1] & MASK32
-    return out
-
-
-def oracle_v_movreld_b32(dst: int, src: int, m0: int, vgprs: list[int]) -> list[int]:
-    out = list(vgprs)
-    idx = (dst + m0) & (NUM_VGPRS - 1)
-    out[idx] = out[src] & MASK32
-    return out
-
-
-def oracle_v_movrels_b32(dst: int, src: int, m0: int, vgprs: list[int]) -> list[int]:
-    out = list(vgprs)
-    idx = (src + m0) & (NUM_VGPRS - 1)
-    out[dst] = out[idx] & MASK32
-    return out
-
-
-def oracle_v_movrelsd_b32(dst: int, src: int, m0: int, vgprs: list[int]) -> list[int]:
-    out = list(vgprs)
-    src_idx = (src + m0) & (NUM_VGPRS - 1)
-    dst_idx = (dst + m0) & (NUM_VGPRS - 1)
-    out[dst_idx] = out[src_idx] & MASK32
-    return out
-
-
-def oracle_v_movrelsd_2_b32(dst: int, src: int, m0: int, vgprs: list[int]) -> list[int]:
-    out = list(vgprs)
-    src_off = m0 & 0x3FF
-    dst_off = (m0 >> 16) & 0x3FF
-    src_idx = (src + src_off) & (NUM_VGPRS - 1)
-    dst_idx = (dst + dst_off) & (NUM_VGPRS - 1)
-    out[dst_idx] = out[src_idx] & MASK32
-    return out
-
-
 class TestSMovrelsB32Oracle(unittest.TestCase):
     def test_oracle_model_against_translator(self):
-        # Seed s20..s23 with sentinels and test m0 = 0, 1, 2
-        for m0 in (0, 1, 2):
+        # Seed s20..s22 with sentinels and test m0 = 0, 1, 2
+        cases = [
+            (0, 0x11112222),
+            (1, 0x33334444),
+            (2, 0x55556666),
+        ]
+        for m0, expected in cases:
             with self.subTest(m0=m0):
-                sgprs = [0] * NUM_SGPRS
-                sgprs[20] = 0x11112222
-                sgprs[21] = 0x33334444
-                sgprs[22] = 0x55556666
-                expected_sgprs = oracle_s_movrels_b32(10, 20, m0, sgprs)
                 lines = [
                     "s_mov_b32 s20, 0x11112222",
                     "s_mov_b32 s21, 0x33334444",
@@ -89,7 +36,7 @@ class TestSMovrelsB32Oracle(unittest.TestCase):
                 ]
                 spv = support.translate_lines(f"ps_smovrels_b32_oracle_{m0}", lines)
                 out = support.mrt0_words(spv)
-                self.assertEqual(out[0], expected_sgprs[10])
+                self.assertEqual(out[0], expected)
 
     def test_oracle_zero_offset(self):
         lines = [
@@ -108,11 +55,21 @@ class TestSMovrelsB32Oracle(unittest.TestCase):
         self.assertEqual(out[0], 0x77778888)
 
     def test_oracle_boundary_offset(self):
-        # Index wraps modulo 128
-        sgprs = [0] * NUM_SGPRS
-        sgprs[5] = 0x9999AAAA
-        expected = oracle_s_movrels_b32(10, 120, 13, sgprs)
-        self.assertEqual(expected[10], 0x9999AAAA)
+        # Index wraps modulo 128 (120 + 13 = 133 % 128 = 5)
+        lines = [
+            "s_mov_b32 s5, 0x9999AAAA",
+            "s_mov_b32 m0, 13",
+            "s_movrels_b32 s10, s120",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b32_boundary", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x9999AAAA)
 
 
 class TestSMovrelsB32AST(unittest.TestCase):
@@ -245,14 +202,12 @@ class TestSMovrelsB32Integration(unittest.TestCase):
 
 class TestSMovrelsB64Oracle(unittest.TestCase):
     def test_oracle_model_against_translator(self):
-        for m0 in (0, 2):
+        cases = [
+            (0, (0x11223344, 0x55667788)),
+            (2, (0x99AABBCC, 0xDDEEFF00)),
+        ]
+        for m0, (exp0, exp1) in cases:
             with self.subTest(m0=m0):
-                sgprs = [0] * NUM_SGPRS
-                sgprs[20] = 0x11223344
-                sgprs[21] = 0x55667788
-                sgprs[22] = 0x99AABBCC
-                sgprs[23] = 0xDDEEFF00
-                expected = oracle_s_movrels_b64(10, 20, m0, sgprs)
                 lines = [
                     "s_mov_b32 s20, 0x11223344",
                     "s_mov_b32 s21, 0x55667788",
@@ -269,16 +224,26 @@ class TestSMovrelsB64Oracle(unittest.TestCase):
                 ]
                 spv = support.translate_lines(f"ps_smovrels_b64_oracle_{m0}", lines)
                 out = support.mrt0_words(spv)
-                self.assertEqual(out[0], expected[10])
-                self.assertEqual(out[1], expected[11])
+                self.assertEqual(out[0], exp0)
+                self.assertEqual(out[1], exp1)
 
     def test_oracle_consecutive_words(self):
-        sgprs = [0] * NUM_SGPRS
-        sgprs[30] = 0xDEADBEEF
-        sgprs[31] = 0xFEEDFACE
-        expected = oracle_s_movrels_b64(12, 30, 0, sgprs)
-        self.assertEqual(expected[12], 0xDEADBEEF)
-        self.assertEqual(expected[13], 0xFEEDFACE)
+        lines = [
+            "s_mov_b32 s30, 0xDEADBEEF",
+            "s_mov_b32 s31, 0xFEEDFACE",
+            "s_mov_b32 m0, 0",
+            "s_movrels_b64 s[12:13], s[30:31]",
+            "v_mov_b32 v0, s12",
+            "v_mov_b32 v1, s13",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b64_consec", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0xDEADBEEF)
+        self.assertEqual(out[1], 0xFEEDFACE)
 
 
 class TestSMovrelsB64AST(unittest.TestCase):
@@ -396,9 +361,6 @@ class TestVMovreldB32Oracle(unittest.TestCase):
     def test_oracle_model_against_translator(self):
         for m0 in (0, 3):
             with self.subTest(m0=m0):
-                vgprs = [0] * NUM_VGPRS
-                vgprs[5] = 0x33445566
-                expected = oracle_v_movreld_b32(2, 5, m0, vgprs)
                 lines = [
                     "v_mov_b32 v5, 0x33445566",
                     f"s_mov_b32 m0, {m0}",
@@ -412,7 +374,7 @@ class TestVMovreldB32Oracle(unittest.TestCase):
                 ]
                 spv = support.translate_lines(f"ps_vmovreld_oracle_{m0}", lines)
                 out = support.mrt0_words(spv)
-                self.assertEqual(out[0], expected[2 + m0])
+                self.assertEqual(out[0], 0x33445566)
 
     def test_oracle_zero_offset(self):
         lines = [
@@ -541,12 +503,12 @@ class TestVMovreldB32Integration(unittest.TestCase):
 
 class TestVMovrelsB32Oracle(unittest.TestCase):
     def test_oracle_model_against_translator(self):
-        for m0 in (0, 2):
+        cases = [
+            (0, 0x44556677),
+            (2, 0x8899AABB),
+        ]
+        for m0, expected in cases:
             with self.subTest(m0=m0):
-                vgprs = [0] * NUM_VGPRS
-                vgprs[4] = 0x44556677
-                vgprs[6] = 0x8899AABB
-                expected = oracle_v_movrels_b32(1, 4, m0, vgprs)
                 lines = [
                     "v_mov_b32 v4, 0x44556677",
                     "v_mov_b32 v6, 0x8899AABB",
@@ -561,7 +523,7 @@ class TestVMovrelsB32Oracle(unittest.TestCase):
                 ]
                 spv = support.translate_lines(f"ps_vmovrels_oracle_{m0}", lines)
                 out = support.mrt0_words(spv)
-                self.assertEqual(out[0], expected[1])
+                self.assertEqual(out[0], expected)
 
     def test_oracle_base_read(self):
         lines = [
@@ -681,12 +643,12 @@ class TestVMovrelsB32Integration(unittest.TestCase):
 
 class TestVMovrelsdB32Oracle(unittest.TestCase):
     def test_oracle_model_against_translator(self):
-        for m0 in (0, 2):
+        cases = [
+            (0, 0x22222222),
+            (2, 0x44444444),
+        ]
+        for m0, expected in cases:
             with self.subTest(m0=m0):
-                vgprs = [0] * NUM_VGPRS
-                vgprs[2] = 0x22222222
-                vgprs[4] = 0x44444444
-                expected = oracle_v_movrelsd_b32(5, 2, m0, vgprs)
                 lines = [
                     "v_mov_b32 v2, 0x22222222",
                     "v_mov_b32 v4, 0x44444444",
@@ -701,7 +663,7 @@ class TestVMovrelsdB32Oracle(unittest.TestCase):
                 ]
                 spv = support.translate_lines(f"ps_vmovrelsd_oracle_{m0}", lines)
                 out = support.mrt0_words(spv)
-                self.assertEqual(out[0], expected[5 + m0])
+                self.assertEqual(out[0], expected)
 
     def test_oracle_identity_offset(self):
         lines = [
@@ -825,9 +787,6 @@ class TestVMovrelsd2B32Oracle(unittest.TestCase):
         # M0: dst_off in [25:16], src_off in [9:0]
         # m0 = (3 << 16) | 1 -> dst_off = 3, src_off = 1
         m0 = (3 << 16) | 1
-        vgprs = [0] * NUM_VGPRS
-        vgprs[3] = 0x12345678
-        expected = oracle_v_movrelsd_2_b32(5, 2, m0, vgprs)
         lines = [
             "v_mov_b32 v3, 0x12345678",
             f"s_mov_b32 m0, {m0}",
@@ -841,7 +800,7 @@ class TestVMovrelsd2B32Oracle(unittest.TestCase):
         ]
         spv = support.translate_lines("ps_vmovrelsd2_oracle", lines)
         out = support.mrt0_words(spv)
-        self.assertEqual(out[0], expected[8])
+        self.assertEqual(out[0], 0x12345678)
 
     def test_oracle_zero_offsets(self):
         lines = [
