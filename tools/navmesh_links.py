@@ -370,11 +370,15 @@ def main(argv=None):
     doc = scan(args.input, start=args.start, limit=args.limit)
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(doc, fh, indent=2)
-            fh.write("\n")
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(doc, fh, indent=2)
+                fh.write("\n")
+        except OSError as exc:
+            sys.stderr.write(f"error: cannot write {args.out}: {exc.strerror or exc}\n")
+            return 2
     if not args.quiet:
         print(json.dumps(doc, indent=2))
     return 0

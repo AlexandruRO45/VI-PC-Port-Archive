@@ -306,6 +306,10 @@ class NavmeshLinksTest(unittest.TestCase):
                 self.assertEqual(nl.main([rpf, "--out", rpf_upper]), 2)
                 with open(rpf, "rb") as fh:
                     self.assertEqual(fh.read(4), b"9FPR")
+            blocker = os.path.join(tmp, "afile")
+            with open(blocker, "w", encoding="utf-8") as fh:
+                fh.write("x")
+            self.assertEqual(nl.main([rpf, "--out", os.path.join(blocker, "report.json")]), 2)
 
 
 if __name__ == "__main__":
