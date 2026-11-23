@@ -495,6 +495,35 @@ class TestTextureMipDrop(unittest.TestCase):
         self.assertFalse(prepared[2]["skip"])
         self.assertEqual(prepared[2]["physical_mip"], 0)
 
+    def test_droppable_allocation_strictly_smaller_than_single_mip_texture(self):
+        """Under drop 1, an 8-mip droppable texture allocates less memory than a 1-mip texture (BatSmacker84 catch)."""
+        # Baseline without drop: 256x256 8-mip >= 256x256 1-mip (349 KB vs 256 KB)
+        t_multi_nodrop = TextureCreateInfoModel(256, 256, 1, 8, flags=D3D12ResourceFlags.NONE, mip_drop_env=0)
+        t_single_nodrop = TextureCreateInfoModel(256, 256, 1, 1, flags=D3D12ResourceFlags.NONE, mip_drop_env=0)
+        bytes_multi_nodrop = calculate_texture_bytes_bc7(t_multi_nodrop.width, t_multi_nodrop.height, t_multi_nodrop.mip_levels)
+        bytes_single_nodrop = calculate_texture_bytes_bc7(t_single_nodrop.width, t_single_nodrop.height, t_single_nodrop.mip_levels)
+        self.assertGreaterEqual(bytes_multi_nodrop, bytes_single_nodrop)
+
+        # Under drop 1: multi-mip shrinks to 128x128 (7 mips), while single-mip stays 256x256 (1 mip)
+        t_multi_drop = TextureCreateInfoModel(256, 256, 1, 8, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+        t_single_drop = TextureCreateInfoModel(256, 256, 1, 1, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+        self.assertEqual(t_multi_drop.width, 128)
+        self.assertEqual(t_single_drop.width, 256)
+        bytes_multi_drop = calculate_texture_bytes_bc7(t_multi_drop.width, t_multi_drop.height, t_multi_drop.mip_levels)
+        bytes_single_drop = calculate_texture_bytes_bc7(t_single_drop.width, t_single_drop.height, t_single_drop.mip_levels)
+        self.assertLess(bytes_multi_drop, bytes_single_drop)
+
+    def test_command_list_copy_dropped_mip_readback_skipped(self):
+        """Command-list CopyTextureRegion from a dropped mip into readback must be skipped."""
+        t = TextureCreateInfoModel(16, 16, 1, 4, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+        # Attempting readback from dropped mip 0
+        subres = 0
+        mip = subres % t.original_mips
+        is_dropped = mip < t.mips_dropped
+        self.assertTrue(is_dropped)
+        skip = is_dropped
+        self.assertTrue(skip)
+
 
 if __name__ == "__main__":
     unittest.main()

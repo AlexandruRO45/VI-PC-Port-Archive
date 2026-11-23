@@ -113,14 +113,16 @@ int main() {
     EXPECT(tex2d->GetDesc().Width == 16);
 
     // 1b. Strict Mip-Drop Verification: GetResourceAllocationInfo must report reduced memory
-    // for a droppable sampled texture vs a protected render-target texture of identical dimensions.
-    // (Fails on main where drop is ignored; passes here where physical allocation is ~75% smaller).
+    // for a droppable sampled texture vs a 1-mip texture of identical width/height.
+    // On main (where drop is ignored), an 8-mip texture requires >= bytes of its top mip (256 KiB)
+    // and is >= single-mip texture size (256 KiB). Under drop 1, the physical image is 128x128 (7 mips, ~128 KiB),
+    // which is strictly smaller than the 1-mip texture and strictly less than top mip bytes 256*256*4.
     const auto desc_droppable = tex2d_desc(256, 256, 8, DXGI_FORMAT_R8G8B8A8_UNORM);
-    auto desc_protected = desc_droppable;
-    desc_protected.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const auto desc_single_mip = tex2d_desc(256, 256, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
     const auto alloc_droppable = device->GetResourceAllocationInfo(0, 1, &desc_droppable);
-    const auto alloc_protected = device->GetResourceAllocationInfo(0, 1, &desc_protected);
-    EXPECT(alloc_droppable.SizeInBytes < alloc_protected.SizeInBytes);
+    const auto alloc_single_mip = device->GetResourceAllocationInfo(0, 1, &desc_single_mip);
+    EXPECT(alloc_droppable.SizeInBytes < alloc_single_mip.SizeInBytes);
+    EXPECT(alloc_droppable.SizeInBytes < 256 * 256 * 4);
 
     // 2. 3D Volume Texture (8x8x4, 3 mips): with drop 1, width=4, height=4, depth=2.
     Ref<ID3D12Resource> tex3d;
@@ -144,6 +146,16 @@ int main() {
     const auto rdesc = buffer_desc(4096);
     EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &rdesc,
                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))));
+
+    // Readback buffer for dropped mip 0: pre-fill with sentinel 0xCD.
+    // Because mip 0 copy from texture is skipped under drop 1, this sentinel remains untouched.
+    Ref<ID3D12Resource> readback_dropped;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &rdesc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_dropped.p))));
+    void* r0_map = nullptr;
+    EXPECT(SUCCEEDED(readback_dropped->Map(0, nullptr, &r0_map)));
+    std::memset(r0_map, 0xCD, 256);
+    readback_dropped->Unmap(0, nullptr);
 
     // 4. Command List:
     // A. Dropped-mip barrier (b0): subresource 0 is dropped.
@@ -223,6 +235,23 @@ int main() {
     dst_rb.PlacedFootprint.Footprint.RowPitch = 256;
     list->CopyTextureRegion(&dst_rb, 0, 0, 0, &src_tex, nullptr);
 
+    // E2. Copy from dropped mip 0 to readback_dropped: must be gracefully skipped (p.skip = true)
+    D3D12_TEXTURE_COPY_LOCATION src_dropped{};
+    src_dropped.pResource = tex2d.p;
+    src_dropped.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_dropped.SubresourceIndex = 0; // dropped mip
+
+    D3D12_TEXTURE_COPY_LOCATION dst_dropped{};
+    dst_dropped.pResource = readback_dropped.p;
+    dst_dropped.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_dropped.PlacedFootprint.Offset = 0;
+    dst_dropped.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst_dropped.PlacedFootprint.Footprint.Width = 16;
+    dst_dropped.PlacedFootprint.Footprint.Height = 16;
+    dst_dropped.PlacedFootprint.Footprint.Depth = 1;
+    dst_dropped.PlacedFootprint.Footprint.RowPitch = 256;
+    list->CopyTextureRegion(&dst_dropped, 0, 0, 0, &src_dropped, nullptr);
+
     // F. All subresources barrier to PIXEL_SHADER_RESOURCE
     D3D12_RESOURCE_BARRIER ball{};
     ball.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -293,6 +322,52 @@ int main() {
     const auto* rb_bytes = static_cast<const unsigned char*>(readback_map);
     EXPECT(rb_bytes[0] == 0xAB);
     readback->Unmap(0, nullptr);
+
+    // 7b. Verify that dropped-mip copy to readback_dropped was skipped (sentinel 0xCD untouched)
+    void* r0_read = nullptr;
+    EXPECT(SUCCEEDED(readback_dropped->Map(0, nullptr, &r0_read)));
+    EXPECT(r0_read != nullptr);
+    const auto* r0_bytes = static_cast<const unsigned char*>(r0_read);
+    EXPECT(r0_bytes[0] == 0xCD);
+    readback_dropped->Unmap(0, nullptr);
+
+    // 8. CPU-visible custom heap texture (8x8, 2 mips):
+    // Under drop 1, mip 0 is dropped and physical image is 4x4, 1 mip.
+    D3D12_HEAP_PROPERTIES custom_heap{};
+    custom_heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+    custom_heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    custom_heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+
+    Ref<ID3D12Resource> tex_cpu;
+    const auto desc_cpu = tex2d_desc(8, 8, 2, DXGI_FORMAT_R8G8B8A8_UNORM);
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&custom_heap, D3D12_HEAP_FLAG_NONE, &desc_cpu,
+                                                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex_cpu.p))));
+
+    // ReadFromSubresource on dropped mip 0: must pitch-aware zero-fill without touching trailing padding
+    unsigned char dest[256];
+    std::memset(dest, 0xEE, sizeof(dest));
+    EXPECT(SUCCEEDED(tex_cpu->ReadFromSubresource(dest, 32, 256, 0, nullptr)));
+    EXPECT(dest[0] == 0);
+    EXPECT(dest[31] == 0);
+    EXPECT(dest[32] == 0);
+    EXPECT(dest[255] == 0xEE);
+
+    // WriteToSubresource on dropped mip 0: graceful no-op
+    unsigned char src_data[256];
+    std::memset(src_data, 0x42, sizeof(src_data));
+    EXPECT(SUCCEEDED(tex_cpu->WriteToSubresource(0, nullptr, src_data, 32, 256)));
+
+    // Retained mip 1 write & readback:
+    std::memset(dest, 0, sizeof(dest));
+    EXPECT(SUCCEEDED(tex_cpu->WriteToSubresource(1, nullptr, src_data, 16, 256)));
+    EXPECT(SUCCEEDED(tex_cpu->ReadFromSubresource(dest, 16, 256, 1, nullptr)));
+    EXPECT(dest[0] == 0x42);
+    EXPECT(dest[15] == 0x42);
+
+    // Map probe on dropped mip 0 vs pointer rejection
+    void* map_ptr = nullptr;
+    EXPECT(FAILED(tex_cpu->Map(0, nullptr, &map_ptr)));
+    EXPECT(SUCCEEDED(tex_cpu->Map(0, nullptr, nullptr)));
 
     std::printf("d3d12_texture_mip_drop_test: PASS\n");
     return 0;
