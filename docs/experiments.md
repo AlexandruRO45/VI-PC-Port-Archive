@@ -3773,17 +3773,17 @@ python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --tools-path "$ru
 
 Add `--calibration path/to/profile.json` to retry strict decode failures using a local version-1 Leonida profile. This option requires NumPy and the calibration library. Use it by itself or with `--require-rust`. The separate legacy history mode uses `--allow-provisional --history`. Output produced by the local profile has `"mode": "fitted"` in the manifest.
 
-To delegate an entire batch to Rust, build the standalone Leonida exporter at the pinned revision and pass its path with `--rust-exporter`. The executable parses the index, schedules workers, rebuilds and detiles blocks, and writes the DDS files and manifest. It defaults to strict export. Add `--calibration` for fitted retry with a local profile. The CLI covers supported BC layouts and supplied histories. Use the reference path above for legacy `--allow-provisional --history` and reference-only layouts or histories.
+For Xbox 1.0.2.1, build the pinned standalone Leonida exporter and pass `--xbox-1.0.2.1` with `--rust-exporter`. The wrapper loads the bundled shared calibration and 161 asset-key recipes, and asks Rust to prefer fitted decoding. The verification covered all 51,156 textures in the BCPack catalog across 55 pools. Other inputs can use the strict default or an explicitly supplied version-1 calibration. Use the reference path above for Python history files.
 
 ```powershell
 $batchCheckout = "$out/Leonida-rust-batch"
-$batchCommit = 'cde8956d2124327f076ab0f9b1ca903f6d70152b'
+$batchCommit = 'b5d30a86f3abec47bf54da4f6f9f26aab6f52e82'
 git init "$batchCheckout"
 git -C "$batchCheckout" fetch --depth=1 https://github.com/wish131400/Leonida.git $batchCommit
 git -C "$batchCheckout" checkout --detach $batchCommit
 $batchTarget = "$out/bcpack-dds"
 cargo build --release --locked --manifest-path "$batchCheckout/tools/bcpack_dds/Cargo.toml" --target-dir "$batchTarget"
-python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --rust-exporter "$batchTarget/release/bcpack_dds.exe" --threads 8
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --rust-exporter "$batchTarget/release/bcpack_dds.exe" --xbox-1.0.2.1 --threads 8
 ```
 
 ### Drawing BC7 textures with a recompiled pixel shader
