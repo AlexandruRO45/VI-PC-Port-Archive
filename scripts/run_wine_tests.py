@@ -15,6 +15,7 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
+A test whose CTest REQUIRED_FILES are missing from the Linux checkout fails without starting Wine, as CTest does.
 """
 import argparse
 from graphlib import CycleError, TopologicalSorter
@@ -175,6 +176,16 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         return "fail", f"CTest working directory is not a directory: {listed_cwd} (mapped to {cwd})"
     if cwd is None:
         cwd = os.path.dirname(exe)
+    for listed in props.get("REQUIRED_FILES", []):
+        # CTest checks these before it starts the test; a relative one is found from the working directory.
+        if ntpath.isabs(listed) or ntpath.splitdrive(listed)[0]:
+            path = map_path(listed, args.windows_root, args.root)
+            if path is None:
+                return "fail", f"required file is outside the Windows checkout: {listed}"
+        else:
+            path = os.path.join(cwd, *norm(listed).split("/"))
+        if not os.path.exists(path):
+            return "fail", f"required file not found: {listed} (looked for {path})"
     assignments = props.get("ENVIRONMENT", [])
     if not isinstance(assignments, list):
         return "fail", "invalid CTest ENVIRONMENT: expected a list of NAME=value entries"
@@ -291,6 +302,8 @@ def valid_test_property(entry) -> bool:
     name, value = entry["name"], entry["value"]
     if name == "WORKING_DIRECTORY":
         return isinstance(value, str) and "\0" not in value
+    if name == "REQUIRED_FILES":
+        return isinstance(value, list) and all(isinstance(p, str) and p and "\0" not in p for p in value)
     if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
         return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
     return True

@@ -367,6 +367,29 @@ subprocess.Popen([sys.executable, {helper!r}])
                 self.assertIn(cwd, detail)
                 run.assert_not_called()
 
+    def test_required_files_use_working_directory_and_artifact_paths(self):
+        exe = self.exiting(0)
+        cwd = self.artifact / "work"
+        (cwd / "sub").mkdir(parents=True)
+        (cwd / "sub" / "relative.txt").touch()
+        (self.artifact / "absolute.txt").touch()
+        entry = ctest_entry("files", self.command_for(exe), {
+            "WORKING_DIRECTORY": WINDOWS_ROOT + "/artifact/work",
+            "REQUIRED_FILES": [r"sub\relative.txt", WINDOWS_ROOT + "/artifact/absolute.txt"],
+        })
+        status, detail = self.run_entry(entry)
+        self.assertEqual(status, "pass", detail)
+
+    def test_absolute_required_file_outside_checkout_cannot_be_mapped(self):
+        entry = ctest_entry("files", self.command_for(self.exiting(0)), {
+            "REQUIRED_FILES": ["C:/outside.txt"],
+        })
+        with mock.patch.object(rwt, "run_test_process") as launch:
+            status, detail = self.run_entry(entry)
+        launch.assert_not_called()
+        self.assertEqual(status, "fail")
+        self.assertIn("outside the Windows checkout: C:/outside.txt", detail)
+
 
 @unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")
 class DriveMapTest(unittest.TestCase):
@@ -516,6 +539,26 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))], "--require", "bad")
         self.assertEqual(code, 1)
         self.assertIn("required tests that did not pass: bad", out)
+
+    def test_a_missing_required_file_fails_without_starting_wine(self):
+        (self.artifact / "present.txt").touch()
+        entry = ctest_entry("files", self.command("ok.py"), {
+            "REQUIRED_FILES": ["present.txt", "absent.txt"],
+        })
+        with mock.patch.object(rwt, "run_test_process") as launch:
+            code, out, _ = self.run_main([entry], "--require", "files")
+        launch.assert_not_called()
+        self.assertEqual(code, 1, out)
+        self.assertIn("[FAIL] files", out)
+        self.assertIn("required file not found: absent.txt", out)
+
+    def test_invalid_required_file_properties_are_rejected(self):
+        for value in ("data.txt", [12], ["bad\0path"]):
+            with self.subTest(value=value):
+                entry = ctest_entry("files", self.command("ok.py"), {"REQUIRED_FILES": value})
+                code, _, err = self.run_main([entry])
+                self.assertEqual(code, 2)
+                self.assertIn("not the output of ctest", err)
 
     def test_a_required_test_that_is_not_listed_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "absent")
