@@ -123,13 +123,25 @@ def strip_hash_comments(text):
     return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
 
 
+def holds_files(folder):
+    """True when a folder holds a file anywhere in it."""
+    for _, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        if any(not f.startswith(".") for f in files):
+            return True
+    return False
+
+
 def needed(root):
     """{tools entry: why} for everything under tools/ the Runtime jobs read."""
     tools = os.path.join(root, "tools")
     entries = os.listdir(tools)
     modules = {e[:-3] for e in entries if e.endswith(".py")}
     data = {e for e in entries if os.path.isfile(os.path.join(tools, e)) and not e.endswith(".py")}
-    subdirs = {e for e in entries if os.path.isdir(os.path.join(tools, e)) and not e.startswith((".", "__"))}
+    # An empty folder reads nothing (a run's leftover, such as an untracked tools/fssm); counting it demanded a path
+    # filter for a directory no job can use and failed a clean tree that happened to have one.
+    subdirs = {e for e in entries if os.path.isdir(os.path.join(tools, e)) and not e.startswith((".", "__"))
+               and holds_files(os.path.join(tools, e))}
 
     def entry(name):
         name = name.rstrip(".")
@@ -284,6 +296,24 @@ class SyntheticTreeTest(unittest.TestCase):
                             "tools/formats.json", "tools/subgroup_info.py", "tools/runner.py"):
                 self.assertIn(f"{missing}: missing", issues)
             self.assertIn("tools/gone.py: listed but does not exist", issues)
+
+    def test_an_empty_folder_under_tools_needs_no_filter_entry(self):
+        # A working copy can hold a leftover empty folder whose name a runtime script also spells: an untracked
+        # tools/fssm beside runtime/test/shaders/build.py's `work/fssm`, which made the check demand a filter entry for
+        # a folder that reads nothing. Count a folder only when it holds a file.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(tmp, ["tools/translator.py", "tools/lanes.py", "tools/late.py", "tools/oracle/**",
+                             "tools/helper.py", "tools/formats.json", "tools/subgroup_info.py",
+                             "tools/runner.py"])
+            folder = os.path.join(tmp, "tools", "leftover")
+            os.makedirs(os.path.join(folder, "nested"))
+            with open(os.path.join(folder, ".hidden"), "w", encoding="utf-8") as f:
+                f.write("x\n")            # a dotfile is not a dependency either
+            # A runtime script that spells the same name, as build.py spells work/fssm.
+            with open(os.path.join(tmp, "runtime", "test", "shaders", "uses.py"), "w", encoding="utf-8") as f:
+                f.write("OUT = 'leftover'\n")
+            self.assertNotIn("tools/leftover/**", needed(tmp))
+            self.assertEqual(problems(tmp), [])
 
     def test_lists_that_differ_are_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
