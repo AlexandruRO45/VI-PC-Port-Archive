@@ -222,7 +222,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
-<<<<<<< HEAD
   # Audio boot shims: AcpHal.dll, xapu.dll and chad.dll. Resolves every name through the registry and calls it with
   # valid, null and fake arguments. The three measured out-pointer calls get real buffers. No game data, no device.
   add_executable(audio_stub_test
