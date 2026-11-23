@@ -518,6 +518,30 @@ class FolderModeStoredBytesTest(unittest.TestCase):
                         with self.assertRaises(ValueError):
                             restofworld_index.scan_dir(tmp)
 
+    def test_non_finite_summary_count_names_the_field(self):
+        # json decodes 1e400 as infinity, and int() on it raises OverflowError, which main does not
+        # catch; NaN reached int() as a ValueError whose message never said which field was broken.
+        for bad in ("1e400", "-1e400", "NaN"):
+            with self.subTest(bad=bad):
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.make(tmp, with_index=False)
+                    with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                        f.write('{"summary": {"span": %s}, "files": [{"off": 4096, "stored": 300}]}' % bad)
+                    with self.assertRaises(ValueError) as caught:
+                        restofworld_index.scan_dir(tmp)
+                    self.assertIn("span", str(caught.exception))
+
+    def test_cli_non_finite_summary_count_is_one_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, with_index=False)
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                f.write('{"summary": {"span": 1e400}, "files": [{"off": 4096, "stored": 300}]}')
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, os.path.join(tmp, "report.json"), "--quiet"],
+                                  capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertIn("span", proc.stderr)
+
     def test_cli_non_number_summary_count_is_one_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.make(tmp, with_index=False)

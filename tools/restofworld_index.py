@@ -382,12 +382,15 @@ def _carve_index(path):
 
 
 def _summary_count(value, field):
-    """int() for an index.json summary count. A non-number (null, list, dict) is a ValueError naming the
-    field, which main reports as one line, not the TypeError traceback int() would otherwise raise."""
+    """int() for an index.json summary count. Anything int() cannot turn into a byte count (a null, list
+    or dict; a JSON literal like 1e400 that decodes to infinity; a NaN) is a ValueError naming the field,
+    which main reports as one line, not the TypeError, OverflowError or bare ValueError it would give."""
     try:
         return int(value)
     except TypeError:
         raise ValueError(f"index.json summary {field} must be a number, not {type(value).__name__}") from None
+    except (OverflowError, ValueError):
+        raise ValueError(f"index.json summary {field} must be a finite byte count, not {value!r}") from None
 
 
 def scan_dir(path, max_inflate=MAX_INFLATE):
