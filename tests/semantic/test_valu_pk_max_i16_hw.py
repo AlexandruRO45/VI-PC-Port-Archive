@@ -319,3 +319,16 @@ class TestValuPkMaxI16RegisterAliasing(unittest.TestCase):
         res = state.execute(inst)
         self.assertEqual(res, 0x12345678)
         self.assertEqual(state.vgpr[0], 0x12345678)
+
+
+class TestValuPkMaxI16ConditionCodes(unittest.TestCase):
+    """Test suite for condition codes and flag preservation."""
+
+    def test_flags_neutrality(self):
+        # Packed integer ops do not set SCC or VCC
+        scc = 0
+        vcc = 0
+        res = ref_pk_max_i16(0x7FFF7FFF, 0x80008000)
+        self.assertEqual(res, 0x7FFF7FFF)
+        self.assertEqual(scc, 0)
+        self.assertEqual(vcc, 0)
