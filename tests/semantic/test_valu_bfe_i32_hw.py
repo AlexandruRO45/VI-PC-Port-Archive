@@ -476,12 +476,72 @@ class TestBoundaryExtremes(unittest.TestCase):
         self.assertEqual(ref_bfe_i32(0x7FC00000, 31, 1), 0)
 
     def test_integer_overflow_extremes(self):
-        # 0x7FFFFFFF (INT_MAX): bits 0..30 all 1s, bit 31 is 0
-        self.assertEqual(ref_bfe_i32(0x7FFFFFFF, 0, 31), 0x7FFFFFFF)
-        # 0x80000000 (INT_MIN): bit 31 is 1, lower 31 bits are 0
+        # 0x7FFFFFFF: width=31 field bits 0..30 are all 1s.
+        # Bit 30 is the sign bit of the 31-bit field: it is 1, so the result is sign-extended to -1.
+        self.assertEqual(ref_bfe_i32(0x7FFFFFFF, 0, 31), 0xFFFFFFFF)
+        # 0x3FFFFFFF: bits 0..30, sign bit (bit 30) = 0 -> stays positive
+        self.assertEqual(ref_bfe_i32(0x3FFFFFFF, 0, 31), 0x3FFFFFFF)
+        # 0x80000000 (INT_MIN): bit 31 is 1, lower 31 bits are all 0
         self.assertEqual(ref_bfe_i32(0x80000000, 0, 31), 0)
-        # Extract full 32 bits from INT_MIN
-        self.assertEqual(ref_bfe_i32(0x80000000, 0, 32), 0x80000000)
+        # width=32 is masked mod 32 to give 0, so result is 0
+        self.assertEqual(ref_bfe_i32(0x80000000, 0, 32), 0)
+
+
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_negative_dst_rejection(self):
+        with self.assertRaises(TypeError):
+            VBfeI32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+
+    def test_out_of_bounds_register_rejection(self):
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_mutation_unsigned_vs_signed_bfe(self):
+        # Unsigned bitfield extract does not sign-extend:
+        # For base=0x80000000, offset=31, width=1:
+        # Signed BFE returns 0xFFFFFFFF (-1)
+        # Unsigned BFE returns 0x1
+        val = 0x80000000
+        signed_result = ref_bfe_i32(val, 31, 1)
+        unsigned_result = (val >> 31) & 1
+        self.assertNotEqual(signed_result, unsigned_result)
+        self.assertEqual(signed_result, 0xFFFFFFFF)
+        self.assertEqual(unsigned_result, 1)
+
+    def test_mutation_dropped_sign_extension(self):
+        # If sign extension step (field -= 1 << width) is omitted:
+        # base=0xFFFFFFF0, offset=2, width=4 -> raw field is 0xC (12)
+        # With sign extension it is -4 (0xFFFFFFFC)
+        raw_field = (0xFFFFFFF0 >> 2) & 0xF
+        proper_result = ref_bfe_i32(0xFFFFFFF0, 2, 4)
+        self.assertNotEqual(raw_field, proper_result)
+        self.assertEqual(raw_field, 0xC)
+        self.assertEqual(proper_result, 0xFFFFFFFC)
+
+    def test_mutation_offset_and_width_mask(self):
+        # Offset and width must be masked mod 32:
+        # offset=36 & 31 = 4; width=40 & 31 = 8
+        res_masked = ref_bfe_i32(0x12345678, 36, 40)
+        res_direct = ref_bfe_i32(0x12345678, 4, 8)
+        self.assertEqual(res_masked, res_direct)
+        self.assertEqual(res_masked, 0x67)
+
+    def test_rejection_invalid_operands_in_translator(self):
+        # Too few arguments to v_bfe_i32 causes a translator error
+        bad_lines = [
+            "v_bfe_i32 v3, v0, 1",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bfe_bad_args", bad_lines)
 
 
 if __name__ == "__main__":
