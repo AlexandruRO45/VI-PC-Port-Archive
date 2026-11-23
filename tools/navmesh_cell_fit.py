@@ -176,14 +176,18 @@ def summarise(meshes, min_fraction=0.9):
     return out
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive", help="navmeshes.rpf")
     ap.add_argument("--common", help="a tools/rpf9_carve.py carve of common.rpf (CVehiclePoints counts, hash search)")
     ap.add_argument("--out", help="write the summary as JSON here")
     ap.add_argument("--min-fraction", type=float, default=0.9)
     ap.add_argument("--static-every", type=int, default=0, help="also measure every Nth static tile as a control")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    if not os.path.isfile(a.archive):
+        ap.error(f"{a.archive}: no such file")
+    if a.common and not os.path.isdir(a.common):
+        ap.error(f"{a.common}: no such folder (a carve of common.rpf)")
     if a.out and same_report_path(a.out, a.archive):
         ap.error("--out would overwrite the archive")
     hashes, docs = None, None

@@ -1,7 +1,10 @@
 """tools/navmesh_cell_fit.py: the grid fit, its chance baseline and the per-cell summary, on synthetic vertices.
 No game files."""
+import contextlib
+import io
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
@@ -44,6 +47,29 @@ class CellFit(unittest.TestCase):
         self.assertIn(cf.nd.joaat_cs("wagon01"), h)
         self.assertIn(cf.nd.joaat_cs("Wagon01.yft"), h)
         self.assertEqual(len(h), 4)
+
+
+class MissingInputs(unittest.TestCase):
+    """A missing path is one line and exit 2: no FileNotFoundError traceback, no 0-document report."""
+
+    def run_main(self, *argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            cf.main(list(argv))
+        return cm.exception.code, err.getvalue()
+
+    def test_missing_archive_is_one_line_and_exit_2(self):
+        code, err = self.run_main(os.path.join(tempfile.gettempdir(), "no-such-navmeshes.rpf"))
+        self.assertEqual(code, 2)
+        self.assertIn("no such file", err)
+
+    def test_missing_common_folder_is_an_error_not_a_zero_document_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            archive = os.path.join(d, "navmeshes.rpf")
+            open(archive, "wb").close()              # the archive check passes; --common is checked before any scan
+            code, err = self.run_main(archive, "--common", os.path.join(d, "nope"))
+        self.assertEqual(code, 2)
+        self.assertIn("no such folder", err)
 
 
 if __name__ == "__main__":
