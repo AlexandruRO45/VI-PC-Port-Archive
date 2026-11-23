@@ -24,6 +24,47 @@ void write(const std::filesystem::path& p, const std::string& text) {
     std::ofstream(p, std::ios::binary) << text;
 }
 
+void swap_table_checks() {
+    using namespace leonida::mods;
+    for (unsigned count : {0u, 1u, 8u, 511u, 512u, 513u, 1024u}) {
+        Mod first, later, disabled;
+        disabled.enabled = false;
+        // Permute insertion order, leave gaps for misses, and override each key both within and across mods.
+        for (unsigned i = 0; i < count; ++i) {
+            const uint32_t from = 2 * ((i * 37) % count);
+            first.archetype_swaps.push_back({from, from + 3});
+            first.archetype_swaps.push_back({from, from + 5});
+            if (i % 3 == 0) later.archetype_swaps.push_back({from, from + 7});
+            disabled.archetype_swaps.push_back({from, from + 9});
+        }
+        const std::vector<Mod> mods{first, later, disabled};
+        const ArchetypeSwaps table(mods);
+        check(table.size() == count, "swap table size counts distinct enabled source hashes");
+        bool matches = true;
+        for (uint32_t query = 0; query < 2 * count + 2; ++query) {
+            // Reference the manifests in order, without using a sorted table or following a replacement.
+            uint32_t expected = query;
+            for (const Mod& mod : mods)
+                if (mod.enabled)
+                    for (const auto& swap : mod.archetype_swaps)
+                        if (swap.from == query) expected = swap.to;
+            matches = matches && table.remap(query) == expected;
+        }
+        check(matches, "unsorted swaps, repeated overrides, disabled mods and gaps match manifest order");
+    }
+    Mod edges;
+    // Enough entries to take the large-table path; include both ends of uint32, cycles and a chain.
+    for (uint32_t i = 0; i < 512; ++i) edges.archetype_swaps.push_back({i, i + 1});
+    edges.archetype_swaps.push_back({0, 0xffffffffu});
+    edges.archetype_swaps.push_back({0xffffffffu, 0});
+    const ArchetypeSwaps table({edges});
+    check(table.size() == 513 && table.remap(0) == 0xffffffffu && table.remap(0xffffffffu) == 0,
+          "uint32 boundary keys and a swap cycle each resolve once");
+    check(table.remap(1) == 2 && table.remap(2) == 3, "a swap chain is not followed recursively");
+    check(table.remap(512) == 512 && table.remap(0xfffffffeu) == 0xfffffffeu,
+          "misses between and after sorted keys leave the hash unchanged");
+}
+
 }  // namespace
 
 int main() {
@@ -157,6 +198,7 @@ int main() {
     check(mandy_only.remap(0xE472B687u) == 0xD7C0CDFFu, "the Mandy mod swaps Lucia's player model for cs_mandy");
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
+    swap_table_checks();
 
     std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

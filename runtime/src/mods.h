@@ -231,21 +231,30 @@ public:
     explicit ArchetypeSwaps(const std::vector<Mod>& mods) {
         for (const Mod& m : mods) {
             if (!m.enabled) continue;
-            for (const ArchetypeSwap& s : m.archetype_swaps) {
-                bool replaced = false;
-                for (auto& [from, to] : table_)
-                    if (from == s.from) to = s.to, replaced = true;
-                if (!replaced) table_.emplace_back(s.from, s.to);
-            }
+            for (const ArchetypeSwap& s : m.archetype_swaps) table_.emplace_back(s.from, s.to);
         }
+        // Keep input order within each hash so the last enabled entry still wins, including within one mod.
+        std::stable_sort(table_.begin(), table_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::size_t unique = 0;
+        for (const auto& swap : table_) {
+            if (unique && table_[unique - 1].first == swap.first) table_[unique - 1].second = swap.second;
+            else table_[unique++] = swap;
+        }
+        table_.resize(unique);
     }
 
     // The archetype the game should get when it asks for `hash` (itself when no mod swaps it). One step only: a swap
     // to a model that is itself swapped is not followed, so two mods cannot loop.
     uint32_t remap(uint32_t hash) const {
-        for (const auto& [from, to] : table_)
-            if (from == hash) return to;
-        return hash;
+        // A short contiguous scan is cheaper for small mod sets; large sets must not scan on every hook call.
+        if (table_.size() < 512) {
+            for (const auto& [from, to] : table_)
+                if (from == hash) return to;
+            return hash;
+        }
+        const auto it = std::lower_bound(table_.begin(), table_.end(), hash,
+                                         [](const auto& swap, uint32_t value) { return swap.first < value; });
+        return it != table_.end() && it->first == hash ? it->second : hash;
     }
 
     std::size_t size() const { return table_.size(); }
