@@ -372,5 +372,55 @@ class TestVLdexpF32SIMDDivergence(unittest.TestCase):
             else:
                 self.assertEqual(simd.vgprs[0][lane], canary)
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestVLdexpF32Aliasing(unittest.TestCase):
+    """Unit tests for in-place register aliasing."""
+
+    def test_alias_dst_equals_src0(self):
+        """v0 = v_ldexp_f32 v0, s0: in-place scale."""
+        state = ScalarVALUState()
+        state.vgprs[0] = 0x3F80_0000  # 1.0f
+        state.sgprs[0] = 3
+
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=0),
+            src1=Operand(RegKind.SGPR, index=0),
+        )
+        ScalarVALUInterpreter.step(instr, state)
+        self.assertEqual(state.vgprs[0], 0x4100_0000)  # 8.0f
+
+    def test_alias_dst_equals_src1(self):
+        """v1 = v_ldexp_f32 v0, v1: scale register overwritten."""
+        state = ScalarVALUState()
+        state.vgprs[0] = 0x3F80_0000  # 1.0f
+        state.vgprs[1] = 2
+
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=1),
+            src0=Operand(RegKind.VGPR, index=0),
+            src1=Operand(RegKind.VGPR, index=1),
+        )
+        ScalarVALUInterpreter.step(instr, state)
+        self.assertEqual(state.vgprs[1], 0x4080_0000)  # 4.0f
+        self.assertEqual(state.vgprs[0], 0x3F80_0000)  # src0 untouched
+
+    def test_all_operands_aliased(self):
+        """v0 = v_ldexp_f32 v0, v0."""
+        state = ScalarVALUState()
+        # 2.0f is 0x4000_0000 (interpreted as int: 1073741824) -> overflows to +inf
+        state.vgprs[0] = 0x4000_0000
+
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=0),
+            src1=Operand(RegKind.VGPR, index=0),
+        )
+        ScalarVALUInterpreter.step(instr, state)
+        self.assertEqual(state.vgprs[0], POS_INF)
+
 if __name__ == "__main__":
     unittest.main()
