@@ -1,0 +1,48 @@
+name: Coverage Dashboard
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: coverage-dashboard
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  update-coverage-dashboard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Regenerate coverage dashboard SVG
+        shell: bash
+        run: |
+          python3 -I tools/coverage_dashboard.py --output docs/coverage/dashboard.svg
+
+      - name: Commit and push if changed
+        shell: bash
+        run: |
+          if ! git diff --quiet docs/coverage/dashboard.svg; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add docs/coverage/dashboard.svg
+            git commit -m "docs: update coverage dashboard [skip ci]"
+            git push
+          else
+            echo "Coverage dashboard SVG is up to date."
+          fi
