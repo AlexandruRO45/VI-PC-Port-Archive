@@ -90,7 +90,7 @@ def payloads_of(dxbc_path):
 def survey(dxbc_dir, disasm_fn=None, limit=None):
     """The census over <dxbc>: counts by stage, hardware id, markers and VS entry VGPRs."""
     index_path = os.path.join(dxbc_dir, "index.json")
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")

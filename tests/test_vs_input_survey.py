@@ -69,6 +69,15 @@ def test_vs_input_survey():
                                 "fetch call, attributes from v4 up": 1, "reads neither v0 nor a fetch call": 1},
               "each shader lands in exactly one family")
 
+        idx = os.path.join(dx, "index.json")
+        with open(idx, "rb") as f:
+            raw = f.read()
+        with open(idx, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw)
+        check(V.survey(dx) == r, "an index.json saved with a UTF-8 BOM gives the same survey")
+        with open(idx, "wb") as f:
+            f.write(raw)
+
         with open(os.path.join(dx, "disasm", "a_vs.s"), "a", encoding="utf-8") as f:
             f.write("\texp prim v0, off, off, off done\n")
         out = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "vs_input_survey.py"), dx],

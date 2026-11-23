@@ -147,6 +147,15 @@ class TestSurvey(unittest.TestCase):
         self.assertEqual(r["by_stage_hw"], {
             "ps|1|5": 1, "vs|0|2": 1, "vs|0|4": 2, "ms|6|7": 1})
 
+    def test_index_with_utf8_bom(self):
+        plain = V.survey(self.dx, disasm_fn=fake_disasm)
+        idx = os.path.join(self.dx, "index.json")
+        with open(idx, "rb") as f:
+            raw = f.read()
+        with open(idx, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw)
+        self.assertEqual(V.survey(self.dx, disasm_fn=fake_disasm), plain)
+
     def test_markers_land_on_the_right_hardware_stage(self):
         r = V.survey(self.dx, disasm_fn=fake_disasm)
         hw = {int(k): v for k, v in r["markers_by_hw"].items()}
