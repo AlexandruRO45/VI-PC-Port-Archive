@@ -278,6 +278,29 @@ of the arenas (16 modules, 6 threads: 6.2 GB; with `MALLOC_ARENA_MAX=1`: 2.1 GB)
 - `--inflight-file` names every module in flight when a large one enters or leaves the driver, so with several
   large modules in flight it names all of them; the `pipelines` stage of `make_game.py` checks each alone.
 
+## A hard memory cap on Windows (`--memory-cap-mb`)
+
+The budget above is an estimate made before a module enters the driver; it can't stop one module that allocates far
+past it. On Windows, `vk_pipeline_check` also puts itself into a job object with `JOB_OBJECT_LIMIT_PROCESS_MEMORY`
+(`runtime/test/process_memory_cap.h`), so past the cap the driver's allocations fail inside the checker instead of
+exhausting the system's commit limit.
+
+Measured on Windows 11, RTX 3080 (NVIDIA 621.14), 32 GB RAM, the wave64-emulated corpus of an own 1.0.2.1 copy, one
+`RTShadowTrace32TemporalHQ_Tiled` compute module checked alone:
+
+| cap | checker's peak private bytes | outcome |
+|---|---|---|
+| none (before this option) | about 69 GB | the system reached its commit limit: other programs and `WerFault.exe` failed with `0xC000012D` (STATUS_COMMITMENT_LIMIT) and the display driver reset |
+| `--memory-cap-mb 16384` | 16.0 GB | after 70 s the driver reported `NVVM compilation failed: 3`; the checker counted 1 failed pipeline and exited normally; at least 9.9 GB of system commit stayed free |
+
+- The default cap is the machine's physical memory; `--memory-cap-mb 0` turns it off. The checker prints the cap
+  on stderr when it starts.
+- A driver that crashes instead of returning an error when its allocation fails is handled as any other crash:
+  `--inflight-file` and `--isolate` name the module, and the `pipelines` stage of `make_game.py` retries it alone.
+- `--isolate` children run in the same job and get the same cap each.
+- The cap does nothing off Windows. On Linux a container or `systemd-run -p MemoryMax=...` caps the process, and the
+  budget above reads that limit.
+
 ## Skipping huge modules
 
 `vk_pipeline_check` now accepts `--max-bytes N`:

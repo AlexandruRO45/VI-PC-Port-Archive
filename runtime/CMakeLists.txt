@@ -448,6 +448,9 @@ if(BUILD_TESTING)
   find_package(Threads REQUIRED)
   target_link_libraries(large_module_gate_test PRIVATE Threads::Threads)
   add_test(NAME large_module_gate COMMAND large_module_gate_test)
+  # vk_pipeline_check's job-object memory cap on Windows (a no-op elsewhere): no Vulkan device.
+  add_executable(process_memory_cap_test test/process_memory_cap_test.cpp)
+  add_test(NAME process_memory_cap COMMAND process_memory_cap_test)
   # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
   add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
   add_test(NAME pipeline_summary COMMAND pipeline_summary_test)

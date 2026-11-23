@@ -42,6 +42,10 @@
 //   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
 //                 after a crash, so the next run checks everything else instead of dying on the same module.
+//   --memory-cap-mb N  Windows: cap each checker process at N MiB of committed memory with a job object
+//                 (process_memory_cap.h), so a runaway driver compile fails the checker instead of exhausting the
+//                 system's commit limit (0xC000012D in other programs). Default: the physical memory size; 0 = no
+//                 cap. --isolate children are in the same job. No effect off Windows.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] simulates a process crash
 //                 just before the pipeline of a matching module is created. For testing --isolate and the
 //                 pipelines stage's retry.
@@ -50,6 +54,7 @@
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
+#include "process_memory_cap.h"
 #include "pipeline_summary.h"
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
@@ -790,7 +795,7 @@ int main(int argc, char** argv) {
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
-            "[--skip-file F]\n");
+            "[--skip-file F] [--memory-cap-mb N]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
@@ -800,6 +805,7 @@ int main(int argc, char** argv) {
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
     unsigned large_parallel = 0;   // 0 = by the memory budget
+    uint64_t memory_cap_mb = leonida::default_process_memory_cap() / (1024 * 1024);   // 0 off Windows: no cap
     double slow = 30.0;
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
@@ -842,6 +848,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-bytes") valid = number(max_bytes);
         else if (a == "--large-module-bytes") valid = number(large_module_bytes);
         else if (a == "--large-parallel") valid = number(large_parallel);
+        else if (a == "--memory-cap-mb") valid = number(memory_cap_mb);
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
@@ -880,6 +887,16 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     if (iso_child) SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #endif
+    // Before any Vulkan call: the driver's allocations are what the cap is for. A child of --isolate inherits the
+    // parent's job and sets its own, nested, with the same value.
+    if (memory_cap_mb > UINT64_MAX / (1024 * 1024)) memory_cap_mb = UINT64_MAX / (1024 * 1024);
+    if (std::string cap_error; !leonida::apply_process_memory_cap(memory_cap_mb * 1024 * 1024, cap_error)) {
+        std::fprintf(stderr, "warning: no memory cap (%s); a runaway compile can exhaust the system's memory\n",
+                     cap_error.c_str());
+    } else if (memory_cap_mb && !iso_child) {
+        std::fprintf(stderr, "memory cap: %llu MiB per checker process (--memory-cap-mb, 0 = off)\n",
+                     static_cast<unsigned long long>(memory_cap_mb));
+    }
 
     const std::string index_path = dir + "/index.json";
     const auto same_file = [](const std::string& a, const std::string& b) {
@@ -946,7 +963,8 @@ int main(int argc, char** argv) {
         std::vector<std::string> pass = {"--jobs", std::to_string(jobs), "--slow", std::to_string(slow), "--stage", stage_filter,
                                          "--max-bytes", std::to_string(max_bytes),
                                          "--large-module-bytes", std::to_string(large_module_bytes),
-                                         "--large-parallel", std::to_string(large_parallel)};
+                                         "--large-parallel", std::to_string(large_parallel),
+                                         "--memory-cap-mb", std::to_string(memory_cap_mb)};
         if (cache_feedback) pass.push_back("--cache-feedback");
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
