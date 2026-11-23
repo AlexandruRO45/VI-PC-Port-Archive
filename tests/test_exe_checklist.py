@@ -112,6 +112,8 @@ class ExeChecklist(unittest.TestCase):
         self.assertTrue(any(n["file"] == "docs/runtime_imports.md" and n["kind"] == "UNVERIFIED" for n in notes))
         # d3d12_vulkan.md's console assumptions carry the page-wide uppercase marker, so the first look lists them
         self.assertTrue(any(n["file"] == "docs/d3d12_vulkan.md" and n["kind"] == "ASSUMPTION" for n in notes))
+        # so does modding.md's note on the three settings only the executable can confirm
+        self.assertTrue(any(n["file"] == "docs/modding.md" and n["kind"] == "ASSUMPTION" for n in notes))
 
 
 if __name__ == "__main__":
