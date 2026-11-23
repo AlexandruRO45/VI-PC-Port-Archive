@@ -148,7 +148,7 @@ def load_streams(source, skip_report=None):
         rows = doc["streams"]
         label, start = "stream {i}", 1
     elif os.path.isfile(source) and lower.endswith(".csv"):
-        with open(source, encoding="utf-8", newline="") as fh:
+        with open(source, encoding="utf-8-sig", newline="") as fh:
             reader = csv.DictReader(fh)
             header = reader.fieldnames or []
             missing = [f for f in REPORT_FIELDS if f not in header]
@@ -195,7 +195,7 @@ def load_pins(path):
     pins = {}
     if not path:
         return pins
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         header = reader.fieldnames or []
         missing = [f for f in ("offset", "path") if f not in header]

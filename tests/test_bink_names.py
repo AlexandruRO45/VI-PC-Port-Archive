@@ -489,6 +489,22 @@ class TestReportErrors(unittest.TestCase):
             code = names_mod.main([source, "--mount", xml, "--out", out])
         return code, err.getvalue(), out
 
+    def test_csv_inputs_accept_a_utf8_bom(self):
+        expected_stream = {"source": "test.rpf", "offset": 16, "size": 64,
+                           "width": 16, "height": 16, "frames": 1}
+        cases = (
+            ("streams.csv", names_mod.load_streams,
+             "source,offset,size,width,height,frames\ntest.rpf,16,64,16,16,1\n", [expected_stream]),
+            ("pins.csv", names_mod.load_pins,
+             "offset,path\n16,fixture.bk2\n", {("", 16): {"fixture.bk2"}}),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, load, text, expected in cases:
+                for bom in ("", "\ufeff"):
+                    with self.subTest(name=name, bom=bool(bom)):
+                        path = self.write(tmp, name, bom + text)
+                        self.assertEqual(load(path), expected)
+
     def test_bad_sources_are_rejected(self):
         # (extension, contents, expected error fragment or None to only require the path)
         cases = [
