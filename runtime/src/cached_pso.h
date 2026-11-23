@@ -40,13 +40,27 @@ inline constexpr std::uint32_t version = 1;
 inline constexpr std::size_t key_bytes = 64;
 inline constexpr std::size_t blob_bytes = 4 + 4 + 12 + 16 + key_bytes + 4;
 
+inline constexpr bool is_hex_digit(std::uint8_t c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+inline bool valid_key_bytes(const std::uint8_t* p, std::size_t n) noexcept {
+    if (!p || n != key_bytes) return false;
+    for (std::size_t i = 0; i < key_bytes; ++i)
+        if (!is_hex_digit(p[i])) return false;
+    return true;
+}
+
+inline bool valid_key(const Key& key) noexcept {
+    return valid_key_bytes(reinterpret_cast<const std::uint8_t*>(key.data()), key.size());
+}
+
 inline std::uint32_t fnv1a(const std::uint8_t* data, std::size_t size) {
     std::uint32_t h = 0x811c9dc5u;
-    if (!data) return h;
+    if (!data && size != 0) return 0u;
     for (std::size_t i = 0; i < size; ++i) h = (h ^ data[i]) * 0x01000193u;
     return h;
 }
-
 
 inline void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
@@ -59,6 +73,7 @@ inline std::uint32_t get32(const std::uint8_t* p) {
 // magic, version, vendor, device, driver, pipelineCacheUUID, key, then FNV-1a of everything before it: a changed
 // byte anywhere makes the blob invalid, as with the PC runtime.
 inline std::vector<std::uint8_t> encode(const Identity& identity, const Key& key) {
+    if (!valid_key(key)) return {};
     std::vector<std::uint8_t> out;
     out.reserve(blob_bytes);
     put32(out, magic);
@@ -67,51 +82,67 @@ inline std::vector<std::uint8_t> encode(const Identity& identity, const Key& key
     put32(out, identity.device);
     put32(out, identity.driver);
     out.insert(out.end(), std::begin(identity.cache_uuid), std::end(identity.cache_uuid));
-    std::string padded = key;
-    padded.resize(key_bytes, '\0');
-    out.insert(out.end(), padded.begin(), padded.end());
+    out.insert(out.end(), key.begin(), key.end());
     put32(out, fnv1a(out.data(), out.size()));
     return out;
 }
 
 inline Check check(const Identity& identity, const Key& key, std::span<const std::uint8_t> blob) {
-    if (blob.size() != blob_bytes || !blob.data() || key.empty()) return Check::invalid;
+    if (blob.size() != blob_bytes || !valid_key(key)) return Check::invalid;
     const std::uint8_t* p = blob.data();
     if (get32(p + blob_bytes - 4) != fnv1a(p, blob_bytes - 4)) return Check::invalid;
     if (get32(p) != magic || get32(p + 4) != version) return Check::invalid;
+    if (!valid_key_bytes(p + 36, key_bytes)) return Check::invalid;
     if (get32(p + 8) != identity.vendor || get32(p + 12) != identity.device) return Check::other_adapter;
     if (get32(p + 16) != identity.driver || std::memcmp(p + 20, identity.cache_uuid, 16) != 0)
         return Check::other_driver;
-    if (key.size() > key_bytes) return Check::other_description;
-    std::string padded = key;
-    padded.resize(key_bytes, '\0');
-    if (std::memcmp(p + 36, padded.data(), key_bytes) != 0) return Check::other_description;
+    if (std::memcmp(p + 36, key.data(), key_bytes) != 0) return Check::other_description;
     return Check::accepted;
+}
+
+inline Check check(const Identity& identity, const Key& key, const void* data, std::size_t size) {
+    if (!data || size != blob_bytes) return Check::invalid;
+    return check(identity, key, std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(data), size));
 }
 
 // Builds the bytes a key is hashed from: every field the PC runtime matches, in a fixed order with lengths, so two
 // descriptions give the same bytes only when those fields are equal.
 class KeyBuilder {
 public:
-    KeyBuilder& tag(const char* name) { return bytes(name, name ? std::strlen(name) : 0); }
+    KeyBuilder& tag(const char* name) {
+        if (!name) {
+            invalid_ = true;
+            return *this;
+        }
+        return bytes(name, std::strlen(name));
+    }
     KeyBuilder& u32(std::uint32_t v) {
-        put32(data_, v);
+        if (!invalid_) put32(data_, v);
         return *this;
     }
     KeyBuilder& bytes(const void* p, std::size_t n) {
-        const std::size_t count = p ? n : 0;
-        put32(data_, std::uint32_t(count));
-        if (count)
+        if (!p && n != 0) {
+            invalid_ = true;
+            return *this;
+        }
+        if (invalid_) return *this;
+        put32(data_, std::uint32_t(n));
+        if (n)
             data_.insert(data_.end(), static_cast<const std::uint8_t*>(p),
-                         static_cast<const std::uint8_t*>(p) + count);
+                         static_cast<const std::uint8_t*>(p) + n);
         return *this;
     }
     KeyBuilder& text(const char* s) { return s ? bytes(s, std::strlen(s)) : u32(0xffffffffu); }
-    const std::vector<std::uint8_t>& data() const { return data_; }
-
+    bool valid() const noexcept { return !invalid_; }
+    const std::vector<std::uint8_t>& data() const {
+        static const std::vector<std::uint8_t> empty;
+        return invalid_ ? empty : data_;
+    }
 
 private:
     std::vector<std::uint8_t> data_;
+    bool invalid_ = false;
 };
+
 
 }  // namespace leonida::cached_pso

@@ -421,22 +421,50 @@ int main() {
 
             const leonida::cached_pso::Identity test_id{0x1002u, 0x73bfu, 0x00800161u, {1, 2, 3, 4}};
             const std::string valid_key(leonida::cached_pso::key_bytes, 'a');
+            const std::string other_key(leonida::cached_pso::key_bytes, 'b');
             const auto encoded = leonida::cached_pso::encode(test_id, valid_key);
+            EXPECT(encoded.size() == leonida::cached_pso::blob_bytes);
             EXPECT(leonida::cached_pso::check(test_id, valid_key, encoded) == leonida::cached_pso::Check::accepted);
-            EXPECT(leonida::cached_pso::check(test_id, valid_key + "b", encoded) ==
+            EXPECT(leonida::cached_pso::check(test_id, other_key, encoded) ==
                    leonida::cached_pso::Check::other_description);
-            EXPECT(leonida::cached_pso::check(test_id, "", leonida::cached_pso::encode(test_id, "")) ==
+
+            // Both encode() and check() enforce the 64-character hex SHA-256 key invariant (no truncation or NUL padding).
+            for (const std::string& bad_key :
+                 {std::string{}, std::string("a"), std::string("a\0", 2), valid_key + "b",
+                  std::string(leonida::cached_pso::key_bytes - 1, 'a') + "g"}) {
+                EXPECT(leonida::cached_pso::encode(test_id, bad_key).empty());
+                EXPECT(leonida::cached_pso::check(test_id, bad_key, encoded) == leonida::cached_pso::Check::invalid);
+                EXPECT(leonida::cached_pso::check(test_id, valid_key,
+                                                  leonida::cached_pso::encode(test_id, bad_key)) ==
+                       leonida::cached_pso::Check::invalid);
+            }
+            // A resealed blob carrying a non-hex byte in its 64-byte key field is rejected as invalid.
+            auto bad_blob_key = encoded;
+            bad_blob_key[36] = 0;
+            const std::uint32_t bad_sum = leonida::cached_pso::fnv1a(bad_blob_key.data(), bad_blob_key.size() - 4);
+            for (int i = 0; i < 4; ++i) bad_blob_key[bad_blob_key.size() - 4 + i] = std::uint8_t(bad_sum >> (8 * i));
+            EXPECT(leonida::cached_pso::check(test_id, valid_key, bad_blob_key) == leonida::cached_pso::Check::invalid);
+
+            // Raw pointer + size overload validates nullptr before constructing std::span.
+            EXPECT(leonida::cached_pso::check(test_id, valid_key, nullptr, leonida::cached_pso::blob_bytes) ==
                    leonida::cached_pso::Check::invalid);
-            EXPECT(leonida::cached_pso::check(
-                       test_id, valid_key,
-                       std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(nullptr),
-                                                     leonida::cached_pso::blob_bytes)) ==
-                   leonida::cached_pso::Check::invalid);
-            EXPECT(leonida::cached_pso::fnv1a(nullptr, 16) == leonida::cached_pso::fnv1a(nullptr, 0));
-            leonida::cached_pso::KeyBuilder kb;
-            kb.tag(nullptr).bytes(nullptr, 16);
-            EXPECT(kb.data().size() == 8);
+            EXPECT(leonida::cached_pso::check(test_id, valid_key, encoded.data(), encoded.size()) ==
+                   leonida::cached_pso::Check::accepted);
+
+            // KeyBuilder distinguishes valid empty (nullptr, 0) from malformed (nullptr, n > 0) or tag(nullptr).
+            EXPECT(leonida::cached_pso::fnv1a(nullptr, 16) == 0u);
+            EXPECT(leonida::cached_pso::fnv1a(nullptr, 0) != 0u);
+            leonida::cached_pso::KeyBuilder kb_empty;
+            kb_empty.tag("cs").bytes(nullptr, 0);
+            EXPECT(kb_empty.valid() && kb_empty.data().size() == 10);
+            leonida::cached_pso::KeyBuilder kb_bad_bytes;
+            kb_bad_bytes.tag("cs").bytes(nullptr, 16);
+            EXPECT(!kb_bad_bytes.valid() && kb_bad_bytes.data().empty());
+            leonida::cached_pso::KeyBuilder kb_bad_tag;
+            kb_bad_tag.tag(nullptr);
+            EXPECT(!kb_bad_tag.valid() && kb_bad_tag.data().empty());
         }
+
 
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
