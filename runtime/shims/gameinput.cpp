@@ -742,6 +742,7 @@ struct Callback {
     void* context;
     void* fn;
     bool active;
+    uint64_t after_reading_order = 0;  // readings already present when this callback was registered are excluded
 };
 
 struct Event {
@@ -843,6 +844,7 @@ bool matches(const Callback& c, const Event& e) {
             if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
             return e.only || ((e.current ^ e.previous) & c.status_filter);
         case CbType::Reading:
+            if (e.reading->order() <= c.after_reading_order) return false;
             return c.kind == GameInputKindUnknown || (c.kind & e.device->info.supportedInput);
         default:
             return true;
@@ -2525,6 +2527,7 @@ private:
         if (token) *token = kInvalidCallbackToken;
         if (!c.fn) return E_INVALIDARG;
         std::lock_guard lock(g().mu);
+        if (c.type == CbType::Reading) c.after_reading_order = g().last_order;
         c.token = g().next_token++;
         g().callbacks.push_back(c);
         if (token) *token = c.token;

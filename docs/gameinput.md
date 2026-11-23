@@ -331,6 +331,12 @@ kind (`GetCurrentReading` answers the most recent of them); asking it for anothe
 `GAMEINPUT_E_READING_NOT_FOUND`. A reading or device callback registered with an aggregate device as its filter is
 refused with `E_NOTIMPL` and an invalid token.
 
+Reading callbacks observe only state changes made after registration, as described in Microsoft's
+[`RegisterReadingCallback` reference](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_registerreadingcallback).
+Readings already queued for a dispatcher still reach callbacks registered before those changes, but are excluded
+from a new callback, with or without a device filter, including registration from inside another callback.
+This boundary uses reading order, independent of timestamp ties.
+
 A device object stays alive for the whole process. When a pad is unplugged its status drops to
 `GameInputDeviceNoStatus` and its device callback runs; when the same pad is plugged in again (matched by SDL GUID and
 serial or device path) the title gets the same object back, connected again.
