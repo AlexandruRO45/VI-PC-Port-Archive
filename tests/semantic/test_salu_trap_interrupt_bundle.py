@@ -509,5 +509,27 @@ class TestSTrapStages(unittest.TestCase):
         self.assertEqual(str(cm.exception), "s_trap")
 
 
+class TestSTrapSyntax(unittest.TestCase):
+    def test_trap_missing_operand_rejection(self):
+        bad_lines = [
+            "s_trap",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_trap_syntax", bad_lines)
+        self.assertEqual(str(cm.exception), "s_trap")
+
+    def test_trap_invalid_target_rejection(self):
+        bad_lines = [
+            "s_trap s0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_trap_reg", bad_lines)
+        self.assertEqual(str(cm.exception), "s_trap")
+
+
 if __name__ == "__main__":
     unittest.main()
