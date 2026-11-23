@@ -54,6 +54,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -67,6 +68,9 @@ sys.dont_write_bytecode = True
 for _p in (HERE, os.path.join(ROOT, "tests", "semantic")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 INF, NAN = float("inf"), float("nan")
 QNAN = 0x7FC00000
@@ -983,6 +987,47 @@ def write_kernels(kernels, out_dir):
     return 0
 
 
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination.
+
+    Parent folders are created when missing (same as the previous direct writer).
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    destination = os.path.realpath(path)
+    staged_parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=staged_parent, prefix=".bvh_tri_probe-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", default="translator", help="translator (default), hw, or translator,hw")
@@ -1044,12 +1089,8 @@ def main(argv=None):
     print(f"summary: {len(rows)} results ({sum(r['lane'] is None for r in rows)} single-lane) of {len(kernels)} "
           f"kernels, {' and '.join(srcs)} against the rule, both forms: {len(rows) - bad} match, {bad} mismatch")
     if args.json_out is not None:
-        parent = os.path.dirname(os.path.abspath(args.json_out))
         try:
-            os.makedirs(parent, exist_ok=True)
-            with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": device, "rows": rows}, f, indent=1)
-                f.write("\n")
+            write_json_report(args.json_out, {"device": device, "rows": rows})
         except OSError as e:
             print(f"error: cannot write --json {args.json_out}: {e}", file=sys.stderr)
             return 2

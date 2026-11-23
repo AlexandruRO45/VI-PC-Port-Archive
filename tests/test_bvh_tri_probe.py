@@ -235,6 +235,19 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(data.decode("utf-8"), "\n".join(kernels()["tri_g4b"].lines()) + "\n")
             self.assertTrue(os.path.isfile(os.path.join(tmp, "tri_g4b.json")))
 
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with unittest.mock.patch.object(probe, "replace_retry",
+                                            side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    probe.write_json_report(path, {"device": None, "rows": []})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()
