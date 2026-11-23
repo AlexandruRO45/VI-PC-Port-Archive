@@ -482,3 +482,56 @@ class TestPermB32Oracle(unittest.TestCase):
             "v_perm_b32 v0, v1, v2, v3",
         ])
         self.assertEqual(val_hw, 0x000000FF)
+
+
+# ------------------------------------------------------------------------------
+# v_perm_b32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VPermB32Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+    src1: Union[RegisterOperand, LiteralOperand]
+    sel: Union[RegisterOperand, LiteralOperand]
+
+
+def step_perm_b32(machine: ScalarMachineQuadLogic, insn: VPermB32Instruction):
+    s0 = machine.read_operand(insn.src0)
+    s1 = machine.read_operand(insn.src1)
+    sel = machine.read_operand(insn.sel)
+    res = ref_perm_b32(s0, s1, sel)
+    machine.vgprs[insn.dst.index] = res
+
+
+class TestPermB32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineQuadLogic()
+        machine.vgprs[1] = 0xAABBCCDD
+        machine.vgprs[2] = 0x11223344
+        machine.vgprs[3] = 0x07060100
+        insn = VPermB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            sel=RegisterOperand(OperandType.VGPR, 3),
+        )
+        step_perm_b32(machine, insn)
+
+        val_hw, _ = run_shader_words("ps_perm_ast_scalar", [
+            "v_mov_b32 v1, 0xAABBCCDD",
+            "v_mov_b32 v2, 0x11223344",
+            "v_mov_b32 v3, 0x07060100",
+            "v_perm_b32 v0, v1, v2, v3",
+        ])
+        self.assertEqual(machine.vgprs[0], val_hw)
+        self.assertEqual(val_hw, 0xAABB3344)
+
+    def test_scalar_in_place_hardware(self):
+        val_inplace, _ = run_shader_words("ps_perm_inplace", [
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 0x03020100",
+            "v_perm_b32 v0, v1, v0, v2",
+        ])
+        self.assertEqual(val_inplace, 0x12345678)
