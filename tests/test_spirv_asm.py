@@ -107,7 +107,7 @@ class SpirvAsmUnitTests(unittest.TestCase):
             magic, ver, gen, bound, schema = struct.unpack_from("<5I", spv, 0)
             self.assertEqual(magic, 0x07230203)
             self.assertEqual(ver, expected_ver)
-            self.assertEqual(gen, 0)
+            self.assertEqual(gen, 7 << 16)  # what spirv-as writes
             self.assertGreater(bound, 1)
             self.assertEqual(schema, 0)
             _validate(spv, target_env=env)
@@ -255,7 +255,7 @@ OpFunctionEnd
         self.assertIn(0x7FC00000, words)   # f32 qNaN
         self.assertIn(0x7FF00000, words)   # f64 +Inf hi word
         self.assertIn(0x7FF80000, words)   # f64 qNaN hi word
-        # Verify exact byte-for-byte parity (excluding header generator word [2]) with spirv-as when present.
+        # Verify exact byte-for-byte parity with spirv-as when present.
         if SPIRV_AS:
             with tempfile.TemporaryDirectory() as d:
                 sa, sv = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
@@ -265,7 +265,7 @@ OpFunctionEnd
                 with open(sv, "rb") as f:
                     ref_words = struct.unpack(f"<{os.path.getsize(sv) // 4}I", f.read())
             self.assertEqual(len(words), len(ref_words))
-            self.assertEqual(words[:2] + words[3:], ref_words[:2] + ref_words[3:])
+            self.assertEqual(words, ref_words)
 
     def test_translated_shaders_validate_and_match_spirv_as(self):
         # Translate diverse synthetic shaders (PS ALU/dot4/f16/branches, CS LDS/atomics/wave64-emulate)

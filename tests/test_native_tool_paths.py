@@ -5,7 +5,7 @@
 On Windows, spirv-as, spirv-val and the GPU test programs read their command line in the ANSI code page, so a folder
 name with a character outside it (a Cyrillic or CJK user name, as under %TEMP%) reached them as '?'. Every shader then
 failed with "file does not exist". The folders here use a private-use character, which no ANSI code page maps.
-tools/rdna2spirv.py's assemble_spirv now runs the tools in the output folder with relative names; run_gpu_tests.py
+tools/rdna2spirv.py's assemble_spirv now gives the tools no path at all (pipes); run_gpu_tests.py
 uses the work folder's 8.3 short name, or stops with one error line when there is none. Standard library only; no
 game files.
 """

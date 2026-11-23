@@ -29,6 +29,7 @@ if _HERE not in sys.path:
 from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
 
 SPIRV_MAGIC = 0x07230203
+GENERATOR = 7 << 16   # Khronos SPIR-V Tools Assembler, the word spirv-as writes, so both assemblers give the same bytes
 
 TARGET_ENV_VERSION = {
     "vulkan1.0": 0x00010000,
@@ -290,7 +291,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             sym_to_id[tok] = vid
         return vid
 
-    words = array.array("I", [SPIRV_MAGIC, version, 0, 0, 0])
+    words = array.array("I", [SPIRV_MAGIC, version, GENERATOR, 0, 0])
 
     def encode_operand(kind: str, toks: list[str], idx: int, lineno: int,
                        res_type_id: int | None, cur_ext_table: dict[str, int] | None,

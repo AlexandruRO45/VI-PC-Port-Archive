@@ -17085,52 +17085,59 @@ def merge_shard_parts(out):
 
 
 def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
-    """Keep the assembled module out of the final path until validation succeeds.
+    """Assemble and validate one module; the final `sv` appears only when both succeed.
 
-    `assembler="spirv-as"` invokes the external spirv-as binary on `sa` (default);
-    `assembler="python"` encodes `asm_text` (or reads `sa`) directly in memory with
-    tools/spirv_asm.py, avoiding the spirv-as subprocess and temporary .spvasm I/O.
+    `assembler="spirv-as"` pipes the assembly to the external spirv-as binary (default). The text comes from
+    `asm_text` when given, so a caller that holds it in memory writes no .spvasm at all; otherwise it is read
+    from `sa`. The binary comes back over a pipe and goes to spirv-val over a pipe, so no staging file is
+    written either; only `sv` is, once the module has validated.
+    `assembler="python"` encodes `asm_text` (or reads `sa`) in memory with tools/spirv_asm.py, which saves the
+    spirv-as launch as well.
     """
+    if assembler == "python":
+        import spirv_asm
+        try:
+            text = asm_text if asm_text is not None else Path(sa).read_text(encoding="utf-8")
+            binary = spirv_asm.assemble(text, target_env="vulkan1.2")
+            result = subprocess.CompletedProcess(["spirv_asm"], 0, "", "")
+        except (OSError, spirv_asm.SpirvAsmError) as exc:
+            binary, result = b"", subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
+    else:
+        try:
+            source = asm_text.encode("utf-8") if asm_text is not None else Path(sa).read_bytes()
+        except OSError as exc:
+            binary, result = b"", subprocess.CompletedProcess(["spirv-as"], 1, "", f"error: cannot read {sa}: {exc}")
+        else:
+            result = subprocess.run(["spirv-as", "-", "-o", "-", "--target-env", "vulkan1.2"],
+                                    input=source, capture_output=True)
+            binary = result.stdout if result.returncode == 0 else b""
+            # stdin is bytes, so the output is too; a test double may already answer in text.
+            result.stdout = ""
+            if isinstance(result.stderr, bytes):
+                result.stderr = result.stderr.decode("utf-8", "replace")
+    if result.returncode == 0:
+        # Offset on non-gather: VK_KHR_maintenance8
+        result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", "-"],
+                                input=binary, capture_output=True)
+        for stream in ("stdout", "stderr"):
+            if isinstance(getattr(result, stream), bytes):
+                setattr(result, stream, getattr(result, stream).decode("utf-8", "replace"))
+    if result.returncode != 0:
+        Path(sv).unlink(missing_ok=True)
+        return result
+    # The module is published whole or not at all: stage it beside `sv`, then rename.
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
-    # spirv-as reads the .spvasm from stdin, and both tools run in the output folder with the staging file's bare
-    # name. On Windows they read their command line in the ANSI code page, so a folder name outside it (a Cyrillic or
-    # CJK user name, say) reached them as '?' and every shader failed with "file does not exist".
-    folder = os.path.dirname(os.path.abspath(tmp))
+        try:
+            f.write(binary)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
     try:
-        if assembler == "python":
-            import spirv_asm
-            try:
-                text = asm_text if asm_text is not None else Path(sa).read_text(encoding="utf-8")
-                tmp.write_bytes(spirv_asm.assemble(text, target_env="vulkan1.2"))
-                result = subprocess.CompletedProcess(["spirv_asm"], 0, "", "")
-            except (OSError, spirv_asm.SpirvAsmError) as exc:
-                result = subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
-        else:
-            try:
-                with open(sa, "rb") as f:
-                    source = f.read()
-            except OSError as exc:
-                result = subprocess.CompletedProcess(["spirv-as"], 1, "", f"error: cannot read {sa}: {exc}")
-            else:
-                result = subprocess.run(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
-                                        input=source, capture_output=True, cwd=folder)
-                # stdin is bytes, so the output is too; a test double may already answer in text.
-                if isinstance(result.stdout, bytes):
-                    result.stdout = result.stdout.decode("utf-8", "replace")
-                if isinstance(result.stderr, bytes):
-                    result.stderr = result.stderr.decode("utf-8", "replace")
-        if result.returncode == 0:
-            # Offset on non-gather: VK_KHR_maintenance8
-            result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
-                                     tmp.name], capture_output=True, text=True, cwd=folder)
-        if result.returncode == 0:
-            tmp.replace(sv)
-        else:
-            Path(sv).unlink(missing_ok=True)
-        return result
+        tmp.replace(sv)
     finally:
         tmp.unlink(missing_ok=True)
+    return result
 
 
 def _limit_arg(text):
@@ -17190,10 +17197,12 @@ def main():
                     help="i/n: translate every n-th shader starting at i (run n processes in parallel, "
                          "then merge the index.part*.json files with --merge)")
     ap.add_argument("--no-asm", action="store_true",
-                    help="delete each .spvasm once its .spv is written (the text is ~2.7x the binary: 35 GB for the corpus)")
+                    help="write no .spvasm for a shader that assembles and validates (the text is ~2.7x the binary: 35 GB "
+                         "for the corpus); the assembly goes to the assembler over a pipe. A rejected shader keeps its "
+                         ".spvasm and is named on stderr")
     ap.add_argument("--assembler", choices=("spirv-as", "python"), default="spirv-as",
                     help="SPIR-V binary assembler: spirv-as (default, external binary) or python (in-process "
-                         "tools/spirv_asm.py; skips writing .spvasm to disk when combined with --no-asm)")
+                         "tools/spirv_asm.py, one process launch fewer per shader)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
     ap.add_argument("--fssm-dir", default=None,
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
@@ -17353,7 +17362,7 @@ def main():
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
         sv = os.path.join(a.out, name + ".spv")
-        write_asm = not (a.no_asm and a.assembler == "python")
+        write_asm = not a.no_asm
         if write_asm:
             with open(sa, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
@@ -17379,9 +17388,10 @@ def main():
                 with open(sa, "w", encoding="utf-8", newline="\n") as f:
                     f.write(asm)
             drop_stale(name)
-            why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
-        if a.no_asm and os.path.exists(sa):
-            os.remove(sa)
+            first = (r.stderr.strip().splitlines() or ["?"])[0]
+            why["INVALID: " + first[:90]] += 1
+            if a.no_asm:  # the text was never on disk: keep it now, so the rejection can be reproduced
+                print(f"INVALID {name}: {first[:200]} (assembly kept in {sa})", file=sys.stderr)
     import json as _js
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}
