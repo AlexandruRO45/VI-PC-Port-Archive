@@ -191,6 +191,26 @@ class SamplerSourceCensus(unittest.TestCase):
         self.assertEqual(self.classes(through([("s_mov_b32 s8, 0x7f001000", 8), ("s_mov_b32 s9, 0", 4)])),
                          [("other_base", "constant address")])
 
+    def test_a_run_time_offset_on_an_inner_load_makes_the_outer_one_run_time(self):
+        """The S# sits at a constant offset from a pointer that was itself loaded at a run-time index: its address
+        depends on that index, so the load is not a static one (two levels, then three)."""
+        def nested(inner, middle=()):
+            return [("s_mov_b32 s9, 0", 4), ("s_lshl_b32 s5, s5, 4", 4), inner, *middle,
+                    ("s_load_dwordx4 s[28:31], s[10:11], 0x40", 8), SAMPLE, END]
+        run_time = ("s_load_dwordx2 s[10:11], s[8:9], s5", 8)
+        fixed = ("s_load_dwordx2 s[10:11], s[8:9], 0x8", 8)
+        hop = [("s_load_dwordx2 s[10:11], s[10:11], 0x10", 8)]
+        self.assertEqual(self.classes(nested(run_time)), [("user_pointer", "dynamic")])
+        self.assertEqual(self.classes(nested(run_time, hop)), [("user_pointer", "dynamic")])
+        # the controls: the same shapes with a constant inner offset stay static
+        self.assertEqual(self.classes(nested(fixed)), [("user_pointer", "static")])
+        self.assertEqual(self.classes(nested(fixed, hop)), [("user_pointer", "static")])
+        # and a V# loaded at a run-time index makes the s_buffer_load through it run-time too
+        vsharp = [("s_mov_b32 s9, 0", 4), ("s_lshl_b32 s5, s5, 4", 4),
+                  ("s_load_dwordx4 s[12:15], s[8:9], s5", 8),
+                  ("s_buffer_load_dwordx4 s[28:31], s[12:15], 0x40", 8), SAMPLE, END]
+        self.assertEqual(self.classes(vsharp), [("user_pointer", "dynamic")])
+
     def test_a_buffer_load_follows_its_vsharp(self):
         self.assertEqual(self.classes([("s_buffer_load_dwordx4 s[28:31], s[4:7], 0x10", 8), SAMPLE, END]),
                          [("user_pointer", "static")])

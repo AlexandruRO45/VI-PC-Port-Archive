@@ -364,9 +364,10 @@ def analyse(insns, stage, user_count, follow_skips=True):
         if tag[1] in seen:                             # a load whose address depends on the load itself
             cycles[0] += 1
             return None, dyn, k
-        # ("ld", pc, i): a pointer or V# that was itself loaded
-        where, _, k2, _ = found_load.get(tag[1]) or load_source(tag[1], seen)
-        return where, dyn, max(k, k2)
+        # ("ld", pc, i): a pointer or V# that was itself loaded. A run-time offset on that load makes everything
+        # read through its result run-time too: the address depends on the index, however constant the last step.
+        where, dyn2, k2, _ = found_load.get(tag[1]) or load_source(tag[1], seen)
+        return where, dyn or dyn2, max(k, k2)
 
     def load_source(pc, seen=()):
         """source() of the address the scalar load at pc reads, with the load's own offset counted as well
