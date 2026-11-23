@@ -43,10 +43,15 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -930,6 +935,14 @@ struct ReplayFunctions {
 };
 
 namespace detail {
+
+// Reports an unsupported command or feature once (D3D-408).
+inline void note_unsupported(const char* what) {
+    static std::mutex mutex;
+    static std::set<std::string_view> seen;
+    std::lock_guard lock(mutex);
+    if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s: unsupported, skipped\n", what);
+}
 
 struct QueryResolveRun {
     VkQueryPool pool = VK_NULL_HANDLE;    // null: zero fill for queries that were never ended
@@ -2455,7 +2468,7 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
 // and callers without a summation helper: reject before allocating any helper scratch.
 template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out,
-                     bool statistics_helpers = false) {
+                     bool statistics_helpers = false, bool tolerant = false) {
     if (!list.closed()) return ReplayResult::list_open;
     if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
     const auto commands = list.commands();
@@ -2493,6 +2506,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         auto& p = out.commands[i];
+        const auto unsupported = [&](const char* what) -> ReplayResult {
+            if (tolerant) {
+                p.skip = true;
+                detail::note_unsupported(what);
+                return ReplayResult::success;
+            }
+            return ReplayResult::unsupported;
+        };
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);
             if (binding) p.binding = *binding;
@@ -2500,7 +2521,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         };
         const auto rect_view = [&](std::span<const Rect> rects, const TargetView& target, VkImageAspectFlags view_aspects) {
             if (rects.empty()) return ReplayResult::success;
-            if (!rendering) return ReplayResult::unsupported;
+            if (!rendering) return unsupported("rectangle clears (dynamic rendering)");
             detail::clip(rects, detail::mip_extent(p.binding, target.mip), target.layer_count, p.rects);
             if (p.rects.empty()) {
                 p.skip = true;
@@ -2516,7 +2537,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             ResourceBinding view_binding = p.binding;
             if (p.clear_format != VK_FORMAT_UNDEFINED) view_binding.format = p.clear_format;
             p.view = vk.image_view(view_binding, range);
-            return p.view ? ReplayResult::success : ReplayResult::unsupported;
+            return p.view ? ReplayResult::success : unsupported("rectangle clear view");
         };
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
@@ -2528,11 +2549,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_subresource;
             }
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
-            if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
+            if (!vk.pipeline_barrier2) {
+                if (const auto r = unsupported("enhanced barrier"); r != ReplayResult::success) return r;
+                continue;
+            }
             if (const auto* buffer_barrier = std::get_if<BufferBarrier>(&command))
                 if (!bind(buffer_barrier->resource)) return ReplayResult::unresolved_resource;
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
-            if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
+            if (!vk.pipeline_barrier2) {
+                if (const auto r = unsupported("enhanced texture barrier"); r != ReplayResult::success) return r;
+                continue;
+            }
             if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
             if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
                 return ReplayResult::invalid_subresource;
@@ -2557,7 +2584,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                             VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
             } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
                        r != ReplayResult::success) return r;
-            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) {
+                if (const auto r = unsupported("ClearRenderTarget (vkCmdClearColorImage)"); r != ReplayResult::success) return r;
+                continue;
+            }
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -2576,21 +2606,35 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
                 return r;
-            if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
+            if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) {
+                if (const auto r = unsupported("ClearDepthStencil (vkCmdClearDepthStencilImage)"); r != ReplayResult::success) return r;
+                continue;
+            }
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
             if (!bind(view.resource)) return ReplayResult::unresolved_resource;
             if (view.buffer) {
-                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
+                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) {
+                    if (const auto r = unsupported("ClearUnorderedAccessView (buffer)"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
-                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
+                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) {
+                    if (r == ReplayResult::unsupported) {
+                        if (const auto u = unsupported("ClearUnorderedAccessView (buffer)"); u != ReplayResult::success) return u;
+                        continue;
+                    }
+                    return r;
+                }
                 const bool short_fill = std::any_of(p.fills.begin(), p.fills.end(), [&](const auto& fill) {
                     return detail::buffer_fill_needs_scratch(p.element, fill[0], fill[1]);
                 });
                 if (short_fill && (!vk.copy_scratch ||
                     !vk.copy_scratch(8, p.fill_scratch, p.fill_scratch_offset) || !p.fill_scratch ||
-                    p.fill_scratch_offset % 4 || p.fill_scratch_offset > UINT64_MAX - 8))
-                    return ReplayResult::unsupported;
+                    p.fill_scratch_offset % 4 || p.fill_scratch_offset > UINT64_MAX - 8)) {
+                    if (const auto r = unsupported("ClearUnorderedAccessView (buffer short fill scratch)"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 if (!p.skip && !p.fills.empty() && p.binding.host_readable) {
                     out.wrote_readback = true;
                     out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -2608,22 +2652,30 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // Emulated R9G9B9E5_SHAREDEXP images (backed by R32_UINT) lack COLOR_ATTACHMENT on E5B9G9R9 and keep the
             // bit-exact R32_UINT backing path.
             const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
-            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element))
-                return ReplayResult::unsupported;
+            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element)) {
+                if (const auto r = unsupported("ClearUnorderedAccessView (format encoding)"); r != ReplayResult::success) return r;
+                continue;
+            }
             const auto* image_layout = uav_clear::layout(p.binding.format);
-            if (!image_layout || image_layout->bytes != p.element.size)
-                return ReplayResult::unsupported;
+            if (!image_layout || image_layout->bytes != p.element.size) {
+                if (const auto r = unsupported("ClearUnorderedAccessView (image layout)"); r != ReplayResult::success) return r;
+                continue;
+            }
             const bool attachment = p.binding.color_attachment && !p.binding.volume;
             const bool view_attachable = vk.color_attachment_format
                                              ? vk.color_attachment_format(view_format)
                                              : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
             const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
             const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
-            if (!uav_clear::decode(clear_format, p.element, p.clear_color))
-                return ReplayResult::unsupported;
+            if (!uav_clear::decode(clear_format, p.element, p.clear_color)) {
+                if (const auto r = unsupported("ClearUnorderedAccessView (format decoding)"); r != ReplayResult::success) return r;
+                continue;
+            }
             if (reinterpret) p.clear_format = view_format;
-            if (!uav->rects.empty() && !attachment)
-                return ReplayResult::unsupported;
+            if (!uav->rects.empty() && !attachment) {
+                if (const auto r = unsupported("ClearUnorderedAccessView (non-attachment rect clear)"); r != ReplayResult::success) return r;
+                continue;
+            }
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
             // render targets are; otherwise vkCmdClearColorImage runs unconditionally and is counted.
             if (predicated && uav->rects.empty() && !attachment) ++out.unpredicated_copies;
@@ -2632,10 +2684,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                    : attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
             if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
-            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) {
+                if (const auto r = unsupported("ClearUnorderedAccessView (vkCmdClearColorImage)"); r != ReplayResult::success) return r;
+                continue;
+            }
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
-            if (!copies) return ReplayResult::unsupported;
+            if (!copies) {
+                if (const auto r = unsupported("copy commands"); r != ReplayResult::success) return r;
+                continue;
+            }
             if (predicated && !std::holds_alternative<CopyBuffer>(command)) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
@@ -2662,11 +2720,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::invalid_copy;
                 if (predicated) {
                     if ((statistics_active && !statistics_helpers) || !vk.prepare_predicated_copy || !vk.emit_predicated_copy ||
-                        !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, src, dst, buffer_copy->size, p.predicated_copy))
-                        return ReplayResult::unsupported;
+                        !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, src, dst, buffer_copy->size, p.predicated_copy)) {
+                        if (const auto r = unsupported("predicated copy"); r != ReplayResult::success) return r;
+                        continue;
+                    }
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
+                if (result == ReplayResult::unsupported) {
+                    if (const auto r = unsupported("CopyTexture"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 if (result == ReplayResult::success && !p.staged_reads.empty()) {
                     // A block-compressed copy staged through transfer scratch (prepare_texture_copy): whole blocks of
                     // the read's row length and height, one region a copy.
@@ -2693,7 +2757,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 const bool rgb96_footprint = result == ReplayResult::success && image.rgb96 &&
                     !p.buffer_image_copies.empty();
                 // Without a segment pool, refuse before allocating conversion scratch/descriptors.
-                if (statistics_active && !statistics_helpers && (depth24_footprint || rgb96_footprint)) return ReplayResult::unsupported;
+                if (statistics_active && !statistics_helpers && (depth24_footprint || rgb96_footprint)) {
+                    if (const auto r = unsupported("depth24/rgb96 conversion during statistics"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 if (depth24_footprint) {
                     const VkBufferImageCopy& region = p.buffer_image_copies[0];
                     const ResourceBinding& buffer = upload ? p.source : p.binding;
@@ -2707,7 +2774,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = region.bufferRowLength ? region.bufferRowLength : job.width;
                     job.app_slice_words = job.app_row_words * (region.bufferImageHeight ? region.bufferImageHeight : job.height);
-                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) {
+                        if (const auto r = unsupported("depth24 conversion"); r != ReplayResult::success) return r;
+                        continue;
+                    }
                     p.has_depth24 = true;
                 } else if (rgb96_footprint) {
                     // A footprint of a 96-bit texture: 12-byte texels, 16 in the image. The same pass and scratch.
@@ -2724,11 +2794,18 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = p.rgb96_row_words;
                     job.app_slice_words = p.rgb96_slice_words;
-                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) {
+                        if (const auto r = unsupported("rgb96 conversion"); r != ReplayResult::success) return r;
+                        continue;
+                    }
                     p.has_depth24 = true;
                 }
             } else {
                 result = detail::prepare_resource_copy(p);
+                if (result == ReplayResult::unsupported) {
+                    if (const auto r = unsupported("CopyResource"); r != ReplayResult::success) return r;
+                    continue;
+                }
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask) {
@@ -2744,8 +2821,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                   c.srcSubresource.layerCount * texel + 15) / 16 * 16;
                 }
                 VkDeviceSize base = 0;
-                if (!texel || !vk.copy_scratch || !vk.copy_scratch(total, p.staged, base))
-                    return ReplayResult::unsupported;
+                if (!texel || !vk.copy_scratch || !vk.copy_scratch(total, p.staged, base)) {
+                    if (const auto r = unsupported("cross-aspect copy scratch"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 for (std::size_t r = 0; r < p.image_copies.size(); ++r) {
                     const VkImageCopy& c = p.image_copies[r];
                     VkBufferImageCopy region{};
@@ -2769,20 +2848,39 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
             }
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
-            if (!vk.resolve_image) return ReplayResult::unsupported;
+            if (!vk.resolve_image) {
+                if (const auto r = unsupported("ResolveSubresource"); r != ReplayResult::success) return r;
+                continue;
+            }
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
-            if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
+            if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success) {
+                if (result == ReplayResult::unsupported) {
+                    if (const auto r = unsupported("ResolveSubresource"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 return result;
+            }
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
-                if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return ReplayResult::unsupported;
+                if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) {
+                    if (const auto r = unsupported("ResolveSubresource (custom rendering)"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 p.view = vk.image_view(p.source, p.source_range);
                 p.resolve_view = vk.image_view(p.binding, p.range);
-                if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
-                if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
+                if (!p.view || !p.resolve_view) {
+                    if (const auto r = unsupported("ResolveSubresource (views)"); r != ReplayResult::success) return r;
+                    continue;
+                }
+                if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success) {
+                    if (result == ReplayResult::unsupported) {
+                        if (const auto r = unsupported("ResolveSubresource (keep around)"); r != ReplayResult::success) return r;
+                        continue;
+                    }
                     return result;
+                }
                 // D3D-417, a driver workaround: AMD's Windows driver (32.0.21042.62, Radeon RDNA2 iGPU) resolves a
                 // dynamic-rendering depth attachment from layer 0 of the image when the multisampled view starts at
                 // another layer (the resolve view's first layer it honours). The same two views in a framebuffer
@@ -2798,7 +2896,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         p.binding, p.resolve_view,
                         image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL), p.resolve_mode,
                         {std::min(from.width, to.width), std::min(from.height, to.height)}, p.resolve_pass);
-                    if (!p.resolve_framebuffer) return ReplayResult::unsupported;
+                    if (!p.resolve_framebuffer) {
+                        if (const auto r = unsupported("ResolveSubresource (depth framebuffer)"); r != ReplayResult::success) return r;
+                        continue;
+                    }
                 }
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
@@ -2820,7 +2921,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
             }
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
-            if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
+            if (!vk.update_buffer || !vk.buffer_at) {
+                if (const auto r = unsupported("WriteBufferImmediate"); r != ReplayResult::success) return r;
+                continue;
+            }
             std::uint64_t bytes = 4;
             if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
                 return ReplayResult::unresolved_resource;
@@ -2829,7 +2933,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             out.wrote_readback = true;
             out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
-            if (!vk.copy_buffer) return ReplayResult::unsupported;
+            if (!vk.copy_buffer) {
+                if (const auto r = unsupported("AtomicCopyBuffer"); r != ReplayResult::success) return r;
+                continue;
+            }
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(atomic->src);
             if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
@@ -2852,26 +2959,43 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (const auto* predication = std::get_if<Predication>(&command)) {
             predicated = predication->buffer != 0;
             if (!predicated) continue;
-            if (!conditional) return ReplayResult::unsupported;
+            if (!conditional) {
+                if (const auto r = unsupported("SetPredication (conditional rendering)"); r != ReplayResult::success) return r;
+                predicated = false;
+                continue;
+            }
             // Without physical segments the capture dispatch would pollute CSInvocations.
-            if (statistics_active && !statistics_helpers) return ReplayResult::unsupported;
+            if (statistics_active && !statistics_helpers) {
+                if (const auto r = unsupported("SetPredication (statistics helpers)"); r != ReplayResult::success) return r;
+                predicated = false;
+                continue;
+            }
             if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
             if (!p.binding.buffer || !detail::within(predication->offset, 8, p.binding.size) ||
                 predication->offset > UINT64_MAX - p.binding.buffer_offset)
                 return ReplayResult::invalid_predication;
             if (!vk.prepare_predicate || !vk.capture_predicate ||
-                !vk.prepare_predicate(p.binding.buffer, p.binding.buffer_offset + predication->offset, p.predicate))
-                return ReplayResult::unsupported;
+                !vk.prepare_predicate(p.binding.buffer, p.binding.buffer_offset + predication->offset, p.predicate)) {
+                if (const auto r = unsupported("SetPredication (predicate capture)"); r != ReplayResult::success) return r;
+                predicated = false;
+                continue;
+            }
         } else if (const QueryRange range = query_range(command); range.count) {
             // BeginQuery, EndQuery and ResolveQueryData are not among D3D12's predicated calls, so a predicate does
             // not suppress them (emit_query suspends conditional rendering around ResolveQueryData).
-            if (!queries) return ReplayResult::unsupported;
+            if (!queries) {
+                if (const auto r = unsupported("query commands"); r != ReplayResult::success) return r;
+                continue;
+            }
             QueryPool* heap = vk.query_pool(range.heap);
             if (!heap) return ReplayResult::unresolved_resource;
             if (!query_fits_heap(heap->heap_type, range.type)) return ReplayResult::invalid_query;
             if (range.first >= heap->count || range.count > heap->count - range.first)
                 return ReplayResult::invalid_query;
-            if (!query_result_size(range.type)) return ReplayResult::unsupported;
+            if (!query_result_size(range.type)) {
+                if (const auto r = unsupported("query type result size"); r != ReplayResult::success) return r;
+                continue;
+            }
             if (range.type != d3d12_query::timestamp && !std::holds_alternative<ResolveQueries>(command)) {
                 const bool begin = std::holds_alternative<BeginQuery>(command);
                 if (range.type == d3d12_query::occlusion) {
@@ -2899,8 +3023,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::invalid_query;
                 // Inside a pipeline-statistics query, QueryReplay::plan checks that the helper dispatch is kept out
                 // of the application's counters.
-                if (range.type == d3d12_query::binary_occlusion && !vk.resolve_binary_occlusion)
-                    return ReplayResult::unsupported;
+                if (range.type == d3d12_query::binary_occlusion && !vk.resolve_binary_occlusion) {
+                    if (const auto r = unsupported("ResolveQueryData (binary occlusion)"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 if (p.binding.host_readable) {
                     out.wrote_readback = true;
                     out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -2928,32 +3054,48 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         !vk.emit_counted_dispatch || (statistics_active && !statistics_helpers) ||
                         !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
                                                      p.source.buffer, p.source.buffer_offset + ind->count_offset,
-                                                     ind->stride, ind->max_count, p.counted_dispatch))
-                        return ReplayResult::unsupported;
+                                                     ind->stride, ind->max_count, p.counted_dispatch)) {
+                        if (const auto r = unsupported("ExecuteIndirect (counted dispatch)"); r != ReplayResult::success) return r;
+                        continue;
+                    }
                 } else if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
                            (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count)) {
-                    return ReplayResult::unsupported;
+                    if (const auto r = unsupported("ExecuteIndirect (count buffer)"); r != ReplayResult::success) return r;
+                    continue;
                 }
             } else {
                 if ((ind->kind == IndirectKind::draw && !vk.draw_indirect) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect) ||
-                    (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect))
-                    return ReplayResult::unsupported;
+                    (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect)) {
+                    if (const auto r = unsupported("ExecuteIndirect"); r != ReplayResult::success) return r;
+                    continue;
+                }
             }
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
-                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
+                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) {
+                    if (const auto r = unsupported("ExecuteIndirect (dispatch pipeline)"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
                 if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
-                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets) {
+                    if (const auto r = unsupported("ExecuteIndirect (bindless sets)"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 p.pipeline = *pipeline;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
             if (vk.xdxr_check) {
-                if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
+                if (!vk.xdxr_check(*build)) {
+                    if (const auto r = unsupported("BuildRaytracingAccelerationStructure (XDXR check)"); r != ReplayResult::success) return r;
+                    continue;
+                }
             } else {
-                if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
-                    return ReplayResult::unsupported;
+                if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure) {
+                    if (const auto r = unsupported("BuildRaytracingAccelerationStructure"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
                 if (!p.accel_dst) return ReplayResult::unresolved_resource;
                 if (build->update && build->src_va) {
@@ -2968,7 +3110,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
             // the destination's room bounds the copy, as the size is only known to the GPU.
-            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
+            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) {
+                if (const auto r = unsupported("CopyRaytracingAccelerationStructure"); r != ReplayResult::success) return r;
+                continue;
+            }
             std::uint64_t room = ~std::uint64_t(0);
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
@@ -2981,7 +3126,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.xdxr_postbuild) {
                 p.skip = true;
             } else {
-                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return ReplayResult::unsupported;
+                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) {
+                    if (const auto r = unsupported("AccelerationStructurePostbuild"); r != ReplayResult::success) return r;
+                    continue;
+                }
                 std::uint64_t room = 8 * info->sources.size();
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
@@ -2989,19 +3137,30 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
-            if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
-                return ReplayResult::unsupported;
+            if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline) {
+                if (const auto r = unsupported("Dispatch"); r != ReplayResult::success) return r;
+                continue;
+            }
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
             if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
-            if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+            if (pipeline->bindless_set && !vk.bind_descriptor_sets) {
+                if (const auto r = unsupported("Dispatch (bindless sets)"); r != ReplayResult::success) return r;
+                continue;
+            }
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
+            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success) {
+                if (r == ReplayResult::unsupported) {
+                    --out.draw_count;
+                    if (const auto u = unsupported("Draw"); u != ReplayResult::success) return u;
+                    continue;
+                }
                 return r;
+            }
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
@@ -3258,6 +3417,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;
         }
+        if (p.skip) continue;
         // Helpers run outside the per-command rendering scopes; both segment endpoints stay outside too.
         const auto end_statistics = [&] {
             if (p.statistics_end != detail::PreparedQuery::no_segment)

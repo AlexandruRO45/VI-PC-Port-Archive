@@ -1846,6 +1846,9 @@ public:
     // not work the next submission will replay (vk_queue_test checks both halves of that contract).
     std::size_t prepared_entries() const { return prepared_.size(); }
 
+    void set_tolerate_unsupported(bool tolerate) { tolerate_unsupported_.store(tolerate, std::memory_order_relaxed); }
+    bool tolerate_unsupported() const { return tolerate_unsupported_.load(std::memory_order_relaxed); }
+
     template<typename GetHeap>
     bool update_tiles(ResourceId id, std::span<const TileRegion> regions,
                       std::span<const TileRange> ranges, GetHeap&& get_heap) {
@@ -1917,8 +1920,11 @@ public:
     }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
-    // the layout tracker as it was. Pending Wait()s are attached to this submission. When one of them (or an
-    // earlier held operation) waits for a fence value no Signal has been submitted for, the lists are copied and
+    // the layout tracker as it was. With tolerate_unsupported (the default), unsupported commands are skipped
+    // and logged once so supported commands in the list still execute. Direct `prepare()` calls keep tolerance off
+    // (`tolerant = false`) so standalone replay unit tests retain strict refusal, while queue tests can toggle strict
+    // mode via `set_tolerate_unsupported(false)`. Pending Wait()s are attached to this submission. When one of them
+    // (or an earlier held operation) waits for a fence value no Signal has been submitted for, the lists are copied and
     // held instead, and the call succeeds: the batch is replayed by the thread that submits the Signal (or the CPU
     // Signal), which is also where its errors are reported (stderr, and take_held_failure()).
     //
@@ -2289,7 +2295,8 @@ private:
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
-            const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
+            const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion,
+                                        tolerate_unsupported_.load(std::memory_order_relaxed));
             if (result != ReplayResult::success) return result;
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
@@ -3090,6 +3097,7 @@ private:
     // submit() already assume; other queues prepare concurrently with their own.
     std::vector<PreparedList> prepared_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
+    std::atomic<bool> tolerate_unsupported_{true};
     bool ok_ = false;
     // Wait-before-Signal. state_mutex_ is outermost (before resource_mutex_ -> tracker_mutex_ -> submit_mutex_) and
     // guards the members above that execute, signal, wait and marker touch.

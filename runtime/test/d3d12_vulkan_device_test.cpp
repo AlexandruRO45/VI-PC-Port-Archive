@@ -6854,6 +6854,57 @@ int main() {
             EXPECT(SUCCEEDED(list->Close()));
         }
 
+        // Execute supported commands in a list containing unsupported commands (D3D-408).
+        // By default, tolerate_unsupported is enabled: unsupported commands are skipped and logged once,
+        // while valid commands in the list execute normally. With tolerate_unsupported disabled,
+        // ExecuteCommandLists refuses the submission and submits nothing.
+        {
+            Ref<ID3D12GraphicsCommandList4> list4;
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list4.p))));
+
+            device->CreateRenderTargetView(rt_resource.p, &rtv_desc, rtv1);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const FLOAT green[4] = {0, 1, 0, 1};
+            list->ClearRenderTargetView(rtv1, green, 0, nullptr);
+            list4->CopyRaytracingAccelerationStructure(0x1000, 0x2000,
+                                                       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+            barrier = transition(rt_resource.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            {
+                const auto dst = footprint(readback.p, rt_place);
+                const auto src = subresource(rt_resource.p, 0);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            barrier = transition(rt_resource.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &barrier);
+            EXPECT(list->Close() == S_OK);
+
+            // 1. With tolerance disabled: ExecuteCommandLists fails with ReplayResult::unsupported and submits nothing
+            rt::d3d12::set_tolerate_unsupported(queue.p, false);
+            EXPECT(!rt::d3d12::tolerate_unsupported(queue.p));
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::unsupported);
+
+            // 2. Re-enable tolerance: ExecuteCommandLists succeeds, unsupported command is skipped, clear executes
+            rt::d3d12::set_tolerate_unsupported(queue.p, true);
+            EXPECT(rt::d3d12::tolerate_unsupported(queue.p));
+            std::memset(down + rt_place.Offset, 0xcd, size * rt_place.Footprint.RowPitch);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(submit_and_wait());
+
+            const std::uint8_t green_texel[4] = {0, 255, 0, 255};
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col)
+                    report("tolerant unsupported cmd clear texel",
+                           row * size + col,
+                           down + rt_place.Offset + row * rt_place.Footprint.RowPitch + col * 4,
+                           green_texel, 4);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            EXPECT(SUCCEEDED(list->Close()));
+        }
+
         // An occlusion query resolved into a predicate, the way a renderer skips occluded work (docs/d3d12_vulkan.md
         // sections 4.6 and 4.7). There are no draws yet, so the query counts 0 samples: EQUAL_ZERO skips the left
         // clear and NOT_EQUAL_ZERO runs the right one. The predicate goes COPY_DEST -> PREDICATION -> COPY_DEST and is

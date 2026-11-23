@@ -764,9 +764,11 @@ int main() {
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, past_view, buffer.p, values, 0, nullptr);
             }) == leonida::ReplayResult::invalid_subresource);
+            rt::d3d12::set_tolerate_unsupported(h.queue, false);
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, v_view, volume.p, values, 1, &rect);
             }) == leonida::ReplayResult::unsupported);
+            rt::d3d12::set_tolerate_unsupported(h.queue, true);
         }
     }
 

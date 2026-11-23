@@ -1353,6 +1353,8 @@ public:
         if (const auto held = queue_.take_held_failure(); held != leonida::ReplayResult::success) last_result_ = held;
         return last_result_;
     }
+    void set_tolerate_unsupported(bool tolerate) { queue_.set_tolerate_unsupported(tolerate); }
+    bool tolerate_unsupported() const { return queue_.tolerate_unsupported(); }
 
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override {
         d3d12_trace::record("ID3D12CommandQueue::GetDesc");
@@ -1800,6 +1802,17 @@ leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
     if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : leonida::ReplayResult::unsupported;
+}
+
+void set_tolerate_unsupported(ID3D12CommandQueue* queue, bool tolerate) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;
+    if (auto* q = CommandQueue::from(queue)) q->set_tolerate_unsupported(tolerate);
+}
+
+bool tolerate_unsupported(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;
+    if (const auto* q = CommandQueue::from(queue)) return q->tolerate_unsupported();
+    return false;
 }
 
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back) {

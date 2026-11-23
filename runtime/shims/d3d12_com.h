@@ -372,6 +372,11 @@ inline constexpr UINT descriptor_size = 32;
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 
+// Controls whether unsupported commands in a command list are tolerated (skipped and logged once,
+// default true) or cause ExecuteCommandLists to fail with ReplayResult::unsupported (D3D-408).
+void set_tolerate_unsupported(ID3D12CommandQueue* queue, bool tolerate);
+bool tolerate_unsupported(ID3D12CommandQueue* queue);
+
 // True when the current thread or process token has SeIncreaseBasePriorityPrivilege enabled (or the test override
 // forces it), which D3D12 requires for D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME.
 bool has_global_realtime_privilege();

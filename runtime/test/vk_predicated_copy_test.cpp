@@ -91,7 +91,9 @@ int main() {
     std::memcpy(expected.data()+5003,input.data()+1,17);
     const CommandList* pointer=&list;
     // A device without the helper must submit nothing, rather than run a transfer unconditionally.
+    queue.set_tolerate_unsupported(false);
     EXPECT(queue.execute({&pointer,1})==ReplayResult::unsupported);
+    queue.set_tolerate_unsupported(true);
     EXPECT(std::memcmp(dst_data,expected.data(),bytes)!=0); // expected includes the not-yet-executed copies
     for(std::size_t i=0;i<bytes;++i) EXPECT(static_cast<unsigned char*>(dst_data)[i]==static_cast<unsigned char>(13*i+173));
     context.configure_predicated_copy(d.device_proc,limits);

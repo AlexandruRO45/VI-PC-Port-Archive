@@ -360,9 +360,13 @@ What is implemented (all of it testable without the game):
   simultaneous-access textures stay in `GENERAL` for life. With `separateDepthStencilLayouts` the depth and stencil
   planes are tracked apart, so a depth-only clear or a one-plane transition leaves the other plane where it is.
 - **Execution** (`runtime/src/vulkan_backend.h`): `VulkanContext` (registered resources, the tracker, a view cache),
-  `VulkanQueue` (`ExecuteCommandLists` prepares every list before writing any, so a bad list submits nothing and
-  leaves the tracker as it was; `Signal`; `Wait`, which is attached to the next submission because a Vulkan wait
-  only holds back its own batch) and `VulkanFence` (a timeline semaphore).
+  `VulkanQueue` (`ExecuteCommandLists` prepares every list before writing any, so a structurally bad list or invalid
+  query submits nothing and leaves the tracker as it was; with `tolerate_unsupported` enabled by default for bring-up
+  (D3D-408), unsupported commands are skipped and logged once via `note_unsupported` so supported commands in the list
+  still execute. Direct `prepare()` calls keep tolerance off (`tolerant = false`) so standalone replay unit tests
+  retain strict refusal, while queue tests can toggle strict mode via `rt::d3d12::set_tolerate_unsupported(queue, false)`.
+  `Signal`; `Wait`, which is attached to the next submission because a Vulkan wait only holds back its own batch) and
+  `VulkanFence` (a timeline semaphore).
 - **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList8` (the GCL7 chain plus
   `OMSetFrontAndBackStencilRef`), `ID3D12CommandQueue`, `ID3D12CommandAllocator` and `ID3D12Fence1` (with
   `SetEventOnCompletion` events). Every method they do not implement is a stub generated at build time from the
