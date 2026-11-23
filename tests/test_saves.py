@@ -955,6 +955,133 @@ class PackIndexValidationTest(unittest.TestCase):
                 self.assertIn(self.index_path, str(error.exception))
                 self.assertIn(field, str(error.exception))
 
+    def test_entry_files_must_stay_inside_the_extract_folder(self):
+        secret = os.path.join(self.tmp.name, "secret.json")
+        write(secret, b'{"stolen":true}')
+        for i, value in enumerate(("../secret.json", secret)):
+            with self.subTest(value=value):
+                out = os.path.join(self.tmp.name, f"packed-{i}.jsav")
+                doc = json.loads(json.dumps(self.index))
+                doc["entries"][0]["file"] = value
+                write(self.index_path, json.dumps(doc).encode("utf-8"))
+                with self.assertRaises(ValueError) as error:
+                    saves.pack_from_dir(self.extracted)
+                self.assertIn(self.index_path, str(error.exception))
+                self.assertIn("entries[0].file", str(error.exception))
+                result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertIn("entries[0].file", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(os.path.exists(out), "a rejected entry must not write the output")
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive and device prefixes")
+    def test_windows_entry_prefixes_are_rejected(self):
+        block_file = self.index["entries"][0]["file"]
+        block_path = os.path.join(self.extracted, block_file)
+        # A drive-relative name uses the root's drive: C:foo joins to root/foo on C:.
+        write(os.path.join(self.extracted, "foo"), b"{}")
+        drive, tail = os.path.splitdrive(os.path.abspath(block_path))
+        device = "\\\\.\\" + drive + tail
+        extended = "\\\\?\\" + drive + tail
+        drive_relative = (drive + "foo", drive + block_file) if len(drive) == 2 else ()
+        for value in (*drive_relative, device, extended, r"\\server\share\secret"):
+            with self.subTest(value=value):
+                doc = json.loads(json.dumps(self.index))
+                doc["entries"][0]["file"] = value
+                write(self.index_path, json.dumps(doc).encode("utf-8"))
+                with self.assertRaises(ValueError) as error:
+                    saves.pack_from_dir(self.extracted)
+                self.assertIn(self.index_path, str(error.exception))
+                self.assertIn("entries[0].file", str(error.exception))
+
+    @unittest.skipUnless(os.name == "nt", "Windows absolute path")
+    def test_windows_absolute_path_inside_extract_is_accepted(self):
+        if os.path.abspath(self.extracted).startswith(("\\\\", "//")):
+            self.skipTest("extract root is UNC; absolute UNC entries are refused")
+        block_file = self.index["entries"][0]["file"]
+        doc = json.loads(json.dumps(self.index))
+        doc["entries"][0]["file"] = os.path.abspath(os.path.join(self.extracted, block_file))
+        write(self.index_path, json.dumps(doc).encode("utf-8"))
+        self.assertEqual(saves.pack_from_dir(self.extracted), self.original)
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction")
+    def test_windows_junction_entry_is_not_read_outside(self):
+        entry = os.path.basename(self.index["entries"][0]["file"])
+        root = os.path.join(self.tmp.name, "real", "deep", "child")
+        os.makedirs(os.path.dirname(root))
+        os.rename(self.extracted, root)
+        self.extracted = root
+        self.index_path = os.path.join(root, "index.json")
+        link = os.path.join(self.tmp.name, "jlink")
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", link, root],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            self.skipTest(f"junction unavailable: {result.stderr.strip() or result.stdout.strip()}")
+        self.addCleanup(lambda: os.path.isdir(link) and os.rmdir(link))
+        outside = os.path.join(self.tmp.name, "child")
+        os.makedirs(outside)
+        write(os.path.join(outside, entry), b'{"stolen":true}')
+        doc = json.loads(json.dumps(self.index))
+        doc["entries"][0]["file"] = "..\\child\\" + entry
+        write(self.index_path, json.dumps(doc).encode("utf-8"))
+        with self.assertRaises((OSError, ValueError)):
+            saves.pack_from_dir(link)
+        out = os.path.join(self.tmp.name, "junction.jsav")
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", link, out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(out), "a rejected entry must not write the output")
+
+    def test_hard_linked_source_file_is_refused(self):
+        secret = os.path.join(self.tmp.name, "outside-secret")
+        write(secret, b'{"stolen":true}')
+        try:
+            os.link(secret, os.path.join(self.extracted, "hard-secret"))
+        except OSError as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        out = os.path.join(self.tmp.name, "packed-hard.jsav")
+        doc = json.loads(json.dumps(self.index))
+        doc["entries"][0]["file"] = "hard-secret"
+        write(self.index_path, json.dumps(doc).encode("utf-8"))
+        with self.assertRaises(ValueError) as error:
+            saves.pack_from_dir(self.extracted)
+        self.assertIn(self.index_path, str(error.exception))
+        self.assertIn("entries[0].file", str(error.exception))
+        self.assertIn("hard link", str(error.exception))
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn("entries[0].file", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(out), "a rejected entry must not write the output")
+
+    def test_entry_paths_that_resolve_inside_are_accepted(self):
+        block_file = self.index["entries"][0]["file"]
+        cases = [block_file, "blocks/../" + block_file]
+        if os.name == "nt":
+            cases.append(block_file.replace("/", "\\"))
+        for value in cases:
+            with self.subTest(value=value):
+                doc = json.loads(json.dumps(self.index))
+                doc["entries"][0]["file"] = value
+                write(self.index_path, json.dumps(doc).encode("utf-8"))
+                self.assertEqual(saves.pack_from_dir(self.extracted), self.original)
+
+    @unittest.skipIf(os.name == "nt", "backslashes are path separators on Windows")
+    def test_backslash_prefixed_entry_is_a_normal_name_on_posix(self):
+        block_file = self.index["entries"][0]["file"]
+        name = "\\inside-block"
+        write(os.path.join(self.extracted, name), rd(os.path.join(self.extracted, block_file)))
+        doc = json.loads(json.dumps(self.index))
+        doc["entries"][0]["file"] = name
+        write(self.index_path, json.dumps(doc).encode("utf-8"))
+        self.assertEqual(saves.pack_from_dir(self.extracted), self.original)
+
     def test_cli_errors_leave_existing_output_untouched(self):
         out = os.path.join(self.tmp.name, "packed.jsav")
         write(out, b"previous complete output")

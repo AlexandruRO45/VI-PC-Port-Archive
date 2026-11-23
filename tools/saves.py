@@ -370,13 +370,12 @@ def pack_from_dir(src, refuse=None):
     def invalid(field, expected):
         raise ValueError(f'{index_path}: {field} must be {expected}')
 
-    def source(name):
-        path = os.path.join(src, name)
+    def source(path, display=None):
         if refuse is not None and same_report_path(path, refuse):
-            raise ValueError(f'{path}: pack reads this file, and --out {refuse} would replace it')
+            raise ValueError(f'{display or path}: pack reads this file, and --out {refuse} would replace it')
         return read(path)
 
-    text = source('index.json')
+    text = source(os.path.join(src, 'index.json'))
     try:
         idx = json.loads(text)
     except (ValueError, RecursionError) as exc:
@@ -413,7 +412,33 @@ def pack_from_dir(src, refuse=None):
         if not 0 <= hashed <= 0xFFFFFFFF:
             invalid(prefix + '.hash', 'a hexadecimal uint32 string')
         hashes.append(hashed)
-    blocks = [source(e['file']) for e in es]
+    root = os.path.realpath(src)
+    paths = []
+    for i, entry in enumerate(es):
+        name = entry['file']
+        # A drive-relative name (C:foo) or a UNC/device prefix would escape through join()/realpath().
+        if os.name == 'nt':
+            drive, _ = os.path.splitdrive(name)
+            if (drive and not os.path.isabs(name)) or name.startswith(('\\\\', '//')):
+                invalid(f'entries[{i}].file', 'a path inside the extract folder')
+        path = os.path.realpath(os.path.join(root, name))
+        try:
+            inside = os.path.commonpath([root, path]) == root
+        except ValueError:  # different drives on Windows
+            inside = False
+        if not inside:
+            invalid(f'entries[{i}].file', 'a path inside the extract folder')
+        try:
+            st = os.stat(path)
+        except OSError:
+            # A missing path still fails at read, from this resolved path.
+            pass
+        else:
+            # A hard link inside the extract can still expose bytes from outside it.
+            if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                invalid(f'entries[{i}].file', 'a file with no other hard links')
+        paths.append(path)
+    blocks = [source(path, os.path.join(src, e['file'])) for path, e in zip(paths, es)]
     return build_jsav(h['version'], h['code_blocks'], hashes, [e['flags'] for e in es], blocks)
 
 
