@@ -25,7 +25,7 @@ This page collects the setup steps and the problems testers have run into so far
   code, so the disassembly tools refuse them, naming the instruction family
   ([docs/design.md](design.md#disassembling-shaders)).
 
-  An older `llvm-mc` is not enough for everything. Ubuntu 24.04's `llvm-18` (18.1.3) runs `run_gpu_tests.py`,
+  An older `llvm-mc` is not enough for the disassembly tools, but it is enough for some test runs. Ubuntu 24.04's `llvm-18` (18.1.3) runs `run_gpu_tests.py`,
   `valu_fuzz.py --family mem` and `lds_fuzz.py`, but rejects `op_sel` on the 16-bit integer VOP3 forms that
   `valu_fuzz.py --family f16` generates (`v_ashrrev_i16_e64 ... op_sel:[0,0,0]`: "not a valid operand"), so no f16
   program assembles. 23.1.6 assembles them.
