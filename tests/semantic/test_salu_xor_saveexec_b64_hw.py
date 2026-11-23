@@ -347,5 +347,71 @@ class TestSXorSaveExecScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.exec_mask, 0x1111_2222_3333_4444 ^ 0x5555_6666_7777_8888)
         self.assertEqual(self.state.scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# -----------------------------------------------------------------------------
+
+class SIMDMultiLaneDivergenceModel:
+    """Models multi-lane execution in Wave64 / Wave32 environments for XOR."""
+
+    @staticmethod
+    def active_lanes_from_mask(mask: int, wave_size: int = 64) -> Set[int]:
+        return {lane for lane in range(wave_size) if (mask & (1 << lane)) != 0}
+
+    @staticmethod
+    def mask_from_active_lanes(lanes: Set[int]) -> int:
+        return sum(1 << l for l in lanes if 0 <= l < 64)
+
+    @staticmethod
+    def toggle_lanes(current_exec: int, toggle_mask: int) -> Tuple[int, int, int]:
+        """In RDNA2 control flow, s_xor_saveexec_b64 toggles lane states.
+
+        Lanes that are active and toggled become inactive.
+        Lanes that are inactive and toggled become active.
+        """
+        new_exec, saved_exec, scc = s_xor_saveexec_b64_oracle(toggle_mask, current_exec)
+        return new_exec, saved_exec, scc
+
+
+class TestSXorSaveExecSIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and dynamic lane toggling."""
+
+    def test_divergent_lane_toggling(self):
+        # All lanes initially active
+        initial_exec = ALL64
+        # Toggle even lanes (0, 2, 4, ... 62)
+        even_mask = 0x5555_5555_5555_5555
+
+        new_exec, saved_exec, scc = SIMDMultiLaneDivergenceModel.toggle_lanes(initial_exec, even_mask)
+        self.assertEqual(saved_exec, ALL64)
+        # Even lanes are now 0; odd lanes remain 1
+        self.assertEqual(new_exec, 0xAAAA_AAAA_AAAA_AAAA)
+        self.assertEqual(scc, 1)
+
+        active_lanes = SIMDMultiLaneDivergenceModel.active_lanes_from_mask(new_exec)
+        self.assertEqual(len(active_lanes), 32)
+        self.assertTrue(all(lane % 2 == 1 for lane in active_lanes))
+
+    def test_wave32_compatibility_half_mask(self):
+        # Wave32 uses lower 32 lanes
+        w32_s0 = 0x0000_0000_FFFF_0000
+        w32_exec = 0x0000_0000_FF00_FF00
+        new_exec, d, scc = s_xor_saveexec_b64_oracle(w32_s0, w32_exec)
+        self.assertEqual(new_exec, 0x0000_0000_00FF_FF00)
+        self.assertEqual(d, w32_exec)
+        self.assertEqual(scc, 1)
+        # High 32 bits remain zero
+        self.assertEqual(new_exec >> 32, 0)
+
+    def test_boundary_lane_toggling(self):
+        # Boundary lanes 0 and 63
+        boundary_toggle = (1 << 0) | (1 << 63)
+        initial_exec = 1 << 0  # only lane 0 active
+        new_exec, d, scc = s_xor_saveexec_b64_oracle(boundary_toggle, initial_exec)
+        # Lane 0 toggled off (0), Lane 63 toggled on (1)
+        self.assertEqual(new_exec, 1 << 63)
+        self.assertEqual(d, initial_exec)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
