@@ -73,9 +73,26 @@ class RunnerTest(unittest.TestCase):
 
     def test_an_empty_suite_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
-            code, out = run(tmp, "-j", "2")
-            self.assertEqual(code, 1)
-            self.assertIn("no test*.py files", out)
+            for jobs in ("1", "2"):
+                code, out = run(tmp, "-j", jobs)
+                self.assertEqual(code, 1, f"-j {jobs}: {out}")
+                self.assertIn("no test*.py files", out)
+
+    def test_missing_directory_fails_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "does_not_exist")
+            for jobs in ("1", "2"):
+                code, out = run(missing, "-j", jobs)
+                self.assertEqual(code, 1, f"-j {jobs}: {out}")
+                self.assertIn("no test*.py files", out)
+
+    def test_non_positive_jobs_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for jobs in ("0", "-1"):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        r.main([tmp, "-j", jobs])
+                self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

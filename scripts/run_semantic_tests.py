@@ -47,14 +47,16 @@ def main(argv=None):
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="files at a time (default: cores)")
     ap.add_argument("-v", "--verbose", action="store_true", help="unittest -v, and print passing files' output")
     a = ap.parse_args(argv)
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
     directory = os.path.abspath(a.directory)
-    if a.jobs <= 1:
-        return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
-                                *(["-v"] if a.verbose else [])])
     modules = test_modules(directory)
     if not modules:
         print(f"no test*.py files in {directory}")
         return 1
+    if a.jobs == 1:
+        return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
+                                *(["-v"] if a.verbose else [])])
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
     start, total, failed = time.monotonic(), 0, []
