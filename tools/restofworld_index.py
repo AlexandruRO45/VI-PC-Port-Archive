@@ -207,7 +207,10 @@ def classify(data, offset, stored):
         return row
     for at in (0x10, 0):
         if data[at:at + 4] == b"0DRP":
-            count = _u64(data, at + 0x10) if at == 0x10 else _u32(data, at + 0x0c)
+            # The count sits at frame +0x10 in both placements: root_objects for the standalone form (stream
+            # +0x20, its +0x14 zero) and root_block for an LRSC payload (docs/restofworld.md, tools/odrp_7a.py).
+            # +0x0c belongs to the zero qword at +0x08 and is never a count.
+            count = _u64(data, at + 0x10) if at == 0x10 else _u32(data, at + 0x10)
             row.update(signature="0drp", version=_u32(data, at + 4), count=count,
                        detail=f"0DRP@{at:#x}")
             return row

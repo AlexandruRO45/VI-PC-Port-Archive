@@ -53,10 +53,11 @@ def page():
 
 
 def page_at_zero():
+    """The LRSC placement as docs/restofworld.md measures it: zero at +0x08..+0x0f, root_block at +0x10."""
     data = bytearray(0x60)
     data[:4] = b"0DRP"
     struct.pack_into("<I", data, 4, 122)
-    struct.pack_into("<I", data, 0x0C, 7)
+    struct.pack_into("<I", data, 0x10, 7)
     return bytes(data)
 
 
@@ -182,6 +183,13 @@ class ClassifyTest(unittest.TestCase):
     def test_page_at_zero_uses_lrsc_count(self):
         row = restofworld_index.classify(page_at_zero(), 0x200, 40)
         self.assertEqual((row["signature"], row["version"], row["count"]), ("0drp", 122, 7))
+        # In the LRSC form +0x08..+0x0f is zero and root_block is at +0x10; a dword written at +0x0c only is
+        # not a count. Reading +0x0c reported 0 for every real LRSC stream (docs/restofworld.md line 78, the
+        # 1-based root_block indices at +0x10).
+        stray = bytearray(page_at_zero())
+        struct.pack_into("<I", stray, 0x10, 0)
+        struct.pack_into("<I", stray, 0x0C, 7)
+        self.assertEqual(restofworld_index.classify(bytes(stray), 0x200, 40)["count"], 0)
 
     def test_rsc8_header(self):
         row = restofworld_index.classify(rsc8(), 0x300, 50)
