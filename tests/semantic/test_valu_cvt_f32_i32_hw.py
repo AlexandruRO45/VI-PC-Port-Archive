@@ -300,5 +300,32 @@ class VCvtF32I32ConditionCodesTests(unittest.TestCase):
         self.assertEqual(scc, 1)
         self.assertEqual(state.vgprs[0], 0xBF800000)
 
+class VCvtF32I32Ieee754BoundariesTests(unittest.TestCase):
+    def test_integer_conversion_never_produces_nan_or_inf(self):
+        # All 32-bit signed integers convert to finite binary32 floats
+        for test_val in (0, 1, -1, 0x7FFFFFFF, 0x80000000, 1000000, -1000000):
+            bits = oracle_cvt_f32_i32(test_val)
+            f_val = struct.unpack(">f", struct.pack(">I", bits))[0]
+            self.assertFalse(math.isnan(f_val))
+            self.assertFalse(math.isinf(f_val))
+
+    def test_sign_bit_preservation(self):
+        # Negative numbers must produce float with sign bit (bit 31) set to 1
+        neg_bits = oracle_cvt_f32_i32(-1)
+        self.assertTrue((neg_bits >> 31) & 1)
+
+        # Zero and positive numbers must produce float with sign bit set to 0
+        pos_bits = oracle_cvt_f32_i32(1)
+        self.assertFalse((pos_bits >> 31) & 1)
+        zero_bits = oracle_cvt_f32_i32(0)
+        self.assertFalse((zero_bits >> 31) & 1)
+
+    def test_monotonicity(self):
+        # For a <= b, float(a) <= float(b)
+        vals = [-1000, -100, -1, 0, 1, 100, 1000]
+        floats = [struct.unpack(">f", struct.pack(">I", oracle_cvt_f32_i32(v)))[0] for v in vals]
+        for i in range(len(floats) - 1):
+            self.assertLessEqual(floats[i], floats[i + 1])
+
 if __name__ == "__main__":
     unittest.main()
