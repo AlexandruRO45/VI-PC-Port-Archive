@@ -438,6 +438,10 @@ if(BUILD_TESTING)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
+  if(MSVC)
+    # Use the same static CRT as vk_pipeline_check when testing checkpoint creation.
+    set_property(TARGET pipeline_cache_file_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
 
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
