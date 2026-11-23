@@ -3,6 +3,7 @@
     python3 -I scripts/check_no_game_data.py            # every file `git ls-files` lists
     python3 -I scripts/check_no_game_data.py PATH...    # only these files
     python3 -I scripts/check_no_game_data.py -h         # this usage
+    python3 -I scripts/check_no_game_data.py -- PATH... # these files, even one whose name starts with '-'
 
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
@@ -267,18 +268,24 @@ def display(path):
     return path.replace("\n", "\\n").replace("\r", "\\r")  # one line per file, even for a name with a newline
 
 
-USAGE = "usage: check_no_game_data.py [-h] [PATH...]"
+USAGE = "usage: check_no_game_data.py [-h] [--] [PATH...]"
 
 
 def main(argv):
-    if argv[:1] in (["-h"], ["--help"]):
+    if "--" in argv:  # ends the options, so a path that starts with '-' can still be checked
+        split = argv.index("--")
+        argv, paths = argv[:split], argv[split + 1:]
+    else:
+        paths = []
+    if "-h" in argv or "--help" in argv:
         print(__doc__.strip())  # the usage at its head; it checks nothing
         return 0
-    if argv and argv[0].startswith("-"):
-        print(f"unknown option {argv[0]}", file=sys.stderr)
+    unknown = next((a for a in argv if a.startswith("-")), None)
+    if unknown:
+        print(f"unknown option {unknown}", file=sys.stderr)
         print(USAGE, file=sys.stderr)
         return 2
-    paths = argv or tracked_files(os.getcwd())
+    paths = argv + paths or tracked_files(os.getcwd())
     found = check(paths)
     for path, name in found:
         print(f"{display(path)}: {name}")

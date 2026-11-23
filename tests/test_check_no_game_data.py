@@ -260,6 +260,13 @@ class CheckNoGameData(unittest.TestCase):
                 self.assertIn("usage: check_no_game_data.py", result.stderr)
                 self.assertEqual(result.stdout, "")
 
+    def test_dash_dash_lets_a_path_that_starts_with_a_dash_be_checked(self):
+        # Without the separator the option check takes such a path for a misspelt option.
+        self.write("-weird.bin", b"TTPF" + bytes(12))
+        result = run(["--", "-weird.bin"], cwd=self.dir)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("-weird.bin: TTPF texture pool", result.stdout)
+
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_default_mode_reads_tracked_files_only(self):
         git = ["git", "-c", "init.defaultBranch=main"]
