@@ -634,6 +634,8 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         head = f.read(8)
+    if head[:4] == b"9FPR" and len(head) < 8:
+        raise ValueError("a truncated RPF9 header (fewer than 8 bytes)")
     data_start = struct.unpack_from("<I", head, 4)[0] if head[:4] == b"9FPR" else 0
     lo = max(data_start, start or 0)
     hi = size if limit is None else min(size, lo + limit)
@@ -788,7 +790,11 @@ def main(argv=None):
         for iname, ipath in inputs:
             if same_report_path(rpath, ipath):
                 ap.error("%s must use a different path than %s" % (rname, iname))
-    total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    try:
+        total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    except (OSError, ValueError) as e:   # an unreadable archive, or a header shorter than its data-start field
+        print(f"ERROR: {a.archive}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
     try:
         summary = summarize(total, a.entities, a.lights_out)
     except ValueError as e:            # a bad --entities row, or an archetype that is not a number
