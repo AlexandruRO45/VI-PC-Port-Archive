@@ -120,6 +120,29 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual([(r["pr"], r["verdict"], r["merges"]) for r in rows],
                          [(32, "clean", []), (31, "already-merged", [merged_sha]), (32, "clean", [])])
 
+    def test_batch_uses_initial_revisions_when_refs_advance(self):
+        base = self.git("rev-parse", "main")
+        self.pr_branch("landing", base, PARAGRAPH)
+        self.pr_branch("next", base, "Initial PR text.\n")
+        advanced = self.pr_branch("next-updated", "next", "Another commit on the PR branch.\n")
+        pairs = ("31=landing", "32=next", "33=next")
+        expected = self.run_check(*pairs)
+        self.assertEqual(expected[0], 0)
+
+        original_git = mc.git
+
+        def git_and_advance_refs(repo, *args, **kwargs):
+            result = original_git(repo, *args, **kwargs)
+            if args[0] == "log":
+                self.merge(31, "landing")
+                self.git("update-ref", "refs/heads/next", advanced)
+            return result
+
+        with mock.patch.object(mc, "git", side_effect=git_and_advance_refs):
+            self.assertEqual(self.run_check(*pairs), expected)
+        self.assertNotEqual(self.git("rev-parse", "main"), base)
+        self.assertEqual(self.git("rev-parse", "next"), advanced)
+
     def test_text_already_on_main_is_reported_even_when_the_patch_differs(self):
         base = self.git("rev-parse", "main")
         self.pr_branch("first", base, "\n" + PARAGRAPH)
