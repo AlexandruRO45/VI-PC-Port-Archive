@@ -534,5 +534,55 @@ class TestValuFrexpExpI32F64RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.state.vgprs[4], 0xCCCCCCCC)
 
 
+# ---------------------------------------------------------------------------
+# Stage 6: Condition codes, status flags, and exponent classification
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class FrexpExpStatusFlags:
+    """Classification flags for frexp exponent values."""
+    is_zero: bool
+    is_positive: bool
+    is_negative: bool
+    raw_exp_s32: int
+
+
+def compute_frexp_status_flags(exp_u32: int) -> FrexpExpStatusFlags:
+    s = to_s32(exp_u32)
+    return FrexpExpStatusFlags(
+        is_zero=(s == 0),
+        is_positive=(s > 0),
+        is_negative=(s < 0),
+        raw_exp_s32=s,
+    )
+
+
+class TestValuFrexpExpI32F64ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes and status flags for v_frexp_exp_i32_f64."""
+
+    def test_status_flags_zero(self) -> None:
+        exp_0 = oracle_frexp_exp_i32_f64(f64_to_bits(0.5))
+        flags = compute_frexp_status_flags(exp_0)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_positive)
+        self.assertFalse(flags.is_negative)
+
+    def test_status_flags_positive(self) -> None:
+        exp_pos = oracle_frexp_exp_i32_f64(f64_to_bits(2.0))
+        flags = compute_frexp_status_flags(exp_pos)
+        self.assertFalse(flags.is_zero)
+        self.assertTrue(flags.is_positive)
+        self.assertFalse(flags.is_negative)
+        self.assertEqual(flags.raw_exp_s32, 2)
+
+    def test_status_flags_negative(self) -> None:
+        exp_neg = oracle_frexp_exp_i32_f64(f64_to_bits(0.25))
+        flags = compute_frexp_status_flags(exp_neg)
+        self.assertFalse(flags.is_zero)
+        self.assertFalse(flags.is_positive)
+        self.assertTrue(flags.is_negative)
+        self.assertEqual(flags.raw_exp_s32, -1)
+
+
 if __name__ == "__main__":
     unittest.main()
