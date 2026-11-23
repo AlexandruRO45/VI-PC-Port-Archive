@@ -545,6 +545,137 @@ bool check_bundle_rejection(ID3D12Device* device) {
     return true;
 }
 
+struct SoStatsResult {
+    D3D12_QUERY_DATA_SO_STATISTICS normal{};
+    D3D12_QUERY_DATA_SO_STATISTICS overflow{};
+    D3D12_QUERY_DATA_SO_STATISTICS stream0{};
+    D3D12_QUERY_DATA_SO_STATISTICS stream1{};
+    D3D12_QUERY_DATA_SO_STATISTICS unended{};
+    UINT64 overflow_counter = 0;
+};
+
+bool run_so_statistics_queries(Fixture& f, SoStatsResult& out) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = make_pso_desc(f, false, false);
+    copycmp::Ptr<ID3D12PipelineState> pso;
+    const HRESULT pso_hr = f.run.device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p));
+    if (FAILED(pso_hr)) {
+        std::fprintf(stderr, "CreateGraphicsPipelineState SO query (%s) failed: 0x%08x\n",
+                     f.run.ours ? "Vulkan" : "host", unsigned(pso_hr));
+        return false;
+    }
+
+    const SoInputVertex two_tris[6] = {
+        {-0.5f,  0.5f, 0.25f, 1.0f, 1, 0, 0, 1},
+        { 0.5f,  0.5f, 0.25f, 1.0f, 0, 1, 0, 1},
+        {-0.5f, -0.5f, 0.25f, 1.0f, 0, 0, 1, 1},
+        { 0.0f,  0.5f, 0.25f, 1.0f, 1, 1, 0, 1},
+        { 0.5f,  0.0f, 0.25f, 1.0f, 0, 1, 1, 1},
+        { 0.0f, -0.5f, 0.25f, 1.0f, 1, 0, 1, 1},
+    };
+    constexpr UINT buf_size = 512;
+    copycmp::Ptr<ID3D12Resource> vb, so_buf, cnt0, cnt1, cnt2, rb_stats, rb_cnt1;
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_UPLOAD, sizeof(two_tris), D3D12_RESOURCE_STATE_GENERIC_READ, vb));
+    {
+        void* p = nullptr;
+        const D3D12_RANGE none{};
+        CHECK(SUCCEEDED(vb->Map(0, &none, &p)));
+        std::memcpy(p, two_tris, sizeof(two_tris));
+        vb->Unmap(0, nullptr);
+    }
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_DEFAULT, buf_size, D3D12_RESOURCE_STATE_STREAM_OUT, so_buf));
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_COPY_DEST, cnt0));
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_COPY_DEST, cnt1));
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_COPY_DEST, cnt2));
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_STATE_COPY_DEST, rb_stats));
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_STATE_COPY_DEST, rb_cnt1));
+    copycmp::Ptr<ID3D12Resource> st_zero;
+    CHECK(f.run.buffer(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_STATE_GENERIC_READ, st_zero));
+    {
+        void* p = nullptr;
+        const D3D12_RANGE none{};
+        CHECK(SUCCEEDED(st_zero->Map(0, &none, &p)));
+        std::memset(p, 0, 256);
+        st_zero->Unmap(0, nullptr);
+    }
+
+    copycmp::Ptr<ID3D12QueryHeap> heap;
+    const D3D12_QUERY_HEAP_DESC qdesc{D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 5, 0};
+    CHECK(SUCCEEDED(f.run.device->CreateQueryHeap(&qdesc, IID_PPV_ARGS(&heap.p))));
+
+    f.run.begin();
+    f.run.list->CopyBufferRegion(cnt0.p, 0, st_zero.p, 0, 256);
+    f.run.list->CopyBufferRegion(cnt1.p, 0, st_zero.p, 0, 256);
+    f.run.list->CopyBufferRegion(cnt2.p, 0, st_zero.p, 0, 256);
+    f.run.barrier(cnt0.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+    f.run.barrier(cnt1.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+    f.run.barrier(cnt2.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+    f.run.list->SetPipelineState(pso.p);
+    f.run.list->SetGraphicsRootSignature(f.root.p);
+    f.run.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VERTEX_BUFFER_VIEW vbv{vb->GetGPUVirtualAddress(), sizeof(two_tris), sizeof(SoInputVertex)};
+    f.run.list->IASetVertexBuffers(0, 1, &vbv);
+    const float off[2] = {0.0f, 0.0f};
+    f.run.list->SetGraphicsRoot32BitConstants(0, 2, off, 0);
+
+    // Query 0: 2 triangles fit inside 512 bytes.
+    const D3D12_STREAM_OUTPUT_BUFFER_VIEW view0{so_buf->GetGPUVirtualAddress(), buf_size, cnt0->GetGPUVirtualAddress()};
+    f.run.list->SOSetTargets(0, 1, &view0);
+    f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    f.run.list->DrawInstanced(6, 1, 0, 0);
+    f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+
+    // Query 1: 2 triangles drawn into 128-byte buffer -> fits 1 triangle (96 bytes), overflows 2nd.
+    const D3D12_STREAM_OUTPUT_BUFFER_VIEW view1{so_buf->GetGPUVirtualAddress(), 128, cnt1->GetGPUVirtualAddress()};
+    f.run.list->SOSetTargets(0, 1, &view1);
+    f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
+    f.run.list->DrawInstanced(6, 1, 0, 0);
+    f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
+
+    // Queries 2 & 3: simultaneous STREAM0 + STREAM1 on a 1-triangle VS draw (only stream 0 receives primitives).
+    const D3D12_STREAM_OUTPUT_BUFFER_VIEW view2{so_buf->GetGPUVirtualAddress(), buf_size, cnt2->GetGPUVirtualAddress()};
+    f.run.list->SOSetTargets(0, 1, &view2);
+    f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 2);
+    f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 3);
+    f.run.list->DrawInstanced(3, 1, 0, 0);
+    f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 3);
+    f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 2);
+
+    // Resolve ended slots; D3D12 leaves un-ended query slots undefined on the host, while the layer guarantees zeros.
+    if (f.run.ours) {
+        f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 5, rb_stats.p, 0);
+    } else {
+        f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 3, rb_stats.p, 0);
+        f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 3, 1, rb_stats.p,
+                                     3 * sizeof(D3D12_QUERY_DATA_SO_STATISTICS));
+    }
+    f.run.barrier(cnt1.p, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    f.run.list->CopyBufferRegion(rb_cnt1.p, 0, cnt1.p, 0, 8);
+
+    const std::string err = f.run.submit();
+    if (!err.empty()) {
+        std::fprintf(stderr, "SO query submit (%s): %s\n", f.run.ours ? "Vulkan" : "host", err.c_str());
+        return false;
+    }
+
+    void* p = nullptr;
+    const D3D12_RANGE r80{0, 5 * sizeof(D3D12_QUERY_DATA_SO_STATISTICS)};
+    CHECK(SUCCEEDED(rb_stats->Map(0, &r80, &p)));
+    D3D12_QUERY_DATA_SO_STATISTICS stats[5]{};
+    std::memcpy(stats, p, sizeof(stats));
+    rb_stats->Unmap(0, nullptr);
+    out.normal = stats[0];
+    out.overflow = stats[1];
+    out.stream0 = stats[2];
+    out.stream1 = stats[3];
+    out.unended = stats[4];
+
+    const D3D12_RANGE r8{0, 8};
+    CHECK(SUCCEEDED(rb_cnt1->Map(0, &r8, &p)));
+    std::memcpy(&out.overflow_counter, p, sizeof(out.overflow_counter));
+    rb_cnt1->Unmap(0, nullptr);
+    return true;
+}
+
 bool check_float_eq(const std::vector<std::uint8_t>& buf, std::size_t byte_offset,
                     const std::array<float, 8>& expected) {
     float got[8] = {};
@@ -786,10 +917,73 @@ int main() {
             }
         }
 
+        // Hardware SO_STATISTICS queries (normal, overflow, simultaneous multi-stream, un-ended, and zero fallback).
+        if (d.transform_feedback_queries) {
+            SoStatsResult ours_q{};
+            if (!run_so_statistics_queries(f_ours, ours_q)) {
+                rc = 1;
+            } else {
+                const auto eq = [](const D3D12_QUERY_DATA_SO_STATISTICS& a, UINT64 written, UINT64 needed) {
+                    return a.NumPrimitivesWritten == written && a.PrimitivesStorageNeeded == needed;
+                };
+                if (!eq(ours_q.normal, 2, 2) || !eq(ours_q.overflow, 1, 2) || ours_q.overflow_counter != 96 ||
+                    !eq(ours_q.stream0, 1, 1) || !eq(ours_q.stream1, 0, 0) || !eq(ours_q.unended, 0, 0)) {
+                    std::fprintf(stderr,
+                                 "SO_STATISTICS unexpected: normal=(%llu,%llu) overflow=(%llu,%llu) cnt=%llu "
+                                 "stream0=(%llu,%llu) stream1=(%llu,%llu) unended=(%llu,%llu)\n",
+                                 ours_q.normal.NumPrimitivesWritten, ours_q.normal.PrimitivesStorageNeeded,
+                                 ours_q.overflow.NumPrimitivesWritten, ours_q.overflow.PrimitivesStorageNeeded,
+                                 ours_q.overflow_counter,
+                                 ours_q.stream0.NumPrimitivesWritten, ours_q.stream0.PrimitivesStorageNeeded,
+                                 ours_q.stream1.NumPrimitivesWritten, ours_q.stream1.PrimitivesStorageNeeded,
+                                 ours_q.unended.NumPrimitivesWritten, ours_q.unended.PrimitivesStorageNeeded);
+                    rc = 1;
+                }
+            }
+            if (has_host && rc == 0) {
+                SoStatsResult host_q{};
+                if (!run_so_statistics_queries(f_host, host_q)) {
+                    rc = 1;
+                } else {
+                    const auto qeq = [](const D3D12_QUERY_DATA_SO_STATISTICS& a,
+                                        const D3D12_QUERY_DATA_SO_STATISTICS& b) {
+                        return a.NumPrimitivesWritten == b.NumPrimitivesWritten &&
+                               a.PrimitivesStorageNeeded == b.PrimitivesStorageNeeded;
+                    };
+                    if (!qeq(ours_q.normal, host_q.normal) || !qeq(ours_q.overflow, host_q.overflow) ||
+                        !qeq(ours_q.stream0, host_q.stream0) || !qeq(ours_q.stream1, host_q.stream1) ||
+                        ours_q.overflow_counter != host_q.overflow_counter) {
+                        std::fprintf(stderr, "SO_STATISTICS differed from host D3D12 (%s)\n", host_name.c_str());
+                        rc = 1;
+                    }
+                }
+            }
+            // Zero-fill fallback when transform_feedback_queries is disabled.
+            if (rc == 0) {
+                rt::d3d12::VulkanDeviceInfo no_tfq = info;
+                no_tfq.transform_feedback_queries = false;
+                copycmp::Ptr<ID3D12Device> dev_no_tfq;
+                REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(no_tfq, IID_PPV_ARGS(&dev_no_tfq.p))));
+                Fixture f_no_tfq;
+                REQUIRE(init_fixture(f_no_tfq, dev_no_tfq.p, true,
+                                     {vs_single_bytes.data(), vs_single_bytes.size()},
+                                     {vs_multi_bytes.data(), vs_multi_bytes.size()},
+                                     {ps_bytes.data(), ps_bytes.size()}));
+                SoStatsResult fb_q{};
+                if (!run_so_statistics_queries(f_no_tfq, fb_q) ||
+                    fb_q.normal.NumPrimitivesWritten != 0 || fb_q.normal.PrimitivesStorageNeeded != 0 ||
+                    fb_q.overflow.NumPrimitivesWritten != 0 || fb_q.overflow.PrimitivesStorageNeeded != 0) {
+                    std::fprintf(stderr, "SO_STATISTICS fallback without transformFeedbackQueries failed\n");
+                    rc = 1;
+                }
+            }
+        }
+
         if (rc == 0) {
             std::printf("stream output: validation parity (11 cases), append/reset counters (%llu/%llu), "
-                        "simultaneous SO+raster, multi-slot (2 buffers), unbind/ClearState, bundle rejection%s passed\n",
+                        "simultaneous SO+raster, multi-slot (2 buffers), unbind/ClearState, bundle rejection%s%s passed\n",
                         ours_cnt_append, ours_cnt_reset,
+                        d.transform_feedback_queries ? ", hardware SO_STATISTICS (normal/overflow/multi-stream/fallback)" : "",
                         has_host ? (" (matched host " + host_name + ")").c_str() : "");
         }
     }

@@ -2657,10 +2657,13 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
-- **Stream-output statistics** (D3D-302). Stream-output graphics PSOs and `SOSetTargets` replay via
-  `VK_EXT_transform_feedback`, while `SO_STATISTICS` query heaps still return zeros here (`BeginQuery`/`EndQuery`
-  track ended state and `ResolveQueryData` fills 16 zero bytes per query) until hardware
-  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` queries are wired in the follow-up change.
+- **Stream-output statistics** (`SO_STATISTICS_STREAM0..3`). When `VK_EXT_transform_feedback` and
+  `transformFeedbackQueries` are enabled, `D3D12_QUERY_HEAP_TYPE_SO_STATISTICS` allocates a
+  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool; `BeginQuery`/`EndQuery` emit
+  `vkCmdBeginQueryIndexedEXT`/`vkCmdEndQueryIndexedEXT` on stream `0..3`, and `ResolveQueryData` resolves the two
+  `UINT64` counters (`NumPrimitivesWritten`, `PrimitivesStorageNeeded`, 16 bytes per query). Without
+  `transformFeedbackQueries`, the heap stays poolless and resolves zeros (`vkCmdFillBuffer`), and un-ended query
+  slots always resolve zeros (`d3d12_stream_output_test`).
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and
@@ -2748,11 +2751,8 @@ Not implemented yet:
 - **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
   kinds or statistics queries overlap each other is refused there with `ReplayResult::unsupported`; the batched
   path above replays them.
-- Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132), and stream-output statistics that count real
-  primitives (they wait for stream output itself). (`GetClockCalibration` is implemented: see section 4.4,
+- Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132). (`GetClockCalibration` is implemented: see section 4.4,
   "Fences, queues and frames in flight".)
-- Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
-  queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures

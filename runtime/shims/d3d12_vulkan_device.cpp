@@ -4178,7 +4178,8 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc, Devic
 // (docs/d3d12_vulkan.md section 4.6). Occlusion heaps hold both OCCLUSION and BINARY_OCCLUSION queries; timestamp
 // and copy-queue timestamp heaps are timestamp pools; pipeline-statistics heaps count all eleven Vulkan
 // statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS. Stream-output
-// statistics heaps have no pool: without stream output every such query is zero.
+// statistics heaps allocate a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool when transformFeedbackQueries is
+// enabled (falling back to zero-fill when unavailable).
 class QueryHeap final
     : public Child<QueryHeap, ID3D12QueryHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12QueryHeap> {
@@ -4213,10 +4214,12 @@ public:
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
             break;
         case h::so_statistics:
-            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
-            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
-            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
-            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
+            if (device_.info.transform_feedback && device_.info.transform_feedback_queries &&
+                vk.vkCmdBeginQueryIndexedEXT && vk.vkCmdEndQueryIndexedEXT) {
+                info.queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+                break;
+            }
+            // Without hardware transformFeedbackQueries, every SO_STATISTICS_STREAMn query resolves zeros.
             return register_pool(desc);
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
@@ -4258,7 +4261,7 @@ private:
     static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 11 * sizeof(UINT64));
 
     DeviceState& device_;
-    VkQueryPool pool_ = VK_NULL_HANDLE;  // null for a stream-output heap (no Vulkan query behind it)
+    VkQueryPool pool_ = VK_NULL_HANDLE;  // null only when SO_STATISTICS falls back without transformFeedbackQueries
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 

@@ -722,8 +722,7 @@ struct OcclusionResult {
 // A D3D12 query heap on Vulkan. The host tracks which queries hold a result. A resolve of a query that
 // was never ended writes zeros instead of waiting on it.
 struct QueryPool {
-    // Null for a stream-output statistics heap: the layer has no stream output (PSOs with StreamOutput entries are
-    // refused), so every SO_STATISTICS_STREAMn query counts 0 written and 0 needed, and a resolve fills zeros.
+    // Null when a stream-output statistics heap falls back to zero-fill (transformFeedbackQueries unavailable).
     VkQueryPool pool = VK_NULL_HANDLE;
     std::uint32_t heap_type = 0;  // d3d12_query_heap
     std::uint32_t count = 0;
@@ -2436,6 +2435,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     // type is still open at most once at any point, because each event closes the one open slot and opens a new
     // one. The occlusion kinds share their D3D12 heap, statistics have their own, so their states are separate.
     std::size_t ordinary_active = 0, binary_active = 0, statistics_active_count = 0;
+    std::array<std::uint32_t, 4> so_active{};
     bool overlaps = false, statistics_overlaps = false, statistics_active = false;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
@@ -2806,7 +2806,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     overlaps |= begin && (ordinary_active || binary_active);
                     if (begin) ++binary_active; else --binary_active;
                 } else if (is_so_statistics(range.type)) {
-                    // No Vulkan query runs for it (QueryPool::pool is null), so it overlaps nothing.
+                    if (heap->pool) {
+                        if (!vk.begin_query_indexed || !vk.end_query_indexed) return ReplayResult::unsupported;
+                        const std::uint32_t stream = range.type - d3d12_query::so_statistics_stream0;
+                        if (begin && so_active[stream] > 0) return ReplayResult::unsupported;
+                        if (begin) ++so_active[stream];
+                        else if (so_active[stream]) --so_active[stream];
+                    }
                 } else {
                     statistics_overlaps |= begin && statistics_active_count;
                     if (begin) ++statistics_active_count; else --statistics_active_count;
@@ -2924,7 +2930,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return r;
         }
     }
-    if (ordinary_active || binary_active) return ReplayResult::invalid_query;
+    if (ordinary_active || binary_active || so_active[0] || so_active[1] || so_active[2] || so_active[3])
+        return ReplayResult::invalid_query;
     out.statistics_overlaps = statistics_overlaps;
     if (statistics_overlaps) {
         const auto result = plan_overlapping_statistics_segments(out);
@@ -3093,17 +3100,25 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         begin_statistics();
         return;
     }
-    // A heap without a Vulkan pool (stream-output statistics: the layer has no stream output) runs nothing for
-    // BeginQuery and EndQuery; its resolves were planned as zero fills.
+    // A heap without a Vulkan pool (stream-output statistics fallback without transformFeedbackQueries) runs
+    // nothing for BeginQuery and EndQuery; its resolves were planned as zero fills.
     if (!heap.pool && !std::holds_alternative<ResolveQueries>(command)) return;
     if (const auto* begin = std::get_if<BeginQuery>(&command)) {
         vk.reset_query_pool(cb, heap.pool, begin->index, 1);
-        const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
-        vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        if (is_so_statistics(begin->type)) {
+            vk.begin_query_indexed(cb, heap.pool, begin->index, 0,
+                                   begin->type - d3d12_query::so_statistics_stream0);
+        } else {
+            const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
+            vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        }
     } else if (const auto* end = std::get_if<EndQuery>(&command)) {
         if (end->type == d3d12_query::timestamp) {
             vk.reset_query_pool(cb, heap.pool, end->index, 1);
             vk.write_timestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);
+        } else if (is_so_statistics(end->type)) {
+            vk.end_query_indexed(cb, heap.pool, end->index,
+                                 end->type - d3d12_query::so_statistics_stream0);
         } else {
             vk.end_query(cb, heap.pool, end->index);
         }
