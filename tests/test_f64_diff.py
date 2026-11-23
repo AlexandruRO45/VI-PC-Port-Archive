@@ -387,6 +387,42 @@ class F64DiffTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("minimal program:", stdout.getvalue())
 
+    def test_hw_kernel_zeroes_output_vgprs_and_shrink_stays_nonempty(self):
+        empty = fd.hw_kernel([])
+        self.assertEqual(
+            empty.lines[:4],
+            ["v_mov_b32 v8, 0", "v_mov_b32 v9, 0", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"],
+        )
+
+        class BrokenAddHW:
+            device = "fake gfx1036"
+
+            def run(self, kernels):
+                out = []
+                for kernel in kernels:
+                    initialized = kernel.lines[:4] == [f"v_mov_b32 v{r}, 0" for r in range(8, 12)]
+                    if not initialized:
+                        out.append([0xBAD00000, 0xBAD00001, 0, 0])
+                        continue
+                    words = fd.ref_program(kernel.lines[:-3], True)
+                    if any(ln.startswith("v_add_f64") for ln in kernel.lines):
+                        words[1] ^= 0x10
+                    out.append(words)
+                return out
+
+        lines = [
+            "v_mov_b32 v12, 0x00000000",
+            "v_mov_b32 v13, 0x3ff00000",
+            "v_add_f64 v[8:9], v[12:13], 1.0",
+        ]
+        fake = BrokenAddHW()
+        with tempfile.TemporaryDirectory() as tmp:
+            status, _, want, _ = fd.run_one(lines, "ps_f64_zero_shrink", tmp, "hw", fake)
+            self.assertEqual(status, "mismatch")
+            reduced = fd.shrink(lines, want, "hw", None, fake, tmp)
+        self.assertTrue(reduced)
+        self.assertTrue(any(ln.startswith("v_add_f64") for ln in reduced))
+
 
 if __name__ == "__main__":
     unittest.main()
