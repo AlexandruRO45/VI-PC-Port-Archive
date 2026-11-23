@@ -419,5 +419,46 @@ class TestSaluAndSaveexecB32ConditionCodes(unittest.TestCase):
         self.assertEqual(state.scc, 1)
 
 
+
+
+class TestSaluAndSaveexecB32BitwiseEdgeCases(unittest.TestCase):
+    """Test suite for 32-bit IEEE-754 bit representations and boundary bitmasks."""
+
+    def test_ieee754_single_precision_bit_patterns(self):
+        cases = [
+            0x7F800000,  # +inf
+            0xFF800000,  # -inf
+            0x7FC00000,  # Canonical NaN
+            0x7F800001,  # Signaling NaN
+            0x00000000,  # +0.0
+            0x80000000,  # -0.0
+            0x00000001,  # Min subnormal
+            0x007FFFFF,  # Max subnormal
+        ]
+        for pattern in cases:
+            for old_exec in (0x0, ALL_LANES_ACTIVE_32, 0xAAAAAAAA):
+                with self.subTest(pattern=hex(pattern), exec=hex(old_exec)):
+                    new_e, d, scc = ref_and_saveexec_b32(pattern, old_exec)
+                    self.assertEqual(d, old_exec)
+                    self.assertEqual(new_e, pattern & old_exec)
+                    self.assertEqual(scc, int(new_e != 0))
+
+    def test_boundary_alternating_bitmasks(self):
+        checkerboards = [
+            0x55555555,
+            0xAAAAAAAA,
+            0x33333333,
+            0xCCCCCCCC,
+            0x0F0F0F0F,
+            0xF0F0F0F0,
+            0x00FF00FF,
+            0xFF00FF00,
+        ]
+        for cb1 in checkerboards:
+            for cb2 in checkerboards:
+                new_e, d, scc = ref_and_saveexec_b32(cb1, cb2)
+                self.assertEqual(new_e, cb1 & cb2)
+
+
 if __name__ == "__main__":
     unittest.main()
