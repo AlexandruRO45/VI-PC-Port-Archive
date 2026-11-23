@@ -465,6 +465,17 @@ STORE_WORDS = {
     "cs_resinfo": ({**dict(enumerate([16, 4, 0, 5, 8, 2, 0, 5, 2, 1, 0, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5,
                     20: 0, 21: 0, 22: 0, 23: 5},
                    {}, {}),
+    # 3D image_load_mip (docs/design.md "3D explicit-mip loads"): a 4x4x4 image with three levels is bound at
+    # binding 6, one per numeric class, and level L of the uint image holds 0x10000 L + 16z + 4y + x at texel
+    # (x, y, z), the sint image the same negated and the unorm image one colour per level. Each result goes to
+    # its own texel of the 2D sint image (i = 8y + x), as derived in cs_imgload_mip_3d.asm's header: the four
+    # address registers at mip 0 and 1, the three T# FORMAT classes, and the d16 forms narrowing the components
+    # before they pack them low half first.
+    "cs_imgload_mip_3d": ({},
+                          {0: 0x39, 1: 0xFFFFFFC7, 2: 0x3F800000, 3: 0, 4: 0, 5: 0x3F800000, 6: 0x10011,
+                           7: 0xFFFEFFEF, 8: 0, 9: 0, 10: 0x3F800000, 11: 0xFFFF, 12: 0x39, 13: 0x8000,
+                           14: 0x3C00},
+                          {}),
 }
 # TEST-184: image_get_lod on vk_texture_test's textures. Per fixture, its draws: S# word 1 (MIN_LOD [11:0], MAX_LOD
 # [23:12], 4.8 fixed point), whether the two-mip texture is drawn, and mrt0, as derived in the .asm header:
