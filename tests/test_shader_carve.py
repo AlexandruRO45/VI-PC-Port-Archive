@@ -679,6 +679,44 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIn("ERROR: cannot write", res_idx.stderr)
         self.assertNotIn("Traceback", res_idx.stderr)
 
+    def test_archive_removed_before_getsize_and_emptied_before_mmap(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+
+        real_getsize = os.path.getsize
+
+        def remove_then_getsize(path):
+            if os.path.abspath(path) == os.path.abspath(self.archive) and os.path.exists(path):
+                os.remove(path)
+            return real_getsize(path)
+
+        err = io.StringIO()
+        with mock.patch("shader_carve.os.path.getsize", side_effect=remove_then_getsize):
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as ctx:
+                    shader_carve.main([self.archive, self.out])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("cannot read", err.getvalue())
+
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+
+        def truncate_then_return_size(path):
+            size = real_getsize(path)
+            if os.path.abspath(path) == os.path.abspath(self.archive):
+                with open(path, "wb"):
+                    pass
+            return size
+
+        err2 = io.StringIO()
+        with mock.patch("shader_carve.os.path.getsize", side_effect=truncate_then_return_size):
+            with contextlib.redirect_stderr(err2):
+                with self.assertRaises(SystemExit) as ctx2:
+                    shader_carve.main([self.archive, self.out])
+        self.assertEqual(ctx2.exception.code, 2)
+        self.assertIn("is empty", err2.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

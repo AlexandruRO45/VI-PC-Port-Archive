@@ -21,6 +21,10 @@ import sys
 import tempfile
 import zlib
 
+# `python -I` leaves the script's directory off sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from replace_retry import replace as replace_retry  # noqa: E402
+
 ENTRY = re.compile(rb"([\x21-\x7e]{3,200})\x00(.)(....)(....)\3(....)", re.DOTALL)
 STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 6: "lib", 13: "ms", 14: "as"}
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
@@ -95,44 +99,49 @@ def main(argv=None) -> int:
         ap.error(f"cannot create {out}: {e.strerror or e}")
     index, seen, used, bad = [], {}, set(), 0
     try:
-        with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-            pos = 0
-            while (mt := ENTRY.search(m, pos)) is not None:
-                # A rejected header is rescanned past its name (a real entry can start inside it); a carved
-                # shader resumes after its stored bytes, so deflate output never becomes a name or a match.
-                pos = mt.end(1) + 1
-                name = mt.group(1).decode("latin-1")
-                stored = struct.unpack("<I", mt.group(3))[0]
-                size = struct.unpack("<I", mt.group(5))[0]
-                if not (16 < stored < 64 << 20 and 32 < size < 256 << 20):
-                    continue
-                start = mt.end()
-                decompressor = zlib.decompressobj(-15)
-                try:
-                    data = decompressor.decompress(m[start:start + stored], size + 1)
-                except zlib.error:
-                    bad += 1
-                    continue
-                if not decompressor.eof or data[:4] != b"DXBC" or len(data) != size:
-                    bad += 1
-                    continue
-                try:
-                    p = parts(data)
-                    stage, sm = shader_model(data, p)
-                except ValueError:
-                    bad += 1
-                    continue
-                pos = start + stored
-                fname = file_name(name, seen, used)
-                out_path = os.path.join(out, fname)
-                try:
-                    with open(out_path, "wb") as f:
-                        f.write(data)
-                except OSError as e:
-                    print(f"ERROR: cannot write {out_path}: {e.strerror or e}", file=sys.stderr)
-                    return 1
-                index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
-                              "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
+        with open(src, "rb") as fh:
+            try:
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            except ValueError:
+                ap.error(f"{src} is empty")
+            with mm as m:
+                pos = 0
+                while (mt := ENTRY.search(m, pos)) is not None:
+                    # A rejected header is rescanned past its name (a real entry can start inside it); a carved
+                    # shader resumes after its stored bytes, so deflate output never becomes a name or a match.
+                    pos = mt.end(1) + 1
+                    name = mt.group(1).decode("latin-1")
+                    stored = struct.unpack("<I", mt.group(3))[0]
+                    size = struct.unpack("<I", mt.group(5))[0]
+                    if not (16 < stored < 64 << 20 and 32 < size < 256 << 20):
+                        continue
+                    start = mt.end()
+                    decompressor = zlib.decompressobj(-15)
+                    try:
+                        data = decompressor.decompress(m[start:start + stored], size + 1)
+                    except zlib.error:
+                        bad += 1
+                        continue
+                    if not decompressor.eof or data[:4] != b"DXBC" or len(data) != size:
+                        bad += 1
+                        continue
+                    try:
+                        p = parts(data)
+                        stage, sm = shader_model(data, p)
+                    except ValueError:
+                        bad += 1
+                        continue
+                    pos = start + stored
+                    fname = file_name(name, seen, used)
+                    out_path = os.path.join(out, fname)
+                    try:
+                        with open(out_path, "wb") as f:
+                            f.write(data)
+                    except OSError as e:
+                        print(f"ERROR: cannot write {out_path}: {e.strerror or e}", file=sys.stderr)
+                        return 1
+                    index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
+                                  "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
     except OSError as e:
         print(f"ERROR: cannot read {src}: {e.strerror or e}", file=sys.stderr)
         return 1
@@ -148,7 +157,7 @@ def main(argv=None) -> int:
                 json.dump(index, f, indent=1)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, index_path)
+            replace_retry(tmp, index_path)
     except OSError as e:
         print(f"ERROR: cannot write {index_path}: {e.strerror or e}", file=sys.stderr)
         return 1
