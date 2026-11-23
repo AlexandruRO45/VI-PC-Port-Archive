@@ -1251,6 +1251,20 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_queue_handover COMMAND d3d12_queue_handover_test)
     set_tests_properties(d3d12_queue_handover PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 400
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # More D3D12 queues than Vulkan queues: they share VkQueues, keeping fences and Wait-before-Signal (section 4.4).
+    # The _one_queue runs make every GPU look like the Intel UHD 770 (one family, one VkQueue): every queue shares it.
+    add_executable(d3d12_queue_share_test test/d3d12_queue_share_test.cpp)
+    target_link_libraries(d3d12_queue_share_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_queue_share_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_queue_share_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_queue_share COMMAND d3d12_queue_share_test)
+    add_test(NAME d3d12_queue_share_one_queue COMMAND d3d12_queue_share_test)
+    set_tests_properties(d3d12_queue_share d3d12_queue_share_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    add_test(NAME d3d12_queue_wait_one_queue COMMAND d3d12_queue_wait_test)
+    set_tests_properties(d3d12_queue_wait_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(d3d12_queue_share_one_queue d3d12_queue_wait_one_queue PROPERTIES
+                         ENVIRONMENT "LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1;LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1")
 
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.

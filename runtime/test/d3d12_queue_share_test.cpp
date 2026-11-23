@@ -10,8 +10,9 @@
 //             for the CPU value: the queue must run once the CPU value lands (on one VkQueue or two).
 //   stress    4 threads, 9 queues (3 per type), each thread copying a buffer through 3 queues per iteration with
 //             a CPU-gated producer; every iteration's readback must be exact.
-// LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1 makes every GPU look like the UHD 770 (one VkQueue per family), so same-type
-// queues share one VkQueue; on lavapipe every queue shares the one VkQueue. No game data.
+// With LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1 and LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1 every GPU looks like the UHD 770 (one
+// family, one VkQueue) and every D3D12 queue shares that VkQueue, as on lavapipe; with the first alone, same-type
+// queues share their family's VkQueue. No game data.
 #include "../shims/d3d12_com.h"
 
 #include <wrl/client.h>
