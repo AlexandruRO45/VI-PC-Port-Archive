@@ -438,5 +438,80 @@ class TestDSWrxchgRtnB32SIMDDivergence(unittest.TestCase):
         self.assertEqual(lds.read_dword(0x10), 100 + 31)
 
 
+class TestDSWrxchgRtnB32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_vdst_aliases_vaddr(self) -> None:
+        self.lds.write_dword(0x40, 0x12345678)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)  # vaddr
+        self.state.rf.set_vgpr(VGPR(2), 0x9ABCDEF0)  # vdata
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(1),  # vdst aliases vaddr
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(new, 0x9ABCDEF0)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(1)), 0x12345678)
+        self.assertEqual(self.lds.read_dword(0x40), 0x9ABCDEF0)
+
+    def test_vdst_aliases_vdata(self) -> None:
+        self.lds.write_dword(0x60, 0xF0F0F0F0)
+        self.state.rf.set_vgpr(VGPR(1), 0x60)  # vaddr
+        self.state.rf.set_vgpr(VGPR(2), 0x0F0F0F0F)  # vdata and vdst
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(2),  # vdst aliases vdata
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0xF0F0F0F0)
+        self.assertEqual(new, 0x0F0F0F0F)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(2)), 0xF0F0F0F0)
+        self.assertEqual(self.lds.read_dword(0x60), 0x0F0F0F0F)
+
+    def test_vaddr_aliases_vdata(self) -> None:
+        self.lds.write_dword(0x40, 0xCAFEBABE)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(1),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0xCAFEBABE)
+        self.assertEqual(new, 0x40)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(5)), 0xCAFEBABE)
+        self.assertEqual(self.lds.read_dword(0x40), 0x40)
+
+    def test_complete_three_way_alias(self) -> None:
+        self.lds.write_dword(0x20, 0x3F)
+        self.state.rf.set_vgpr(VGPR(3), 0x20)
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(3),
+            vaddr=VGPR(3),
+            vdata=VGPR(3),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0x3F)
+        self.assertEqual(new, 0x20)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(3)), 0x3F)
+        self.assertEqual(self.lds.read_dword(0x20), 0x20)
+
+
 if __name__ == "__main__":
     unittest.main()
