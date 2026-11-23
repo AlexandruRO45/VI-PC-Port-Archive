@@ -76,13 +76,14 @@ bool RtShadows::create(Gpu& gpu, const std::vector<std::uint8_t>& shader, const 
     //     each step pops one entry and pushes one; only the shader's step cap ends it, and the stack never grows;
     //   at 256, the overflow: the root lists itself four times, so each step pops one and pushes four. The 32-entry
     //     stack is full after ten steps and the eleventh must stop the lane as overflowed instead of writing past it.
+    // They are read through a V# and as a BVH, so they live in a DEFAULT buffer, filled once from an UPLOAD one (a V#
+    // over an UPLOAD heap is outside what the layer maps for the guest; see docs/d3d12_vulkan.md).
     {
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD, {}, {}, 0, 0};
-        const auto d = buffer_desc(512);
-        CHECK(SUCCEEDED(device_->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &d,
-                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                         IID_PPV_ARGS(&stall_.p))));
+        CHECK(make(default_heap, 512, D3D12_RESOURCE_STATE_COMMON, stall_));
         CHECK(stall_->GetGPUVirtualAddress() % 256 == 0);
+        Ref<ID3D12Resource> staging;   // kept alive until the copy's fence has passed
+        CHECK(make(upload_heap, 512, D3D12_RESOURCE_STATE_GENERIC_READ, staging));
         std::uint32_t words[128] = {};
         for (unsigned fixture = 0; fixture < 2; ++fixture) {
             std::uint32_t* w = words + 64 * fixture;
@@ -100,9 +101,21 @@ bool RtShadows::create(Gpu& gpu, const std::vector<std::uint8_t>& shader, const 
             }
         }
         void* mapped = nullptr;
-        CHECK(SUCCEEDED(stall_->Map(0, nullptr, &mapped)));
+        CHECK(SUCCEEDED(staging->Map(0, nullptr, &mapped)));
         std::memcpy(mapped, words, sizeof(words));
-        stall_->Unmap(0, nullptr);
+        staging->Unmap(0, nullptr);
+        CHECK(SUCCEEDED(allocator_->Reset()));
+        CHECK(SUCCEEDED(list_->Reset(allocator_.p, nullptr)));
+        const auto to_dest = transition(stall_.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        list_->ResourceBarrier(1, &to_dest);
+        list_->CopyBufferRegion(stall_.p, 0, staging.p, 0, sizeof(words));
+        const auto to_read = transition(stall_.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list_->ResourceBarrier(1, &to_read);
+        CHECK(list_->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list_.p};
+        queue_->ExecuteCommandLists(1, lists);
+        CHECK(SUCCEEDED(queue_->Signal(fence_.p, ++fence_value_)));
+        CHECK(wait_fence(fence_, fence_value_));
     }
     // Poison: copied over the output and the step counts before every pass, so a lane that writes nothing shows.
     {

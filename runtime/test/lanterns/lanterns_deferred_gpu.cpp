@@ -57,7 +57,10 @@ bool Deferred::create(Gpu& gpu, const std::vector<std::uint8_t>& shader) {
                                                           IID_PPV_ARGS(&out.p)));
     };
     const auto uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    CHECK(make(upload_heap, kLightBytes, D3D12_RESOURCE_STATE_GENERIC_READ, lights_));   // read in place
+    // The lights are read through a V#, so they live in a DEFAULT buffer, copied from an UPLOAD one before each pass
+    // (a V# over an UPLOAD heap is outside what the layer maps for the guest; see docs/d3d12_vulkan.md).
+    CHECK(make(default_heap, kLightBytes, D3D12_RESOURCE_STATE_COMMON, lights_));
+    CHECK(make(upload_heap, kLightBytes, D3D12_RESOURCE_STATE_GENERIC_READ, lights_upload_));
     CHECK(make(default_heap, kPixelBytes, D3D12_RESOURCE_STATE_COMMON, output_, uav));
     CHECK(make(default_heap, kCountBytes, D3D12_RESOURCE_STATE_COMMON, counts_, uav));
     CHECK(make(default_heap, kListBytes, D3D12_RESOURCE_STATE_COMMON, lists_, uav));
@@ -108,28 +111,31 @@ bool Deferred::run(const std::vector<PointLight>& lights, const std::array<float
                    std::vector<std::uint32_t>& tile_lists) {
     CHECK(lights.size() == kLights);
     void* mapped = nullptr;
-    CHECK(SUCCEEDED(lights_->Map(0, nullptr, &mapped)));
+    CHECK(SUCCEEDED(lights_upload_->Map(0, nullptr, &mapped)));
     std::memcpy(mapped, lights.data(), kLightBytes);
-    lights_->Unmap(0, nullptr);
+    lights_upload_->Unmap(0, nullptr);
 
     CHECK(SUCCEEDED(allocator_->Reset()));
     CHECK(SUCCEEDED(list_->Reset(allocator_.p, nullptr)));
     const auto copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE, read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     const auto out_from = first_run_ ? D3D12_RESOURCE_STATE_COMMON : copy_src;
+    const auto lights_from = first_run_ ? D3D12_RESOURCE_STATE_COMMON : read;
     first_run_ = false;
     // Poison first: a run that skips a store leaves 0xdeadbeef, not the previous run's value.
     const auto dest = D3D12_RESOURCE_STATE_COPY_DEST;
-    const D3D12_RESOURCE_BARRIER poison[3] = {transition(output_.p, out_from, dest), transition(counts_.p, out_from, dest),
-                                              transition(lists_.p, out_from, dest)};
-    list_->ResourceBarrier(3, poison);
+    const D3D12_RESOURCE_BARRIER poison[4] = {transition(output_.p, out_from, dest), transition(counts_.p, out_from, dest),
+                                              transition(lists_.p, out_from, dest), transition(lights_.p, lights_from, dest)};
+    list_->ResourceBarrier(4, poison);
+    list_->CopyBufferRegion(lights_.p, 0, lights_upload_.p, 0, kLightBytes);
     list_->CopyBufferRegion(output_.p, 0, poison_.p, 0, kPixelBytes);
     list_->CopyBufferRegion(counts_.p, 0, poison_.p, 0, kCountBytes);
     list_->CopyBufferRegion(lists_.p, 0, poison_.p, 0, kListBytes);
     // The albedo is the Gpu's target, which a frame leaves in COPY_SOURCE; it goes back there afterwards.
-    const D3D12_RESOURCE_BARRIER start[4] = {transition(gpu_->target(), copy_src, read), transition(output_.p, dest, uav),
-                                             transition(counts_.p, dest, uav), transition(lists_.p, dest, uav)};
-    list_->ResourceBarrier(4, start);
+    const D3D12_RESOURCE_BARRIER start[5] = {transition(gpu_->target(), copy_src, read), transition(output_.p, dest, uav),
+                                             transition(counts_.p, dest, uav), transition(lists_.p, dest, uav),
+                                             transition(lights_.p, dest, read)};   // stays readable until the next run
+    list_->ResourceBarrier(5, start);
     ID3D12DescriptorHeap* heaps[] = {heap_.p};
     list_->SetDescriptorHeaps(1, heaps);
     list_->SetComputeRootSignature(root_.p);
