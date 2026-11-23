@@ -1,4 +1,4 @@
-"""tools/d3d12_guid_sites.py on hand-built PE32+ images (no game files, no SDK needed)."""
+"""tools/d3d12_guid_sites.py on hand-built PE32/PE32+ images (no game files, no SDK needed)."""
 import json
 import os
 import struct
@@ -91,6 +91,42 @@ def lea(target_rva: int, insn_rva: int, rex=b"\x48", opcode=b"\x8d", reg=b"\x15"
     return rex + opcode + reg + struct.pack("<i", target_rva - (insn_rva + 7))
 
 
+def pe_import_tables(bits, shared=False):
+    """Synthetic PE32/PE32+ with named, ordinal, named imports and a separate IAT by default."""
+    data = bytearray(0x800)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    opt_size = 224 if bits == 32 else 240
+    struct.pack_into("<HHIIIHH", data, 0x84, 0x14C if bits == 32 else 0x8664,
+                     2, 0, 0, 0, opt_size, 0x2102 if bits == 32 else 0x2022)
+    opt = 0x98
+    struct.pack_into("<H", data, opt, 0x10B if bits == 32 else 0x20B)
+    struct.pack_into("<I" if bits == 32 else "<Q", data,
+                     opt + (28 if bits == 32 else 24), 0x400000)
+    struct.pack_into("<II", data, opt + 32, 0x1000, 0x200)  # section/file alignment
+    struct.pack_into("<II", data, opt + 56, 0x3000, 0x400)  # image/header size
+    dirs = opt + (96 if bits == 32 else 112)
+    struct.pack_into("<I", data, dirs - 4, 16)
+    struct.pack_into("<II", data, dirs + 8, 0x2000, 40)
+    sec = opt + opt_size
+    for name, rva, raw, chars in ((b".text", 0x1000, 0x400, 0x60000020),
+                                  (b".rdata", 0x2000, 0x600, 0x40000040)):
+        data[sec:sec + 8] = name.ljust(8, b"\0")
+        struct.pack_into("<IIII", data, sec + 8, 0x200, rva, 0x200, raw)
+        struct.pack_into("<I", data, sec + 36, chars)
+        sec += 40
+    data[0x400] = 0x90  # NOP; these fixtures are read, never executed
+    struct.pack_into("<IIIII", data, 0x600, 0x2040, 0, 0, 0x20A0, 0x2040 if shared else 0x2060)
+    for offset in (0x640, 0x660):
+        struct.pack_into("<IIII" if bits == 32 else "<QQQQ", data, offset,
+                         0x2080, (1 << (bits - 1)) | 80, 0x2090, 0)
+    for offset, text in ((0x680, b"\0\0IID_First\0"), (0x690, b"\0\0IID_Second\0"),
+                         (0x6A0, b"d3d12_xs.dll\0")):
+        data[offset:offset + len(text)] = text
+    return bytes(data)
+
+
 class GuidSites(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -145,6 +181,34 @@ class GuidSites(unittest.TestCase):
         self.assertEqual(r["iat_guid_loads"][0]["dll"], "d3d12_xs.dll")
         self.assertEqual(r["iat_guid_loads"][0]["name"], "IID_Fake")
         self.assertEqual(r["guid_candidates"], [])  # nothing leas the queue GUID in this image
+
+    def test_import_slots_use_the_images_entry_width(self):
+        for bits, lookup_slots, address_slots in (
+                (32, (0x2040, 0x2044, 0x2048), (0x2060, 0x2064, 0x2068)),
+                (64, (0x2040, 0x2048, 0x2050), (0x2060, 0x2068, 0x2070))):
+            for shared in (False, True):
+                with self.subTest(bits=bits, shared=shared):
+                    image = sites.Image(pe_import_tables(bits, shared))
+                    expected = dict(zip(lookup_slots,
+                                        (("d3d12_xs.dll", "IID_First"), ("d3d12_xs.dll", "#80"),
+                                         ("d3d12_xs.dll", "IID_Second"))))
+                    if not shared:
+                        expected.update(zip(address_slots, tuple(expected.values())))
+                    self.assertEqual(image.iat_slots(), expected)
+
+    def test_cli_reports_pe32_imports_without_a_traceback(self):
+        path = self.write("pe32.dll", pe_import_tables(32))
+        header = self.write("empty.h", b"")
+        report = os.path.join(self.tmp.name, "pe32.json")
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"),
+             path, "--header", header, "--json", report], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["images"][0]["imports_of_note"],
+                         ["d3d12_xs.dll: IID_First, #80, IID_Second"])
 
     def test_queue_desc_window(self):
         rdata = (struct.pack("<IIII", 2, 0, 0, 0)      # a COMPUTE-shaped window at +0

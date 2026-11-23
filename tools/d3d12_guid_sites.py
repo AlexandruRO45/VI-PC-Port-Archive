@@ -182,7 +182,7 @@ class Image:
                 i += 1
             if iat_rva and iat_rva != thunk_rva:  # the loader binds the IAT copy; code loads through it
                 for j in range(i):
-                    slots.setdefault(iat_rva + 8 * j, slots[thunk_rva + 8 * j])
+                    slots.setdefault(iat_rva + width * j, slots[thunk_rva + width * j])
             pos += 20
         return slots
 
