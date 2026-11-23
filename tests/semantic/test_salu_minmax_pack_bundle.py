@@ -464,5 +464,18 @@ class SPackHhB32B16OracleTests(unittest.TestCase):
         res = oracle_pack_hh_b32_b16(0x0000FFFF, 0x0000FFFF)
         self.assertEqual(res, 0)
 
+class SPackHhB32B16AstInterpreterTests(unittest.TestCase):
+    def test_pack_hh_ast_construction(self):
+        ast = SaluInstructionAST("s_pack_hh_b32_b16", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        self.assertEqual(ast.mnemonic, "s_pack_hh_b32_b16")
+
+    def test_pack_hh_scalar_execution(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x43210000)
+        state.set_sgpr(1, 0x87650000)
+        res = oracle_pack_hh_b32_b16(state.get_sgpr(0), state.get_sgpr(1))
+        state.set_sgpr(2, res)
+        self.assertEqual(state.get_sgpr(2), 0x87654321)
+
 if __name__ == "__main__":
     unittest.main()
