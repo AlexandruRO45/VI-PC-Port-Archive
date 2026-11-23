@@ -288,9 +288,18 @@ FMA_FOLD_ZERO_SIGN = ("a Vulkan driver may fold an all-constant Fma without keep
                       "IEEE sign), so a GPU zero with the opposite sign is not judged")
 
 
+FMA_SPLIT = ("a Vulkan driver may split a GLSL Fma, rounding the product and the sum separately (the Vulkan spec allows "
+             "it; observed on an NVIDIA RTX 4070 for an all-constant Fma, which is fused when its operands are not "
+             "constants), so a GPU result equal to the split Fma is not judged unless --fma khr asks for fusion")
+FMA_ZERO_UNSPECIFIED = ("the RDNA2 documentation leaves the sign of a zero product plus a zero addend unspecified, so a "
+                        "zero of the other sign is not judged")
+REQUIRE_FUSED_FMA = False       # set by --fma khr: a split Fma is then a mismatch, not a counted skip
+
+
 def ref_program(lines, include_known=False, notes=None, lane_mask=M32):
-    """The four exported words. ``notes`` (a list) receives (kind, destination register) for results a GPU oracle may
-    legitimately get wrong in a known way (see FMA_FOLD_ZERO_SIGN). ``lane_mask`` is the EXEC mask the program starts
+    """The four exported words. ``notes`` (a list) receives tuples (kind, destination register, ...) for results an
+    oracle may legitimately get wrong in a known way (FMA_FOLD_ZERO_SIGN, FMA_SPLIT, FMA_ZERO_UNSPECIFIED); the
+    comparison in run_one turns a difference that matches a note into a counted skip. ``lane_mask`` is the EXEC mask the program starts
     with: all 32 lanes of a wave32 for the translator and Vulkan oracles (the translator exposes a full mask), the single
     lane the hardware kernel runs for --oracle hw (a v_cmpx result is read back through exec_lo)."""
     vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, lane_mask & M32
@@ -386,6 +395,16 @@ def ref_program(lines, include_known=False, notes=None, lane_mask=M32):
             d = int(dst[2:-1].split(":")[0]); result = round_fraction(exact)
             if notes is not None and is_zero(z) and exact != 0 and is_zero(result) and (result ^ z) & 0x8000000000000000:
                 notes.append(("fma-fold-zero-sign", d))      # an underflowing product against an opposite-signed zero
+            if notes is not None and (is_zero(x) or is_zero(y)) and is_zero(z):
+                notes.append(("fma-zero-sign-unspecified", d))   # zero product + zero addend: the sign is not documented
+            if notes is not None and not (is_zero(x) or is_zero(y)):
+                # The split Fma: the product rounded to binary64, then the sum (then the same scale), as a driver that
+                # does not fuse would compute it.
+                split = add_bits(round_fraction(to_fraction(x) * to_fraction(y)), z)
+                if not (is_inf(split) or is_zero(split)) and vcc:
+                    split = round_fraction(to_fraction(split) * Fraction(2) ** (128 if ((z >> 52) & 0x7FF) > 1023 else -128))
+                if split != result:
+                    notes.append(("fma-split", d, split))
             vgpr[d], vgpr[d + 1] = bits_to_words(result)
         else:
             raise HarnessError(f"reference does not implement {op}")
@@ -529,6 +548,17 @@ def maybe_word_modifier(rng, src):
     return f"|{src}|" if choice == 0 else f"-{src}" if choice == 1 else f"-|{src}|"
 
 
+FMA_PROBES = {"probe-fma-cancel-vcc-clear": 0, "probe-fma-cancel-vcc-set": 1}      # label -> VCC value
+
+
+def fma_probe_bits():
+    return (bits_of_float(1 + 2.0 ** -30), bits_of_float(-(1 + 2.0 ** -29)))
+
+
+def bits_of_float(value):
+    return struct.unpack("<Q", struct.pack("<d", value))[0]
+
+
 def make_case(rng, op, allow_literal=True, known_case=None):
     setup_lines, body_lines = [], []
     vg, sg = {}, {}
@@ -562,9 +592,18 @@ def make_case(rng, op, allow_literal=True, known_case=None):
         body_lines.append(f"{op} v[8:9], {left}, {right}{suffix}")
     elif op == "v_div_fixup_f64":
         body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
+    elif op == "v_div_fmas_f64" and known_case in FMA_PROBES:
+        # A directed cancellation: fma(a, a, c) with a = 1 + 2^-30 and c = -(1 + 2^-29) is exactly 2^-60 fused and 0 when
+        # the product is rounded first (and the same scaled by 2^-128 with VCC set).
+        a_bits, c_bits = fma_probe_bits()
+        setup_lines += [f"s_mov_b32 s4, 0x{a_bits & M32:08x}", f"s_mov_b32 s5, 0x{a_bits >> 32:08x}",
+                        f"s_mov_b32 s6, 0x{c_bits & M32:08x}", f"s_mov_b32 s7, 0x{c_bits >> 32:08x}"]
+        body_lines += [f"v_cmp_eq_i32_e32 vcc_lo, 0, {0 if FMA_PROBES[known_case] else 1}",
+                       f"{op} v[8:9], s[4:5], s[4:5], s[6:7]"]
     elif op == "v_div_fmas_f64":
-        # VCC is initialized true so the f64 scaled FMA path is exercised deterministically.
-        body_lines += ["v_cmp_eq_i32_e32 vcc_lo, 0, 0", f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}"]
+        # VCC set exercises the scaled path and VCC clear the plain fma; the parity of an operand word picks which, so the
+        # random stream of every other program is unchanged.
+        body_lines += [f"v_cmp_eq_i32_e32 vcc_lo, 0, {0 if vg[8] & 1 else 1}", f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}"]
     elif "class" in op:
         src, mask = maybe_word_modifier(rng, gen_source(rng, 2 if op.startswith("v_cmpx") else 0, allow_literal, bus)), f"0x{rng.randrange(1024):x}"
         if op.startswith("v_cmpx"):
@@ -659,11 +698,21 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
     except (rdna2spirv.Unsupported, UnsupportedConstruct, SkipCase) as exc: return "skip", f"{type(exc).__name__}: {exc}", expected, None
     except (IndexError, KeyError, ValueError, OverflowError) as exc: return "skip", f"translator/interpreter limitation: {type(exc).__name__}: {exc}", expected, None
     if equivalent(expected, actual, output_kind(lines)): return "match", "", expected, actual
-    if oracle == "gpu":
-        for kind, d in notes:
-            if kind == "fma-fold-zero-sign" and d in (8, 10):
-                flipped = list(expected); flipped[d - 8 + 1] ^= 0x80000000      # the high word of v[d:d+1]
-                if equivalent(flipped, actual, output_kind(lines)): return "skip", FMA_FOLD_ZERO_SIGN, expected, actual
+    if oracle in ("gpu", "translator"):
+        for note in notes:
+            kind, d = note[0], note[1]
+            if d not in (8, 10):
+                continue
+            flipped = list(expected); flipped[d - 8 + 1] ^= 0x80000000      # the high word of v[d:d+1]
+            if kind == "fma-zero-sign-unspecified" and equivalent(flipped, actual, output_kind(lines)):
+                return "skip", FMA_ZERO_UNSPECIFIED, expected, actual
+            if oracle != "gpu":
+                continue
+            if kind == "fma-fold-zero-sign" and equivalent(flipped, actual, output_kind(lines)):
+                return "skip", FMA_FOLD_ZERO_SIGN, expected, actual
+            if kind == "fma-split" and not REQUIRE_FUSED_FMA:
+                split = list(expected); split[d - 8], split[d - 8 + 1] = bits_to_words(note[2])
+                if equivalent(split, actual, output_kind(lines)): return "skip", FMA_SPLIT, expected, actual
     return "mismatch", "word comparison", expected, actual
 
 
@@ -701,6 +750,8 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
     sequence += [(rng.choice(ops), False, None) for _ in range(programs)]
     if known:
         sequence += [("v_add_f64", True, label) for label in KNOWN_DIVERGENCES]
+    if sweep and "v_div_fmas_f64" in ops:
+        sequence += [("v_div_fmas_f64", True, label) for label in FMA_PROBES]      # one directed cancellation per VCC value
     cases = []
     for idx, (op, is_sweep, known_case) in enumerate(sequence):
         setup_lines, body_lines, _, _ = make_case(rng, op, allow_literal, known_case)
@@ -717,12 +768,12 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
         gpu_ctx = prepare_gpu(gpu, tmp) if oracle == "gpu" else hw if oracle == "hw" else None
         for idx, lines, known_case in cases:
             status, reason, want, got = run_one(lines, f"ps_f64_{idx:05d}", tmp, oracle, gpu_ctx,
-                                                include_known=bool(known_case),
+                                                include_known=known_case in KNOWN_DIVERGENCES,
                                                 hw_words=hw_results[idx] if hw_results is not None else None)
             if status == "skip": skips[reason] += 1
             else: counts[status] += 1
             if status == "mismatch":
-                reduced = shrink(lines, want, oracle, gpu, gpu_ctx, tmp, bool(known_case))
+                reduced = shrink(lines, want, oracle, gpu, gpu_ctx, tmp, known_case in KNOWN_DIVERGENCES)
                 failures.append((reduced, want, got, reason))
             if status == "mismatch" and not all_failures: break
     return counts, skips, failures
@@ -772,6 +823,10 @@ def main(argv=None):
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--no-literals", action="store_true")
     ap.add_argument("--known", action="store_true")
+    ap.add_argument("--fma", choices=("glsl", "khr"), default="glsl",
+                    help="glsl (default): a GPU result equal to a split Fma (product rounded first) is a counted skip, as the "
+                         "Vulkan spec lets a driver round twice; khr: the translator is asked for OpFmaKHR "
+                         "(rdna2spirv.py --fma khr, where it covers f64) and a split Fma is a mismatch")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--all-failures", action="store_true")
     ap.add_argument("--oracle", choices=("translator", "gpu", "hw"), default="translator",
@@ -779,6 +834,10 @@ def main(argv=None):
     ap.add_argument("--exe", help="vk_harness executable for --oracle gpu")
     ap.add_argument("--hw-arch", help="GPU architecture hw_oracle assembles for (default: detected)")
     args = ap.parse_args(argv)
+    global REQUIRE_FUSED_FMA
+    REQUIRE_FUSED_FMA = args.fma == "khr"
+    if REQUIRE_FUSED_FMA:
+        rdna2spirv.FMA_KHR = True
     if args.programs < 0 or args.max_ops < 1: print("programs must be nonnegative and max-ops positive", file=sys.stderr); return 2
     ops = [x.strip() for x in args.ops.split(",")] if args.ops else list(BASE)
     bad = sorted(set(ops) - set(BASE))

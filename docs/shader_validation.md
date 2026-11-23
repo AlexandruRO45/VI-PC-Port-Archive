@@ -1324,6 +1324,32 @@ device. Because any Vulkan driver could do the same, the exclusion is not tied t
 result that differs from the reference only in the sign of that zero is a counted skip (with a vendor-neutral reason);
 any other difference is still a mismatch. It does not apply to `--oracle hw`, which runs real hardware kernels.
 
+**A split `Fma`.** `GLSL.std.450` `Fma` is a fused multiply-add in the translator, but the Vulkan spec lets a driver round
+twice. On an NVIDIA RTX 4070 an all-constant `Fma` comes back as the split result (the product rounded to binary64, then the
+sum), while the same `Fma` on operands that are not compile-time constants (values built from `FragCoord`) is fused and
+equals Python's `math.fma` and the Fraction reference. Two reports show it: `fma(S0, 3.25, S0)` with
+`S0 = 0x2a67551395e2ebea` is `0x2a88ca64cf411aa9` fused and `...aa8` split (reported on an RTX 4080; an AMD `gfx1036` was exact),
+and `fma(a, a, c)` with `a = 1 + 2^-30`, `c = -(1 + 2^-29)` is `2^-60` fused and `0` split (reported on an RTX 4090, the
+`cs_div_fmas_f64` fixture of #6635). Every program of this fuzzer is made of constants, so a random `v_div_fmas_f64` can show
+it whenever the product is inexact. The reference states the split value for each such program, and in an `--oracle gpu`
+run a result equal to that split value (scaled the same way with VCC set) is a counted skip with a vendor-neutral reason; any
+other difference is a mismatch. `--fma khr` asks for fusion instead: the translator gets `rdna2spirv.FMA_KHR` (`OpFmaKHR`,
+which covers f64 where #6635 is applied) and a split result is then a mismatch. `--oracle hw` always judges. Two directed
+cancellation programs (`fma(a, a, c)` above with VCC clear and with VCC set) run with every `v_div_fmas_f64` sweep, so the
+split is seen on every run and not only when random operands cancel; on the RTX 4070 both are counted skips and, with
+`--fma khr`, two mismatches. `v_div_fmas_f64` is also generated with VCC clear (plain `fma`) about half of the time, picked by
+the parity of an operand word so the random stream of every other program is unchanged.
+
+**A zero product plus a zero addend.** `1 * (-0) + (-0)` is `-0` in IEEE 754 round to nearest, while the translator, and the
+reference here, give `+0` (76 of 16,000 random cases in a reviewer's independent comparison). The RDNA2 documentation does
+not specify the sign of that zero, so the reference states `+0` and a result with the other sign is a counted skip in
+`--oracle translator` and `--oracle gpu` runs; `--oracle hw` judges it, since measuring it is what the hardware run is for.
+
+The `v_div_fixup_f64` and `v_div_fmas_f64` rules here are the ones of the measured `gfx1036` notes in `docs/design.md`
+(a NaN in S1 or S2 passes through unquieted, the underflow cutoff is `exp(S2) - exp(S1) <= -1076`, with VCC set the result is
+scaled by `2^+128` when `|S2| >= 2.0` and by `2^-128` below it). The closed #6947 derived the same rules independently and
+reported 0 mismatches on a real RX 6700 XT.
+
 Known divergence probes are excluded and counted by default, then reinserted with `--known`: binary64 output modifiers
 (SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172),
 and driver-dependent NaN or signed-zero clamp results. The CPU translator reproduces none of these today, so

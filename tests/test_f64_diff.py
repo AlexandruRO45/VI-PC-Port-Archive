@@ -294,12 +294,12 @@ class F64DiffTests(unittest.TestCase):
             with self.subTest(addend=addend):
                 notes = []
                 words = fd.ref_program(self.fmas(addend), notes=notes)
-                self.assertEqual(notes, [("fma-fold-zero-sign", 8)] if flagged else [])
+                self.assertEqual([n for n in notes if n[0] == "fma-fold-zero-sign"], [("fma-fold-zero-sign", 8)] if flagged else [])
                 if flagged: self.assertEqual(words[:2], [0, 0x80000000])          # the IEEE result is -0
         notes = []                      # symmetric: a +0 result against a -0 addend is flagged too (its GPU sign is unobserved)
         fd.ref_program([*self.FMAS_UNDERFLOW[:3], f"v_mov_b32 v15, {self.TINY}",
                         "v_div_fmas_f64 v[8:9], v[12:13], v[14:15], -0.0"], notes=notes)
-        self.assertEqual(notes, [("fma-fold-zero-sign", 8)])
+        self.assertEqual([n for n in notes if n[0] == "fma-fold-zero-sign"], [("fma-fold-zero-sign", 8)])
 
     def test_fma_zero_sign_skip_is_vendor_neutral_and_gpu_only(self):
         for vendor in ("NVIDIA", "AMD", "Intel"):
@@ -335,6 +335,118 @@ class F64DiffTests(unittest.TestCase):
             wrong = fd.ref_program(normal)
             with gpu([wrong[0], wrong[1] ^ 0x80000000, wrong[2], wrong[3]]):
                 self.assertEqual(fd.run_one(normal, "ps_f64_fold", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+
+    # ---- the split Fma (KubickNubick, DeSunShine), the zero sign nobody specifies (whattheflop), the VCC clear half ----
+
+    KUBICK = ["s_mov_b32 s4, 0x95e2ebea", "s_mov_b32 s5, 0x2a675513", "v_div_fmas_f64 v[8:9], s[4:5], 3.25, s[4:5]"]
+
+    def gpu_returns(self, words):
+        return mock.patch.object(fd, "run_gpu", return_value=words)
+
+    def test_reported_fma_case_is_fused_in_the_reference_and_split_by_a_driver(self):
+        import math
+        notes = []
+        words = fd.ref_program(self.KUBICK, notes=notes)
+        s0 = fd.to_float(fd.words_to_bits(0x95E2EBEA, 0x2A675513))
+        self.assertEqual(fd.words_to_bits(*words[:2]), fd.from_float(math.fma(s0, 3.25, s0)))   # one rounding, as C's fma
+        self.assertEqual(words[:2], [0xCF411AA9, 0x2A88CA64])
+        self.assertEqual(notes, [("fma-split", 8, 0x2A88CA64CF411AA8)])   # product rounded first: the last bit differs
+
+    def test_a_gpu_result_equal_to_the_split_fma_is_a_counted_skip_unless_fusion_is_required(self):
+        split = [0xCF411AA8, 0x2A88CA64, *fd.ref_program(self.KUBICK)[2:]]
+        with tempfile.TemporaryDirectory() as tmp, self.gpu_returns(split):
+            status, reason, _, _ = fd.run_one(self.KUBICK, "ps_f64_split", tmp, "gpu", {"exe": "unused"})
+            self.assertEqual((status, reason), ("skip", fd.FMA_SPLIT))
+            with mock.patch.object(fd, "REQUIRE_FUSED_FMA", True):                 # --fma khr
+                self.assertEqual(fd.run_one(self.KUBICK, "ps_f64_split", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+        other = list(split); other[0] ^= 4                                           # not the split value either
+        with tempfile.TemporaryDirectory() as tmp, self.gpu_returns(other):
+            self.assertEqual(fd.run_one(self.KUBICK, "ps_f64_split", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+        with tempfile.TemporaryDirectory() as tmp, self.gpu_returns(fd.ref_program(self.KUBICK)):
+            self.assertEqual(fd.run_one(self.KUBICK, "ps_f64_split", tmp, "gpu", {"exe": "unused"})[0], "match")
+        hw = mock.Mock(); hw.run.return_value = [split]                              # real hardware is always judged
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(fd.run_one(self.KUBICK, "ps_f64_split", tmp, "hw", hw)[0], "mismatch")
+
+    def test_directed_cancellation_probes_expect_the_fused_value(self):
+        for label, vcc_set, words in (("probe-fma-cancel-vcc-clear", False, [0, 0x3C300000]),     # 2^-60
+                                      ("probe-fma-cancel-vcc-set", True, [0, 0x34300000])):      # 2^-60 * 2^-128
+            with self.subTest(label=label):
+                setup, body, _, _ = fd.make_case(random.Random(1), "v_div_fmas_f64", known_case=label)
+                lines = setup + body
+                self.assertIn(f"v_cmp_eq_i32_e32 vcc_lo, 0, {0 if vcc_set else 1}", lines)
+                notes = []
+                self.assertEqual(fd.ref_program(lines, notes=notes)[:2], words)
+                self.assertEqual([n[:2] for n in notes], [("fma-split", 8)])
+                self.assertEqual(notes[0][2], 0)                                     # a split Fma loses everything
+                with tempfile.TemporaryDirectory() as tmp, self.gpu_returns([0, 0, *fd.ref_program(lines)[2:]]):
+                    self.assertEqual(fd.run_one(lines, "ps_f64_probe", tmp, "gpu", {"exe": "unused"})[:2], ("skip", fd.FMA_SPLIT))
+
+    def test_the_sweep_adds_the_probes_for_v_div_fmas_f64_only(self):
+        calls = []
+        def recorder(lines, name, tmp, oracle="translator", gpu=None, include_known=False, hw_words=None):
+            calls.append((lines, include_known))
+            return "skip", "recorded", None, None
+        with mock.patch.object(fd, "run_one", recorder):
+            fd.run_batch(["v_div_fmas_f64"], 0, 1, sweep=True)
+            self.assertEqual(len(calls), 3)                                          # the sweep case and two probes
+            self.assertFalse(any(known for _, known in calls))                       # probes are not known divergences
+            self.assertEqual(sum("s_mov_b32 s6, 0x00800000" in lines for lines, _ in calls), 2)
+            calls.clear()
+            fd.run_batch(["v_div_fixup_f64"], 0, 1, sweep=True)
+            self.assertEqual(len(calls), 1)
+
+    def test_v_div_fmas_is_generated_with_vcc_clear_too(self):
+        seen = set()
+        for seed in range(80):
+            setup, body, _, _ = fd.make_case(random.Random(seed), "v_div_fmas_f64")
+            seen.update(line for line in body if line.startswith("v_cmp_eq_i32_e32"))
+        self.assertEqual(seen, {"v_cmp_eq_i32_e32 vcc_lo, 0, 0", "v_cmp_eq_i32_e32 vcc_lo, 0, 1"})
+
+    def test_zero_product_plus_zero_addend_has_an_unspecified_sign(self):
+        for vcc in ("v_cmp_eq_i32_e32 vcc_lo, 0, 0", "v_cmp_eq_i32_e32 vcc_lo, 0, 1"):
+            lines = [vcc, "v_div_fmas_f64 v[8:9], 1.0, -0.0, -0.0"]                  # 1 * (-0) + (-0): IEEE says -0
+            notes = []
+            expected = fd.ref_program(lines, notes=notes)
+            self.assertEqual((expected[1], notes), (0, [("fma-zero-sign-unspecified", 8)]))   # the reference keeps +0
+            minus = [expected[0], 0x80000000, expected[2], expected[3]]
+            for oracle in ("gpu", "translator"):
+                with self.subTest(vcc=vcc, oracle=oracle), tempfile.TemporaryDirectory() as tmp:
+                    patched = self.gpu_returns(minus) if oracle == "gpu" else mock.patch.object(fd, "translate", return_value=minus)
+                    with patched:
+                        status, reason, _, _ = fd.run_one(lines, "ps_f64_zero", tmp, oracle, {"exe": "unused"})
+                    self.assertEqual((status, reason), ("skip", fd.FMA_ZERO_UNSPECIFIED))
+            wrong = [expected[0] ^ 1, expected[1], expected[2], expected[3]]
+            with self.subTest(vcc=vcc, case="another word"), tempfile.TemporaryDirectory() as tmp, self.gpu_returns(wrong):
+                self.assertEqual(fd.run_one(lines, "ps_f64_zero", tmp, "gpu", {"exe": "unused"})[0], "mismatch")
+            hw = mock.Mock(); hw.run.return_value = [minus]                          # measuring it is what hw is for
+            with self.subTest(vcc=vcc, case="hw"), tempfile.TemporaryDirectory() as tmp:
+                self.assertEqual(fd.run_one(lines, "ps_f64_zero", tmp, "hw", hw)[0], "mismatch")
+
+    def test_fma_option_khr_requires_fusion_and_glsl_allows_the_split(self):
+        before = fd.REQUIRE_FUSED_FMA
+        self.addCleanup(setattr, fd, "REQUIRE_FUSED_FMA", before)
+        self.addCleanup(setattr, fd.rdna2spirv, "FMA_KHR", getattr(fd.rdna2spirv, "FMA_KHR", False))
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(fd.main(["--ops", "v_trunc_f64", "--programs", "0", "--fma", "khr"]), 0)
+        self.assertTrue(fd.REQUIRE_FUSED_FMA)
+        self.assertTrue(fd.rdna2spirv.FMA_KHR)
+        with contextlib.redirect_stdout(stdout):
+            fd.main(["--ops", "v_trunc_f64", "--programs", "0"])
+        self.assertFalse(fd.REQUIRE_FUSED_FMA)
+
+    def test_div_fixup_and_div_fmas_rules_match_the_measured_notes_and_the_closed_6947(self):
+        # Tied to the same measured RDNA2 notes as #6947 (0 mismatches on an RX 6700 XT): the scale is 2^+128 when
+        # |S2| >= 2.0 and 2^-128 below, the underflow cutoff is -1076, a NaN in S1/S2 is not quieted.
+        def fmas(x, y, z):
+            return fd.ref_program(["v_cmp_eq_i32_e32 vcc_lo, 0, 0", f"v_div_fmas_f64 v[8:9], {x}, {y}, {z}"])[:2]
+        self.assertEqual(fmas("1.0", "1.0", "2.0"), [0, 0x48080000])                # 3.0 * 2^128
+        self.assertEqual(fmas("1.0", "1.0", "-2.0"), [0, 0xC7F00000])               # -1.0 * 2^128
+        self.assertEqual(fmas("1.0", "1.0", "1.0"), [0, 0x38000000])                # 2.0 * 2^-128
+        self.assertEqual(fd.fixup(self.THREE, 1076 << 52, 1 << 52), self.THREE)     # exponent gap -1075 passes S0
+        self.assertEqual(fd.fixup(self.THREE, 1077 << 52, 1 << 52), 0)              # -1076 is the underflow cutoff
+        self.assertEqual(fd.fixup(self.THREE, self.SNAN, self.ONE), self.SNAN)
 
     def test_frexp_table(self):
         half = 0x3FE0000000000000
