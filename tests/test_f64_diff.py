@@ -62,9 +62,15 @@ class F64DiffTests(unittest.TestCase):
 
     def test_skips_are_counted_with_reason(self):
         result = self.command("--ops", "v_cvt_f32_f64", "--programs", "0")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 2, result.stdout)   # nothing was compared: not a pass
         self.assertIn("1 total", result.stdout)
         self.assertIn("OpFConvert", result.stdout)
+        self.assertIn("no program ran: every one was skipped", result.stdout)
+
+    def test_a_run_that_compares_a_program_still_exits_0(self):
+        result = self.command("--ops", "v_add_f64", "--programs", "1", "--max-ops", "1", "--no-sweep")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("1 match", result.stdout)
 
     def test_sqrt_preserves_negative_zero(self):
         self.assertEqual(fd.ref_program(["v_sqrt_f64 v[8:9], -0.0"]), [0, 0x80000000, 0, 0])
@@ -348,9 +354,10 @@ class F64DiffTests(unittest.TestCase):
     def test_hw_oracle_skip_reason_from_runner_is_counted(self):
         fake = self.FakeHW(reason="MODE dx10_clamp, ieee cannot be set on gfx1170")
         code, out, _, _ = self.run_main(fake, "--ops", "v_trunc_f64", "--programs", "3")
-        self.assertEqual(code, 0, out)
+        self.assertEqual(code, 2, out)   # the oracle skipped every program: nothing was compared
         self.assertIn("hardware: MODE dx10_clamp", out)
         self.assertIn("0 match, 0 mismatch", out)
+        self.assertIn("no program ran: every one was skipped", out)
 
     def test_hw_oracle_unavailable_exits_77_without_running(self):
         stderr = io.StringIO()

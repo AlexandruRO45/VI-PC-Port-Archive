@@ -10,7 +10,8 @@ The GPU path is deliberately optional. It translates the same fragment shader, r
 through vk_harness, and reads back RGBA32F words. ``--oracle hw`` runs the programs natively
 on an AMD GPU through tools/hw_oracle (``--hw-arch`` selects the architecture) and compares
 them with the reference; it returns 77 only when that oracle is unavailable. ``--known`` runs
-known divergence probes; a reproduced mismatch intentionally returns 1.
+known divergence probes; a reproduced mismatch intentionally returns 1. A run that compared nothing (every case
+skipped) exits 2.
 """
 import argparse
 import gc
@@ -799,6 +800,9 @@ def main(argv=None):
                 print("expected: " + " ".join(f"{x:08x}" for x in want))
                 print("actual:   " + " ".join(f"{x:08x}" for x in got))
         return 1
+    if not counts["match"]:   # nothing was compared: every case was skipped
+        print("no program ran: every one was skipped")
+        return 2
     return 0
 
 
