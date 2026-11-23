@@ -51,6 +51,8 @@
 #include "vk_pc_tail.h"
 #include "vk_validation.h"
 #include "cs_wave_probe_spv.h"
+#include "spirv_capability.h"
+#include "spirv_capability.h"
 
 #include <cctype>
 #include <cmath>
@@ -327,6 +329,7 @@ struct Device {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceMemoryProperties mp{};
     uint32_t qi = 0;
@@ -385,7 +388,8 @@ static int open_instance(Device& d, Io& io) {
     std::vector<VkQueueFamilyProperties> qf(qn);
     vkGetPhysicalDeviceQueueFamilyProperties(d.pd, &qn, qf.data());
     while (d.qi < qn && !(qf[d.qi].queueFlags & VK_QUEUE_COMPUTE_BIT)) d.qi++;
-    d.f2q.pNext = &d.f13q;
+    d.f12q.pNext = &d.f13q;
+    d.f2q.pNext = &d.f12q;
     vkGetPhysicalDeviceFeatures2(d.pd, &d.f2q);
     vkGetPhysicalDeviceMemoryProperties(d.pd, &d.mp);
     // OpFmaKHR (rdna2spirv.py --fma khr): VK_KHR_shader_fma, when the device has it.
@@ -395,7 +399,8 @@ static int open_instance(Device& d, Io& io) {
 
 // How one job runs on this device: the subgroup size it can request or observe, and what the device must enable.
 struct Plan {
-    bool can_request_size = false, fixed = false, observed = false, observed_full = false, needs_float64 = false;
+    bool can_request_size = false, fixed = false, observed = false, observed_full = false, needs_float64 = false,
+         needs_int64 = false, int64_atomics = false;
     uint32_t local_total = 0;
 };
 
@@ -419,6 +424,24 @@ static int plan_job(const Device& d, const Job& job, const Program& p, Io& io, P
         io.err.print("unsupported: %s uses Float64 and the device has no shaderFloat64\n", job.spv.c_str());
         return 77;
     }
+    // shaderFloat64 and shaderInt64 only for a module that declares them: SHADER-423's address pairs need no
+    // 64-bit integers (TEST-468).
+    pl.needs_int64 = leonida::vk_test::needs_shader_int64(p.code.data(), p.code.size());
+    if (pl.needs_int64 && !d.f2q.features.shaderInt64) {
+        io.err.print("unsupported: %s declares Int64 and the device has no shaderInt64\n", job.spv.c_str());
+        return 77;
+    }
+    // 64-bit atomics: the translator's are buffer atomics (rdna2spirv.py --int64-atomics, *_atomic_swap_x2 on
+    // PhysicalStorageBuffer memory), which need shaderBufferInt64Atomics. Without the check a device that lacks it
+    // (MoltenVK) failed the pipeline instead of reporting 77. A shared-memory one gets shaderSharedInt64Atomics too
+    // where the device has it.
+    pl.int64_atomics = leonida::vk_test::declares_capability(p.code.data(), p.code.size(),
+                                                            leonida::vk_test::spirv_capability_int64_atomics);
+    if (pl.int64_atomics && !d.f12q.shaderBufferInt64Atomics) {
+        io.err.print("unsupported: %s declares Int64Atomics and the device has no shaderBufferInt64Atomics\n",
+                     job.spv.c_str());
+        return 77;
+    }
     // A size the device can't require but runs anyway: one min..max range (fixed), or its default subgroupSize in a
     // module below SPIR-V 1.6 (Vulkan "Varying Subgroup Size": SubgroupSize then always equals subgroupSize), which
     // cs_wave_probe checks before the test runs (observed). Full subgroups where local size X is a multiple of
@@ -438,20 +461,23 @@ static int plan_job(const Device& d, const Job& job, const Program& p, Io& io, P
 
 // Creates the device and its queue. chain13: pass the Vulkan 1.3 features at all; full_subgroups and float64: what
 // to enable. A single run enables what its program needs; a batch everything the device has.
-static int create_device(Device& d, Io& io, bool chain13, bool full_subgroups, bool float64) {
+static int create_device(Device& d, Io& io, bool chain13, bool full_subgroups, bool float64, bool int64,
+                         bool int64_atomics) {
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = d.qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
+    f12.shaderBufferInt64Atomics = int64_atomics ? VK_TRUE : VK_FALSE;
+    f12.shaderSharedInt64Atomics = int64_atomics && d.f12q.shaderSharedInt64Atomics ? VK_TRUE : VK_FALSE;
     if (chain13) {
         f13.subgroupSizeControl = d.f13q.subgroupSizeControl;
         f13.computeFullSubgroups = full_subgroups ? VK_TRUE : VK_FALSE;
         f12.pNext = &f13;
     }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.features.shaderInt64 = VK_TRUE;
+    f2.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
     f2.features.shaderFloat64 = float64 ? VK_TRUE : VK_FALSE;
     f2.pNext = &f12;
     d.fma.link_after(&f2);
@@ -883,7 +909,8 @@ static int open_batch_device(Device& d, Io& io) {
     const int rc = open_instance(d, io);
     if (rc >= 0) return rc;
     const bool full = d.f13q.computeFullSubgroups == VK_TRUE;
-    return create_device(d, io, d.f13q.subgroupSizeControl || full, full, d.f2q.features.shaderFloat64 == VK_TRUE);
+    return create_device(d, io, d.f13q.subgroupSizeControl || full, full, d.f2q.features.shaderFloat64 == VK_TRUE,
+                         d.f2q.features.shaderInt64 == VK_TRUE, d.f12q.shaderBufferInt64Atomics == VK_TRUE);
 }
 
 // One line of a batch file: spv, groups, expect, then --require-wave64 and NAME=VALUE settings, tab-separated.
@@ -1033,7 +1060,7 @@ static int single_main(const Job& job) {
     rc = plan_job(d, job, p, io, pl);
     if (rc >= 0) return rc;
     rc = create_device(d, io, d.f13q.subgroupSizeControl || job.require_wave64,
-                       job.require_wave64 || pl.observed_full, pl.needs_float64);
+                       job.require_wave64 || pl.observed_full, pl.needs_float64, pl.needs_int64, pl.int64_atomics);
     if (rc >= 0) return rc;
     return run_job(d, job, p, pl, io, UINT64_MAX);
 }
