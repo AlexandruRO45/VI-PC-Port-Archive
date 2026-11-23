@@ -100,3 +100,33 @@ not an `E_NOTIMPL`.
 
 These are one run's first failures, not a list of what is missing. Every stand-in above is local and untested
 beyond "the title goes on to the next call". Nothing has reached a draw or a present yet.
+
+## 5. The same run under Wine on Linux
+
+Measured 2026-11-23 on Linux with the cross build in [testing.md](testing.md) (clang-cl 23.1.5, xwin SDK
+10.0.26100, Wine 11.22), an RTX 3090 (driver 620.70.06) and `LEONIDA_D3D12=vulkan`. The folder held only the
+executable, so the seven Xbox-only package DLLs were not there to be mapped.
+
+| Pass | Result |
+|---|---|
+| `--dry-run` | The image maps at its preferred base with 53 shim, 432 host and 102 unimplemented imports. The 102 are the seven package DLLs' exports. With those DLLs in the folder, a second Linux machine (RTX 3060, Wine 11.21) measured 54 shim, 432 host, 72 bound to the four bundled modules and 29 unimplemented: 72 of the 102 bind to the bundled modules, 29 stay missing, and the last one is an import `main` serves with a shim now that did not when this run was made (54 shim against 53). |
+| `--init` | Exit 0, both TLS callbacks, no `dllmain`, no exception. On the older `main` this run (without the package DLLs) held one access violation, read at `0xf`, inside the second TLS callback; it does not reproduce at `47428cc2`, where the same folder maps with 94 unimplemented imports and none of them from `xmem.dll`, so the fault was one of the shims merged since. JoaoPauluu's run with the full package has four `dllmain` events and no exception either. |
+| `--run` | The same stop on both machines. Exit 5, an unhandled access violation: the title's first static initializer calls a shim, and a `std::mutex` lock there takes a null mutex. The runtime's own static TLS block at module index 0 reads zero on the game thread, so the compiler's guard variable looks initialized while the pointer it guards is still null. |
+
+The cross build has one more trap worth a line here. It does not find the Vulkan headers by itself, so without
+`-DLEONIDA_VULKAN_HEADERS_FETCH=ON` the Vulkan device is not compiled in and `LEONIDA_D3D12=vulkan` is ignored
+without a message: under Wine 9 that run then fails at `D3D12XboxCreateDevice` (the host's `D3D12CreateDevice` at 12_0
+returns `E_INVALIDARG`, and at 11_0 the proxy's first `QueryInterface` is `E_NOINTERFACE`). With the headers, a second
+Linux machine (RTX 3060, Wine 9.0) reaches the Windows chain's own stops in order on the pinned PR stack, one device
+slot at a time (#6964, #6954, #7076), and gets to stop 10 with 1,181 D3D12 calls through: 5 queues, fences,
+allocators, 581 command lists created and closed, and `XboxIDXGIDevice::GetAdapter`. It stops at the ~185 MiB
+`XMemVirtualAlloc` with type `0x42000` and attribute 7, the placeholder reserve at stop 10, and
+`XMemAllocatePhysicalPages` was reached and answered with attributes `0x280` and 11,360 pages. The same build on
+Wine 11.20 raises `0x80000101` right after the third `XMemVirtualAlloc`, before any D3D12 call, which Wine 9.0 does
+not do.
+
+Index 0 is RT-259's subject: `/GA` code in the title reads and writes `gs:[58h]` slot 0 without loading
+`_tls_index`, and under `gta6rt` slot 0 belongs to `gta6rt.exe`, so the title's TLS writes land in the runtime's own
+block. [#4313](https://github.com/ItsNotRexed/Leonida/pull/4313) moves the runtime's block to a helper index. Whether
+Wine then reaches stop 1 is not measured here: #4313 conflicts with `main` at the time of writing, and everything
+above stop 1 in this page is the Windows chain.
