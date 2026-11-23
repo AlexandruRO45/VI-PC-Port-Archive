@@ -43,6 +43,7 @@ from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shader
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
+from check import mixed_f32_varying_problem
 from check import barycentric_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
@@ -582,6 +583,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
+              "ps_mixed_f32_varying": "vs_mixed_varying.asm",
               SIGNED_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
@@ -827,6 +829,12 @@ def run_suite(a, work: str) -> int:
             # is no .spv (the f16 fallback is on by default where PerVertexKHR doesn't compile: MoltenVK).
             results.append((name, None, "SKIP (computed I/J pairs need PerVertexKHR inputs: "
                                         "no --bary-fallback / --f16-interp-fallback)"))
+            continue
+        if name == "ps_mixed_f32_varying" and (bary_fallback() or f16_interp_fallback()):
+            # Before the .spv check: neither fallback has per-vertex inputs for a flat and interpolated read of one
+            # attribute, so the translator refuses it and there is no .spv.
+            results.append((name, None, "SKIP (flat and interpolated reads of one f32 attribute need "
+                                        "PerVertexKHR inputs)"))
             continue
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))
@@ -1314,6 +1322,10 @@ def run_suite(a, work: str) -> int:
                 with open(raw, "rb") as source:
                     problem = ij_computed_problem(list(struct.iter_unpack("<4I", source.read())))
                 ok, detail = not problem, problem or "computed I/J pair words and v/2 within 1e-6"
+            elif name == "ps_mixed_f32_varying":
+                with open(raw, "rb") as source:
+                    problem = mixed_f32_varying_problem(list(struct.iter_unpack("<4I", source.read())), 1e-6)
+                ok, detail = not problem, problem or "4096/4096 pixels: flat vertex-0 words exact, both interpolations within 1e-6"
             elif name == "ps_mandelbrot":
                 px = read_raw_u32(raw) if os.path.isfile(raw) else []
                 problem = frame_problem(px) or mandelbrot_problem(px)

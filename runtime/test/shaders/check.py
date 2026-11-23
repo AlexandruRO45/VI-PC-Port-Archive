@@ -426,12 +426,13 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
-                      "ps_texoff_forms",
+                      "ps_texoff_forms", "ps_mixed_f32_varying",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
                       "ps_mandelbrot"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
-                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
+                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts",
+                "ps_mixed_f32_varying": "vs_mixed_varying"}
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 SIGNED_MIP_TEST = "ps_sample_implicit_sint"
@@ -1424,11 +1425,33 @@ def barycentric_problem(px: list[tuple[float, float, float, float]], abs_tol: fl
     return ""
 
 
+def mixed_f32_varying_problem(px: list[tuple[int, int, int, int]], abs_tol: float) -> str:
+    """Check ps_mixed_f32_varying over the 64-by-64 frame covered by the vs_mixed_varying triangle: .x and .w are the
+    flat read of attr1, which has to be vertex 0's 1.0 as raw bits, and .y and .z are interpolated, 1 + i + 2j over
+    the same location and 2i over attr0, which no v_interp_mov reads."""
+    if len(px) != 64 * 64:
+        return f"expected 4096 pixels, got {len(px)}"
+    for index, pixel in enumerate(px):
+        y, x = divmod(index, 64)
+        if (pixel[0], pixel[3]) != (0x3F800000, 0x3F800000):
+            return (f"at ({x},{y}): flat attr1.x/.y read {pixel[0]:#010x} / {pixel[3]:#010x}, "
+                    f"want vertex 0's 0x3f800000")
+        i, j = (x + 0.5) / 128, (y + 0.5) / 128
+        got = tuple(struct.unpack("<f", struct.pack("<I", w))[0] for w in pixel[1:3])
+        want = (1 + i + 2 * j, 2 * i)
+        if any(abs(g - w) > abs_tol for g, w in zip(got, want)):
+            return f"at ({x},{y}): interpolated {got[0]!r} / {got[1]!r}, want {want[0]!r} / {want[1]!r}"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
         # Before the .spv check: without PerVertexKHR inputs the translator refuses a computed I/J pair (no .spv).
         return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
+    if name == "ps_mixed_f32_varying" and (BARY_FALLBACK or F16_HALVES):
+        # Before the .spv check: neither fallback has per-vertex inputs, so the translator refuses the mixed read.
+        return Skip("SKIP (flat and interpolated reads of one f32 attribute need PerVertexKHR inputs)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
@@ -1468,6 +1491,8 @@ def pixel_test(tools, spirv, name):
         wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
         err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
         return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}"
+    if name == "ps_mixed_f32_varying":
+        return mixed_f32_varying_problem(px, 1e-6)
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
     if name == "ps_ij_computed":

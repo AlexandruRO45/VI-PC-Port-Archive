@@ -46,6 +46,9 @@ MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
 # Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
+# Not built under either fallback either: a mixed flat and smooth read of one attribute needs per-vertex inputs that
+# no fallback has for this shape (see main).
+MIXED_F32_READS = ("ps_mixed_f32_varying",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header  # noqa: E402
 
@@ -203,6 +206,14 @@ def main():
             print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
                   ", ".join(per_vertex))
         names = [n for n in names if n not in per_vertex]
+    # A mixed flat and smooth read of one attribute is refused under either fallback, so it needs its own test here:
+    # --bary-fallback's per-vertex inputs are for a computed I/J pair, not for this shape.
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1" or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
+        mixed_reads = [n for n in names if n in MIXED_F32_READS]
+        if mixed_reads:
+            print("not built (mixed flat and smooth reads of one attribute need PerVertexKHR inputs):",
+                  ", ".join(mixed_reads))
+        names = [n for n in names if n not in mixed_reads]
     if not names:
         return 0
     out.mkdir(parents=True, exist_ok=True)
