@@ -318,6 +318,14 @@ class TestPermLaneX16Divergence(unittest.TestCase):
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
         self.assertIn("OpBitwiseXor", spv)
 
+class TestPermLaneX16Distinguisher(unittest.TestCase):
+    def test_xor16_presence(self):
+        # Distinguish v_permlane16 (no xor 16) vs v_permlanex16 (has xor 16)
+        spv_p16 = run_cs_permlane("v_permlane16_b32", 0, 0, name="cs_dist_p16")
+        spv_px16 = run_cs_permlane("v_permlanex16_b32", 0, 0, name="cs_dist_px16")
+        self.assertNotIn("OpBitwiseXor", spv_p16)
+        self.assertIn("OpBitwiseXor", spv_px16)
+
 
 if __name__ == "__main__":
     unittest.main()
