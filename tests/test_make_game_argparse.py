@@ -328,13 +328,15 @@ class JobsHandlingTest(unittest.TestCase):
                                         patch("make_game.wave64_settings", return_value=(True, True)) as probe, \
                                         patch("make_game.runtime_gpu_per_vertex", return_value=None) as per_vertex_probe, \
                                         patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
-                                        patch("make_game.runtime_gpu_max_push_constants", return_value=None) as max_pc_probe:
+                                        patch("make_game.runtime_gpu_max_push_constants", return_value=None) as max_pc_probe, \
+                                        patch("make_game.runtime_gpu_mesh_draws_crash", return_value=None) as mesh_probe:
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
                                     probe_gpu = per_vertex_probe.call_args.kwargs["probe_gpu"]
                                     self.assertTrue(callable(probe_gpu))
                                     probe.assert_called_once_with("auto", mesh_compute=False, probe_gpu=probe_gpu)
                                     max_pc_probe.assert_called_once_with(probe_gpu=probe_gpu)
+                                    mesh_probe.assert_called_once_with(probe_gpu=probe_gpu)
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
                                         emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
