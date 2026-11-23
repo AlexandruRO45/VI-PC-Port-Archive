@@ -869,5 +869,31 @@ class TestVSqrtF32SIMDAndIEEE(unittest.TestCase):
                 self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
 
 
+def run_hw_sqrt_f32(src_val: float) -> float:
+    bits = f32_to_bits(src_val)
+    lines = [
+        f"v_mov_b32 v0, {bits:#x}",
+        "v_sqrt_f32 v0, v0",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_sqrt_f32_hw", lines)
+    out_bits = support.mrt0_words(spv)[0]
+    return bits_to_f32(out_bits)
+
+
+class TestVSqrtF32HardwareTranslator(unittest.TestCase):
+    """Translator integration and hardware execution tests for v_sqrt_f32."""
+
+    def test_translator_sqrt_values(self):
+        self.assertEqual(run_hw_sqrt_f32(0.0), 0.0)
+        self.assertEqual(run_hw_sqrt_f32(1.0), 1.0)
+        self.assertEqual(run_hw_sqrt_f32(4.0), 2.0)
+        self.assertEqual(run_hw_sqrt_f32(9.0), 3.0)
+        self.assertEqual(run_hw_sqrt_f32(16.0), 4.0)
+        self.assertEqual(run_hw_sqrt_f32(25.0), 5.0)
+        self.assertEqual(run_hw_sqrt_f32(float("inf")), float("inf"))
+
+
 if __name__ == "__main__":
     unittest.main()
