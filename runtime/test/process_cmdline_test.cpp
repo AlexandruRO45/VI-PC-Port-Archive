@@ -5,6 +5,7 @@
 // No game files.
 #include <windows.h>
 #include <shellapi.h>
+#include <io.h>
 
 #include <cstdio>
 #include <cstring>
@@ -20,10 +21,11 @@ int failures = 0;
 
 const wchar_t* g_flush_path = nullptr;
 FILE* g_flush_stream = nullptr;
+constexpr char kBufferedText[] = "buffered C stream\n";
 
 bool buffer_stream() {
     if (_wfopen_s(&g_flush_stream, g_flush_path, L"w") != 0 || !g_flush_stream) return false;
-    std::fputs("buffered C stream\n", g_flush_stream);
+    std::fputs(kBufferedText, g_flush_stream);
     return true;
 }
 
@@ -52,23 +54,28 @@ void check_normal_exit_flush(bool use_exit) {
     const int code = rt::process::run_entry(reinterpret_cast<void*>(entry), 0);
     g_flush_path = nullptr;
 
+    LARGE_INTEGER size{};
+    const bool flushed = g_flush_stream &&
+                         GetFileSizeEx(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(g_flush_stream))), &size) &&
+                         size.QuadPart == static_cast<LONGLONG>(sizeof(kBufferedText) - 1);
+    if (g_flush_stream) {
+        std::fclose(g_flush_stream);
+        g_flush_stream = nullptr;
+    }
     char contents[32] = {};
     FILE* copy = nullptr;
     if (_wfopen_s(&copy, path, L"r") == 0 && copy) {
         std::fread(contents, 1, sizeof(contents) - 1, copy);
         std::fclose(copy);
     }
-    if (g_flush_stream) {
-        std::fclose(g_flush_stream);
-        g_flush_stream = nullptr;
-    }
     DeleteFileW(path);
 
     const int expected_code = use_exit ? 23 : 17;
-    if (code != expected_code || std::strcmp(contents, "buffered C stream\n") != 0) {
-        std::fprintf(stderr, "FAIL %s: exit code %d (want %d), buffered contents %s\n",
+    const bool contents_match = std::strcmp(contents, kBufferedText) == 0;
+    if (code != expected_code || !flushed || !contents_match) {
+        std::fprintf(stderr, "FAIL %s: exit code %d (want %d), buffered stream %s, contents %s\n",
                      use_exit ? "exit()" : "entry return", code, expected_code,
-                     std::strcmp(contents, "buffered C stream\n") == 0 ? "match" : "were not flushed");
+                     flushed ? "was flushed" : "was not flushed before cleanup", contents_match ? "match" : "differ");
         ++failures;
     }
 }
@@ -248,7 +255,7 @@ int main() {
     // A byte above 0x7f in the narrow program name is part of the name, not the end of it.
     check_winmain(L"caf\u00e9.exe", {L"-x"}, L"-x", "a non-ASCII program name");
 
-    // Read while the guest's stream is still open: a later host exit or test cleanup must not be what flushes it.
+    // Check the open stream's file size before closing it: test cleanup must not be what flushes it.
     check_normal_exit_flush(false);
     check_normal_exit_flush(true);
 
