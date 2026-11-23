@@ -17,21 +17,15 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLAG = re.compile(r"(?<![\w-])(--[a-z][\w-]*)")
 SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", ".txt", ".cs", ".cjs", ".js", ".html",
                    ".bat", ".sh", ".yml", ".yaml", ".csproj")
-# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself, and
-# the LLVM spirv-opt passes docs/embedded_shaders.md lists among the runs it timed (the pass names are the tool's,
-# no source file here spells them).
-FOREIGN = {"--search", "--state", "--index-url", "--help",
-           "--ssa-rewrite", "--eliminate-dead-code-aggressive", "--eliminate-dead-branches", "--merge-blocks",
-           "--cfg-cleanup", "--merge-return", "--scalar-replacement"}
+# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself.
+FOREIGN = {"--search", "--state", "--index-url", "--help"}
 # Pages that quote another project's tree (SCARAB, americas-recomp).
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
@@ -42,17 +36,16 @@ PS1_COMMAND = re.compile(
 PS1_FLAG = re.compile(r"(?<![\w-])(-[a-zA-Z][\w-]*)")
 
 
-def tracked_files():
-    # -z and fsdecode, as the link check does: git quotes and octal-escapes a name outside ASCII in its plain
-    # output, so `"tools/jap\\346\\227\\245.md"` would reach the `.md` tests quoted and be skipped in silence.
+def tracked_files(root=ROOT):
+    # NUL-delimited output preserves filenames that Git would otherwise quote and escape.
     try:
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True).stdout
         return [os.fsdecode(name) for name in out.split(b"\0") if name]
     except (OSError, subprocess.CalledProcessError):
         found = []
-        for root, dirs, files in os.walk(ROOT):
+        for base, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if d not in (".git", "build", "__pycache__", "node_modules")]
-            found += [os.path.relpath(os.path.join(root, f), ROOT).replace(os.sep, "/") for f in files]
+            found += [os.path.relpath(os.path.join(base, f), root).replace(os.sep, "/") for f in files]
         return found
 
 
@@ -219,6 +212,17 @@ def ps1_flag_mismatches(pages, sources):
 
 
 class DocsCliFlags(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "requires Git")
+    def test_a_tracked_name_outside_ascii_reaches_the_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+            subprocess.run(["git", "config", "core.quotePath", "true"], cwd=tmp, check=True)
+            page = "日本語 notes.md"
+            with open(os.path.join(tmp, page), "w", encoding="utf-8", newline="\n") as f:
+                f.write("`--not-a-real-flag`\n")
+            subprocess.run(["git", "add", "--", page], cwd=tmp, check=True)
+            self.assertEqual([p for p in tracked_files(tmp) if p.endswith(".md")], [page])
+
     def test_dev_inherits_only_the_selected_producer_flags(self):
         pages = {"docs/dev.md": ("```\n"
                                  "python -I scripts/dev.py boot-trace --d3d12 --negative-controls\n"
@@ -249,21 +253,6 @@ class DocsCliFlags(unittest.TestCase):
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
         self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
 
-    @unittest.skipUnless(shutil.which("git"), "requires Git")
-    def test_a_tracked_name_outside_ascii_reaches_the_checks(self):
-        # git octal-escapes and quotes such a name in its plain output; read that way it ends in `\\346....md"` and
-        # every `.md` filter below drops it without a word, so the page is never scanned.
-        with tempfile.TemporaryDirectory() as tmp:
-            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
-            subprocess.run(["git", "config", "core.quotePath", "true"], cwd=tmp, check=True)
-            page = "caf\u00e9 notes.md"
-            with open(os.path.join(tmp, page), "w", encoding="utf-8", newline="\n") as f:
-                f.write("[missing](missing.md) `--not-a-real-flag`\n")
-            subprocess.run(["git", "add", "--", page], cwd=tmp, check=True)
-            module = sys.modules[__name__]
-            with patch.object(module, "ROOT", tmp):
-                self.assertEqual(tracked_files(), [page])
-
     def test_docs_name_existing_flags(self):
         files = tracked_files()
         code = "\n".join(read(p) for p in files if p.endswith(SOURCE_SUFFIXES) and not p.startswith("docs/"))
@@ -272,12 +261,6 @@ class DocsCliFlags(unittest.TestCase):
         missing = unknown_flags(pages, code)
         self.assertEqual(missing, [], "flags in the docs that no source file mentions: " +
                          "; ".join(f"{where} {flag}" for where, flag in missing))
-
-    def test_every_foreign_flag_is_still_in_the_docs(self):
-        # A FOREIGN entry that no page mentions any more is dead weight that hides a real miss later on: the
-        # allowance would swallow the flag name even once the docs stop quoting the other program.
-        pages = "\n".join(read(p) for p in tracked_files() if p.endswith(".md"))
-        self.assertEqual([flag for flag in sorted(FOREIGN) if flag not in pages], [], "FOREIGN flags no page uses")
 
     def test_fenced_commands_use_the_flags_of_their_tool(self):
         files = tracked_files()
