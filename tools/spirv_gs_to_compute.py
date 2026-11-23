@@ -262,6 +262,17 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                     f"%gsc_recbase = OpIMul {uint} %gsc_prim {k(mv)}",
                     f"%gsc_metabase = OpIMul {uint} %gsc_prim {k(mv + 1)}"]
             block_tail[entry_label] = "%gsc_body"
+        # Captured outputs are private globals shared by the entry point and its helpers.
+        output_access = re.match(r"(?:%\w+ = OpLoad %\w+|OpStore) (%\w+)(?=\s|$)", s)
+        if output_access and output_access.group(1) in out_vars:
+            start, end = output_access.span(1)
+            out.append(s[:start] + out_vars[output_access.group(1)] + s[end:])
+            continue
+        chain = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
+        if chain and chain.group(3) in out_vars:
+            ptr = "%gsc_ptr_pv_f" if chain.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
+            out.append(f"{chain.group(1)} = OpAccessChain {ptr} {out_vars[chain.group(3)]} {chain.group(4)}")
+            continue
         if state not in ("main", "main_vars"):
             out.append(ln)
             continue
@@ -271,27 +282,19 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             cur_block = m_lbl.group(1)
             out.append(ln)
             continue
-        m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
-        if m and m.group(3) in in_slot:
-            idx = m.group(4).split()
+        if chain and chain.group(3) in in_slot:
+            idx = chain.group(4).split()
             vtx = idx[0]
             if defs.get(vtx, (None, [None]))[1][:1] != [uint]:
                 vtx = tmp()
                 out.append(f"{vtx} = OpBitcast {uint} {idx[0]}")
             a, b, c = tmp(), tmp(), tmp()
-            ptr = "%gsc_ptr_sb_f" if m.group(2) in float_ptrs else "%gsc_ptr_sb_v4"
+            ptr = "%gsc_ptr_sb_f" if chain.group(2) in float_ptrs else "%gsc_ptr_sb_v4"
             out += [f"{a} = OpIAdd {uint} %gsc_inbase {vtx}", f"{b} = OpIMul {uint} {a} {k(nin)}",
-                    f"{c} = OpIAdd {uint} {b} {k(in_slot[m.group(3)])}",
-                    " ".join([f"{m.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:])]
-            continue
-        if m and m.group(3) in out_vars:
-            ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
-            out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
+                    f"{c} = OpIAdd {uint} {b} {k(in_slot[chain.group(3)])}",
+                    " ".join([f"{chain.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:])]
             continue
         m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
-        if m and m.group(3) in out_vars:
-            out.append(s[:m.start(3)] + out_vars[m.group(3)] + s[m.end(3):])
-            continue
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)
             out.append(f"{m.group(1)} = OpBitcast {m.group(2)} {val}" if m.group(2) != uint
@@ -299,10 +302,6 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             continue
         for v in list(in_slot) + list(out_vars) + sorted(gone - set(in_slot) - set(out_vars)):
             if re.search(rf"{re.escape(v)}\b", s):
-                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)(?:\s+.*)?$", s)
-                if v in out_vars and m2:
-                    s = f"OpStore {out_vars[v]} {m2.group(1)}"
-                    break
                 raise Unsupported(f"unhandled use of {v}: {s}")
         if s == "OpEmitVertex":
             # Guard stores and counter increment on n < OutputVertices so over-emitting drops extra vertices

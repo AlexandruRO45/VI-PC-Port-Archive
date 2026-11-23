@@ -234,6 +234,38 @@ def maybe_validate_spirv(spvasm):
 
 
 class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
+    def test_helper_updates_output_before_emit(self):
+        gs = _make_gs([
+            "%entry = OpLabel",
+            "OpStore %out_pos %v_a",
+            "%call = OpFunctionCall %void %helper",
+            "OpEmitVertex",
+            "OpEndPrimitive",
+            "OpReturn",
+        ], max_verts=1, verts_in=1, topology="OutputPoints")
+        helper = """\
+%helper = OpFunction %void None %fn
+%helper_entry = OpLabel
+%prev = OpLoad %v4float %out_pos Aligned 4
+%updated = OpCompositeInsert %v4float %f3 %prev 1
+OpStore %out_pos %updated Aligned 4
+%x_ptr = OpAccessChain %ptr_out_f %out_pos %u0
+OpStore %x_ptr %f2
+OpReturn
+OpFunctionEnd
+"""
+        gs = gs.replace("%main = OpFunction", "%ptr_out_f = OpTypePointer Output %float\n%main = OpFunction")
+        gs = gs.replace("OpExecutionMode %main Triangles", "OpExecutionMode %main InputPoints")
+        for module in (gs + helper, gs.replace("%main = OpFunction", helper + "%main = OpFunction")):
+            with self.subTest(helper_first=module.index("%helper =") < module.index("%main =")):
+                maybe_validate_spirv(module)
+                out, _ = gsc.rewrite(module)
+                self.assertNotIn("%out_pos", out)
+                self.assertIn("%prev = OpLoad %v4float %gsc_out0 Aligned 4", out.splitlines())
+                self.assertIn("OpStore %gsc_out0 %updated Aligned 4", out.splitlines())
+                self.assertIn("%x_ptr = OpAccessChain %gsc_ptr_pv_f %gsc_out0 %u0", out.splitlines())
+                maybe_validate_spirv(out)
+
     def test_read_output_before_emit_with_implicit_shader_capability(self):
         gs = _make_gs([
             "%entry = OpLabel",
