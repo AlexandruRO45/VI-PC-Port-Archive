@@ -577,6 +577,70 @@ class CpuRefTest(unittest.TestCase):
                 self.assertIn("0..63", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    def test_multi_dword_vgpr_sources_and_bad_mask_conditions_are_rejected(self):
+        cases = (
+            ("int_vgpr_pair", "v_add_nc_u32 v0, v[1:2], v3\ns_endpgm"),
+            ("float_vgpr_pair", "v_add_f32 v0, v[1:2], v3\ns_endpgm"),
+            ("cndmask_quad_sgpr_cond", "v_cndmask_b32_e64 v0, v1, v2, s[0:3]\ns_endpgm"),
+            ("cndmask_neg_cond", "v_cndmask_b32_e64 v0, v1, v2, -s0\ns_endpgm"),
+            ("cndmask_abs_cond", "v_cndmask_b32_e64 v0, v1, v2, |s0|\ns_endpgm"),
+        )
+        for name, body in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.execute(body)
+
+    def test_abs_neg_modifiers_rejected_on_integer_bitwise_and_scalar_ops(self):
+        cases = (
+            ("v_add_nc_u32_neg", "v_add_nc_u32 v0, -v1, v2\ns_endpgm"),
+            ("v_add_nc_u32_abs", "v_add_nc_u32 v0, |v1|, v2\ns_endpgm"),
+            ("v_and_b32_neg", "v_and_b32 v0, -v1, v2\ns_endpgm"),
+            ("v_mov_b32_neg", "v_mov_b32 v0, -v1\ns_endpgm"),
+            ("v_mov_b32_abs", "v_mov_b32 v0, |v1|\ns_endpgm"),
+            ("v_bfe_u32_neg", "v_bfe_u32 v0, -v1, 0, 8\ns_endpgm"),
+            ("s_mov_b32_neg", "s_mov_b32 s0, -s1\ns_endpgm"),
+            ("s_add_u32_abs", "s_add_u32 s0, |s1|, s2\ns_endpgm"),
+        )
+        for name, body in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.execute(body)
+
+    def test_inactive_exec_still_rejects_unsupported_vector_operands(self):
+        cases = (
+            ("bad_dst_float", "v_add_f32 s0, v1, v2\ns_endpgm"),
+            ("bad_dst_int", "v_add_nc_u32 s0, v1, v2\ns_endpgm"),
+            ("bad_src_special", "v_mov_b32 v0, m0\ns_endpgm"),
+            ("bad_src_pair", "v_add_f32 v0, v[1:2], v3\ns_endpgm"),
+            ("bad_int_neg", "v_and_b32 v0, -v1, v2\ns_endpgm"),
+            ("bad_cndmask_cond", "v_cndmask_b32_e64 v0, v1, v2, m0\ns_endpgm"),
+            ("bad_int_vop_dst", "v_not_b32 s0, v1\ns_endpgm"),
+        )
+        for name, body in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.execute(body, exec=0)
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.execute(body, lanes=64, exec=0)
+
+    def test_unsupported_operand_reports_instruction_pc(self):
+        # When Machine runs instructions whose pc differs from code_start (or without enc lengths),
+        # operand-level Unsupported errors must report the failing instruction's own pc.
+        info = {
+            "name": "pc_check",
+            "code_start": 0,
+            "insns": [
+                {"op": "v_mov_b32", "args": [{"k": "vgpr", "r": 0, "n": 1}, {"k": "imm", "v": 1}],
+                 "mods": [], "enc": None, "pc": 0x0},
+                {"op": "v_mov_b32", "args": [{"k": "vgpr", "r": 1, "n": 1}, {"k": "special", "t": "m0"}],
+                 "mods": [], "enc": None, "pc": 0x10},
+                {"op": "s_endpgm", "args": [], "mods": [], "enc": None, "pc": 0x14},
+            ],
+        }
+        with self.assertRaises(cpu_ref.Unsupported) as cm:
+            cpu_ref.Machine(info).run()
+        self.assertEqual(cm.exception.pc, 0x10)
+
 
 if __name__ == "__main__":
     unittest.main()
