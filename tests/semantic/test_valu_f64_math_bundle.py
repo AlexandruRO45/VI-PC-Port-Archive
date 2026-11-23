@@ -643,5 +643,18 @@ class VFrexpExpI32F64SimdIeeeTests(unittest.TestCase):
         self.assertEqual(oracle_frexp_exp_i32_f64(F64_QNAN), 0)
         self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_INF), 0)
 
+class VFrexpExpI32F64TranslatorTests(unittest.TestCase):
+    def test_frexp_exp_translation(self):
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_ONE & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_ONE >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_exp_f64_test", lines)
+        self.assertIn("OpCapability", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
